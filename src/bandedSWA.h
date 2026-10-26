@@ -302,6 +302,16 @@ struct BswCompactCounts {
     uint64_t superblocks = 0, moves = 0, retired = 0;
 };
 
+/* Running totals of the 8-bit extension batches one kernel object ran in each score domain
+ * (bsw8_score_domain_counts()): a batch is one group of the tier's lane count through the
+ * plain wrapper, or one group's superblock entry through the compaction driver. Only the
+ * AVX-512BW tier has two domains (see bsw8_gap_bytes_fit_int8); the other tiers leave both
+ * at zero. One increment per batch, for the tests that pin which instantiation a scoring
+ * takes. Never reset. */
+struct BswScoreDomainCounts {
+    uint64_t signed_batches = 0, unsigned_batches = 0;
+};
+
 #include "kernel_dispatch.h"  /* must come before BandedPairWiseSW class so per-tier compiles see the renamed symbol */
 
 #include <memory>
@@ -429,6 +439,10 @@ public:
 
     /* This object's compaction totals since construction (all zero on tiers without it). */
     virtual BswCompactCounts lane_compaction_counts() const = 0;
+
+    /* This object's 8-bit extension batches per score domain since construction (both zero
+     * on tiers with a single domain). */
+    virtual BswScoreDomainCounts bsw8_score_domain_counts() const = 0;
 };
 
 /* Factory: returns a per-tier concrete BandedPairWiseSW. Construction
@@ -437,6 +451,18 @@ std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
     int o_del, int e_del, int o_ins, int e_ins, int zdrop,
     int end_bonus, const int8_t *mat,
     int8_t w_match, int8_t w_mismatch, int numThreads);
+
+/* The x86 8-bit extension kernels broadcast each gap penalty as the byte of its int value
+ * ((uint8_t)(o + e) and (uint8_t) e, as _mm512_set1_epi8 / _mm256_set1_epi8 truncate). The
+ * AVX-512BW kernel's signed-domain form (smithWaterman512_8Impl<true>, which carries every
+ * score byte as score ^ 0x80) subtracts those bytes with int8 saturation, which is exact only
+ * when every one of them is at most 127; for any larger byte the unsigned-domain form runs.
+ * Decided once per batch; the wrappers seed H in the matching domain. */
+static inline bool bsw8_gap_bytes_fit_int8(int o_del, int e_del, int o_ins, int e_ins)
+{
+    return (uint8_t) (o_del + e_del) <= 127 && (uint8_t) e_del <= 127 &&
+           (uint8_t) (o_ins + e_ins) <= 127 && (uint8_t) e_ins <= 127;
+}
 
 /* Per-tier factory function forward declarations.
  * Defined in bandedSWA.<tier>.o (each kernel TU compile).
@@ -492,6 +518,7 @@ public:
         compact_min_w_  = min_w;
     }
     BswCompactCounts lane_compaction_counts() const override { return compact_counts_; }
+    BswScoreDomainCounts bsw8_score_domain_counts() const override { return domain_counts_; }
 
     // Scalar code section
     int scalarBandedSWA(int qlen, const uint8_t *query, int tlen,
@@ -666,17 +693,10 @@ public:
                                    uint16_t numThreads,
                                    int32_t w);
 
-    void smithWaterman512_8(uint8_t seq1SoA[],
-                            uint8_t seq2SoA[],
-                            int nrow,
-                            int ncol,
-                            SeqPair *p,
-                            uint8_t h0[],
-                            uint16_t tid,
-                            int32_t numPairs,
-                            int zdrop,
-                            int32_t w,
-                            uint8_t myband[]);
+    // The 8-bit kernel (smithWaterman512_8Impl, private) carries its H/E/F bytes either as the
+    // unsigned score or as the score ^ 0x80 when every gap penalty byte fits an int8; this
+    // wrapper and the compaction one below decide that once per call and seed H to match. See
+    // the score-domain note above MAIN_CODE8_CORE in bandedSWA.cpp.
     // Same-row lane compaction: superblocks of K 64-lane groups in row lockstep; see
     // bandedSWA_compact512.inc and set_lane_compaction.
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
@@ -720,6 +740,40 @@ public:
     
 private:
     BswCompactCounts compact_counts_;   // see lane_compaction_counts
+    BswScoreDomainCounts domain_counts_;   // see bsw8_score_domain_counts
+#if __AVX512BW__
+    // The AVX-512BW 8-bit extension in one score domain (SIGNED8: every H/E/F byte is the
+    // score ^ 0x80; else the unsigned score). Private: each instantiation requires H to be
+    // seeded in its domain, which only the public wrappers above guarantee, deciding the domain
+    // once per call from the gap penalty bytes (bsw8_gap_bytes_fit_int8). See the score-domain
+    // note above MAIN_CODE8_CORE in bandedSWA.cpp.
+    template <bool SIGNED8>
+    void smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
+                                        uint8_t *seqBufRef,
+                                        uint8_t *seqBufQer,
+                                        int32_t numPairs,
+                                        uint16_t numThreads,
+                                        int32_t w);
+    template <bool SIGNED8>
+    void smithWaterman512_8Impl(uint8_t seq1SoA[],
+                                uint8_t seq2SoA[],
+                                int nrow,
+                                int ncol,
+                                SeqPair *p,
+                                uint8_t h0[],
+                                uint16_t tid,
+                                int32_t numPairs,
+                                int zdrop,
+                                int32_t w,
+                                uint8_t myband[]);
+    template <bool SIGNED8>
+    void smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
+                                               uint8_t *seqBufRef,
+                                               uint8_t *seqBufQer,
+                                               int32_t numPairs,
+                                               int32_t w,
+                                               int K);
+#endif
     int m;
     int end_bonus, zdrop;
     int o_del, o_ins, e_del, e_ins;

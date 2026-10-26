@@ -461,7 +461,8 @@ the staging code is common to every SIMD tier, running before the tier-specific 
 ## 8-bit banded-SW score for a negative seed score depended on its SIMD group (PR #528)
 
 The 8-bit banded-SW extension kernels (`smithWaterman128_8`, `smithWaterman256_8`,
-`smithWaterman512_8`) keep each lane's best score in a wide per-lane side channel,
+`smithWaterman512_8`, the last now the template `smithWaterman512_8Impl<SIGNED8>`, one
+instantiation per score domain) keep each lane's best score in a wide per-lane side channel,
 `best_abs`, seeded with the raw seed score `h0`, while the byte DP state is seeded with `h0`
 clamped to 0. The per-row wide update ran `best_abs = max(best_abs, byte max)` over every
 lane of the group whenever *any* lane's maximum advanced that row, on the assumption that
