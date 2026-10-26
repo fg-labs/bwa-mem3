@@ -183,7 +183,7 @@ int main(int argc, char **argv) {
         int32_t tid = omp_get_thread_num();
         // Per-thread sortSMEMs counting-sort scratch: allocated once here and
         // grown on demand inside sortSMEMs, never shared across threads.
-        SmemSortScratch sortScratch = {NULL, 0, NULL, 0};
+        SmemSortScratch sortScratch = {NULL, 0, NULL, 0, NULL, 0};
         // Initial capacity must hold at least one batch's worst case so the
         // first grow check below has a real budget to compare against. When
         // numthreads > numReads, perThreadQuota is 0 and the legacy

@@ -50,6 +50,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
 #include "io_utils.h"     /* io_request_size, IO_MAX_ONCE */
 #include "FMI_search.h"
+#include "ksort.h"        /* smem_sort_rid_mn: per-rid introsort on (key, idx) pairs */
 #include "smem_parked.h"
 #include "profiling.h"
 #include "libsais_build.h"
@@ -2146,6 +2147,61 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 }
 
 
+/* ---- Shared pieces of the SMEM rid counting sort (sortSMEMs and
+ * smem_sort_rid_mn). ---- */
+
+/* Grow a reused scratch buffer to hold at least `need` elements: free + fresh
+ * 64-byte-aligned allocation, null-checked, never shrunk (so a buffer is
+ * bounded by the largest batch it has seen). Contents are not preserved. */
+template <typename T>
+static T *smem_scratch_reserve(T *&buf, int64_t &cap, int64_t need)
+{
+    if (need > cap) {
+        _mm_free(buf);
+        buf = (T *) _mm_malloc((size_t)need * sizeof(T), 64);
+        if (buf == NULL) {
+            fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
+            exit(EXIT_FAILURE);
+        }
+        cap = need;
+    }
+    return buf;
+}
+
+/* rid range present in a[0, n), n >= 1. A per-thread block holds only its own
+ * reads, so the dense rid index is offset by the observed minimum. */
+static int64_t smem_rid_range(const SMEM *a, int64_t n, uint32_t *minRidOut)
+{
+    uint32_t minRid = a[0].rid, maxRid = a[0].rid;
+    for (int64_t i = 1; i < n; i++) {
+        uint32_t r = a[i].rid;
+        if (r < minRid) minRid = r;
+        if (r > maxRid) maxRid = r;
+    }
+    *minRidOut = minRid;
+    return (int64_t)maxRid - (int64_t)minRid + 1;
+}
+
+/* Stable counting scatter of a[0, n) by rid: out[] receives make(i) for each
+ * input i, grouped by ascending rid, keeping input order within a rid. cnt
+ * must hold `range` entries; on return cnt[r] is the END offset of bucket r
+ * (its start is cnt[r - 1], or 0 for r == 0). cnt is zeroed over [0, range)
+ * here -- only the used prefix, not the whole capacity. */
+template <typename T, typename Make>
+static void smem_rid_scatter(const SMEM *a, int64_t n, uint32_t minRid, int64_t range,
+                             int64_t *cnt, T *out, Make make)
+{
+    memset(cnt, 0, (size_t)range * sizeof(int64_t));
+    for (int64_t i = 0; i < n; i++)
+        cnt[a[i].rid - minRid]++;
+    int64_t sum = 0;
+    for (int64_t r = 0; r < range; r++) { int64_t c = cnt[r]; cnt[r] = sum; sum += c; }
+    for (int64_t i = 0; i < n; i++) {
+        int64_t b = (int64_t)a[i].rid - minRid;
+        out[cnt[b]++] = make(i);
+    }
+}
+
 void FMI_search::sortSMEMs(SMEM *matchArray,
         int64_t numTotalSmem[],
         int32_t numReads,
@@ -2153,23 +2209,22 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         int nthreads,
         SmemSortScratch &scratch)
 {
-    /* The only property the caller needs from this sort is that every SMEM of a
-     * given read (rid) is contiguous and the reads appear in ascending rid
-     * order: mem_collect_smem then walks each rid block and re-sorts it with
-     * ks_introsort(mem_intv1) keyed purely on (m, n). The old qsort's secondary
-     * (m asc, n desc) ordering was therefore thrown away — and SMEMs that tie on
-     * (rid, m, n) are byte-identical (same read span => same SA interval), so the
-     * unstable re-sort's handling of them cannot depend on their incoming order.
+    /* Stable counting sort of each per-thread block by rid: every SMEM of a
+     * read (rid) becomes contiguous, reads in ascending rid order, and SMEMs of
+     * one rid keep their incoming relative order. No (m, n) order is applied.
+     *
+     * The aligner no longer calls this (mem_collect_smem uses smem_sort_rid_mn,
+     * which also orders each read by (m, n)); it is kept for the integration
+     * tests, which diff its output, so its order must not change. The
+     * smem_sort_rid_mn unit test pins it to a stable sort by rid.
      *
      * rid is a dense index in [0, numReads), so a counting sort by rid replaces
-     * the O(n log n) function-pointer qsort with an O(n + rid_range) pass.
-     *
-     * The count/offset array (`cnt`) and the stable-scatter buffer (`tmp`) live
-     * in caller-owned scratch that is allocated once and reused across batches
-     * (audit SEED-15), replacing the old per-batch calloc/_mm_malloc + free.
-     * FMI_search is shared across worker threads, so no member scratch may be
-     * used here; the scratch instead comes from the caller's per-thread
-     * mem_cache slot (mmc->smem_sort_scratch[tid]) and is never shared. */
+     * the old O(n log n) function-pointer qsort with an O(n + rid_range) pass.
+     * The count/offset array (`cnt`) and the scatter buffer (`tmp`) live in
+     * caller-owned scratch that is allocated once and reused across batches
+     * (audit SEED-15). FMI_search is shared across worker threads, so no member
+     * scratch may be used here; the scratch comes from the caller and is never
+     * shared. */
     int tid;
     int32_t perThreadQuota = (numReads + (nthreads - 1)) / nthreads;
     for(tid = 0; tid < nthreads; tid++)
@@ -2180,57 +2235,75 @@ void FMI_search::sortSMEMs(SMEM *matchArray,
         int32_t first = tid * perThreadQuota;
         SMEM *myMatchArray = matchArray + (int64_t)first * readlength;
 
-        /* rid range actually present in this block (dense, but a per-thread
-         * block only holds its own reads, so offset by the observed minimum). */
-        uint32_t minRid = myMatchArray[0].rid, maxRid = myMatchArray[0].rid;
-        for (int64_t i = 1; i < smem_count; i++) {
-            uint32_t r = myMatchArray[i].rid;
-            if (r < minRid) minRid = r;
-            if (r > maxRid) maxRid = r;
-        }
-        int64_t range = (int64_t)maxRid - (int64_t)minRid + 1;
+        uint32_t minRid;
+        int64_t range = smem_rid_range(myMatchArray, smem_count, &minRid);
+        int64_t *cnt = smem_scratch_reserve(scratch.cnt, scratch.cntCap, range);
+        SMEM    *tmp = smem_scratch_reserve(scratch.tmp, scratch.tmpCap, smem_count);
 
-        /* Grow the reused scratch on demand; it is never shrunk. cnt is zeroed
-         * over [0, range) below — exactly what the old per-call calloc did — so
-         * only the used prefix must be reset, not the whole capacity. tmp is
-         * fully overwritten by the scatter, so it needs no initialization. */
-        if (range > scratch.cntCap) {
-            _mm_free(scratch.cnt);
-            scratch.cnt = (int64_t *) _mm_malloc((size_t)range * sizeof(int64_t), 64);
-            if (scratch.cnt == NULL) {
-                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
-                exit(EXIT_FAILURE);
-            }
-            scratch.cntCap = range;
-        }
-        if (smem_count > scratch.tmpCap) {
-            _mm_free(scratch.tmp);
-            scratch.tmp = (SMEM *) _mm_malloc((size_t)smem_count * sizeof(SMEM), 64);
-            if (scratch.tmp == NULL) {
-                fprintf(stderr, "ERROR: out of memory in %s\n", __func__);
-                exit(EXIT_FAILURE);
-            }
-            scratch.tmpCap = smem_count;
-        }
-        int64_t *cnt = scratch.cnt;
-        SMEM    *tmp = scratch.tmp;
-
-        memset(cnt, 0, (size_t)range * sizeof(int64_t));
-
-        for (int64_t i = 0; i < smem_count; i++)
-            cnt[myMatchArray[i].rid - minRid]++;
-
-        int64_t sum = 0;
-        for (int64_t r = 0; r < range; r++) { int64_t c = cnt[r]; cnt[r] = sum; sum += c; }
-
-        /* stable scatter: same-rid SMEMs keep their incoming relative order */
-        for (int64_t i = 0; i < smem_count; i++) {
-            int64_t b = (int64_t)myMatchArray[i].rid - minRid;
-            tmp[cnt[b]++] = myMatchArray[i];
-        }
+        smem_rid_scatter(myMatchArray, smem_count, minRid, range, cnt, tmp,
+                         [myMatchArray](int64_t i) { return myMatchArray[i]; });
         /* tmp is distinct scratch storage and cannot overlap myMatchArray */
         memcpy(myMatchArray, tmp, (size_t)smem_count * sizeof(SMEM));
     }
+}
+
+/* (sort key, source index) pair for smem_sort_rid_mn; forward-declared as
+ * SmemKeyIdx in FMI_search.h so the layout stays private to this file. */
+struct smem_key_idx
+{
+    uint64_t key;   /* (uint64_t)m << 32 | n */
+    uint64_t idx;   /* position of the SMEM in the unsorted array */
+};
+
+/* Per-rid order of mem_collect_smem: the key (m << 32 | n) ascending. This
+ * MUST order exactly as bwamem.cpp's intv_lt1 (KSORT_INIT(mem_intv1)), which
+ * defined the order before this sort replaced it; the unit test
+ * test/unit/test_smem_sort_rid_mn.cpp enforces it against that comparator. */
+#define smem_key_lt(a, b) ((a).key < (b).key)
+KSORT_INIT(smem_key_idx, SmemKeyIdx, smem_key_lt)
+
+void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch)
+{
+    /* Same result as sortSMEMs (nthreads = 1) followed by a per-rid
+     * ks_introsort(mem_intv1), by construction:
+     *  - the stable counting scatter by rid is the same, except that it moves a
+     *    16-byte (key, idx) pair instead of the 48-byte SMEM, so every rid
+     *    bucket starts in the same incoming order;
+     *  - each bucket is then sorted by the same ks_introsort algorithm with an
+     *    identically-ordering comparator on the same keys, so it makes the same
+     *    comparisons and applies the same swaps -- the same permutation, ties
+     *    included;
+     *  - each SMEM is then gathered into scratch and copied back (two 48-byte
+     *    moves, against a scatter + copy-back + every sort shift before).
+     * The rid buckets come straight from the counting offsets, so no rescan
+     * for rid boundaries is needed either. */
+    if (n <= 1) return;
+
+    uint32_t minRid;
+    int64_t range = smem_rid_range(a, n, &minRid);
+    int64_t    *cnt = smem_scratch_reserve(scratch.cnt, scratch.cntCap, range);
+    SMEM       *tmp = smem_scratch_reserve(scratch.tmp, scratch.tmpCap, n);
+    SmemKeyIdx *p   = smem_scratch_reserve(scratch.pairs, scratch.pairsCap, n);
+
+    smem_rid_scatter(a, n, minRid, range, cnt, p, [a](int64_t i) {
+        SmemKeyIdx e;
+        e.key = ((uint64_t)a[i].m << 32) | (uint64_t)a[i].n;
+        e.idx = (uint64_t)i;
+        return e;
+    });
+
+    int64_t start = 0;
+    for (int64_t r = 0; r < range; r++) {
+        int64_t end = cnt[r];
+        if (end - start > 1)
+            ks_introsort(smem_key_idx, (size_t)(end - start), p + start);
+        start = end;
+    }
+
+    for (int64_t i = 0; i < n; i++)
+        tmp[i] = a[p[i].idx];
+    /* tmp is distinct scratch storage and cannot overlap a */
+    memcpy(a, tmp, (size_t)n * sizeof(SMEM));
 }
 
 

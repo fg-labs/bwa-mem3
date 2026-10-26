@@ -16,7 +16,7 @@
  * (see backwardExt_konly in FMI_search.h).
  *
  * Precondition: identical SMEMs are adjacent in the array (guaranteed after
- * sortSMEMs + per-read ks_introsort(mem_intv1) in mem_collect_smem). */
+ * smem_sort_rid_mn's rid + (m, n) sort in mem_collect_smem). */
 int64_t smem_dedup_inplace(SMEM *a, int64_t n)
 {
     if (n <= 1) return n;

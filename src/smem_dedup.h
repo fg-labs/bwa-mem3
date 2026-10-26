@@ -12,8 +12,8 @@ extern "C" {
  * An entry is kept only if it differs from the previous kept entry on
  * (rid,m,n,k,s).
  * `l` is deliberately NOT part of the key -- see smem_dedup.cpp for why.
- * Precondition: identical SMEMs are adjacent (true after sortSMEMs + per-read
- * intv_lt1 sort in mem_collect_smem).
+ * Precondition: identical SMEMs are adjacent (true after smem_sort_rid_mn's
+ * rid + (m, n) sort in mem_collect_smem).
  * O(n), no allocation. n <= 1 is handled safely (returns n). */
 int64_t smem_dedup_inplace(SMEM *a, int64_t n);
 

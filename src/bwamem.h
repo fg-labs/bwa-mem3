@@ -525,8 +525,8 @@ typedef struct
     SMEM    *lockstep_match_buf[MAX_THREADS];
     int64_t  lockstep_buf_cap[MAX_THREADS];
 
-    // Reusable per-thread scratch for FMI_search::sortSMEMs' rid counting sort
-    // (audit SEED-15). Owned here so the count/offset and stable-scatter buffers
+    // Reusable per-thread scratch for smem_sort_rid_mn's rid counting sort (audit
+    // SEED-15). Owned here so the count/offset, (key, idx) and gather buffers
     // are allocated once and grown on demand instead of malloc/free'd per batch.
     // Each worker thread touches only its own [tid] slot, so the reuse is safe
     // by construction even though the FMI_search instance itself is shared.

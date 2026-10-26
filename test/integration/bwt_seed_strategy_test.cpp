@@ -187,7 +187,7 @@ int main(int argc, char **argv) {
     // sortSMEMs' counting-sort scratch is caller-owned; this call site is
     // single-threaded (sortSMEMs loops over the per-thread blocks itself), so
     // one instance suffices.
-    SmemSortScratch sortScratch = {NULL, 0, NULL, 0};
+    SmemSortScratch sortScratch = {NULL, 0, NULL, 0, NULL, 0};
     fmiSearch->sortSMEMs(matchArray,
             numTotalSmem,
             numReads,
