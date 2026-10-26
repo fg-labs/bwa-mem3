@@ -62,6 +62,7 @@
 #include "rescue_env.h"
 #include "framework/rescue_prune_test.h"
 #include "simd_dispatch.h"
+#include "seq_reverse.h"
 
 #include <algorithm>
 #include <chrono>
@@ -427,10 +428,8 @@ static void load_dump(const char *path, std::vector<Job> &jobs, int stride)
 /* ---------------------------------------------------------------------------------------- */
 /* production pipeline replicas                                                               */
 /* ---------------------------------------------------------------------------------------- */
-static void revseq(int l, uint8_t *s)
-{
-    for (int i = 0; i < l >> 1; i++) std::swap(s[i], s[l - 1 - i]);
-}
+/* same reverse as production's between-phase rescue revseq (bwamem_pair.cpp) */
+static void revseq(int l, uint8_t *s) { seq_reverse_inplace(s, l); }
 
 struct Batch {
     std::vector<SeqPair> sp;

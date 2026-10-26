@@ -6,18 +6,14 @@
 
 #include "kswv.h"   // g_defr
 #include "macro.h"  // SIMD_WIDTH8
+#include "seq_reverse.h"
 
 namespace bwa_tests {
 
 namespace {
 
-inline void revseq(int l, uint8_t *s) {
-    for (int i = 0; i < l >> 1; ++i) {
-        uint8_t t = s[i];
-        s[i] = s[l - 1 - i];
-        s[l - 1 - i] = t;
-    }
-}
+// Same reverse as production's between-phase rescue revseq (bwamem_pair.cpp).
+inline void revseq(int l, uint8_t *s) { seq_reverse_inplace(s, l); }
 
 } // namespace
 
