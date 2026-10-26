@@ -87,7 +87,9 @@ bool rescue_band_enabled()
  * (-t 16, interleaved reps) 100 beat 85 on wgs-5M by 0.7 % wall (3 reps; 120 and 150 within
  * 0.15 % of 100, 60 worse than 85) and on wes-5M by 0.5 % (3 reps). The AVX2 tier keeps 85: on
  * Zen 5 forced to it, 100 was -0.5 % on wgs-5M but mixed on wes-5M. Output is the same at every
- * value: the gate only picks which of two exact kernels runs. */
+ * value: the gate only picks which of two exact kernels runs. The AVX-512BW measurements predate
+ * the u8 kswv's two-row sweep (BWA3_RESCUE_ROWPAIR), which makes a hull cell cheaper still, so
+ * re-measure against it before retuning that tier's default. */
 int rescue_band_cost_pct_default(int tier)
 {
     return tier == BWAMEM3_TIER_AVX512BW ? 0 : tier == BWAMEM3_TIER_NEON ? 100 : 85;

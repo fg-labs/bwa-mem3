@@ -64,6 +64,7 @@
 
 #include "ksw_runner.h"
 #include "kswr_cmp.h"
+#include "scoped_env.h"
 #include "kswv_runner.h"  // BWA_TESTS_HAVE_KSWV
 #include "meth_scoring.h"
 #include "scoring.h"
@@ -304,28 +305,7 @@ void check_meth_batch_matches_scalar(uint64_t seed, int n_pairs, int len_a, int 
                   len_a > len_b ? len_a : len_b);
 }
 
-// RAII override of an environment variable (see test_kswv_correctness.cpp): set
-// on construction, restore the prior value (or unset) on destruction so doctest
-// run order cannot leak a toggle into a sibling case.
-class ScopedEnv {
-public:
-    ScopedEnv(const char *name, const char *value) : name_(name) {
-        const char *cur = getenv(name);
-        had_ = cur != nullptr;
-        if (had_) saved_ = cur;
-        setenv(name, value, 1);
-    }
-    ~ScopedEnv() {
-        if (had_) setenv(name_.c_str(), saved_.c_str(), 1);
-        else      unsetenv(name_.c_str());
-    }
-    ScopedEnv(const ScopedEnv &) = delete;
-    ScopedEnv &operator=(const ScopedEnv &) = delete;
-private:
-    std::string name_;
-    std::string saved_;
-    bool had_ = false;
-};
+using bwa_tests::ScopedEnv;   // scoped_env.h
 
 // Run one freed-cell (mat-aware, HasFreed) batch through make_kswv and return
 // one kswr_t per input pair, in input order. Mirrors compare_batch's kernel
@@ -513,13 +493,20 @@ TEST_CASE("kswv::getScores16 matches scalar on mixed-length --meth batches"
 // of the three configurations -- one-row, two-row inline, two-row lazy -- and
 // require strict all-field equality. 143 -> quantum 144 and 151 -> quantum 160
 // give ragged, odd partial blocks, so the two-row sweep's odd-tail branch fires.
+// The u8 legs run both FScan bodies, signed (BWA3_RESCUE_USQADD on) and biased
+// (off). On AVX-512BW only the u8 FScan body sweeps two rows and LAZYQE is
+// NEON-only, so there the case runs the u8 legs as one-row vs two-row.
 TEST_CASE("kswv --meth freed cell: ROWPAIR/LAZYQE configurations agree"
           * doctest::test_suite("unit/kswv")) {
-#if !defined(__ARM_NEON) && !defined(__aarch64__)
-    MESSAGE("skipped: the toggles affect the NEON rescue kernels only");
-    return;
-#else
     auto run_meth_toggle_parity = [](int scoring, bool ot, bool use16) {
+        bwamem3_simd_init();
+        const int tier = bwamem3_simd_tier();
+        const bool neon = tier == BWAMEM3_TIER_NEON;
+        if (!neon && (tier != BWAMEM3_TIER_AVX512BW || use16)) {
+            MESSAGE("skipped: ROWPAIR reaches the NEON kswv bodies and the AVX-512BW "
+                    "u8 FScan body only");
+            return;
+        }
         const bwa_tests::ScoringMatrix mat =
             use16 ? meth_matrix(scoring, ot, 14, 8) : meth_matrix(scoring, ot, 1, 4);
         // Guard against a vacuous meth leg: the matrix must actually free a cell,
@@ -536,53 +523,60 @@ TEST_CASE("kswv --meth freed cell: ROWPAIR/LAZYQE configurations agree"
         for (auto &p : pairs) convert_query_bisulfite(rng, p, ot);
         const int max_qlen = 151;
 
-        std::vector<kswr_t> one_row, pair_inline, pair_lazy;
-        {
-            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "0");
-            ScopedEnv lq("BWA3_RESCUE_LAZYQE", "1");
-            // Anchor the one-row leg to the scalar oracle so this case is not a
-            // pure self-consistency check: three-way config parity alone cannot
-            // detect a defect shared by all three configurations. compare_batch
-            // drives the freed kernel through both phases and compares every
-            // field (score/score2/te/qe/te2/tb/qb) against the scalar reference;
-            // the kswr_all_fields_eq parity checks below then pin the remaining two configs
-            // to this independently-verified one.
-            compare_batch(0, pairs, mat, mat.data(), use16, max_qlen);
-            one_row = run_freed_config(pairs, mat, use16, max_qlen);
-        }
-        {
-            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "1");
-            {
-                ScopedEnv lq("BWA3_RESCUE_LAZYQE", "0");
-                pair_inline = run_freed_config(pairs, mat, use16, max_qlen);
+        // Count the pairs where `other` differs from `one_row` on any field.
+        auto drift_vs = [&](const std::vector<kswr_t> &one_row,
+                            const std::vector<kswr_t> &other, const char *usq,
+                            const char *what) {
+            REQUIRE(one_row.size() == other.size());
+            int drift = 0;
+            for (size_t i = 0; i < one_row.size(); i++) {
+                if (!bwa_tests::kswr_all_fields_eq(one_row[i], other[i])) {
+                    ++drift;
+                    CAPTURE(i); CAPTURE(scoring); CAPTURE(ot); CAPTURE(use16);
+                    CAPTURE(std::string(usq)); CAPTURE(std::string(what));
+                    CHECK(bwa_tests::kswr_all_fields_eq(one_row[i], other[i]));
+                }
             }
-            {
-                ScopedEnv lq("BWA3_RESCUE_LAZYQE", "1");
-                pair_lazy = run_freed_config(pairs, mat, use16, max_qlen);
-            }
-        }
-        REQUIRE(one_row.size() == pair_inline.size());
-        REQUIRE(one_row.size() == pair_lazy.size());
+            MESSAGE("meth freed toggle scoring=" << scoring << " ot=" << ot << " use16="
+                    << use16 << " usqadd=" << std::string(usq) << ": " << std::string(what) << " drift=" << drift
+                    << " over " << one_row.size() << " pairs");
+            return drift;
+        };
 
-        int drift_inline = 0, drift_lazy = 0;
-        for (size_t i = 0; i < one_row.size(); i++) {
-            if (!bwa_tests::kswr_all_fields_eq(one_row[i], pair_inline[i])) {
-                ++drift_inline;
-                CAPTURE(i); CAPTURE(scoring); CAPTURE(ot); CAPTURE(use16);
-                CHECK(bwa_tests::kswr_all_fields_eq(one_row[i], pair_inline[i]));
+        // BWA3_RESCUE_USQADD=0 runs the biased u8 FScan body, which has its own
+        // freed-cell pair (the freed value biased by +shift); u16 has no such
+        // switch, so it runs the default only.
+        for (const char *usq : use16 ? std::vector<const char *>{"1"}
+                                     : std::vector<const char *>{"1", "0"}) {
+            ScopedEnv uq("BWA3_RESCUE_USQADD", usq);
+            std::vector<kswr_t> one_row, pair_inline, pair_lazy;
+            {
+                ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "0");
+                ScopedEnv lq("BWA3_RESCUE_LAZYQE", "1");
+                // Anchor the one-row leg to the scalar oracle so this case is not a
+                // pure self-consistency check: config parity alone cannot detect a
+                // defect shared by every configuration. compare_batch drives the
+                // freed kernel through both phases and compares every field
+                // (score/score2/te/qe/te2/tb/qb) against the scalar reference; the
+                // kswr_all_fields_eq parity checks below then pin the other configs
+                // to this independently-verified one.
+                compare_batch(0, pairs, mat, mat.data(), use16, max_qlen);
+                one_row = run_freed_config(pairs, mat, use16, max_qlen);
             }
-            if (!bwa_tests::kswr_all_fields_eq(one_row[i], pair_lazy[i])) {
-                ++drift_lazy;
-                CAPTURE(i); CAPTURE(scoring); CAPTURE(ot); CAPTURE(use16);
-                CHECK(bwa_tests::kswr_all_fields_eq(one_row[i], pair_lazy[i]));
+            {
+                ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "1");
+                if (neon) {   // LAZYQE reaches only the NEON two-row sweep
+                    ScopedEnv lq("BWA3_RESCUE_LAZYQE", "0");
+                    pair_inline = run_freed_config(pairs, mat, use16, max_qlen);
+                }
+                {
+                    ScopedEnv lq("BWA3_RESCUE_LAZYQE", "1");
+                    pair_lazy = run_freed_config(pairs, mat, use16, max_qlen);
+                }
             }
+            if (neon) CHECK(drift_vs(one_row, pair_inline, usq, "two-row inline") == 0);
+            CHECK(drift_vs(one_row, pair_lazy, usq, "two-row lazy") == 0);
         }
-        MESSAGE("meth freed toggle scoring=" << scoring << " ot=" << ot
-                << " use16=" << use16 << ": inline drift=" << drift_inline
-                << ", lazy drift=" << drift_lazy << " over " << one_row.size()
-                << " pairs");
-        CHECK(drift_inline == 0);
-        CHECK(drift_lazy == 0);
     };
 
     // One SUBCASE per (scoring, strand, width) variant so a REQUIRE tripping in
@@ -601,7 +595,6 @@ TEST_CASE("kswv --meth freed cell: ROWPAIR/LAZYQE configurations agree"
     SUBCASE("COLLAPSED OT u16") { run_meth_toggle_parity(MEM_METH_SCORING_COLLAPSED, true,  true);  }
     SUBCASE("COLLAPSED OB u8")  { run_meth_toggle_parity(MEM_METH_SCORING_COLLAPSED, false, false); }
     SUBCASE("COLLAPSED OB u16") { run_meth_toggle_parity(MEM_METH_SCORING_COLLAPSED, false, true);  }
-#endif
 }
 
 
@@ -638,17 +631,23 @@ TEST_CASE("kswv --meth freed cell: BWA3_RESCUE_FSCAN off == on, and FSCAN matche
         }
         const int max_qlen = 151;
 
-        struct Config { const char *name, *rowpair, *lazyqe; bool oracle; };
+        // avx512_u8: the config differs from the default only on the AVX-512BW
+        // u8 body, so elsewhere it would re-run the same kernel.
+        struct Config { const char *name, *rowpair, *lazyqe; bool oracle, avx512_u8; };
         const Config configs[] = {
 #if defined(__ARM_NEON) || defined(__aarch64__)
-            {"one-row",        "0", "1", false},
-            {"two-row inline", "1", "0", false},
-            {"two-row lazy",   "1", "1", true},   // the production default
+            {"one-row",        "0", "1", false, false},
+            {"two-row inline", "1", "0", false, false},
+            {"two-row lazy",   "1", "1", true,  false},   // the production default
 #else
-            {"x86",            "1", "1", true},   // toggles other than FSCAN are NEON-only
+            // ROWPAIR reaches the AVX-512BW u8 FScan body only; LAZYQE is NEON-only.
+            {"x86 one-row",    "0", "1", false, true},
+            {"x86",            "1", "1", true,  false},   // the production default
 #endif
         };
+        const bool avx512_u8 = !use16 && bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
         for (const Config &c : configs) {
+            if (c.avx512_u8 && !avx512_u8) continue;
             ScopedEnv rp("BWA3_RESCUE_ROWPAIR", c.rowpair);
             ScopedEnv lq("BWA3_RESCUE_LAZYQE", c.lazyqe);
             std::vector<kswr_t> off, on;

@@ -50,7 +50,8 @@
  *                                   add / subtract pair (NEON; the AVX2 and AVX-512BW FScan bodies
  *                                   do it in the signed H - 128 domain, at open-plus-extend sums
  *                                   up to 127)
- * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit): sweep two target rows per pass
+ * BWA3_RESCUE_ROWPAIR         1     NEON kswv (8- and 16-bit) and the AVX-512BW u8 kswv FScan body:
+ *                                   sweep two target rows per pass
  * BWA3_RESCUE_LAZYQE          1     NEON kswv two-row sweep: recover the query end after the row
  *                                   instead of inline
  * BWA3_RESCUE_SCORE2_BITS     1     u8 kswv score2/te2 scan: visit only each lane's rows at or above

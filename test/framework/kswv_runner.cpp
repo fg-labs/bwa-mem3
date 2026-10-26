@@ -9,6 +9,7 @@
 
 #include "kswv.h"
 #include "seqpair_batch.h"
+#include "simd_dispatch.h"  // make_kswv
 
 namespace bwa_tests {
 
@@ -121,6 +122,24 @@ std::vector<kswr_t> run_kswv_batch_gaps(const std::vector<TestPair> &pairs,
 
     std::vector<kswr_t> out(bb.aln(), bb.aln() + bb.n());
     return out;
+}
+
+std::vector<kswr_t> run_kswv_batch_runtime(const std::vector<TestPair> &pairs,
+                                           const ScoringMatrix &mat,
+                                           int xtra_flags,
+                                           int32_t maxRefLen, int32_t maxQerLen,
+                                           const int8_t *mat25) {
+    BatchBuffers bb(pairs, xtra_flags);
+    std::unique_ptr<Ikswv> pwsw = make_kswv(DEFAULT_GAP_OPEN, DEFAULT_GAP_EXTEND,
+                                            DEFAULT_GAP_OPEN, DEFAULT_GAP_EXTEND,
+                                            mat[0], mat[1], 1, maxRefLen, maxQerLen, mat25);
+    if (pwsw->needsScalar()) return {};
+    pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(), bb.aln(), bb.n(), 1, 0);
+    const int survivors = bb.prepare_phase1();
+    if (survivors > 0)
+        pwsw->getScores8(bb.pairs(), bb.ref_buf(), bb.qer_buf(), bb.aln(), survivors, 1, 1);
+    // aln() stays indexed by input order; prepare_phase1 compacts only pairs().
+    return std::vector<kswr_t>(bb.aln(), bb.aln() + pairs.size());
 }
 
 } // namespace bwa_tests

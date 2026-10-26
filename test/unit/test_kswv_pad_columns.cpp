@@ -26,6 +26,7 @@
 #include "doctest/doctest.h"
 
 #include "kswr_cmp.h"
+#include "scoped_env.h"
 #include "ksw_runner.h"
 #include "kswv_runner.h"
 #include "scoring.h"
@@ -35,25 +36,7 @@
 
 namespace {
 
-class ScopedEnv {
-public:
-    ScopedEnv(const char *name, const char *value) : name_(name) {
-        const char *cur = getenv(name);
-        had_ = cur != nullptr;
-        if (had_) saved_ = cur;
-        setenv(name, value, 1);
-    }
-    ~ScopedEnv() {
-        if (had_) setenv(name_.c_str(), saved_.c_str(), 1);
-        else      unsetenv(name_.c_str());
-    }
-    ScopedEnv(const ScopedEnv &) = delete;
-    ScopedEnv &operator=(const ScopedEnv &) = delete;
-private:
-    std::string name_;
-    std::string saved_;
-    bool had_ = false;
-};
+using bwa_tests::ScopedEnv;   // scoped_env.h
 
 // A query of period `period` (random bases) against a reference holding copies
 // of it with a few substitutions, so a row's max recurs at columns `period` apart.

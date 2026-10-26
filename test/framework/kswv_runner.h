@@ -50,6 +50,18 @@ std::vector<kswr_t> run_kswv_batch_gaps(const std::vector<TestPair> &pairs,
                                         int xtra_flags = 0,
                                         bool use16     = false);
 
+// As run_kswv_batch_gaps with the default gaps, but built through make_kswv:
+// the kernel is the RUNTIME tier's (it honors BWAMEM3_FORCE_TIER), not the one
+// this test binary was compiled for, and a non-null mat25 selects the mat-aware
+// (--meth freed-cell) kernel. maxRefLen / maxQerLen are the kswv capacities.
+// Returns {} when the kernel reports needsScalar(), so callers must REQUIRE the
+// result's size.
+std::vector<kswr_t> run_kswv_batch_runtime(const std::vector<TestPair> &pairs,
+                                           const ScoringMatrix &mat,
+                                           int xtra_flags,
+                                           int32_t maxRefLen, int32_t maxQerLen,
+                                           const int8_t *mat25 = nullptr);
+
 } // namespace bwa_tests
 
 #endif
