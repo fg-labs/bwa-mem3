@@ -64,7 +64,7 @@ static inline int get_pri_idx(double XA_drop_ratio, const mem_alnreg_t *a, int i
 // Okay, returning strings is bad, but this has happened a lot elsewhere. If I have time, I need serious code cleanup.
 // When out_hn is non-NULL, it is set to a newly-allocated int[a->n] of per-primary
 // hit counts (cnt[r]) so callers can emit the HN:i tag; caller owns the buffer.
-char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query) // ONLY work after mem_mark_primary_se()
+char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query, int want0, int want1) // ONLY work after mem_mark_primary_se()
 {
 	int i, k, r, *cnt, tot;
 	kstring_t *aln = 0, str = {0,0,0};
@@ -102,6 +102,7 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	for (i = 0; i < a->n; ++i) {
 		mem_aln_t t;
 		if ((r = get_pri_idx(opt->XA_drop_ratio, a->a, i)) < 0) continue;
+		if (want0 >= 0 && r != want0 && r != want1) continue; // XA[r] is never read: leave it NULL
 		if (cnt[r] > opt->max_XA_hits_alt || (!has_alt[r] && cnt[r] > opt->max_XA_hits)) continue;
 		/* Pass meth_orig_query so each XA sub-entry regenerates under the SAME
 		 * NM/MD policy as the primary record. Omitting it silently falls back to

@@ -759,13 +759,27 @@ int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* -
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 
+/* The paired path's ALT record of one end: region n_pri (the first non-primary
+ * region) when it is emitted as a supplementary ALT record, else -1. The emitter
+ * (mem_sam_pe_batch_post) reads XA of this slot and of the pair's primary only. */
+static inline int mem_pe_alt_slot(const mem_opt_t *opt, const mem_alnreg_v *a, int n_pri)
+{
+    if (n_pri >= (int) a->n) return -1;
+    const mem_alnreg_t *p = &a->a[n_pri];
+    return p->score < opt->T || p->secondary >= 0 || !p->is_alt ? -1 : n_pri;
+}
+
 /* ONLY work after mem_mark_primary_se(); out_hn may be NULL.
  * `meth_orig_query` is forwarded to mem_reg2aln for each XA sub-entry so they
  * regenerate under the same NM/MD policy as the primary record (see
- * mem_reg2aln). NULL (the default) keeps the legacy literal regen. */
+ * mem_reg2aln). NULL (the default) keeps the legacy literal regen.
+ * `want0`/`want1`: when want0 >= 0, only the XA strings of primaries want0 and
+ * want1 are built (the others stay NULL); the hit counts in *out_hn still cover
+ * every primary. -1 (the default) builds all of them. */
 char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                    const mem_alnreg_v *a, int l_query, const char *query,
-                   int **out_hn, const char *meth_orig_query = NULL);
+                   int **out_hn, const char *meth_orig_query = NULL,
+                   int want0 = -1, int want1 = -1);
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s,
                  int n, const mem_aln_t *list, int which, const mem_aln_t *m_);
 

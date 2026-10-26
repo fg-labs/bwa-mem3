@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -30,6 +31,22 @@ inline uint8_t base_to_2bit(char c) {
 inline void pac_pack_set(uint8_t *pac, int64_t i, uint8_t v) {
     pac[i >> 2] |= (uint8_t)(v << ((~i & 3) << 1));
 }
+
+/* Small synthetic-sequence helpers shared by the XA tests. */
+
+/* `len` uniformly random ACGT bases from a fixed seed. */
+inline std::string random_bases(int len, uint32_t seed) {
+    std::string s(len, 'A');
+    std::mt19937 rng(seed);
+    for (char &c : s) c = "ACGT"[rng() & 3];
+    return s;
+}
+
+/* A substitution: each base maps to a different one (A->C->G->T->A). */
+inline char flip(char c) { return c == 'A' ? 'C' : c == 'C' ? 'G' : c == 'G' ? 'T' : 'A'; }
+
+/* The nt4 code (0..3 = ACGT, 4 = N) of an ASCII base. */
+inline uint8_t nt4(char c) { return nst_nt4_table[(unsigned char)c]; }
 
 /* RAII fixture that owns an original (un-converted) single-contig bns + pac:
  *   - bns: one contig "X" of length len at offset 0
