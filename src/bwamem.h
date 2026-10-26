@@ -780,6 +780,12 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
                    const mem_alnreg_v *a, int l_query, const char *query,
                    int **out_hn, const char *meth_orig_query = NULL,
                    int want0 = -1, int want1 = -1);
+/* Per-thread count of XA hits whose global alignment mem_gen_alt took from an
+ * earlier duplicate hit of the same read (mem_core_key) instead of computing it.
+ * Nothing in the aligner reads it: it lets the unit tests see that reuse happened,
+ * which the output alone cannot show. It is live in every build (one thread-local
+ * increment per reused hit) because the tests link the shipped objects. */
+extern thread_local long mem_gen_alt_n_reused;
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s,
                  int n, const mem_aln_t *list, int which, const mem_aln_t *m_);
 
@@ -1126,10 +1132,29 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt, int64_t n_processed,
  * `want_md` 0 builds no MD string: the returned cigar holds only the n_cigar
  * ops, so the result must not be passed to anything that reads MD after them
  * (mem_aln2sam). NM, the CIGAR and everything else are unchanged. Used for the
- * XA hits in mem_gen_alt, which read only the CIGAR and NM. */
+ * XA hits in mem_gen_alt, which read only the CIGAR and NM.
+ *
+ * `reuse` and `made` (want_md 0 only) let mem_gen_alt compute the global alignment
+ * of duplicate hits once: the CIGAR ops and NM before the end-deletion squeeze and
+ * the clips, keyed by mem_core_key. With `reuse` they are taken from it instead of
+ * computed; it must be what this region computes (an equal key). With `made` the
+ * computed ops are appended to *made and the NM stored in *made_NM. Everything after
+ * that step runs as usual. */
+typedef struct { const uint32_t *cigar; int n_cigar, NM; } mem_cigar_core_t;
 mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                       int l_seq, const char *seq, const mem_alnreg_t *ar,
-                      const char *meth_orig_query = NULL, int want_md = 1);
+                      const char *meth_orig_query = NULL, int want_md = 1,
+                      const mem_cigar_core_t *reuse = NULL,
+                      std::vector<uint32_t> *made = NULL, int *made_NM = NULL);
+
+/* What the global alignment of a region (its CIGAR ops and NM, see mem_reg2aln)
+ * depends on besides the read and `opt`: two regions of one read with equal keys
+ * get the same ops and NM. mem_core_key returns 0 (no key) for a region whose
+ * window is empty or does not lie on one strand. */
+typedef struct { int qb, qe, rev, truesc, w, hyp; int64_t rlen, fb; } mem_core_key_t;
+int mem_core_key(const bntseq_t *bns, const mem_alnreg_t *ar, mem_core_key_t *k);
+int mem_core_key_equal(const bntseq_t *bns, const uint8_t *pac, const mem_core_key_t *x,
+                       const mem_core_key_t *y);
 
 
 /**

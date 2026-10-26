@@ -5575,23 +5575,43 @@ static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
     return opt->meth_mode && meth_orig_query != NULL && ar->meth_hypothesis >= 0;
 }
 
-mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query, int want_md)
+/* The key of a region's global alignment (mem_reg2aln_global): everything it reads
+ * that can differ between two regions of one read -- the query window, the strand,
+ * the reference length and forward-strand start (whose bases mem_core_key_equal
+ * compares), the true score and band that set the DP band and the retry loop, and
+ * the --meth hypothesis that picks the matrix. The read itself and `opt` are the
+ * same for every region of one mem_gen_alt call, so they are not part of it. */
+int mem_core_key(const bntseq_t *bns, const mem_alnreg_t *ar, mem_core_key_t *k)
 {
-    mem_aln_t a;
-    int i, w2, tmp, qb, qe, NM, score, is_rev, last_sc = -(1<<30), l_MD;
-    int64_t pos, rb, re;
-    uint8_t *query;
+    const int64_t l_pac = bns->l_pac;
+    // the geometry bwa_gen_cigar4 aligns: a non-empty window on one strand
+    if (!(ar->rb >= 0 && ar->rb < ar->re && ar->re <= (l_pac << 1) && !(ar->rb < l_pac && ar->re > l_pac))) return 0;
+    k->qb = ar->qb; k->qe = ar->qe;
+    k->rev = ar->rb >= l_pac;
+    k->truesc = ar->truesc; k->w = ar->w;
+    k->hyp = ar->meth_hypothesis;
+    k->rlen = ar->re - ar->rb;
+    k->fb = k->rev ? (l_pac << 1) - ar->re : ar->rb;
+    return 1;
+}
 
-    memset(&a, 0, sizeof(mem_aln_t));
-    a.HN = -1; // sentinel: HN not computed unless caller fills from mem_gen_alt out_hn
-    a.meth_hypothesis = -1; // non-meth default; overwritten below from ar
-    if (ar == 0 || ar->rb < 0 || ar->re < 0) { // generate an unmapped record
-        a.rid = -1; a.pos = -1; a.flag |= 0x4;
-        return a;
-    }
-    a.meth_hypothesis = ar->meth_hypothesis; // carry hypothesis to the output layer
-    qb = ar->qb, qe = ar->qe;
-    rb = ar->rb, re = ar->re;
+int mem_core_key_equal(const bntseq_t *bns, const uint8_t *pac, const mem_core_key_t *x, const mem_core_key_t *y)
+{
+    return x->qb == y->qb && x->qe == y->qe && x->rev == y->rev && x->rlen == y->rlen
+        && x->truesc == y->truesc && x->w == y->w && x->hyp == y->hyp
+        && bns_pac_fwd_equal(bns->l_pac, pac, x->fb, y->fb, x->rlen);
+}
+
+/* The global alignment step of mem_reg2aln: the CIGAR ops of region `ar` (followed by
+ * its MD when want_md) in a->cigar / a->n_cigar, and its NM in *NM.
+ * mem_gen_alt reuses this result for every region with an equal mem_core_key: any new
+ * input read here that can differ between two regions of one read (a field of `ar`
+ * above all) must be added to mem_core_key and mem_core_key_equal. */
+static void mem_reg2aln_global(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query, int want_md, mem_aln_t *a, int *NM)
+{
+    int i, w2, tmp, score, last_sc = -(1<<30);
+    const int qb = ar->qb, qe = ar->qe;
+    const int64_t rb = ar->rb, re = ar->re;
     /* Shallow same-call prefetch of this alignment's CIGAR-emission window,
      * hidden behind the ~dozens of setup instructions below. The emit loops also
      * issue a deeper look-ahead prefetch of the NEXT read/pair's window (see
@@ -5613,7 +5633,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      * one live instance per thread is safe; grown to the high-water l_query. */
     static thread_local u8vec_scratch_t t_query;
     if (t_query.v.m < (size_t)l_query) kv_resize(uint8_t, t_query.v, (size_t)l_query);
-    query = t_query.v.a;
+    uint8_t *query = t_query.v.a;
     /* SAM-A10: only [qb,qe) of `query` is ever read (bwa_gen_cigar2 below is
      * handed &query[qb] with length qe-qb); the encode was over the whole read.
      * Encode only the consumed window — the untouched prefix/suffix are never
@@ -5622,14 +5642,12 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
         unsigned char ch = (unsigned char) regen_query[i];
         query[i] = nst_nt4_decode(ch, 5);
     }
-    a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
-    if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
     tmp = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_del, opt->e_del);
     w2  = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_ins, opt->e_ins);
     w2 = w2 > tmp? w2 : tmp;
     if (bwa_verbose >= 4) fprintf(stderr, "* Band width: inferred=%d, cmd_opt=%d, alnreg=%d\n", w2, opt->w, ar->w);
     if (w2 > opt->w) w2 = w2 < ar->w? w2 : ar->w;
-    i = 0; a.cigar = 0;
+    i = 0; a->cigar = 0;
     /* D3 (--meth, PR-5): native-alphabet output regen.
      *   - `regen_query` is the ORIGINAL read (meth_orig_query) under --meth, else
      *     the projected read for non-meth (legacy, unchanged).
@@ -5678,9 +5696,9 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     const int8_t *regen_mat = use_meth_orig
         ? mem_opt_meth_mat(opt, regen_hyp) : opt->mat;
     do {
-        free(a.cigar);
+        free(a->cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a.cigar = bwa_gen_cigar4(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a.n_cigar, &NM, use_meth_orig, want_md);
+        a->cigar = bwa_gen_cigar4(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a->n_cigar, NM, use_meth_orig, want_md);
         if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
         if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
         last_sc = score;
@@ -5692,7 +5710,40 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
      * when MD is built) would then read through NULL. A valid alnreg cannot produce any of those, so this is a guard on
      * the callee's contract, not an invariant the local control flow
      * establishes; keep it live in every build. */
-    xassert(a.cigar != NULL, "bwa_gen_cigar4 returned no CIGAR for a valid region");
+    xassert(a->cigar != NULL, "bwa_gen_cigar4 returned no CIGAR for a valid region");
+    /* query is the reused thread-local nt4 scratch -- no free here. */
+}
+
+mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query, int want_md, const mem_cigar_core_t *reuse, std::vector<uint32_t> *made, int *made_NM)
+{
+    mem_aln_t a;
+    int qb, qe, NM, is_rev, l_MD;
+    int64_t pos, rb, re;
+
+    xassert(!(reuse || made) || !want_md, "mem_reg2aln: reuse/made need want_md 0");
+    xassert(!made == !made_NM, "mem_reg2aln: made and made_NM go together");
+    xassert(!(reuse && made), "mem_reg2aln: reuse and made are exclusive");
+    memset(&a, 0, sizeof(mem_aln_t));
+    a.HN = -1; // sentinel: HN not computed unless caller fills from mem_gen_alt out_hn
+    a.meth_hypothesis = -1; // non-meth default; overwritten below from ar
+    if (ar == 0 || ar->rb < 0 || ar->re < 0) { // generate an unmapped record
+        a.rid = -1; a.pos = -1; a.flag |= 0x4;
+        return a;
+    }
+    a.meth_hypothesis = ar->meth_hypothesis; // carry hypothesis to the output layer
+    qb = ar->qb, qe = ar->qe;
+    rb = ar->rb, re = ar->re;
+    a.mapq = ar->secondary < 0? mem_approx_mapq_se(opt, ar) : 0;
+    if (ar->secondary >= 0) a.flag |= 0x100; // secondary alignment
+    if (reuse) { // the caller's earlier result for an equal mem_core_key
+        a.n_cigar = reuse->n_cigar; NM = reuse->NM;
+        a.cigar = (uint32_t*) malloc(4 * (a.n_cigar > 0 ? a.n_cigar : 1));
+        xassert(a.cigar != NULL, "out of memory: a.cigar");
+        memcpy(a.cigar, reuse->cigar, 4 * a.n_cigar);
+    } else {
+        mem_reg2aln_global(opt, bns, pac, l_query, query_, ar, meth_orig_query, want_md, &a, &NM);
+        if (made) made->insert(made->end(), a.cigar, a.cigar + a.n_cigar), *made_NM = NM;
+    }
     l_MD = want_md? strlen((char*)(a.cigar + a.n_cigar)) + 1 : 0; // no MD: the moves below carry only the CIGAR
     a.NM = NM;
     pos = bns_depos(bns, rb < bns->l_pac? rb : re - 1, &is_rev);
@@ -5743,7 +5794,6 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     a.pos = pos - bns->anns[a.rid].offset;
     a.score = ar->score; a.sub = ar->sub > ar->csub? ar->sub : ar->csub;
     a.is_alt = ar->is_alt; a.alt_sc = ar->alt_sc;
-    /* query is the reused thread-local nt4 scratch — no free here. */
     return a;
 }
 

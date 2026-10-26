@@ -48,6 +48,18 @@ inline char flip(char c) { return c == 'A' ? 'C' : c == 'C' ? 'G' : c == 'G' ? '
 /* The nt4 code (0..3 = ACGT, 4 = N) of an ASCII base. */
 inline uint8_t nt4(char c) { return nst_nt4_table[(unsigned char)c]; }
 
+/* The reverse complement of an ACGT string. */
+inline std::string revcomp(const std::string &s) {
+    std::string r(s.rbegin(), s.rend());
+    for (char &c : r) c = c == 'A' ? 'T' : c == 'C' ? 'G' : c == 'G' ? 'C' : 'A';
+    return r;
+}
+
+/* Pack `s` into the 2-bit pac layout at `pac` ((s.size() + 3) / 4 zeroed bytes). */
+inline void pack_into(const std::string &s, uint8_t *pac) {
+    for (size_t i = 0; i < s.size(); ++i) pac_pack_set(pac, (int64_t)i, base_to_2bit(s[i]));
+}
+
 /* RAII fixture that owns an original (un-converted) single-contig bns + pac:
  *   - bns: one contig "X" of length len at offset 0
  *   - pac: the forward sequence packed 2-bit, un-converted

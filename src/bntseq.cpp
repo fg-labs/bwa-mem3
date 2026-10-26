@@ -657,6 +657,35 @@ static inline void bns_expand4(__m128i v, __m128i *o0, __m128i *o1, __m128i *o2,
 }
 #endif
 
+/* 32 forward-strand bases of the 2-bit pac starting at base p, the first base in
+ * the top two bits. Reads pac bytes [p>>2, (p>>2) + 8]. The byte swap puts pac
+ * byte p>>2 on top only on a little-endian host. */
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "bns_pac_load32 assumes a little-endian host");
+static inline uint64_t bns_pac_load32(const uint8_t *pac, int64_t p)
+{
+	const uint8_t *q = pac + (p >> 2);
+	uint64_t x;
+	memcpy(&x, q, 8);
+	x = __builtin_bswap64(x);
+	const int sh = (int)(p & 3) << 1;
+	if (sh) x = x << sh | (uint64_t) q[8] >> (8 - sh);
+	return x;
+}
+
+int bns_pac_fwd_equal(int64_t l_pac, const uint8_t *pac, int64_t a, int64_t b, int64_t len)
+{
+	if (a == b || len <= 0) return 1;
+	const int64_t hi = a > b ? a : b;
+	if (hi + len + 64 < l_pac) { // every bns_pac_load32 stays inside the pac
+		for (; len >= 32; a += 32, b += 32, len -= 32)
+			if (bns_pac_load32(pac, a) != bns_pac_load32(pac, b)) return 0;
+		return len == 0 || ((bns_pac_load32(pac, a) ^ bns_pac_load32(pac, b)) >> (64 - 2 * len)) == 0;
+	}
+	for (int64_t k = 0; k < len; ++k) // near the end of the pac: one base at a time
+		if (_get_pac(pac, a + k) != _get_pac(pac, b + k)) return 0;
+	return 1;
+}
+
 void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
                       int64_t beg, int64_t end,
                       uint8_t *dst, int64_t *len_out)
