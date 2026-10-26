@@ -64,21 +64,43 @@ GET_OCC(pp, c, occ_id_pp, y_pp, occ_pp, one_hot_bwt_str_c_pp, match_mask_pp) \
                 uint64_t match_mask_pp = one_hot_bwt_str_c_pp & one_hot_mask_array[y_pp]; \
                 occ_pp += _mm_countbits_64(match_mask_pp);
 
-/* Reusable scratch for FMI_search::sortSMEMs' rid counting sort. Hoisted out of
- * the per-batch malloc/free + memcpy (audit SEED-15): the caller owns one of
- * these per worker thread (see mem_cache in bwamem.h) and passes it in on every
- * batch, so the count/offset array (`cnt`) and the stable-scatter buffer (`tmp`)
- * are allocated once and grown on demand instead of allocated and freed per
- * call. Zero-initialize the struct before first use (all-NULL, zero caps); the
- * owner frees `cnt`/`tmp` with _mm_free at teardown (both NULL-safe). One
- * instance is single-threaded scratch — never share it across threads. */
+/* (sort key, source index) pair used only inside smem_sort_rid_mn; the full
+ * definition is private to FMI_search.cpp. */
+typedef struct smem_key_idx SmemKeyIdx;
+
+/* Reusable, single-threaded scratch for the SMEM rid counting sort. The caller
+ * owns one per worker thread (see mem_cache in bwamem.h) and passes it in on
+ * every batch (audit SEED-15), so the buffers are allocated once and grown on
+ * demand instead of allocated and freed per call:
+ *   - cnt:   rid count/offset array, sized to the batch's rid range
+ *            (smem_sort_rid_mn and FMI_search::sortSMEMs);
+ *   - tmp:   SMEM staging buffer, sized to the SMEM count -- the rid scatter
+ *            target in sortSMEMs, the gather target in smem_sort_rid_mn;
+ *   - pairs: (key, idx) buffer, sized to the SMEM count (smem_sort_rid_mn only).
+ * Buffers are never shrunk, so per thread the peak is 48 B (tmp) + 16 B (pairs)
+ * per SMEM of the largest batch, plus 8 B per rid of its rid range.
+ * Zero-initialize before first use (all NULL, zero caps); the owner frees
+ * cnt/tmp/pairs with _mm_free at teardown (all NULL-safe). Never share one
+ * instance across threads. */
 typedef struct smem_sort_scratch
 {
-    int64_t *cnt;     /* counting-sort count/offset array; >= observed rid range */
+    int64_t *cnt;     /* rid count/offset array; >= observed rid range          */
     int64_t  cntCap;  /* allocated capacity of cnt, in int64_t entries           */
-    SMEM    *tmp;     /* stable-scatter output buffer; >= observed SMEM count     */
+    SMEM    *tmp;     /* SMEM staging (scatter or gather) buffer; >= SMEM count  */
     int64_t  tmpCap;  /* allocated capacity of tmp, in SMEM entries              */
+    SmemKeyIdx *pairs;    /* smem_sort_rid_mn's (key, idx) buffer; >= SMEM count  */
+    int64_t     pairsCap; /* allocated capacity of pairs, in entries             */
 }SmemSortScratch;
+
+/* Sort n SMEMs into the order mem_collect_smem needs: ascending rid, and within
+ * one rid by (m << 32 | n) with exactly the permutation that FMI_search::sortSMEMs
+ * (stable counting sort by rid) followed by a per-rid ks_introsort(mem_intv1)
+ * produces -- ties on (rid, m, n) included. The rid scatter and the per-rid
+ * sort run on 16-byte (key, index) pairs with the same introsort and the same
+ * comparisons, so the 48-byte SMEMs are not shifted by the sort; each is moved
+ * twice (gathered into scratch, then copied back). scratch is single-threaded,
+ * caller-owned, grown on demand. */
+void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch);
 
 #define SAL_PFD 16
 
@@ -310,7 +332,10 @@ class FMI_search: public indexEle
                                                     int32_t minSeedLen,
                                                     SMEM *matchArray,
                                                     int32_t max_readlength);
-        
+
+    /* No production caller: mem_collect_smem uses smem_sort_rid_mn. Kept for the
+     * integration tests (smem2_test, bwt_seed_strategy_test, fmi_test); the
+     * smem_sort_rid_mn unit test also pins it to a stable sort by rid. */
     void sortSMEMs(SMEM *matchArray,
                    int64_t numTotalSmem[],
                    int32_t numReads,

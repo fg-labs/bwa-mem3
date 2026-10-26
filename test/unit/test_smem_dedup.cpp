@@ -8,7 +8,7 @@
 // are merged" case below, which pins this contract.
 //
 // Precondition tested here: identical SMEMs are adjacent (true after
-// sortSMEMs + per-read intv_lt1 sort in mem_collect_smem).
+// smem_sort_rid_mn's rid + (m, n) sort in mem_collect_smem).
 
 #include "doctest/doctest.h"
 #include "smem_dedup.h"

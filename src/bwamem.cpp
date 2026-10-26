@@ -116,8 +116,12 @@ static_assert(MEM_CHAIN_W_BITS + 2 + 1 + 2 == 32,
               "keeps saturating correctly -- but re-check that the new max still exceeds any "
               "reachable chain weight (bounded by query length).");
 
-#define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))  // trial
-KSORT_INIT(mem_intv1, SMEM, intv_lt1)  // debug
+/* The per-read SMEM order (m << 32 | n). mem_collect_smem now sorts through
+ * smem_sort_rid_mn (FMI_search.cpp), whose smem_key_lt MUST order identically;
+ * test/unit/test_smem_sort_rid_mn.cpp enforces that. ks_introsort_mem_intv1 has
+ * no aligner caller left -- it is kept as that test's oracle link target. */
+#define intv_lt1(a, b) ((((uint64_t)(a).m) <<32 | ((uint64_t)(a).n)) < (((uint64_t)(b).m) <<32 | ((uint64_t)(b).n)))
+KSORT_INIT(mem_intv1, SMEM, intv_lt1)
 
 #define max_(x, y) ((x)>(y)?(x):(y))
 #define min_(x, y) ((x)>(y)?(y):(x))
@@ -3016,21 +3020,9 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
     tot_smem = num_smem1 + num_smem2 + num_smem3;
     // assert(mmc->wsize_mem[tid] > (tot_smem));
     // fprintf(stderr, "num_smems: %d %d %d, %d\n", num_smem1, num_smem2, num_smem3, tot_smem);
-    fmi->sortSMEMs(matchArray, &tot_smem, nseq, seq_[0].l_seq, 1, mmc->smem_sort_scratch[tid]); // seq_[0].l_seq - only used for blocking when using nthreads
-
-    pos = 0;
-    int64_t smem_ptr = 0;
-    for (int l=0; l<nseq && pos < tot_smem - 1; l++) {
-        pos = smem_ptr - 1;
-        do {
-            pos++;
-        } while (pos < tot_smem - 1 && matchArray[pos].rid == matchArray[pos + 1].rid);
-        int64_t n = pos + 1 - smem_ptr;
-
-        if (n > 0)
-            ks_introsort(mem_intv1, n, &matchArray[smem_ptr]);
-        smem_ptr = pos + 1;
-    }
+    /* rid-ascending, and within each read by (m, n): the same order (ties
+     * included) as sortSMEMs followed by a per-rid ks_introsort(mem_intv1). */
+    smem_sort_rid_mn(matchArray, tot_smem, mmc->smem_sort_scratch[tid]);
 
     if (opt->smem_dedup)
         tot_smem = smem_dedup_inplace(matchArray, tot_smem);
