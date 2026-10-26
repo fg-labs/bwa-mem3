@@ -19,44 +19,19 @@
 #endif
 
 #include "doctest/doctest.h"
+#include "run_in_child.h"
 
 #include "utils.h"
 
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
-#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
 
-/* Run `body` in a forked child with stderr and core dumps suppressed, and
- * report how it terminated. A child that runs to completion exits 0, so any
- * other status means the body aborted or exited on its own.
- *
- * The child touches no doctest machinery — it does not report assertions, and
- * it restores the default SIGABRT disposition before running `body`. It
- * inherits doctest's crash handler, which would otherwise catch the abort,
- * report a spurious "test case CRASHED", and then resume the child's copy of
- * the test runner, re-running the rest of the suite inside the fork. With
- * SIG_DFL the child just dies on the signal, which is what the parent waits
- * for. */
-int run_in_child(void (*body)()) {
-    const pid_t pid = fork();
-    if (pid == 0) {
-        signal(SIGABRT, SIG_DFL);
-        struct rlimit no_core = {0, 0};
-        setrlimit(RLIMIT_CORE, &no_core);
-        (void)freopen("/dev/null", "w", stderr);
-        body();
-        _exit(0);
-    }
-    REQUIRE(pid > 0);
-    int status = 0;
-    REQUIRE(waitpid(pid, &status, 0) == pid);
-    return status;
-}
+using bwa_tests::run_in_child;   // forked death-test harness (run_in_child.h)
 
 void fail_an_xassert() { xassert(1 == 2, "test: xassert must fire under NDEBUG"); }
 
