@@ -16,11 +16,15 @@
 #   - a scoring the aligner cannot carry (see the scoring checks below): an -A
 #     outside 1..127, an effective -B outside 0..128, a negative -d or -U, or
 #     an effective gap open plus extension sum out of range.
+#   - a -T that is not a complete int (atoi read garbage as 0 and wrapped
+#     out-of-range values).
 #
 # Validation fires during option parsing, before the reference is opened, so
-# /dev/null placeholders suffice — no fixture is needed. The message (not just a
+# /dev/null placeholders suffice for the rejections. The message (not just a
 # non-zero exit) is asserted, so a non-zero exit from a later missing-input
-# error cannot masquerade as the rejection under test.
+# error cannot masquerade as the rejection under test. The last check aligns
+# one read against the phiX fixture (FIXTURES, default test/fixtures) to show
+# an accepted -T reaches the output filter.
 
 set -euo pipefail
 
@@ -157,7 +161,7 @@ check_accept() {
     local rc=0
     "$BWA_MEM3" mem "$@" /dev/null /dev/null /dev/null \
         > "$OUT_DIR/out" 2> "$OUT_DIR/err" || rc=$?
-    if grep -qE "ERROR: (-[ABdU] |the effective )" "$OUT_DIR/err"; then
+    if grep -qE "ERROR: (-[ABdTU] |the effective )" "$OUT_DIR/err"; then
         echo "FAIL: $desc: a valid scoring was rejected" >&2
         cat "$OUT_DIR/err" >&2
         exit 1
@@ -201,6 +205,12 @@ check_reject "-A 4 -B -4" "ERROR: the effective mismatch penalty is -4, $B_RANGE
 check_reject "-A 33" "ERROR: the effective mismatch penalty is 132, $B_RANGE" -A 33
 check_reject "-A 127" "ERROR: the effective mismatch penalty is 508, $B_RANGE" -A 127
 check_reject "-B 4x" "ERROR: -B mismatch penalty must be an integer" -B 4x
+# atoi() mapped garbage to 0 (output every alignment) and wrapped out-of-range
+# values; -T now takes a complete int.
+check_reject "-T 30x" "ERROR: -T minimum score to output must be an integer" -T 30x
+check_reject "-T abc" "ERROR: -T minimum score to output must be an integer" -T abc
+check_reject "-T 2147483648" "ERROR: -T minimum score to output must be an integer" -T 2147483648
+check_reject "-T -2147483649" "ERROR: -T minimum score to output must be an integer" -T -2147483649
 # The 8-bit banded extension asserts zdrop >= 0 and aborts.
 check_reject "-d -1" "ERROR: -d z-drop must be a non-negative integer" -d -1
 check_reject "-d 5x" "ERROR: -d z-drop must be a non-negative integer" -d 5x
@@ -225,6 +235,10 @@ check_accept "-A 127 -B 4" -A 127 -B 4
 check_accept "-B 0" -B 0
 check_accept "-B 128" -B 128
 check_accept "-d 0 -U 0" -d 0 -U 0
+check_accept "-T 0" -T 0
+check_accept "-T -5" -T -5
+check_accept "-T 2147483647" -T 2147483647
+check_accept "-T -2147483648" -T -2147483648
 check_accept "-O 536870910" -O 536870910
 check_accept "-x pacbio" -x pacbio
 check_accept "-x ont2d" -x ont2d
@@ -233,4 +247,41 @@ check_accept "--meth" --meth
 check_accept "--meth -A 2" --meth -A 2
 check_accept "--meth-scoring genomic -A 32" --meth --meth-scoring genomic -A 32
 
-echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, -O rejects negative, -w rejects values outside 0..536870911, -A, -B, -d, -U and the effective gap penalties are range-checked, -O and -I reject a first value with no digits, and all reject non-finite, out-of-range, and trailing-garbage values)"
+# An accepted -T must reach the output filter, not just get past parsing: a
+# 100 bp read copied from phiX scores exactly 100 at the default scoring, so it
+# is reported at -T 100 and unmapped (flag 0x4) at -T 101.
+FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)}"
+if [[ ! -s "$FIXTURES/phix.fa" ]]; then
+    echo "FAIL: phix.fa missing: $FIXTURES/phix.fa" >&2
+    exit 1
+fi
+cp "$FIXTURES/phix.fa" "$OUT_DIR/phix.fa"
+if ! "$BWA_MEM3" index "$OUT_DIR/phix.fa" > /dev/null 2>&1; then
+    echo "FAIL: could not index $OUT_DIR/phix.fa" >&2
+    exit 1
+fi
+read_seq="$(grep -v '^>' "$OUT_DIR/phix.fa" | tr -d '\n' | cut -c1001-1100)"
+if [[ ${#read_seq} -ne 100 ]]; then
+    echo "FAIL: could not cut a 100 bp read from phix.fa (got ${#read_seq} bp)" >&2
+    exit 1
+fi
+printf '>r1\n%s\n' "$read_seq" > "$OUT_DIR/read.fa"
+# Print the FLAG and AS:i of the read's primary record at threshold $1.
+primary_flag_and_score() {
+    "$BWA_MEM3" mem -T "$1" "$OUT_DIR/phix.fa" "$OUT_DIR/read.fa" 2> "$OUT_DIR/err" > "$OUT_DIR/out.sam"
+    awk -F'\t' '!/^@/ && $2 < 256 { as = "none"; for (i = 12; i <= NF; i++) if ($i ~ /^AS:i:/) as = $i; print $2, as; exit }' "$OUT_DIR/out.sam"
+}
+got="$(primary_flag_and_score 100)"
+if [[ $got != "0 AS:i:100" ]]; then
+    echo "FAIL: -T 100: expected the exact 100 bp read reported forward with AS:i:100, got '$got'" >&2
+    cat "$OUT_DIR/err" >&2
+    exit 1
+fi
+got="$(primary_flag_and_score 101)"
+if [[ ${got%% *} != 4 ]]; then
+    echo "FAIL: -T 101: expected the read reported unmapped (flag 4), got '$got'" >&2
+    cat "$OUT_DIR/err" >&2
+    exit 1
+fi
+
+echo "PASS: arg_range_validation (-E, -I, and -c reject non-positive, -O rejects negative, -w rejects values outside 0..536870911, -A, -B, -d, -U and the effective gap penalties are range-checked, -T must be an int and is applied to output, -O and -I reject a first value with no digits, and all reject non-finite, out-of-range, and trailing-garbage values)"

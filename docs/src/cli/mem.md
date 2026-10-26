@@ -446,7 +446,7 @@ individual flags are unaffected.
 | `-E INT[,INT]` | 1,1 | Gap extension penalty per base. A gap of length k costs `-O + -E * k`. Must be positive, and each effective `-O + -E` sum at most 536870911 (2^29 - 1). |
 | `-L INT[,INT]` | 5,5 | Clipping penalty for 5' and 3' ends. |
 | `-U INT` | 17 | Penalty for an unpaired read pair (affects mate-rescue scoring). Must be non-negative. |
-| `-T INT` | 30 | Minimum alignment score to output. Alignments below this threshold are not reported. |
+| `-T INT` | 30 | Minimum alignment score to output. Alignments below this threshold are not reported. Must be a complete integer in the `int` range (negative values are accepted). |
 
 > **Note — --meth overrides scoring defaults**
 >

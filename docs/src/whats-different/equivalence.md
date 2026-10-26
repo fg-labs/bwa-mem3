@@ -342,10 +342,10 @@ not yet carry this change.
 
 ## Degenerate numeric inputs (fail-fast, not silent)
 
-Five kinds of degenerate command line that upstream bwa/bwa-mem2 accept but then mishandle
+Six kinds of degenerate command line that upstream bwa/bwa-mem2 accept but then mishandle
 are now rejected at parse; for the first two the underlying divides are also guarded defensively
 ([#460](https://github.com/fg-labs/bwa-mem3/pull/460)).
-All five change behavior **only** on these degenerate inputs (one exception in the last item, noted there); all valid inputs are
+All six change behavior **only** on these degenerate inputs (one exception in the scoring item, noted there); all valid inputs are
 byte-identical — the full byte-identity suite (the `wgs-5M` / `wes-5M` / `hic-1M`
 alignment-record streams on x86 with the `c6a`/`c8g` cross-architecture check
 described above, plus the CI record-level phiX paired-end regression on the
@@ -408,6 +408,11 @@ non-degenerate input:
   tier-dependent output before, with one exception that ran consistently: a
   negative `-U` (a bonus for leaving a pair unpaired, which the pairing code
   does not expect).
+- **A malformed `-T`** ([#649](https://github.com/fg-labs/bwa-mem3/pull/649)): upstream parses `-T` with `atoi`, so a non-numeric
+  value such as `-T abc` becomes 0 and outputs every alignment, a value with
+  trailing characters (`-T 30x`) silently keeps its numeric prefix, and a
+  value outside `int` wraps. `-T` must now be a complete integer in the `int`
+  range; negative values are still accepted.
 
 ## What is preserved
 

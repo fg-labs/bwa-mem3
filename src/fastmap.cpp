@@ -1587,9 +1587,9 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     aux_.shared = aux;
     aux_.index = 0;
     int pthread_ret = pthread_mutex_init(&aux_.mutex, 0);
-    assert(pthread_ret == 0);
+    if (pthread_ret != 0) err_fatal(__func__, "pthread_mutex_init failed: %s", strerror(pthread_ret));
     pthread_ret = pthread_cond_init(&aux_.cv, 0);
-    assert(pthread_ret == 0);
+    if (pthread_ret != 0) err_fatal(__func__, "pthread_cond_init failed: %s", strerror(pthread_ret));
 
     fprintf(stderr, "* No. of pipeline threads: %d\n\n", p_nt);
     aux_.workers = (ktp_worker_t*) malloc(p_nt * sizeof(ktp_worker_t));
@@ -1607,12 +1607,29 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     pthread_t *ptid = (pthread_t *) calloc(p_nt, sizeof(pthread_t));
     xassert(ptid != NULL, "out of memory: ptid");
 
-    for (int i = 0; i < p_nt; ++i)
-        pthread_create(&ptid[i], 0, ktp_worker, (void*) &aux_.workers[i]);
+    /* A create or join failure can leave workers running, so bail out with
+     * _exit, not err_fatal's exit(): exit() would run atexit handlers and
+     * static destructors against live threads (see pread_chunk_fail). */
+    for (int i = 0; i < p_nt; ++i) {
+        pthread_ret = pthread_create(&ptid[i], 0, ktp_worker, (void*) &aux_.workers[i]);
+        if (pthread_ret != 0) {
+            fprintf(stderr, "[%s] pthread_create failed: %s\n", __func__, strerror(pthread_ret));
+            fflush(stderr);
+            _exit(EXIT_FAILURE);
+        }
+    }
 
-    for (int i = 0; i < p_nt; ++i)
-        pthread_join(ptid[i], 0);
+    for (int i = 0; i < p_nt; ++i) {
+        pthread_ret = pthread_join(ptid[i], 0);
+        if (pthread_ret != 0) {
+            fprintf(stderr, "[%s] pthread_join failed: %s\n", __func__, strerror(pthread_ret));
+            fflush(stderr);
+            _exit(EXIT_FAILURE);
+        }
+    }
 
+    /* Every worker has been joined and the handles are valid, so a destroy
+     * failure (EBUSY, EINVAL) can only be a program bug: assert, not an error. */
     pthread_ret = pthread_mutex_destroy(&aux_.mutex);
     assert(pthread_ret == 0);
     pthread_ret = pthread_cond_destroy(&aux_.cv);
@@ -2421,7 +2438,21 @@ int main_mem(int argc, char *argv[])
             opt->b = (int)v;
             opt0.b = 1;
         }
-        else if (c == 'T') opt->T = atoi(optarg), opt0.T = 1, assert(opt->T >= INT_MIN && opt->T <= INT_MAX);
+        else if (c == 'T') {
+            /* atoi() maps garbage to 0 and wraps out-of-range tokens; take a
+             * complete int here. A negative threshold is valid (it disables
+             * the output filter), so the full int range is accepted. */
+            int64_t v;
+            if (parse_bounded_i64(optarg, INT_MIN, INT_MAX, &v) != 0) {
+                fprintf(stderr, "ERROR: -T minimum score to output must be an integer in %d..%d (got %s)\n",
+                        INT_MIN, INT_MAX, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->T = (int)v;
+            opt0.T = 1;
+        }
         else if (c == 'U') {
             /* Paired-end scoring computes `score - pen_unpaired`
              * (bwamem_pair.cpp), which overflows for a penalty near INT_MIN, and a
@@ -4003,6 +4034,15 @@ int main_mem(int argc, char *argv[])
     // fp = gzopen(argv[optind + 1], "r");
     if (aux.legacy_reader) {
         fp = gzdopen(fd, "r");
+        if (fp == NULL) {
+            fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 1]);
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            delete aux.fmi;
+            close(fd);   // gzdopen failed, so nothing else owns fd; kclose does not close it
+            kclose(ko);
+            return 1;
+        }
         aux.ks = kseq_init(fp);
     } else {
         const char *fr_err = NULL;
@@ -4045,8 +4085,17 @@ int main_mem(int argc, char *argv[])
             }
             if (aux.legacy_reader) {
                 fp2 = gzdopen(fd2, "r");
+                if (fp2 == NULL) {
+                    fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 2]);
+                    free(opt);
+                    err_gzclose(fp); kseq_destroy(aux.ks);
+                    if (out_opened) fclose(aux.fp);
+                    delete aux.fmi; kclose(ko);
+                    close(fd2);   // gzdopen failed, so nothing else owns fd2; kclose does not close it
+                    kclose(ko2);
+                    return 1;
+                }
                 aux.ks2 = kseq_init(fp2);
-                assert(aux.ks2 != 0);
             } else {
                 const char *fr_err2 = NULL;
                 aux.fr2 = fast_reader_dopen(fd2, &fr_err2);
