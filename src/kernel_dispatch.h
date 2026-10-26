@@ -64,6 +64,7 @@
 #  define ksw_g2_wave16_wmin  BWAMEM3_PASTE(ksw_g2_wave16_wmin,  KERNEL_VARIANT)
 #  define ksw_g2_wave_wmin    BWAMEM3_PASTE(ksw_g2_wave_wmin,    KERNEL_VARIANT)
 #  define ksw_g2_wave_zr_capacity BWAMEM3_PASTE(ksw_g2_wave_zr_capacity, KERNEL_VARIANT)
+#  define ksw_g2_wave_set_zr_poison BWAMEM3_PASTE(ksw_g2_wave_set_zr_poison, KERNEL_VARIANT)
 #  define ksw_extend          BWAMEM3_PASTE(ksw_extend,          KERNEL_VARIANT)
 #  define ksw_global          BWAMEM3_PASTE(ksw_global,          KERNEL_VARIANT)
 #  define ksw_align2          BWAMEM3_PASTE(ksw_align2,          KERNEL_VARIANT)

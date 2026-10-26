@@ -526,6 +526,7 @@ extern "C" unsigned long ksw_g2_wave16_exec_count##suffix(void);                
 extern "C" int ksw_g2_wave16_wmin##suffix(void);                                      \
 extern "C" int ksw_g2_wave_wmin##suffix(void);                                        \
 extern "C" unsigned long ksw_g2_wave_zr_capacity##suffix(void);                       \
+extern "C" void ksw_g2_wave_set_zr_poison##suffix(int byte);                          \
 extern "C" int ksw_global##suffix(int qlen, const uint8_t *query, int tlen,           \
     const uint8_t *target, int m, const int8_t *mat, int gapo, int gape,              \
     int w, int *n_cigar, uint32_t **cigar);                                           \
@@ -632,6 +633,12 @@ extern "C" int ksw_g2_wave_wmin(void) {
 extern "C" unsigned long ksw_g2_wave_zr_capacity(void) {
     bwamem3_simd_init();
     KSW_DISPATCH_CALL(ksw_g2_wave_zr_capacity);
+}
+
+/* Test-only: poison the active tier's direction-byte store (see ksw.cpp). */
+extern "C" void ksw_g2_wave_set_zr_poison(int byte) {
+    bwamem3_simd_init();
+    KSW_DISPATCH_CALL(ksw_g2_wave_set_zr_poison, byte);
 }
 
 extern "C" int ksw_global(int qlen, const uint8_t *query, int tlen,

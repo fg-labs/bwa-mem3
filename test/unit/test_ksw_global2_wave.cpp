@@ -126,12 +126,13 @@ std::vector<TestPair> build_bulk_random(std::mt19937 &rng, int n) {
 }
 
 // Band widths to test per pair, each clamped up to the pair's feasibility floor.
-// Spans below/at/above the per-arch crossovers (int16 10/10/5, int32 16/26/52
+// Spans below/at/above the per-arch crossovers (int16 4/4/5, int32 16/26/52
 // across AVX-512/AVX2/NEON) plus wide bands that force the interior fast-path
 // chunk, so both the boundary-only and the interior code paths are exercised
-// regardless of the compiled tier. 4/5 straddle the NEON int16 crossover
-// (KSW_WAVE16_WMIN = 5; it was 16, covered by the 16 entry), 9/10 the AVX2 /
-// AVX-512 one (10 on those tiers), and 32/33 the AVX2 tier's former value (33),
+// regardless of the compiled tier. 3/4 straddle the x86 int16 crossover
+// (KSW_WAVE16_WMIN = 4), 4/5 the NEON one (5; it was 16, covered by the 16
+// entry), 9/10 the x86 tiers' former value (10), and 32/33 the AVX2 tier's
+// value before that (33),
 // so byte-identity -- and, via run_parity's routing gate, which kernel ran -- is
 // asserted right at the current boundaries and at the old ones the crossovers
 // were lowered from.
@@ -230,9 +231,9 @@ void run_parity(const std::vector<TestPair> &pairs, const int8_t *mat,
                     //    int32) -- an unmoved counter means the run silently
                     //    degenerated to scalar-vs-scalar;
                     //  - int16-safe pairs at wt >= the int16 crossover: the narrow
-                    //    int16 kernel itself must have run -- this is what pins the
-                    //    lowered AVX2 crossover (10): a constant that drifted back
-                    //    up would leave w in [10, old) scalar and fail here;
+                    //    int16 kernel itself must have run, so the dispatcher
+                    //    honours the tier's reported crossover (the crossover
+                    //    values themselves are pinned in a case of their own);
                     //  - int16-rejected pairs: the int16 kernel must never run.
                     // Every pair's actual w is >= wt (the floor only raises it), so
                     // a gate keyed on wt holds for the whole set. On a scalar tier
@@ -287,12 +288,12 @@ TEST_CASE("wavefront ksw_global2 byte-identical on short/low-penalty pairs (int1
     pairs.push_back(bwa_tests::gen_with_n_bases_pair(rng, 76, 80, 6));   // N bases in the int16 regime
     pairs.push_back(bwa_tests::gen_exact_match_pair(76));
     // Equal-length pairs (band_floor == 3) so the exact crossover widths in
-    // kBandTargets (9/10/32/33) run un-clamped in the int16-SAFE range too,
+    // kBandTargets (3/4, 9/10, 32/33) run un-clamped in the int16-SAFE range too,
     // mirroring the int16-fallback case below: the random pairs above have large
     // |tlen-qlen|, so their floor clamps those narrow widths away. all_mismatch
     // and homopolymer keep qlen == tlen (unlike gen_exact_match_pair, whose ref
-    // is 2x the query), so the routing gate pins the narrow int16 kernel right at
-    // the lowered AVX2 crossover and at the old boundary it was lowered from.
+    // is 2x the query), so the routing gate checks the narrow int16 kernel right at
+    // the lowered x86 crossover (4) and at the old boundary it was lowered from.
     pairs.push_back(bwa_tests::gen_all_mismatch_pair(76));
     pairs.push_back(bwa_tests::gen_homopolymer_pair(76, 0));
     // These pairs are all short/low-penalty, so their score range provably fits
@@ -302,10 +303,11 @@ TEST_CASE("wavefront ksw_global2 byte-identical on short/low-penalty pairs (int1
 
 // Long queries push H_upper = qlen*A + A past the int16 gate's ceiling
 // (32767 - SLACK = 32703), so ksw_g2_wave16_safe returns false and the
-// dispatcher must fall back to the int32 wave (w >= its WMIN) or scalar. This and
-// the gap-penalty case below are the only cases in the suite that exercise the
-// int32 wavefront kernel: every wavefront tier now has KSW_WAVE16_WMIN <=
-// KSW_WAVE_WMIN (AVX2 10/26, AVX-512 10/16, NEON 5/52), so the int16 tier
+// dispatcher must fall back to the int32 wave (w >= its WMIN) or scalar. This, the
+// gap-penalty case below and the poisoned-store case's int32 subcase are the only
+// cases in the suite that exercise the int32 wavefront kernel: every wavefront
+// tier now has KSW_WAVE16_WMIN <=
+// KSW_WAVE_WMIN (AVX2 4/26, AVX-512 4/16, NEON 5/52), so the int16 tier
 // otherwise always wins the safe-and-wide-enough race. Confirms the cascade
 // stays byte-identical when the int16 tier is rejected. (The score matrix is
 // int8_t, so |value| <= 127; with the max match score A=127, qlen>256 is what
@@ -319,9 +321,9 @@ TEST_CASE("wavefront ksw_global2 byte-identical when int16 falls back to int32/s
     std::vector<bwa_tests::TestPair> pairs;
     std::uniform_int_distribution<int> qd(270, 360), rd(270, 370);
     for (int i = 0; i < 25; i++) pairs.push_back(bwa_tests::gen_random_pair(rng, qd(rng), rd(rng)));
-    // Equal-length pairs (band_floor == 3) so the exact crossover widths in
-    // kBandTargets (9/10/32/33) run without being clamped up in the int16-
-    // fallback range too. The random pairs above have large |tlen-qlen|, so
+    // Equal-length pairs (band_floor == 3) so the narrow and former-crossover
+    // widths in kBandTargets (3/4, 9/10, 32/33) run without being clamped up in
+    // the int16-fallback range too. The random pairs above have large |tlen-qlen|, so
     // their floor clamps those narrow widths away; these prove byte-identity at
     // the boundaries on the int32-wave/scalar cascade the int16 gate falls back
     // to for these long queries. all_mismatch and homopolymer keep qlen == tlen
@@ -349,6 +351,103 @@ TEST_CASE("wavefront ksw_global2 byte-identical on short pairs routed to int32 b
     for (int i = 0; i < 60; i++) pairs.push_back(bwa_tests::gen_random_pair(rng, qd(rng), rd(rng)));
     const std::vector<GapSet> gaps = {{3000, 1, 3000, 1}, {5, 2, 3000, 3}};
     run_parity(pairs, mat.data(), /*expect_int16=*/false, /*expect_int16_rejected=*/true, gaps);
+}
+
+// Every other case here scores with a symmetric matrix, where mat[5t+q] ==
+// mat[5q+t], so a score lookup that swapped the target and query codes (Lemma 2;
+// each tier forms the index its own way) would still match the scalar oracle.
+// Score with matrices that tell the two apart: one asymmetric in every
+// off-diagonal cell, N row and column included, and the --meth shape, a
+// symmetric matrix with one off-diagonal cell freed to a match. Small values
+// keep the int16 kernel eligible, and its routing gate is asserted.
+TEST_CASE("wavefront ksw_global2 byte-identical with asymmetric score matrices"
+          * doctest::test_suite("unit/ksw_global2")) {
+    std::mt19937 rng(8642);
+    std::vector<bwa_tests::TestPair> pairs;
+    std::uniform_int_distribution<int> qd(20, 90), rd(20, 95);
+    for (int i = 0; i < 80; i++) pairs.push_back(bwa_tests::gen_random_pair(rng, qd(rng), rd(rng)));
+    pairs.push_back(bwa_tests::gen_with_n_bases_pair(rng, 76, 80, 6));
+    pairs.push_back(bwa_tests::gen_all_mismatch_pair(76));
+    SUBCASE("every off-diagonal cell asymmetric") {
+        bwa_tests::ScoringMatrix mat{};
+        // mat[5t+q] != mat[5q+t] for every t != q: (5t+q) % 7 and (5q+t) % 7
+        // differ unless 4(t-q) is 0 mod 7, which no t != q in 0..4 gives.
+        for (int t = 0; t < 5; t++)
+            for (int q = 0; q < 5; q++)
+                mat[t * 5 + q] = (t == q && t < 4) ? (int8_t)(2 + t % 2)
+                                                   : (int8_t)(-(1 + (t * 5 + q) % 7));
+        for (int t = 0; t < 5; t++)
+            for (int q = t + 1; q < 5; q++) REQUIRE(mat[t * 5 + q] != mat[q * 5 + t]);
+        run_parity(pairs, mat.data(), /*expect_int16=*/true);
+    }
+    SUBCASE("--meth shape: one off-diagonal cell freed") {
+        auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
+        mat[1 * 5 + 3] = 1;   // reference C x read T scores as a match; its mirror does not
+        REQUIRE(mat[1 * 5 + 3] != mat[3 * 5 + 1]);
+        run_parity(pairs, mat.data(), /*expect_int16=*/true);
+    }
+}
+
+// The per-tier crossovers are a throughput choice measured per tier; pin them so
+// a change is deliberate. The routing gate in run_parity checks only that the
+// dispatcher honours whatever the tier reports.
+TEST_CASE("wavefront ksw_global2 crossovers are the measured per-tier values"
+          * doctest::test_suite("unit/ksw_global2")) {
+    bwamem3_simd_init();
+    const int tier = bwamem3_simd_tier();
+    if (tier == BWAMEM3_TIER_AVX2) {
+        CHECK(ksw_g2_wave16_wmin() == 4);
+        CHECK(ksw_g2_wave_wmin() == 26);
+    } else if (tier == BWAMEM3_TIER_AVX512BW) {
+        CHECK(ksw_g2_wave16_wmin() == 4);
+        CHECK(ksw_g2_wave_wmin() == 16);
+    } else if (tier == BWAMEM3_TIER_NEON) {
+        CHECK(ksw_g2_wave16_wmin() == 5);
+        CHECK(ksw_g2_wave_wmin() == 52);
+    } else {
+        CHECK(ksw_g2_wave16_wmin() == 0);
+        CHECK(ksw_g2_wave_wmin() == 0);
+    }
+}
+
+// Every kernel stores a boundary chunk's direction bytes whole: the bytes of
+// lanes past the band land in later diagonals' slots, which those diagonals must
+// rewrite before the backtrack reads them (Lemma 9). Fill the store with a
+// direction value before every call, so a byte the backtrack reads that no
+// diagonal of the same call wrote would change the CIGAR: 0x3F sets every origin
+// and extend bit (an insertion in every state), 0x00 clears them (a match step,
+// which a stale byte on a match run would hide), and 0x15 decodes as a deletion
+// in every state. Short pairs make most chunks boundary chunks. The
+// int16 subcase gates on the int16 kernel having run (so a fallback to int32
+// cannot leave it untested); the second gap list rejects the int16 tier so the
+// int32 kernel is covered too.
+TEST_CASE("wavefront ksw_global2 reads only direction bytes the same call wrote (poisoned store)"
+          * doctest::test_suite("unit/ksw_global2")) {
+    struct ScopedPoison {
+        explicit ScopedPoison(int b) { ksw_g2_wave_set_zr_poison(b); }
+        ~ScopedPoison() { ksw_g2_wave_set_zr_poison(-1); }
+    };
+    if (!tier_has_wavefront()) {
+        // The poison is applied only on a wavefront call; on a scalar tier the
+        // case would compare scalar with scalar and claim coverage it lacks.
+        MESSAGE("skipped: the running tier has no wavefront ksw_global2 kernel");
+        return;
+    }
+    const auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
+    std::mt19937 rng(4242);
+    auto pairs = build_edge_cases(rng);
+    std::uniform_int_distribution<int> qd(1, 70), rd(1, 75);
+    for (int i = 0; i < 60; i++) pairs.push_back(bwa_tests::gen_random_pair(rng, qd(rng), rd(rng)));
+    for (int poison : {0x3F, 0x00, 0x15}) {
+        SUBCASE(("poison=" + std::to_string(poison)).c_str()) {
+            ScopedPoison sp(poison);
+            SUBCASE("int16 tier") { run_parity(pairs, mat.data(), /*expect_int16=*/true); }
+            SUBCASE("int32 tier") {
+                const std::vector<GapSet> gaps = {{3000, 1, 3000, 1}, {5, 2, 3000, 3}};
+                run_parity(pairs, mat.data(), /*expect_int16=*/false, /*expect_int16_rejected=*/true, gaps);
+            }
+        }
+    }
 }
 
 // Windowed high-water decay of the direction-byte store zr (see

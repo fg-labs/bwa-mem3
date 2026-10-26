@@ -19,11 +19,11 @@
  * also pass certified bands of 1 or 2, which never reach these kernels because
  * the dispatcher enters them only at w >= their minimum widths, all >= 3, see the
  * static_asserts in ksw.cpp), the
- * anti-diagonal SIMD kernel ksw_g2_wave (NEON/AVX2/AVX-512 -- same recurrence
- * and boundary seeding, differing in vector width and intrinsic spelling, in
- * how a boundary chunk stores its direction bytes and the final score (see
- * Lemma 9), and, on NEON only, in a band-edge chunk's E/F masking (Lemma 8b))
- * returns a score, n_cigar and cigar[] byte-identical to ksw_global2_scalar.
+ * anti-diagonal SIMD kernel ksw_g2_wave (NEON/AVX2/AVX-512 -- same recurrence,
+ * boundary seeding, band-edge masking (Lemma 8b), whole-chunk direction stores
+ * and ring-read final score (Lemma 9), differing only in vector width, intrinsic
+ * spelling and the score lookup (Lemma 2)) returns a score, n_cigar and cigar[]
+ * byte-identical to ksw_global2_scalar.
  * The proof is empirically gated by test/unit/test_ksw_global2_wave.cpp
  * (differential parity vs the scalar oracle on randomized + edge inputs).
  *
@@ -45,16 +45,19 @@
  * on s=i+j both compute the identical mathematical H/E/F/d at every cell,
  * independent of evaluation order.
  *
- * LEMMA 2 (score lookup fidelity). The SIMD table lookup (2-level vpshufb /
- * vqtbl2 / vpermb over the flattened `mat` bytes, indexed by target[i]*m+
- * query[j], sign-extended via shift-left-24/shift-right-24) returns exactly
- * mat[target[i]*m+query[j]], the same int8_t scalar's query-profile q[j]
- * yields, sign-extended the same way by C's usual arithmetic conversions.
- * NEON forms the index in byte lanes (vmla_u8) and sign-extends with vmovl_s8:
- * the byte index is the wide index mod 256, the only byte the wide form's
- * lookup kept, so the looked-up value is the same. AVX2's reversed-query buffer
- * and NEON's vrev32_u8/vrev64_u8 only change how the byte is *loaded* (for
- * contiguous SIMD access), never its value.
+ * LEMMA 2 (score lookup fidelity). Every tier's table lookup, indexed by
+ * target[i]*m+query[j], returns exactly mat[target[i]*m+query[j]], the same
+ * int8_t scalar's query-profile q[j] yields, sign-extended the same way by C's
+ * usual arithmetic conversions. NEON (vqtbl2 over the 32 flattened `mat` bytes)
+ * and AVX2 (two 16-byte vpshufb halves, each selected by the index itself) form
+ * the index in byte lanes and sign-extend the looked-up byte with one widening
+ * convert: the byte index is the wide index mod 256, and every real index is
+ * below 25, so it names the same table entry. AVX-512 looks the index up in the
+ * 25 scores already widened to the lane width (vpermw over 32 words, vpermt2d
+ * over two 16-dword tables), which reads the index modulo 32, again exact for
+ * every real index. The x86 reversed-query buffer and NEON's vrev32_u8/vrev64_u8
+ * only change how the code is *loaded* (for contiguous SIMD access), never its
+ * value.
  *
  * LEMMA 3 (direction-byte identity). Given identical inputs (Lemma 1), both
  * kernels run the identical 4-comparison chain with identical tie-breaks:
@@ -86,9 +89,12 @@
  * wavefront's evalid mask ((i-1,j) in scalar band, derived the same way as
  * Lemma 5) selects precisely between these two cases.
  *
- * LEMMA 7 (ring-buffer indexing correctness). The fixed store offset (+1
- * relative to the producing row) makes Hd2[i]=H(i-1,j-1), Ep1[i]=E(i,j) (per
- * Lemma 6), Fp1[i+1]=F(i,j) exactly the predecessors Lemma 1 requires. Since
+ * LEMMA 7 (ring-buffer indexing correctness). The kernels carry the ring slots
+ * as loop state advanced once per diagonal (H: 0,1,2,0,...; E/F: 0,1,0,...),
+ * the same physical slot ((d%3)+3)%3 / ((d%2)+2)%2 gives for diagonal d. The
+ * fixed store offset (+1 relative to the producing row) makes Hd2[i]=H(i-1,j-1),
+ * Ep1[i]=E(i,j) (per Lemma 6) and Fp1[i+1]=F(i,j) exactly the predecessors
+ * Lemma 1 requires. Since
  * an in-band cell's diagonal/E/F predecessors are themselves in-band or an
  * explicitly-overridden boundary lane (Lemmas 4-5), stale values left in
  * unread out-of-band ring slots are never read by an in-band cell.
@@ -96,11 +102,11 @@
  * LEMMA 8 (interior fast-path equivalence). The interior chunk-skip branch
  * fires only when i0>iS(s) and i0+lanes-1<iE(s); this implies every lane in
  * the chunk has i>=1, j=s-i>=1, and is fully in-band, so i0m, j0m, freset are
- * always false and evalid/inband always true -- exactly the conditions under
+ * always false and evalid always true -- exactly the conditions under
  * which the general branch reduces to the interior branch's unconditional
  * loads. The split is a pure throughput optimization with no semantic effect.
  *
- * LEMMA 8b (NEON band-edge fast path). A chunk with i0>0 and s-i0>lanes-1 has
+ * LEMMA 8b (band-edge fast path, every tier). A chunk with i0>0 and s-i0>lanes-1 has
  * no lane with i==0 (i>=i0>=1) or j==0 (j=s-i>=s-i0-(lanes-1)>=1), so i0m and
  * j0m are all false and the seeding leaves Hdiag unchanged. For a lane in band
  * (iS(s)<=i<=iE(s), i.e. 2i-s in [-w,w] and j<=qlen-1): evalid reduces to
@@ -122,16 +128,15 @@
  * so both capture H(tlen-1,qlen-1) as the final score. Precondition qlen>=1
  * (the sole production call shape) makes this capture reachable; the tlen==0
  * corner reduces identically in both to the closed-form -(o_ins+e_ins*qlen).
- * The AVX2/AVX-512 kernels find that cell by scanning a boundary chunk's
- * lanes. The NEON kernels read it after each diagonal instead: iS(s) is never
- * below row s-(qlen-1), so by Lemma 5 the cell is in band iff that row is
- * iS(s) (and iS(s)<=iE(s)), and its H is the ring slot of row iS(s). The NEON
- * kernels also store a boundary chunk's direction bytes whole, where the x86
- * kernels store only its in-band lanes: every lane of a chunk has i>=iS(s), and
- * a lane is in band iff i<=iE(s) (Lemma 5), so the in-band bytes are the
+ * The kernels read that cell after each diagonal: iS(s) is never below row
+ * s-(qlen-1), so by Lemma 5 the cell is in band iff that row is iS(s) (and
+ * iS(s)<=iE(s)), and its H is the ring slot of row iS(s). They also store a
+ * boundary chunk's direction bytes whole: every lane of a chunk has i>=iS(s),
+ * and a lane is in band iff i<=iE(s) (Lemma 5), so the in-band bytes are the
  * scalar's; the bytes of lanes past iE(s) land in later diagonals' slots, which
  * those diagonals write before the backtrack reads them (zr's +64 slack covers
- * the last diagonal, and the per-diagonal xassert checks the whole last chunk).
+ * the last diagonal's overhang, at most lanes-1 <= 31 bytes, and the
+ * per-diagonal xassert checks the whole last chunk).
  *
  * LEMMA 10 (backtrack trajectory identity). Both backtrack loops start at the
  * textually identical cell (tlen-1, min(tlen-1+w,qlen-1)) and apply the
@@ -233,7 +238,13 @@ static constexpr int  KSW_ZR_DECAY_WINDOW = 64;         // wave calls per decay 
 namespace {
 struct KswWaveScratch {
     int maxlen=0, pad=64, stride=0;
-    std::vector<int32_t> Hb,Eb,Fb; std::vector<uint8_t> tpad,qpad,qrev,zr;
+    std::vector<int32_t> Hb,Eb,Fb; std::vector<uint8_t> tpad,zr;
+#if defined(__aarch64__)
+    std::vector<uint8_t> qpad;   // the query, forward (the NEON kernels)
+#endif
+#if defined(__AVX512BW__) || defined(__AVX2__)
+    std::vector<uint8_t> qrev;   // the query, reversed (the x86 kernels)
+#endif
     std::vector<int> zoff,ziS;
     long zwin_max=0;   // largest zneed seen in the current decay window (see below)
     int  zwin_n=0;     // wave calls counted in the current decay window
@@ -246,7 +257,13 @@ struct KswWaveScratch {
             maxlen=L>maxlen?L:maxlen;
             stride=maxlen+1+32;
             Hb.assign(3L*stride,MINUS_INF); Eb.assign(2L*stride,MINUS_INF); Fb.assign(2L*stride,MINUS_INF);
-            tpad.assign(maxlen+2*pad,0); qpad.assign(maxlen+2*pad,0); qrev.assign(maxlen+2*pad,0);
+            tpad.assign(maxlen+2*pad,0);
+#if defined(__aarch64__)
+            qpad.assign(maxlen+2*pad,0);                   // the NEON kernels read the query forward
+#endif
+#if defined(__AVX512BW__) || defined(__AVX2__)
+            qrev.assign(maxlen+2*pad,0);                   // the x86 kernels read it reversed
+#endif
             zoff.assign(2*maxlen+2,0); ziS.assign(2*maxlen+2,0);
 #if defined(__AVX512BW__) || defined(__AVX2__) || defined(__aarch64__)
             Hb16.assign(3L*stride,(int16_t)KSW_VMINF16); Eb16.assign(2L*stride,(int16_t)KSW_VMINF16); Fb16.assign(2L*stride,(int16_t)KSW_VMINF16);
@@ -342,58 +359,64 @@ static inline bool ksw_g2_wave_area_ok(int qlen,int tlen,int w){
 
 #if defined(__AVX512BW__)
 #define KSW_WAVE_WMIN 16
+/* The x86 kernels share the NEON kernels' boundary handling (Lemmas 8b and 9):
+ * the H/E/F ring slots are carried as loop state, a band-edge chunk clear of row 0
+ * and column 0 masks only its E and F edge lanes, every chunk stores its direction
+ * bytes whole, and the final score is read from the H ring once per diagonal. The
+ * score is looked up in the 25 scores widened to the lane width, indexed by
+ * target*5 + query with the query read from the reversed buffer: vpermt2d over
+ * two 16-dword tables here, vpermw over 32 words in the int16 kernel (every real
+ * index is below 25, inside both tables). */
 static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
-	assert(m==5);             // AVX2 folds the score index as tv*5; NEON/non-VBMI tables hold <=32 entries — any m!=5 is silently wrong
+	assert(m==5);             // the x86 kernels fold the score index as tv*5; the score tables hold <=32 entries — any m!=5 is silently wrong
 	assert(n_cigar_&&cigar_); // score is captured only on the z!=0 path, so a score-only call would return MINUS_INF for qlen>w
 	if(n_cigar_)*n_cigar_=0; bool want=(n_cigar_&&cigar_);
 	uint8_t*z=want?S.zr.data():0; const int stride=S.stride,pad=S.pad;
 	int*zoff=S.zoff.data(),*ziS=S.ziS.data(); long roff=0;
 	int32_t*Hb=S.Hb.data(),*Eb=S.Eb.data(),*Fb=S.Fb.data();
-	auto Hs=[&](int d){return &Hb[(long)(((d%3)+3)%3)*stride];};
-	auto Es=[&](int d){return &Eb[(long)(((d%2)+2)%2)*stride];};
-	auto Fs=[&](int d){return &Fb[(long)(((d%2)+2)%2)*stride];};
-	uint8_t*tpad=S.tpad.data(),*qpad=S.qpad.data();
-	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i]; for(int j=0;j<qlen;++j)qpad[pad+j]=query[j];
-#if defined(__AVX512VBMI__)
-	int8_t tab64[64]; memset(tab64,0,64); memcpy(tab64,mat,m*m<=64?m*m:64);
-	__m512i TAB=_mm512_loadu_si512((const void*)tab64);
-#else
-	int8_t tlo[16],thi[16]; memset(tlo,0,16); memset(thi,0,16);
-	for(int i=0;i<m*m&&i<16;++i)tlo[i]=mat[i]; for(int i=16;i<m*m&&i<32;++i)thi[i-16]=mat[i];
-	const __m512i TABLO=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)tlo));
-	const __m512i TABHI=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)thi));
-#endif
-	const __m512i REVIDX=_mm512_set_epi32(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
+	// Incremental ring slots, as in the NEON int32 kernel.
+	int hc=0,hd2=1,efc=0,efp=1;
+	uint8_t*tpad=S.tpad.data(),*qrev=S.qrev.data();
+	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i];
+	for(int j=0;j<qlen;++j)qrev[pad+j]=query[qlen-1-j];   // reversed query: each chunk's query load is contiguous
+	int32_t tab[32]; memset(tab,0,sizeof(tab)); for(int k=0;k<m*m&&k<32;++k)tab[k]=mat[k];
+	const __m512i TABLO=_mm512_loadu_si512((const void*)tab),TABHI=_mm512_loadu_si512((const void*)(tab+16));
 	const __m512i LANEID=_mm512_set_epi32(15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0);
 	const __m512i VMINF=_mm512_set1_epi32(MINUS_INF);
 	int32_t score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const int Sdim=(tlen-1)+(qlen-1)+1;
-	for(int s=0;s<Sdim;++s){
-		int32_t*Hc=Hs(s),*Ec=Es(s),*Fc=Fs(s); int32_t*Hd2=Hs(s-2),*Ep1=Es(s-1),*Fp1=Fs(s-1);
+	for(int s=0;s<Sdim;++s, hc=(hc==2?0:hc+1), hd2=(hd2==2?0:hd2+1), efc^=1, efp^=1){
+		int32_t*Hc=&Hb[(long)hc*stride],*Ec=&Eb[(long)efc*stride],*Fc=&Fb[(long)efc*stride]; int32_t*Hd2=&Hb[(long)hd2*stride],*Ep1=&Eb[(long)efp*stride],*Fp1=&Fb[(long)efp*stride];
 		// tight in-band i-range on diagonal s (band cells are a contiguous window):
 		//   iS = max(0, s-(qlen-1), ceil((s-w)/2)),  iE = min(tlen-1, s, floor((s+w)/2))
 		int iS=s-(qlen-1); { int a=(s-w+1)>>1; if(a>iS)iS=a; } if(iS<0)iS=0;
 		int iE=s;          { int a=(s+w)>>1;   if(a<iE)iE=a; } if(iE>tlen-1)iE=tlen-1;
-		int i_hi=iE;
 		int zbase_s=(int)roff;
-		if(want){ zoff[s]=zbase_s; ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?iE-iS+1:0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS) roff += (iE-iS+1); }
+		if(want){ zoff[s]=zbase_s; ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?((iE-iS+16)&~15):0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS) roff += (iE-iS+1); }
 		for(int i0=iS;i0<=iE;i0+=16){
 			bool interior=(i0>iS && i0+15<iE);
-			__m512i Hdiag,e,f; __mmask16 inband; __m512i iv,jv,beg;
+			__m512i Hdiag,e,f;
 			if (interior) {
 				// interior chunk: no i==0/j==0/e-invalid/f-reset lanes; all in band
 				Hdiag=_mm512_loadu_si512(&Hd2[i0]);
 				e=_mm512_loadu_si512(&Ep1[i0]);
 				f=_mm512_loadu_si512(&Fp1[i0+1]);
-				inband=0xFFFF;
+			} else if (i0>0 && s-i0>15) {
+				// Band-edge chunk clear of row 0 and column 0 (Lemma 8b): the seeding is a
+				// no-op, an in-band lane's E is invalid only at 2i-s == -w and its F resets
+				// only at 2i-s == w, both on diagonals with s+w even.
+				Hdiag=_mm512_loadu_si512(&Hd2[i0]);
+				e=_mm512_loadu_si512(&Ep1[i0]);
+				f=_mm512_loadu_si512(&Fp1[i0+1]);
+				if (((s+w)&1)==0) {
+					e=_mm512_mask_blend_epi32(_mm512_cmpeq_epi32_mask(LANEID,_mm512_set1_epi32((s-w)/2-i0)),e,VMINF);
+					f=_mm512_mask_blend_epi32(_mm512_cmpeq_epi32_mask(LANEID,_mm512_set1_epi32((s+w)/2-i0)),f,VMINF);
+				}
 			} else {
-				iv=_mm512_add_epi32(_mm512_set1_epi32(i0),LANEID);
-				jv=_mm512_sub_epi32(_mm512_set1_epi32(s),iv);
-				beg=_mm512_max_epi32(_mm512_setzero_si512(),_mm512_sub_epi32(iv,_mm512_set1_epi32(w)));
-				__m512i endc=_mm512_min_epi32(_mm512_set1_epi32(qlen),_mm512_add_epi32(iv,_mm512_set1_epi32(w+1)));
-				inband=_mm512_cmpge_epi32_mask(iv,_mm512_setzero_si512())&_mm512_cmplt_epi32_mask(iv,_mm512_set1_epi32(tlen))
-					&_mm512_cmpge_epi32_mask(jv,beg)&_mm512_cmplt_epi32_mask(jv,endc);
+				__m512i iv=_mm512_add_epi32(_mm512_set1_epi32(i0),LANEID);
+				__m512i jv=_mm512_sub_epi32(_mm512_set1_epi32(s),iv);
+				__m512i beg=_mm512_max_epi32(_mm512_setzero_si512(),_mm512_sub_epi32(iv,_mm512_set1_epi32(w)));
 				Hdiag=_mm512_loadu_si512(&Hd2[i0]);
 				__mmask16 i0m=_mm512_cmpeq_epi32_mask(iv,_mm512_setzero_si512());
 				__mmask16 j0m=_mm512_cmpeq_epi32_mask(jv,_mm512_setzero_si512());
@@ -408,20 +431,12 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 				__mmask16 freset=_mm512_cmpeq_epi32_mask(jv,beg);
 				f=_mm512_mask_blend_epi32(freset,_mm512_loadu_si512(&Fp1[i0+1]),VMINF);
 			}
-			// score
-			__m128i tb=_mm_loadu_si128((const __m128i*)&tpad[pad+i0]);
-			__m128i qb=_mm_loadu_si128((const __m128i*)&qpad[pad+(s-i0-15)]);
-			__m512i tv=_mm512_cvtepu8_epi32(tb);
-			__m512i qv=_mm512_permutexvar_epi32(REVIDX,_mm512_cvtepu8_epi32(qb));
-			__m512i idx=_mm512_add_epi32(_mm512_mullo_epi32(tv,_mm512_set1_epi32(m)),qv);
-#if defined(__AVX512VBMI__)
-			__m512i res=_mm512_permutexvar_epi8(idx,TAB);                     // single vpermb
-#else
-			__m512i slo=_mm512_shuffle_epi8(TABLO,idx);                       // VBMI-free 2-level vpshufb
-			__m512i shi=_mm512_shuffle_epi8(TABHI,_mm512_sub_epi8(idx,_mm512_set1_epi8(16)));
-			__m512i res=_mm512_mask_blend_epi32(_mm512_cmpgt_epi32_mask(idx,_mm512_set1_epi32(15)),slo,shi);
-#endif
-			__m512i Sv=_mm512_srai_epi32(_mm512_slli_epi32(res,24),24);
+			// score: idx = target[i]*5 + query[s-i]; target contiguous, query from the
+			// reversed buffer (lane k reads query[s-i0-k]), one vpermt2d over the scores
+			__m512i tv=_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)&tpad[pad+i0]));
+			__m512i qv=_mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i*)&qrev[pad+(qlen-1-s+i0)]));
+			__m512i idx=_mm512_add_epi32(_mm512_add_epi32(_mm512_slli_epi32(tv,2),tv),qv);
+			__m512i Sv=_mm512_permutex2var_epi32(TABLO,idx,TABHI);
 			__m512i mm=_mm512_add_epi32(Hdiag,Sv);
 			__m512i h_me=_mm512_max_epi32(mm,e); __m512i h=_mm512_max_epi32(h_me,f);   // h/E'/F' via max (byte-identical on ties)
 			__m512i t1=_mm512_sub_epi32(mm,_mm512_set1_epi32(oe_del)); __m512i em=_mm512_sub_epi32(e,_mm512_set1_epi32(e_del));
@@ -435,15 +450,13 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 				__mmask16 hgf=_mm512_cmpge_epi32_mask(h_me,f); d=_mm512_mask_blend_epi32(hgf,_mm512_set1_epi32(2),d);
 				__mmask16 emgt=_mm512_cmpgt_epi32_mask(em,t1); d=_mm512_mask_or_epi32(d,emgt,d,_mm512_set1_epi32(1<<2));
 				__mmask16 fmgt=_mm512_cmpgt_epi32_mask(fm,t2); d=_mm512_mask_or_epi32(d,fmgt,d,_mm512_set1_epi32(2<<4));
-				if(interior){ int base=zbase_s+(i0-iS); _mm_storeu_si128((__m128i*)&z[base], _mm512_cvtepi32_epi8(d)); }
-				else {
-					int32_t dv[16],hv[16]; _mm512_storeu_si512(dv,d); _mm512_storeu_si512(hv,h);
-					int lim=i_hi-i0; if(lim>15)lim=15;
-					for(int k=0;k<=lim;++k){ if(!((inband>>k)&1))continue; int i=i0+k,j=s-i;
-						z[zbase_s+(i-iS)]=(uint8_t)dv[k]; if(j==qlen-1)score=hv[k]; }
-				}
+				// All 16 direction bytes, on boundary chunks too (Lemma 9).
+				_mm_storeu_si128((__m128i*)&z[zbase_s+(i0-iS)], _mm512_cvtepi32_epi8(d));
 			}
 		}
+		// The terminal column j = qlen-1 is row s-(qlen-1) on this diagonal. iS is never
+		// below it, so the cell is in band iff it is row iS (Lemma 9); take its H.
+		if(z && s-(qlen-1)==iS && iS<=iE) score=Hc[iS+1];
 	}
 	if(z) ksw_wave_backtrack(z,zoff,ziS,tlen,qlen,w,n_cigar_,cigar_);
 	return score;
@@ -456,61 +469,57 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
  * int32 wave or scalar (both already byte-identical). Structure mirrors the int32
  * AVX-512 kernel exactly at half the element width. jv is derived from the scalar
  * (s-i0), not from s, because s=i+j can exceed int16 range on long reads even when
- * i and j individually do not. Crossover: 32-lane int16 beats scalar from w~8 and
- * overtakes the 16-lane int32 kernel at w>=16 (measured on Sapphire Rapids,
- * clang-19, 150bp/b=4). WMIN=10 keeps a comfortable margin on the weaker non-VBMI
- * table-lookup path (VBMI is faster at the low end). */
-#define KSW_WAVE16_WMIN 10
+ * i and j individually do not. Crossover: with the boundary handling and score
+ * lookup above, the int16 kernel beats the tuned scalar fill from w = 4; the
+ * whole-aligner measurements behind that choice (an AMD gain, neutral on Intel)
+ * are in docs/src/whats-different/performance.md (PR #651). 3, the lowest width
+ * the static_assert in ksw.cpp allows, was not measured. */
+#define KSW_WAVE16_WMIN 4
 static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
-	assert(m==5);             // AVX2 folds the score index as tv*5; NEON/non-VBMI tables hold <=32 entries — any m!=5 is silently wrong
+	assert(m==5);             // the x86 kernels fold the score index as tv*5; the score tables hold <=32 entries — any m!=5 is silently wrong
 	assert(n_cigar_&&cigar_); // score is captured only on the z!=0 path, so a score-only call would return MINUS_INF for qlen>w
 	if(n_cigar_)*n_cigar_=0; bool want=(n_cigar_&&cigar_);
 	uint8_t*z=want?S.zr.data():0; const int stride=S.stride,pad=S.pad;
 	int*zoff=S.zoff.data(),*ziS=S.ziS.data(); long roff=0;
 	int16_t*Hb=S.Hb16.data(),*Eb=S.Eb16.data(),*Fb=S.Fb16.data();
-	auto Hs=[&](int d){return &Hb[(long)(((d%3)+3)%3)*stride];};
-	auto Es=[&](int d){return &Eb[(long)(((d%2)+2)%2)*stride];};
-	auto Fs=[&](int d){return &Fb[(long)(((d%2)+2)%2)*stride];};
-	uint8_t*tpad=S.tpad.data(),*qpad=S.qpad.data();
-	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i]; for(int j=0;j<qlen;++j)qpad[pad+j]=query[j];
-#if defined(__AVX512VBMI__)
-	int8_t tab64[64]; memset(tab64,0,64); memcpy(tab64,mat,m*m<=64?m*m:64);
-	__m512i TAB=_mm512_loadu_si512((const void*)tab64);
-#else
-	int8_t tlo[16],thi[16]; memset(tlo,0,16); memset(thi,0,16);
-	for(int i=0;i<m*m&&i<16;++i)tlo[i]=mat[i]; for(int i=16;i<m*m&&i<32;++i)thi[i-16]=mat[i];
-	const __m512i TABLO=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)tlo));
-	const __m512i TABHI=_mm512_broadcast_i32x4(_mm_loadu_si128((const __m128i*)thi));
-#endif
-	// REVIDX lane k = 31-k (reverses the forward query load); LANEID lane k = k.
-	const __m512i REVIDX=_mm512_set_epi16(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31);
+	int hc=0,hd2=1,efc=0,efp=1;
+	uint8_t*tpad=S.tpad.data(),*qrev=S.qrev.data();
+	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i];
+	for(int j=0;j<qlen;++j)qrev[pad+j]=query[qlen-1-j];
+	int16_t tab[32]; memset(tab,0,sizeof(tab)); for(int k=0;k<m*m&&k<32;++k)tab[k]=mat[k];
+	const __m512i TAB=_mm512_loadu_si512((const void*)tab);
 	const __m512i LANEID=_mm512_set_epi16(31,30,29,28,27,26,25,24,23,22,21,20,19,18,17,16,15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0);
 	const __m512i VMINF=_mm512_set1_epi16(KSW_VMINF16);
 	int score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const int Sdim=(tlen-1)+(qlen-1)+1;
-	for(int s=0;s<Sdim;++s){
-		int16_t*Hc=Hs(s),*Ec=Es(s),*Fc=Fs(s); int16_t*Hd2=Hs(s-2),*Ep1=Es(s-1),*Fp1=Fs(s-1);
+	for(int s=0;s<Sdim;++s, hc=(hc==2?0:hc+1), hd2=(hd2==2?0:hd2+1), efc^=1, efp^=1){
+		int16_t*Hc=&Hb[(long)hc*stride],*Ec=&Eb[(long)efc*stride],*Fc=&Fb[(long)efc*stride]; int16_t*Hd2=&Hb[(long)hd2*stride],*Ep1=&Eb[(long)efp*stride],*Fp1=&Fb[(long)efp*stride];
 		int iS=s-(qlen-1); { int a=(s-w+1)>>1; if(a>iS)iS=a; } if(iS<0)iS=0;
 		int iE=s;          { int a=(s+w)>>1;   if(a<iE)iE=a; } if(iE>tlen-1)iE=tlen-1;
-		int i_hi=iE;
 		int zbase_s=(int)roff;
-		if(want){ zoff[s]=zbase_s; ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?iE-iS+1:0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS) roff += (iE-iS+1); }
+		if(want){ zoff[s]=zbase_s; ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?((iE-iS+32)&~31):0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS) roff += (iE-iS+1); }
 		for(int i0=iS;i0<=iE;i0+=32){
 			bool interior=(i0>iS && i0+31<iE);
-			__m512i Hdiag,e,f; __mmask32 inband; __m512i iv,jv,beg;
+			__m512i Hdiag,e,f;
 			if (interior) {
 				Hdiag=_mm512_loadu_si512(&Hd2[i0]);
 				e=_mm512_loadu_si512(&Ep1[i0]);
 				f=_mm512_loadu_si512(&Fp1[i0+1]);
-				inband=0xFFFFFFFFu;
+			} else if (i0>0 && s-i0>31) {
+				// Band-edge chunk (Lemma 8b, see the int32 kernel). The lane indices lie in
+				// [-w, 0] and [0, w], and ksw_g2_wave16_safe bounds w, so they fit int16.
+				Hdiag=_mm512_loadu_si512(&Hd2[i0]);
+				e=_mm512_loadu_si512(&Ep1[i0]);
+				f=_mm512_loadu_si512(&Fp1[i0+1]);
+				if (((s+w)&1)==0) {
+					e=_mm512_mask_blend_epi16(_mm512_cmpeq_epi16_mask(LANEID,_mm512_set1_epi16((int16_t)((s-w)/2-i0))),e,VMINF);
+					f=_mm512_mask_blend_epi16(_mm512_cmpeq_epi16_mask(LANEID,_mm512_set1_epi16((int16_t)((s+w)/2-i0))),f,VMINF);
+				}
 			} else {
-				iv=_mm512_add_epi16(_mm512_set1_epi16((int16_t)i0),LANEID);
-				jv=_mm512_sub_epi16(_mm512_set1_epi16((int16_t)(s-i0)),LANEID);
-				beg=_mm512_max_epi16(_mm512_setzero_si512(),_mm512_sub_epi16(iv,_mm512_set1_epi16((int16_t)w)));
-				__m512i endc=_mm512_min_epi16(_mm512_set1_epi16((int16_t)qlen),_mm512_add_epi16(iv,_mm512_set1_epi16((int16_t)(w+1))));
-				inband=_mm512_cmpge_epi16_mask(iv,_mm512_setzero_si512())&_mm512_cmplt_epi16_mask(iv,_mm512_set1_epi16((int16_t)tlen))
-					&_mm512_cmpge_epi16_mask(jv,beg)&_mm512_cmplt_epi16_mask(jv,endc);
+				__m512i iv=_mm512_add_epi16(_mm512_set1_epi16((int16_t)i0),LANEID);
+				__m512i jv=_mm512_sub_epi16(_mm512_set1_epi16((int16_t)(s-i0)),LANEID);
+				__m512i beg=_mm512_max_epi16(_mm512_setzero_si512(),_mm512_sub_epi16(iv,_mm512_set1_epi16((int16_t)w)));
 				Hdiag=_mm512_loadu_si512(&Hd2[i0]);
 				__mmask32 i0m=_mm512_cmpeq_epi16_mask(iv,_mm512_setzero_si512());
 				__mmask32 j0m=_mm512_cmpeq_epi16_mask(jv,_mm512_setzero_si512());
@@ -525,20 +534,11 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 				__mmask32 freset=_mm512_cmpeq_epi16_mask(jv,beg);
 				f=_mm512_mask_blend_epi16(freset,_mm512_loadu_si512(&Fp1[i0+1]),VMINF);
 			}
-			// score: idx = target[i]*m + query[s-i]; target contiguous, query forward-loaded then lane-reversed
-			__m256i tb=_mm256_loadu_si256((const __m256i*)&tpad[pad+i0]);
-			__m256i qb=_mm256_loadu_si256((const __m256i*)&qpad[pad+(s-i0-31)]);
-			__m512i tv=_mm512_cvtepu8_epi16(tb);
-			__m512i qv=_mm512_permutexvar_epi16(REVIDX,_mm512_cvtepu8_epi16(qb));
-			__m512i idx=_mm512_add_epi16(_mm512_mullo_epi16(tv,_mm512_set1_epi16((int16_t)m)),qv);
-#if defined(__AVX512VBMI__)
-			__m512i res=_mm512_permutexvar_epi8(idx,TAB);                     // single vpermb (even byte = mat[idx])
-#else
-			__m512i slo=_mm512_shuffle_epi8(TABLO,idx);                       // VBMI-free 2-level vpshufb
-			__m512i shi=_mm512_shuffle_epi8(TABHI,_mm512_sub_epi8(idx,_mm512_set1_epi8(16)));
-			__m512i res=_mm512_mask_blend_epi16(_mm512_cmpgt_epi16_mask(idx,_mm512_set1_epi16(15)),slo,shi);
-#endif
-			__m512i Sv=_mm512_srai_epi16(_mm512_slli_epi16(res,8),8);         // extract+sign-extend low byte per lane
+			// score: one vpermw over the 25 scores as words (see the int32 kernel)
+			__m512i tv=_mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)&tpad[pad+i0]));
+			__m512i qv=_mm512_cvtepu8_epi16(_mm256_loadu_si256((const __m256i*)&qrev[pad+(qlen-1-s+i0)]));
+			__m512i idx=_mm512_add_epi16(_mm512_add_epi16(_mm512_slli_epi16(tv,2),tv),qv);
+			__m512i Sv=_mm512_permutexvar_epi16(idx,TAB);
 			__m512i mm=_mm512_add_epi16(Hdiag,Sv);
 			__m512i h_me=_mm512_max_epi16(mm,e); __m512i h=_mm512_max_epi16(h_me,f);   // h/E'/F' via max (byte-identical on ties)
 			__m512i t1=_mm512_sub_epi16(mm,_mm512_set1_epi16((int16_t)oe_del)); __m512i em=_mm512_sub_epi16(e,_mm512_set1_epi16((int16_t)e_del));
@@ -552,15 +552,11 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 				__mmask32 hgf=_mm512_cmpge_epi16_mask(h_me,f); d=_mm512_mask_blend_epi16(hgf,_mm512_set1_epi16(2),d);
 				__mmask32 emgt=_mm512_cmpgt_epi16_mask(em,t1); d=_mm512_or_si512(d,_mm512_maskz_mov_epi16(emgt,_mm512_set1_epi16(1<<2)));
 				__mmask32 fmgt=_mm512_cmpgt_epi16_mask(fm,t2); d=_mm512_or_si512(d,_mm512_maskz_mov_epi16(fmgt,_mm512_set1_epi16(2<<4)));
-				if(interior){ int base=zbase_s+(i0-iS); _mm256_storeu_si256((__m256i*)&z[base], _mm512_cvtepi16_epi8(d)); }
-				else {
-					int16_t dv[32],hv[32]; _mm512_storeu_si512(dv,d); _mm512_storeu_si512(hv,h);
-					int lim=i_hi-i0; if(lim>31)lim=31;
-					for(int k=0;k<=lim;++k){ if(!((inband>>k)&1))continue; int i=i0+k,j=s-i;
-						z[zbase_s+(i-iS)]=(uint8_t)dv[k]; if(j==qlen-1)score=hv[k]; }
-				}
+				// All 32 direction bytes, on boundary chunks too (Lemma 9).
+				_mm256_storeu_si256((__m256i*)&z[zbase_s+(i0-iS)], _mm512_cvtepi16_epi8(d));
 			}
 		}
+		if(z && s-(qlen-1)==iS && iS<=iE) score=Hc[iS+1];   // terminal column (see the int32 kernel)
 	}
 	if(z) ksw_wave_backtrack(z,zoff,ziS,tlen,qlen,w,n_cigar_,cigar_);
 	return score;
@@ -572,48 +568,67 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 static inline __m256i cmge(__m256i a,__m256i b){ return _mm256_andnot_si256(_mm256_cmpgt_epi32(b,a),_mm256_set1_epi32(-1)); }
 // select mask? X : Y  via bitwise (mask all-1s/0): AND/ANDNOT/OR — avoids port-5 blendv.
 static inline __m256i sel(__m256i mask,__m256i X,__m256i Y){ return _mm256_or_si256(_mm256_and_si256(mask,X),_mm256_andnot_si256(mask,Y)); }
+/* Scores mat[5t+q] of up to 16 (target, query) code pairs, one byte per lane,
+ * with the index formed in bytes (Lemma 2). Each 16-byte table half is looked up
+ * with the half selected by the index itself: adds_epu8(idx,112) keeps an index
+ * below 16 in [112,128) (bit 7 clear, low nibble the index) and pushes one of 16
+ * or more to 128 and above, where vpshufb writes zero; idx-16 does the reverse for
+ * the high half, so the two lookups OR together. The caller widens the bytes with
+ * a sign-extending convert. */
+static inline __m128i ksw_wave_score_bytes(__m128i tlo,__m128i thi,__m128i tb,__m128i qb){
+	__m128i t2=_mm_add_epi8(tb,tb);
+	__m128i idx=_mm_add_epi8(_mm_add_epi8(_mm_add_epi8(t2,t2),tb),qb);
+	__m128i lo=_mm_shuffle_epi8(tlo,_mm_adds_epu8(idx,_mm_set1_epi8(112)));
+	__m128i hi=_mm_shuffle_epi8(thi,_mm_sub_epi8(idx,_mm_set1_epi8(16)));
+	return _mm_or_si128(lo,hi);
+}
 
+/* AVX2 int32 kernel: 8 lanes, with the boundary handling described above the
+ * AVX-512 int32 kernel (Lemmas 8b and 9) and the byte score lookup above. */
 static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
-	assert(m==5);             // AVX2 folds the score index as tv*5; NEON/non-VBMI tables hold <=32 entries — any m!=5 is silently wrong
+	assert(m==5);             // the x86 kernels fold the score index as tv*5; the score tables hold <=32 entries — any m!=5 is silently wrong
 	assert(n_cigar_&&cigar_); // score is captured only on the z!=0 path, so a score-only call would return MINUS_INF for qlen>w
 	if(n_cigar_)*n_cigar_=0; bool want=(n_cigar_&&cigar_);
 	uint8_t*z=want?S.zr.data():0; const int stride=S.stride,pad=S.pad;
 	int*zoff=S.zoff.data(),*ziS=S.ziS.data(); long roff=0;
 	int32_t*Hb=S.Hb.data(),*Eb=S.Eb.data(),*Fb=S.Fb.data();
-	auto Hs=[&](int d){return &Hb[(long)(((d%3)+3)%3)*stride];}; auto Es=[&](int d){return &Eb[(long)(((d%2)+2)%2)*stride];}; auto Fs=[&](int d){return &Fb[(long)(((d%2)+2)%2)*stride];};
+	int hc=0,hd2=1,efc=0,efp=1;
 	uint8_t*tpad=S.tpad.data(),*qrev=S.qrev.data();
 	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i];
 	for(int j=0;j<qlen;++j)qrev[pad+j]=query[qlen-1-j];   // reversed query: score load becomes contiguous (no per-chunk permute)
-	// VBMI-free score table: two 16-byte halves broadcast to both 128-lanes for 2-level vpshufb
 	int8_t tlo[16],thi[16]; memset(tlo,0,16); memset(thi,0,16);
 	for(int i=0;i<m*m&&i<16;++i)tlo[i]=mat[i]; for(int i=16;i<m*m&&i<32;++i)thi[i-16]=mat[i];
-	const __m256i TABLO=_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)tlo));
-	const __m256i TABHI=_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)thi));
+	const __m128i TABLO=_mm_loadu_si128((const __m128i*)tlo),TABHI=_mm_loadu_si128((const __m128i*)thi);
 	int32_t score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const __m256i VMINF=_mm256_set1_epi32(MINUS_INF);
 	const __m256i LANEID=_mm256_setr_epi32(0,1,2,3,4,5,6,7);
 	const int Sdim=(tlen-1)+(qlen-1)+1;
-	for(int s=0;s<Sdim;++s){
-		int32_t*Hc=Hs(s),*Ec=Es(s),*Fc=Fs(s); int32_t*Hd2=Hs(s-2),*Ep1=Es(s-1),*Fp1=Fs(s-1);
+	for(int s=0;s<Sdim;++s, hc=(hc==2?0:hc+1), hd2=(hd2==2?0:hd2+1), efc^=1, efp^=1){
+		int32_t*Hc=&Hb[(long)hc*stride],*Ec=&Eb[(long)efc*stride],*Fc=&Fb[(long)efc*stride]; int32_t*Hd2=&Hb[(long)hd2*stride],*Ep1=&Eb[(long)efp*stride],*Fp1=&Fb[(long)efp*stride];
 		int iS=s-(qlen-1); {int a=(s-w+1)>>1; if(a>iS)iS=a;} if(iS<0)iS=0;
 		int iE=s; {int a=(s+w)>>1; if(a<iE)iE=a;} if(iE>tlen-1)iE=tlen-1;
-		int i_hi=iE; int zbase_s=(int)roff; if(want){zoff[s]=zbase_s;ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?iE-iS+1:0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS)roff+=(iE-iS+1);}
+		int zbase_s=(int)roff; if(want){zoff[s]=zbase_s;ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?((iE-iS+8)&~7):0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS)roff+=(iE-iS+1);}
 		for(int i0=iS;i0<=iE;i0+=8){
 			bool interior=(i0>iS && i0+7<iE);
-			__m256i Hdiag,e,f,inband,iv,jv,beg;
+			__m256i Hdiag,e,f;
 			if(interior){
 				Hdiag=_mm256_loadu_si256((const __m256i*)&Hd2[i0]);
 				e=_mm256_loadu_si256((const __m256i*)&Ep1[i0]);
 				f=_mm256_loadu_si256((const __m256i*)&Fp1[i0+1]);
-				inband=_mm256_set1_epi32(-1);
+			} else if(i0>0 && s-i0>7){
+				// Band-edge chunk clear of row 0 and column 0 (Lemma 8b, see the AVX-512 kernel).
+				Hdiag=_mm256_loadu_si256((const __m256i*)&Hd2[i0]);
+				e=_mm256_loadu_si256((const __m256i*)&Ep1[i0]);
+				f=_mm256_loadu_si256((const __m256i*)&Fp1[i0+1]);
+				if(((s+w)&1)==0){
+					e=sel(_mm256_cmpeq_epi32(LANEID,_mm256_set1_epi32((s-w)/2-i0)),VMINF,e);
+					f=sel(_mm256_cmpeq_epi32(LANEID,_mm256_set1_epi32((s+w)/2-i0)),VMINF,f);
+				}
 			} else {
-				iv=_mm256_add_epi32(_mm256_set1_epi32(i0),LANEID);
-				jv=_mm256_sub_epi32(_mm256_set1_epi32(s),iv);
-				beg=_mm256_max_epi32(_mm256_setzero_si256(),_mm256_sub_epi32(iv,_mm256_set1_epi32(w)));
-				__m256i endc=_mm256_min_epi32(_mm256_set1_epi32(qlen),_mm256_add_epi32(iv,_mm256_set1_epi32(w+1)));
-				inband=_mm256_and_si256(_mm256_and_si256(cmge(iv,_mm256_setzero_si256()),_mm256_cmpgt_epi32(_mm256_set1_epi32(tlen),iv)),
-					_mm256_and_si256(cmge(jv,beg),_mm256_cmpgt_epi32(endc,jv)));
+				__m256i iv=_mm256_add_epi32(_mm256_set1_epi32(i0),LANEID);
+				__m256i jv=_mm256_sub_epi32(_mm256_set1_epi32(s),iv);
+				__m256i beg=_mm256_max_epi32(_mm256_setzero_si256(),_mm256_sub_epi32(iv,_mm256_set1_epi32(w)));
 				Hdiag=_mm256_loadu_si256((const __m256i*)&Hd2[i0]);
 				__m256i i0m=_mm256_cmpeq_epi32(iv,_mm256_setzero_si256());
 				__m256i j0m=_mm256_cmpeq_epi32(jv,_mm256_setzero_si256());
@@ -627,18 +642,11 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 				__m256i freset=_mm256_cmpeq_epi32(jv,beg);
 				f=sel(freset,VMINF,_mm256_loadu_si256((const __m256i*)&Fp1[i0+1]));
 			}
-			// score: idx = target[i]*5 + query[s-i]. target contiguous; query from the
-			// pre-reversed buffer -> plain contiguous load (no per-chunk cross-lane permute).
-			__m256i tv=_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)&tpad[pad+i0]));
-			__m256i qv=_mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)&qrev[pad+(qlen-1-s+i0)]));
-			__m256i tv5=_mm256_add_epi32(_mm256_slli_epi32(tv,2),tv);   // tv*5 = (tv<<2)+tv (m==5), off the score dep chain
-			__m256i idx=_mm256_add_epi32(tv5,qv);
-			// 2-level vpshufb table lookup (idx 0..24): low table for idx<16, high for idx>=16
-			__m256i slo=_mm256_shuffle_epi8(TABLO,idx);
-			__m256i shi=_mm256_shuffle_epi8(TABHI,_mm256_sub_epi8(idx,_mm256_set1_epi8(16)));
-			__m256i ge16=_mm256_cmpgt_epi32(idx,_mm256_set1_epi32(15));
-			__m256i res=_mm256_or_si256(_mm256_and_si256(ge16,shi),_mm256_andnot_si256(ge16,slo));
-			__m256i Sv=_mm256_srai_epi32(_mm256_slli_epi32(res,24),24);  // extract+sign-extend low byte per lane
+			// score: target contiguous; query from the pre-reversed buffer -> contiguous load;
+			// the index and the lookup in bytes, then one sign-extending widen.
+			__m128i tb=_mm_loadl_epi64((const __m128i*)&tpad[pad+i0]);
+			__m128i qb=_mm_loadl_epi64((const __m128i*)&qrev[pad+(qlen-1-s+i0)]);
+			__m256i Sv=_mm256_cvtepi8_epi32(ksw_wave_score_bytes(TABLO,TABHI,tb,qb));
 			__m256i mm=_mm256_add_epi32(Hdiag,Sv);
 			__m256i h_me=_mm256_max_epi32(mm,e); __m256i h=_mm256_max_epi32(h_me,f);
 			__m256i t1=_mm256_sub_epi32(mm,_mm256_set1_epi32(oe_del)); __m256i em=_mm256_sub_epi32(e,_mm256_set1_epi32(e_del));
@@ -651,17 +659,13 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 				__m256i hgf=cmge(h_me,f); d=sel(hgf,d,_mm256_set1_epi32(2));
 				__m256i emgt=_mm256_cmpgt_epi32(em,t1); d=_mm256_or_si256(d,_mm256_and_si256(emgt,_mm256_set1_epi32(1<<2)));
 				__m256i fmgt=_mm256_cmpgt_epi32(fm,t2); d=_mm256_or_si256(d,_mm256_and_si256(fmgt,_mm256_set1_epi32(2<<4)));
-				if(interior){ int base=zbase_s+(i0-iS);
-					__m128i lo=_mm256_castsi256_si128(d),hi=_mm256_extracti128_si256(d,1);
-					__m128i p16=_mm_packus_epi32(lo,hi); __m128i p8=_mm_packus_epi16(p16,p16);
-					_mm_storel_epi64((__m128i*)&z[base],p8);
-				} else {
-					int32_t ib[8],dv[8],hv[8]; _mm256_storeu_si256((__m256i*)ib,inband); _mm256_storeu_si256((__m256i*)dv,d); _mm256_storeu_si256((__m256i*)hv,h);
-					for(int k=0;k<8;++k){ int i=i0+k; if(i>i_hi)break; if(!ib[k])continue; int j=s-i;
-						z[zbase_s+(i-iS)]=(uint8_t)dv[k]; if(j==qlen-1)score=hv[k]; }
-				}
+				// All 8 direction bytes, on boundary chunks too (Lemma 9).
+				__m128i lo=_mm256_castsi256_si128(d),hi=_mm256_extracti128_si256(d,1);
+				__m128i p16=_mm_packus_epi32(lo,hi); __m128i p8=_mm_packus_epi16(p16,p16);
+				_mm_storel_epi64((__m128i*)&z[zbase_s+(i0-iS)],p8);
 			}
 		}
+		if(z && s-(qlen-1)==iS && iS<=iE) score=Hc[iS+1];   // terminal column (Lemma 9)
 	}
 	if(z) ksw_wave_backtrack(z,zoff,ziS,tlen,qlen,w,n_cigar_,cigar_);
 	return score;
@@ -672,62 +676,62 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
  * only when ksw_g2_wave16_safe proves every H/E/F stays in int16 range, so it is
  * byte-identical to the int32 scalar; otherwise the dispatcher falls back to the
  * int32 wave or scalar (both already byte-identical). Structure mirrors the int32
- * AVX2 kernel exactly at half the element width (pre-reversed query buffer, 2-level
- * vpshufb table, bitwise select). jv is derived from the scalar (s-i0), not from
+ * AVX2 kernel exactly at half the element width (pre-reversed query buffer, byte
+ * score lookup, bitwise select). jv is derived from the scalar (s-i0), not from
  * s, because s=i+j can exceed int16 range on long reads even when i,j do not.
- * Crossover: on the AVX2 hosts that actually run this tier (AMD Zen 3, clang-19,
- * 150 bp / b=4, whole aligner) the 16-lane int16 kernel beats the scalar
- * fallback from w~10 and the whole-aligner sweep over WMIN in {33, 26, 20, 16,
- * 10, 8, 6, 4} is -0.4 to -1.0% user CPU for every value at or below 20, with
- * no clear floor; 10 is the shipped value, matching the AVX-512BW tier's
- * constant. The former 33 came from Sapphire Rapids running the AVX2 tier,
- * where the 8-lane int32 kernel was ~1% faster than int16 in the w~20-32
- * band -- that host ships the AVX-512BW objects, so the AVX2 constant is
- * tuned for the hosts that use it. */
-#define KSW_WAVE16_WMIN 10
+ * Crossover: with the boundary handling and byte score lookup above, the int16
+ * kernel beats the tuned scalar fill from w = 4 (measurements in
+ * docs/src/whats-different/performance.md, PR #651). 3, the lowest width the
+ * static_assert in ksw.cpp allows, was not measured. */
+#define KSW_WAVE16_WMIN 4
 // >= mask for signed int16: !(a<b) = !(b>a).
 static inline __m256i cmge16(__m256i a,__m256i b){ return _mm256_andnot_si256(_mm256_cmpgt_epi16(b,a),_mm256_set1_epi32(-1)); }
 
 static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
-	assert(m==5);             // AVX2 folds the score index as tv*5; NEON/non-VBMI tables hold <=32 entries — any m!=5 is silently wrong
+	assert(m==5);             // the x86 kernels fold the score index as tv*5; the score tables hold <=32 entries — any m!=5 is silently wrong
 	assert(n_cigar_&&cigar_); // score is captured only on the z!=0 path, so a score-only call would return MINUS_INF for qlen>w
 	if(n_cigar_)*n_cigar_=0; bool want=(n_cigar_&&cigar_);
 	uint8_t*z=want?S.zr.data():0; const int stride=S.stride,pad=S.pad;
 	int*zoff=S.zoff.data(),*ziS=S.ziS.data(); long roff=0;
 	int16_t*Hb=S.Hb16.data(),*Eb=S.Eb16.data(),*Fb=S.Fb16.data();
-	auto Hs=[&](int d){return &Hb[(long)(((d%3)+3)%3)*stride];}; auto Es=[&](int d){return &Eb[(long)(((d%2)+2)%2)*stride];}; auto Fs=[&](int d){return &Fb[(long)(((d%2)+2)%2)*stride];};
+	int hc=0,hd2=1,efc=0,efp=1;
 	uint8_t*tpad=S.tpad.data(),*qrev=S.qrev.data();
 	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i];
 	for(int j=0;j<qlen;++j)qrev[pad+j]=query[qlen-1-j];   // reversed query: score load becomes contiguous (no per-chunk permute)
 	int8_t tlo[16],thi[16]; memset(tlo,0,16); memset(thi,0,16);
 	for(int i=0;i<m*m&&i<16;++i)tlo[i]=mat[i]; for(int i=16;i<m*m&&i<32;++i)thi[i-16]=mat[i];
-	const __m256i TABLO=_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)tlo));
-	const __m256i TABHI=_mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)thi));
+	const __m128i TABLO=_mm_loadu_si128((const __m128i*)tlo),TABHI=_mm_loadu_si128((const __m128i*)thi);
 	int score; if(qlen==0)score=0; else if(qlen<=w)score=-(o_ins+e_ins*qlen); else score=MINUS_INF;
 	const __m256i VMINF=_mm256_set1_epi16(KSW_VMINF16);
 	const __m256i LANEID=_mm256_setr_epi16(0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15);
 	const int Sdim=(tlen-1)+(qlen-1)+1;
-	for(int s=0;s<Sdim;++s){
-		int16_t*Hc=Hs(s),*Ec=Es(s),*Fc=Fs(s); int16_t*Hd2=Hs(s-2),*Ep1=Es(s-1),*Fp1=Fs(s-1);
+	for(int s=0;s<Sdim;++s, hc=(hc==2?0:hc+1), hd2=(hd2==2?0:hd2+1), efc^=1, efp^=1){
+		int16_t*Hc=&Hb[(long)hc*stride],*Ec=&Eb[(long)efc*stride],*Fc=&Fb[(long)efc*stride]; int16_t*Hd2=&Hb[(long)hd2*stride],*Ep1=&Eb[(long)efp*stride],*Fp1=&Fb[(long)efp*stride];
 		int iS=s-(qlen-1); {int a=(s-w+1)>>1; if(a>iS)iS=a;} if(iS<0)iS=0;
 		int iE=s; {int a=(s+w)>>1; if(a<iE)iE=a;} if(iE>tlen-1)iE=tlen-1;
-		int i_hi=iE; int zbase_s=(int)roff; if(want){zoff[s]=zbase_s;ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?iE-iS+1:0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS)roff+=(iE-iS+1);}
+		int zbase_s=(int)roff; if(want){zoff[s]=zbase_s;ziS[s]=iS; xassert((long)zbase_s+(iE>=iS?((iE-iS+16)&~15):0)<=(long)S.zr.size(),"ksw wave: direction-store overrun"); if(iE>=iS)roff+=(iE-iS+1);}
 		for(int i0=iS;i0<=iE;i0+=16){
 			bool interior=(i0>iS && i0+15<iE);
-			__m256i Hdiag,e,f,inband,iv,jv,beg;
+			__m256i Hdiag,e,f;
 			if(interior){
 				Hdiag=_mm256_loadu_si256((const __m256i*)&Hd2[i0]);
 				e=_mm256_loadu_si256((const __m256i*)&Ep1[i0]);
 				f=_mm256_loadu_si256((const __m256i*)&Fp1[i0+1]);
-				inband=_mm256_set1_epi16(-1);
+			} else if(i0>0 && s-i0>15){
+				// Band-edge chunk (Lemma 8b). The lane indices lie in [-w, 0] and [0, w], and
+				// ksw_g2_wave16_safe bounds w, so they fit int16.
+				Hdiag=_mm256_loadu_si256((const __m256i*)&Hd2[i0]);
+				e=_mm256_loadu_si256((const __m256i*)&Ep1[i0]);
+				f=_mm256_loadu_si256((const __m256i*)&Fp1[i0+1]);
+				if(((s+w)&1)==0){
+					e=sel(_mm256_cmpeq_epi16(LANEID,_mm256_set1_epi16((int16_t)((s-w)/2-i0))),VMINF,e);
+					f=sel(_mm256_cmpeq_epi16(LANEID,_mm256_set1_epi16((int16_t)((s+w)/2-i0))),VMINF,f);
+				}
 			} else {
-				iv=_mm256_add_epi16(_mm256_set1_epi16((int16_t)i0),LANEID);
-				jv=_mm256_sub_epi16(_mm256_set1_epi16((int16_t)(s-i0)),LANEID);
-				beg=_mm256_max_epi16(_mm256_setzero_si256(),_mm256_sub_epi16(iv,_mm256_set1_epi16((int16_t)w)));
-				__m256i endc=_mm256_min_epi16(_mm256_set1_epi16((int16_t)qlen),_mm256_add_epi16(iv,_mm256_set1_epi16((int16_t)(w+1))));
-				inband=_mm256_and_si256(_mm256_and_si256(cmge16(iv,_mm256_setzero_si256()),_mm256_cmpgt_epi16(_mm256_set1_epi16((int16_t)tlen),iv)),
-					_mm256_and_si256(cmge16(jv,beg),_mm256_cmpgt_epi16(endc,jv)));
+				__m256i iv=_mm256_add_epi16(_mm256_set1_epi16((int16_t)i0),LANEID);
+				__m256i jv=_mm256_sub_epi16(_mm256_set1_epi16((int16_t)(s-i0)),LANEID);
+				__m256i beg=_mm256_max_epi16(_mm256_setzero_si256(),_mm256_sub_epi16(iv,_mm256_set1_epi16((int16_t)w)));
 				Hdiag=_mm256_loadu_si256((const __m256i*)&Hd2[i0]);
 				__m256i i0m=_mm256_cmpeq_epi16(iv,_mm256_setzero_si256());
 				__m256i j0m=_mm256_cmpeq_epi16(jv,_mm256_setzero_si256());
@@ -741,16 +745,10 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 				__m256i freset=_mm256_cmpeq_epi16(jv,beg);
 				f=sel(freset,VMINF,_mm256_loadu_si256((const __m256i*)&Fp1[i0+1]));
 			}
-			// score: target contiguous; query from the pre-reversed buffer -> contiguous load.
-			__m256i tv=_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)&tpad[pad+i0]));
-			__m256i qv=_mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)&qrev[pad+(qlen-1-s+i0)]));
-			__m256i tv5=_mm256_add_epi16(_mm256_slli_epi16(tv,2),tv);   // tv*5 = (tv<<2)+tv (m==5), off the score dep chain
-			__m256i idx=_mm256_add_epi16(tv5,qv);
-			__m256i slo=_mm256_shuffle_epi8(TABLO,idx);                 // 2-level vpshufb (idx 0..24)
-			__m256i shi=_mm256_shuffle_epi8(TABHI,_mm256_sub_epi8(idx,_mm256_set1_epi8(16)));
-			__m256i ge16=_mm256_cmpgt_epi16(idx,_mm256_set1_epi16(15));
-			__m256i res=sel(ge16,shi,slo);
-			__m256i Sv=_mm256_srai_epi16(_mm256_slli_epi16(res,8),8);   // extract+sign-extend low byte per lane
+			// score: the index and the lookup in bytes, then one sign-extending widen.
+			__m128i tb=_mm_loadu_si128((const __m128i*)&tpad[pad+i0]);
+			__m128i qb=_mm_loadu_si128((const __m128i*)&qrev[pad+(qlen-1-s+i0)]);
+			__m256i Sv=_mm256_cvtepi8_epi16(ksw_wave_score_bytes(TABLO,TABHI,tb,qb));
 			__m256i mm=_mm256_add_epi16(Hdiag,Sv);
 			__m256i h_me=_mm256_max_epi16(mm,e); __m256i h=_mm256_max_epi16(h_me,f);
 			__m256i t1=_mm256_sub_epi16(mm,_mm256_set1_epi16((int16_t)oe_del)); __m256i em=_mm256_sub_epi16(e,_mm256_set1_epi16((int16_t)e_del));
@@ -763,16 +761,12 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 				__m256i hgf=cmge16(h_me,f); d=sel(hgf,d,_mm256_set1_epi16(2));
 				__m256i emgt=_mm256_cmpgt_epi16(em,t1); d=_mm256_or_si256(d,_mm256_and_si256(emgt,_mm256_set1_epi16(1<<2)));
 				__m256i fmgt=_mm256_cmpgt_epi16(fm,t2); d=_mm256_or_si256(d,_mm256_and_si256(fmgt,_mm256_set1_epi16(2<<4)));
-				if(interior){ int base=zbase_s+(i0-iS);
-					__m128i lo=_mm256_castsi256_si128(d),hi=_mm256_extracti128_si256(d,1);
-					_mm_storeu_si128((__m128i*)&z[base], _mm_packus_epi16(lo,hi));   // 16 contiguous direction bytes
-				} else {
-					int16_t ib[16],dv[16],hv[16]; _mm256_storeu_si256((__m256i*)ib,inband); _mm256_storeu_si256((__m256i*)dv,d); _mm256_storeu_si256((__m256i*)hv,h);
-					for(int k=0;k<16;++k){ int i=i0+k; if(i>i_hi)break; if(!ib[k])continue; int j=s-i;
-						z[zbase_s+(i-iS)]=(uint8_t)dv[k]; if(j==qlen-1)score=hv[k]; }
-				}
+				// All 16 direction bytes, on boundary chunks too (Lemma 9).
+				__m128i lo=_mm256_castsi256_si128(d),hi=_mm256_extracti128_si256(d,1);
+				_mm_storeu_si128((__m128i*)&z[zbase_s+(i0-iS)], _mm_packus_epi16(lo,hi));
 			}
 		}
+		if(z && s-(qlen-1)==iS && iS<=iE) score=Hc[iS+1];   // terminal column (Lemma 9)
 	}
 	if(z) ksw_wave_backtrack(z,zoff,ziS,tlen,qlen,w,n_cigar_,cigar_);
 	return score;
@@ -783,7 +777,7 @@ static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*tar
 
 static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
-	assert(m==5);             // AVX2 folds the score index as tv*5; NEON/non-VBMI tables hold <=32 entries — any m!=5 is silently wrong
+	assert(m==5);             // the score index is folded as tv*m into a <=32-entry table — any m!=5 is silently wrong
 	assert(n_cigar_&&cigar_); // score is captured only on the z!=0 path, so a score-only call would return MINUS_INF for qlen>w
 	if(n_cigar_)*n_cigar_=0; bool want=(n_cigar_&&cigar_);
 	uint8_t*z = want? S.zr.data():0;
@@ -795,7 +789,7 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 	// slots, so each diagonal gets the same physical slot ((d%3+3)%3 / (d%2+2)%2) as
 	// recomputing it, with no modulo per diagonal. The walk encodes the ring depths
 	// (H=3, E/F=2; the efc/efp ^1 toggle works only for 2) that KswWaveScratch
-	// allocates and the x86 kernels' modulo lambdas use: change them together.
+	// allocates and every wavefront kernel walks the same way: change them together.
 	int hc=0,hd2=1,efc=0,efp=1;
 	uint8_t*tpad=S.tpad.data(),*qpad=S.qpad.data();
 	for(int i=0;i<tlen;++i)tpad[pad+i]=target[i];
@@ -908,7 +902,7 @@ static int ksw_g2_wave(int qlen,const uint8_t*query,int tlen,const uint8_t*targe
 
 static int ksw_g2_wave16(int qlen,const uint8_t*query,int tlen,const uint8_t*target,int m,const int8_t*mat,int o_del,int e_del,int o_ins,int e_ins,int w,int*n_cigar_,uint32_t**cigar_,KswWaveScratch&S){
 	int oe_del=o_del+e_del,oe_ins=o_ins+e_ins;
-	assert(m==5);             // AVX2 folds the score index as tv*5; NEON/non-VBMI tables hold <=32 entries — any m!=5 is silently wrong
+	assert(m==5);             // the score index is folded as tv*m into a <=32-entry table — any m!=5 is silently wrong
 	assert(n_cigar_&&cigar_); // score is captured only on the z!=0 path, so a score-only call would return MINUS_INF for qlen>w
 	if(n_cigar_)*n_cigar_=0; bool want=(n_cigar_&&cigar_);
 	uint8_t*z = want? S.zr.data():0;

@@ -162,6 +162,12 @@ extern "C" {
 	 * spike gives way to narrow calls. Not used on any production path. */
 	unsigned long ksw_g2_wave_zr_capacity(void);
 
+	/* Test-only hook (see ksw.cpp): fill the calling thread's wavefront
+	 * direction-byte store with `byte` (0..255) before every wavefront call, or
+	 * stop with -1, so the unit test can show the backtrack reads only bytes the
+	 * same call wrote. Not used on any production path. */
+	void ksw_g2_wave_set_zr_poison(int byte);
+
 	/**
 	 * Extend alignment
 	 *
