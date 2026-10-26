@@ -21,6 +21,10 @@
 #      BWAMEM3_TESTING_HOLD_LAST_ITEM keeps each pass's last item from leaving
 #      until a prefix has been written, so this does not depend on the caller
 #      running before every item has finished.
+#   3. --bam=0 streams only its last batch: with the delay, the BAM file must
+#      equal the BWA_MEM3_STREAM_OUTPUT=0 one byte for byte (same -o name, so
+#      @PG CL matches) and exactly one batch is armed to stream; with the last
+#      item held and no delay, that batch must write early.
 # How many batches write early under the delay is not checked: a pass that
 # outlasts the delay on a slow host may legitimately see the previous write
 # finish and stream, so only the output order is asserted.
@@ -138,4 +142,26 @@ cmp -s pe.off.sam pe.nodelay.sam || fail "pe.nodelay: streamed output differs fr
 n=$(batches pe.nodelay)
 e=$(early_batches pe.nodelay)
 [[ $n -ge 4 && $e -eq $n ]] || fail "pe.nodelay: $e of $n batches wrote early with the last item held; streaming is not engaging"
-echo "PASS: stream_output_order ($(batches pe.delay.t4) batches; output is unchanged with the write step delayed; all $e batches write early without the delay)"
+# (3) --bam=0, paired. One fixed -o name for every run so the headers match.
+# K divides the 8000 pairs exactly, and an exactly full last batch is not
+# streamed (see mem.md), so cut 7 batches with a short last one instead.
+KB=230000
+bam_run() { # <tag> <env...>: --bam=0 -t 4 paired into bam.cur, moved to <tag>.bam
+    local tag=$1
+    shift
+    env BWA_MEM3_STREAM_STATS=1 BWA_MEM3_STREAM_OUTPUT=1 BWAMEM3_TESTING_WRITE_DELAY_MS=0 \
+        BWAMEM3_TESTING_HOLD_LAST_ITEM=0 "$@" "$BWA_MEM3_TESTING" mem -K "$KB" -t 4 --bam=0 -o bam.cur ref.fa r1.fq r2.fq 2> "$tag.err" \
+        || fail "mem ($tag)" "$tag.err"
+    [[ -s bam.cur ]] || fail "empty output ($tag)"
+    mv bam.cur "$tag.bam"
+}
+bam_run bam0.off BWA_MEM3_STREAM_OUTPUT=0
+[[ $(batches bam0.off) -eq 0 ]] || fail "bam0.off: streamed with BWA_MEM3_STREAM_OUTPUT=0"
+bam_run bam0.delay BWAMEM3_TESTING_WRITE_DELAY_MS=100
+cmp -s bam0.off.bam bam0.delay.bam || fail "bam0.delay: streamed BAM differs from unstreamed with the write step delayed"
+[[ $(batches bam0.delay) -eq 1 ]] || fail "bam0.delay: $(batches bam0.delay) batches armed to stream at --bam=0, expected only the last"
+bam_run bam0.hold BWAMEM3_TESTING_HOLD_LAST_ITEM=1
+cmp -s bam0.off.bam bam0.hold.bam || fail "bam0.hold: streamed BAM differs from unstreamed"
+[[ $(batches bam0.hold) -eq 1 && $(early_batches bam0.hold) -eq 1 ]] \
+    || fail "bam0.hold: the last batch did not write early with its last item held ($(early_batches bam0.hold) of $(batches bam0.hold))"
+echo "PASS: stream_output_order ($(batches pe.delay.t4) batches; output is unchanged with the write step delayed; all $e batches write early without the delay; --bam=0 last batch unchanged and streamed)"
