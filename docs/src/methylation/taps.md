@@ -7,7 +7,7 @@ existing pages and are linked from here rather than repeated.
 ## TL;DR
 
 ```bash
-# Index once — the SAME index serves both chemistries.
+# Index once — the SAME index serves every chemistry.
 bwa-mem3 index --meth ref.fa
 
 # Align TAPS reads. Note the '=' — see the warning below.
@@ -67,6 +67,9 @@ over `genomic` — with identical MAPQ calibration (60+ bin 99.99 % either way) 
 `NM` (mean 1.966 vs 1.969), so the gain is not bought with over-confidence or
 inflated edit distance. An explicit `--meth-scoring` always overrides the default.
 
+Illumina 5-base libraries take the same path; see
+[Illumina 5-base libraries](5base.md).
+
 ## Downstream methylation calling
 
 **Most extractors assume bisulfite polarity.** MethylDackel reports the
@@ -99,7 +102,7 @@ supported.
 ---
 
 **See also:**
-[Flags](flags.md#--methemseqtaps) ·
+[Flags](flags.md#--methemseqtaps5base) ·
 [SAM tags: XR, XG, XM](tags.md) ·
 [Conversion details](conversion.md) ·
 [Overview](overview.md)

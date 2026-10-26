@@ -1,18 +1,20 @@
 # Methylation Reference Overview
 
 `bwa-mem3 mem --meth` is a single-binary, single-command methylation aligner,
-supporting both **bisulfite/EM-seq** (the default) and **TAPS**
-(`--meth=taps`). One `bwa-mem3 index --meth` builds the reference, and one
+supporting **bisulfite/EM-seq** (the default), **TAPS** (`--meth=taps`), and
+**Illumina 5-base** (`--meth=5base`). One `bwa-mem3 index --meth` builds the reference, and one
 `bwa-mem3 mem --meth` aligns raw FASTQ to sorted-ready records — no Python, no
 piped read-conversion preprocessor, and no separate post-processing script.
 `--meth` selects alignment semantics only; the output container is `--bam`'s
 job — SAM text by default, BAM with `--bam`.
 
-> **Pick the chemistry.** Both chemistries convert C→T as far as the aligner can
-> see, so the same index and scoring serve both — but they invert the *meaning*
-> of the observed base, so `XM:Z` calls come out backwards if the chemistry is
-> wrong. Bisulfite/EM-seq is the default; pass `--meth=taps` for TAPS libraries.
-> See [Flags](flags.md#--methemseqtaps).
+> **Pick the chemistry.** Every chemistry converts C→T as far as the aligner can
+> see, so the same index and scoring serve them all — but TAPS and 5-base
+> convert the *methylated* cytosines, which inverts the *meaning* of the
+> observed base, so `XM:Z` calls come out backwards if the chemistry is wrong.
+> Bisulfite/EM-seq is the default; pass `--meth=taps` for TAPS libraries and
+> `--meth=5base` for [Illumina 5-base](5base.md) libraries.
+> See [Flags](flags.md#--methemseqtaps5base).
 
 What sets it apart from the classic [bwameth.py](https://github.com/brentp/bwa-meth)
 approach is **where the alignment is scored**. bwameth.py converts the reads
@@ -117,12 +119,13 @@ about converted bases. This is controlled by `--meth-scoring`:
 |------|----------|--------|------|----------|
 | **`collapsed`** | **`--meth` / `--meth=emseq`** | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ` on typical WGBS/EM-seq ([full caveat](bwameth-mapping.md)), so re-validate if pinned to a bwameth release. |
 | **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and counts toward `NM`, making the BAM usable for variant calling. A variant in the conversion direction itself is still not counted in `NM`, though `MD` lists it ([why](#which-real-variants-stay-visible)). |
-| **`neutral`** | **`--meth=taps`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants count toward `NM` on the same terms as `genomic`; +0.24–0.28 pp placement over `genomic`, measured on 4.07 M simulated TAPS reads against full hg38 across three methylation loads ([full arms and method](taps.md#what---methtaps-changes)). |
+| **`neutral`** | **`--meth=taps`**, **`--meth=5base`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants count toward `NM` on the same terms as `genomic`; +0.24–0.28 pp placement over `genomic`, measured on 4.07 M simulated TAPS reads against full hg38 across three methylation loads ([full arms and method](taps.md#what---methtaps-changes)). |
 
 The default follows the chemistry: `--meth` and `--meth=emseq` default to
 `collapsed`, so existing methylation pipelines see bwameth-compatible read
-placement unless they explicitly opt into `genomic`; `--meth=taps` defaults to
-`neutral`, because TAPS conversions are sparse (~3% of cytosines vs ~95% under
+placement unless they explicitly opt into `genomic`; `--meth=taps` (and
+`--meth=5base`, which is TAPS to the aligner) defaults to `neutral`, because TAPS
+conversions are sparse (~3% of cytosines vs ~95% under
 EM-seq) and collapsing costs specificity it can no longer repay. An explicit
 `--meth-scoring` always overrides the chemistry default.
 
@@ -198,6 +201,10 @@ bwa-mem3 mem --meth --meth-scoring genomic -t 16 ref.fa R1.fq.gz R2.fq.gz \
 
 # TAPS: --meth=taps sets the TAPS XM:Z polarity and defaults to neutral scoring.
 bwa-mem3 mem --meth=taps -t 16 ref.fa R1.fq.gz R2.fq.gz \
+  | samtools sort -o out.bam
+
+# Illumina 5-base: same polarity and scoring default as TAPS.
+bwa-mem3 mem --meth=5base -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
 ```
 

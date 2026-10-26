@@ -6,7 +6,7 @@ Bismark tags are emitted; `--set-as-failed` and `--chimera-qc`
 control QC behavior during BAM post-processing (both affect the chimera QC and
 strand-filtering logic inside `meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
 
-## `--meth[={emseq|taps}]`
+## `--meth[={emseq|taps|5base}]`
 
 Selects the **methylation chemistry**. Defaults to `emseq`, so a bare `--meth`
 behaves exactly as it always has.
@@ -15,12 +15,17 @@ behaves exactly as it always has.
 |-------|-----------|------------------------------|
 | `emseq` (default) | bisulfite / EM-seq | **un**methylated C (aliases: `em-seq`, `bisulfite`) |
 | `taps` | TET-assisted pyridine borane | **methylated** 5mC/5hmC |
+| `5base` | Illumina 5-base | **methylated** 5mC (alias: `5-base`) |
+
+`5base` has the same alignment, `XM:Z` polarity and `neutral` default as
+`taps`; see [Illumina 5-base libraries](5base.md) for why, for its
+measurements, and for the 5hmC difference.
 
 > **Use `--meth=taps`, not `--meth taps`.** The argument is optional, and
 > `getopt_long` only accepts optional arguments in the `=` form; a separate word
 > is parsed as a positional (i.e. your first FASTQ).
 
-**What the chemistry changes — and what it does not.** Both chemistries produce
+**What the chemistry changes — and what it does not.** Every chemistry produces
 the *same* base change as far as the aligner can see (ref C → read T on the top
 strand, ref G → read A on the bottom). Seeding, the converted index, and the
 scoring matrices are therefore **shared**, which is why TAPS reads align correctly
@@ -43,7 +48,7 @@ identical either way.
 > as `1 − truth`, silently. Always pass `=taps` for TAPS libraries, or suppress
 > `XM:Z` and call with a TAPS-aware extractor such as Rastair.
 
-**Scoring default.** `--meth=taps` defaults `--meth-scoring` to `neutral`
+**Scoring default.** `--meth=taps` and `--meth=5base` default `--meth-scoring` to `neutral`
 (bare `--meth` still defaults to `collapsed`). TAPS converts only the methylated
 cytosines, so conversions are far sparser than under EM-seq — 3.2 % of cytosines
 versus 94.6 % on a matched chr22 simulation — and the collapsed 3-letter alphabet
@@ -76,7 +81,7 @@ conversion (bwameth-style), keep it variant-aware, or merely tolerate it.
   for variant calling; a variant in the conversion direction itself shares the
   freed cell with a conversion and is not counted in `NM`
   ([why](overview.md#which-real-variants-stay-visible)). Keeps bwa's default `-B 4`.
-- `neutral` (**default for `--meth=taps`**) — free only the conversion direction,
+- `neutral` (**default for `--meth=taps` and `--meth=5base`**) — free only the conversion direction,
   but score it `0` rather than `+A`: tolerated but not rewarded. Best for TAPS,
   whose conversions are sparse, where a full-match reward over-credits spurious
   C→T alignments (see the measurement above). Keeps `-B 4`; the mirror cell stays
@@ -109,12 +114,14 @@ Keep `collapsed` for methylation-only workflows that must match bwameth placemen
 (e.g. clinical pipelines validated against a bwameth release). Choose `genomic`
 when you want one BAM that serves both methylation *and* variant calling, or want
 the aligner to distinguish real variants from conversions. Prefer `neutral` for
-TAPS (its default), where conversions are sparse and rewarding them as matches
+TAPS and 5-base (their default), where conversions are sparse and rewarding them as matches
 costs placement specificity — it keeps variants visible for variant calling on the
-same terms as `genomic` while placing sparse-conversion reads more accurately
-(+0.24–0.28 pp over `genomic` on the 4.07 M-read simulated-TAPS-against-hg38
-measurement described under [`--meth[={emseq|taps}]`](#--methemseqtaps); no
-equivalent measurement exists for real TAPS libraries yet).
+same terms as `genomic` while placing sparse-conversion reads more accurately.
+For TAPS that is +0.24–0.28 pp over `genomic` on the 4.07 M-read
+simulated-TAPS-against-hg38 measurement described under
+[`--meth[={emseq|taps|5base}]`](#--methemseqtaps5base); no equivalent
+measurement exists for real TAPS libraries yet. For 5-base it is +0.19 pp on
+simulated 5-base reads ([measurement](5base.md#measured-on-simulated-5-base-reads)).
 
 > **Note — `-B` follows the mode, but you can override it**
 >

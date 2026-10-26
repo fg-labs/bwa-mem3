@@ -50,7 +50,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
-#include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps */
+#include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps|5base */
 #include "stage_prof.h"
 #include "seed_order.h"
 #include "kstring.h"   /* kstring_t/kputs: the --compat divergence-guard flag list */
@@ -1717,15 +1717,28 @@ static int path_exists(const char *p)
     return 0;
 }
 
+/* Every --meth=CHEM spelling and the chemistry it selects. The one list both
+ * the --meth parser and the stray-value check read, so a new alias cannot be
+ * accepted by one and missed by the other. 5base/5-base (Illumina 5-base)
+ * convert only 5mC to T, directionally: the same aligner-visible change, call
+ * polarity and sparsity as TAPS, so they are TAPS here. The one chemistry
+ * difference, 5hmC (TAPS converts it, 5-base does not), changes what a call
+ * measures, not how a read aligns. */
+static const struct { const char *name; meth_chem_t chem; } meth_chem_names[] = {
+    { "emseq",  METH_CHEM_EMSEQ }, { "em-seq", METH_CHEM_EMSEQ }, { "bisulfite", METH_CHEM_EMSEQ },
+    { "taps",   METH_CHEM_TAPS  }, { "5base",  METH_CHEM_TAPS  }, { "5-base",    METH_CHEM_TAPS  },
+};
+
 /* If `s` is a value that belongs to one of the --meth family's options rather
  * than a path, return the flag it belongs to; else NULL. Deliberately narrow:
  * every token here is a closed-vocabulary keyword no one would name a reference
- * after, and the caller additionally requires that no such path exists. */
-static const char *stray_option_value_flag(const char *s)
+ * after, and the caller additionally requires that no such path exists. The
+ * match ignores case, so `--meth TAPS` is caught too; when `canon` is non-NULL
+ * it receives the vocabulary's own spelling (the parsers are case-sensitive),
+ * or NULL for the `^` form, which has none. */
+static const char *stray_option_value_flag(const char *s, const char **canon)
 {
     static const struct { const char *value, *flag; } known[] = {
-        { "taps",      "--meth"         }, { "emseq",     "--meth" },
-        { "em-seq",    "--meth"         }, { "bisulfite", "--meth" },
         { "collapsed", "--meth-scoring" }, { "genomic",   "--meth-scoring" },
         { "neutral",   "--meth-scoring" },
         { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
@@ -1735,34 +1748,48 @@ static const char *stray_option_value_flag(const char *s)
         { "off",       "--meth-seed-prune" },
         { "true",      "--rescue-skip"  }, { "false",     "--rescue-skip" },
     };
+    if (canon != NULL) *canon = NULL;
     if (s == NULL) return NULL;
     /* A `^`-prefixed exclusion can only have come from --meth-tags. Its `-XM`
      * synonym needs no case here: `X` takes an argument in the short optstring,
      * so getopt binds `-XM` as `-X M` and it never reaches a positional slot. */
     if (s[0] == '^') return "--meth-tags";
+    for (size_t i = 0; i < sizeof(meth_chem_names) / sizeof(meth_chem_names[0]); ++i)
+        if (strcasecmp(s, meth_chem_names[i].name) == 0) {
+            if (canon != NULL) *canon = meth_chem_names[i].name;
+            return "--meth";
+        }
     for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i)
-        if (strcasecmp(s, known[i].value) == 0) return known[i].flag;
+        if (strcasecmp(s, known[i].value) == 0) {
+            if (canon != NULL) *canon = known[i].value;
+            return known[i].flag;
+        }
     return NULL;
 }
 
-/* The corrective spelling for a stray value, tailored to how it got orphaned. */
+/* The corrective spelling for a stray value, tailored to how it got orphaned
+ * and naming the value the user meant in the vocabulary's own spelling, so the
+ * advice never names a different value (for --meth, a different chemistry and
+ * so the opposite call polarity) nor a casing the parser rejects. Formatted
+ * advice lives in a static buffer, valid until the next call. */
 static const char *stray_option_value_advice(const char *s)
 {
-    const char *flag = stray_option_value_flag(s);
+    static char buf[256];
+    const char *canon = NULL;
+    const char *flag = stray_option_value_flag(s, &canon);
     if (flag == NULL) return "";
-    if (strcmp(flag, "--meth") == 0)
-        return "       --meth takes an OPTIONAL argument, which getopt only binds with '=':\n"
-               "       write --meth=taps, not --meth taps.";
     if (strcmp(flag, "--meth-tags") == 0)
         return "       --meth-tags takes ONE comma-separated list, not a space-separated one:\n"
                "       write --meth-tags XR,XG (or --meth-tags '^XM'), not --meth-tags XR XG.";
-    if (strcmp(flag, "--meth-seed-prune") == 0)
-        return "       --meth-seed-prune takes an OPTIONAL argument, which getopt only binds with '=':\n"
-               "       write --meth-seed-prune=baseline, not --meth-seed-prune baseline.";
-    if (strcmp(flag, "--rescue-skip") == 0)
-        return "       --rescue-skip takes an OPTIONAL argument, which getopt only binds with '=':\n"
-               "       write --rescue-skip=false, not --rescue-skip false.";
-    return "       Pass it as the argument to that flag, e.g. --meth-scoring genomic.";
+    if (strcmp(flag, "--meth-scoring") == 0) {
+        snprintf(buf, sizeof(buf), "       Pass it as the argument to that flag: --meth-scoring %s.", canon);
+    } else {
+        /* --meth, --meth-seed-prune and --rescue-skip take an OPTIONAL argument. */
+        snprintf(buf, sizeof(buf),
+                 "       %s takes an OPTIONAL argument, which getopt only binds with '=':\n"
+                 "       write %s=%s, not %s %s.", flag, flag, canon, flag, canon);
+    }
+    return buf;
 }
 
 static void usage(const mem_opt_t *opt)
@@ -1932,12 +1959,16 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                          (aliases: em-seq, bisulfite)\n");
     fprintf(stderr, "                   taps   TET-assisted pyridine borane, METHYLATED C converts;\n");
     fprintf(stderr, "                          also defaults --meth-scoring to neutral\n");
+    fprintf(stderr, "                   5base  Illumina 5-base, METHYLATED C (5mC) converts; same\n");
+    fprintf(stderr, "                          aligner semantics as taps (alias: 5-base)\n");
     fprintf(stderr, "                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS\n");
-    fprintf(stderr, "                 data without =taps inverts every methylation call.\n");
+    fprintf(stderr, "                 or 5-base data without =taps or =5base inverts every\n");
+    fprintf(stderr, "                 methylation call.\n");
     fprintf(stderr, "   --meth-scoring collapsed|genomic|neutral\n");
     fprintf(stderr, "                 scoring mode. Default depends on chemistry: collapsed for\n");
-    fprintf(stderr, "                 --meth/--meth=emseq, neutral for --meth=taps (TAPS conversions\n");
-    fprintf(stderr, "                 are sparse, so collapsing costs specificity it can't repay).\n");
+    fprintf(stderr, "                 --meth/--meth=emseq, neutral for --meth=taps|5base (their\n");
+    fprintf(stderr, "                 conversions are sparse, so collapsing costs specificity it\n");
+    fprintf(stderr, "                 can't repay).\n");
     fprintf(stderr, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
     fprintf(stderr, "                 placement (sets -B 2).\n");
     fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
@@ -2702,18 +2733,16 @@ int main_mem(int argc, char *argv[])
              * accepts the `--meth=taps` form (a separate word is treated as a
              * positional), so a bare `--meth` leaves optarg NULL => em-seq. */
             if (optarg != NULL) {
-                if (strcmp(optarg, "emseq") == 0 || strcmp(optarg, "em-seq") == 0
-                        || strcmp(optarg, "bisulfite") == 0) {
-                    opt->meth_chem = METH_CHEM_EMSEQ;
-                } else if (strcmp(optarg, "taps") == 0) {
-                    opt->meth_chem = METH_CHEM_TAPS;
-                } else {
-                    fprintf(stderr, "ERROR: --meth accepts 'emseq' (default) or 'taps', got '%s'\n"
-                                    "       note: use --meth=taps, not --meth taps\n", optarg);
+                size_t k = 0, n = sizeof(meth_chem_names) / sizeof(meth_chem_names[0]);
+                while (k < n && strcmp(optarg, meth_chem_names[k].name) != 0) ++k;
+                if (k == n) {
+                    fprintf(stderr, "ERROR: --meth accepts 'emseq' (default; aliases em-seq, bisulfite), "
+                                    "'taps', or '5base' (alias 5-base), got '%s'\n", optarg);
                     free(opt);
                     if (out_opened) fclose(aux.fp);
                     return 1;
                 }
+                opt->meth_chem = meth_chem_names[k].chem;
             }
         }
         else if (c == OPT_METH_SCORING) {
@@ -3174,7 +3203,7 @@ int main_mem(int argc, char *argv[])
      * path. Diagnose it here, before any index work, whenever a positional
      * matches a known option-value vocabulary and is not an actual path. */
     for (int pos = optind; pos < argc; ++pos) {
-        const char *flag = stray_option_value_flag(argv[pos]);
+        const char *flag = stray_option_value_flag(argv[pos], NULL);
         if (flag == NULL || path_exists(argv[pos])) continue;
         fprintf(stderr,
                 "ERROR: '%s' was taken as a positional argument (%s), but it looks like\n"
@@ -3590,7 +3619,7 @@ int main_mem(int argc, char *argv[])
      *     A/B with the asymmetric matrix showed b=4 places better and is better
      *     MAPQ-calibrated than b=2 (placement 92.6 vs 92.5, discordant MAPQ
      *     1.8 vs 2.1).
-     *   NEUTRAL (variant-aware, the --meth=taps default): also keeps -B 4. It
+     *   NEUTRAL (variant-aware, the --meth=taps|5base default): also keeps -B 4. It
      *     differs from GENOMIC only in the freed cell's VALUE (0 vs +a), not in
      *     the leniency gate, so the same b=4 argument applies unchanged.
      * pen_unpaired is only consulted for paired-end rescue, so setting it
@@ -3600,8 +3629,8 @@ int main_mem(int argc, char *argv[])
      * scaled by opt->a inside mem_opt_apply_meth_defaults — see bwamem.h. Before
      * that, they were applied flat and silently discarded -A. */
     if (opt->meth_mode) {
-        /* TAPS defaults to NEUTRAL scoring. TAPS converts only the METHYLATED
-         * cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
+        /* TAPS (and 5base, which is TAPS here) defaults to NEUTRAL scoring.
+         * TAPS converts only the METHYLATED cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
          * 3.2% of C vs 94.6% on chr22 @ 12x). The collapsed 3-letter alphabet buys
          * little at that density and costs specificity. NEUTRAL goes one step
          * further: it scores the conversion cell as 0 rather than a full match,

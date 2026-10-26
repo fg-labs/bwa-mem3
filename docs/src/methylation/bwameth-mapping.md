@@ -70,7 +70,7 @@ environment, no bwameth.py version pinning.
 is applied in-memory to the seeding copy of each read.
 
 **Variant-aware options.** `--meth-scoring genomic` and `--meth-scoring neutral`
-(the `--meth=taps` default) both score a real C/T or G/A variant on the mirror cell
+(the `--meth=taps` / `--meth=5base` default) both score a real C/T or G/A variant on the mirror cell
 as a mismatch, so a single BAM supports both methylation calling and variant
 calling — something a collapsed-space aligner cannot produce. (A variant in the
 conversion direction itself remains hidden; see

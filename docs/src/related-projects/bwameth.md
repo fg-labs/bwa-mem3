@@ -29,7 +29,7 @@ where bwameth.py converts both reads and reference to 3-letter space and aligns
 there, bwa-mem3 uses the 3-letter projection only to **find seeds**, then extends
 and scores against the **original 4-letter reference**. That enables two further
 variant-aware modes — `--meth-scoring genomic`, which scores the conversion cell as
-a full match, and `--meth-scoring neutral` (the `--meth=taps` default), which scores
+a full match, and `--meth-scoring neutral` (the `--meth=taps` / `--meth=5base` default), which scores
 it `0` so a sparse conversion is tolerated but not rewarded. Both keep a real C/T or
 G/A variant in the direction *opposite* the conversion as a mismatch (counted in
 `NM`), something a collapsed-space aligner cannot do; a variant in the conversion

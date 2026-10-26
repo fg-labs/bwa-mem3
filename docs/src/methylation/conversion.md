@@ -62,7 +62,7 @@ Under `--meth-scoring collapsed` (the `--meth` / `--meth=emseq` default) the mir
 cell is freed too (ref-`T` × read-`C`, ref-`A` × read-`G`), so C/T and G/A are
 interchangeable and placement matches bwameth. Under `--meth-scoring genomic` only
 the conversion direction is freed, scored as a full match. Under
-`--meth-scoring neutral` (the `--meth=taps` default) only the conversion direction
+`--meth-scoring neutral` (the `--meth=taps` / `--meth=5base` default) only the conversion direction
 is freed as well, but it scores `0` rather than a match: a converted base is
 tolerated, not rewarded. Both `genomic` and `neutral` leave the mirror cell a real
 mismatch, so a genuine variant *in that direction* stays a mismatch and `NM`
