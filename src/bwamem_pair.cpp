@@ -45,6 +45,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "simd_dispatch.h"
 #include "rescue_prune.h"
 #include "rescue_band.h"
+#include "seq_reverse.h"
 #include "rescue_env.h"
 #include "meth_xm.h"   /* meth_chem_t: exact rescue pruning under --meth is EM-seq only */
 #include <chrono>
@@ -1334,11 +1335,12 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
     return 1;
 }
 
+/* Reverse s[0, l) in place: the aligned prefixes of the query and reference
+ * windows that go on to the start-position kswv pass. Vectorized (seq_reverse.h);
+ * byte-identical to the scalar swap loop. */
 static inline void revseq(int l, uint8_t *s)
 {
-    int i, t;
-    for (i = 0; i < l>>1; ++i)
-        t = s[i], s[i] = s[l - 1 - i], s[l - 1 - i] = t;
+    seq_reverse_inplace(s, l);
 }
 
 /* Task 5: Read the BWAMEM3_METH_BATCHED_RESCUE escape hatch once. Default ON
