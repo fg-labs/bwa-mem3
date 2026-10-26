@@ -1719,6 +1719,15 @@ jobs:
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/cohort_ramp_validation.sh
 
+      - name: A missing input is reported before the index load
+        # A typo in a read path must fail before a multi-GB index load, not
+        # after it -- but only through an existence check: stdin, `<cmd` and a
+        # slow FIFO producer must not be opened (or block) before the load.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/input_fail_fast.sh
+
       - name: Chunk cap stays opt-in (batching matches bwa-mem2 at every -t)
         # bwa and bwa-mem2 both use an uncapped `chunk_size * n_threads` batch.
         # A default cap re-partitions the input, which changes each batch's
@@ -2195,6 +2204,12 @@ jobs:
           make ASAN=1 arch=avx2 \
             CXX=clang++-19 cli_arg_safety_test
           ./cli_arg_safety_test
+          # The pre-load input check returns early from mem; run its
+          # regression against the asan binary so a memory error on that
+          # return, or in the -p / URL / `<cmd` legs, fails the job.
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
+          bash test/regression/input_fail_fast.sh
 
       - name: ccache statistics
         if: always()

@@ -40,6 +40,40 @@ bwa-mem3 mem --meth -t 16 \
 
 ### Input / output
 
+#### Read inputs
+
+`in1.fq` and `in2.fq` may be plain or gzip-compressed FASTQ/FASTA files, `-` for
+stdin, a `<cmd` producer whose stdout is read, or an `http://` / `ftp://` URL.
+
+Before the index is loaded, each input named as a file is checked with
+`stat()`. If the check fails for any reason (the file is missing, a parent
+directory is not searchable, `ENOTDIR`, a name too long), or the path is a
+directory, `mem` exits with status 1 and reports `fail to open file` for the
+first input or `failed to open file` for the second. For a missing or
+unreachable path that is the same error as before, only earlier.
+A mistyped path then fails at once rather than after a multi-gigabyte index
+load. The check opens nothing. `-`, `<cmd`, URLs, and the second input under
+`-p` (which ignores it) are not checked. The inputs are still opened and read
+after the load, so stdin, a `<cmd` producer or a FIFO that is slow to start
+never delays the load. A file that exists but cannot be opened (for example,
+no read permission) is still reported after the load.
+
+Because the check runs earlier, which error appears first can differ from
+bwa-mem2 ([#645](https://github.com/fg-labs/bwa-mem3/pull/645)):
+
+- An input error is now reported before an index error, including a missing
+  `--meth` seed index.
+- If the first input exists but cannot be opened and the second is missing, the
+  second is reported first.
+- An input that is created while the index loads is now rejected.
+- The check only looks at the path, so a local input that changes while the
+  index loads is handled by the open after the load: a removed input fails
+  there, and a replaced one is read as it is at that open.
+- A directory input now gets `fail to open file` (`failed to open file` in the
+  second input position) before the load. It used to fail after the load with
+  the reader's error: `read failed`, or `[gzread] Is a directory` under
+  `--legacy-reader`.
+
 #### `-o STR` — output file
 
 Write output to `STR` instead of stdout. Honored for both SAM and `--bam`

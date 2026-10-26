@@ -650,6 +650,30 @@ divergences — `--fast` is an opaque multi-flag bundle, and no target has a bis
 "byte-identical to X under `--meth`" is undefined rather than merely violated. The full reject list
 and the shared-knob rule live in [Equivalence](equivalence.md) and [Alignment modes](modes.md).
 
+## Missing read inputs are reported before the index load ([#645](https://github.com/fg-labs/bwa-mem3/pull/645))
+
+bwa-mem2 opens the read inputs only after loading the index, so a mistyped read
+path costs a full index load (minutes on a large reference) before
+`fail to open file` appears. `bwa-mem3 mem` checks with `stat()`, before the
+load, that each input named as a file exists and is not a directory.
+
+For a missing or unreachable path the message and exit status are unchanged;
+only the timing changes, and with it which error is reported first:
+
+- With both the index and an input missing, the input error now appears (for
+  `--meth`, the missing seed index too).
+- If R1 exists but cannot be opened and R2 is missing, R2 is now reported first.
+- An input created during the load is now rejected.
+
+A directory input is the one case whose message changes. It used to fail after
+the load with the reader's error (`read failed`, or `[gzread] Is a directory`
+under `--legacy-reader`). It now fails before the load with `fail to open file`
+(`failed to open file` for the second input), exit status 1.
+
+`-`, `<cmd` producers, URLs and the second input under `-p` are not checked.
+Inputs are still opened after the load, so a slow producer never delays it.
+Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#read-inputs).
+
 ## Changes catalog
 
 | Item | bwa-mem3 PR | Upstream PR/issue | Status |
@@ -678,6 +702,7 @@ and the shared-knob rule live in [Equivalence](equivalence.md) and [Alignment mo
 | `--extend-csub` pruned-competitor `MAPQ` seed | [#269](https://github.com/fg-labs/bwa-mem3/pull/269) | — | fork-only (**forced on under `--fast`**, including `--meth --fast`; opt-in elsewhere, not byte-identical — changes emitted `MAPQ` on both the scalar SE and batched paired-end paths when the cap/gate prunes) |
 | `--huge-pages` 1 GB huge pages for the index | [#405](https://github.com/fg-labs/bwa-mem3/pull/405) | — | fork-only (Linux, opt-in, off by default; alignment records byte-identical, `@PG` `CL:` excepted; single-host measurement, not a cross-host/cross-tier claim) |
 | Transparent huge page fallback warning (stderr) | [#587](https://github.com/fg-labs/bwa-mem3/pull/587) | — | fork-only (Linux, stderr-only; at most one two-line `[W::]` warning per run, suppressed at `-v 1`; alignment records byte-identical, `@PG` `CL:` excepted, on 5M-pair WGS and WES slices (hg38), default and both `--compat` targets, on AWS Graviton 4 (arm64, NEON tier) and AMD Zen 5 (x86-64, AVX-512BW tier); CI's phiX smoke test also compares the records at `-v 3` and `-v 4` on the Linux x86-64 AVX2 row) |
+| Missing read inputs reported before the index load | [#645](https://github.com/fg-labs/bwa-mem3/pull/645) | — | fork-only (error timing; same message and exit status for a missing or unreachable path; a directory input now gets `fail to open file` before the load instead of the reader's error after it; alignment output unchanged) |
 | Certified adaptive extension band (`--no-band-cert` to disable) | [#420](https://github.com/fg-labs/bwa-mem3/pull/420) | — | fork-only (**default on**, alignment records byte-identical by a per-pair certificate — `@PG` `CL:` excepted; throughput measured on a 5M-read WGS slice, Apple M2 Max / arm64 NEON tier — see [the measurement](#certified-adaptive-extension-band-default-on---no-band-cert-to-disable) for full scope) |
 
 ---
