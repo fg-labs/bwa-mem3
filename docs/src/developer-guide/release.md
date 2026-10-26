@@ -183,6 +183,13 @@ Releases are not tagged by hand. The [`.github/workflows/release.yml`](https://g
    [Flagging breaking changes](contributing.md#flagging-breaking-changes)),
    not the release PR.
 
+   CI runs on the release PR like any other PR when release-please pushes
+   as the org's `fg-labs-bot` GitHub App (the `FG_LABS_BOT_APP_ID` and
+   `FG_LABS_BOT_PRIVATE_KEY` org secrets). Without them it pushes with the
+   default `GITHUB_TOKEN`, its CI runs are held at `action_required`, and
+   the merge queue rejects the PR until a maintainer approves the held runs
+   with **Approve workflows to run** on the release PR.
+
 2. **Review the release PR.** Confirm the proposed version matches the
    change set per the [semver policy](#semver-policy), and that the
    generated `CHANGELOG.md` reads correctly — in particular that any
