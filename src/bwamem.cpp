@@ -5681,7 +5681,6 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     pos = bns_depos(bns, rb < bns->l_pac? rb : re - 1, &is_rev);
     a.is_rev = is_rev;
     if (a.n_cigar > 0) { // squeeze out leading or trailing deletions
-        assert(a.cigar != NULL);
         if ((a.cigar[0]&0xf) == 2) {
             pos += a.cigar[0]>>4;
             --a.n_cigar;
