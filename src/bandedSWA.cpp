@@ -2582,7 +2582,7 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
 // ----------------------------------------------------------------------------------
 
 // ------------------------ vec 8 --------------------------------------------------
-// ZSCORE8 is unused in smithWaterman512_8 (z-drop replaced by the wide scalar
+// ZSCORE8 is unused in smithWaterman512_8Impl (z-drop replaced by the wide scalar
 // epilogue, as in the NEON/AVX2 twins); retained here in case a future 512-bit
 // tier reinstates it.
 #define ZSCORE8(i4_512, y4_512)                                         \
@@ -2668,30 +2668,70 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         sbt11_out = _mm512_mask_blend_epi8(freed_, sbt_, match512);    \
     }
 
+// --- Score domain of the 8-bit kernel (smithWaterman512_8Impl<SIGNED8>) ---
+// SIGNED8 == false: every H/E/F byte is the unsigned score in [0,255] (max_epu8 / subs_epu8 /
+// cmpgt_epu8, score 0 == 0x00).
+// SIGNED8 == true: every H/E/F byte is the score ^ 0x80, i.e. score - 128 as an int8. The map
+// is an order-preserving bijection [0,255] -> [-128,127], so max_epu8 becomes max_epi8,
+// cmpgt_epu8 becomes cmpgt_epi8, and max(0, h - p) for a gap penalty byte p <= 127 becomes
+// subs_epi8 (the floor 0 is the int8 saturation point -128). Score 0 is the byte 0x80
+// (hzero512). The match/mismatch step becomes a single signed-saturating add (see
+// MAIN_CODE8_CORE). The bias is applied where the state enters (the wrappers' H seeds, the
+// band-edge seed write, a cleared lane in the compaction driver) and removed where it leaves
+// (the byte stores feeding the wide per-row epilogue and the z-drop byte gate), never per
+// cell. The domain is decided once per batch wrapper call (bsw8_gap_bytes_fit_int8) and
+// drives both the H seeds and the kernel instantiation, so the two cannot disagree.
+template <bool S> static inline __m512i bsw8_max512(__m512i a, __m512i b)
+{ return S ? _mm512_max_epi8(a, b) : _mm512_max_epu8(a, b); }
+template <bool S> static inline __m512i bsw8_subs512(__m512i a, __m512i b)
+{ return S ? _mm512_subs_epi8(a, b) : _mm512_subs_epu8(a, b); }
+template <bool S> static inline __mmask64 bsw8_cmpgt512(__m512i a, __m512i b)
+{ return S ? _mm512_cmpgt_epi8_mask(a, b) : _mm512_cmpgt_epu8_mask(a, b); }
+/* the unsigned score bytes of a state vector */
+template <bool S> static inline __m512i bsw8_unbias512(__m512i v, __m512i x80)
+{ return S ? _mm512_xor_si512(v, x80) : v; }
+/* zero iff both the F and the H byte are score 0: f | h unsigned; (f ^ 0x80) | (h ^ 0x80) in one
+ * vpternlogd (truth table 0x7E) biased */
+template <bool S> static inline __m512i bsw8_hf_or512(__m512i f, __m512i h, __m512i x80)
+{ return S ? _mm512_ternarylogic_epi32(f, h, x80, 0x7E) : _mm512_or_si512(f, h); }
+
 #define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512, e_ins512, oe_ins512, e_del512, oe_del512) \
     {                                                                   \
-        /* M = max(0, h00 + sbt) in UNSIGNED-saturating form so a legitimate  \
-         * score in [128,255] is kept (the old signed add_epi8 + signed       \
-         * max_epi8 floor wrapped/mis-read >127 as negative). Split the signed \
-         * substitution score into +bonus and -penalty parts: adds_epu8 (no   \
-         * wrap past 255) then subs_epu8 (floors at 0). Mirrors the validated  \
-         * NEON smithWaterman128_8 recurrence. */                              \
-        /* sbt_neg = max(0,-sbt) = sbt_pos - sbt (exactly one of pos/neg nonzero); \
-         * one op, byte-identical for sbt in [-127,127] (golden gate guards -128). */ \
-        __m512i sbt_pos = _mm512_max_epi8(sbt11, zero512);              \
-        __m512i sbt_neg = _mm512_sub_epi8(sbt_pos, sbt11);              \
-        __m512i m11 = _mm512_subs_epu8(_mm512_adds_epu8(h00, sbt_pos), sbt_neg); \
-        __mmask64 cmp11 = _mm512_cmpeq_epi8_mask(h00, zero512);         \
-        m11 = _mm512_mask_blend_epi8(cmp11, m11, zero512);  /* h00==0 -> local restart */ \
-        h11 = _mm512_max_epu8(m11, e11);                                \
-        h11 = _mm512_max_epu8(h11, f11);                                \
-        /* gap-open from H (standard Gotoh), unsigned-saturating */      \
-        __m512i temp512 = _mm512_subs_epu8(m11, oe_ins512);            \
-        e11 = _mm512_subs_epu8(e11, e_ins512);                          \
-        e11 = _mm512_max_epu8(temp512, e11);                            \
-        temp512 = _mm512_subs_epu8(m11, oe_del512);                    \
-        f21 = _mm512_subs_epu8(f11, e_del512);                          \
-        f21 = _mm512_max_epu8(temp512, f21);                            \
+        __m512i m11;                                                    \
+        if (SIGNED8) {                                                  \
+            /* M = clamp(h00 + sbt, 0, 255) with the local restart (h00 == 0 -> M = 0) \
+             * in the biased domain: a signed-saturating add of the int8 sbt (any  \
+             * value, -128 included) to h00 - 128, run only in lanes with h00 != 0; \
+             * a restart lane keeps h00 == 0x80, the biased 0. The empty asm hides  \
+             * the mask's origin, else the compiler rewrites the merge-masked add   \
+             * (h00 is both passthrough and operand) as an add plus a masked move. */ \
+            __mmask64 live11 = _mm512_cmpneq_epi8_mask(h00, x80_512);   \
+            __asm__("" : "+Yk"(live11));                                \
+            m11 = _mm512_mask_adds_epi8(h00, live11, h00, sbt11);       \
+        } else {                                                        \
+            /* M = max(0, h00 + sbt) in UNSIGNED-saturating form so a legitimate  \
+             * score in [128,255] is kept (the old signed add_epi8 + signed       \
+             * max_epi8 floor wrapped/mis-read >127 as negative). Split the signed \
+             * substitution score into +bonus and -penalty parts: adds_epu8 (no   \
+             * wrap past 255) then subs_epu8 (floors at 0). Mirrors the validated  \
+             * NEON smithWaterman128_8 recurrence. */                              \
+            /* sbt_neg = max(0,-sbt) = sbt_pos - sbt (exactly one of pos/neg nonzero); \
+             * one op, byte-identical for sbt in [-127,127] (golden gate guards -128). */ \
+            __m512i sbt_pos = _mm512_max_epi8(sbt11, zero512);          \
+            __m512i sbt_neg = _mm512_sub_epi8(sbt_pos, sbt11);          \
+            m11 = _mm512_subs_epu8(_mm512_adds_epu8(h00, sbt_pos), sbt_neg); \
+            __mmask64 cmp11 = _mm512_cmpeq_epi8_mask(h00, zero512);     \
+            m11 = _mm512_mask_blend_epi8(cmp11, m11, zero512);  /* h00==0 -> local restart */ \
+        }                                                               \
+        h11 = bsw8_max512<SIGNED8>(m11, e11);                           \
+        h11 = bsw8_max512<SIGNED8>(h11, f11);                           \
+        /* gap-open from H (standard Gotoh), saturating at score 0 */    \
+        __m512i temp512 = bsw8_subs512<SIGNED8>(m11, oe_ins512);        \
+        e11 = bsw8_subs512<SIGNED8>(e11, e_ins512);                     \
+        e11 = bsw8_max512<SIGNED8>(temp512, e11);                       \
+        temp512 = bsw8_subs512<SIGNED8>(m11, oe_del512);                \
+        f21 = bsw8_subs512<SIGNED8>(f11, e_del512);                     \
+        f21 = bsw8_max512<SIGNED8>(temp512, f21);                       \
     }
 
 // Symmetric (default) fast path. N detected by movepi16_mask (N=0xFFFF, high bit).
@@ -2823,12 +2863,13 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
 
 }
 
-void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
-                                                  uint8_t *seqBufRef,
-                                                  uint8_t *seqBufQer,
-                                                  int32_t numPairs,
-                                                  uint16_t numThreads,
-                                                  int32_t w)
+template <bool SIGNED8>
+void BandedPairWiseSW::smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
+                                                      uint8_t *seqBufRef,
+                                                      uint8_t *seqBufQer,
+                                                      int32_t numPairs,
+                                                      uint16_t numThreads,
+                                                      int32_t w)
 {
     numThreads = effective_threads(numThreads);
     int64_t st1, st2, st3, st4, st5;
@@ -2893,6 +2934,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         int8_t *H2 = H8__ + tid * SIMD_WIDTH8 * MAX_SEQ_LEN8;
 
         __m512i zero512   = _mm512_setzero_si512();
+        /* H seeds are written in the kernel's score domain (see smithWaterman512_8Impl): the
+         * score ^ 0x80 for the signed-domain form, the plain score otherwise. SIGNED8 is the
+         * one decision for this call: it biases the seeds here and picks the instantiation. */
+        const __m512i hbias512 = SIGNED8 ? _mm512_set1_epi8((char) 0x80) : zero512;
         __m512i o_ins512  = _mm512_set1_epi8(o_ins);
         __m512i e_ins512  = _mm512_set1_epi8(e_ins);
         __m512i oe_ins512 = _mm512_set1_epi8(o_ins + e_ins);
@@ -2967,17 +3012,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
              * row maxLen1 inclusive -- byte-for-byte what the scalar loops wrote. */
             x86_soa_pack<SIMD_WIDTH8>(mySeq1SoA, seq1p, len1a, len1a, maxLen1 + 1, DUMMY1, DUMMY1, false, AMBIG, 8);
             /* B5: only boundary row H2[maxLen1] survives the seed below; write just that row. */
-            _mm512_store_si512((__m512i *)(H2 + maxLen1 * SIMD_WIDTH8), _mm512_set1_epi8((char)DUMMY1));
+            _mm512_store_si512((__m512i *)(H2 + maxLen1 * SIMD_WIDTH8),
+                               _mm512_xor_si512(_mm512_set1_epi8((char)DUMMY1), hbias512));
 //--------------------
             __m512i h0_512 = _mm512_load_si512((__m512i*) h0);
-            _mm512_store_si512((__m512i *) H2, h0_512);
+            _mm512_store_si512((__m512i *) H2, _mm512_xor_si512(h0_512, hbias512));
             // h0-prefix deletion seed, unsigned-saturating [0,255] (was signed
             // sub_epi8 + max_epi8 floor; see smithWaterman128_8 / smithWaterman256_8).
             __m512i tmp512 = _mm512_subs_epu8(h0_512, o_del512);
 
             for(k = 1; k < maxLen1; k++) {
                 tmp512 = _mm512_subs_epu8(tmp512, e_del512);
-                _mm512_store_si512((__m512i *)(H2 + k* SIMD_WIDTH8), tmp512);
+                _mm512_store_si512((__m512i *)(H2 + k* SIMD_WIDTH8), _mm512_xor_si512(tmp512, hbias512));
             }
 //-------------------
             for(j = 0; j < SIMD_WIDTH8; j++)
@@ -2998,19 +3044,19 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
              * column maxLen2 inclusive. */
             x86_soa_pack<SIMD_WIDTH8>(mySeq2SoA, seq2p, len2a, len2a, maxLen2 + 1, DUMMY2, DUMMY2, true, AMBIG, 8);
             /* B5: only boundary row H1[maxLen2]=0 survives the seed below. */
-            _mm512_store_si512((__m512i *)(H1 + maxLen2 * SIMD_WIDTH8), _mm512_setzero_si512());
+            _mm512_store_si512((__m512i *)(H1 + maxLen2 * SIMD_WIDTH8), hbias512);
 //------------------------
-            _mm512_store_si512((__m512i *) H1, h0_512);
+            _mm512_store_si512((__m512i *) H1, _mm512_xor_si512(h0_512, hbias512));
             // h0-prefix insertion seed, unsigned-saturating [0,255]:
             // H1[1] = max(0, h0' - oe_ins), then -e_ins per step (was signed
             // cmpgt_mask+sub+mask_blend, then sub+max_epi8).
             tmp512 = _mm512_subs_epu8(h0_512, oe_ins512);
-            _mm512_store_si512((__m512i *) (H1 + SIMD_WIDTH8), tmp512);
+            _mm512_store_si512((__m512i *) (H1 + SIMD_WIDTH8), _mm512_xor_si512(tmp512, hbias512));
 
             for(k = 2; k < maxLen2; k++)
             {
                 tmp512 = _mm512_subs_epu8(tmp512, e_ins512);
-                _mm512_store_si512((__m512i *)(H1 + k*SIMD_WIDTH8), tmp512);
+                _mm512_store_si512((__m512i *)(H1 + k*SIMD_WIDTH8), _mm512_xor_si512(tmp512, hbias512));
             }
 //------------------------
             /* Banding calculation in pre-processing */
@@ -3036,17 +3082,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 }
             }
 
-            smithWaterman512_8(mySeq1SoA,
-                               mySeq2SoA,
-                               maxLen1,
-                               maxLen2,
-                               pairArray + i,
-                               h0,
-                               tid,
-                               numPairs,
-                               zdrop,
-                               bsize,
-                               myband);
+            (SIGNED8 ? domain_counts_.signed_batches : domain_counts_.unsigned_batches)++;
+            smithWaterman512_8Impl<SIGNED8>(mySeq1SoA,
+                                            mySeq2SoA,
+                                            maxLen1,
+                                            maxLen2,
+                                            pairArray + i,
+                                            h0,
+                                            tid,
+                                            numPairs,
+                                            zdrop,
+                                            bsize,
+                                            myband);
         }
     }
 
@@ -3070,17 +3117,33 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
     return;
 }
 
-void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
-                                          uint8_t seq2SoA[],
-                                          int nrow,
-                                          int ncol,
-                                          SeqPair *p,
-                                          uint8_t h0[],
-                                          uint16_t tid,
-                                          int32_t numPairs,
-                                          int zdrop,
-                                          int32_t w,
-                                          uint8_t myband[])
+// The score domain of a batch (see the note above MAIN_CODE8_CORE) is decided here, once, from
+// the gap penalty bytes; the instantiation seeds H in that domain and runs the matching kernel.
+void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
+                                                  uint8_t *seqBufRef,
+                                                  uint8_t *seqBufQer,
+                                                  int32_t numPairs,
+                                                  uint16_t numThreads,
+                                                  int32_t w)
+{
+    if (bsw8_gap_bytes_fit_int8(o_del, e_del, o_ins, e_ins))
+        smithWatermanBatchWrapper8Impl<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    else
+        smithWatermanBatchWrapper8Impl<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+}
+
+template <bool SIGNED8>
+void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
+                                              uint8_t seq2SoA[],
+                                              int nrow,
+                                              int ncol,
+                                              SeqPair *p,
+                                              uint8_t h0[],
+                                              uint16_t tid,
+                                              int32_t numPairs,
+                                              int zdrop,
+                                              int32_t w,
+                                              uint8_t myband[])
 {
     __m512i match512     = _mm512_set1_epi8(this->w_match);
     __m512i mismatch512  = _mm512_set1_epi8(this->w_mismatch);
@@ -3143,6 +3206,10 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     // M = max(0, h00 + sbt) with unsigned-saturating arithmetic (adds_epu8 then
     // subs_epu8) and the row/global-max trackers (maxRS1, maxScore512) compare
     // with UNSIGNED order (_mm512_cmpgt_epu8_mask), so the full [0,255] is usable.
+    // With SIGNED8 the same scores are carried as score ^ 0x80 (see the score-domain
+    // note above MAIN_CODE8_CORE): the recurrence and the trackers use the signed
+    // forms of the same ops, H_h / H_v arrive biased from the wrapper, and the bytes
+    // are unbiased wherever they meet wide or unsigned arithmetic below.
     //
     // PRECONDITION (enforced by the caller): every pair reaching this kernel has
     // passed bwamem.cpp's bsw8_envelope_ok(), which admits a pair only when its
@@ -3212,9 +3279,16 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     __m512i one512    = _mm512_set1_epi8(1);
     __m512i two512    = _mm512_set1_epi8(2);
     __m512i ff512     = _mm512_set1_epi8(0xFF);
+    // score domain: the byte of score 0 (hzero512) and the bias of a score byte. The empty
+    // asm keeps 0x80 in a register: as a known constant the compiler folds it into the
+    // per-cell restart compare as a memory operand, a fourth load per cell.
+    __m512i x80_512 = _mm512_set1_epi8((char) 0x80);
+    __asm__("" : "+v"(x80_512));
+    const __m512i hzero512 = SIGNED8 ? x80_512 : zero512;
+    const uint8_t hbias8   = SIGNED8 ? 0x80 : 0;
 
     // gscore query-end capture (see smithWaterman128_8). Reset per row.
-    __m512i hqe512   = zero512;   // query-end cell H (rebaselined byte) this row
+    __m512i hqe512   = hzero512;  // query-end cell H (score byte) this row
     __m512i qfire512 = zero512;   // 0xFF where this lane reached its query end this row
 
     // Offset-frame band edges. head_off starts at 0 (col 0 - row 0); tail_off
@@ -3225,12 +3299,12 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
     _mm512_store_si512((__m512i *) head, head512);
     _mm512_store_si512((__m512i *) tail, tail512);
 
-    __m512i hval = _mm512_load_si512((__m512i *)(H_v));
+    __m512i hval = _mm512_load_si512((__m512i *)(H_v));   /* the h0 seed, in the score domain */
     __mmask64 dmask = 0xFFFFFFFFFFFFFFFFULL;
 
     __m512i maxScore512 = hval;
     for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
-        _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), zero512);
+        _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), hzero512);
 
     __m512i y512       = zero512;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
     __m512i max_off512 = zero512;
@@ -3250,7 +3324,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
     for(i = 0; i < nrow; i++)
     {
-        __m512i e11 = zero512;
+        __m512i e11 = hzero512;
         __m512i h00, h11, h10;
         __m512i s10 = _mm512_load_si512((__m512i *)(seq1SoA + (i + 0) * SIMD_WIDTH8));
 
@@ -3260,17 +3334,17 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         if (end > i + w + 1) end = i + w + 1;
         if (end > ncol) end = ncol;
 
-        h10 = zero512;
+        h10 = hzero512;
         if (beg == 0)
             h10 = _mm512_load_si512((__m512i *)(H_v + (i+1) * SIMD_WIDTH8));
 
         __m512i j512 = zero512;
-        __m512i maxRS1 = zero512;
+        __m512i maxRS1 = hzero512;
 
         __m512i y1_512 = zero512;   // row-max column as diagonal offset (col - i)
 
         // gscore query-end capture resets each row.
-        hqe512   = zero512;
+        hqe512   = hzero512;
         qfire512 = zero512;
 
         // Per-row diagonal-offset of the query end: qlen_off = qlen - i. Built
@@ -3321,8 +3395,8 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
                 const int oe_ = (uint8_t) (this->o_ins + this->e_ins), e_ = (uint8_t) this->e_ins;
                 while (nm_) { const int l = __builtin_ctzll(nm_); nm_ &= nm_ - 1;
                     const int c = i + me_a[l] + 1;
-                    H_h[c * SIMD_WIDTH8 + l] = (int8_t) (uint8_t) bsw_seed_row(h0[l], oe_, e_, c);
-                    F[c * SIMD_WIDTH8 + l] = 0; }
+                    H_h[c * SIMD_WIDTH8 + l] = (int8_t) ((uint8_t) bsw_seed_row(h0[l], oe_, e_, c) ^ hbias8);
+                    F[c * SIMD_WIDTH8 + l] = (int8_t) hbias8; }
             }
             maxend512 = _mm512_max_epi8(maxend512, tail512);
         }
@@ -3342,8 +3416,8 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             if (cmp1 == 0x00) break;
             __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(pj512, tail512);
             cmp1 = cmp1 | cmp2;
-            h512 = _mm512_mask_blend_epi8(cmp1, h512, zero512);
-            f512 = _mm512_mask_blend_epi8(cmp1, f512, zero512);
+            h512 = _mm512_mask_blend_epi8(cmp1, h512, hzero512);
+            f512 = _mm512_mask_blend_epi8(cmp1, f512, hzero512);
 
             _mm512_store_si512((__m512i *)(F + l * SIMD_WIDTH8), f512);
             _mm512_store_si512((__m512i *)(H_h + l * SIMD_WIDTH8), h512);
@@ -3443,12 +3517,12 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(head512, pj512); \
             __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(pj512, tail512); \
             cmp1 = cmp1 | cmp2; \
-            h10 = _mm512_mask_blend_epi8(cmp1, h10, zero512); \
+            h10 = _mm512_mask_blend_epi8(cmp1, h10, hzero512); \
             __m512i bmaxRS = maxRS1, blend512; \
-            maxRS1 =_mm512_max_epu8(maxRS1, h11); \
+            maxRS1 = bsw8_max512<SIGNED8>(maxRS1, h11); \
             __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11); \
             cmp1 = _mm512_cmpgt_epi8_mask(j512, tail512); \
-            f21 = _mm512_mask_blend_epi8(cmp1, f21, zero512); \
+            f21 = _mm512_mask_blend_epi8(cmp1, f21, hzero512); \
             cmp1 = cmp1 | cmp2; \
             blend512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
             y1_512 = _mm512_mask_blend_epi8(cmp1, blend512, y1_512); \
@@ -3476,7 +3550,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 #define EXT13_CELL8_512_FAST { \
             EXT13_CELL8_512_COMMON \
             BSW8_ASSERT_FAST8_512(pj512, j512); \
-            maxRS1 =_mm512_max_epu8(maxRS1, h11); \
+            maxRS1 = bsw8_max512<SIGNED8>(maxRS1, h11); \
             __mmask64 cmpA = _mm512_cmpeq_epi8_mask(maxRS1, h11); \
             y1_512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
             _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21); \
@@ -3492,14 +3566,14 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, j512);
         __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(j512, tail512);
         cmp1 = cmp1 | cmp2;
-        h10 = _mm512_mask_blend_epi8(cmp1, h10, zero512);
+        h10 = _mm512_mask_blend_epi8(cmp1, h10, hzero512);
 
         _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10);
-        _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), zero512);
+        _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), hzero512);
 
         /* exit due to zero score by a row */
         __m512i bmaxScore512 = maxScore512;
-        __mmask64 tmp = _mm512_cmpeq_epi8_mask(maxRS1, zero512);
+        __mmask64 tmp = _mm512_cmpeq_epi8_mask(maxRS1, hzero512);
         if (tmp == dmask) {
             /* Finalize THIS row's query-end (gscore/gtle) capture before exiting
              * (see smithWaterman128_8 zero-row break): scalar records the row's
@@ -3507,7 +3581,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
              * gscore==0 query-end tail row is dropped -> wrong gtle under the
              * asymmetric --meth matrix. Mirror of the epilogue gscore block. */
             int8_t hq_a_[SIMD_WIDTH8] __attribute((aligned(64)));
-            _mm512_store_si512((__m512i *) hq_a_, hqe512);
+            _mm512_store_si512((__m512i *) hq_a_, bsw8_unbias512<SIGNED8>(hqe512, x80_512));
             const __mmask64 qf64_ = _mm512_movepi8_mask(qfire512);
             for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
                 const int base = g * 16;
@@ -3526,13 +3600,14 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
 
         exit0 = _mm512_mask_blend_epi8(tmp, exit0, zero512);
 
-        __m512i score512 = _mm512_max_epu8(maxScore512, maxRS1);
+        __m512i score512 = bsw8_max512<SIGNED8>(maxScore512, maxRS1);
         // exit0: 0xFF=alive; movepi8_mask high-bit => mask bit=1 where alive.
         __mmask64 mex0 = _mm512_movepi8_mask(exit0);
         maxScore512 = _mm512_mask_blend_epi8(mex0, maxScore512, score512);
 
-        // UNSIGNED >: signed cmpgt_epi8 mis-read scores >127 (long reads).
-        __mmask64 cmp = _mm512_cmpgt_epu8_mask(maxScore512, bmaxScore512);
+        // UNSIGNED > (signed in the biased domain): a plain signed compare of
+        // unsigned bytes mis-read scores >127 (long reads).
+        __mmask64 cmp = bsw8_cmpgt512<SIGNED8>(maxScore512, bmaxScore512);
         // y512 (best col) stays a diagonal offset captured in the best row's
         // frame; the best row itself moves to the wide xrow[] side channel.
         y512 = _mm512_mask_blend_epi8(cmp, y512, y1_512);
@@ -3571,7 +3646,9 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         // Byte-identical: when the gate is clear every store below is a no-op.
         const __mmask64 qf64 = _mm512_movepi8_mask(qfire512);
         const __mmask64 need_z = (zdrop > 0)
-            ? _mm512_test_epi8_mask(_mm512_subs_epu8(_mm512_subs_epu8(maxScore512, maxRS1), zdrop512),
+            ? _mm512_test_epi8_mask(_mm512_subs_epu8(_mm512_subs_epu8(bsw8_unbias512<SIGNED8>(maxScore512, x80_512),
+                                                                      bsw8_unbias512<SIGNED8>(maxRS1, x80_512)),
+                                                     zdrop512),
                                     ff512)
             : 0;
         const bool need_wide = !zgate_exact || (cmp | qf64 | need_z) != 0;
@@ -3586,9 +3663,9 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
             int8_t  hqe_a[SIMD_WIDTH8]      __attribute((aligned(64)));
             _mm512_store_si512((__m512i *) y1_a, y1_512);
             _mm512_store_si512((__m512i *) y_a, y512);
-            _mm512_store_si512((__m512i *) ms_a, maxScore512);
-            _mm512_store_si512((__m512i *) rs_a, maxRS1);
-            _mm512_store_si512((__m512i *) hqe_a, hqe512);
+            _mm512_store_si512((__m512i *) ms_a, bsw8_unbias512<SIGNED8>(maxScore512, x80_512));
+            _mm512_store_si512((__m512i *) rs_a, bsw8_unbias512<SIGNED8>(maxRS1, x80_512));
+            _mm512_store_si512((__m512i *) hqe_a, bsw8_unbias512<SIGNED8>(hqe512, x80_512));
             // VECTORIZED per-lane wide updates (see smithWaterman128_8) using
             // AVX-512 mask registers: 16 int32 per __m512i -> SIMD_WIDTH8/16 groups
             // of 16. Per-lane predicates (cmp/qfire/exit) are __mmask16 slices; the
@@ -3673,7 +3750,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         {
             __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
             __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp = _mm512_or_si512(f512, h512);
+            __m512i tmp = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
             __mmask64 val = _mm512_cmpeq_epi8_mask(tmp, zero512);
             if (val == dmask) nbeg = l;
             else
@@ -3685,7 +3762,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         {
             __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
             __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp = _mm512_or_si512(f512, h512);
+            __m512i tmp = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
             __mmask64 val = _mm512_cmpeq_epi8_mask(tmp, zero512);
             if (val != dmask)
                 break;
@@ -3704,7 +3781,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         {
             __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
             __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp_ = _mm512_or_si512(f512, h512);
+            __m512i tmp_ = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
             tmp_ = _mm512_or_si512(tmp_, exit1);
             __mmask64 tmp = _mm512_cmpeq_epi8_mask(tmp_, zero512);
             if (tmp == 0x00) {
@@ -3726,7 +3803,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
         {
             __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
             __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp_ = _mm512_or_si512(f512, h512);
+            __m512i tmp_ = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
             tmp_ = _mm512_or_si512(tmp_, exit1);
             __mmask64 tmp = _mm512_cmpeq_epi8_mask(tmp_, zero512);
             if (tmp == 0x00)  {
@@ -3756,7 +3833,7 @@ void BandedPairWiseSW::smithWaterman512_8(uint8_t seq1SoA[],
          * routing gate guarantees no row max ever reaches the byte ceiling; trap
          * loudly if a caller pushed an out-of-envelope pair through getScores8
          * rather than let it return a silently saturated score. */
-        assert(!_mm512_cmpge_epu8_mask(maxRS1, _mm512_set1_epi8((int8_t) BYTE_CEIL)) &&
+        assert(!_mm512_cmpge_epu8_mask(bsw8_unbias512<SIGNED8>(maxRS1, x80_512), _mm512_set1_epi8((int8_t) BYTE_CEIL)) &&
                "8-bit banded SW: row max hit the byte ceiling — pair violates "
                "bsw8_envelope_ok() and must route to the 16-bit kernel");
 #endif

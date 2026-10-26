@@ -1124,26 +1124,28 @@ jobs:
           MAKE_ARGS="arch=$arch CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" bash test/run_unit_tests.sh
 
       # The unit binary above is built at the row's floor (AVX2), so the
-      # AVX-512BW kswv bodies (among them the signed-domain u8 FScan body that
-      # BWA3_RESCUE_USQADD selects) run in no unit test there. Where the runner
+      # AVX-512BW bodies run in no unit test there: the kswv bodies (among them
+      # the signed-domain u8 FScan body that BWA3_RESCUE_USQADD selects), the
+      # AVX-512BW 8-bit extension lane-compaction driver, its epilogue z-drop
+      # gates, and the extension kernel's signed score domain. Where the runner
       # has AVX-512BW, build the unit binary at that tier in a copy of the tree
       # (its objects must not replace the AVX2 ones the later steps use) and run
-      # the kswv suite; elsewhere report SKIP. A light PR run (CI_DEPTH, see the
-      # top of the file) reports SKIP too: the second tree is a minute of
+      # those four suites; elsewhere report SKIP. A light PR run (CI_DEPTH, see
+      # the top of the file) reports SKIP too: the second tree is a minute of
       # compile on the row that sets the workflow's wall time, and these bodies
       # change only on the kernel paths that make a PR run full. The merge
       # queue always runs it.
-      - name: kswv unit tests at the AVX-512BW tier (where the runner has it)
+      - name: AVX-512BW tier unit tests (kswv, lane compaction, z-drop gates, signed domain; where the runner has it)
         if: matrix.canonical == true
         env:
           MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
         run: |
           if [ "${CI_DEPTH:-full}" = light ]; then
-            echo "SKIP: light PR run (no kernel path changed); the merge queue runs the kswv, lane-compaction and z-drop gate unit tests at the avx512bw tier"
+            echo "SKIP: light PR run (no kernel path changed); the merge queue runs the kswv, lane-compaction, z-drop gate and signed-domain unit tests at the avx512bw tier"
             exit 0
           fi
           if ! grep -qw avx512bw /proc/cpuinfo; then
-            echo "SKIP: runner has no AVX-512BW; the kswv, lane-compaction and z-drop gate unit tests did not run at the avx512bw tier"
+            echo "SKIP: runner has no AVX-512BW; the kswv, lane-compaction, z-drop gate and signed-domain unit tests did not run at the avx512bw tier"
             exit 0
           fi
           rm -rf "$RUNNER_TEMP/avx512bw"
@@ -1164,6 +1166,11 @@ jobs:
           # The AVX-512BW 8-bit kernel's epilogue skip (and its compaction
           # driver's) must step aside for gap extends whose z-drop drift wraps.
           "$RUNNER_TEMP/avx512bw/test/bwa_mem3_tests_unit" -tc='8-bit extension z-drop gates*'
+          # The AVX-512BW 8-bit kernel's signed score domain exists only at this
+          # tier: BWA_REQUIRE_SIGNED8=1 makes a missing avx512bw tier a failure,
+          # so the signed instantiation cannot pass unexercised.
+          BWA_REQUIRE_SIGNED8=1 \
+            "$RUNNER_TEMP/avx512bw/test/bwa_mem3_tests_unit" -ts=unit/bandedswa-signed8
 
       - name: Makefile header-dependency check
         # Runs after the build because it inspects an already-built tree; on an
@@ -2650,7 +2657,7 @@ jobs:
               shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test
           fi
           if [ "$MATRIX_CANONICAL" = true ]; then
-            # The second tree of the "kswv unit tests at the AVX-512BW tier"
+            # The second tree of the "AVX-512BW tier unit tests (kswv, lane compaction, z-drop gates, signed domain; where the runner has it)"
             # step: same path and copy, so its compiles hash the same. Built
             # whether or not this runner has AVX-512BW; compiling needs only the
             # compiler.
