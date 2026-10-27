@@ -14,11 +14,11 @@
 | `BWA3_RESCUE_REPEAT` | `1` | `src/bwamem_pair.cpp` | a rescue job repeating one of the last eight filtered jobs byte for byte reads that job's result instead of being enqueued again |
 | `BWA3_RESCUE_FSCAN` | `1` | `src/kswv.cpp`, `src/rescue_band.cpp` | the 11-op kswv rescue cell in every SIMD body; 0 also selects the banded DP's original cell |
 | `BWA3_RESCUE_USQADD` | `1` | `src/kswv.cpp` | u8 kswv: one saturating add per cell instead of the biased add / subtract pair (NEON; the AVX2 and AVX-512BW FScan bodies do it in the signed H - 128 domain, at open-plus-extend sums up to 127) |
-| `BWA3_RESCUE_ROWPAIR` | `1` | `src/kswv.cpp` | NEON kswv (8- and 16-bit): sweep two target rows per pass |
+| `BWA3_RESCUE_ROWPAIR` | `1` | `src/kswv.cpp` | NEON kswv (8- and 16-bit) and the AVX-512BW u8 FScan body: sweep two target rows per pass |
 | `BWA3_RESCUE_LAZYQE` | `1` | `src/kswv.cpp` | NEON kswv two-row sweep: recover the query end after the row instead of inline |
 | `BWA3_RESCUE_SCORE2_BITS` | `1` | `src/kswv.cpp` | u8 kswv score2/te2 scan: visit only each lane's rows at or above minsc (0: walk every row) |
-| `BWA3_RESCUE_PADCOLS` | `1` | `src/kswv.cpp` | NEON u8 kswv: take the diagonal as is in a lane group's all-pad query columns, where the score is provably 0 (0: gather it) |
-| `BWA3_RESCUE_QE_REVSCAN` | `1` | `src/kswv.cpp` | NEON kswv (8- and 16-bit): rescan a query-end block last to first (0: first to last with a found mask) |
+| `BWA3_RESCUE_PADCOLS` | `1` | `src/kswv.cpp` | NEON u8 kswv and the AVX-512BW u8 signed-domain FScan bodies: take the diagonal as is in a lane group's all-pad query columns, where the score is provably 0 (0: gather it) |
+| `BWA3_RESCUE_QE_REVSCAN` | `1` | `src/kswv.cpp` | NEON kswv (8- and 16-bit) and the AVX-512BW u8 kswv: rescan a query-end block last to first (0: first to last with a found mask) |
 | `BWA3_RESCUE_BAND` | `1` | `src/rescue_band.cpp` | run rescue jobs as diagonal bands (NEON or AVX2 kernel) |
 | `BWA3_RESCUE_BAND_COST` | `auto` | `src/rescue_band.cpp` | band a pass-0 parent iff its band cells cost less than this % of the hull's; auto is 0 (no pass-0 banding) where kswv runs at the AVX-512BW tier, whose 64-lane hull undercuts the 32-lane band kernel, 100 on aarch64 (NEON), else 85 |
 | `BWA3_RESCUE_BAND_R2` | `1` | `src/rescue_band.cpp` | run round 2 banded (0: kswv on the hull) |

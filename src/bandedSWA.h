@@ -269,6 +269,16 @@ typedef struct dnaSeqPair
     // (default; the kernels never read this field, so it does not perturb
     // the non-meth getScores8/16 results — proven by the unchanged goldens).
     int8_t meth_hyp = -1;
+    // Certified probe rung's band (ungapped_analyze_pb's probe band): equal to
+    // tight_band on a TIGHT pair, and also set on non-HIT pairs with
+    // FP_TIGHT_MAX < len2 <= FP_N_MAX, whose tight_band stays 0 for the
+    // --adaptive-band ladder. Read only by bsw_tb_probe_rung, which uses it to pick
+    // a bucket width and certifies at that width, so it never decides output. 0
+    // means "no bound"; FP_PROBE_BAND_NUM0 (negative, ungapped_ext.h) marks a non-HIT
+    // pair whose band numerator is <= 0 (tight_band 0), which the rung probes at its
+    // clip slack. Saturated to INT16_MAX (sits in the struct's tail padding;
+    // any band past the rung's 30-wide cap is ineligible either way).
+    int16_t probe_band = 0;
 }SeqPair;
 
 

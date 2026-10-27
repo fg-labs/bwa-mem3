@@ -658,12 +658,133 @@ static void stream_disarm(worker_t &w)
     w.emit_prefix_ctx = NULL;
 }
 
-ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, worker_t &w)
-{
-    ktp_aux_t *aux = (ktp_aux_t*) shared;
-    ktp_data_t *ret = (ktp_data_t*) data;
+/* main_mem's query inputs, opened by mem_open_inputs. MEM_IN_GZ1/2: gzdopen
+ * failed on the file's descriptor (--legacy-reader). */
+enum { MEM_IN_OK = 0, MEM_IN_OPEN1, MEM_IN_READER1, MEM_IN_GZ1, MEM_IN_OPEN2, MEM_IN_READER2,
+       MEM_IN_GZ2 };
 
-    if (step == 0)
+typedef struct {
+    ktp_aux_t  *aux;
+    const char *fn1, *fn2;     /* the query files; fn2 NULL when there is one */
+    void       *ko, *ko2;
+    gzFile      fp, fp2;       /* --legacy-reader only */
+    int         err;           /* MEM_IN_*: which step failed */
+    const char *fr_err;        /* the fast reader's reason, for MEM_IN_READER1/2 */
+    int         pe_ignored;    /* -p with a second file: it is ignored */
+} mem_inputs_t;
+
+/* Open the query files and their readers into aux, and set MEM_F_PE for a
+ * second file. On a failure everything opened here is closed again and err
+ * names the step; the caller reports it. Prints nothing, because it may run on
+ * the prefetch thread while the index loads: the caller prints the error and
+ * the -p warning after the load, where main_mem always printed them. */
+static void mem_open_inputs(mem_inputs_t *in)
+{
+    ktp_aux_t *aux = in->aux;
+    int fd = -1, fd2 = -1;
+    in->ko = kopen(in->fn1, &fd);
+    if (in->ko == 0) { in->err = MEM_IN_OPEN1; return; }
+    if (aux->legacy_reader) {
+        in->fp = gzdopen(fd, "r");
+        if (in->fp == NULL) {
+            close(fd);   // gzdopen failed, so nothing else owns fd; kclose does not close it
+            kclose(in->ko);
+            in->err = MEM_IN_GZ1;
+            return;
+        }
+        aux->ks = kseq_init(in->fp);
+    } else {
+        aux->fr1 = fast_reader_dopen(fd, &in->fr_err);
+        if (aux->fr1 == NULL) {
+            kclose(in->ko);
+            in->err = MEM_IN_READER1;
+            return;
+        }
+        aux->frks = fast_kseq_init(aux->fr1);
+    }
+
+    // PAIRED_END
+    /* Handling Paired-end reads */
+    aux->ks2 = 0;
+    if (in->fn2 == NULL) return;
+    if (aux->opt->flag & MEM_F_PE) { in->pe_ignored = 1; return; }
+    in->ko2 = kopen(in->fn2, &fd2);
+    if (in->ko2 == 0) {
+        // kclose(ko) below owns and frees the handle; a free(ko) here
+        // would make that a use-after-free + double free.
+        if (aux->legacy_reader) { err_gzclose(in->fp); kseq_destroy(aux->ks); }
+        else { fast_kseq_destroy(aux->frks); fast_reader_close(aux->fr1); }
+        kclose(in->ko);
+        in->err = MEM_IN_OPEN2;
+        return;
+    }
+    if (aux->legacy_reader) {
+        in->fp2 = gzdopen(fd2, "r");
+        if (in->fp2 == NULL) {
+            err_gzclose(in->fp); kseq_destroy(aux->ks);
+            kclose(in->ko);
+            close(fd2);   // gzdopen failed, so nothing else owns fd2; kclose does not close it
+            kclose(in->ko2);
+            in->err = MEM_IN_GZ2;
+            return;
+        }
+        aux->ks2 = kseq_init(in->fp2);
+    } else {
+        aux->fr2 = fast_reader_dopen(fd2, &in->fr_err);
+        if (aux->fr2 == NULL) {
+            fast_kseq_destroy(aux->frks); fast_reader_close(aux->fr1);
+            kclose(in->ko); kclose(in->ko2);
+            in->err = MEM_IN_READER2;
+            return;
+        }
+        aux->frks2 = fast_kseq_init(aux->fr2);
+    }
+    aux->opt->flag |= MEM_F_PE;
+}
+
+/* First-slice prefetch. main_mem fixes task_size and the cohort-slice settings
+ * before it loads the index, then opens the inputs and runs the first read
+ * step on a helper thread (preread_main) while the index loads, and joins it
+ * right after. Opening and reading use only the options, the readers and those
+ * settings: main_mem sets them all before the thread starts, and the thread is
+ * their only user until the join, so the slice is the one the pipeline would
+ * have read itself: same request, same boundary, same order. The pipeline's
+ * first read step returns it (preread_take). That call is the first step-0
+ * call of the run: worker 0 takes step 0 first, and step 0 runs one worker at
+ * a time (ktp_worker).
+ *
+ * Everything else the read step does is put off to preread_take, so that what
+ * a run prints, writes and exits with is unchanged:
+ *  - its stderr lines (the read step's own and bseq_read_fast's warnings) are
+ *    held back on a bseq_diag_t and printed there, in order;
+ *  - a malformed first record does not exit during the index load, before the
+ *    SAM header is written: bseq_read_fast holds the error back and returns no
+ *    reads, and preread_take raises it with the same message;
+ *  - the read-memo pre-pass on a whole first cohort (an input that fits in the
+ *    first slice) runs there, on the pipeline thread, as before. Its module map
+ *    is a C++ static, and when the index load fails the main thread calls
+ *    exit() while this thread may still be running (or blocked on a quiet
+ *    stdin); the thread must not touch anything exit() tears down.
+ * Only the fast reader reads ahead: --legacy-reader's reader prints and exits
+ * on its own, so with it the thread only opens the inputs and the pipeline
+ * reads the first slice, as before. */
+typedef struct {
+    mem_inputs_t *in;
+    ktp_data_t   *ret;      /* the first read step's item; NULL at clean EOF */
+    bseq_diag_t   diag;     /* its stderr lines and any input error, held back */
+    int           read;     /* the read step ran */
+    int           memo;     /* the read-memo pre-pass is due on ret */
+    int           pending;  /* joined, and ret not yet handed to the pipeline */
+} preread_t;
+
+/* The pipeline's read step (step 0): read the next slice, or the next whole
+ * cohort, into a new item. With pr (the first-slice prefetch, on its thread,
+ * with pr->diag installed), a held-back input error abandons the read (NULL)
+ * and the read-memo pre-pass is left to preread_take (pr->memo). Its stderr
+ * lines go through bseq_diag_printf, which prints them at once on the
+ * pipeline's threads. */
+static ktp_data_t *kt_read_step(ktp_aux_t *aux, preread_t *pr)
+{
     {
         ktp_data_t *ret = (ktp_data_t *) calloc(1, sizeof(ktp_data_t));
         xassert(ret != NULL, "out of memory: ret");
@@ -794,6 +915,11 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         ret->seqs = aux->legacy_reader
             ? bseq_read_orig(slice_target, &ret->n_seqs, aux->ks, aux->ks2, &sz, &ret->read_arena)
             : bseq_read_fast(slice_target, &ret->n_seqs, aux->frks, aux->frks2, &sz, &ret->read_arena, aux->copy_comment);
+        if (pr != NULL && pr->diag.fatal) {
+            /* A malformed record, held back: preread_take raises it. */
+            free(ret);
+            return NULL;
+        }
         aux->cohort_arena = ret->read_arena;
 
         /* A short read means the input ran out, which ends the cohort early. */
@@ -852,12 +978,12 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
          * at the first whole-record boundary at or past the request, so delivered
          * and requested differ). */
         if (slice_target != aux->task_size)
-            fprintf(stderr, "[0000] read_chunk: %lld, slice: %lld, work_chunk_size: %lld, nseq: %d%s\n",
+            bseq_diag_printf("[0000] read_chunk: %lld, slice: %lld, work_chunk_size: %lld, nseq: %d%s\n",
                     (long long)aux->task_size, (long long)slice_target,
                     (long long)sz, ret->n_seqs,
                     ret->cohort_complete ? "" : " (cohort slice)");
         else
-            fprintf(stderr, "[0000] read_chunk: %lld, work_chunk_size: %lld, nseq: %d%s\n",
+            bseq_diag_printf("[0000] read_chunk: %lld, work_chunk_size: %lld, nseq: %d%s\n",
                     (long long)aux->task_size, (long long)sz, ret->n_seqs,
                     ret->cohort_complete ? "" : " (cohort slice)");
 
@@ -975,8 +1101,10 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             int64_t size = 0;
             for (int i = 0; i < ret->n_seqs; ++i) size += ret->seqs[i].l_seq;
 
-            fprintf(stderr, "\t[0000][ M::%s] read %d sequences (%ld bp)...\n",
-                    __func__, ret->n_seqs, (long)size);
+            /* Named for kt_pipeline, as before the read step became its own
+             * function, so the line reads the same. */
+            bseq_diag_printf("\t[0000][ M::%s] read %d sequences (%ld bp)...\n",
+                             "kt_pipeline", ret->n_seqs, (long)size);
         }
 
         /* [dedup-reads] Run the read-memo pre-pass here, on the read step, for an
@@ -999,15 +1127,78 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
          * (flag, meth_mode: fixed for the run). */
         if (ret->cohort_complete && !mid_cohort && !(aux->opt->flag & MEM_F_SMARTPE)
             && mem_read_memo_prepass_eligible(aux->opt, ret->n_seqs)) {
-            ret->memo.r = read_memo_prepass(aux->opt, ret->seqs, ret->n_seqs, &ret->memo.st);
-            ret->has_memo = 1;
-            /* read_wall was sampled above; extend it over the pre-pass, which
-             * is now part of the read step's serial time. */
-            if (sp_enabled()) ret->prof.read_wall = sp_wall() - sp_r0;
+            if (pr != NULL) {
+                pr->memo = 1;
+            } else {
+                ret->memo.r = read_memo_prepass(aux->opt, ret->seqs, ret->n_seqs, &ret->memo.st);
+                ret->has_memo = 1;
+                /* read_wall was sampled above; extend it over the pre-pass, which
+                 * is now part of the read step's serial time. */
+                if (sp_enabled()) ret->prof.read_wall = sp_wall() - sp_r0;
+            }
         }
 
         return ret;
     } // Step 0
+}
+
+static preread_t g_preread;
+
+static void *preread_main(void *arg)
+{
+    preread_t *pr = (preread_t *) arg;
+    mem_open_inputs(pr->in);
+    if (pr->in->err != MEM_IN_OK || pr->in->aux->legacy_reader)
+        return NULL;
+    bseq_diag_install(&pr->diag);
+    pr->ret = kt_read_step(pr->in->aux, pr);
+    bseq_diag_install(NULL);
+    pr->read = 1;
+    return NULL;
+}
+
+/* The pipeline's first read step: print what the read held back (and exit
+ * there on a malformed record, as the read itself would have), run the
+ * read-memo pre-pass if it is due, and hand over the item. */
+static ktp_data_t *preread_take(ktp_aux_t *aux)
+{
+    bseq_diag_replay(&g_preread.diag);
+    ktp_data_t *ret = g_preread.ret;
+    if (g_preread.memo) {
+        ret->memo.r = read_memo_prepass(aux->opt, ret->seqs, ret->n_seqs, &ret->memo.st);
+        ret->has_memo = 1;
+    }
+    bseq_diag_free(&g_preread.diag);
+    memset(&g_preread, 0, sizeof(g_preread));
+    return ret;
+}
+
+/* Free a prefetched item that will never reach the pipeline (an early return
+ * in main_mem after the join). A partial slice leaves its arena with the
+ * cohort (aux->cohort_arena); a cohort-completing one carries it. */
+static void preread_discard(void)
+{
+    ktp_data_t *d = g_preread.pending ? g_preread.ret : NULL;
+    if (d != NULL) {
+        ktp_aux_t *aux = g_preread.in->aux;
+        for (int i = 0; i < d->n_seqs; ++i) release_read_record(&d->seqs[i]);
+        read_arena_destroy(d->read_arena);
+        read_arena_destroy(aux->cohort_arena);
+        aux->cohort_arena = NULL;
+        free(d->seqs);
+        free(d);
+    }
+    bseq_diag_free(&g_preread.diag);
+    memset(&g_preread, 0, sizeof(g_preread));
+}
+
+ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, worker_t &w)
+{
+    ktp_aux_t *aux = (ktp_aux_t*) shared;
+    ktp_data_t *ret = (ktp_data_t*) data;
+
+    if (step == 0)
+        return g_preread.pending ? preread_take(aux) : kt_read_step(aux, NULL);
     else if (step == 1)  /* Step 2: Main processing-engine */
     {
         static int task = 0;
@@ -2090,10 +2281,12 @@ static void meth_orig_ref_free_handles(ktp_aux_t *aux)
  * Mirrors the normal end-of-function teardown exactly; safe with the
  * zero-initialized handles (ko/ko2/fp/fp2 = 0, aux memset to 0), and the PE
  * branch is guarded on the PE reader actually existing. This runs on the
- * main thread during setup, before any worker threads spawn. */
+ * main thread during setup, before any worker threads spawn and after the
+ * first-slice prefetch thread has been joined; the slice it read is dropped. */
 static void mem_close_input_readers(ktp_aux_t &aux, gzFile fp, gzFile fp2,
                                     void *ko, void *ko2)
 {
+    preread_discard();
     if (aux.legacy_reader) { kseq_destroy(aux.ks); err_gzclose(fp); }
     else { fast_kseq_destroy(aux.frks); fast_reader_close(aux.fr1); }
     kclose(ko);
@@ -2220,7 +2413,6 @@ int main_mem(int argc, char *argv[])
     mem_opt_t    *opt, opt0;
     gzFile        fp = 0, fp2 = 0;
     void         *ko = 0, *ko2 = 0;
-    int           fd, fd2;
     mem_pestat_t  pes[4];
     ktp_aux_t     aux;
     bool          is_o       = 0;
@@ -3860,6 +4052,217 @@ int main_mem(int argc, char *argv[])
         return 1;
     }
 
+    /* READS file operations: the inputs are opened by mem_open_inputs, on the
+     * first-slice prefetch thread while the index loads (preread_main), or on
+     * this thread after the load. Either way any failure is reported after the
+     * load, where it always was. */
+    mem_inputs_t in;
+    memset(&in, 0, sizeof(in));
+    in.aux = &aux;
+    in.fn1 = argv[optind + 1];
+    in.fn2 = (optind + 2 < argc) ? argv[optind + 2] : NULL;
+
+    /* The batch and cohort-slice settings. They depend only on the options, and
+     * they are fixed here, before the index load, because the first read step
+     * (preread_main) needs them. Their notices and warnings are held back
+     * (bseq_diag_printf) and printed where main_mem always printed them, after
+     * the output header. */
+    bseq_diag_t settings_notes;
+    memset(&settings_notes, 0, sizeof(settings_notes));
+    bseq_diag_install(&settings_notes);
+    if (fixed_chunk_size > 0) {
+        /* -K: the user pinned the batch size (for reproducibility) — honor it
+         * exactly, never cap. */
+        aux.task_size = fixed_chunk_size;
+    } else {
+        /* Default batch size is chunk_size (~10M bases) per thread -- byte-for-byte
+         * the same formula as bwa (fastmap.c: `opt->chunk_size * opt->n_threads`)
+         * and bwa-mem2 v2.2.1 (fastmap.cpp: same), with NO cap.
+         *
+         * A cap is tempting: at very high -t a single chunk becomes enormous
+         * (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks and the
+         * pipeline starves -- the first chunk's read and the last chunk's write
+         * overlap nothing (fill/drain). Measured on c8g.16xlarge / a
+         * 5M-read WGS slice, that costs ~1.6s of a 25.8s PROCESS() at -t 64.
+         *
+         * But capping RE-PARTITIONS THE INPUT, and the partition is not an
+         * implementation detail: mem_pestat() infers the insert-size distribution
+         * from whatever reads land in a batch (bwamem.cpp), and those percentile
+         * bounds feed pairing, mate rescue and MAPQ. Different batches => different
+         * pes => different output. Everything else in the aligner is batch-invariant
+         * (read ids come from the global n_processed counter, so the hash_64 tie
+         * breaks are stable), which makes mem_pestat the single reason a cap is
+         * observable at all -- and it is enough.
+         *
+         * A default cap of 256M therefore silently broke byte-identity with
+         * bwa/bwa-mem2 for every -t >= 26 (10M * 26 > 256M) -- ordinary production
+         * settings -- while looking safe because the benchmark aligns at -t 16,
+         * where the cap never engaged. So the cap is now OPT-IN:
+         *
+         *   default            no cap; identical batching to bwa/bwa-mem2 at any -t
+         *   --chunk-cap N      cap at N bases (0 = off)
+         *   --fast             implies --chunk-cap 256000000 (--fast already does
+         *                      not promise byte-identical output)
+         *   BWA_MEM3_CHUNK_CAP env override, for sweeps; wins over both
+         *
+         * If you want a specific batch size AND reproducibility, use -K: it pins
+         * the size exactly and is never capped (see the branch above), which also
+         * makes output independent of -t. */
+        int64_t cap = chunk_cap;
+        /* An unset or EMPTY value leaves the CLI/--fast cap alone -- atoll("") is
+         * 0, which would otherwise read as "no cap" and silently switch an
+         * explicit --chunk-cap off. A malformed value is reported rather than
+         * silently treated as 0 for the same reason: this variable changes how
+         * the input is partitioned, so a typo in it must not quietly change the
+         * output. Reported, not fatal -- unlike the --chunk-cap flag: an
+         * unusable sweep value should not stop a run when the documented
+         * default is still correct. */
+        const char *cap_env = getenv("BWA_MEM3_CHUNK_CAP");
+        if (cap_env && *cap_env) {
+            if (parse_bounded_i64(cap_env, 0, INT64_MAX, &cap) != 0)
+                bseq_diag_printf("WARNING: BWA_MEM3_CHUNK_CAP='%s' is not a "
+                                "non-negative integer; ignoring it and using "
+                                "chunk cap %lld\n", cap_env, (long long)cap);
+        }
+        int64_t scaled = (int64_t)opt->chunk_size * (int64_t)opt->n_threads;
+        aux.task_size = (cap > 0 && scaled > cap) ? cap : scaled;
+        if (cap > 0 && scaled > cap)
+            bseq_diag_printf("[M::%s] chunk cap engaged: batch %lld -> %lld bases; "
+                    "output is NOT byte-identical to bwa/bwa-mem2 at this -t\n",
+                    __func__, (long long)scaled, (long long)cap);
+    }
+    tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
+
+    /* Cohort slicing. The first batch's read overlaps nothing -- the compute
+     * pipeline has nothing to chew on until it lands -- and with the cap now
+     * opt-in that first read is `chunk_size * n_threads` bases, the largest
+     * single unhidden cost in the run. Reading the FIRST cohort as a geometric
+     * ramp lets compute start on the first slice -- cohort_ramp_first bases,
+     * 16 Mbase by default, independent of -t -- while the rest is still
+     * arriving.
+     *
+     * This does not move the cohort boundary, so mem_pestat sees exactly the
+     * read set it would have seen otherwise and the output is unchanged. See
+     * the slice-target clamp in the read step for why the boundary is preserved
+     * even though each read overshoots its request.
+     *
+     * Steady-state cohorts stay single-slice: once the pipeline is full,
+     * read(N+1) already overlaps compute(N), so slicing them would only add
+     * kt_for passes and shrink the SIMD batches for no overlap gain. */
+    {
+        int64_t slices = cohort_slices;
+        /* Validated like BWA_MEM3_CHUNK_CAP, and non-fatal for the same reason
+         * (the documented default still applies): a bare atoll turns a typo into 0,
+         * which means "no slicing" -- silently disabling the thing the variable
+         * was set to configure. An empty value leaves the CLI/default alone. */
+        const char *cs_env = getenv("BWA_MEM3_COHORT_SLICES");
+        if (cs_env && *cs_env) {
+            if (parse_bounded_i64(cs_env, 0, COHORT_SLICES_MAX, &slices) != 0)
+                bseq_diag_printf("WARNING: BWA_MEM3_COHORT_SLICES='%s' is not an "
+                                "integer in 0..%d; ignoring it and using %lld\n",
+                        cs_env, (int)COHORT_SLICES_MAX, (long long)slices);
+        }
+        /* -p re-derives pairing from adjacency across the WHOLE array
+         * (bseq_classify carries has_last state), so a slice boundary between
+         * two mates would classify them as two SEs, change n_sep[], and shift
+         * the read-id base handed to the second mem_process_seqs. Classification
+         * must therefore precede alignment, which is incompatible with aligning
+         * slices early. Fall back to un-sliced cohorts. */
+        if (opt->flag & MEM_F_SMARTPE) {
+            if (slices > 0)
+                bseq_diag_printf("[M::%s] -p (smart pairing) is incompatible with "
+                        "cohort slicing; reading each batch in one slice\n", __func__);
+            slices = 0;
+        }
+        aux.cohort_slices = slices > 0 ? slices : 0;
+        /* Stress knob for test/regression/cohort_slice_identity.sh: slice every
+         * cohort, not just the first, so a small input exercises the accumulator
+         * and the boundary clamp many times over. Deliberately env-only -- it
+         * trades throughput for coverage and is not a mode users should pick. */
+        const char *sa_env = getenv("BWA_MEM3_COHORT_SLICE_ALL");
+        aux.cohort_slice_all = (sa_env && *sa_env && strcmp(sa_env, "0") != 0) ? 1 : 0;
+        if (aux.cohort_slice_all && aux.cohort_slices > 0)
+            bseq_diag_printf("[M::%s] BWA_MEM3_COHORT_SLICE_ALL set: slicing every "
+                    "cohort (stress mode; slower)\n", __func__);
+
+        /* Ramp growth ratio. Env override for sweeps, as with the slice count.
+         * A ratio at or below 1 would shrink the ramp rather than grow it, so it
+         * cannot reach the cohort at all; that is user error, not a mode, and the
+         * default is restored rather than reading the input in equal dribbles. */
+        double ramp_ratio = cohort_ramp_ratio;
+        const char *rr_env = getenv("BWA_MEM3_COHORT_RAMP_RATIO");
+        if (rr_env && *rr_env) {
+            /* Parsed exactly like --cohort-ramp-ratio, and for the same reason:
+             * atof() accepts a prefix, so '1.5x' silently becomes 1.5 and
+             * 'abc' becomes 0.0. The 0.0 case would at least surface via the
+             * `<= 1` guard below, but as a ratio the user never typed. Only
+             * PARSEABILITY is checked here -- the `<= 1` range check stays
+             * below, shared with the CLI value, because it is a documented
+             * fallback rather than an error. */
+            if (parse_full_double(rr_env, &ramp_ratio) != 0)
+                bseq_diag_printf("WARNING: BWA_MEM3_COHORT_RAMP_RATIO='%s' is not "
+                                "a number; ignoring it and using %.2f\n",
+                        rr_env, ramp_ratio);
+        }
+        /* Spelled as the negation of the ACCEPT condition, not `<= 1.0`, so NaN
+         * lands here too: strtod("nan") parses cleanly and every comparison
+         * against NaN is false, so `<= 1.0` would wave it through as a valid
+         * ratio. It would then poison the ramp -- prev * NaN is NaN, which is
+         * neither >= task_size nor convertible to int64_t, putting the ramp back
+         * on the undefined conversion the saturation in the read step exists to
+         * avoid. A ratio that cannot grow the ramp is user error either way. */
+        if (!(ramp_ratio > 1.0)) {
+            bseq_diag_printf("[M::%s] a cohort ramp ratio of %.3f would never grow "
+                    "the ramp to the cohort; using %.2f\n",
+                    __func__, ramp_ratio, cohort_ramp_ratio_default);
+            ramp_ratio = cohort_ramp_ratio_default;
+        }
+        aux.cohort_ramp_ratio = ramp_ratio;
+
+        /* First-slice size, also env-overridable for sweeps. 0 selects the old
+         * fractional shape (task_size / ratio^depth), which is what makes an
+         * exact A/B against the pre-absolute behaviour possible; negative is
+         * meaningless, so it is treated as 0 rather than silently clamped. */
+        int64_t ramp_first = cohort_ramp_first;
+        const char *rf_env = getenv("BWA_MEM3_COHORT_RAMP_FIRST");
+        if (rf_env && *rf_env) {
+            /* Validated exactly like --cohort-ramp-first. Without this, the env
+             * spelling reintroduces the bug the flag's validation exists to
+             * prevent: atoll("16M") is 16, a positive value, so
+             * BWA_MEM3_COHORT_RAMP_FIRST=16M would silently request a SIXTEEN
+             * BYTE first slice instead of 16 Mbases. Non-fatal here, unlike the
+             * flag -- the same choice BWA_MEM3_CHUNK_CAP and
+             * BWA_MEM3_COHORT_SLICES make above. */
+            if (parse_bounded_i64(rf_env, 0, INT64_MAX, &ramp_first) != 0)
+                bseq_diag_printf("WARNING: BWA_MEM3_COHORT_RAMP_FIRST='%s' is not "
+                                "a non-negative integer number of bases; ignoring "
+                                "it and using %lld\n",
+                        rf_env, (long long)ramp_first);
+        }
+        aux.cohort_ramp_first = ramp_first > 0 ? ramp_first : 0;
+    }
+    bseq_diag_install(NULL);
+
+    /* First-slice prefetch: open the inputs and run the first read step now,
+     * on their own thread, so both overlap the index load (preread_main;
+     * joined right after the load). Not under --profile: the stage profiler is
+     * armed after the load, and the first chunk's read must be timed by it like
+     * every other. Without the thread the inputs are opened after the load and
+     * the pipeline reads the first slice itself, as before. */
+    pthread_t preread_tid;
+    int preread_started = 0;
+    {
+        int want_preread = 1;
+#ifdef STAGE_PROF
+        if (profile_path && profile_path[0]) want_preread = 0;
+#endif
+        if (want_preread) {
+            memset(&g_preread, 0, sizeof(g_preread));
+            g_preread.in = &in;
+            preread_started = (pthread_create(&preread_tid, NULL, preread_main, &g_preread) == 0);
+        }
+    }
+
     /* Load bwt2/FMI index */
     uint64_t tim = __rdtsc();
 
@@ -3890,6 +4293,26 @@ int main_mem(int argc, char *argv[])
     fprintf(stderr, "* SA compression enabled with xfactor: %d\n", 1 << (int)aux.fmi->sa_compx);
     #endif
     tprof[FMI][0] += __rdtsc() - tim;
+
+    /* The first read step has normally finished by now. Joining here, after the
+     * index timer, keeps any wait out of "Index read time"; the pipeline's
+     * first read step returns its item (preread_take). An input that failed
+     * to open is reported below, where main_mem always reported it; until
+     * then, and after, every early return closes the inputs and drops the
+     * item (mem_close_input_readers). */
+    if (preread_started) {
+        /* A join failure can leave the thread running, so bail out with _exit,
+         * as process() does for the pipeline's workers. */
+        const int join_ret = pthread_join(preread_tid, NULL);
+        if (join_ret != 0) {
+            fprintf(stderr, "[%s] pthread_join failed: %s\n", __func__, strerror(join_ret));
+            fflush(stderr);
+            _exit(EXIT_FAILURE);
+        }
+        g_preread.pending = g_preread.read;
+    } else {
+        mem_open_inputs(&in);
+    }
 
 #if SMEM_LOCKSTEP_N > 1
     /* Resolve the phase-2 SMEM lockstep width once, before the seeding workers
@@ -3946,6 +4369,7 @@ int main_mem(int argc, char *argv[])
             delete aux.fmi;
             free(opt);
             if (out_opened) fclose(aux.fp);
+            if (in.err == MEM_IN_OK) mem_close_input_readers(aux, in.fp, in.fp2, in.ko, in.ko2);
             return 1;
         }
         fprintf(stderr,
@@ -4023,98 +4447,27 @@ int main_mem(int argc, char *argv[])
         for (i = 0; i < aux.meth_orig_bns->n_seqs; ++i)
             aux.meth_orig_bns->anns[i].is_alt = 0;
 
-    /* READS file operations */
-    ko = kopen(argv[optind + 1], &fd);
-	if (ko == 0) {
-		fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 1]);
+    /* READS file operations: opened above (mem_open_inputs); report a failure
+     * here, after the index and the --meth original reference have loaded, as
+     * main_mem always has. */
+    ko = in.ko; ko2 = in.ko2; fp = in.fp; fp2 = in.fp2;
+    if (in.err != MEM_IN_OK) {
+        if (in.err == MEM_IN_OPEN1 || in.err == MEM_IN_GZ1)
+            fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, in.fn1);
+        else if (in.err == MEM_IN_OPEN2)
+            fprintf(stderr, "[E::%s] failed to open file `%s'.\n", __func__, in.fn2);
+        else if (in.err == MEM_IN_GZ2)
+            fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, in.fn2);
+        else   /* MEM_IN_READER1, MEM_IN_READER2 */
+            fprintf(stderr, "[E::%s] %s\n", __func__, in.fr_err ? in.fr_err : "failed to open input");
         free(opt);
-        if (out_opened)
-            fclose(aux.fp);
+        if (out_opened) fclose(aux.fp);
         delete aux.fmi;
-        // kclose(ko);
         return 1;
     }
-    // fp = gzopen(argv[optind + 1], "r");
-    if (aux.legacy_reader) {
-        fp = gzdopen(fd, "r");
-        if (fp == NULL) {
-            fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 1]);
-            free(opt);
-            if (out_opened) fclose(aux.fp);
-            delete aux.fmi;
-            close(fd);   // gzdopen failed, so nothing else owns fd; kclose does not close it
-            kclose(ko);
-            return 1;
-        }
-        aux.ks = kseq_init(fp);
-    } else {
-        const char *fr_err = NULL;
-        aux.fr1 = fast_reader_dopen(fd, &fr_err);
-        if (aux.fr1 == NULL) {
-            fprintf(stderr, "[E::%s] %s\n", __func__, fr_err ? fr_err : "failed to open input");
-            free(opt);
-            if (out_opened) fclose(aux.fp);
-            delete aux.fmi;
-            kclose(ko);
-            return 1;
-        }
-        aux.frks = fast_kseq_init(aux.fr1);
-    }
-
-    // PAIRED_END
-    /* Handling Paired-end reads */
-    aux.ks2 = 0;
-    if (optind + 2 < argc) {
-        if (opt->flag & MEM_F_PE) {
-            fprintf(stderr, "[W::%s] when '-p' is in use, the second query file is ignored.\n",
-                    __func__);
-        }
-        else
-        {
-            ko2 = kopen(argv[optind + 2], &fd2);
-            if (ko2 == 0) {
-                fprintf(stderr, "[E::%s] failed to open file `%s'.\n", __func__, argv[optind + 2]);
-                free(opt);
-                // kclose(ko) below owns and frees the handle; a free(ko) here
-                // would make that a use-after-free + double free.
-                if (aux.legacy_reader) { err_gzclose(fp); kseq_destroy(aux.ks); }
-                else { fast_kseq_destroy(aux.frks); fast_reader_close(aux.fr1); }
-                if (out_opened)
-                    fclose(aux.fp);
-                delete aux.fmi;
-                kclose(ko);
-                // kclose(ko2);
-                return 1;
-            }
-            if (aux.legacy_reader) {
-                fp2 = gzdopen(fd2, "r");
-                if (fp2 == NULL) {
-                    fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, argv[optind + 2]);
-                    free(opt);
-                    err_gzclose(fp); kseq_destroy(aux.ks);
-                    if (out_opened) fclose(aux.fp);
-                    delete aux.fmi; kclose(ko);
-                    close(fd2);   // gzdopen failed, so nothing else owns fd2; kclose does not close it
-                    kclose(ko2);
-                    return 1;
-                }
-                aux.ks2 = kseq_init(fp2);
-            } else {
-                const char *fr_err2 = NULL;
-                aux.fr2 = fast_reader_dopen(fd2, &fr_err2);
-                if (aux.fr2 == NULL) {
-                    fprintf(stderr, "[E::%s] %s\n", __func__, fr_err2 ? fr_err2 : "failed to open input");
-                    free(opt);
-                    fast_kseq_destroy(aux.frks); fast_reader_close(aux.fr1);
-                    if (out_opened) fclose(aux.fp);
-                    delete aux.fmi; kclose(ko); kclose(ko2);
-                    return 1;
-                }
-                aux.frks2 = fast_kseq_init(aux.fr2);
-            }
-            opt->flag |= MEM_F_PE;
-        }
-    }
+    if (in.pe_ignored)
+        fprintf(stderr, "[W::%s] when '-p' is in use, the second query file is ignored.\n",
+                __func__);
 
     /* Look up optional per-index header records (<prefix>.hdr or
      * <baseprefix>.dict) once and route them into both output paths. The
@@ -4267,177 +4620,9 @@ int main_mem(int argc, char *argv[])
     }
 #endif
 
-    if (fixed_chunk_size > 0) {
-        /* -K: the user pinned the batch size (for reproducibility) — honor it
-         * exactly, never cap. */
-        aux.task_size = fixed_chunk_size;
-    } else {
-        /* Default batch size is chunk_size (~10M bases) per thread -- byte-for-byte
-         * the same formula as bwa (fastmap.c: `opt->chunk_size * opt->n_threads`)
-         * and bwa-mem2 v2.2.1 (fastmap.cpp: same), with NO cap.
-         *
-         * A cap is tempting: at very high -t a single chunk becomes enormous
-         * (10M * 192 ~= 1.9G bases), so the input is only ~3-4 chunks and the
-         * pipeline starves -- the first chunk's read and the last chunk's write
-         * overlap nothing (fill/drain). Measured on c8g.16xlarge / a
-         * 5M-read WGS slice, that costs ~1.6s of a 25.8s PROCESS() at -t 64.
-         *
-         * But capping RE-PARTITIONS THE INPUT, and the partition is not an
-         * implementation detail: mem_pestat() infers the insert-size distribution
-         * from whatever reads land in a batch (bwamem.cpp), and those percentile
-         * bounds feed pairing, mate rescue and MAPQ. Different batches => different
-         * pes => different output. Everything else in the aligner is batch-invariant
-         * (read ids come from the global n_processed counter, so the hash_64 tie
-         * breaks are stable), which makes mem_pestat the single reason a cap is
-         * observable at all -- and it is enough.
-         *
-         * A default cap of 256M therefore silently broke byte-identity with
-         * bwa/bwa-mem2 for every -t >= 26 (10M * 26 > 256M) -- ordinary production
-         * settings -- while looking safe because the benchmark aligns at -t 16,
-         * where the cap never engaged. So the cap is now OPT-IN:
-         *
-         *   default            no cap; identical batching to bwa/bwa-mem2 at any -t
-         *   --chunk-cap N      cap at N bases (0 = off)
-         *   --fast             implies --chunk-cap 256000000 (--fast already does
-         *                      not promise byte-identical output)
-         *   BWA_MEM3_CHUNK_CAP env override, for sweeps; wins over both
-         *
-         * If you want a specific batch size AND reproducibility, use -K: it pins
-         * the size exactly and is never capped (see the branch above), which also
-         * makes output independent of -t. */
-        int64_t cap = chunk_cap;
-        /* An unset or EMPTY value leaves the CLI/--fast cap alone -- atoll("") is
-         * 0, which would otherwise read as "no cap" and silently switch an
-         * explicit --chunk-cap off. A malformed value is reported rather than
-         * silently treated as 0 for the same reason: this variable changes how
-         * the input is partitioned, so a typo in it must not quietly change the
-         * output. Reported, not fatal -- unlike the --chunk-cap flag, the index
-         * is already loaded here, and an unusable sweep value should not throw
-         * that work away when the documented default is still correct. */
-        const char *cap_env = getenv("BWA_MEM3_CHUNK_CAP");
-        if (cap_env && *cap_env) {
-            if (parse_bounded_i64(cap_env, 0, INT64_MAX, &cap) != 0)
-                fprintf(stderr, "WARNING: BWA_MEM3_CHUNK_CAP='%s' is not a "
-                                "non-negative integer; ignoring it and using "
-                                "chunk cap %lld\n", cap_env, (long long)cap);
-        }
-        int64_t scaled = (int64_t)opt->chunk_size * (int64_t)opt->n_threads;
-        aux.task_size = (cap > 0 && scaled > cap) ? cap : scaled;
-        if (cap > 0 && scaled > cap)
-            fprintf(stderr, "[M::%s] chunk cap engaged: batch %lld -> %lld bases; "
-                    "output is NOT byte-identical to bwa/bwa-mem2 at this -t\n",
-                    __func__, (long long)scaled, (long long)cap);
-    }
-    tprof[MISC][1] = opt->chunk_size = aux.actual_chunk_size = aux.task_size;
-
-    /* Cohort slicing. The first batch's read overlaps nothing -- the compute
-     * pipeline has nothing to chew on until it lands -- and with the cap now
-     * opt-in that first read is `chunk_size * n_threads` bases, the largest
-     * single unhidden cost in the run. Reading the FIRST cohort as a geometric
-     * ramp lets compute start on the first slice -- cohort_ramp_first bases,
-     * 16 Mbase by default, independent of -t -- while the rest is still
-     * arriving.
-     *
-     * This does not move the cohort boundary, so mem_pestat sees exactly the
-     * read set it would have seen otherwise and the output is unchanged. See
-     * the slice-target clamp in the read step for why the boundary is preserved
-     * even though each read overshoots its request.
-     *
-     * Steady-state cohorts stay single-slice: once the pipeline is full,
-     * read(N+1) already overlaps compute(N), so slicing them would only add
-     * kt_for passes and shrink the SIMD batches for no overlap gain. */
-    {
-        int64_t slices = cohort_slices;
-        /* Validated like BWA_MEM3_CHUNK_CAP, and non-fatal for the same reason
-         * (the index is already loaded here): a bare atoll turns a typo into 0,
-         * which means "no slicing" -- silently disabling the thing the variable
-         * was set to configure. An empty value leaves the CLI/default alone. */
-        const char *cs_env = getenv("BWA_MEM3_COHORT_SLICES");
-        if (cs_env && *cs_env) {
-            if (parse_bounded_i64(cs_env, 0, COHORT_SLICES_MAX, &slices) != 0)
-                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_SLICES='%s' is not an "
-                                "integer in 0..%d; ignoring it and using %lld\n",
-                        cs_env, (int)COHORT_SLICES_MAX, (long long)slices);
-        }
-        /* -p re-derives pairing from adjacency across the WHOLE array
-         * (bseq_classify carries has_last state), so a slice boundary between
-         * two mates would classify them as two SEs, change n_sep[], and shift
-         * the read-id base handed to the second mem_process_seqs. Classification
-         * must therefore precede alignment, which is incompatible with aligning
-         * slices early. Fall back to un-sliced cohorts. */
-        if (opt->flag & MEM_F_SMARTPE) {
-            if (slices > 0)
-                fprintf(stderr, "[M::%s] -p (smart pairing) is incompatible with "
-                        "cohort slicing; reading each batch in one slice\n", __func__);
-            slices = 0;
-        }
-        aux.cohort_slices = slices > 0 ? slices : 0;
-        /* Stress knob for test/regression/cohort_slice_identity.sh: slice every
-         * cohort, not just the first, so a small input exercises the accumulator
-         * and the boundary clamp many times over. Deliberately env-only -- it
-         * trades throughput for coverage and is not a mode users should pick. */
-        const char *sa_env = getenv("BWA_MEM3_COHORT_SLICE_ALL");
-        aux.cohort_slice_all = (sa_env && *sa_env && strcmp(sa_env, "0") != 0) ? 1 : 0;
-        if (aux.cohort_slice_all && aux.cohort_slices > 0)
-            fprintf(stderr, "[M::%s] BWA_MEM3_COHORT_SLICE_ALL set: slicing every "
-                    "cohort (stress mode; slower)\n", __func__);
-
-        /* Ramp growth ratio. Env override for sweeps, as with the slice count.
-         * A ratio at or below 1 would shrink the ramp rather than grow it, so it
-         * cannot reach the cohort at all; that is user error, not a mode, and the
-         * default is restored rather than reading the input in equal dribbles. */
-        double ramp_ratio = cohort_ramp_ratio;
-        const char *rr_env = getenv("BWA_MEM3_COHORT_RAMP_RATIO");
-        if (rr_env && *rr_env) {
-            /* Parsed exactly like --cohort-ramp-ratio, and for the same reason:
-             * atof() accepts a prefix, so '1.5x' silently becomes 1.5 and
-             * 'abc' becomes 0.0. The 0.0 case would at least surface via the
-             * `<= 1` guard below, but as a ratio the user never typed. Only
-             * PARSEABILITY is checked here -- the `<= 1` range check stays
-             * below, shared with the CLI value, because it is a documented
-             * fallback rather than an error. */
-            if (parse_full_double(rr_env, &ramp_ratio) != 0)
-                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_RAMP_RATIO='%s' is not "
-                                "a number; ignoring it and using %.2f\n",
-                        rr_env, ramp_ratio);
-        }
-        /* Spelled as the negation of the ACCEPT condition, not `<= 1.0`, so NaN
-         * lands here too: strtod("nan") parses cleanly and every comparison
-         * against NaN is false, so `<= 1.0` would wave it through as a valid
-         * ratio. It would then poison the ramp -- prev * NaN is NaN, which is
-         * neither >= task_size nor convertible to int64_t, putting the ramp back
-         * on the undefined conversion the saturation in the read step exists to
-         * avoid. A ratio that cannot grow the ramp is user error either way. */
-        if (!(ramp_ratio > 1.0)) {
-            fprintf(stderr, "[M::%s] a cohort ramp ratio of %.3f would never grow "
-                    "the ramp to the cohort; using %.2f\n",
-                    __func__, ramp_ratio, cohort_ramp_ratio_default);
-            ramp_ratio = cohort_ramp_ratio_default;
-        }
-        aux.cohort_ramp_ratio = ramp_ratio;
-
-        /* First-slice size, also env-overridable for sweeps. 0 selects the old
-         * fractional shape (task_size / ratio^depth), which is what makes an
-         * exact A/B against the pre-absolute behaviour possible; negative is
-         * meaningless, so it is treated as 0 rather than silently clamped. */
-        int64_t ramp_first = cohort_ramp_first;
-        const char *rf_env = getenv("BWA_MEM3_COHORT_RAMP_FIRST");
-        if (rf_env && *rf_env) {
-            /* Validated exactly like --cohort-ramp-first. Without this, the env
-             * spelling reintroduces the bug the flag's validation exists to
-             * prevent: atoll("16M") is 16, a positive value, so
-             * BWA_MEM3_COHORT_RAMP_FIRST=16M would silently request a SIXTEEN
-             * BYTE first slice instead of 16 Mbases. Non-fatal here, unlike the
-             * flag, because the index is already loaded by this point -- same
-             * choice BWA_MEM3_CHUNK_CAP and BWA_MEM3_COHORT_SLICES make above. */
-            if (parse_bounded_i64(rf_env, 0, INT64_MAX, &ramp_first) != 0)
-                fprintf(stderr, "WARNING: BWA_MEM3_COHORT_RAMP_FIRST='%s' is not "
-                                "a non-negative integer number of bases; ignoring "
-                                "it and using %lld\n",
-                        rf_env, (long long)ramp_first);
-        }
-        aux.cohort_ramp_first = ramp_first > 0 ? ramp_first : 0;
-    }
+    /* The batch and cohort-slice notices, held back above. */
+    bseq_diag_replay(&settings_notes);
+    bseq_diag_free(&settings_notes);
 
     /* Pipeline depth. The 3-step pipeline (read / process / write) is gated by
      * how many of those steps can run at once. With 2 workers only 2 of the 3

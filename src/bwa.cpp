@@ -40,6 +40,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kstring.h"
 #include "kvec.h"
 #include "u8vec_scratch.h"
+#include "ext_reverse_copy.h"
 #include <string>
 
 int bwa_verbose = 3;
@@ -395,6 +396,91 @@ static inline int bwa_nm_edit(const int8_t mat[25], uint8_t r, uint8_t q, int nm
     return r != q && (!nm_from_mat || mat[r * 5 + q] < 0);
 }
 
+#if defined(__AVX2__)
+#include <immintrin.h>
+
+/* bwa_gen_cigar4's loops over an M op, 32 columns at a time (x86 at the avx2 baseline; without
+ * __AVX2__, NEON included, the scalar loops run). Bit-identical to the scalar loops: the score
+ * is the integer sum of the same mat[r*5 + q] values, the mismatches are found by the same
+ * `query != rseq` test and visited in ascending column order, so MD gets the same bytes, and NM
+ * counts the columns bwa_nm_edit counts. */
+
+/* mat[r*5 + q] for 32 columns by pshufb: `lo` holds mat[0..15], `hi` mat[16..24], and bit 4 of
+ * idx = r*5 + q picks the table. Bases are 0..4 (rseq from the 2-bit pac, the query by
+ * nst_nt4_table), so idx <= 24 and r << 2 carries nothing into the next byte. */
+struct cig_lut_t { __m256i lo, hi; };
+
+static inline cig_lut_t cig_lut_make(const int8_t mat[25])
+{
+    const __m128i lo = _mm_loadu_si128((const __m128i *) mat);
+    const __m128i hi = _mm_srli_si128(_mm_loadu_si128((const __m128i *) (mat + 9)), 7); // mat[16..24], then 0s
+    return cig_lut_t{ _mm256_broadcastsi128_si256(lo), _mm256_broadcastsi128_si256(hi) };
+}
+
+static inline __m256i cig_lut_get(const cig_lut_t &t, __m256i r, __m256i q)
+{
+    const __m256i idx = _mm256_add_epi8(_mm256_add_epi8(_mm256_slli_epi16(r, 2), r), q);
+    // blendv reads bit 7 of each byte, which the 16-bit shift fills from bit 4 of the same byte
+    return _mm256_blendv_epi8(_mm256_shuffle_epi8(t.lo, idx), _mm256_shuffle_epi8(t.hi, idx),
+                              _mm256_slli_epi16(idx, 3));
+}
+
+// acc (8 int32 lanes) += the 32 signed bytes of v
+static inline __m256i cig_acc(__m256i acc, __m256i v)
+{
+    const __m256i s16 = _mm256_maddubs_epi16(_mm256_set1_epi8(1), v); // byte pairs, |sum| <= 256
+    return _mm256_add_epi32(acc, _mm256_madd_epi16(s16, _mm256_set1_epi16(1)));
+}
+
+static inline int cig_hsum(__m256i acc)
+{
+    __m128i s = _mm_add_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4e));
+    s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xb1));
+    return _mm_cvtsi128_si32(s);
+}
+
+// columns whose query and reference bytes differ, as a lane mask
+static inline uint32_t cig_mismatch(__m256i q, __m256i r)
+{
+    return ~(uint32_t) _mm256_movemask_epi8(_mm256_cmpeq_epi8(q, r));
+}
+
+/* Calls f(qv, rv, keep, keepv, base) over columns [0, len) of an M op whose query starts at q
+ * (q_before bytes of the query before it, q_after from it to the query's end) and whose reference
+ * starts at r (r_before bytes before it). Lane j of a call is column base + j; keep (a lane mask)
+ * and keepv (0xff bytes) hold the lanes that are columns of the op not visited before. Full blocks
+ * of 32 come first; the last len % 32 columns are one load ending at len when both sides have the
+ * bytes before it, else one load from the remainder's start when the query has 32 bytes from
+ * there (the reference always has: bwa_gen_cigar4 keeps 64 bytes of headroom past rlen). Returns
+ * the columns visited, len unless a short op near the buffers' ends leaves the rest to a scalar
+ * loop. */
+template <class F>
+static inline int cig_blocks(const uint8_t *q, const uint8_t *r, int len, int q_before, int q_after, int r_before, F &&f)
+{
+    const __m256i all = _mm256_set1_epi8(-1);
+    int i = 0;
+    for (; i + 32 <= len; i += 32)
+        f(_mm256_loadu_si256((const __m256i *) (q + i)), _mm256_loadu_si256((const __m256i *) (r + i)), 0xffffffffu, all, i);
+    const int rem = len - i;
+    if (rem == 0) return len;
+    const __m256i iota = _mm256_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+                                          16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31);
+    if (q_before + len >= 32 && r_before + len >= 32) { // lanes 32 - rem .. 31 are new
+        const int b = len - 32;
+        f(_mm256_loadu_si256((const __m256i *) (q + b)), _mm256_loadu_si256((const __m256i *) (r + b)),
+          ~0u << (32 - rem), _mm256_cmpgt_epi8(iota, _mm256_set1_epi8((char) (31 - rem))), b);
+        return len;
+    }
+    if (q_after - i >= 32) { // lanes 0 .. rem - 1
+        f(_mm256_loadu_si256((const __m256i *) (q + i)), _mm256_loadu_si256((const __m256i *) (r + i)),
+          (1u << rem) - 1, _mm256_cmpgt_epi8(_mm256_set1_epi8((char) rem), iota), i);
+        return len;
+    }
+    return i;
+}
+#endif
+
 /* Generate CIGAR when the alignment end points are known.
  *
  * MD (built when `want_md`) lists every column whose bases differ literally
@@ -420,7 +506,10 @@ static inline int bwa_nm_edit(const int8_t mat[25], uint8_t r, uint8_t q, int nm
 uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
 {
     uint32_t *cigar = 0;
-    uint8_t tmp, *rseq;
+    uint8_t *rseq;
+#if !defined(__AVX2__)
+    uint8_t tmp; // the scalar reversals' swap byte
+#endif
     int i;
     int64_t rlen;
     kstring_t str;
@@ -438,10 +527,16 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     }
     if (re - rb != rlen) goto ret_gen_cigar; // possible if out of range
     if (rb >= l_pac) { // then reverse both query and rseq; this is to ensure indels to be placed at the leftmost position
+#if defined(__AVX2__)
+        // 32-byte blocks from both ends (ext_reverse_copy.h); clang 19 leaves the swap loops scalar
+        ext_reverse_inplace_avx2(query, l_query);
+        ext_reverse_inplace_avx2(rseq, rlen);
+#else
         for (i = 0; i < l_query>>1; ++i)
             tmp = query[i], query[i] = query[l_query - 1 - i], query[l_query - 1 - i] = tmp;
         for (i = 0; i < rlen>>1; ++i)
             tmp = rseq[i], rseq[i] = rseq[rlen - 1 - i], rseq[rlen - 1 - i] = tmp;
+#endif
     }
     /* No gap, so no DP: an equal-length region whose band is 0 (below), or one whose
      * certified band is 0 (bwa_global_cert_band: every gapped path scores below the
@@ -487,16 +582,49 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             }
             if (!want_md && NM && n_cigar) {
                 // the NM walk below over the one M op, fused into the score loop
-                int n_mm = 0;
-                for (i = 0, *score = 0; i < l_query; ++i) {
-                    *score += mat[rseq[i]*5 + query[i]];
+                int n_mm = 0, sc = 0;
+                i = 0;
+#if defined(__AVX2__)
+                {
+                    const cig_lut_t lut = cig_lut_make(mat);
+                    __m256i acc = _mm256_setzero_si256();
+                    i = cig_blocks(query, rseq, l_query, 0, l_query, 0,
+                                   [&](__m256i qv, __m256i rv, uint32_t keep, __m256i keepv, int) {
+                        const __m256i v = cig_lut_get(lut, rv, qv);
+                        acc = cig_acc(acc, _mm256_and_si256(v, keepv));
+                        uint32_t ed = cig_mismatch(qv, rv) & keep;
+                        if (nm_from_mat) ed &= (uint32_t) _mm256_movemask_epi8(v); // mat[r*5 + q] < 0
+                        n_mm += __builtin_popcount(ed);
+                    });
+                    sc = cig_hsum(acc);
+                }
+#endif
+                for (; i < l_query; ++i) {
+                    sc += mat[rseq[i]*5 + query[i]];
                     n_mm += bwa_nm_edit(mat, rseq[i], query[i], nm_from_mat);
                 }
+                *score = sc;
                 *NM = n_mm;
                 goto reverse_back;
             }
-            for (i = 0, *score = 0; i < l_query; ++i)
-                *score += mat[rseq[i]*5 + query[i]];
+            {
+                int sc = 0;
+                i = 0;
+#if defined(__AVX2__)
+                {
+                    const cig_lut_t lut = cig_lut_make(mat);
+                    __m256i acc = _mm256_setzero_si256();
+                    i = cig_blocks(query, rseq, l_query, 0, l_query, 0,
+                                   [&](__m256i qv, __m256i rv, uint32_t, __m256i keepv, int) {
+                        acc = cig_acc(acc, _mm256_and_si256(cig_lut_get(lut, rv, qv), keepv));
+                    });
+                    sc = cig_hsum(acc);
+                }
+#endif
+                for (; i < l_query; ++i)
+                    sc += mat[rseq[i]*5 + query[i]];
+                *score = sc;
+            }
         } else {
             // NW alignment
             if (bwa_verbose >= 4) {
@@ -509,10 +637,22 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     } // ungapped / NW block
     if (NM && n_cigar && !want_md) { // compute NM only: the MD walk below without the appends
         int k, x, y, n_mm = 0, n_gap = 0;
+#if defined(__AVX2__)
+        const cig_lut_t lut = cig_lut_make(mat);
+#endif
         for (k = 0, x = y = 0; k < *n_cigar; ++k) {
             int op = cigar[k]&0xf, len = cigar[k]>>4;
             if (op == 0) { // match
-                for (i = 0; i < len; ++i)
+                i = 0;
+#if defined(__AVX2__)
+                i = cig_blocks(query + x, rseq + y, len, x, l_query - x, y,
+                               [&](__m256i qv, __m256i rv, uint32_t keep, __m256i, int) {
+                    uint32_t ed = cig_mismatch(qv, rv) & keep;
+                    if (nm_from_mat) ed &= (uint32_t) _mm256_movemask_epi8(cig_lut_get(lut, rv, qv)); // mat[r*5 + q] < 0
+                    n_mm += __builtin_popcount(ed);
+                });
+#endif
+                for (; i < len; ++i)
                     n_mm += bwa_nm_edit(mat, rseq[y + i], query[x + i], nm_from_mat);
                 x += len; y += len;
             } else if (op == 2) { // deletion
@@ -530,6 +670,26 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             cigar = (uint32_t*)str.s;
             op  = cigar[k]&0xf, len = cigar[k]>>4;
             if (op == 0) { // match
+#if defined(__AVX2__)
+                // each mismatch p: the u matches since the last edit, then its reference base
+                int last = 0; // the op's columns before `last` are in u or already written
+                auto put_mismatch = [&](int p) {
+                    u += p - last;
+                    kputw(u, &str);
+                    kputc(int2base[rseq[y + p]], &str);
+                    u = 0; last = p + 1;
+                    /* NM increment; see the nm_from_mat contract above */
+                    n_mm += bwa_nm_edit(mat, rseq[y + p], query[x + p], nm_from_mat);
+                };
+                i = cig_blocks(query + x, rseq + y, len, x, l_query - x, y,
+                               [&](__m256i qv, __m256i rv, uint32_t keep, __m256i, int base) {
+                    for (uint32_t m = cig_mismatch(qv, rv) & keep; m; m &= m - 1)
+                        put_mismatch(base + __builtin_ctz(m));
+                });
+                for (; i < len; ++i)
+                    if (query[x + i] != rseq[y + i]) put_mismatch(i);
+                u += len - last;
+#else
                 for (i = 0; i < len; ++i) {
                     if (query[x + i] != rseq[y + i]) {
                         kputw(u, &str);
@@ -539,6 +699,7 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                         n_mm += bwa_nm_edit(mat, rseq[y + i], query[x + i], nm_from_mat);
                     } else ++u;
                 }
+#endif
                 x += len; y += len;
             } else if (op == 2) { // deletion
                 if (k > 0 && k < *n_cigar - 1) { // don't do the following if D is the first or the last CIGAR
@@ -555,9 +716,14 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
         cigar = (uint32_t*)str.s;
     }
 reverse_back:
-    if (rb >= l_pac) // reverse back query
+    if (rb >= l_pac) { // reverse back query
+#if defined(__AVX2__)
+        ext_reverse_inplace_avx2(query, l_query);
+#else
         for (i = 0; i < l_query>>1; ++i)
             tmp = query[i], query[i] = query[l_query - 1 - i], query[l_query - 1 - i] = tmp;
+#endif
+    }
 
 ret_gen_cigar:
     /* rseq aliases thread-local kvec scratch in this function; do not free. */

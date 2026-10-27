@@ -31,8 +31,14 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "macro.h"
 #include <stdint.h>
 #include <assert.h>
+#include <time.h>       /* clock_gettime, nanosleep: proc_freq */
 #include "bwa.h"        /* bwa_verbose: gates the per-category UGP histograms */
 #include "profiling.h"
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include "simd_compat.h" /* __rdtsc: sse2neon's _rdtsc (CNTVCT_EL0) */
+#else
+#include <x86intrin.h>   /* __rdtsc */
+#endif
 
 // Profiling globals. Defined here rather than in main.cpp so they are part of
 // libbwa.a and visible to consumers that link the library without pulling in
@@ -40,6 +46,107 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 uint64_t proc_freq = 0;
 alignas(64) tprof_row_t tprof[LIM_R] = {};
 uint64_t prof[LIM_R] = {0};
+
+// The __rdtsc() tick rate is measured against CLOCK_MONOTONIC over a window,
+// dividing the ticks by the wall time that clock reports for the same window.
+// Both clocks track wall time -- the TSC is invariant on every x86-64 this
+// targets, and __rdtsc() reads the fixed-rate CNTVCT_EL0 on arm64 -- so the
+// residual error is the nanosecond-scale cost of the counter reads spread over
+// the window, far below the precision the timing reports claim.
+//
+// The window is the run itself: proc_freq_mark_start() opens it at the top of
+// main() and proc_freq_resolve() closes it when a report first reads the rate.
+// proc_freq is read by nothing during the run, only by those end-of-run
+// reports, so no process sleeps before doing its work. The run's window is also
+// the longer one: seconds for an alignment rather than milliseconds.
+//
+// History: this was `tim = __rdtsc(); sleep(1); proc_freq = __rdtsc() - tim;`
+// in main(), a full second of wall time on EVERY invocation (run_unit_tests.sh
+// spent ~60 s of its 74 s asleep), then a 5 ms nanosleep() window, still paid
+// up front by every process. A sleeping core sits at its lowest P-state, so on
+// parts whose TSC is *not* invariant a sleep measured precisely the frequency
+// the aligner never runs at, where the run's own window averages over the
+// frequencies the run ran at.
+static struct timespec proc_freq_t0 = {0, 0};
+static uint64_t proc_freq_c0 = 0;
+static int proc_freq_started = 0;
+
+void proc_freq_mark_start(void)
+{
+    struct timespec t0 = {0, 0};
+    if (clock_gettime(CLOCK_MONOTONIC, &t0) != 0) return;
+    proc_freq_c0 = __rdtsc();
+    proc_freq_t0 = t0;
+    proc_freq_started = 1;
+}
+
+// The fallback when the run's window is too short to divide by with any
+// precision, or was never opened (a library consumer that does not go through
+// main()): measure over a 5 ms sleep, doubling per retry. nanosleep() returns
+// early when a signal arrives; we divide by the *measured* elapsed time rather
+// than the requested one, so a short window is still usable -- but if it came
+// back too short, try again on a longer one.
+static uint64_t calibrate_proc_freq(void)
+{
+    const long base_window_ns = 5L * 1000 * 1000;
+    const int max_attempts = 4;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        struct timespec window = {0, base_window_ns << attempt};
+        // Zero-initialized so that a failing clock_gettime() -- which
+        // CLOCK_MONOTONIC does not do in practice, but which would
+        // otherwise leave these indeterminate -- yields elapsed == 0 and
+        // falls into the retry below rather than reading uninitialized
+        // memory and dividing by garbage.
+        struct timespec t0 = {0, 0}, t1 = {0, 0};
+
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        uint64_t c0 = __rdtsc();
+        nanosleep(&window, NULL);
+        uint64_t c1 = __rdtsc();
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+
+        double elapsed = (double)(t1.tv_sec - t0.tv_sec)
+                       + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
+        if (elapsed >= 1e-4 && c1 > c0)
+            return (uint64_t)((double)(c1 - c0) / elapsed + 0.5);
+    }
+    // Not reachable in practice (it would take max_attempts consecutive
+    // windows cut short to under 100 us). Say so on stderr rather than
+    // silently returning a bogus rate: without this, a pathological
+    // environment -- nanosleep() blocked by a seccomp filter, a process
+    // under relentless signal pressure -- would print implausible timings
+    // with nothing explaining why. stderr only, so the SAM on stdout is
+    // unaffected.
+    fprintf(stderr, "[W::%s] could not calibrate the processor tick rate in "
+                    "%d attempts; timing reports will be meaningless.\n",
+            __func__, max_attempts);
+    // Return 1 rather than 0 so the reports print implausible seconds
+    // instead of dividing by zero.
+    return 1;
+}
+
+uint64_t proc_freq_resolve(void)
+{
+    if (proc_freq != 0) return proc_freq;
+    if (proc_freq_started) {
+        // Same bracketing as the fallback: the tick reads sit inside the
+        // clock reads.
+        struct timespec t1 = {0, 0};
+        uint64_t c1 = __rdtsc();
+        if (clock_gettime(CLOCK_MONOTONIC, &t1) == 0) {
+            double elapsed = (double)(t1.tv_sec - proc_freq_t0.tv_sec)
+                           + (double)(t1.tv_nsec - proc_freq_t0.tv_nsec) * 1e-9;
+            // A window under 1 ms is shorter than the 5 ms sleep this
+            // replaced; take the sleep instead.
+            if (elapsed >= 1e-3 && c1 > proc_freq_c0) {
+                proc_freq = (uint64_t)((double)(c1 - proc_freq_c0) / elapsed + 0.5);
+                return proc_freq;
+            }
+        }
+    }
+    proc_freq = calibrate_proc_freq();
+    return proc_freq;
+}
 
 int find_opt(const tprof_row_t &a, int len, uint64_t *max, uint64_t *min, double *avg)
 {
@@ -63,6 +170,7 @@ int display_stats(int nthreads)
 {
     uint64_t max, min;
     double avg;
+    proc_freq_resolve();
     fprintf(stderr, "No. of OMP threads: %d\n", nthreads);
     fprintf(stderr, "Processor is running @%lf MHz\n", proc_freq*1.0/1e6);
     fprintf(stderr, "Runtime profile:\n");
