@@ -5068,11 +5068,9 @@ void kswv::kswvBatchWrapper16(SeqPair *pairArray,
         uint16_t tid = 0;  // no threading here.
         int16_t *mySeq1SoA = NULL;
         mySeq1SoA = seq1SoA + tid * this->maxRefLen * SIMD_WIDTH16;
-        assert(mySeq1SoA != NULL);
             
         int16_t *mySeq2SoA = NULL;
         mySeq2SoA = seq2SoA + tid * this->maxQerLen * SIMD_WIDTH16;
-        assert(mySeq1SoA != NULL);
         
         uint8_t *seq1;
         uint8_t *seq2;

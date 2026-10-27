@@ -16,6 +16,7 @@
 // must be a fatal error instead of being emitted.
 
 #include "doctest/doctest.h"
+#include "run_in_child.h"
 
 #include "bwamem.h"
 #include "meth_orig_ref_fixture.h"
@@ -27,7 +28,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -162,25 +162,7 @@ mem_aln_t make_mate(uint32_t *cigar) {
     return m;
 }
 
-/* Run `body` in a forked child with stderr and core dumps suppressed and
- * report how it terminated (as test_xassert_macro.cpp does, which explains
- * why the child restores SIGABRT's default disposition). A child that runs
- * to completion exits 0. */
-int run_in_child(void (*body)()) {
-    const pid_t pid = fork();
-    if (pid == 0) {
-        signal(SIGABRT, SIG_DFL);
-        struct rlimit no_core = {0, 0};
-        setrlimit(RLIMIT_CORE, &no_core);
-        (void)freopen("/dev/null", "w", stderr);
-        body();
-        _exit(0);
-    }
-    REQUIRE(pid > 0);
-    int status = 0;
-    REQUIRE(waitpid(pid, &status, 0) == pid);
-    return status;
-}
+using bwa_tests::run_in_child;   // forked death-test harness (run_in_child.h)
 
 /* The guard fails through err_fatal, which exits with EXIT_FAILURE; a signal
  * (a crash or a failed assert) is not the guard firing. */

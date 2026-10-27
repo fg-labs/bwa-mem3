@@ -913,7 +913,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 
         uint8_t *mySeq2SoA = NULL;
         mySeq2SoA = seq2SoA + tid * MAX_SEQ_LEN8 * SIMD_WIDTH8;
-        assert(mySeq1SoA != NULL && mySeq2SoA != NULL);
         
         uint8_t *seq1;
         uint8_t *seq2;
@@ -2836,7 +2835,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
-    assert(SIMD_WIDTH8 == 64 && SIMD_WIDTH16 == 32);
+    static_assert(SIMD_WIDTH8 == 64 && SIMD_WIDTH16 == 32, "AVX512 kernel requires 64x8-bit and 32x16-bit lanes");
     int i;
     int64_t startTick, endTick;
 
@@ -4952,7 +4951,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
         uint16_t tid = 0; 
         uint16_t *mySeq1SoA = seq1SoA + tid * MAX_SEQ_LEN16 * SIMD_WIDTH16;
         uint16_t *mySeq2SoA = seq2SoA + tid * MAX_SEQ_LEN16 * SIMD_WIDTH16;
-        assert(mySeq1SoA != NULL && mySeq2SoA != NULL);
         
         uint8_t *seq1;
         uint8_t *seq2;
@@ -6190,7 +6188,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
-    assert(SIMD_WIDTH8 == 16 && SIMD_WIDTH16 == 8);
+    static_assert(SIMD_WIDTH8 == 16 && SIMD_WIDTH16 == 8, "SSE/NEON kernel requires 16x8-bit and 8x16-bit lanes");
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
 #if defined(__aarch64__)
@@ -6276,7 +6274,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         uint16_t tid =  0; 
         uint8_t *mySeq1SoA = seq1SoA + tid * MAX_SEQ_LEN8 * SIMD_WIDTH8;
         uint8_t *mySeq2SoA = seq2SoA + tid * MAX_SEQ_LEN8 * SIMD_WIDTH8;
-        assert(mySeq1SoA != NULL && mySeq2SoA != NULL);     
         uint8_t *seq1;
         uint8_t *seq2;
         uint8_t h0[SIMD_WIDTH8]   __attribute__((aligned(64)));

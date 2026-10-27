@@ -135,16 +135,20 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	FILE *fp;
 	const char *fname;
 	bntseq_t *bns;
-	long long xx;
+	long long xx, cnt;
 	int i;
 	int scanres;
 	bns = (bntseq_t*)calloc(1, sizeof(bntseq_t));
 	xassert(bns != NULL, "out of memory: bns");
 	{ // read .ann
 		fp = xopen(fname = ann_filename, "r");
-		scanres = fscanf(fp, "%lld%d%u", &xx, &bns->n_seqs, &bns->seed);
-		assert(bns->n_seqs >= 0 && bns->n_seqs <= INT_MAX);
+		// The header counts are read as long long and range-checked before
+		// narrowing: %d into an int would wrap an oversized count to a small one.
+		scanres = fscanf(fp, "%lld%lld%u", &xx, &cnt, &bns->seed);
 		if (scanres != 3) goto badread;
+		if (xx < 0) err_fatal(__func__, "corrupt index %s: reference length %lld is negative", fname, xx);
+		if (cnt < 0 || cnt > INT_MAX) err_fatal(__func__, "corrupt index %s: sequence count %lld is out of range", fname, cnt);
+		bns->n_seqs = (int32_t)cnt;
 		bns->l_pac = xx;
 		bns->anns = (bntann1_t*)calloc(bns->n_seqs, sizeof(bntann1_t));
         // A zero-sequence .ann is degenerate but not an allocation failure:
@@ -159,15 +163,22 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 			scanres = fscanf(fp, "%u%8192s", &p->gi, str);
 			if (scanres != 2) goto badread;
 			p->name = strdup(str);
-			// read fasta comments 
+			// read fasta comments; a line longer than str keeps its first
+			// sizeof(str) - 1 characters, and the rest is skipped with a warning
+			int truncated = 0;
 			while (q - str < sizeof(str) - 1 && (c = fgetc(fp)) != '\n' && c != EOF) *q++ = c;
-			while (c != '\n' && c != EOF) c = fgetc(fp);
+			while (c != '\n' && c != EOF) {
+				c = fgetc(fp);
+				if (c != '\n' && c != EOF) truncated = 1;
+			}
 			if (c == EOF) {
 				scanres = EOF;
 				goto badread;
 			}
 			*q = 0;
-			assert(strlen(str) < 8192);
+			if (truncated)
+				fprintf(stderr, "[W::%s] %s: the comment of '%s' is longer than %d characters and was truncated\n",
+						__func__, fname, p->name, (int)sizeof(str) - 2);
 			if (q - str > 1 && strcmp(str, " (null)") != 0) p->anno = strdup(str + 1); // skip leading space
 			else p->anno = strdup("");
 			// read the rest
@@ -178,14 +189,15 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		err_fclose(fp);
 	}
 	{ // read .amb
-		int64_t l_pac;
-		int32_t n_seqs;
+		long long n_seqs;
 		fp = xopen(fname = amb_filename, "r");
-		scanres = fscanf(fp, "%lld%d%d", &xx, &n_seqs, &bns->n_holes);
-		assert(bns->n_holes >= 0 && bns->n_holes <= INT_MAX);
+		scanres = fscanf(fp, "%lld%lld%lld", &xx, &n_seqs, &cnt);
 		if (scanres != 3) goto badread;
-		l_pac = xx;
-		xassert(l_pac == bns->l_pac && n_seqs == bns->n_seqs, "inconsistent .ann and .amb files.");
+		if (cnt < 0 || cnt > INT_MAX) err_fatal(__func__, "corrupt index %s: hole count %lld is out of range", fname, cnt);
+		bns->n_holes = (int32_t)cnt;
+		if (xx != bns->l_pac || n_seqs != bns->n_seqs)
+			err_fatal(__func__, "corrupt index %s: header (%lld %lld) does not match the .ann header (%lld %d)",
+					  fname, xx, n_seqs, (long long)bns->l_pac, bns->n_seqs);
         if(bns->n_holes){
             bns->ambs = (bntamb1_t*)calloc(bns->n_holes, sizeof(bntamb1_t));
             xassert(bns->ambs != NULL, "out of memory: bns->ambs");

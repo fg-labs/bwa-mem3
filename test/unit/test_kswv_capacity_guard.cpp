@@ -26,12 +26,12 @@
 #include <csignal>
 #include <cstdint>
 #include <memory>
-#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "run_in_child.h"
 
 #include "ksw_runner.h"    // DEFAULT_GAP_OPEN / DEFAULT_GAP_EXTEND
 #include "kswv_runner.h"   // BWA_TESTS_HAVE_KSWV
@@ -59,24 +59,7 @@ bool batched_kswv_available() {
            tier == BWAMEM3_TIER_NEON;
 }
 
-// Run `body` in a forked child with stderr and core dumps suppressed; return
-// its wait status. A body that runs to completion calls _exit(0); the guard
-// firing ends the child on SIGABRT (via _err_fatal_simple_core -> abort()).
-int run_in_child(void (*body)()) {
-    const pid_t pid = fork();
-    if (pid == 0) {
-        signal(SIGABRT, SIG_DFL);
-        struct rlimit no_core = {0, 0};
-        setrlimit(RLIMIT_CORE, &no_core);
-        (void)freopen("/dev/null", "w", stderr);
-        body();
-        _exit(0);
-    }
-    REQUIRE(pid > 0);
-    int status = 0;
-    REQUIRE(waitpid(pid, &status, 0) == pid);
-    return status;
-}
+using bwa_tests::run_in_child;   // forked death-test harness (run_in_child.h)
 
 // A single ref/query pair, both `len` bases long (2-bit encoded, repeating
 // A/C/G/T so the content is well-formed for the kernel in the passing case).
