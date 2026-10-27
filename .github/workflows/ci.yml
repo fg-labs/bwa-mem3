@@ -2125,6 +2125,12 @@ jobs:
           # fast path against the code it replaces.
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/chain_flat_replay_identity.sh
+          # The rescue fixture's mate lists are below the release gate of the sorted mate-rb copy
+          # _post keeps once a rescue has changed a list; BWA_MEM3_DEBUG_RESCUE_SKIP_XCHECK indexes
+          # every list with an anchor left, so here the default leg builds and probes it, the
+          # XCHECK asserts the copy and every probed skip set, and the script requires both.
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" RESCUE_EXPECT_POST_RB_INDEX=1 \
+          bash test/regression/rescue_prune_identity.sh
 
       - name: SIMD floor enforcement (TESTING_BUILD, injected below-floor tier)
         # What happens when the binary lands on a host older than the floor it
