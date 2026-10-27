@@ -57,8 +57,8 @@ uint64_t PackedText::get_kmer(int64_t pos, int k) const
 {
     // Runtime guards (not just asserts): k > 32 would compute a negative
     // shift (62 - 2*i) and trigger UB; k <= 0 trivially returns 0. Both
-    // also kept as asserts so debug builds catch the misuse loudly while
-    // release builds (-DNDEBUG) still degrade gracefully.
+    // also kept as asserts so normal builds catch the misuse loudly, while an
+    // EXTRA_CXXFLAGS=-DNDEBUG opt-out build still degrades gracefully.
     assert(k >= 0 && k <= 32);
     assert(pos >= 0);
     if (k <= 0) return 0;

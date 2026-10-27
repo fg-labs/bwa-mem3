@@ -3,8 +3,10 @@
 # `#if`, `#ifdef`, `#ifndef` or `#elif` directive that tests NDEBUG.
 #
 # Why this is a hard error rather than a style preference: no target in this
-# build system has ever defined NDEBUG -- not the Makefile, not any workflow in
-# .github/, including the release build. So a gate written as
+# build system defines NDEBUG -- not the Makefile, not any workflow in .github/,
+# including the release build -- and the Makefile strips a -DNDEBUG that a
+# packager's CPPFLAGS injects (conda-forge's compiler activation exports one),
+# so packaged builds do not define it either. So a gate written as
 #
 #     #ifndef NDEBUG
 #         ... expensive debug-only work ...
@@ -34,8 +36,11 @@
 # whole point of that test.
 #
 # Note this lint says nothing about plain `assert()` calls, which are live in
-# every build here and are fine. `xassert()` (utils.h) remains the right guard
-# for a check that must survive a hypothetical -DNDEBUG build.
+# every build here without an explicit -DNDEBUG opt-out (or a two-token
+# `-D NDEBUG` in CPPFLAGS, which the Makefile's filter does not match),
+# packaged builds included, and are fine. `xassert()`
+# (utils.h) remains the right guard for a check that must survive an explicit
+# `make EXTRA_CXXFLAGS=-DNDEBUG` opt-out build.
 
 set -euo pipefail
 

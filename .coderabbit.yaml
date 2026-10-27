@@ -77,24 +77,35 @@ reviews:
     - path: "src/**/*.{c,cpp,h}"
       instructions: >-
         NO target in this build system defines NDEBUG — not the Makefile, not
-        any workflow, including the release build. So an `#if` / `#ifdef` /
-        `#ifndef` / `#elif` directive testing NDEBUG never compiles out of
-        anything this repository produces: the "debug-only" work runs in every
-        shipped binary while the comment claims it does not. That has bitten
-        this codebase twice (a pac-fetch poison that memset whole buffers on
-        every fetch, and a chaining cross-check that ran the O(n^2) reference
-        pass the surrounding optimization existed to skip). Flag any such gate;
+        any workflow, including the release build — and the Makefile strips a
+        -DNDEBUG that a packager's CPPFLAGS injects (conda-forge's does; only
+        the single-token spellings `-DNDEBUG` and `-DNDEBUG=<v>` are stripped,
+        so a two-token `-D NDEBUG` in CPPFLAGS still reaches the compiler).
+        Source policy therefore prohibits every `#if` / `#ifdef` / `#ifndef` /
+        `#elif` directive that tests NDEBUG. Default builds, and packaged
+        builds that inject the single-token form, leave NDEBUG undefined, so a
+        negative gate (`#ifndef NDEBUG`, `#if !defined(NDEBUG)`) keeps its
+        "debug-only" code compiled and running while the comment claims it
+        does not, and a positive gate (`#ifdef NDEBUG`) never compiles its
+        "release-only" branch; only an explicit `EXTRA_CXXFLAGS=-DNDEBUG`
+        opt-out (or an unfiltered two-token `-D NDEBUG`) flips either. The
+        negative case has bitten this codebase twice (a pac-fetch
+        poison that memset whole buffers on every fetch, and a chaining
+        cross-check that ran the O(n^2) reference pass the surrounding
+        optimization existed to skip). Flag any such gate;
         the idiom that works here is a dedicated opt-in macro, off by default
         and named in the comment (`BWA_MEM3_DEBUG_*`, `BSW8_ASSERT_ENVELOPE`,
         `BWAMEM3_UGP_PROFILE`), built with `make EXTRA_CXXFLAGS=-D<macro>`.
         test/regression/ndebug_gate_lint.sh enforces this as a hard CI error.
-        Plain `assert()` is live in every build here and is fine; `xassert(cond,
-        msg)` (src/utils.h) is the guard for a check that must survive a
-        hypothetical -DNDEBUG build — flag an allocation, bounds, or invariant
-        guard whose only enforcement is a plain `assert()` and whose failure
-        would be silent corruption rather than a crash. Also flag: malloc /
-        calloc / realloc without a null check, and `realloc` assigned back onto
-        the pointer it was passed (leaks the original on failure). House
+        Plain `assert()` is live in every build here without an explicit
+        `-DNDEBUG` opt-out (or a two-token `-D NDEBUG`, which the CPPFLAGS
+        filter does not match), packaged builds included, and is fine; `xassert(cond, msg)` (src/utils.h) is the guard
+        for a check that must survive an explicit `EXTRA_CXXFLAGS=-DNDEBUG`
+        opt-out build — flag an allocation, bounds, or invariant guard whose
+        only enforcement is a plain `assert()` and whose failure would be
+        silent corruption rather than a crash. Also flag: malloc / calloc /
+        realloc without a null check, and `realloc` assigned back onto the
+        pointer it was passed (leaks the original on failure). House
         conventions, not findings: diagnostics use a bare `ERROR:` prefix (54
         sites) with no program name, and functions are documented with leading
         `//` or `/* */` block comments rather than a docstring format — do not
@@ -442,8 +453,10 @@ reviews:
         a change to the default goal (test/regression/make_default_goal.sh); and
         changes to the default optimization or LTO flags without a stated
         reason, since published throughput numbers assume them. Nothing here may
-        define NDEBUG: the whole codebase's debug-gate policy assumes it is never
-        defined, and test/regression/ndebug_gate_lint.sh encodes that assumption.
+        define NDEBUG, and the CPPFLAGS filter must keep stripping a packager's
+        -DNDEBUG (test/regression/make_c_opt_level.sh): the whole codebase's
+        debug-gate policy assumes it is never defined, and
+        test/regression/ndebug_gate_lint.sh encodes that assumption.
     - path: ".github/workflows/**"
       instructions: >-
         Actions must be pinned by full commit SHA with the version in a trailing
@@ -502,7 +515,11 @@ reviews:
           look up: this repository and its own scripts, upstream bwa, bwa-mem2,
           bwa-meth, Bismark, samtools, htslib, libsais, mimalloc, sse2neon,
           zlib-ng, dwgsim, holodeck (the public read simulator this repository
-          already clones by URL in test/meth/test_bismark_tags.sh),
+          already clones by URL in test/meth/test_bismark_tags.sh), conda,
+          conda-forge and Bioconda (the public packaging ecosystem the README
+          and release workflow already name as bwa-mem3's distribution channel),
+          the public compilers and their toolchains (clang / LLVM, GCC, lld)
+          that benchmark and build notes cite with a version,
           release-please (the public release-automation project this repository
           already links by URL in docs/src/developer-guide/release.md and pins
           by action ref in .github/workflows/release.yml), and standard OS or

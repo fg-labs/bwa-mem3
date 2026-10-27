@@ -332,6 +332,41 @@ ifeq ($(strip $(STAGE_PROF)),1)
     CPPFLAGS += -DSTAGE_PROF=1
 endif
 
+# Drop any optimization level (-O0/-O1/-O2/-O3/-Os/-Og/-Ofast) and -DNDEBUG from
+# CPPFLAGS.
+# The aligner's own compile rules (.cpp.o, .c.o, the per-tier kernel rules) and
+# the bwa-mem3 link put $(CPPFLAGS) after $(CXXFLAGS), $(BASE_CXXFLAGS) or
+# $(SRC_CFLAGS), and the compiler takes the last -O it sees, so an -O in CPPFLAGS
+# would replace the -O3 those set (and the sanitizers' -O1 and COVERAGE_OPT), on
+# the compile lines and, with LTO, on the link line that drives LTO code
+# generation. conda-forge's compiler activation exports
+# CPPFLAGS="-DNDEBUG -D_FORTIFY_SOURCE=2 -O2", so a conda/bioconda build would
+# otherwise compile the aligner, including the SIMD kernels, at -O2. An -O level
+# is not a preprocessor flag; to change the optimization level, use
+# EXTRA_CXXFLAGS (C++) or EXTRA_CFLAGS (the C reader), which come after -O3.
+# -DNDEBUG is removed too (only the single-token spellings -DNDEBUG and
+# -DNDEBUG=<v>; a two-token `-D NDEBUG` is not matched): conda's CPPFLAGS
+# defines it, which would compile every plain assert() out of a packaged build.
+# No target here defines NDEBUG, and the sources rely on plain asserts being
+# live in every build without an explicit -DNDEBUG opt-out (see
+# test/regression/ndebug_gate_lint.sh). To build
+# bwa-mem3's own sources without them deliberately, pass
+# `make EXTRA_CXXFLAGS=-DNDEBUG` (and EXTRA_CFLAGS=-DNDEBUG for the C reader),
+# which this filter does not touch and the PGO/LTO targets forward.
+# The filter runs unconditionally, after the last `CPPFLAGS +=` above. A
+# command-line CPPFLAGS needs `override` to be rewritten (and then, as before,
+# replaces every `CPPFLAGS +=` above), and `export` so the recursive makes still
+# get it: the override drops the export a command-line variable otherwise has,
+# and lto-build clears MAKEFLAGS / MAKEOVERRIDES, which leaves the environment
+# as its sub-make's only source. An environment or makefile value is rewritten
+# in place and stays exported to the recursive makes.
+ifeq ($(origin CPPFLAGS),command line)
+    override CPPFLAGS := $(filter-out -O% -DNDEBUG -DNDEBUG=%,$(CPPFLAGS))
+    export CPPFLAGS
+else
+    CPPFLAGS := $(filter-out -O% -DNDEBUG -DNDEBUG=%,$(CPPFLAGS))
+endif
+
 # Version string for `bwa-mem3 version` and the @PG VN: field. The single
 # source of truth is `version.txt` (rewritten by release-please on each
 # release). The logic of "base version + optional git-describe dev suffix"
@@ -1723,13 +1758,13 @@ endif
 
 pgo-generate:
 	rm -f src/*.o $(BWA_LIB)
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="-fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
 	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
 	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
 	rm -f src/*.o $(BWA_LIB)
-	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="-fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
+	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
 pgo-clean:
@@ -1836,7 +1871,7 @@ lto-build:
 	  case "$$CXX_VERSION" in *clang*) LTO_FLAG=-flto=thin ;; *) LTO_FLAG=-flto=$$LTO_JOBS ;; esac; \
 	  echo "LTO_FLAG=$$LTO_FLAG (cxx: $$CXX_VERSION, arch: $(LTO_ARCH), lto-jobs: $$LTO_JOBS)"; \
 	  MAKEFLAGS= MAKEOVERRIDES= \
-	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto BWA_LTO_MODE=off EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" CXX="$(CXX)" all
+	    $(MAKE) -j1 arch=$(LTO_ARCH) EXE=bwa-mem3.lto BWA_LTO_MODE=off EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) $$LTO_FLAG -fno-semantic-interposition" EXTRA_CFLAGS="$(EXTRA_CFLAGS)" CXX="$(CXX)" all
 	@echo "LTO binary: bwa-mem3.lto (arch=$(LTO_ARCH))"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition

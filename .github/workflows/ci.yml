@@ -1207,10 +1207,16 @@ jobs:
           MAKE_ARGS="CXX=$CXX USE_MIMALLOC=$MATRIX_USE_MIMALLOC" \
             bash test/regression/make_default_goal.sh
 
-      - name: Makefile reader C TUs build at -O3
-        # Parse-time check (make -n -B on one reader object), so it needs no
-        # built tree. Pins the reader's -O level: default -O3 with -g, not
-        # lowered by an environment CFLAGS, -O1 under ASAN, and EXTRA_CFLAGS last.
+      - name: Makefile -O levels (reader C TUs, C++/kernel TUs, CPPFLAGS)
+        # Parse-time check (make -n -B on single objects and on the bwa-mem3
+        # link, prebuilt libraries held old), so it needs no built tree. Pins
+        # the reader's -O level: default -O3 with -g, not lowered by an
+        # environment CFLAGS, -O1 under ASAN, and EXTRA_CFLAGS last. Also pins
+        # that an -O in CPPFLAGS (conda-forge exports -O2 there) lowers neither
+        # the reader, a C++ TU, a per-tier kernel TU nor the LTO link, nor ASAN's
+        # -O1 or COVERAGE_OPT, and that the rest of CPPFLAGS is kept, while its
+        # -DNDEBUG is stripped (EXTRA_CXXFLAGS/EXTRA_CFLAGS=-DNDEBUG still pass,
+        # also through pgo-generate, pgo-use and lto-build).
         if: matrix.canonical == true
         env:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}

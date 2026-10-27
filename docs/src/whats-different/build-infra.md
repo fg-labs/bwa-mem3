@@ -88,8 +88,41 @@ the compile rules now honor all three variables, and `$(EXE)` link adds
 `$(CPPFLAGS)`. This allows downstream packagers (Debian, Bioconda) and
 reproducible-build systems to inject hardening flags (`-D_FORTIFY_SOURCE=2`,
 `-fstack-protector-strong`, `-Wl,-z,relro`) through the environment without
-patching the Makefile. No functional change unless the env vars are set.
+patching the Makefile. No functional change unless the env vars are set,
+apart from an `-O` level or `-DNDEBUG` in `CPPFLAGS`, which are now ignored
+(below).
 Closes [issue #39](https://github.com/fg-labs/bwa-mem3/issues/39).
+
+## `-O` and `-DNDEBUG` in `CPPFLAGS` ignored (PR #640)
+
+The aligner's own compile rules and the `bwa-mem3` link pass `$(CPPFLAGS)`
+after the Makefile's optimization level, and the compiler takes the last `-O`.
+conda-forge's compiler activation exports
+`CPPFLAGS="-DNDEBUG -D_FORTIFY_SOURCE=2 -O2"`, so a conda (e.g. Bioconda)
+build compiled the aligner, the SIMD kernels included, at `-O2`. The Makefile
+now strips `-O` levels from `CPPFLAGS`, so its per-target levels win: `-O3`,
+the sanitizers' `-O1`, and `COVERAGE_OPT`. To change the optimization level,
+use `EXTRA_CXXFLAGS` / `EXTRA_CFLAGS`.
+
+The same filter strips `-DNDEBUG` (only the single-token spellings `-DNDEBUG`
+and `-DNDEBUG=<v>`), which conda-forge's `CPPFLAGS` also defines and which
+would otherwise compile every plain `assert()` out of a packaged build. No
+target in this repository defines `NDEBUG`, and the sources treat plain
+asserts as live in every build without an explicit `-DNDEBUG` opt-out,
+packaged builds included. None of them sits in a per-cell loop, and keeping
+them live measured within noise: conda-forge's Linux flags with `LTO=full`,
+clang 19.1.7, HG00096 WGS on hg38, paired median wall change over 8 rotated
+interleaved rounds of asserts kept vs compiled out was +0.18% (per-round range
+−1.43% to +1.52%) for 5M pairs at `-t 16` and 0.00% for 200k pairs at `-t 1`
+on Graviton4 (m8g.4xlarge, aarch64 / NEON), and 0.00% for 5M pairs at `-t 16`
+on Zen 4 (m7a.4xlarge, x86-64 / AVX-512BW). To build
+bwa-mem3's own sources without them deliberately, pass
+`make EXTRA_CXXFLAGS=-DNDEBUG` (and `EXTRA_CFLAGS=-DNDEBUG` for the C reader),
+which the filter does not touch and the PGO and `lto-build` targets forward;
+checks that must survive even that use `xassert()` (`src/utils.h`). The
+opt-out does not reach the bundled htslib, which is configured with the
+filtered `CPPFLAGS` and keeps its own asserts. The Bioconda recipe links
+conda-forge's htslib instead, so this only matters for bundled-htslib builds.
 
 ## Testing and CI (PR #23, #24)
 

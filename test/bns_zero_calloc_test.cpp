@@ -10,7 +10,7 @@
 //     7.20.3 for a zero-size request, and not a failure at all.
 //
 // An unconditional non-NULL guard conflates them, and because the guard is an
-// xassert rather than an assert it fires in release builds too -- which is the
+// xassert rather than an assert it fires in -DNDEBUG builds too -- which is the
 // whole point of the change it belongs to.
 //
 // Why this is a standalone binary rather than a case in the doctest suite:
