@@ -1573,8 +1573,13 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         int xtra = sp.h0;
         uint8_t *qs = seqBufQer + sp.idq;
         uint8_t *rs = seqBufRef + sp.idr;
-        aln[i] = ksw_align2(sp.len2, qs, sp.len1, rs, 5,
-                            opt->mat, opt->o_del, opt->e_del,
+        /* --meth-context cpg: rs is a CpG-labelled window (_pre), so score it with
+         * the pair's 7-code matrix at m = 7 (meth_model_mat), as _post's scalar path does. */
+        int m = 5;
+        const int8_t *mm = opt->mat;
+        if (meth_cpg_on(opt)) mm = meth_model_mat(opt, sp.meth_hyp, &m);
+        aln[i] = ksw_align2(sp.len2, qs, sp.len1, rs, m,
+                            mm, opt->o_del, opt->e_del,
                             opt->o_ins, opt->e_ins, xtra, 0);
     }
     // tprof[SAM2][0] += __rdtsc() - tim;
@@ -1623,14 +1628,17 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         // The batched kernel expresses exactly the matrices mem_opt_fill_meth_mat
         // produces: GENOMIC (one freed cell to +a), NEUTRAL (one freed cell to 0),
         // and COLLAPSED (the conversion cell PLUS its mirror — a symmetric
-        // (i,j)/(j,i) pair). The freed-less x86 tiers never reach here —
+        // (i,j)/(j,i) pair) — plus, under --meth-context cpg, the 7-code mat7_ot /
+        // mat7_ob (one freed cell on the C5 / G6 row, gated per row by the CpG
+        // label; kswv::init_meth_cpg). The freed-less x86 tiers never reach here —
         // meth_scoring_batched_expressible() gates this branch on the running
         // tier — so needsScalar() is always false. Guard it at RUNTIME rather
         // than with a bare assert(): under NDEBUG assert is a no-op, which would
         // let a future unsupported matrix run the batched kernel and silently
         // mis-score. Fail loudly instead — this can only fire on a programming
-        // error in mem_opt_fill_meth_mat (a matrix that is neither a single freed
-        // cell nor a mirror pair) or a tier gate that drifted out of lockstep
+        // error in mem_opt_fill_meth_mat / meth_model_fill_mats (a matrix that is
+        // neither a single freed cell nor a mirror pair, or a cpg matrix that is not
+        // one gated CpG cell) or a tier gate that drifted out of lockstep
         // with the kswv mat-aware ctor.
         if (pwsw_ot->needsScalar() || pwsw_ob->needsScalar())
             err_fatal(__func__,
@@ -2703,8 +2711,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                  * The kernels' Cpg arm reads the labels (mem_sam_pe_batch builds the
                  * kswv objects on mat7_ot / mat7_ob); the between-phase reversal keeps
                  * them, as ksw_align2's does on the scalar path. */
-                if (meth_cpg_on(opt))
-                    meth_label_window(rs, sp.len1, rb, rid, bns, pac, mmc->ref_string);
+                if (meth_cpg_on(opt))   // rs is this pair's private staged copy, never a loaded image
+                    meth_label_window(rs, sp.len1, rb, rid, bns, pac, NULL);
                 /* Query: stage the mate bases directly from $ms (no `rev`
                  * scratch). For is_rev, reverse-complement into qs; this is
                  * byte-identical to the removed two-step (build rev, then

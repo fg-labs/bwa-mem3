@@ -375,18 +375,30 @@ TEST_CASE("kswv cpg: matrices the gate cannot express take the scalar fallback"
         CHECK(make_kswv(6, 1, 6, 1, 1, -4, 1, 256, 256, mat7, true)->needsScalar() == !simd);
 
         int8_t m[49];
-        // A freed cell on a plain base row: not a CpG gate.
+        const int frow = hyp ? METH_C5 : METH_G6;   // the freed (labelled) row
+        // A freed cell on a plain base row: the ACGT block is not symmetric.
         memcpy(m, mat7, sizeof m);
         m[(hyp ? METH_C : METH_G) * METH_M + (hyp ? METH_T : METH_A)] = 1;
+        CHECK(make_kswv(6, 1, 6, 1, 1, -4, 1, 256, 256, m, true)->needsScalar());
+        // An N row / N column entry that is not w_ambig.
+        memcpy(m, mat7, sizeof m);
+        m[METH_N * METH_M + METH_A] = 0;
+        CHECK(make_kswv(6, 1, 6, 1, 1, -4, 1, 256, 256, m, true)->needsScalar());
+        memcpy(m, mat7, sizeof m);
+        m[METH_C * METH_M + METH_N] = 0;
+        CHECK(make_kswv(6, 1, 6, 1, 1, -4, 1, 256, 256, m, true)->needsScalar());
+        // A labelled row whose read-N column differs from its base row.
+        memcpy(m, mat7, sizeof m);
+        m[frow * METH_M + METH_N] = 0;
         CHECK(make_kswv(6, 1, 6, 1, 1, -4, 1, 256, 256, m, true)->needsScalar());
         // Two freed cells on the CpG rows.
         memcpy(m, mat7, sizeof m);
         m[METH_C5 * METH_M + METH_T] = 1;
         m[METH_G6 * METH_M + METH_A] = 1;
         CHECK(make_kswv(6, 1, 6, 1, 1, -4, 1, 256, 256, m, true)->needsScalar());
-        // A labelled row that is not its base row elsewhere.
+        // The freed row differs from its base row in a second cell as well.
         memcpy(m, mat7, sizeof m);
-        m[(hyp ? METH_G6 : METH_C5) * METH_M + METH_A] = 0;
+        m[frow * METH_M + (hyp ? METH_A : METH_C)] = 0;
         CHECK(make_kswv(6, 1, 6, 1, 1, -4, 1, 256, 256, m, true)->needsScalar());
         // A freed value outside [w_mismatch, w_match].
         memcpy(m, mat7, sizeof m);

@@ -48,6 +48,9 @@
 #     half); an FR pair always rescues its mate reverse-complemented
 #     (is_rev = 1). Pairs use -I 300,20 so rescue needs no insert-size
 #     estimate.
+#  7b. The same three rescues with --rescue-kmer, on both references: the
+#     batched rescue narrows the window to a k-mer anchor's diagonal before the
+#     staged copy is labelled. Same AS / NM as 7.
 #  8. All of the above reads under `--meth=5base --meth-context all` are
 #     record-for-record identical to `--meth=5base` alone.
 #
@@ -286,6 +289,8 @@ run cpg.bam ref.fa --meth=5base --meth-context cpg
 run all.bam ref.fa --meth=5base --meth-context all
 run base.bam ref.fa --meth=5base
 run cpg_rc.bam ref_rc.fa --meth=5base --meth-context cpg
+run cpg_kmer.bam ref.fa --meth=5base --meth-context cpg --rescue-kmer
+run cpg_rc_kmer.bam ref_rc.fa --meth=5base --meth-context cpg --rescue-kmer
 
 # Read 1 of NAME (primary record): rname pos rev cigar AS NM MD #MD-bases #XM-Z.
 # READ=128 selects read 2 instead.
@@ -390,6 +395,23 @@ rescued() { # rescued NAME READ-BIT WANT-CPG WANT-ALL
 rescued resc2cpg 128 "68 6" "68 6"
 rescued resc2plain 128 "63 7" "67 6"
 rescued resc1plain 64 "63 7" "67 6"
+
+# 7b. The same rescues with --rescue-kmer: the batched rescue scans the plain
+# window for a k-mer anchor and narrows it to the anchor's diagonal before the
+# staged copy is CpG-labelled, so the labels at the narrowed edges must come
+# from their real neighbours. Each rescued mate is ungapped and the anchor lies
+# on its diagonal, so the narrowed SW finds the same alignment and score.
+rescued_kmer() { # rescued_kmer NAME READ-BIT WANT-CPG
+    local name=$1 bit=$2 want=$3 bam rn rev cig as nm
+    for bam in cpg_kmer.bam cpg_rc_kmer.bam; do
+        read -r rn _ rev cig as nm _ _ _ < <(READ=$bit r1 "$bam" "$name")
+        [ "$cig $as $nm" = "100M $want" ] \
+            || fail "$name ($bam): read $((bit / 64)) $rn rev=$rev $cig AS NM = $as $nm, want 100M $want under cpg with --rescue-kmer"
+    done
+}
+rescued_kmer resc2cpg 128 "68 6"
+rescued_kmer resc2plain 128 "63 7"
+rescued_kmer resc1plain 64 "63 7"
 
 # 8. `all` is the default, record for record.
 cmp -s <(samtools view all.bam) <(samtools view base.bam) \
