@@ -217,6 +217,27 @@ TEST_CASE("mat7 freed cells" * doctest::test_suite("unit/meth_model"))
     free(o);
 }
 
+// rescue_prune's bounds (B1/B2) are derived from mat_ot/mat_ob. They stay sound
+// under cpg because cpg only ever removes score: every mat7 cell is <= the
+// 5-code cell of the plain base, for both hypotheses.
+TEST_CASE("cpg score <= all score pointwise" * doctest::test_suite("unit/meth_model"))
+{
+    const int scorings[] = { MEM_METH_SCORING_NEUTRAL, MEM_METH_SCORING_GENOMIC };
+    for (int s : scorings) {
+        mem_opt_t *o = opt_for(s, 1, 4);
+        CAPTURE(s);
+        for (int r = 0; r < METH_M; ++r) {
+            for (int c = 0; c < 5; ++c) {
+                CAPTURE(r); CAPTURE(c);
+                const int b = meth_code_base((uint8_t)r);
+                CHECK(o->mat7_ot[r * 7 + c] <= o->mat_ot[b * 5 + c]);
+                CHECK(o->mat7_ob[r * 7 + c] <= o->mat_ob[b * 5 + c]);
+            }
+        }
+        free(o);
+    }
+}
+
 TEST_CASE("meth_label_cpg label interior" * doctest::test_suite("unit/meth_model"))
 {
     OrigRefFixture f("ACGTTCGA");

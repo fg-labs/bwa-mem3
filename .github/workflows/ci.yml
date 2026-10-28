@@ -2056,6 +2056,18 @@ jobs:
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 
+      - name: --meth-context identity (generated fixtures)
+        # all == default, cpg identical across the tiers the runner has and with
+        # batched rescue on and off, MAPQ/AS invariants. No base binary in CI, so
+        # the no-meth identity leg reports SKIP:.
+        run: |
+          command -v samtools >/dev/null 2>&1 \
+            || { echo "FAIL: samtools not on PATH; meth_context_identity would SKIP"; exit 1; }
+          command -v mawk >/dev/null 2>&1 \
+            || { echo "FAIL: mawk not on PATH; meth_context_identity would SKIP"; exit 1; }
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/meth_context_identity.sh
+
       - name: ccache statistics
         if: always()
         run: ccache --show-stats || true
