@@ -126,6 +126,21 @@ extern uint64_t prof[10][112];
 static inline int query_quantum8(int len2)  { return kswv_query_quantum8(len2); }
 static inline int query_quantum16(int len2) { return kswv_query_quantum16(len2); }
 
+/* The x86 u8 wrappers over-allocate the per-call query SoA by this much and
+ * place it with kswv_query_soa_place. */
+#define KSWV_QUERY_SOA_SLACK 4096
+
+/* The address in raw[0, KSWV_QUERY_SOA_SLACK) that is 3 KiB past `rails`
+ * modulo 4 KiB, so the query SoA sits off all three column rails (0, 1 and
+ * 2 KiB; see the constructor) whatever offset the allocator gave either block.
+ * It keeps the rails' alignment (the block is 128-byte aligned, and so is
+ * 3 KiB). */
+static inline uint8_t *kswv_query_soa_place(uint8_t *raw, const void *rails)
+{
+    const uintptr_t want = ((uintptr_t) rails + 3072) & 4095;
+    return raw + ((want - ((uintptr_t) raw & 4095)) & 4095);
+}
+
 /* Why the two query pads differ, since only one of them is inert:
  *   [len2, quantum)      X86_QPAD8 / NEON_QPAD8 -> sbt = shift (0 in the USQADD
  *                        form), i.e. m11 = h00. This
@@ -419,9 +434,23 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
     swTicks = 0;
     sort2Ticks = 0;
 
-    F16     = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
-    H16_0   = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
-    H16_1   = (int16_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
+    /* The three column rails share one block, 1 KiB apart modulo 4 KiB. A u8
+     * cell stores H1[j+1] and F[j+1] while the next cell loads H0[j+1] and the
+     * query SoA at j+1. Three same-size allocations can come back at one
+     * offset modulo 4 KiB (the allocator decides), and then those loads match
+     * the in-flight stores on address bits 11:0 and the core holds them until
+     * the stores resolve. The x86 u8 wrappers place the query SoA 3 KiB off
+     * the block (kswv_query_soa_place).
+     * Layout only: the kernels touch the same elements in the same order. */
+    {
+        const size_t rail_b = (size_t) this->maxQerLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t);
+        const size_t stride_b = ((rail_b + 4095) & ~(size_t) 4095) + 1024;
+        uint8_t *rails = (uint8_t *) _mm_malloc(3 * stride_b, 128);
+        xassert(rails != NULL, "out of memory: kswv column rails");
+        F16   = (int16_t *) rails;
+        H16_0 = (int16_t *) (rails + stride_b);
+        H16_1 = (int16_t *) (rails + 2 * stride_b);
+    }
     rowMax16 = (int16_t *)_mm_malloc(this->maxRefLen * SIMD_WIDTH16 * numThreads * sizeof(int16_t), 64);
 
     F8 = (uint8_t*) F16;
@@ -562,7 +591,7 @@ kswv::kswv(const int o_del, const int e_del, const int o_ins,
 
 // destructor 
 kswv::~kswv() {
-    _mm_free(F16); _mm_free(H16_0); _mm_free(H16_1);
+    _mm_free(F16);   /* H16_0 and H16_1 live in the same block */
     _mm_free(rowMax16);
     _mm_free(score2Bits8);
     _mm_free(colIdx8);
@@ -3695,10 +3724,12 @@ void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
 {
     uint8_t *seq1SoA = (uint8_t*)_mm_malloc(
         (size_t)this->maxRefLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
-    uint8_t *seq2SoA = (uint8_t*)_mm_malloc(
-        (size_t)this->maxQerLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 128);
+    uint8_t *seq2SoA_raw = (uint8_t*)_mm_malloc(
+        (size_t)this->maxQerLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t)
+        + KSWV_QUERY_SOA_SLACK, 128);
     xassert(seq1SoA != NULL, "out of memory: seq1SoA");
-    xassert(seq2SoA != NULL, "out of memory: seq2SoA");
+    xassert(seq2SoA_raw != NULL, "out of memory: seq2SoA");
+    uint8_t *seq2SoA = kswv_query_soa_place(seq2SoA_raw, F16);
 
     int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1) / SIMD_WIDTH8) * SIMD_WIDTH8;
     for (int32_t ii = numPairs; ii < roundNumPairs; ii++) {
@@ -3755,7 +3786,7 @@ void kswv::kswvBatchWrapper8_avx2(SeqPair *pairArray,
     }
 
     _mm_free(seq1SoA);
-    _mm_free(seq2SoA);
+    _mm_free(seq2SoA_raw);
 }
 
 void kswv::getScores8(SeqPair *pairArray,
@@ -4341,11 +4372,12 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
     uint8_t *seq1SoA = NULL;
     seq1SoA = (uint8_t *)_mm_malloc(this->maxRefLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
     
-    uint8_t *seq2SoA = NULL;
-    seq2SoA = (uint8_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t), 64);
+    uint8_t *seq2SoA_raw = (uint8_t *)_mm_malloc(this->maxQerLen * SIMD_WIDTH8 * numThreads * sizeof(uint8_t)
+                                                 + KSWV_QUERY_SOA_SLACK, 64);
     
     xassert(seq1SoA != NULL, "out of memory: seq1SoA");
-    xassert(seq2SoA != NULL, "out of memory: seq2SoA");
+    xassert(seq2SoA_raw != NULL, "out of memory: seq2SoA");
+    uint8_t *seq2SoA = kswv_query_soa_place(seq2SoA_raw, F16);
 
     int32_t ii;
     int32_t roundNumPairs = ((numPairs + SIMD_WIDTH8 - 1) / SIMD_WIDTH8 ) * SIMD_WIDTH8;
@@ -4494,7 +4526,7 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
     
     // free mem
     _mm_free(seq1SoA);
-    _mm_free(seq2SoA);
+    _mm_free(seq2SoA_raw);
     
     return;
 }
