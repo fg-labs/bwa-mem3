@@ -33,15 +33,23 @@ void pac_put(std::vector<uint8_t> &pac, int64_t i, uint8_t v)
 }
 
 // Fetch window [rb, rb + len) of the doubled coordinate space, exactly as the
-// aligner does, and label it.
-std::vector<uint8_t> fetch_label(const bntseq_t *bns, const uint8_t *pac,
-                                 int64_t rb, int64_t len, int rid)
+// aligner does.
+std::vector<uint8_t> fetch_raw(const bntseq_t *bns, const uint8_t *pac,
+                               int64_t rb, int64_t len)
 {
     std::vector<uint8_t> w((size_t)len + 1, 0xff);
     int64_t got = 0;
     bns_get_seq_into(bns->l_pac, pac, rb, rb + len, w.data(), &got);
     REQUIRE(got == len);
     w.resize((size_t)len);
+    return w;
+}
+
+// Fetch the window and label it.
+std::vector<uint8_t> fetch_label(const bntseq_t *bns, const uint8_t *pac,
+                                 int64_t rb, int64_t len, int rid)
+{
+    std::vector<uint8_t> w = fetch_raw(bns, pac, rb, len);
     meth_label_cpg(w.data(), len, rb, rid, bns, pac);
     return w;
 }
@@ -341,6 +349,111 @@ TEST_CASE("meth_label_cpg matches the frame oracle on random windows"
             for (int64_t end = beg + 1; end <= half_end; ++end) {
                 std::vector<uint8_t> w = fetch_label(f.orig_bns, f.orig_pac, beg, end - beg, 0);
                 check_window(contig, w, beg, L);
+            }
+        }
+    }
+}
+
+TEST_CASE("meth_label_cpg matches the per-contig oracle on windows straddling contigs"
+          * doctest::test_suite("unit/meth_model"))
+{
+    // Windows anywhere in the doubled coordinate space, possibly spanning a
+    // contig boundary; rid is the contig of the window's midpoint, as the
+    // aligner picks it. Positions outside rid stay unlabelled (raw codes);
+    // positions inside match the oracle run on contig rid alone, in frame.
+    srand48(23);
+    const char alpha[] = "ACGTCGCGN";
+    for (int rep = 0; rep < 30; ++rep) {
+        std::vector<std::string> contigs;
+        const int nc = 2 + (int)(lrand48() % 3);
+        for (int j = 0; j < nc; ++j) {
+            std::string c;
+            const int n = 1 + (int)(lrand48() % 12);
+            for (int i = 0; i < n; ++i) c += alpha[lrand48() % 9];
+            contigs.push_back(c);
+        }
+        MultiRef r(contigs);
+        for (size_t i = 0; i < r.all.size(); ++i)
+            if (r.all[i] == 'N') pac_put(r.pac, (int64_t)i, (uint8_t)(lrand48() & 3));
+        const int64_t L = r.bns.l_pac;
+        for (int64_t beg = 0; beg < 2 * L; ++beg) {
+            const int64_t half_end = beg < L ? L : 2 * L;
+            for (int64_t end = beg + 1; end <= half_end; ++end) {
+                const int64_t len = end - beg;
+                int is_rev = 0;
+                const int64_t mid_f = bns_depos(&r.bns, beg + len / 2, &is_rev);
+                const int rid = bns_pos2rid(&r.bns, mid_f);
+                const std::vector<uint8_t> raw = fetch_raw(&r.bns, r.pac.data(), beg, len);
+                std::vector<uint8_t> w = raw;
+                meth_label_cpg(w.data(), len, beg, rid, &r.bns, r.pac.data());
+
+                const std::string &cg = contigs[(size_t)rid];
+                const int64_t off = r.anns[(size_t)rid].offset, clen = (int64_t)cg.size();
+                const std::vector<int> exp = oracle_frame(is_rev ? revcomp(cg) : cg);
+                for (int64_t k = 0; k < len; ++k) {
+                    const int64_t fc = is_rev ? (2 * L - 1 - (beg + k)) : beg + k;
+                    CAPTURE(rep); CAPTURE(beg); CAPTURE(len); CAPTURE(k);
+                    if (fc < off || fc >= off + clen) { CHECK(w[(size_t)k] == raw[(size_t)k]); continue; }
+                    const int64_t t = fc - off;
+                    const int e = exp[(size_t)(is_rev ? clen - 1 - t : t)];
+                    if (e < 0) CHECK(w[(size_t)k] == raw[(size_t)k]);
+                    else       CHECK((int)w[(size_t)k] == e);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("meth_label_cpg leaves a window outside contig rid unchanged"
+          * doctest::test_suite("unit/meth_model"))
+{
+    MultiRef r({"ACGCGT", "TCGCGA"});
+    const int64_t L = r.bns.l_pac;
+    // Forward window inside contig 0, labelled as contig 1; and the reverse
+    // window of contig 1 labelled as contig 0.
+    CHECK(fetch_label(&r.bns, r.pac.data(), 0, 6, 1) == fetch_raw(&r.bns, r.pac.data(), 0, 6));
+    CHECK(fetch_label(&r.bns, r.pac.data(), L, 6, 0) == fetch_raw(&r.bns, r.pac.data(), L, 6));
+    // Sanity: with the right rid both are labelled.
+    CHECK(fetch_label(&r.bns, r.pac.data(), 0, 6, 0) != fetch_raw(&r.bns, r.pac.data(), 0, 6));
+    CHECK(fetch_label(&r.bns, r.pac.data(), L, 6, 1) != fetch_raw(&r.bns, r.pac.data(), L, 6));
+}
+
+TEST_CASE("meth_label_cpg masks a merged multi-base ambs run exactly"
+          * doctest::test_suite("unit/meth_model"))
+{
+    //                                   0123456789012345
+    const std::string stored          = "TACGCGCGCGCGCGTA";   // pac bases
+    const std::string contig_with_n   = "TACNNNNNNNNNCGTA";   // run [3, 12)
+    MultiRef r({stored});
+    // Replace the (empty) per-base ambs with one merged 9-bp run.
+    r.ambs.clear();
+    bntamb1_t a{};
+    a.offset = 3; a.len = 9; a.amb = 'N';
+    r.ambs.push_back(a);
+    r.bns.ambs = r.ambs.data();
+    r.bns.n_holes = 1;
+    const int64_t L = r.bns.l_pac;
+
+    // The full forward window: the C before the run and the CpG inside it
+    // are unlabelled; the CpG after it is labelled.
+    CHECK(fetch_label(&r.bns, r.pac.data(), 0, 16, 0)
+          == std::vector<uint8_t>({3, 0, 1, 2, 1, 2, 1, 2, 1, 2, 1, 2, 5, 6, 3, 0}));
+    // A window strictly inside the run (the run extends past it both sides).
+    CHECK(fetch_label(&r.bns, r.pac.data(), 5, 5, 0) == fetch_raw(&r.bns, r.pac.data(), 5, 5));
+    CHECK(fetch_label(&r.bns, r.pac.data(), L + 16 - 10, 5, 0)
+          == fetch_raw(&r.bns, r.pac.data(), L + 16 - 10, 5));
+    // Every window on both strands against the oracle, with N positions raw.
+    for (int64_t beg = 0; beg < 2 * L; ++beg) {
+        const int64_t half_end = beg < L ? L : 2 * L;
+        for (int64_t end = beg + 1; end <= half_end; ++end) {
+            const std::vector<uint8_t> raw = fetch_raw(&r.bns, r.pac.data(), beg, end - beg);
+            const std::vector<uint8_t> w = fetch_label(&r.bns, r.pac.data(), beg, end - beg, 0);
+            check_window(contig_with_n, w, beg, L);
+            const bool rev = beg >= L;
+            for (int64_t k = 0; k < end - beg; ++k) {
+                const int64_t fc = rev ? 2 * L - 1 - (beg + k) : beg + k;
+                CAPTURE(beg); CAPTURE(k);
+                if (fc >= 3 && fc < 12) CHECK(w[(size_t)k] == raw[(size_t)k]);
             }
         }
     }

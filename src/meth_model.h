@@ -42,7 +42,17 @@ void meth_model_fill_mats(mem_opt_t *o);
  * The neighbours beyond either end of the window are read from pac in the
  * same frame. A neighbour outside contig rid, or a position or neighbour
  * inside a bns->ambs run (an original-reference N), never forms a CpG.
- * Window positions outside contig rid are not labelled. */
+ * Window positions outside contig rid are not labelled.
+ *
+ * Caller contract:
+ *   - win is a writable, thread-private copy, never a pointer into a shared
+ *     reference image (bns_fetch_seq_v2_rid returns ref_string + beg when one
+ *     is loaded);
+ *   - bns/pac are the ORIGINAL-reference handles (meth_orig_bns /
+ *     meth_orig_pac), not the converted seed index;
+ *   - rb is the start the fetch actually used (its post-clamp *beg);
+ *   - win holds codes 0..3, or labels from an earlier call; code 4 is not
+ *     expected. */
 void meth_label_cpg(uint8_t *win, int64_t len, int64_t rb, int rid,
                     const bntseq_t *bns, const uint8_t *pac);
 
