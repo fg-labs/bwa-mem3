@@ -629,7 +629,6 @@ void kswv::init_meth_cpg(const int8_t *mat7)
     for (int r = 5; r <= 6; r++)
         for (int c = 0; c <= 4; c++) {
             if (mat7[r * M + c] == mat7[(r - 4) * M + c]) continue;
-            if (c == 4) return;
             n_freed++; r_freed = r; c_freed = c;
         }
     if (n_freed != 1) return;
