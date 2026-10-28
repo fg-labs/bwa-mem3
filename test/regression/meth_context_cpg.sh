@@ -33,7 +33,22 @@
 #     its seed by a transversion at offset 17 (the one case the SIMD routing
 #     under cpg is visible in). Under cpg AS = 100 - 4 - 8 = 88
 #     and NM 2, under all AS 92 and NM 1; forward and reverse-strand twin agree.
-#  7. All of the above reads under `--meth=5base --meth-context all` are
+#  7. Conversions scored by the mate-rescue SW: a mate that cannot seed (an
+#     A <-> T transversion every 15 bases leaves no 19-mer) is rescued from its
+#     mate's anchor, so its AS is the rescue SW's score. Six transversions, so
+#     with c CpG conversions free and p non-CpG ones: AS = (100 - 6 - c - p)
+#     - 4 * (6 + p) under cpg, and p is free under all. Read 2 rescued from
+#     read 1 (matrix OT: read 2's chemistry flipped by the rescue strand) with
+#     two CpG conversions: AS 68, NM 6; with one non-CpG conversion more: cpg
+#     AS 63 / NM 7, all AS 67 / NM 6. Read 1 rescued from read 2 (matrix OB),
+#     two CpG and one non-CpG conversion: the same 63 / 7 and 67 / 6. All
+#     three equal on the reverse-strand twin. Between the two references each
+#     hypothesis is rescued once from a forward-strand anchor (window in the
+#     forward half) and once from a reverse-strand one (window in the reverse
+#     half); an FR pair always rescues its mate reverse-complemented
+#     (is_rev = 1). Pairs use -I 300,20 so rescue needs no insert-size
+#     estimate.
+#  8. All of the above reads under `--meth=5base --meth-context all` are
 #     record-for-record identical to `--meth=5base` alone.
 #
 # Inputs:
@@ -204,13 +219,63 @@ for o in "${CPG_X[@]}" "$PLAIN_X"; do R1X=$(set_base "$R1X" "$o" T); done
 [ "${R1X:17:1}" = A ] && R1X=$(set_base "$R1X" 17 T) || R1X=$(set_base "$R1X" 17 A)
 add_pair ext "$R1X" "$(revcomp "${C1:$((X + 200)):100}")"
 
+# Rescue pairs. mutate_unseedable CONTIG START NCPG NPLAIN: the forward 100-mer
+# CONTIG[START, START + 100) with C->T at NCPG CpG Cs in [5, 95] and NPLAIN
+# non-CpG Cs in [30, 70], and an A <-> T swap at the A or T nearest each of
+# offsets 10, 25, ..., 85 (never next to a conversion), so no 19 bases in a
+# row match. Prints the read.
+mutate_unseedable() {
+    local s=$1 b=$2 ncpg=$3 nplain=$4 w o t d k conv=() cg pl far
+    w=${s:$b:100}
+    read -r -a cg <<< "$(pick "$ncpg" 5 95 "$(cpg_c "$s" "$b")")"
+    conv+=("${cg[@]}")
+    if [ "$nplain" -gt 0 ]; then
+        pl=""
+        for o in $(plain_c "$s" "$b"); do
+            [ "$o" -ge 30 ] && [ "$o" -le 70 ] || continue
+            far=1
+            for k in "${conv[@]}"; do [ $((o - k)) -le 2 ] && [ $((k - o)) -le 2 ] && far=0; done
+            [ "$far" = 1 ] && {
+                pl=$o
+                break
+            }
+        done
+        [ -n "$pl" ] || fail "fixture: no non-CpG C in [30, 70] of $b"
+        conv+=("$pl")
+    fi
+    for o in "${conv[@]}"; do w=$(set_base "$w" "$o" T); done
+    for t in 10 25 40 55 70 85; do
+        local hit=""
+        for d in 0 1 -1 2 -2; do
+            o=$((t + d))
+            case "${s:$((b + o)):1}" in A | T) ;; *) continue ;; esac
+            far=1
+            for k in "${conv[@]}"; do [ $((o - k)) -le 1 ] && [ $((k - o)) -le 1 ] && far=0; done
+            [ "$far" = 1 ] && {
+                hit=$o
+                break
+            }
+        done
+        [ -n "$hit" ] || fail "fixture: no A/T near offset $t of $b"
+        [ "${s:$((b + hit)):1}" = A ] && w=$(set_base "$w" "$hit" T) || w=$(set_base "$w" "$hit" A)
+    done
+    printf '%s\n' "$w"
+}
+# Pair 6 (a, b): an OT fragment chr1[1200, 1500); read 1 = chr1[1200, 1300),
+# read 2 = the reverse complement of the unseedable chr1[1400, 1500).
+add_pair resc2cpg "${C1:1200:100}" "$(revcomp "$(mutate_unseedable "$C1" 1400 2 0)")"
+add_pair resc2plain "${C1:1200:100}" "$(revcomp "$(mutate_unseedable "$C1" 1400 2 1)")"
+# Pair 7: an OT fragment chr1[1650, 1950); read 1 = the unseedable
+# chr1[1650, 1750), read 2 = the reverse complement of chr1[1850, 1950).
+add_pair resc1plain "$(mutate_unseedable "$C1" 1650 2 1)" "$(revcomp "${C1:1850:100}")"
+
 "$BWA_MEM3" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth ref.fa nonzero exit"
 "$BWA_MEM3" index --meth ref_rc.fa > /dev/null 2>&1 || fail "index --meth ref_rc.fa nonzero exit"
 
 run() { # run BAM REF ARGS...
     local bam=$1 ref=$2
     shift 2
-    "$BWA_MEM3" mem -t 1 "$@" "$ref" r1.fq r2.fq > "$bam" 2> "$bam.log" \
+    "$BWA_MEM3" mem -t 1 -I 300,20 "$@" "$ref" r1.fq r2.fq > "$bam" 2> "$bam.log" \
         || {
             cat "$bam.log" >&2
             fail "mem $* $ref nonzero exit"
@@ -223,9 +288,10 @@ run base.bam ref.fa --meth=5base
 run cpg_rc.bam ref_rc.fa --meth=5base --meth-context cpg
 
 # Read 1 of NAME (primary record): rname pos rev cigar AS NM MD #MD-bases #XM-Z.
+# READ=128 selects read 2 instead.
 r1() { # r1 BAM NAME
-    samtools view -F 0x900 "$1" | mawk -v name="$2" '
-    $1 == name && (int($2/64) % 2) == 1 {
+    samtools view -F 0x900 "$1" | mawk -v name="$2" -v bit="${READ:-64}" '
+    $1 == name && (int($2/bit) % 2) == 1 {
         as = nm = md = xm = "NA"
         for (i = 12; i <= NF; i++) {
             if ($i ~ /^AS:i:/) as = substr($i, 6)
@@ -309,7 +375,23 @@ read -r rn _ rev cig as nm _ nb nz < <(r1 cpg_rc.bam ext)
 read -r _ _ _ cig as nm _ _ _ < <(r1 all.bam ext)
 [ "$cig/$as/$nm" = "100M/92/1" ] || fail "ext (all): $cig AS $as NM $nm, want 100M AS 92 NM 1 (every conversion free under all)"
 
-# 7. `all` is the default, record for record.
+# 7. Conversions scored by the mate-rescue SW, forward and on the twin.
+rescued() { # rescued NAME READ-BIT WANT-CPG WANT-ALL
+    local name=$1 bit=$2 want_cpg=$3 want_all=$4 rn rev cig as nm
+    read -r rn _ rev cig as nm _ _ _ < <(READ=$bit r1 cpg.bam "$name")
+    [ "$cig" = 100M ] || fail "$name: read $((bit / 64)) $rn rev=$rev $cig, want 100M (rescued)"
+    [ "$as $nm" = "$want_cpg" ] || fail "$name: read $((bit / 64)) AS NM = $as $nm, want $want_cpg under cpg (rescue SW on the labelled window)"
+    read -r rn _ rev cig as nm _ _ _ < <(READ=$bit r1 cpg_rc.bam "$name")
+    [ "$cig" = 100M ] || fail "$name (twin): read $((bit / 64)) $rn rev=$rev $cig, want 100M"
+    [ "$as $nm" = "$want_cpg" ] || fail "$name (twin): read $((bit / 64)) AS NM = $as $nm, want $want_cpg under cpg"
+    read -r _ _ _ cig as nm _ _ _ < <(READ=$bit r1 all.bam "$name")
+    [ "$cig $as $nm" = "100M $want_all" ] || fail "$name (all): read $((bit / 64)) $cig AS NM = $as $nm, want 100M $want_all"
+}
+rescued resc2cpg 128 "68 6" "68 6"
+rescued resc2plain 128 "63 7" "67 6"
+rescued resc1plain 64 "63 7" "67 6"
+
+# 8. `all` is the default, record for record.
 cmp -s <(samtools view all.bam) <(samtools view base.bam) \
     || fail "--meth-context all differs from --meth=5base alone"
 

@@ -2416,6 +2416,11 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * is reachable via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch) or on
              * a freed-less SIMD tier (sse41/sse42/avx), where the kswv kernel has
              * no freed-cell override and every scoring mode must score scalar. */
+            /* --meth-context cpg takes this route too (meth_scoring_batched_expressible
+             * is false), so every cpg job leaves here: the k-mer anchor scan,
+             * --rescue-kmer narrowing, --rescue-skip and rescue pruning below never
+             * run for it, and the window unpacked above is unused. _post re-fetches
+             * the window into a private copy, labels it and scores it at m = 7. */
             if (opt->meth_mode && (!meth_batched_rescue_enabled()
                     || !meth_scoring_batched_expressible(opt))) {
                 // Escape hatch (env=0) or freed-less tier: keep the legacy scalar

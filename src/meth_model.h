@@ -83,7 +83,11 @@ static inline const int8_t *meth_model_mat(const mem_opt_t *opt, int hyp, int *m
 
 /* The alphabet size of a matrix meth_model_mat or mem_opt_meth_mat returned:
  * 7 for mat7_ot / mat7_ob, 5 for every other. For a consumer handed only the
- * matrix pointer (mem_seed_sw, mem_patch_reg). */
+ * matrix pointer (mem_seed_sw, mem_patch_reg).
+ *
+ * m is recovered by POINTER IDENTITY with opt's own arrays: a copy of a mat7
+ * matrix (or one from another mem_opt_t) reads as m = 5 and would be indexed
+ * at stride 5, silently. Pass the pointer meth_model_mat returned, unchanged. */
 static inline int meth_mat_m(const mem_opt_t *opt, const int8_t *mat)
 {
     return (mat == opt->mat7_ot || mat == opt->mat7_ob) ? METH_M : 5;

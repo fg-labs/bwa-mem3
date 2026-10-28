@@ -726,3 +726,75 @@ TEST_CASE("meth_model_mat and the u8 rescue admission under cpg"
     CHECK(m == 5);
     free(o);
 }
+
+TEST_CASE("ksw_align2 at m=7 (the chained-seed SW filter) on labelled windows"
+          * doctest::test_suite("unit/meth_model"))
+{
+    // mem_seed_sw's call: ksw_align2(..., 7, mat7, ..., KSW_XSTART) on a window
+    // labelled in its fetch frame.
+    //                    01234567890123456789
+    const std::string g = "AATTACGATTTCATTAGGAT";   // CpG C at 5, plain C at 11
+    OrigRefFixture f(g);
+    const int64_t L = f.bns.l_pac;
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
+    auto sw = [&](std::vector<uint8_t> q, std::vector<uint8_t> t, int m, const int8_t *mat) {
+        return ksw_align2((int)q.size(), q.data(), (int)t.size(), t.data(), m, mat,
+                          o->o_del, o->e_del, o->o_ins, o->e_ins, KSW_XSTART, NULL);
+    };
+    // Forward window, OT: the CpG C->T is free, the plain one -4: 18 - 4.
+    std::string r = g;
+    r[5] = 'T'; r[11] = 'T';
+    std::vector<uint8_t> fwd = fetch_raw(f.orig_bns, f.orig_pac, 0, L);
+    std::vector<uint8_t> fwd_lab = fwd;
+    meth_label_cpg(fwd_lab.data(), L, 0, 0, f.orig_bns, f.orig_pac);
+    kswr_t x = sw(codes_of(r), fwd_lab, 7, o->mat7_ot);
+    CHECK(x.score == 14);
+    CHECK(x.qb == 0); CHECK(x.qe == 19); CHECK(x.tb == 0); CHECK(x.te == 19);
+    CHECK(sw(codes_of(r), fwd, 5, o->mat_ot).score == 18);   // all: both free
+    // Reverse window (the reverse complement), OB on the reverse-complemented read.
+    std::vector<uint8_t> rev = fetch_raw(f.orig_bns, f.orig_pac, L, L);
+    meth_label_cpg(rev.data(), L, L, 0, f.orig_bns, f.orig_pac);
+    kswr_t y = sw(codes_of(revcomp(r)), rev, 7, o->mat7_ob);
+    CHECK(y.score == 14);
+    CHECK(y.qb == 0); CHECK(y.qe == 19); CHECK(y.tb == 0); CHECK(y.te == 19);
+    free(o);
+}
+
+TEST_CASE("bwa_gen_cigar4 at m=7 through mem_patch_reg's call"
+          * doctest::test_suite("unit/meth_model"))
+{
+    // mem_patch_reg: no CIGAR and no NM out (n_cigar = NM = NULL), nm_from_mat 0,
+    // want_md 1; only the global score is read.
+    const std::string g = "GATTACGATTCAGTAGGATCCATAGTTAGCATAGGATTAC";
+    OrigRefFixture f(g);
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
+    std::string r = g;
+    r[5] = 'T'; r[10] = 'T';
+    r.erase(22, 1);
+    for (int w : {0, 10, 40}) {
+        std::vector<uint8_t> q = codes_of(r);
+        int score7 = 0, score5 = 0;
+        uint32_t *c = bwa_gen_cigar4(o->mat7_ot, 7, f.orig_bns, 6, 1, 6, 1, w, f.bns.l_pac, f.orig_pac,
+                                     (int)q.size(), q.data(), 0, 40, &score7, 0, 0, 0, 1);
+        free(c);
+        q = codes_of(r);
+        c = bwa_gen_cigar4(o->mat_ot, 5, NULL, 6, 1, 6, 1, w, f.bns.l_pac, f.orig_pac,
+                           (int)q.size(), q.data(), 0, 40, &score5, 0, 0, 0, 1);
+        free(c);
+        CAPTURE(w);
+        CHECK(score7 == 37 - 4 - 7);   // the plain C->T is a mismatch under cpg
+        CHECK(score5 == 37 - 7);
+    }
+    // The same call with NM and MD out (mem_reg2aln's), and the reverse twin.
+    {
+        Cigar4Out c = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ot, 7, codes_of(r), 0, 40, 40);
+        CHECK(c.score == 37 - 4 - 7);
+        CHECK(c.nm == 2);
+        CHECK(c.md == "5C4C11^T17");
+        const int64_t L = f.bns.l_pac;
+        Cigar4Out cr = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ob, 7, codes_of(revcomp(r)), L, 2 * L, 40);
+        CHECK(cr.score == c.score);
+        CHECK(cr.nm == c.nm);
+    }
+    free(o);
+}
