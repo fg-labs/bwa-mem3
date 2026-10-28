@@ -540,9 +540,11 @@ row) ([#580](https://github.com/fg-labs/bwa-mem3/pull/580)).
 Seed chaining finds each seed's closest chain in a per-read sorted array of packed
 `(position << 20) | chain index` keys instead of the klib B-tree. The key orders exactly as the
 position does. When the flat index cannot reproduce the B-tree's answer, the declining seed
-changes nothing and the read is re-chained from its seed log through the unchanged B-tree path:
-two chains at the same position (the B-tree's tie order depends on its node layout), a seed
-position outside `[0, 2^43)`, or a read that would exceed `BWA3_CHAIN_FLAT_CAP` chains (default
+changes nothing and the read's seeds up to it are chained again through the unchanged B-tree
+path (the flat pass keeps no copy of them: the default path resolves them again from the read's
+SMEMs, and the opt-in seed reorder modes replay their already ordered seeds): two chains at the
+same position (the B-tree's tie order depends on its node layout), a seed position outside
+`[0, 2^43)`, or a read that would exceed `BWA3_CHAIN_FLAT_CAP` chains (default
 512; `0` sends every read to the B-tree). The packed chain index has 20 bits, so a cap above 2^20
 (1048576), including one too large for `strtol`, is clamped to 1048576 with a one-time
 `[W::chain-flat]` warning on stderr; a malformed or negative value is reported on stderr and the

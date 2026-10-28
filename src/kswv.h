@@ -479,8 +479,9 @@ private:
 				   int32_t numPairs,
 				   int phase);
 
-	/* Templated u8 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed, bool FScan, bool Sgn>
+	/* Templated u8 kernel body; see kswv_neon_u8_impl. RowPair: the FScan
+	 * body's two-target-row sweep (BWA3_RESCUE_ROWPAIR). */
+	template<bool HasFreed, bool FScan, bool Sgn, bool RowPair>
 	int kswv512_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,

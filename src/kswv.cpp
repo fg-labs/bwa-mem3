@@ -306,8 +306,14 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
  * m11 <= h00. The pad corner (xor 0, the match entry) is a pad column, still
  * masked. The mask folds into the diagonal add as a zero-masking add over the
  * lanes whose s2 is not the pad, in place of a compare-to-mask and a blend. */
-#define MAIN_SAM_CODE8_FS(s1, s2, h00, h11, e11, f11, f21, APPLY_BND, NEED_DUMMY) \
+#define MAIN_SAM_CODE8_FS(s1, s2, h00, h11, e11, f11, f21, APPLY_BND, NEED_DUMMY, PADC) \
     {                                                                   \
+        __m512i m11;                                                    \
+        /* PADC: an all-pad column of the signed-domain body, where m11 is \
+         * h00 in every lane (see jzero in kswv512_u8_impl). */          \
+        if (PADC && Sgn) {                                              \
+            m11 = h00;                                                  \
+        } else {                                                        \
         __m512i sbt11 = _mm512_shuffle_epi8(Sgn ? permS512 : permSft512, _mm512_xor_si512(s1, s2)); \
         if (NEED_DUMMY)                                                 \
             sbt11 = _mm512_mask_blend_epi8(_mm512_cmpeq_epu8_mask(s2, qpad512), \
@@ -315,7 +321,6 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
         if (HasFreed)                                                   \
             sbt11 = _mm512_mask_blend_epi8(                             \
                 _mm512_cmpeq_epi8_mask(s2, active_frread512), sbt11, freedval512); \
-        __m512i m11;                                                    \
         if (Sgn) {                                                      \
             m11 = APPLY_BND                                             \
                 ? _mm512_mask_adds_epi8(highbit512, _mm512_testn_epi8_mask(s2, highbit512), h00, sbt11) \
@@ -325,6 +330,7 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
                 ? _mm512_maskz_adds_epu8(_mm512_testn_epi8_mask(s2, highbit512), h00, sbt11) \
                 : _mm512_adds_epu8(h00, sbt11);                         \
             m11 = _mm512_subs_epu8(m11, sft512);                        \
+        }                                                               \
         }                                                               \
         const __m512i g11 = Sgn ? _mm512_max_epi8(m11, f11) : _mm512_max_epu8(m11, f11); \
         const __m512i t11 = Sgn ? _mm512_subs_epi8(g11, oe512) : _mm512_subs_epu8(g11, oe512); \
@@ -4471,6 +4477,28 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
     return;
 }
 
+/* BWA3_RESCUE_ROWPAIR (default ON) on this tier: the u8 FScan body sweeps two
+ * target rows per pass over the query, as the NEON kernel does (see the note
+ * above rescue_rowpair_enabled in the NEON section, and KSWV512_U8_CELL_PAIR_FS
+ * below). 0 restores the one-row sweep. The original (non-FScan) cell keeps the
+ * one-row sweep either way. Read per call, like every rescue toggle. */
+static bool rescue_rowpair_enabled() { return rescue_env_on("BWA3_RESCUE_ROWPAIR"); }
+
+/* BWA3_RESCUE_PADCOLS (default ON) on this tier: the signed-domain u8 FScan
+ * bodies (two-row sweep and one-row body) run the group's all-pad query
+ * columns, [jzero, jsplit), with a cell that takes the diagonal as m11 instead
+ * of gathering a score that is provably 0 there; see jzero in
+ * kswv512_u8_impl and the NEON note above rescue_padcols_enabled. 0 leaves
+ * that range empty. Read per call, like every rescue toggle. */
+static bool rescue_padcols_enabled() { return rescue_env_on("BWA3_RESCUE_PADCOLS"); }
+
+/* BWA3_RESCUE_QE_REVSCAN (default ON) on this tier: the u8 kernel's lazy
+ * query-end rescan (KSWV512_U8_EPILOGUE, every body) scans a checkpoint block's
+ * columns last to first, as the NEON kernels do (see the note above
+ * rescue_qe_revscan_enabled in the NEON section). 0 restores the forward scan
+ * with its first-hit mask. Read once per call. */
+static bool rescue_qe_revscan_enabled() { return rescue_env_on("BWA3_RESCUE_QE_REVSCAN"); }
+
 /* Thin dispatcher: see kswv256_u8 / kswv_neon_u8. */
 int kswv::kswv512_u8(uint8_t seq1SoA[],
                      uint8_t seq2SoA[],
@@ -4486,18 +4514,23 @@ int kswv::kswv512_u8(uint8_t seq1SoA[],
     const bool fscan = rescue_fscan_enabled() &&
         fscan_scoring_ok(this->o_del, this->e_del, this->o_ins, this->e_ins, 255);
     const bool sgn = kswv_u8_signed_ok(fscan, this->o_ins, this->e_ins);   // as on AVX2
-#define KSWV512_U8_DISPATCH(HF, FS, SG)                                         \
-    kswv512_u8_impl<HF, FS, SG>(seq1SoA, seq2SoA, nrow, ncol, p, aln,           \
-                                po_ind, tid, numPairs, phase)
+    const bool pair = fscan && rescue_rowpair_enabled();
+#define KSWV512_U8_DISPATCH(HF, FS, SG, RP)                                     \
+    kswv512_u8_impl<HF, FS, SG, RP>(seq1SoA, seq2SoA, nrow, ncol, p, aln,       \
+                                    po_ind, tid, numPairs, phase)
+#define KSWV512_U8_DISPATCH_FS(HF, SG)                                          \
+    (pair ? KSWV512_U8_DISPATCH(HF, true, SG, true)                             \
+          : KSWV512_U8_DISPATCH(HF, true, SG, false))
     if (has_freed)
-        return sgn ? KSWV512_U8_DISPATCH(true, true, true)
-             : fscan ? KSWV512_U8_DISPATCH(true, true, false) : KSWV512_U8_DISPATCH(true, false, false);
-    return sgn ? KSWV512_U8_DISPATCH(false, true, true)
-         : fscan ? KSWV512_U8_DISPATCH(false, true, false) : KSWV512_U8_DISPATCH(false, false, false);
+        return sgn ? KSWV512_U8_DISPATCH_FS(true, true)
+             : fscan ? KSWV512_U8_DISPATCH_FS(true, false) : KSWV512_U8_DISPATCH(true, false, false, false);
+    return sgn ? KSWV512_U8_DISPATCH_FS(false, true)
+         : fscan ? KSWV512_U8_DISPATCH_FS(false, false) : KSWV512_U8_DISPATCH(false, false, false, false);
+#undef KSWV512_U8_DISPATCH_FS
 #undef KSWV512_U8_DISPATCH
 }
 
-template<bool HasFreed, bool FScan, bool Sgn>
+template<bool HasFreed, bool FScan, bool Sgn, bool RowPair>
 int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
                      uint8_t seq2SoA[],
                      int16_t nrow,
@@ -4519,7 +4552,11 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
 
     /* Per-row running-max checkpoints; see kswv_neon_u8_impl. */
     alignas(64) uint8_t blockMax[QE_MAXBLK * SIMD_WIDTH8];
-    
+    /* Row i+1's checkpoints in the two-row sweep (RowPair); blockMax serves
+     * row i there and the one-row body otherwise. */
+    alignas(64) uint8_t blockMax1[QE_MAXBLK * SIMD_WIDTH8];
+    (void) blockMax1;
+
     m_b = n_b = 0; b = 0;
 
     int8_t temp[SIMD_WIDTH8] __attribute((aligned(64))) = {0};
@@ -4652,12 +4689,302 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * subdivides the [0, jsplit) range. */
     const int jdummy = compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
 
-    int i, limit = nrow;
-    for (i=0; i < nrow; i++)
+    /* All-pad columns (BWA3_RESCUE_PADCOLS, signed-domain FScan bodies only),
+     * as in kswv_neon_u8_impl. From the group's longest query up to jsplit,
+     * every lane's query byte is X86_QPAD8: each lane is past its len2 and short
+     * of its quantum. The X86_QPAD8 blend sets the score to 0 in the signed
+     * domain (permS512's entries are unbiased; the blend writes zero512), and
+     * _mm512_adds_epi8(h, 0) == h, so the cell's m11 is its diagonal as is.
+     * [jzero, jsplit) therefore runs a cell with no query load, XOR, shuffle,
+     * compare, blend or add. The freed-cell override never fires there either:
+     * it compares s2 with fr_read / fr_read2 (base codes) or FREED_INACTIVE8,
+     * never X86_QPAD8. The FScan bodies apply no boundary mask below jsplit, so
+     * nothing else differs. A dummy tail lane (len2 = 0) pins jsplit to 0, and
+     * a lane whose len2 is a multiple of 16 pins it to at most that len2, so
+     * the range is empty in both cases. The biased (!Sgn) body is excluded: its
+     * pad cell is subs(adds(h, shift), shift), which is not h when h + shift
+     * saturates. jzero >= jdummy whenever the range is non-empty (jdummy is
+     * then some lane's len2, at most maxLen2); the clamp keeps the X86_QPAD8
+     * range [jdummy, jzero) well formed regardless. 0 leaves the range empty. */
+    int jzero = jsplit;
+    if (Sgn && FScan && rescue_padcols_enabled()) {
+        int maxLen2 = 0;
+        for (int l = 0; l < SIMD_WIDTH8; l++)
+            if (p[l].len2 > maxLen2) maxLen2 = p[l].len2;
+        jzero = maxLen2 < jsplit ? maxLen2 : jsplit;
+        if (jzero < jdummy) jzero = jdummy;
+    }
+
+    /* The lazy query-end rescan's order; see the epilogue below. */
+    const bool qe_revscan = rescue_qe_revscan_enabled();
+
+    /* Per-row epilogue, shared by the one-row and two-row sweeps (cf.
+     * KSWV_U8_EPILOGUE in the NEON kernel). It threads the cross-row state (the
+     * lagged rowMax store through pimax512 / mask512 / minsc_msk, gmax / te /
+     * qe, and exit0) and must run once per row in ascending row order, so the
+     * paired sweep runs it twice back to back and an exit at row i suppresses
+     * row i+1 exactly as the one-row loop does. EPI_IMAX is the row's running
+     * max in the cell's domain (H - 128 under Sgn), EPI_BMAX its QE_BLK
+     * checkpoints, and EPI_HBASE the row's stored H, column j at
+     * EPI_HBASE + j * SIMD_WIDTH8. */
+#define KSWV512_U8_EPILOGUE(EPI_ROW, EPI_IMAX, EPI_BMAX, EPI_HBASE)              \
+    {                                                                           \
+        const int row_ = (EPI_ROW);                                             \
+        uint8_t *const bmax_ = (EPI_BMAX);                                      \
+        const uint8_t *const hbase_ = (EPI_HBASE);                              \
+        /* Close the final (possibly partial) block; see kswv_neon_u8_impl. */  \
+        const __m512i imax_h = (EPI_IMAX);                                      \
+        _mm512_store_si512((__m512i *)(bmax_ + ((ncol - 1) / QE_BLK) * SIMD_WIDTH8), \
+                           imax_h);                                             \
+        /* Sgn: the row max back to the unsigned domain; the rescan compares   \
+         * against imax_h. */                                                   \
+        const __m512i imaxu = Sgn ? _mm512_xor_si512(imax_h, h_zero) : imax_h;  \
+        const __m512i rowv = _mm512_set1_epi16(row_);                           \
+                                                                                \
+        /* Block I */                                                           \
+        if (row_ > 0)                                                           \
+        {                                                                       \
+            __mmask64 msk64 = _mm512_cmpgt_epu8_mask(imaxu, pimax512);          \
+            msk64 |= mask512;                                                   \
+            pimax512 = _mm512_mask_blend_epi8(msk64, pimax512, zero512);        \
+            pimax512 = _mm512_mask_blend_epi8(minsc_msk, zero512, pimax512);    \
+            pimax512 = _mm512_mask_blend_epi8(exit0, zero512, pimax512);        \
+                                                                                \
+            _mm512_store_si512((__m512i *) (rowMax + (row_ - 1) * SIMD_WIDTH8), pimax512); \
+            mask512 = ~msk64;                                                   \
+        }                                                                       \
+        pimax512 = imaxu;                                                       \
+        minsc_msk = _mm512_cmpge_epu8_mask(imaxu, minsc512);                    \
+        minsc_msk &= minsc_msk_a;                                               \
+                                                                                \
+        /* Block II: gmax, te */                                                \
+        __mmask64 cmp0 = _mm512_cmpgt_epu8_mask(imaxu, gmax512);                \
+        cmp0 &= exit0;                                                          \
+        gmax512 = _mm512_mask_blend_epi8(cmp0, gmax512, imaxu);                 \
+        te512 = _mm512_mask_blend_epi16((__mmask32)cmp0, te512, rowv);          \
+        te512_ = _mm512_mask_blend_epi16((__mmask32) (cmp0 >> SIMD_WIDTH16), te512_, rowv); \
+        /* Deferred query-end recovery over the QE_BLK checkpoints; see        \
+         * kswv_neon_u8_impl for the derivation. `found` and the per-block      \
+         * masks are k-regs here, so a block that holds no active lane's max    \
+         * costs one compare, one kandn and one kor. */                         \
+        if (cmp0 && qe_revscan)                                                 \
+        {                                                                       \
+            /* Backward column rescan (BWA3_RESCUE_QE_REVSCAN; see the note    \
+             * above rescue_qe_revscan_enabled in the NEON section). The block  \
+             * walk is the forward scan's, so its only loop-carried state is    \
+             * foundBlk in a GPR. Inside a block, the columns are scanned last  \
+             * to first with a compare masked by `newly` and a merge-masked     \
+             * load of the column index: the last write leaves each such lane   \
+             * at its FIRST column holding the max, min{ j : H[j] == imax } over \
+             * the same stored H, which the forward scan's first-hit            \
+             * (eq & ~got) blend gives, without its got mask. */                \
+            __m512i iqe512 = _mm512_set1_epi8(-1);                              \
+            __mmask64 foundBlk = 0;                                             \
+            const uint8_t *colIdx = this->colIdx8;                              \
+            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;                   \
+            for (int b = 0; b < nblocks; b++) {                                 \
+                __mmask64 reached = _mm512_cmpeq_epu8_mask(                     \
+                    _mm512_load_si512((__m512i *)(bmax_ + b * SIMD_WIDTH8)), imax_h); \
+                __mmask64 newly = reached & ~foundBlk & cmp0;                   \
+                foundBlk |= reached;                                            \
+                if (newly) {                                                    \
+                    const int j0 = b * QE_BLK;                                  \
+                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol; \
+                    for (int j2 = j1 - 1; j2 >= j0; j2--) {                     \
+                        const __mmask64 eq = _mm512_mask_cmpeq_epu8_mask(newly, \
+                            _mm512_load_si512((__m512i *)(hbase_ + j2 * SIMD_WIDTH8)), \
+                            imax_h);                                            \
+                        iqe512 = _mm512_mask_loadu_epi8(iqe512, eq,             \
+                            (const void *)(colIdx + j2 * SIMD_WIDTH8));          \
+                    }                                                           \
+                }                                                               \
+                if ((foundBlk & cmp0) == cmp0) break;                           \
+            }                                                                   \
+            qe512 = _mm512_mask_blend_epi8(cmp0, qe512, iqe512);                \
+        }                                                                       \
+        else if (cmp0)                                                          \
+        {                                                                       \
+            __m512i iqe512 = _mm512_set1_epi8(-1);                              \
+            __mmask64 foundBlk = 0;                                             \
+            const uint8_t *colIdx = this->colIdx8;                              \
+            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;                   \
+            for (int b = 0; b < nblocks; b++) {                                 \
+                __mmask64 reached = _mm512_cmpeq_epu8_mask(                     \
+                    _mm512_load_si512((__m512i *)(bmax_ + b * SIMD_WIDTH8)), imax_h); \
+                __mmask64 newly = reached & ~foundBlk & cmp0;                   \
+                foundBlk |= reached;                                            \
+                if (newly) {                                                    \
+                    const int j0 = b * QE_BLK;                                  \
+                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol; \
+                    __mmask64 got = 0;                                          \
+                    for (int j2 = j0; j2 < j1; j2++) {                          \
+                        __mmask64 eq = _mm512_cmpeq_epu8_mask(                  \
+                            _mm512_load_si512((__m512i *)(hbase_ + j2 * SIMD_WIDTH8)), \
+                            imax_h) & newly;                                    \
+                        iqe512 = _mm512_mask_blend_epi8(                        \
+                            eq & ~got, iqe512,                                  \
+                            _mm512_loadu_si512((const __m512i *)(colIdx + j2 * SIMD_WIDTH8))); \
+                        got |= eq;                                              \
+                    }                                                           \
+                }                                                               \
+                if ((foundBlk & cmp0) == cmp0) break;                           \
+            }                                                                   \
+            qe512 = _mm512_mask_blend_epi8(cmp0, qe512, iqe512);                \
+        }                                                                       \
+                                                                                \
+        cmp0 = _mm512_cmpge_epu8_mask(gmax512, endsc512);                       \
+        cmp0 &= endsc_msk_a;                                                    \
+                                                                                \
+        __m512i left512 = _mm512_adds_epu8(gmax512, sft512);                    \
+        __mmask64 cmp2 = _mm512_cmpge_epu8_mask(left512, cmax512);              \
+                                                                                \
+        exit0 = (~(cmp0 | cmp2)) & exit0;                                       \
+    }
+
+    /* Two-target-row FScan cell (RowPair), the AVX-512 twin of
+     * KSWV_NEON_U8_CELL_PAIR_FS with its LazyQE store: rows i and i+1 at
+     * column j in one body. Row i's diagonal is H0[j] (= H(i-1, j-1)); row
+     * i+1's diagonal is row i's H at the previous column (d1) and its vertical
+     * carry is row i's F, both handed over in registers, so the pair loads the
+     * query column, H0[j] and F[j+1] once and stores F once for two cells. Row
+     * i's H for column j is written back to H0[j], the diagonal slot it has
+     * just consumed and no later cell of this sweep reads, for the post-row
+     * query-end rescan; row i+1's H goes to H1[j+1] as in the one-row body.
+     * Each cell is MAIN_SAM_CODE8_FS's arithmetic on the same inputs, and the
+     * row epilogues still run in row order, so the sweep is byte-identical to
+     * the one-row loop (the NEON gate "BWA3_RESCUE_ROWPAIR off == on" covers
+     * the same reorder there). dm_ (X86_QPAD8 column lanes) and cb_ (non-pad
+     * query lanes) are built once per column for both rows. */
+#define KSWV512_MAX(a, b)  (Sgn ? _mm512_max_epi8((a), (b)) : _mm512_max_epu8((a), (b)))
+#define KSWV512_SUBS(a, b) (Sgn ? _mm512_subs_epi8((a), (b)) : _mm512_subs_epu8((a), (b)))
+#define KSWV512_U8_FS_M11(M, DIAG, S1, AFR, APPLY_BND, NEED_DUMMY, PADC)          \
+        if (PADC && Sgn) { M = (DIAG); } else                                   \
+        {                                                                       \
+            __m512i sbt_ = _mm512_shuffle_epi8(Sgn ? permS512 : permSft512,     \
+                                               _mm512_xor_si512((S1), s2));     \
+            if (NEED_DUMMY)                                                     \
+                sbt_ = _mm512_mask_blend_epi8(dm_, sbt_, Sgn ? zero512 : sft512); \
+            if (HasFreed)                                                       \
+                sbt_ = _mm512_mask_blend_epi8(                                  \
+                    _mm512_cmpeq_epi8_mask(s2, (AFR)), sbt_, freedval512);      \
+            if (Sgn) {                                                          \
+                M = APPLY_BND                                                   \
+                    ? _mm512_mask_adds_epi8(highbit512, cb_, (DIAG), sbt_)      \
+                    : _mm512_adds_epi8((DIAG), sbt_);                           \
+            } else {                                                            \
+                M = APPLY_BND                                                   \
+                    ? _mm512_maskz_adds_epu8(cb_, (DIAG), sbt_)                 \
+                    : _mm512_adds_epu8((DIAG), sbt_);                           \
+                M = _mm512_subs_epu8(M, sft512);                                \
+            }                                                                   \
+        }
+#define KSWV512_U8_CELL_PAIR_FS(APPLY_BND, NEED_DUMMY, PADC)                      \
+        {                                                                       \
+            const __m512i s2  = _mm512_load_si512((__m512i *)(seq2SoA + j * SIMD_WIDTH8)); \
+            const __m512i f11 = _mm512_load_si512((__m512i *)(F + (j + 1) * SIMD_WIDTH8)); \
+            const __m512i h00 = _mm512_load_si512((__m512i *)(H0 + j * SIMD_WIDTH8)); \
+            __mmask64 dm_ = 0, cb_ = 0;                                         \
+            if (NEED_DUMMY) dm_ = _mm512_cmpeq_epu8_mask(s2, qpad512);          \
+            if (APPLY_BND) cb_ = _mm512_testn_epi8_mask(s2, highbit512);        \
+            (void) dm_; (void) cb_;                                             \
+            /* ---- Row i (diagonal H0[j]) ---- */                              \
+            __m512i m0_;                                                        \
+            KSWV512_U8_FS_M11(m0_, h00, s1_0, afr0_512, APPLY_BND, NEED_DUMMY, PADC)  \
+            const __m512i g0_ = KSWV512_MAX(m0_, f11);                          \
+            const __m512i t0_ = KSWV512_SUBS(g0_, oe512);                       \
+            const __m512i h0_ = KSWV512_MAX(g0_, e11_0);                        \
+            _mm512_store_si512((__m512i *)(H0 + j * SIMD_WIDTH8), h0_);         \
+            imax0 = KSWV512_MAX(imax0, g0_);                                    \
+            e11_0 = KSWV512_MAX(t0_, KSWV512_SUBS(e11_0, e_ins512));            \
+            const __m512i f0_ = KSWV512_MAX(t0_, KSWV512_SUBS(f11, e_del512));  \
+            /* ---- Row i+1 (diagonal d1, vertical carry f0_) ---- */           \
+            __m512i m1_;                                                        \
+            KSWV512_U8_FS_M11(m1_, d1, s1_1, afr1_512, APPLY_BND, NEED_DUMMY, PADC)   \
+            const __m512i g1_ = KSWV512_MAX(m1_, f0_);                          \
+            const __m512i t1_ = KSWV512_SUBS(g1_, oe512);                       \
+            _mm512_store_si512((__m512i *)(H1 + (j + 1) * SIMD_WIDTH8),         \
+                               KSWV512_MAX(g1_, e11_1));                        \
+            _mm512_store_si512((__m512i *)(F + (j + 1) * SIMD_WIDTH8),          \
+                               KSWV512_MAX(t1_, KSWV512_SUBS(f0_, e_del512)));  \
+            imax1 = KSWV512_MAX(imax1, g1_);                                    \
+            e11_1 = KSWV512_MAX(t1_, KSWV512_SUBS(e11_1, e_ins512));            \
+            d1 = h0_;                                                           \
+        }
+    /* Column-range driver for the pair: run the cell over [j, hi) in
+     * QE_BLK-aligned blocks and checkpoint both rows' running maxima at every
+     * block boundary crossed (cf. KSWV_U8_BLOCKS). Block b is written after
+     * column QE_BLK*b + QE_BLK - 1, the cell the one-row body's
+     * `j == qeNext` test fires on; a range that ends off a boundary leaves the
+     * block open for the next range, and the epilogue closes the last one. */
+#define KSWV512_U8_PAIR_BLOCKS(hi, APPLY_BND, NEED_DUMMY, PADC)                   \
+        for (; j < (hi); ) {                                                    \
+            const int jnb_ = ((j / QE_BLK) + 1) * QE_BLK;                       \
+            const int jend_ = jnb_ < (hi) ? jnb_ : (hi);                        \
+            for (; j < jend_; j++) KSWV512_U8_CELL_PAIR_FS(APPLY_BND, NEED_DUMMY, PADC) \
+            if ((j % QE_BLK) == 0) {                                            \
+                _mm512_store_si512((__m512i *)(blockMax  + (j / QE_BLK - 1) * SIMD_WIDTH8), imax0); \
+                _mm512_store_si512((__m512i *)(blockMax1 + (j / QE_BLK - 1) * SIMD_WIDTH8), imax1); \
+            }                                                                   \
+        }
+
+    int i = 0, limit = nrow;
+    while (i < nrow)
     {
+        /* ---- Two-target-row sweep (FScan bodies under RowPair) ------------
+         * Taken whenever a full pair of rows remains: FScan has no reference
+         * half of the boundary mask, so any two rows pair up. The final odd
+         * row, and every row of the original cell, run the one-row body. */
+        if (FScan && RowPair && i + 1 < nrow)
+        {
+            const __m512i s1_0 = _mm512_load_si512((__m512i *)(seq1SoA + (i + 0) * SIMD_WIDTH8));
+            const __m512i s1_1 = _mm512_load_si512((__m512i *)(seq1SoA + (i + 1) * SIMD_WIDTH8));
+            __m512i imax0 = h_zero, imax1 = h_zero;
+            __m512i e11_0 = h_zero, e11_1 = h_zero;
+            /* Row i+1's diagonal at column 0 is H(i, -1), the DP's 0. */
+            __m512i d1 = h_zero;
+
+            /* Freed-cell override built once per row for both rows of the pair
+             * (s1 differs between them); see the one-row body below. */
+            __m512i freedval512, afr0_512, afr1_512;
+            if (HasFreed) {
+                freedval512 = _mm512_set1_epi8((char)(Sgn ? fr_val : fr_val + shift));
+                const __m512i fin  = _mm512_set1_epi8((char)FREED_INACTIVE8);
+                const __m512i frv  = _mm512_set1_epi8((char)fr_ref);
+                const __m512i frv2 = _mm512_set1_epi8((char)fr_ref2);
+                const __m512i frd  = _mm512_set1_epi8((char)fr_read);
+                const __m512i frd2 = _mm512_set1_epi8((char)fr_read2);
+                afr0_512 = _mm512_mask_blend_epi8(_mm512_cmpeq_epi8_mask(s1_0, frv2), fin, frd2);
+                afr0_512 = _mm512_mask_blend_epi8(_mm512_cmpeq_epi8_mask(s1_0, frv), afr0_512, frd);
+                afr1_512 = _mm512_mask_blend_epi8(_mm512_cmpeq_epi8_mask(s1_1, frv2), fin, frd2);
+                afr1_512 = _mm512_mask_blend_epi8(_mm512_cmpeq_epi8_mask(s1_1, frv), afr1_512, frd);
+            }
+
+            /* The one-row FScan body's column ranges; [jzero, jsplit) is the
+             * all-pad range (see jzero), empty unless Sgn. */
+            int j = 0;
+            KSWV512_U8_PAIR_BLOCKS(jdummy, false, false, false)
+            KSWV512_U8_PAIR_BLOCKS(jzero, false, true, false)
+            KSWV512_U8_PAIR_BLOCKS(jsplit, false, true, true)
+            KSWV512_U8_PAIR_BLOCKS(ncol, true, true, false)
+
+            /* Row epilogues in row order: an exit at row i must suppress row
+             * i+1. Row i's H is in H0 (column j at index j), row i+1's in H1
+             * (column j at index j+1). */
+            KSWV512_U8_EPILOGUE(i, imax0, blockMax, H0)
+            if (exit0 == 0) { limit = i; i += 1; break; }
+            KSWV512_U8_EPILOGUE(i + 1, imax1, blockMax1, H1 + SIMD_WIDTH8)
+            if (exit0 == 0) { limit = i + 1; i += 2; break; }
+            /* Restore the column -1 boundary the in-place store clobbered
+             * (H0[0] held row i's column 0); after the swap this buffer is H1,
+             * then H0 again two rows on, when its [0] must read the DP's 0. */
+            _mm512_store_si512((__m512i *)H0, h_zero);
+
+            uint8_t *S = H1; H1 = H0; H0 = S;
+            i += 2;
+            continue;
+        }
         __m512i e11 = h_zero;
         __m512i h00, h11, h10, s1;
-        __m512i i512 = _mm512_set1_epi16(i);
         int j ;
         
         s1 = _mm512_load_si512((__m512i *)(seq1SoA + (i + 0) * SIMD_WIDTH8));
@@ -4722,14 +5049,14 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
          * off the contended vector ports. */
         /* FScan: the G-based cell, with only the query half of the boundary
          * mask and only from jsplit on (see MAIN_SAM_CODE8_FS). */
-#define KSWV_AVX512_U8_CELL_FS(APPLY_BND, NEED_DUMMY)                               \
+#define KSWV_AVX512_U8_CELL_FS(APPLY_BND, NEED_DUMMY, PADC)                         \
         {                                                                           \
             __m512i f11, s2, f21;                                                   \
             h00 = _mm512_load_si512((__m512i *)(H0 + j * SIMD_WIDTH8));             \
             s2  = _mm512_load_si512((__m512i *)(seq2SoA + (j) * SIMD_WIDTH8));      \
             f11 = _mm512_load_si512((__m512i *)(F + (j+1) * SIMD_WIDTH8));          \
                                                                                     \
-            MAIN_SAM_CODE8_FS(s1, s2, h00, h11, e11, f11, f21, (APPLY_BND), (NEED_DUMMY)); \
+            MAIN_SAM_CODE8_FS(s1, s2, h00, h11, e11, f11, f21, (APPLY_BND), (NEED_DUMMY), (PADC)); \
                                                                                     \
             _mm512_store_si512((__m512i *)(H1 + (j + 1) * SIMD_WIDTH8), h11);       \
             _mm512_store_si512((__m512i *)(F + (j + 1)* SIMD_WIDTH8), f21);         \
@@ -4741,9 +5068,10 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
         }
 
         if (FScan) {
-            for (j = 0; j < jdummy; j++)  KSWV_AVX512_U8_CELL_FS(false, false)
-            for (; j < jsplit; j++)       KSWV_AVX512_U8_CELL_FS(false, true)
-            for (; j < ncol; j++)         KSWV_AVX512_U8_CELL_FS(true, true)
+            for (j = 0; j < jdummy; j++)  KSWV_AVX512_U8_CELL_FS(false, false, false)
+            for (; j < jzero; j++)        KSWV_AVX512_U8_CELL_FS(false, true, false)
+            for (; j < jsplit; j++)       KSWV_AVX512_U8_CELL_FS(false, true, true)
+            for (; j < ncol; j++)         KSWV_AVX512_U8_CELL_FS(true, true, false)
         } else {
             for (j = 0; j < jdummy; j++)
                 KSWV_AVX512_U8_CELL(HasFreed
@@ -4759,85 +5087,24 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
 #undef KSWV_AVX512_U8_CELL_FS
 #undef KSWV_AVX512_U8_CELL
 
-        /* Close the final (possibly partial) block; see kswv_neon_u8_impl. */
-        _mm512_store_si512((__m512i *)(blockMax + ((ncol - 1) / QE_BLK) * SIMD_WIDTH8),
-                           imax512);
-        /* Sgn: the row max back to the unsigned domain; the rescan compares against imax_h. */
-        const __m512i imax_h = imax512;
-        if (Sgn) imax512 = _mm512_xor_si512(imax512, h_zero);
-
-        // Block I
-        if (i > 0)
-        {
-            __mmask64 msk64 = _mm512_cmpgt_epu8_mask(imax512, pimax512);
-            msk64 |= mask512;
-            pimax512 = _mm512_mask_blend_epi8(msk64, pimax512, zero512);
-            pimax512 = _mm512_mask_blend_epi8(minsc_msk, zero512, pimax512);
-            pimax512 = _mm512_mask_blend_epi8(exit0, zero512, pimax512);
-            
-            _mm512_store_si512((__m512i *) (rowMax + (i-1)*SIMD_WIDTH8), pimax512);
-            mask512 = ~msk64;
-        }
-        pimax512 = imax512;
-        minsc_msk = _mm512_cmpge_epu8_mask(imax512, minsc512);
-        minsc_msk &= minsc_msk_a;
-
-        // Block II: gmax, te
-        __mmask64 cmp0 = _mm512_cmpgt_epu8_mask(imax512, gmax512);
-        cmp0 &= exit0;
-        gmax512 = _mm512_mask_blend_epi8(cmp0, gmax512, imax512);
-        te512 = _mm512_mask_blend_epi16((__mmask32)cmp0, te512,  i512);
-        te512_ = _mm512_mask_blend_epi16((__mmask32) (cmp0 >> SIMD_WIDTH16), te512_,  i512);
-        /* Deferred query-end recovery over the QE_BLK checkpoints; see
-         * kswv_neon_u8_impl for the derivation. `found` and the per-block
-         * masks are k-regs here, so a block that holds no active lane's max
-         * costs one compare, one kandn and one kor. */
-        if (cmp0)
-        {
-            __m512i iqe512 = _mm512_set1_epi8(-1);
-            __mmask64 foundBlk = 0;
-            const uint8_t *colIdx = this->colIdx8;
-            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;
-            for (int b = 0; b < nblocks; b++) {
-                __mmask64 reached = _mm512_cmpeq_epu8_mask(
-                    _mm512_load_si512((__m512i *)(blockMax + b * SIMD_WIDTH8)), imax_h);
-                __mmask64 newly = reached & ~foundBlk & cmp0;
-                foundBlk |= reached;
-                if (newly) {
-                    const int j0 = b * QE_BLK;
-                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol;
-                    __mmask64 got = 0;
-                    for (int j2 = j0; j2 < j1; j2++) {
-                        __mmask64 eq = _mm512_cmpeq_epu8_mask(
-                            _mm512_load_si512((__m512i *)(H1 + (j2 + 1) * SIMD_WIDTH8)),
-                            imax_h) & newly;
-                        iqe512 = _mm512_mask_blend_epi8(
-                            eq & ~got, iqe512,
-                            _mm512_loadu_si512((const __m512i *)(colIdx + j2 * SIMD_WIDTH8)));
-                        got |= eq;
-                    }
-                }
-                if ((foundBlk & cmp0) == cmp0) break;
-            }
-            qe512 = _mm512_mask_blend_epi8(cmp0, qe512, iqe512);
-        }
-        
-        cmp0 = _mm512_cmpge_epu8_mask(gmax512, endsc512);
-        cmp0 &= endsc_msk_a;
-        
-        __m512i left512 = _mm512_adds_epu8(gmax512, sft512);
-        __mmask64 cmp2 = _mm512_cmpge_epu8_mask(left512, cmax512);
-
-        exit0 = (~(cmp0 | cmp2)) & exit0;
+        KSWV512_U8_EPILOGUE(i, imax512, blockMax, H1 + SIMD_WIDTH8)
         if (exit0 == 0)
         {
-            limit = i++;
+            limit = i;
+            i += 1;
             break;
-        }       
+        }
 
         uint8_t *S = H1; H1 = H0; H0 = S;
-        i512 = _mm512_add_epi16(i512, one512);
+        i += 1;
     } // for nrow
+#undef KSWV512_U8_PAIR_BLOCKS
+#undef KSWV512_U8_CELL_PAIR_FS
+#undef KSWV512_U8_FS_M11
+#undef KSWV512_SUBS
+#undef KSWV512_MAX
+#undef KSWV512_U8_EPILOGUE
+    (void) limit;
 
     pimax512 = _mm512_mask_blend_epi8(mask512, pimax512, zero512);
     pimax512 = _mm512_mask_blend_epi8(minsc_msk, zero512, pimax512);

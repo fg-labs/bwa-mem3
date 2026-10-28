@@ -3,8 +3,10 @@
  * bandedSWA_compact.inc's (NEON), on 64-lane groups: superblocks of K groups in row lockstep,
  * bsw_compact_plan() after a row in which lanes finished, moved lanes copied slot to slot in the
  * absolute column frame, the receiving slot cleared left of the lane's head over the group range.
- * The row body is smithWaterman512_8Impl's (its cell loops through the same EXT13_CELL8_512_*
- * macros) with its persistent vectors kept in a per-group struct.
+ * The row body is smithWaterman512_8Impl's lean row (its cell loops through the same EXT13_CELL8_512_*
+ * macros, which record the narrowing offsets; the counted trim; the narrow epilogue with the gated
+ * z-drop, BSW8_GSCORE_NARROW512 and BSW8_ZDROP_WIDE512) with its persistent vectors kept in a
+ * per-group struct.
  *
  * Any change to the row body here must be mirrored in smithWaterman512_8Impl (and vice versa);
  * test/unit/test_bandedswa_compact.cpp compares the two field by field. */
@@ -20,7 +22,9 @@ static_assert(SIMD_WIDTH8 == 64, "bandedSWA_compact512.inc: Bsw8CVec512 holds 64
 namespace {
 struct alignas(64) Bsw8CVec512 {
     uint8_t head[64], tail[64], maxend[64], exit0[64], maxScore[64], y[64], max_off[64], h0[64], myband[64];
-    int32_t xrow[64], ierow[64], best_abs[64], gbest_abs[64], qlenw[64], mlenw[64], tlenw[64];
+    uint8_t gbest8[64], gset8[64];      /* gscore byte, and 0xFF where it is set (-1 otherwise) */
+    int16_t xrow16[64], ierow16[64];    /* best row and best-gscore row (rows < MAX_SEQ_LEN8) */
+    int32_t best_abs[64], qlenw[64], mlenw[64], tlenw[64];   /* best_abs: the raw h0 */
     SeqPair *pair[64];
     int nbeg, nend, ncol, minq;
     uint8_t *seq1, *seq2;
@@ -111,6 +115,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
     const __m512i zdrop512 = _mm512_set1_epi8(zdrop);
     /* the epilogue skip below is exact only for gap extends inside this bound */
     const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
+    /* lean z-drop gate threshold byte: drop <= 255, so for zdrop >= 255 no lane can die */
+    const __m512i zgate512 = _mm512_set1_epi8((int8_t) (zdrop < 255 ? zdrop : 255));
     const __mmask64 dmask = 0xFFFFFFFFFFFFFFFFULL;
     const int o_del8 = (uint8_t) (int8_t) this->o_del, e_del8 = (uint8_t) (int8_t) this->e_del;
     /* band-edge write: byte penalties, as the seed row's set1_epi8 / subs_epu8 uses them */
@@ -123,12 +129,16 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
     auto writeback = [&](Bsw8CVec512 &V, int l) {
         SeqPair *p = V.pair[l];
         if (!p) return;
-        p->score   = V.best_abs[l];
-        p->tle     = V.xrow[l];
-        p->qle     = (V.xrow[l] == 0) ? 0 : ((int) (int8_t) V.y[l] + V.xrow[l] - 1);
+        const int xr = V.xrow16[l];
+        int sc = V.best_abs[l];   /* raw h0; the score is max(h0, maxScore) once the lane advanced */
+        const int ms = (uint8_t) (V.maxScore[l] ^ hbias8);   /* maxScore is kept in the score domain */
+        if (xr != 0 && ms > sc) sc = ms;
+        p->score   = sc;
+        p->tle     = xr;
+        p->qle     = (xr == 0) ? 0 : ((int) (int8_t) V.y[l] + xr - 1);
         p->max_off = (uint8_t) V.max_off[l];
-        p->gscore  = V.gbest_abs[l];
-        p->gtle    = V.ierow[l];
+        p->gscore  = V.gset8[l] ? (int) V.gbest8[l] : -1;
+        p->gtle    = V.ierow16[l];
         V.pair[l] = nullptr;
     };
 
@@ -166,7 +176,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                 V.tlenw[l] = p[l].len1; V.qlenw[l] = p[l].len2;
                 int ml = p[l].len2 + V.myband[l]; if (ml > p[l].len1) ml = p[l].len1;
                 V.mlenw[l] = ml;
-                V.xrow[l] = 0; V.ierow[l] = 0; V.best_abs[l] = p[l].h0; V.gbest_abs[l] = -1;
+                V.xrow16[l] = 0; V.ierow16[l] = 0; V.best_abs[l] = p[l].h0; V.gbest8[l] = 0; V.gset8[l] = 0;
                 V.pair[l] = &p[l];
                 V.head[l] = 0; V.tail[l] = 127; V.maxend[l] = (uint8_t) -128; V.exit0[l] = 0xFF;
                 V.maxScore[l] = (uint8_t) (V.h0[l] ^ hbias8); V.y[l] = 0; V.max_off[l] = 0;
@@ -195,7 +205,6 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
             int8_t *H_h = V.H, *F = V.F;
             const uint8_t *seq2SoA = V.seq2;
             const int minq = V.minq, vncol = V.ncol;
-            int32_t *xrow = V.xrow, *ierow = V.ierow, *best_abs = V.best_abs, *gbest_abs = V.gbest_abs;
             __m512i head512     = _mm512_load_si512((const __m512i *) V.head);
             __m512i tail512     = _mm512_load_si512((const __m512i *) V.tail);
             __m512i maxend512   = _mm512_load_si512((const __m512i *) V.maxend);
@@ -256,19 +265,21 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                 }
                 maxend512 = _mm512_max_epi8(maxend512, tail512);
             }
-            {
+            {   /* trim, counted (the lean row; see smithWaterman512_8Impl) */
                 __mmask64 cmph = _mm512_cmpeq_epi8_mask(head512, phead512) & _mm512_cmpeq_epi8_mask(tail512, ptail512);
-                for (int l = beg; l < end && cmph != dmask; l++) {
-                    __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-                    __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
-                    __m512i pj512 = _mm512_set1_epi8(l - i);
-                    __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, pj512);
-                    if (cmp1 == 0x00) break;
-                    cmp1 = cmp1 | _mm512_cmpgt_epi8_mask(pj512, tail512);
-                    h512 = _mm512_mask_blend_epi8(cmp1, h512, hzero512);
-                    f512 = _mm512_mask_blend_epi8(cmp1, f512, hzero512);
-                    _mm512_store_si512((__m512i *)(F + l * SIMD_WIDTH8), f512);
-                    _mm512_store_si512((__m512i *)(H_h + l * SIMD_WIDTH8), h512);
+                if (cmph != dmask) {
+                    int trim_hi = i + bsw8_hmax_epi8_512(head512);
+                    if (trim_hi > end) trim_hi = end;
+                    for (int l = beg; l < trim_hi; l++) {
+                        __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
+                        __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
+                        __m512i pj512 = _mm512_set1_epi8(l - i);
+                        __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, pj512) | _mm512_cmpgt_epi8_mask(pj512, tail512);
+                        h512 = _mm512_mask_blend_epi8(cmp1, h512, hzero512);
+                        f512 = _mm512_mask_blend_epi8(cmp1, f512, hzero512);
+                        _mm512_store_si512((__m512i *)(F + l * SIMD_WIDTH8), f512);
+                        _mm512_store_si512((__m512i *)(H_h + l * SIMD_WIDTH8), h512);
+                    }
                 }
             }
             {
@@ -301,19 +312,14 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
             }
             int fast_lo = beg, fast_hi = beg;
             if (_mm512_movepi8_mask(exit0) == dmask) {
-                int8_t hh_[SIMD_WIDTH8] __attribute((aligned(64)));
-                int8_t tt_[SIMD_WIDTH8] __attribute((aligned(64)));
-                _mm512_store_si512((__m512i *) hh_, head512);
-                _mm512_store_si512((__m512i *) tt_, tail512);
-                int maxhead = -128, mintail = 127;
-                for (int l = 0; l < SIMD_WIDTH8; l++) {
-                    if (hh_[l] > maxhead) maxhead = hh_[l];
-                    if (tt_[l] < mintail) mintail = tt_[l];
-                }
+                const int maxhead = bsw8_hmax_epi8_512(head512);
+                const int mintail = bsw8_hmin_epi8_512(tail512);
                 fast_lo = i + maxhead; if (fast_lo < beg) fast_lo = beg; if (fast_lo > end) fast_lo = end;
                 fast_hi = i + mintail; if (fast_hi < fast_lo) fast_hi = fast_lo; if (fast_hi > end) fast_hi = end;
             }
             j512 = _mm512_set1_epi8(beg - i);
+            __m512i nf_first512 = _mm512_set1_epi8(end - i);       /* see BSW8_NF_TRACK512 */
+            __m512i nf_last512  = _mm512_set1_epi8(beg - 1 - i);
             /* the cell loops of smithWaterman512_8Impl, through its own macros */
             for (j = beg; j < fast_lo; j++)   EXT13_CELL8_512_MASKED
             for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_512_FAST
@@ -323,25 +329,26 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                 h10 = _mm512_mask_blend_epi8(cmp1, h10, hzero512);
                 _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10);
                 _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), hzero512);
+                nf_last512 = _mm512_mask_mov_epi8(nf_last512, _mm512_cmpneq_epi8_mask(h10, hzero512), j512);   /* j512 == end - i */
             }
+            /* the narrow side channels (BSW8_GSCORE_NARROW512 folds into these) */
+            __m512i gbest512 = _mm512_load_si512((const __m512i *) V.gbest8);
+            __mmask64 gset64 = _mm512_movepi8_mask(_mm512_load_si512((const __m512i *) V.gset8));
+            __m512i ierow_lo = _mm512_load_si512((const __m512i *) V.ierow16);
+            __m512i ierow_hi = _mm512_load_si512((const __m512i *) (V.ierow16 + 32));
+            auto store_gscore = [&]() {
+                _mm512_store_si512((__m512i *) V.gbest8, gbest512);
+                _mm512_store_si512((__m512i *) V.gset8, _mm512_movm_epi8(gset64));
+                _mm512_store_si512((__m512i *) V.ierow16, ierow_lo);
+                _mm512_store_si512((__m512i *) (V.ierow16 + 32), ierow_hi);
+            };
             __m512i bmaxScore512 = maxScore512;
             __mmask64 tmp = _mm512_cmpeq_epi8_mask(maxRS1, hzero512);
             if (tmp == dmask) {
-                int8_t hq_a_[SIMD_WIDTH8] __attribute((aligned(64)));
-                _mm512_store_si512((__m512i *) hq_a_, bsw8_unbias512<SIGNED8>(hqe512, x80_512));
-                const __mmask64 qf64_ = _mm512_movepi8_mask(qfire512);
-                for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
-                    const int base = g * 16;
-                    const __mmask16 qfm = (__mmask16)(qf64_ >> (16 * g));
-                    __m512i hqeg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(hq_a_ + base)));
-                    __m512i gba = _mm512_loadu_si512((const void *)(gbest_abs + base));
-                    __mmask16 gmask = qfm & _mm512_cmpge_epi32_mask(hqeg, gba);
-                    gba = _mm512_mask_mov_epi32(gba, gmask, hqeg);
-                    _mm512_storeu_si512((void *)(gbest_abs + base), gba);
-                    __m512i ierg = _mm512_loadu_si512((const void *)(ierow + base));
-                    ierg = _mm512_mask_mov_epi32(ierg, gmask, _mm512_set1_epi32(i + 1));
-                    _mm512_storeu_si512((void *)(ierow + base), ierg);
-                }
+                BSW8_GSCORE_NARROW512(gbest512, gset64, ierow_lo, ierow_hi,
+                                      bsw8_unbias512<SIGNED8>(hqe512, x80_512),
+                                      _mm512_movepi8_mask(qfire512), i + 1);
+                store_gscore();
                 _mm512_store_si512((__m512i *) V.exit0, zero512);
                 return 0;
             }
@@ -357,112 +364,36 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                 ind512 = _mm512_max_epu8(max_off512, ind512);
                 max_off512 = _mm512_mask_blend_epi8(cmp, bmax_off512, ind512);
             }
-            const __mmask64 qf64 = _mm512_movepi8_mask(qfire512);
-            const __mmask64 need_z = (zdrop > 0)
-                ? _mm512_test_epi8_mask(_mm512_subs_epu8(_mm512_subs_epu8(bsw8_unbias512<SIGNED8>(maxScore512, x80_512),
-                                                                          bsw8_unbias512<SIGNED8>(maxRS1, x80_512)),
-                                                         zdrop512), ff512)
-                : 0;
-            if (!zgate_exact || (cmp | qf64 | need_z) != 0) {
-                int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(64)));
-                int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(64)));
-                int8_t  ms_a[SIMD_WIDTH8]       __attribute((aligned(64)));
-                int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(64)));
-                int8_t  hqe_a[SIMD_WIDTH8]      __attribute((aligned(64)));
-                _mm512_store_si512((__m512i *) y1_a, y1_512);
-                _mm512_store_si512((__m512i *) y_a, y512);
-                _mm512_store_si512((__m512i *) ms_a, bsw8_unbias512<SIGNED8>(maxScore512, x80_512));
-                _mm512_store_si512((__m512i *) rs_a, bsw8_unbias512<SIGNED8>(maxRS1, x80_512));
-                _mm512_store_si512((__m512i *) hqe_a, bsw8_unbias512<SIGNED8>(hqe512, x80_512));
-                const __m512i vi   = _mm512_set1_epi32(i);
-                const __m512i vip1 = _mm512_set1_epi32(i + 1);
-                const __m512i vone = _mm512_set1_epi32(1);
-                const __m512i vzd  = _mm512_set1_epi32(zdrop);
-                const __m512i vedel = _mm512_set1_epi32(this->e_del);
-                const __m512i veins = _mm512_set1_epi32(this->e_ins);
-                const __mmask64 ex64 = _mm512_movepi8_mask(exit0);
-                __mmask64 die64 = 0;
-                for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
-                    const int base = g * 16;
-                    const __mmask16 cmpm = (__mmask16)(cmp  >> (16 * g));
-                    const __mmask16 qfm  = (__mmask16)(qf64 >> (16 * g));
-                    const __mmask16 exm  = (__mmask16)(ex64 >> (16 * g));
-                    __m512i msg  = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(ms_a  + base)));
-                    __m512i rsg  = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(rs_a  + base)));
-                    __m512i hqeg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(hqe_a + base)));
-                    __m512i y1g  = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y1_a  + base)));
-                    __m512i yg   = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y_a   + base)));
-                    __m512i xrg = _mm512_loadu_si512((const void *)(xrow + base));
-                    xrg = _mm512_mask_mov_epi32(xrg, cmpm, vip1);
-                    _mm512_storeu_si512((void *)(xrow + base), xrg);
-                    __m512i bag = _mm512_loadu_si512((const void *)(best_abs + base));
-                    bag = _mm512_mask_max_epi32(bag, cmpm, bag, msg);
-                    _mm512_storeu_si512((void *)(best_abs + base), bag);
-                    __m512i gba = _mm512_loadu_si512((const void *)(gbest_abs + base));
-                    __mmask16 gmask = qfm & _mm512_cmpge_epi32_mask(hqeg, gba);
-                    gba = _mm512_mask_mov_epi32(gba, gmask, hqeg);
-                    _mm512_storeu_si512((void *)(gbest_abs + base), gba);
-                    __m512i ierg = _mm512_loadu_si512((const void *)(ierow + base));
-                    ierg = _mm512_mask_mov_epi32(ierg, gmask, vip1);
-                    _mm512_storeu_si512((void *)(ierow + base), ierg);
-                    __m512i y1c  = _mm512_add_epi32(y1g, vi);
-                    __m512i yc   = _mm512_add_epi32(yg, _mm512_sub_epi32(xrg, vone));
-                    const __mmask16 seedm = _mm512_cmpeq_epi32_mask(xrg, _mm512_setzero_si512());
-                    yc = _mm512_mask_mov_epi32(yc, seedm, _mm512_setzero_si512());
-                    __m512i tmpi = _mm512_sub_epi32(vip1, xrg);
-                    __m512i tmpj = _mm512_sub_epi32(y1c, yc);
-                    __m512i zdelta = _mm512_sub_epi32(tmpi, tmpj);
-                    __mmask16 zdsel = _mm512_cmpgt_epi32_mask(zdelta, _mm512_setzero_si512());
-                    __m512i zesel  = _mm512_mask_blend_epi32(zdsel, veins, vedel);
-                    __m512i dif  = _mm512_mullo_epi32(_mm512_abs_epi32(zdelta), zesel);
-                    __m512i drop = _mm512_sub_epi32(msg, rsg);
-                    __mmask16 diem = exm & _mm512_cmpgt_epi32_mask(_mm512_sub_epi32(drop, dif), vzd);
-                    die64 |= ((__mmask64) diem) << (16 * g);
+            {   /* lean epilogue: xrow16, gscore, gated z-drop (see smithWaterman512_8Impl) */
+                const __m512i vip1_16 = _mm512_set1_epi16((int16_t) (i + 1));
+                __m512i xrow_lo = _mm512_load_si512((const __m512i *) V.xrow16);
+                __m512i xrow_hi = _mm512_load_si512((const __m512i *) (V.xrow16 + 32));
+                xrow_lo = _mm512_mask_mov_epi16(xrow_lo, (__mmask32) cmp, vip1_16);
+                xrow_hi = _mm512_mask_mov_epi16(xrow_hi, (__mmask32) (cmp >> 32), vip1_16);
+                _mm512_store_si512((__m512i *) V.xrow16, xrow_lo);
+                _mm512_store_si512((__m512i *) (V.xrow16 + 32), xrow_hi);
+                BSW8_GSCORE_NARROW512(gbest512, gset64, ierow_lo, ierow_hi,
+                                      bsw8_unbias512<SIGNED8>(hqe512, x80_512),
+                                      _mm512_movepi8_mask(qfire512), i + 1);
+                store_gscore();
+                if (zdrop > 0) {   /* live lanes only, as in smithWaterman512_8Impl (mex0 == exit0 here) */
+                    const __mmask64 need_z = _mm512_mask_cmpgt_epu8_mask(mex0,
+                        _mm512_subs_epu8(bsw8_unbias512<SIGNED8>(maxScore512, x80_512),
+                                         bsw8_unbias512<SIGNED8>(maxRS1, x80_512)), zgate512);
+                    if (!zgate_exact || need_z != 0)
+                        BSW8_ZDROP_WIDE512(xrow_lo, xrow_hi);
                 }
-                if (zdrop > 0) exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());
             }
-            {   /* narrowing (the four scans) */
-                int l;
-                for (l = beg; l < end; l++) {
-                    __m512i tmp_ = bsw8_hf_or512<SIGNED8>(_mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8)),
-                                                          _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8)), x80_512);
-                    if (_mm512_cmpeq_epi8_mask(tmp_, zero512) == dmask) V.nbeg = l;
-                    else break;
-                }
-                for (l = end; l >= beg; l--) {
-                    __m512i tmp_ = bsw8_hf_or512<SIGNED8>(_mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8)),
-                                                          _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8)), x80_512);
-                    if (_mm512_cmpeq_epi8_mask(tmp_, zero512) != dmask) break;
-                }
+            {   /* narrowing from the tracked first / last offsets (see smithWaterman512_8Impl) */
+                const int minfirst = bsw8_hmin_epi8_512(nf_first512);
+                if (minfirst > beg - i) V.nbeg = i + minfirst - 1;
+                const int l = i + bsw8_hmax_epi8_512(nf_last512);
                 V.nend = l + 2 < vncol ? l + 2 : vncol;
-                __m512i exit1 = _mm512_xor_si512(exit0, ff512);
-                __mmask64 tmpb = dmask;
-                __m512i l512 = _mm512_set1_epi8(beg - i);
-                for (l = beg; l < end; l++) {
-                    __m512i tmp_ = bsw8_hf_or512<SIGNED8>(_mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8)),
-                                                          _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8)), x80_512);
-                    tmp_ = _mm512_or_si512(tmp_, exit1);
-                    __mmask64 tm = _mm512_cmpeq_epi8_mask(tmp_, zero512);
-                    if (tm == 0x00) break;
-                    tm = tm & tmpb;
-                    l512 = _mm512_add_epi8(l512, one512);
-                    head512 = _mm512_mask_blend_epi8(tm, head512, l512);
-                    tmpb = tm;
-                }
-                __m512i index512 = tail512;
-                tmpb = dmask;
-                l512 = _mm512_set1_epi8(end - i);
-                for (l = end; l >= beg; l--) {
-                    __m512i tmp_ = bsw8_hf_or512<SIGNED8>(_mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8)),
-                                                          _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8)), x80_512);
-                    tmp_ = _mm512_or_si512(tmp_, exit1);
-                    __mmask64 tm = _mm512_cmpeq_epi8_mask(tmp_, zero512);
-                    if (tm == 0x00) break;
-                    tm = tm & tmpb;
-                    l512 = _mm512_sub_epi8(l512, one512);
-                    index512 = _mm512_mask_blend_epi8(tm, index512, l512);
-                    tmpb = tm;
-                }
+                const __mmask64 live64 = _mm512_movepi8_mask(exit0);
+                __mmask64 upd = live64 & _mm512_cmpneq_epi8_mask(nf_first512, _mm512_set1_epi8(beg - i));
+                head512 = _mm512_mask_mov_epi8(head512, upd, nf_first512);
+                upd = live64 & _mm512_cmpneq_epi8_mask(nf_last512, _mm512_set1_epi8(end - i));
+                __m512i index512 = _mm512_mask_mov_epi8(tail512, upd, nf_last512);
                 index512 = _mm512_add_epi8(index512, two512);
                 tail512 = _mm512_min_epi8(index512, qlen_off512);
             }
@@ -510,8 +441,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                 D.head[dl] = Sv.head[sl]; D.tail[dl] = Sv.tail[sl]; D.maxend[dl] = Sv.maxend[sl];
                 D.exit0[dl] = Sv.exit0[sl]; D.maxScore[dl] = Sv.maxScore[sl]; D.y[dl] = Sv.y[sl];
                 D.max_off[dl] = Sv.max_off[sl]; D.h0[dl] = Sv.h0[sl]; D.myband[dl] = Sv.myband[sl];
-                D.xrow[dl] = Sv.xrow[sl]; D.ierow[dl] = Sv.ierow[sl]; D.best_abs[dl] = Sv.best_abs[sl];
-                D.gbest_abs[dl] = Sv.gbest_abs[sl];
+                D.xrow16[dl] = Sv.xrow16[sl]; D.ierow16[dl] = Sv.ierow16[sl]; D.best_abs[dl] = Sv.best_abs[sl];
+                D.gbest8[dl] = Sv.gbest8[sl]; D.gset8[dl] = Sv.gset8[sl];
                 D.qlenw[dl] = Sv.qlenw[sl]; D.mlenw[dl] = Sv.mlenw[sl]; D.tlenw[dl] = Sv.tlenw[sl];
                 D.pair[dl] = Sv.pair[sl];
                 int ha = r + (int8_t) Sv.head[sl];

@@ -46,6 +46,16 @@ struct tprof_row_t {
 
 int display_stats(int );
 extern uint64_t proc_freq;
+
+/* proc_freq is the __rdtsc() tick rate (ticks per second) every timing report
+ * divides by. It is measured over the process's own run rather than by sleeping
+ * at start-up: proc_freq_mark_start() records a (CLOCK_MONOTONIC, __rdtsc())
+ * pair, and proc_freq_resolve() sets proc_freq from a second pair the first
+ * time a report needs it (display_stats(), the `index` "Total time taken"
+ * line), falling back to a short sleep when that window is too short. A
+ * nonzero proc_freq set by the caller is kept. Returns proc_freq. */
+void proc_freq_mark_start(void);
+uint64_t proc_freq_resolve(void);
 extern tprof_row_t tprof[LIM_R];
 extern uint64_t prof[LIM_R];
 #endif

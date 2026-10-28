@@ -3131,6 +3131,124 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         smithWatermanBatchWrapper8Impl<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
 }
 
+// Lean row of the AVX-512BW 8-bit kernel (smithWaterman512_8Impl and its lane-compaction driver,
+// bandedSWA_compact512.inc): the x86 port of the aarch64 BSW8_ROW_LEAN row. Every result field is
+// unchanged; each block below states its exactness argument, and they are the NEON lean row's:
+//   - the band-trim loop runs a precomputed trip count, i + max(head) - beg, instead of a
+//     reduction and a branch on (head > pj) every column;
+//   - the per-row epilogue keeps xrow / ierow as int16 and gscore as a byte plus a "set" mask,
+//     updated without branches; only the z-drop step stays wide, behind a gate (drop > zdrop in
+//     some lane);
+//   - the four band-narrowing scans become each lane's first and last nonzero column, recorded by
+//     the cell loops as they store the row (BSW8_NF_TRACK512); all four scan results are
+//     functions of those two offsets.
+// Horizontal signed-byte max / min over the 64 lanes (the trim count, the EXT-13 fast bounds and
+// the narrowing's nbeg / nend). Identical to a scalar loop over the lanes.
+static inline int bsw8_hmax_epi8_512(__m512i v)
+{
+    __m256i m = _mm256_max_epi8(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
+    __m128i x = _mm_max_epi8(_mm256_castsi256_si128(m), _mm256_extracti128_si256(m, 1));
+    x = _mm_max_epi8(x, _mm_srli_si128(x, 8));
+    x = _mm_max_epi8(x, _mm_srli_si128(x, 4));
+    x = _mm_max_epi8(x, _mm_srli_si128(x, 2));
+    x = _mm_max_epi8(x, _mm_srli_si128(x, 1));
+    return (int8_t) _mm_cvtsi128_si32(x);
+}
+static inline int bsw8_hmin_epi8_512(__m512i v)
+{
+    __m256i m = _mm256_min_epi8(_mm512_castsi512_si256(v), _mm512_extracti64x4_epi64(v, 1));
+    __m128i x = _mm_min_epi8(_mm256_castsi256_si128(m), _mm256_extracti128_si256(m, 1));
+    x = _mm_min_epi8(x, _mm_srli_si128(x, 8));
+    x = _mm_min_epi8(x, _mm_srli_si128(x, 4));
+    x = _mm_min_epi8(x, _mm_srli_si128(x, 2));
+    x = _mm_min_epi8(x, _mm_srli_si128(x, 1));
+    return (int8_t) _mm_cvtsi128_si32(x);
+}
+// Narrowing fold (see the note above). Every column of [beg, end) stores its F and H exactly once,
+// in the cell bodies (EXT13_CELL8_512_MASKED / _FAST), the column end stores the masked carry and
+// F = score 0 after them, and nothing writes F or H between the cell loops and the narrowing, so
+// the cell bodies record, per lane, the offsets of the first and the last column whose stored F or
+// H is a nonzero score (bsw8_hf_or512: zero iff both bytes are the score-0 byte of the kernel's
+// domain, 0x00 unsigned and 0x80 biased; the macro reads SIGNED8 and x80_512 at its use sites).
+// hs / fs are the values stored to H_h[j] / F[j] and pj the column's diagonal offset j - i.
+// nf_first512 starts at end - i (the scan's "none") and takes a masked signed min with pj;
+// nf_last512 starts at beg - 1 - i ("none") and takes pj where nonzero. Columns run in increasing
+// j in every loop form, so the min is the first nonzero offset and the latest store the last.
+// All offsets lie in [-w-1, w+1] (w <= BSW8_MAX_W = 124), so int8 holds them.
+#define BSW8_NF_TRACK512(hs_, fs_, pj_)                                         \
+        {                                                                       \
+            const __m512i nfo_ = bsw8_hf_or512<SIGNED8>((fs_), (hs_), x80_512); \
+            const __mmask64 nz_ = _mm512_test_epi8_mask(nfo_, nfo_);            \
+            nf_first512 = _mm512_mask_min_epi8(nf_first512, nz_, nf_first512, (pj_)); \
+            nf_last512  = _mm512_mask_mov_epi8(nf_last512, nz_, (pj_));         \
+        }
+// The query-end (gscore) fold on the narrow side channels: gb_ (gscore byte), gs_ (__mmask64 of
+// lanes whose gscore is set), il_ / ih_ (ierow as int16, lanes 0-31 and 32-63). The wide form
+// took hqe / i+1 where qfire and hqe >= gbest_abs, with gbest_abs = -1 while unset; hqe is a byte
+// in [0,255], so that is "always" where unset and an unsigned byte compare where set. hqe_ and gb_
+// are unsigned score bytes: the callers pass the query-end byte unbiased (bsw8_unbias512).
+#define BSW8_GSCORE_NARROW512(gb_, gs_, il_, ih_, hqe_, qf_, ip1_)              \
+    do {                                                                        \
+        const __mmask64 gm_ = (qf_) & (~(gs_) | _mm512_cmpge_epu8_mask((hqe_), (gb_))); \
+        (gb_) = _mm512_mask_mov_epi8((gb_), gm_, (hqe_));                       \
+        (gs_) |= gm_;                                                           \
+        const __m512i v16_ = _mm512_set1_epi16((int16_t) (ip1_));               \
+        (il_) = _mm512_mask_mov_epi16((il_), (__mmask32) gm_, v16_);            \
+        (ih_) = _mm512_mask_mov_epi16((ih_), (__mmask32) (gm_ >> 32), v16_);    \
+    } while (0)
+// Lean z-drop (step (4) of the wide epilogue it replaces), on rows where the gate is open: the
+// same int32 arithmetic, with xrow read from the int16 halves xl_ / xh_. Clears dying live lanes in
+// exit0. A lane dies only if drop - dif > zdrop with dif >= 0, so drop > zdrop is necessary; drop =
+// maxScore512 - maxRS1 is exact in bytes on live lanes (both unbiased to the unsigned score here and
+// in the callers' gate). The callers skip it when no live lane has
+// drop > min(zdrop, 255) and BSW8_ZDROP_GATE_EXACT holds, and when zdrop is 0 (the wide block
+// never applied the kill then).
+#define BSW8_ZDROP_WIDE512(xl_, xh_)                                            \
+    do {                                                                        \
+        int8_t  y1_a[SIMD_WIDTH8] __attribute((aligned(64)));                   \
+        int8_t  y_a[SIMD_WIDTH8]  __attribute((aligned(64)));                   \
+        int8_t  ms_a[SIMD_WIDTH8] __attribute((aligned(64)));                   \
+        int8_t  rs_a[SIMD_WIDTH8] __attribute((aligned(64)));                   \
+        int16_t xr_a[SIMD_WIDTH8] __attribute((aligned(64)));                   \
+        _mm512_store_si512((__m512i *) y1_a, y1_512);                           \
+        _mm512_store_si512((__m512i *) y_a, y512);                              \
+        _mm512_store_si512((__m512i *) ms_a, bsw8_unbias512<SIGNED8>(maxScore512, x80_512)); \
+        _mm512_store_si512((__m512i *) rs_a, bsw8_unbias512<SIGNED8>(maxRS1, x80_512)); \
+        _mm512_store_si512((__m512i *) xr_a, (xl_));                            \
+        _mm512_store_si512((__m512i *) (xr_a + 32), (xh_));                     \
+        const __m512i vi   = _mm512_set1_epi32(i);                              \
+        const __m512i vip1 = _mm512_set1_epi32(i + 1);                          \
+        const __m512i vone = _mm512_set1_epi32(1);                              \
+        const __m512i vzd  = _mm512_set1_epi32(zdrop);                          \
+        const __m512i vedel = _mm512_set1_epi32(this->e_del);                   \
+        const __m512i veins = _mm512_set1_epi32(this->e_ins);                   \
+        const __mmask64 ex64 = _mm512_movepi8_mask(exit0);                      \
+        __mmask64 die64 = 0;                                                    \
+        for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {                            \
+            const int base = g * 16;                                            \
+            const __mmask16 exm = (__mmask16)(ex64 >> (16 * g));                \
+            __m512i msg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(ms_a + base))); \
+            __m512i rsg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(rs_a + base))); \
+            __m512i y1g = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y1_a + base))); \
+            __m512i yg  = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y_a  + base))); \
+            __m512i xrg = _mm512_cvtepi16_epi32(_mm256_load_si256((const __m256i *)(xr_a + base))); \
+            __m512i y1c = _mm512_add_epi32(y1g, vi);                            \
+            __m512i yc  = _mm512_add_epi32(yg, _mm512_sub_epi32(xrg, vone));    \
+            const __mmask16 seedm = _mm512_cmpeq_epi32_mask(xrg, _mm512_setzero_si512()); \
+            yc = _mm512_mask_mov_epi32(yc, seedm, _mm512_setzero_si512());      \
+            __m512i tmpi = _mm512_sub_epi32(vip1, xrg);                         \
+            __m512i tmpj = _mm512_sub_epi32(y1c, yc);                           \
+            __m512i zdelta = _mm512_sub_epi32(tmpi, tmpj);                      \
+            __mmask16 zdsel = _mm512_cmpgt_epi32_mask(zdelta, _mm512_setzero_si512()); \
+            __m512i zesel = _mm512_mask_blend_epi32(zdsel, veins, vedel);       \
+            __m512i dif  = _mm512_mullo_epi32(_mm512_abs_epi32(zdelta), zesel); \
+            __m512i drop = _mm512_sub_epi32(msg, rsg);                          \
+            __mmask16 diem = exm & _mm512_cmpgt_epi32_mask(_mm512_sub_epi32(drop, dif), vzd); \
+            die64 |= ((__mmask64) diem) << (16 * g);                            \
+        }                                                                       \
+        exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());     \
+    } while (0)
+
 template <bool SIGNED8>
 void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
                                               uint8_t seq2SoA[],
@@ -3197,8 +3315,6 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
     int32_t qlenw[SIMD_WIDTH8];   // raw query length (cols), wide
     int32_t mbandw[SIMD_WIDTH8];  // per-lane band width, wide
     int32_t mlenw[SIMD_WIDTH8];   // min(qlen+myband, tlen), wide row bound
-    int32_t xrow[SIMD_WIDTH8];    // best row for score (== i+1 at capture)
-    int32_t ierow[SIMD_WIDTH8];   // best row for gscore (== i+1 at capture)
 
     // --- PLAIN UNSIGNED [0,255] SW (no score re-baselining) ---
     // Scores live in the UNSIGNED byte range [0,255]. The DP recurrence computes
@@ -3254,8 +3370,18 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
     if (maxStep < 1) maxStep = 1;
     const int BYTE_CEIL = 255 - maxStep;
 #endif
-    int32_t best_abs[SIMD_WIDTH8]; // running best score, seeded with the raw h0 (absolute == byte once the lane advances)
-    int32_t gbest_abs[SIMD_WIDTH8];// running gscore (query-end), absolute
+    // Narrow side channels (the lean row). Rows are < MAX_SEQ_LEN8 = 1088, so int16 holds the best
+    // row (xrow) and the best-gscore row (ierow) exactly; lanes 0-31 in the _lo vector, 32-63 in
+    // _hi. gscore is a query-end cell byte in [0,255] or unset (-1): kept as the byte (gbest512)
+    // plus a "set" mask (gset64). best_abs is not tracked per row: maxScore512 changes on a lane
+    // exactly on the rows where cmp is set, so the old masked running max max(best_abs, maxScore)
+    // equals max(h0, final maxScore) on lanes that advanced at least once (xrow != 0) and the raw
+    // h0 otherwise. It is reconstructed at the result store from h0_raw.
+    int32_t h0_raw[SIMD_WIDTH8];   // the raw seed score (absolute; may be negative under --meth)
+    __m512i xrow_lo = _mm512_setzero_si512(), xrow_hi = _mm512_setzero_si512();
+    __m512i ierow_lo = _mm512_setzero_si512(), ierow_hi = _mm512_setzero_si512();
+    __m512i gbest512 = _mm512_setzero_si512();
+    __mmask64 gset64 = 0;
 
     int32_t minq = 10000000;
     for (int l=0; l<SIMD_WIDTH8; l++) {
@@ -3265,10 +3391,7 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
         int ml = qlenw[l] + mbandw[l];
         if (ml > tlenw[l]) ml = tlenw[l];
         mlenw[l]  = ml;
-        xrow[l]   = 0;
-        ierow[l]  = 0;
-        best_abs[l] = p[l].h0; // maxScore512 inits to the h0 seed; record it wide
-        gbest_abs[l]= -1;      // unset sentinel (-1): gscore=-1 / gtle=0 when no query end is reached, matching scalar
+        h0_raw[l] = p[l].h0;   // maxScore512 inits to the h0 seed; the score falls back to it raw
         if (p[l].len2 < minq) minq = p[l].len2;
     }
     minq -= 1; // for gscore
@@ -3305,7 +3428,7 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
     for(j = 0; j <= ncol; j++)   /* through column ncol: every F cell the kernel can read is defined */
         _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), hzero512);
 
-    __m512i y512       = zero512;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow[l]-1)
+    __m512i y512       = zero512;   // best col as diagonal offset: col - i_at_capture (i_at_capture = xrow - 1)
     __m512i max_off512 = zero512;
     __m512i exit0      = _mm512_set1_epi8(0xFF);
     __m512i maxend512 = _mm512_set1_epi8(-128);
@@ -3313,6 +3436,8 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
     // Whether the per-row epilogue skip may skip a row on drop <= zdrop: see
     // BSW8_ZDROP_GATE_EXACT.
     const bool zgate_exact = BSW8_ZDROP_GATE_EXACT(this->e_del, this->e_ins);
+    // Lean z-drop gate threshold byte: drop <= 255, so for zdrop >= 255 no lane can die.
+    const __m512i zgate512 = _mm512_set1_epi8((int8_t) (zdrop < 255 ? zdrop : 255));
 
     int beg = 0, end = ncol;
     int nbeg = beg, nend = end;
@@ -3405,21 +3530,26 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
         __mmask64 cmpt = _mm512_cmpeq_epi8_mask(tail512, ptail512);
         cmph &= cmpt;
 
-        for (int l=beg; l<end && cmph != dmask; l++)
-        {
-            __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
-
-            __m512i pj512 = _mm512_set1_epi8(l - i);   // diagonal offset of column l
-            __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, pj512);
-            if (cmp1 == 0x00) break;
-            __mmask64 cmp2 = _mm512_cmpgt_epi8_mask(pj512, tail512);
-            cmp1 = cmp1 | cmp2;
-            h512 = _mm512_mask_blend_epi8(cmp1, h512, hzero512);
-            f512 = _mm512_mask_blend_epi8(cmp1, f512, hzero512);
-
-            _mm512_store_si512((__m512i *)(F + l * SIMD_WIDTH8), f512);
-            _mm512_store_si512((__m512i *)(H_h + l * SIMD_WIDTH8), h512);
+        // Lean trim (counted). The original loop stopped at the first column where no lane has
+        // head > pj. pj = l - i lies in [-w, w] for every l in [beg, end), with no int8 wrap
+        // (callers cap w at BSW8_MAX_W = 124), so "some lane has head > l - i" is exactly
+        // l < i + max(head) over all 64 lanes, and it is monotone in l: the trip count is known
+        // up front, and the loop does the same stores without a per-column reduction and branch.
+        if (cmph != dmask) {
+            int trim_hi = i + bsw8_hmax_epi8_512(head512);
+            if (trim_hi > end) trim_hi = end;
+            for (int l = beg; l < trim_hi; l++)
+            {
+                __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
+                __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
+                __m512i pj512 = _mm512_set1_epi8(l - i);   // diagonal offset of column l
+                __mmask64 cmp1 = _mm512_cmpgt_epi8_mask(head512, pj512) |
+                                 _mm512_cmpgt_epi8_mask(pj512, tail512);
+                h512 = _mm512_mask_blend_epi8(cmp1, h512, hzero512);
+                f512 = _mm512_mask_blend_epi8(cmp1, f512, hzero512);
+                _mm512_store_si512((__m512i *)(F + l * SIMD_WIDTH8), f512);
+                _mm512_store_si512((__m512i *)(H_h + l * SIMD_WIDTH8), h512);
+            }
         }
 
 #if RDT
@@ -3476,27 +3606,24 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
         // high-score fallback.
         int fast_lo = beg, fast_hi = beg;
         if (_mm512_movepi8_mask(exit0) == dmask) {   // all 64 lanes active
-            int8_t hh_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
-            int8_t tt_[SIMD_WIDTH8] __attribute((aligned(SIMD_WIDTH8)));
-            _mm512_store_si512((__m512i *) hh_, head512);
-            _mm512_store_si512((__m512i *) tt_, tail512);
-            int maxhead = -128, mintail = 127;
-            for (int l = 0; l < SIMD_WIDTH8; l++) {
-                if (hh_[l] > maxhead) maxhead = hh_[l];
-                if (tt_[l] < mintail) mintail = tt_[l];
-            }
+            // horizontal max(head) / min(tail) over the 64 lanes (a vector reduce)
+            const int maxhead = bsw8_hmax_epi8_512(head512);
+            const int mintail = bsw8_hmin_epi8_512(tail512);
             fast_lo = i + maxhead; if (fast_lo < beg) fast_lo = beg; if (fast_lo > end) fast_lo = end;
             fast_hi = i + mintail; if (fast_hi < fast_lo) fast_hi = fast_lo; if (fast_hi > end) fast_hi = end;
         }
 
         j512 = _mm512_set1_epi8(beg - i);   // diagonal offset of first band column
+        // narrowing offsets, recorded by the cell bodies (BSW8_NF_TRACK512)
+        __m512i nf_first512 = _mm512_set1_epi8(end - i);
+        __m512i nf_last512  = _mm512_set1_epi8(beg - 1 - i);
 
 #define EXT13_CELL8_512_COMMON \
             __m512i f11, f21, sbt11; \
             h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH8)); \
             f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH8)); \
             sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH8)); \
-            __m512i pj512 = j512; (void) pj512; /* pre-increment col: masked body only */ \
+            __m512i pj512 = j512; /* pre-increment col: the masked band test and BSW8_NF_TRACK512 */ \
             j512 = _mm512_add_epi8(j512, one512); \
             MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero512, \
                             e_ins512, oe_ins512, e_del512, oe_del512);
@@ -3528,6 +3655,7 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
             maxRS1 = _mm512_mask_blend_epi8(cmp1, maxRS1, bmaxRS); \
             _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21); \
             _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10); \
+            BSW8_NF_TRACK512(h10, f21, pj512) \
             h10 = h11; \
             EXT13_CELL8_512_GSCORE \
         }
@@ -3554,6 +3682,7 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
             y1_512 = _mm512_mask_blend_epi8(cmpA, y1_512, j512); \
             _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), f21); \
             _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10); \
+            BSW8_NF_TRACK512(h10, f21, pj512) \
             h10 = h11; \
             EXT13_CELL8_512_GSCORE \
         }
@@ -3569,6 +3698,8 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
 
         _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH8), h10);
         _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH8), hzero512);
+        // The column end stores F = score 0 and the masked carry: it can set last, never first.
+        nf_last512 = _mm512_mask_mov_epi8(nf_last512, _mm512_cmpneq_epi8_mask(h10, hzero512), j512);   // j512 == end - i here
 
         /* exit due to zero score by a row */
         __m512i bmaxScore512 = maxScore512;
@@ -3579,21 +3710,9 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
              * gscore then hits its own m==0 break, so the vector must too, else the
              * gscore==0 query-end tail row is dropped -> wrong gtle under the
              * asymmetric --meth matrix. Mirror of the epilogue gscore block. */
-            int8_t hq_a_[SIMD_WIDTH8] __attribute((aligned(64)));
-            _mm512_store_si512((__m512i *) hq_a_, bsw8_unbias512<SIGNED8>(hqe512, x80_512));
-            const __mmask64 qf64_ = _mm512_movepi8_mask(qfire512);
-            for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
-                const int base = g * 16;
-                const __mmask16 qfm = (__mmask16)(qf64_ >> (16 * g));
-                __m512i hqeg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(hq_a_ + base)));
-                __m512i gba = _mm512_loadu_si512((const void *)(gbest_abs + base));
-                __mmask16 gmask = qfm & _mm512_cmpge_epi32_mask(hqeg, gba); // hqe >= gbest
-                gba = _mm512_mask_mov_epi32(gba, gmask, hqeg);
-                _mm512_storeu_si512((void *)(gbest_abs + base), gba);
-                __m512i ierg = _mm512_loadu_si512((const void *)(ierow + base));
-                ierg = _mm512_mask_mov_epi32(ierg, gmask, _mm512_set1_epi32(i + 1));
-                _mm512_storeu_si512((void *)(ierow + base), ierg);
-            }
+            BSW8_GSCORE_NARROW512(gbest512, gset64, ierow_lo, ierow_hi,
+                                  bsw8_unbias512<SIGNED8>(hqe512, x80_512),
+                                  _mm512_movepi8_mask(qfire512), i + 1);
             break;
         }
 
@@ -3608,7 +3727,7 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
         // unsigned bytes mis-read scores >127 (long reads).
         __mmask64 cmp = bsw8_cmpgt512<SIGNED8>(maxScore512, bmaxScore512);
         // y512 (best col) stays a diagonal offset captured in the best row's
-        // frame; the best row itself moves to the wide xrow[] side channel.
+        // frame; the best row itself moves to the int16 xrow side channel.
         y512 = _mm512_mask_blend_epi8(cmp, y512, y1_512);
 
         // max_off = max running diagonal-distance of the row-max from the main
@@ -3621,203 +3740,71 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
         ind512 = _mm512_max_epu8(max_off512, ind512);
         max_off512 = _mm512_mask_blend_epi8(cmp, bmax_off512, ind512);
 
-        // Per-lane wide updates (O(rows)): best-score row (xrow), best-gscore
-        // row (ierow), absolute-frame score tracking, and the z-drop test — all
-        // done in wide scalars so row distances that exceed int8 for long reads
-        // are handled exactly.
-        //
-        // Run the block only on rows where some lane can actually change:
-        //   * xrow / best_abs change only where cmp is set (the lane's max
-        //     advanced this row; both updates are masked by cmp);
-        //   * gbest_abs / ierow change only where qfire is set;
-        //   * a lane can z-drop only if drop - dif > zdrop with dif >= 0, so
-        //     drop > zdrop is necessary, and drop = maxScore - maxRS1 is exact
-        //     in bytes on alive lanes (both are [0,255] under the routing
-        //     envelope). subs_epu8 twice: nonzero iff drop > zdrop. Dead lanes
-        //     may read as "needed"; the block masks them with exit as before,
-        //     so that only costs a skipped skip. When zdrop is 0 the kill is
-        //     never applied, so the term is dropped from the gate. A zdrop
-        //     above 255 truncates in the byte broadcast to a smaller value, so
-        //     the gate opens on a superset of rows: still byte-identical.
-        //     dif >= 0 needs the gap extends inside BSW8_ZDROP_GATE_EXACT's
-        //     bound; outside it (a huge or negative -E) the block runs on every
-        //     row (zgate_exact).
-        // Byte-identical: when the gate is clear every store below is a no-op.
-        const __mmask64 qf64 = _mm512_movepi8_mask(qfire512);
-        const __mmask64 need_z = (zdrop > 0)
-            ? _mm512_test_epi8_mask(_mm512_subs_epu8(_mm512_subs_epu8(bsw8_unbias512<SIGNED8>(maxScore512, x80_512),
-                                                                      bsw8_unbias512<SIGNED8>(maxRS1, x80_512)),
-                                                     zdrop512),
-                                    ff512)
-            : 0;
-        const bool need_wide = !zgate_exact || (cmp | qf64 | need_z) != 0;
-        if (need_wide) {
-            // Only the int32 DATA channels need materializing as byte arrays; the
-            // cmp/qfire/exit per-lane predicates are read straight from the cmp
-            // __mmask64 and movepi8_mask(qfire512)/movepi8_mask(exit0) below.
-            int8_t  y1_a[SIMD_WIDTH8]       __attribute((aligned(64)));
-            int8_t  y_a[SIMD_WIDTH8]        __attribute((aligned(64)));
-            int8_t  ms_a[SIMD_WIDTH8]       __attribute((aligned(64)));
-            int8_t  rs_a[SIMD_WIDTH8]       __attribute((aligned(64)));
-            int8_t  hqe_a[SIMD_WIDTH8]      __attribute((aligned(64)));
-            _mm512_store_si512((__m512i *) y1_a, y1_512);
-            _mm512_store_si512((__m512i *) y_a, y512);
-            _mm512_store_si512((__m512i *) ms_a, bsw8_unbias512<SIGNED8>(maxScore512, x80_512));
-            _mm512_store_si512((__m512i *) rs_a, bsw8_unbias512<SIGNED8>(maxRS1, x80_512));
-            _mm512_store_si512((__m512i *) hqe_a, bsw8_unbias512<SIGNED8>(hqe512, x80_512));
-            // VECTORIZED per-lane wide updates (see smithWaterman128_8) using
-            // AVX-512 mask registers: 16 int32 per __m512i -> SIMD_WIDTH8/16 groups
-            // of 16. Per-lane predicates (cmp/qfire/exit) are __mmask16 slices; the
-            // z-dropped lanes are accumulated into a combined mask and cleared in
-            // exit0. Byte-identical (same >, >= tie-breaks; same abs/z-drop math).
-            const __m512i vi   = _mm512_set1_epi32(i);
-            const __m512i vip1 = _mm512_set1_epi32(i + 1);
-            const __m512i vone = _mm512_set1_epi32(1);
-            const __m512i vzd  = _mm512_set1_epi32(zdrop);
-            const __m512i vedel = _mm512_set1_epi32(this->e_del);
-            const __m512i veins = _mm512_set1_epi32(this->e_ins);
-            const __mmask64 ex64 = _mm512_movepi8_mask(exit0);
-            __mmask64 die64 = 0;
-            for (int g = 0; g < SIMD_WIDTH8 / 16; g++) {
-                const int base = g * 16;
-                const __mmask16 cmpm = (__mmask16)(cmp  >> (16 * g));
-                const __mmask16 qfm  = (__mmask16)(qf64 >> (16 * g));
-                const __mmask16 exm  = (__mmask16)(ex64 >> (16 * g));
-                __m512i msg  = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(ms_a  + base)));
-                __m512i rsg  = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(rs_a  + base)));
-                __m512i hqeg = _mm512_cvtepu8_epi32(_mm_loadu_si128((const __m128i *)(hqe_a + base)));
-                __m512i y1g  = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y1_a  + base)));
-                __m512i yg   = _mm512_cvtepi8_epi32(_mm_loadu_si128((const __m128i *)(y_a   + base)));
-
-                __m512i xrg = _mm512_loadu_si512((const void *)(xrow + base));
-                xrg = _mm512_mask_mov_epi32(xrg, cmpm, vip1);
-                _mm512_storeu_si512((void *)(xrow + base), xrg);
-
-                // best_abs = max(best_abs, (uint8)ms) only where the lane's max
-                // advanced this row (cmp); see smithWaterman256_8 for why it is masked.
-                __m512i bag = _mm512_loadu_si512((const void *)(best_abs + base));
-                bag = _mm512_mask_max_epi32(bag, cmpm, bag, msg);
-                _mm512_storeu_si512((void *)(best_abs + base), bag);
-
-                // gscore: where qfire AND hqe >= gbest_abs, take hqe / i+1
-                __m512i gba = _mm512_loadu_si512((const void *)(gbest_abs + base));
-                __mmask16 gmask = qfm & _mm512_cmpge_epi32_mask(hqeg, gba); // qfire & hqe>=gbest
-                gba = _mm512_mask_mov_epi32(gba, gmask, hqeg);
-                _mm512_storeu_si512((void *)(gbest_abs + base), gba);
-                __m512i ierg = _mm512_loadu_si512((const void *)(ierow + base));
-                ierg = _mm512_mask_mov_epi32(ierg, gmask, vip1);
-                _mm512_storeu_si512((void *)(ierow + base), ierg);
-
-                __m512i y1c  = _mm512_add_epi32(y1g, vi);
-                __m512i yc   = _mm512_add_epi32(yg, _mm512_sub_epi32(xrg, vone));
-                // z-drop unset-best sentinel: y1c and yc each carry the +1 frame
-                // bias (y1 stores col-i+1) so the biases cancel in tmpj = mj-max_j,
-                // BUT only when a best score has been captured (xrow >= 1). While
-                // the best is still the h0 seed (xrow == 0), scalar's max_j == -1
-                // and its drift uses (mj - max_j) = mj + 1; the raw reconstruction
-                // yc = y512 + (xrow-1) gives -1 instead of the required max_j+1 = 0,
-                // under-counting the drift by 1 and firing the z-drop one row early.
-                // Force yc = 0 (== max_j+1 for the -1 sentinel) where xrow == 0 so
-                // the drift matches scalarBandedSWA exactly in the high-h0 regime
-                // (seed score never beaten before the z-drop horizon). This is a
-                // no-op once any row has beaten the seed (xrow >= 1).
-                const __mmask16 seedm = _mm512_cmpeq_epi32_mask(xrg, _mm512_setzero_si512());
-                yc = _mm512_mask_mov_epi32(yc, seedm, _mm512_setzero_si512());
-                __m512i tmpi = _mm512_sub_epi32(vip1, xrg);
-                __m512i tmpj = _mm512_sub_epi32(y1c, yc);
-                // z-drop gap term weighted by gap-extend penalty, matching the
-                // scalar reference (drift>0 -> deletion side *e_del, else *e_ins).
-                __m512i zdelta = _mm512_sub_epi32(tmpi, tmpj);
-                __mmask16 zdsel = _mm512_cmpgt_epi32_mask(zdelta, _mm512_setzero_si512());
-                __m512i zesel  = _mm512_mask_blend_epi32(zdsel, veins, vedel);
-                __m512i dif  = _mm512_mullo_epi32(_mm512_abs_epi32(zdelta), zesel);
-                __m512i drop = _mm512_sub_epi32(msg, rsg);
-                __mmask16 diem = exm & _mm512_cmpgt_epi32_mask(_mm512_sub_epi32(drop, dif), vzd);
-                die64 |= ((__mmask64)diem) << (16 * g);
+        // Per-row epilogue, lean form: the same xrow / best score / gscore + ierow / z-drop
+        // updates as the former wide block (vectorized int32 over four groups of 16, run on every
+        // row where cmp | qfire | need_z was set, which with 64 lanes is nearly every row), with
+        // the side channels kept narrow and only the z-drop step gated.
+        //   (1) best-score row: xrow = cmp ? i+1 : xrow (int16, exact: rows < 1088).
+        //   (2) best_abs: reconstructed at the result store (see h0_raw above).
+        //   (3) gscore / ierow: BSW8_GSCORE_NARROW512.
+        //   (4) z-drop: BSW8_ZDROP_WIDE512 on rows where some live lane has drop > min(zdrop, 255)
+        //       (or every row when BSW8_ZDROP_GATE_EXACT fails), reading xrow after (1) as the
+        //       wide block did.
+        {
+            const __m512i vip1_16 = _mm512_set1_epi16((int16_t) (i + 1));
+            xrow_lo = _mm512_mask_mov_epi16(xrow_lo, (__mmask32) cmp, vip1_16);
+            xrow_hi = _mm512_mask_mov_epi16(xrow_hi, (__mmask32) (cmp >> 32), vip1_16);
+            BSW8_GSCORE_NARROW512(gbest512, gset64, ierow_lo, ierow_hi,
+                                  bsw8_unbias512<SIGNED8>(hqe512, x80_512),
+                                  _mm512_movepi8_mask(qfire512), i + 1);
+            if (zdrop > 0) {
+                // Live lanes only (mex0 == exit0 here): BSW8_ZDROP_WIDE512 kills only lanes in
+                // exit0, and a dead lane's frozen maxScore512 against its maxRS1 would hold the
+                // gate open on nearly every row after its exit.
+                const __mmask64 need_z = _mm512_mask_cmpgt_epu8_mask(mex0,
+                    _mm512_subs_epu8(bsw8_unbias512<SIGNED8>(maxScore512, x80_512),
+                                     bsw8_unbias512<SIGNED8>(maxRS1, x80_512)), zgate512);
+                if (!zgate_exact || need_z != 0)
+                    BSW8_ZDROP_WIDE512(xrow_lo, xrow_hi);
             }
-            if (zdrop > 0) exit0 = _mm512_mask_mov_epi8(exit0, die64, _mm512_setzero_si512());
         }
 
 #if RDT
         prof[DP1][0] += __rdtsc() - tim1;
 #endif
 
-        /* Narrowing of the band */
-        /* From beg */
+        /* Narrowing of the band (lean). With v[l] = F[l] | H_h[l] and, per lane, first = offset
+         * (l - i) of the first nonzero v[l] in [beg, end) ("none" = end - i) and last = offset of
+         * the last nonzero v[l] in [beg, end] ("none" = beg - 1 - i), the four former scans are:
+         *   1. nbeg: last l of the leading all-lanes-zero run   -> i + min(first) - 1 if
+         *            min(first) > beg - i, else unchanged
+         *   2. nend: first l from end down with any lane nonzero -> i + max(last) (+2, clamped)
+         *   3. head: per live lane, end of its leading zero run  -> first, unless first == beg - i
+         *            (no leading zeros: unchanged). Scan 3 stopped at the first column where every
+         *            live lane is nonzero, which is never before any live lane's run ends, and
+         *            each lane's update was the end of its own run.
+         *   4. tail: per live lane, start of its trailing zero run -> last, unless last == end - i
+         *            (unchanged); then +2 and min with qlen - i as before.
+         * Dead lanes never update head/tail (the scans OR'ed ~exit0 in); scans 1 and 2 count every
+         * lane. first and last come from the cell loops (BSW8_NF_TRACK512). Only rows with
+         * beg < end get here: with no band columns maxRS1 stays 0 and the row takes the zero-row
+         * break above. */
         int l;
-        for (l = beg; l < end; l++)
         {
-            __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
-            __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
-            __mmask64 val = _mm512_cmpeq_epi8_mask(tmp, zero512);
-            if (val == dmask) nbeg = l;
-            else
-                break;
+            const __m512i first512 = nf_first512, last512 = nf_last512;
+            const int minfirst = bsw8_hmin_epi8_512(first512);
+            if (minfirst > beg - i) nbeg = i + minfirst - 1;
+            l = i + bsw8_hmax_epi8_512(last512);
+            nend = l + 2 < ncol ? l + 2 : ncol;
+            const __mmask64 live64 = _mm512_movepi8_mask(exit0);
+            __mmask64 upd = live64 & _mm512_cmpneq_epi8_mask(first512, _mm512_set1_epi8(beg - i));
+            head512 = _mm512_mask_mov_epi8(head512, upd, first512);
+            upd = live64 & _mm512_cmpneq_epi8_mask(last512, _mm512_set1_epi8(end - i));
+            __m512i index512 = _mm512_mask_mov_epi8(tail512, upd, last512);
+            index512 = _mm512_add_epi8(index512, two512);
+            // signed min in the offset frame against qlen-i
+            tail512 = _mm512_min_epi8(index512, qlen_off512);
         }
-
-        /* From end */
-        for (l = end; l >= beg; l--)
-        {
-            __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
-            __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
-            __mmask64 val = _mm512_cmpeq_epi8_mask(tmp, zero512);
-            if (val != dmask)
-                break;
-        }
-        nend = l + 2 < ncol? l + 2: ncol;
-
-#if RDT
-        tim1 = __rdtsc();
-#endif
-
-        __m512i exit1 = _mm512_xor_si512(exit0, ff512);
-        __mmask64 tmpb = dmask;
-        __m512i l512 = _mm512_set1_epi8(beg - i);   // diagonal offset of column beg
-
-        for (l = beg; l < end; l++)
-        {
-            __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
-            __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp_ = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
-            tmp_ = _mm512_or_si512(tmp_, exit1);
-            __mmask64 tmp = _mm512_cmpeq_epi8_mask(tmp_, zero512);
-            if (tmp == 0x00) {
-                break;
-            }
-
-            tmp = tmp & tmpb;
-            l512 = _mm512_add_epi8(l512, one512);
-            // NEW
-            head512 = _mm512_mask_blend_epi8(tmp, head512, l512);
-            tmpb = tmp;
-        }
-
-        __m512i  index512 = tail512;
-        tmpb = dmask;
-        l512 = _mm512_set1_epi8(end - i);   // diagonal offset of column end
-
-        for (l = end; l >= beg; l--)
-        {
-            __m512i f512 = _mm512_load_si512((__m512i *)(F + l * SIMD_WIDTH8));
-            __m512i h512 = _mm512_load_si512((__m512i *)(H_h + l * SIMD_WIDTH8));
-            __m512i tmp_ = bsw8_hf_or512<SIGNED8>(f512, h512, x80_512);
-            tmp_ = _mm512_or_si512(tmp_, exit1);
-            __mmask64 tmp = _mm512_cmpeq_epi8_mask(tmp_, zero512);
-            if (tmp == 0x00)  {
-                break;
-            }
-
-            tmp = tmp & tmpb;
-            l512 = _mm512_sub_epi8(l512, one512);
-            // NEW
-            index512 = _mm512_mask_blend_epi8(tmp, index512, l512);
-            tmpb = tmp;
-        }
-        index512 = _mm512_add_epi8(index512, two512);
-        // signed min in the offset frame against qlen-i
-        tail512 = _mm512_min_epi8(index512, qlen_off512);
         maxend512 = _mm512_subs_epi8(maxend512, one512);
 
         // Frame shift for the next row: i advances by 1, so the same absolute
@@ -3846,28 +3833,40 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
     prof[DP][0] += __rdtsc() - tim;
 #endif
 
-    // Scores come from the per-lane wide best_abs/gbest_abs side channels, which
-    // carry the byte state widened per row (the byte IS the absolute score under
-    // the routing envelope — see the precondition above — except that best_abs
-    // keeps a negative h0 until the lane's byte max advances). Positions are
-    // reconstructed wide from the diagonal-offset lanes plus the per-lane
-    // best-row side channels.
+    // Scores come from the final byte state and the narrow side channels (the byte IS the
+    // absolute score under the routing envelope -- see the precondition above -- except that the
+    // score keeps a negative h0 until the lane's byte max advances; see h0_raw). Positions are
+    // reconstructed wide from the diagonal-offset lanes plus the per-lane best-row side channels.
     int8_t maxj[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm512_store_si512((__m512i *) maxj, y512);   // best col as diagonal offset
 
     int8_t max_off_ar[SIMD_WIDTH8]  __attribute((aligned(64)));
     _mm512_store_si512((__m512i *) max_off_ar, max_off512);
 
+    int16_t xrow16[SIMD_WIDTH8]  __attribute((aligned(64)));
+    int16_t ierow16[SIMD_WIDTH8] __attribute((aligned(64)));
+    uint8_t gbest8[SIMD_WIDTH8]  __attribute((aligned(64)));
+    uint8_t ms8[SIMD_WIDTH8]     __attribute((aligned(64)));
+    _mm512_store_si512((__m512i *) xrow16, xrow_lo);
+    _mm512_store_si512((__m512i *) (xrow16 + 32), xrow_hi);
+    _mm512_store_si512((__m512i *) ierow16, ierow_lo);
+    _mm512_store_si512((__m512i *) (ierow16 + 32), ierow_hi);
+    _mm512_store_si512((__m512i *) gbest8, gbest512);
+    _mm512_store_si512((__m512i *) ms8, bsw8_unbias512<SIGNED8>(maxScore512, x80_512));   // unsigned score bytes
+
     for(i = 0; i < SIMD_WIDTH8; i++)
     {
-        p[i].score   = best_abs[i];                               // absolute score
-        p[i].tle     = xrow[i];                                   // best row (target end)
+        const int xr = xrow16[i];
+        int sc = h0_raw[i];                                       // absolute score: see h0_raw
+        if (xr != 0 && (int) ms8[i] > sc) sc = ms8[i];
+        p[i].score   = sc;
+        p[i].tle     = xr;                                        // best row (target end)
         // qle reconstruction: maxj[l] = col - (xrow-1), so col = maxj[l] + (xrow-1).
         // Guard the unset case (xrow==0 means no update occurred).
-        p[i].qle     = (xrow[i] == 0) ? 0 : ((int) maxj[i] + xrow[i] - 1);
+        p[i].qle     = (xr == 0) ? 0 : ((int) maxj[i] + xr - 1);
         p[i].max_off = (uint8_t) max_off_ar[i];
-        p[i].gscore  = gbest_abs[i];                              // absolute gscore (-1 if unset)
-        p[i].gtle    = ierow[i];                                  // best gscore row
+        p[i].gscore  = ((gset64 >> i) & 1) ? (int) gbest8[i] : -1; // absolute gscore (-1 if unset)
+        p[i].gtle    = ierow16[i];                                // best gscore row
     }
 
     return;

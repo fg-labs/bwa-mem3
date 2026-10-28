@@ -102,6 +102,33 @@ typedef struct smem_sort_scratch
  * caller-owned, grown on demand. */
 void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch);
 
+/* The bwtSeed pass's first walk on a read (from x = 0), recorded by the SMEM
+ * pass's first forward walk on it. Both start at read base 0 and step every
+ * base with the same forward extension, so the bwtSeed walk is a prefix of the
+ * SMEM walk (min_intv 1), which goes on while s >= 1: the SMEM walk notes the
+ * step at which the bwtSeed walk stops (s < max_intv and n + 1 >= min_len), or
+ * where it would end when the SMEM walk stops first, and the bwtSeed pass
+ * emits that seed and starts the read at x instead of walking it again.
+ * mem_collect_smem fills `rec` (one entry per read, indexed by rid; it sets
+ * every x to -1 first) through getSMEMsAllPosOneThread and reads it back in
+ * bwtSeedStrategyAllPosOneThread_lockstep. */
+typedef struct bsd_first_walk
+{
+    int64_t k, l, s;  /* the walk's last interval, emitted as its seed when s > 0
+                       * (l is stale when the SMEM walk compared the read with the
+                       * text: nothing reads SMEM.l after seeding)             */
+    int32_t n;        /* the seed's last base (m = 0)                          */
+    int32_t x;        /* where the bwtSeed pass goes on; < 0: not recorded     */
+}BsdFirstWalk;
+
+typedef struct bsd_first_walk_hint
+{
+    BsdFirstWalk *rec;     /* one per read, indexed by rid                     */
+    int32_t       max_intv;/* the bwtSeed pass's max_intv (>= 1, every read)    */
+    int32_t       min_len; /* the bwtSeed pass's minSeedLen                     */
+}BsdFirstWalkHint;
+#define FMI_BSD_FIRST_WALK 1
+
 #define SAL_PFD 16
 
 /* SMEM_LOCKSTEP_N (phase-2 SMEM lockstep width, the compile-time floor/default
@@ -216,8 +243,10 @@ class FMI_search: public indexEle
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
-     * destructor munmaps `base` and leaves the aliased buffers untouched. */
-    void load_index_from_shm(uint8_t *base, size_t len);
+     * destructor munmaps `base` and leaves the aliased buffers untouched.
+     * n_threads: workers for the process-private bwtSeed jump table built
+     * after the attach (build_seed_jump_table). */
+    void load_index_from_shm(uint8_t *base, size_t len, int n_threads = 1);
 
     /* Densify the SA sample table on the fly: given an existing FM-index's
      * checkpoint-occ block, C[] array, and SA samples taken at stride
@@ -280,7 +309,9 @@ class FMI_search: public indexEle
      * read finishes; finished reads are emitted in input order through a
      * per-thread parked list (smem_parked.h), so matchArray is written in the
      * same (read, smem) order as the scalar path.
-     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
+     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized).
+     * With bsd_hint, a walk from query position 0 at min_intv 1 records the
+     * bwtSeed pass's first walk on its read (BsdFirstWalk). */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                           int32_t *query_pos_array,
                                           int32_t *min_intv_array,
@@ -292,9 +323,12 @@ class FMI_search: public indexEle
                                           int32_t  max_readlength,
                                           int32_t minSeedLen,
                                           SMEM *matchArray,
-                                          int64_t *__numTotalSmem);
+                                          int64_t *__numTotalSmem,
+                                          BsdFirstWalkHint *bsd_hint = nullptr);
 
-    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
+    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized).
+     * bsd_hint (first round only, lockstep build) as in
+     * getSMEMsOnePosOneThread_lockstep. */
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
@@ -305,7 +339,8 @@ class FMI_search: public indexEle
                                  int32_t max_readlength,
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
-                                 int64_t *__numTotalSmem);
+                                 int64_t *__numTotalSmem,
+                                 BsdFirstWalkHint *bsd_hint = nullptr);
 
 
     /* matchArray must hold at least numReads * (longest l_seq in seq_) SMEMs;
@@ -323,7 +358,10 @@ class FMI_search: public indexEle
      * order so the CP_OCC cache-line misses from independent reads issue
      * concurrently. Same SMEM emission order as the scalar (reads in input
      * order; within a read, outer-x ascending). matchArray must hold at
-     * least numReads * max_readlength SMEMs. */
+     * least numReads * max_readlength SMEMs. With bsd_hint (filled by the
+     * SMEM pass, BsdFirstWalk), a read whose first walk was recorded emits
+     * that walk's seed and starts at its x; a hint whose min_len or max_intv
+     * differs from this call's is not used. */
     int64_t bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
                                                     int32_t *max_intv_array,
                                                     int32_t numReads,
@@ -331,7 +369,8 @@ class FMI_search: public indexEle
                                                     int32_t *query_cum_len_ar,
                                                     int32_t minSeedLen,
                                                     SMEM *matchArray,
-                                                    int32_t max_readlength);
+                                                    int32_t max_readlength,
+                                                    const BsdFirstWalkHint *bsd_hint = nullptr);
 
     /* No production caller: mem_collect_smem uses smem_sort_rid_mn. Kept for the
      * integration tests (smem2_test, bwt_seed_strategy_test, fmi_test); the
@@ -378,11 +417,22 @@ class FMI_search: public indexEle
      * --compat=bwa-mem2; see compat_target_t::sa_sentinel_drop_offset). */
     int64_t call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
                           int drop_sentinel_offset = 0);
+    /* trust_s1_tag: smemArray comes from bwa-mem3's seeding path
+     * (mem_collect_smem), so an s == 1 SMEM carrying the lockstep driver's
+     * text-position tag in info is written from it without an LF walk
+     * (FMI_search.cpp, ls_s1_sa_tag); used only at drop_sentinel_offset 0.
+     * External callers (the fmi_seed_sa_prefetch facade) leave it false. */
     void get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                  int64_t *coordCountArray, int64_t count,
                                  const int32_t max_occ, int tid, int64_t &id_,
-                                 int drop_sentinel_offset = 0);
-    
+                                 int drop_sentinel_offset = 0,
+                                 bool trust_s1_tag = false);
+    /* One read's SMEMs a[0..n), sorted by (m, n) as mem_collect_smem sorts
+     * them: an untagged s == 1 SMEM that lies inside a tagged one gives it the
+     * same tag (FMI_search.cpp, ls_s1_sa_tag), so get_sa_entries_prefetch
+     * writes its coordinate without an LF walk too. */
+    static void s1_tag_contained(SMEM *a, int64_t n);
+
     int64_t reference_seq_len;
     int64_t sentinel_index;
     int64_t sa_compx;        // SA sample shift; sample rate 1/(1<<sa_compx). Loaded per-index.
@@ -401,6 +451,32 @@ private:
          * shm-backed buffers. */
         uint8_t *shm_base;
         size_t   shm_len;
+
+        /* bwtSeed jump table: the bidirectional interval (k, l, s) of every
+         * string of length 1..seed_jump_depth, level L at offset
+         * seed_jump_level_off(L), indexed within a level by the string's
+         * 2-bit code, first base most significant. Built once per process by
+         * build_seed_jump_table after cp_occ, count[] and sentinel_index are in
+         * (load_index, load_index_from_shm); NULL when BWA3_BWTSEED_JUMP=0.
+         * Level 1 is bsd_init_slot's 1-base interval and every child is the
+         * walk's own forward step (backwardExt on the k<->l-swapped parent with
+         * 3 - c, swapped back), so an entry is exactly the interval a bwtSeed
+         * walk reaches by stepping, s == 0 strings included. A walk cannot
+         * leave before length minSeedLen except at an N or the read end, so
+         * bwtSeedStrategyAllPosOneThread_lockstep jumps from its first base
+         * straight to length min(depth, minSeedLen - 1) when the read has
+         * that many ACGT bases there. The SMEM lockstep driver's forward walks
+         * step the same way, so a walk's first visit takes its steps to depths
+         * 2..min(depth, ACGT bases left) from the table, each with the forward
+         * step's own exits (ls_advance_forward_table). Owned (_mm_malloc), also
+         * on the shm path. */
+        struct SeedJumpEntry { int64_t k, l, s; };
+        SeedJumpEntry *seed_jump;
+        int32_t        seed_jump_depth;
+        static int64_t seed_jump_level_off(int L) { return (((int64_t)1 << (2 * L)) - 4) / 3; }
+        void build_seed_jump_table(int n_threads);
+        void seed_jump_children(int L, int64_t first, int64_t n);
+        static void *seed_jump_worker(void *arg);
 
         /* Defined inline so all hot callers (getSMEMs* and ls_advance_*)
          * fully absorb the body and pay no struct-by-value pass / return
@@ -520,13 +596,23 @@ private:
         __attribute__((always_inline)) inline
         SMEM backwardExt_konly(SMEM smem, uint8_t a) const
         {
+            return backwardExt_konly_cp(cp_occ, count[a], smem, a);
+        }
+
+        /* backwardExt_konly on a caller-held cp_occ pointer and count[a], so a
+         * caller that extends many intervals by one base (the general loops of
+         * ls_advance_backward_step) can keep both in registers; read through
+         * this, clang reloads them after every prev[] store. Same arithmetic. */
+        __attribute__((always_inline)) static inline
+        SMEM backwardExt_konly_cp(const CP_OCC *cpo, int64_t count_a, SMEM smem, uint8_t a)
+        {
             const int64_t sp = (int64_t)smem.k;
             if (smem.s == 1) {
-                const CP_OCC &blk = cp_occ[sp >> CP_SHIFT];
+                const CP_OCC &blk = cpo[sp >> CP_SHIFT];
                 const int pos = (int)(sp & CP_MASK);
                 const uint64_t oh = blk.one_hot_bwt_str[a];
                 if ((oh >> (CP_MASK - pos)) & 1ULL) {  /* BWT[sp] == a  => s' = 1 */
-                    smem.k = count[a] + blk.cp_count[a] +
+                    smem.k = count_a + blk.cp_count[a] +
                              occ_popcount64(&blk.one_hot_bwt_str[a], &one_hot_mask_array[pos]);
                     smem.s = 1;
                 } else {                               /* s' = 0; new k is dead */
@@ -535,13 +621,13 @@ private:
                 return smem;
             }
             const int64_t ep = sp + (int64_t)smem.s;
-            const CP_OCC &blk_sp = cp_occ[sp >> CP_SHIFT];
-            const CP_OCC &blk_ep = cp_occ[ep >> CP_SHIFT];
+            const CP_OCC &blk_sp = cpo[sp >> CP_SHIFT];
+            const CP_OCC &blk_ep = cpo[ep >> CP_SHIFT];
             const int64_t occ_s = blk_sp.cp_count[a] +
                 occ_popcount64(&blk_sp.one_hot_bwt_str[a], &one_hot_mask_array[(sp & CP_MASK)]);
             const int64_t occ_e = blk_ep.cp_count[a] +
                 occ_popcount64(&blk_ep.one_hot_bwt_str[a], &one_hot_mask_array[(ep & CP_MASK)]);
-            smem.k = count[a] + occ_s;
+            smem.k = count_a + occ_s;
             smem.s = occ_e - occ_s;
             return smem;
         }
@@ -557,10 +643,19 @@ private:
                       const int32_t *rid_array,
                       const bseq1_t *seq_,
                       const int32_t *query_cum_len_ar,
-                      const uint8_t *enc_qdb);
+                      const uint8_t *enc_qdb,
+                      BsdFirstWalkHint *bsd_hint);
     void ls_prefetch_cp_occ(const BatchSlot *s);
-    void ls_prefetch_cp_occ_t1(const BatchSlot *s);
-    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb);
+    inline void ls_bsd_note(BatchSlot *s, int64_t k, int64_t l, int64_t sz);
+    void ls_bsd_resolve(BatchSlot *s, const uint8_t *enc_qdb, int32_t p);
+    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
+                                 bool s1_text);
+    void ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
+                                  bool s1_text);
+    inline void ls_prefetch_sa_row(int64_t p) const;
+    void ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac);
+    void ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
+                       const uint8_t *pac, int64_t l_pac);
     void ls_prepare_backward(BatchSlot *s);
     void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,
@@ -573,12 +668,17 @@ private:
                        const int32_t *max_intv_array,
                        const bseq1_t *seq_,
                        const int32_t *query_cum_len_ar,
-                       const uint8_t *enc_qdb);
+                       const uint8_t *enc_qdb,
+                       const BsdFirstWalkHint *bsd_hint,
+                       int32_t minSeedLen,
+                       const SeedJumpEntry *jlev, int32_t jd);
     void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
-    void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
+    void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
+                       const SeedJumpEntry *jlev, int32_t jd);
     void bsd_advance_step(BwtSeedSlot *s,
                           const uint8_t *enc_qdb,
-                          int32_t minSeedLen);
+                          int32_t minSeedLen,
+                          const SeedJumpEntry *jlev, int32_t jd);
 };
 
 #endif

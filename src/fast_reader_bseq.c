@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <limits.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -82,6 +83,74 @@ static inline void fr_rec_to_bseq1(const fr_fastq_rec_t *r, bseq1_t *s, read_are
     s->l_seq   = (int)r->seq_l;
 }
 
+/* Held-back diagnostics (fast_reader_bseq.h). One sink per thread, so a read
+ * running ahead on one thread holds back only its own output. */
+static __thread bseq_diag_t *tl_diag;
+
+void bseq_diag_install(bseq_diag_t *d) { tl_diag = d; }
+
+static void diag_vappend(bseq_diag_t *d, const char *fmt, va_list ap)
+{
+    va_list aq;
+    va_copy(aq, ap);
+    int need = vsnprintf(NULL, 0, fmt, aq);
+    va_end(aq);
+    if (need < 0) return;
+    if (d->len + (size_t)need + 1 > d->cap) {
+        size_t cap = d->cap ? d->cap : 256;
+        while (cap < d->len + (size_t)need + 1) cap <<= 1;
+        char *t = (char *)realloc(d->text, cap);
+        if (t == NULL) err_fatal(__func__, "failed to hold back %d bytes of reader diagnostics", need);
+        d->text = t;
+        d->cap = cap;
+    }
+    vsnprintf(d->text + d->len, d->cap - d->len, fmt, ap);
+    d->len += (size_t)need;
+}
+
+void bseq_diag_printf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    if (tl_diag != NULL) diag_vappend(tl_diag, fmt, ap);
+    else vfprintf(stderr, fmt, ap);
+    va_end(ap);
+}
+
+/* Record a malformed-input error on the installed sink (BSEQ_FATAL). */
+static void diag_hold_fatal(const char *where, const char *fmt, ...)
+{
+    bseq_diag_t *d = tl_diag;
+    if (d == NULL) return;
+    va_list ap;
+    va_start(ap, fmt);
+    d->fatal = 1;
+    snprintf(d->fatal_where, sizeof d->fatal_where, "%s", where);
+    vsnprintf(d->fatal_msg, sizeof d->fatal_msg, fmt, ap);
+    va_end(ap);
+}
+
+void bseq_diag_replay(const bseq_diag_t *d)
+{
+    if (d->len > 0) fwrite(d->text, 1, d->len, stderr);
+    if (d->fatal) err_fatal(d->fatal_where, "%s", d->fatal_msg);
+}
+
+void bseq_diag_free(bseq_diag_t *d)
+{
+    free(d->text);
+    memset(d, 0, sizeof *d);
+}
+
+/* A malformed-input error in bseq_read_fast: err_fatal, exactly as before,
+ * unless the thread holds its diagnostics back; then record it and abandon
+ * the read (label `held_fatal`). */
+#define BSEQ_FATAL(...) do {                                           \
+        if (tl_diag == NULL) err_fatal(__func__, __VA_ARGS__);         \
+        diag_hold_fatal(__func__, __VA_ARGS__);                        \
+        goto held_fatal;                                               \
+    } while (0)
+
 void *fast_kseq_init(fast_reader_t *fr) { return fr_fastq_init(fr); }
 
 void fast_kseq_destroy(void *p) { fr_fastq_destroy((fr_fastq_t *)p); }
@@ -118,12 +187,12 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
             sp_read_add(SP_READ_PARSE, (sp_wall() - _tk0) - ((d + c) - _io0));
         }
         if (g1 == -2)
-            err_fatal(__func__, "malformed FASTQ record or read/decode error in the 1st input (record %ld)", (long)n);
+            BSEQ_FATAL("malformed FASTQ record or read/decode error in the 1st input (record %ld)", (long)n);
         if (g1 != 1) break;                              /* clean EOF (g1 == 0) */
         if (p2 && g2 == -2)
-            err_fatal(__func__, "malformed FASTQ record or read/decode error in the 2nd input (record %ld)", (long)n);
+            BSEQ_FATAL("malformed FASTQ record or read/decode error in the 2nd input (record %ld)", (long)n);
         if (p2 && g2 != 1) {                             /* 2nd file has fewer (g2 == 0) */
-            fprintf(stderr, "[W::%s] the 2nd file has fewer sequences.\n", __func__);
+            bseq_diag_printf("[W::%s] the 2nd file has fewer sequences.\n", __func__);
             break;
         }
         /* Reject a >=2 GiB record before it is copied or narrowed: l_seq is an
@@ -132,9 +201,9 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
          * carves the sequence into the arena -- with the record index and mate
          * side, matching the other err_fatal call sites in this file. */
         if (r1.seq_l > (size_t)INT_MAX)
-            err_fatal(__func__, "sequence of %zu bases in the 1st input (record %ld) exceeds the supported read length", r1.seq_l, (long)n);
+            BSEQ_FATAL("sequence of %zu bases in the 1st input (record %ld) exceeds the supported read length", r1.seq_l, (long)n);
         if (p2 && r2.seq_l > (size_t)INT_MAX)
-            err_fatal(__func__, "sequence of %zu bases in the 2nd input (record %ld) exceeds the supported read length", r2.seq_l, (long)n);
+            BSEQ_FATAL("sequence of %zu bases in the 2nd input (record %ld) exceeds the supported read length", r2.seq_l, (long)n);
         /* Capacity check for BOTH writes this iteration. In paired-end mode `n`
          * advances by two and the loop writes seqs[n] and seqs[n+1], but the
          * initial estimate below can be odd (an odd chunk_size/seq_l quotient),
@@ -195,9 +264,9 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
         fr_fastq_rec_t rr;
         int gp = p2 ? fr_fastq_next(p2, &rr) : 0;
         if (gp == -2)
-            err_fatal(__func__, "malformed FASTQ record or read/decode error in the 2nd input while draining after the 1st input ended");
+            BSEQ_FATAL("malformed FASTQ record or read/decode error in the 2nd input while draining after the 1st input ended");
         if (gp == 1)
-            fprintf(stderr, "[W::%s] the 1st file has fewer sequences.\n", __func__);
+            bseq_diag_printf("[W::%s] the 1st file has fewer sequences.\n", __func__);
     }
     /* PIPE-F6: hand the arena (backing every read's name/seq/qual) to the caller,
      * which destroys it in the write stage once everything it backs is consumed.
@@ -210,4 +279,16 @@ bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int
     *n_ = n;
     *s = size;
     return seqs;
+
+held_fatal:
+    /* A malformed-input error held back on this thread's sink: no reads. The
+     * caller abandons the read, and bseq_diag_replay raises the error later.
+     * A carried arena is left to its cohort, as on the EOF path. */
+    for (int64_t i = 0; i < n; ++i) free(seqs[i].comment);
+    free(seqs);
+    if (arena_created_here) { read_arena_destroy(arena); arena = NULL; }
+    *arena_out = arena;
+    *n_ = 0;
+    *s = 0;
+    return NULL;
 }

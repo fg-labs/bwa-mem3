@@ -667,6 +667,82 @@ static inline void bns_expand4(__m128i v, __m128i *o0, __m128i *o1, __m128i *o2,
 	*o0 = _mm_unpacklo_epi16(lo01, lo23); *o1 = _mm_unpackhi_epi16(lo01, lo23);
 	*o2 = _mm_unpacklo_epi16(hi01, hi23); *o3 = _mm_unpackhi_epi16(hi01, hi23);
 }
+
+/* Forward bases [k, k+64) to d[0..64); k is a multiple of 4, so the block is the 16 pac bytes
+ * from k>>2. Byte-identical to the LUT loops (verified vs them over 200k random windows). */
+static inline void bns_block(const uint8_t *pac, int64_t k, uint8_t *d)
+{
+	__m128i v = _mm_loadu_si128((const __m128i *)(pac + (k >> 2))), o0, o1, o2, o3;
+	bns_expand4(v, &o0, &o1, &o2, &o3);
+	_mm_storeu_si128((__m128i *)d,        o0);
+	_mm_storeu_si128((__m128i *)(d + 16), o1);
+	_mm_storeu_si128((__m128i *)(d + 32), o2);
+	_mm_storeu_si128((__m128i *)(d + 48), o3);
+}
+
+/* Forward bases k, k-1, ..., k-63, complemented, to d[0..64); k is the last base of its byte.
+ * Forward-expands the 16-byte block [k-63, k], then reverses the byte order (pshufb) and
+ * complements (^3); byte-identical to the rev-LUT (verified over 200k windows). The load reads
+ * pac[(k>>2)-15 .. k>>2], the same span the LUT loop reads; the callers keep k-64 >= beg_f,
+ * and beg_f >= -1 after the end <= 2*l_pac clamp, so it never reads before pac[0]. */
+static inline void bns_block_rc(const uint8_t *pac, int64_t k, uint8_t *d)
+{
+	const __m128i rmask = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+	const __m128i m3 = _mm_set1_epi8(3);
+	__m128i v = _mm_loadu_si128((const __m128i *)(pac + ((k >> 2) - 15))), o0, o1, o2, o3;
+	bns_expand4(v, &o0, &o1, &o2, &o3);   // o0..o3 = forward bases [k-63, k] ascending
+	_mm_storeu_si128((__m128i *)d,        _mm_xor_si128(_mm_shuffle_epi8(o3, rmask), m3));
+	_mm_storeu_si128((__m128i *)(d + 16), _mm_xor_si128(_mm_shuffle_epi8(o2, rmask), m3));
+	_mm_storeu_si128((__m128i *)(d + 32), _mm_xor_si128(_mm_shuffle_epi8(o1, rmask), m3));
+	_mm_storeu_si128((__m128i *)(d + 48), _mm_xor_si128(_mm_shuffle_epi8(o0, rmask), m3));
+}
+
+/* Any-phase windows. A window of at least 16 bases is written as whole 16-byte blocks from a
+ * byte boundary plus 16-base pieces at any base phase: one piece for the 0-3 bases before the
+ * first byte boundary (it starts at the window's first base, so the blocks start at the next
+ * boundary), the blocks, then pieces to the window's end, the last of which ends exactly there.
+ * A window with no whole block after its first boundary is all pieces. Pieces may overwrite
+ * bases already written, with the same values; nothing is written outside the window. Each piece
+ * is bns_expand4's o0 on 4 packed bytes that pac16_end shifts to the piece's phase. pac16_end
+ * assembles a big-endian word from a native load, so this path is built on little-endian hosts
+ * only (every supported target); elsewhere, and for windows its guards exclude, the leading
+ * scalar loop, the blocks and the LUT loops below write the window. */
+#if !defined(__BYTE_ORDER__) || __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define BNS_SIMD_TAIL 1
+
+/* 16 bases from the 4 packed bytes in v's low 32 bits, ascending (o0 of bns_expand4). */
+static inline __m128i bns_expand1(__m128i v)
+{
+	const __m128i m3 = _mm_set1_epi8(3);
+	__m128i b0 = _mm_and_si128(_mm_srli_epi16(v, 6), m3), b1 = _mm_and_si128(_mm_srli_epi16(v, 4), m3);
+	__m128i b2 = _mm_and_si128(_mm_srli_epi16(v, 2), m3), b3 = _mm_and_si128(v, m3);
+	return _mm_unpacklo_epi16(_mm_unpacklo_epi8(b0, b1), _mm_unpacklo_epi8(b2, b3));
+}
+
+/* The forward bases [e-16, e) at any phase, as 4 packed bytes in memory order in the low 32 bits.
+ * Reads the 8 pac bytes ending at base e-1's byte, ((e-1)>>2)-7 .. (e-1)>>2: the caller keeps
+ * e >= 29 and e <= l_pac, so it reads neither before pac[0] nor past the last byte holding a base. */
+static inline __m128i pac16_end(const uint8_t *pac, int64_t e)
+{
+	uint64_t w;
+	memcpy(&w, pac + ((e - 1) >> 2) - 7, 8);
+	w = __builtin_bswap64(w) >> ((~(e - 1) & 3) << 1);   // MSB-first, base e-1 in bits 1:0
+	return _mm_cvtsi32_si128((int)__builtin_bswap32((uint32_t)w));
+}
+
+/* Forward bases [e-16, e) to d[0..16). */
+static inline void bns_piece(const uint8_t *pac, int64_t e, uint8_t *d)
+{
+	_mm_storeu_si128((__m128i *)d, bns_expand1(pac16_end(pac, e)));
+}
+
+/* Forward bases e-1, e-2, ..., e-16, complemented, to d[0..16). */
+static inline void bns_piece_rc(const uint8_t *pac, int64_t e, uint8_t *d)
+{
+	const __m128i rmask = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+	_mm_storeu_si128((__m128i *)d, _mm_xor_si128(_mm_shuffle_epi8(bns_expand1(pac16_end(pac, e)), rmask), _mm_set1_epi8(3)));
+}
+#endif
 #endif
 
 void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
@@ -684,28 +760,35 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 			int64_t end_f = (l_pac<<1) - 1 - beg;
 			const uint8_t (*rev)[4] = pac2nt4_lut().rev;
 			k = end_f;
+#ifdef BNS_SIMD_TAIL
+			// Any phase: forward bases beg_f+1 .. end_f, emitted from end_f down. ka is the last base
+			// of its byte, end_f or up to 3 below it. When a whole block fits below ka, one piece
+			// writes dst[0..16) (forward bases end_f .. end_f-15, covering the 0-3 above ka) and the
+			// blocks follow from ka; otherwise the pieces start at end_f. Pieces have tops k, k-16, ...
+			// and the last one's lowest base is beg_f+1. Needs 16 bases in the window (no write
+			// before dst[0]) and beg_f >= 12 (every piece ends at or above lo = beg_f+17 >= 29,
+			// pac16_end's bound).
+			if (end_f - beg_f >= 16 && beg_f >= 12) {
+				const int64_t ka = ((end_f + 1) & ~(int64_t)3) - 1;
+				if (ka - 64 >= beg_f) {
+					bns_piece_rc(pac, end_f + 1, dst);
+					for (k = ka; k - 64 >= beg_f; k -= 64) bns_block_rc(pac, k, dst + (end_f - k));
+				}
+				if (k > beg_f) {
+					const int64_t lo = beg_f + 17;
+					for (int64_t e = k + 1; ; e -= 16) {
+						if (e < lo) e = lo;
+						bns_piece_rc(pac, e, dst + (end_f + 1 - e));
+						if (e == lo) break;
+					}
+				}
+				return;
+			}
+#endif
 			// leading partial bases until k is the last base of its byte
 			for (; k > beg_f && (k & 3) != 3; --k) dst[l++] = 3 - _get_pac(pac, k);
 #ifdef BNS_SIMD_UNPACK
-			// SIMD reverse: forward-expand the 16-byte block [k-63, k], then reverse the byte
-			// order (pshufb) and complement (^3). k is the last base of its byte, so the block
-			// stays byte-aligned; byte-identical to the rev-LUT below (verified over 200k windows).
-			// The load reads pac[(k>>2)-15 .. k>>2] -- the same span the scalar loop below reads;
-			// the guard (k-64 >= beg_f, and beg_f >= -1 after the end<=2*l_pac clamp) keeps the low
-			// index >= 0, so it never reads before pac[0].
-			{
-				const __m128i rmask = _mm_set_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-				const __m128i m3 = _mm_set1_epi8(3);
-				for (; k - 64 >= beg_f; k -= 64) {
-					__m128i v = _mm_loadu_si128((const __m128i *)(pac + ((k >> 2) - 15))), o0, o1, o2, o3;
-					bns_expand4(v, &o0, &o1, &o2, &o3);   // o0..o3 = forward bases [k-63, k] ascending
-					_mm_storeu_si128((__m128i *)(dst + l),      _mm_xor_si128(_mm_shuffle_epi8(o3, rmask), m3));
-					_mm_storeu_si128((__m128i *)(dst + l + 16), _mm_xor_si128(_mm_shuffle_epi8(o2, rmask), m3));
-					_mm_storeu_si128((__m128i *)(dst + l + 32), _mm_xor_si128(_mm_shuffle_epi8(o1, rmask), m3));
-					_mm_storeu_si128((__m128i *)(dst + l + 48), _mm_xor_si128(_mm_shuffle_epi8(o0, rmask), m3));
-					l += 64;
-				}
-			}
+			for (; k - 64 >= beg_f; k -= 64, l += 64) bns_block_rc(pac, k, dst + l);
 #endif
 			// whole packed bytes: expand 4 rev-complemented bases per indexed load
 			for (; k - 4 >= beg_f; k -= 4) {
@@ -717,20 +800,33 @@ void bns_get_seq_into(int64_t l_pac, const uint8_t *pac,
 		} else { // forward strand
 			const uint8_t (*fwd)[4] = pac2nt4_lut().fwd;
 			k = beg;
+#ifdef BNS_SIMD_TAIL
+			// Any phase: ka is the first byte boundary at or after beg, at most 3 above it. When a
+			// whole block fits from ka, one piece writes dst[0..16) (bases beg .. beg+15, covering
+			// the 0-3 before ka) and the blocks follow from ka; otherwise the pieces start at beg.
+			// Pieces end at k+16, k+32, ... and the last exactly at end. Needs 16 bases in the
+			// window (no write before dst[0]) and beg >= 13 (every piece ends at or above
+			// beg+16 >= 29, pac16_end's bound).
+			if (end - beg >= 16 && beg >= 13) {
+				const int64_t ka = (beg + 3) & ~(int64_t)3;
+				if (ka + 64 <= end) {
+					bns_piece(pac, beg + 16, dst);
+					for (k = ka; k + 64 <= end; k += 64) bns_block(pac, k, dst + (k - beg));
+				}
+				if (k < end) {
+					for (int64_t e = k + 16; ; e += 16) {
+						if (e > end) e = end;
+						bns_piece(pac, e, dst + (e - 16 - beg));
+						if (e == end) break;
+					}
+				}
+				return;
+			}
+#endif
 			// leading partial bases until k is byte-aligned
 			for (; k < end && (k & 3) != 0; ++k) dst[l++] = _get_pac(pac, k);
 #ifdef BNS_SIMD_UNPACK
-			// SIMD: 16 packed bytes -> 64 bases per step; byte-identical to the LUT below
-			// (verified vs it over 200k random windows), ~3x faster on ~150 bp windows.
-			for (; k + 64 <= end; k += 64) {
-				__m128i v = _mm_loadu_si128((const __m128i *)(pac + (k >> 2))), o0, o1, o2, o3;
-				bns_expand4(v, &o0, &o1, &o2, &o3);
-				_mm_storeu_si128((__m128i *)(dst + l),      o0);
-				_mm_storeu_si128((__m128i *)(dst + l + 16), o1);
-				_mm_storeu_si128((__m128i *)(dst + l + 32), o2);
-				_mm_storeu_si128((__m128i *)(dst + l + 48), o3);
-				l += 64;
-			}
+			for (; k + 64 <= end; k += 64, l += 64) bns_block(pac, k, dst + l);
 #endif
 			// whole packed bytes: expand 4 bases per indexed load
 			for (; k + 4 <= end; k += 4) {

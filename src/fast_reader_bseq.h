@@ -53,6 +53,31 @@ void  fast_kseq_destroy(void *p);
 bseq1_t *bseq_read_fast(int64_t chunk_size, int *n_, void *ks1_, void *ks2_, int64_t *s,
                         read_arena_t **arena_out, int copy_comment);
 
+/* Held-back diagnostics, for a read that runs ahead of its turn (mem's first
+ * slice, read while the index loads: preread_main in fastmap.cpp). While a
+ * thread has one installed, bseq_read_fast appends its warnings to it instead
+ * of printing them, and on a malformed-input error records the message and
+ * returns no reads (*n_ = 0, NULL) instead of calling err_fatal; the caller
+ * then abandons the read. bseq_diag_printf does the same for the caller's own
+ * stderr lines. The owner replays it later with bseq_diag_replay, which prints
+ * the held text and then, for a held error, calls err_fatal with the same
+ * header and message: the same stderr in the same order and the same exit, at
+ * the point the read would have run. With none installed, every one of these
+ * prints, or exits, at once, exactly as before. Allocation failures still call
+ * err_fatal at once. */
+typedef struct {
+    char  *text;              /* held stderr text, in order */
+    size_t len, cap;
+    int    fatal;             /* a malformed-input error ended the read */
+    char   fatal_where[64];   /* its err_fatal header */
+    char   fatal_msg[512];
+} bseq_diag_t;
+
+void bseq_diag_install(bseq_diag_t *d);      /* this thread's sink; NULL removes it */
+void bseq_diag_printf(const char *fmt, ...); /* to the thread's sink, or stderr */
+void bseq_diag_replay(const bseq_diag_t *d); /* print the held text; err_fatal on a held error */
+void bseq_diag_free(bseq_diag_t *d);
+
 #ifdef __cplusplus
 }
 #endif
