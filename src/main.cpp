@@ -33,7 +33,6 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #include "simd_dispatch.h"
 #include "version.h"
 #include "bwa_shm.h"
-#include <time.h>   /* clock_gettime, nanosleep: proc_freq calibration */
 
 #ifdef USE_MIMALLOC
 #include <stdlib.h>  /* strtol: MIMALLOC_PURGE_DELAY check */
@@ -106,71 +105,6 @@ static void append_pg_cl_arg(kstring_t *pg, const char *arg)
 {
     kputc_checked(' ', pg);
     append_pg_cl_sanitized(pg, arg);
-}
-
-// Measure the __rdtsc() tick rate (ticks per second) that every timing
-// report divides by: display_stats(), the `index` "Total time taken" line,
-// and the `mem` profiling trailer.
-//
-// This used to be `tim = __rdtsc(); sleep(1); proc_freq = __rdtsc() - tim;`,
-// which spent a full second of wall time on EVERY invocation -- including
-// `version`, `shm -l`, and plain usage errors, none of which ever read
-// proc_freq. Invisible next to a real alignment run, but it dominates the
-// test suite: run_unit_tests.sh spawns ~60 short bwa-mem3 processes, so it
-// spent ~60 s of its 74 s asleep against under 5 s of real CPU work.
-//
-// Measure over a short window instead and divide by the wall time
-// CLOCK_MONOTONIC reports for that same window. Both clocks track wall
-// time -- the TSC is invariant on every x86-64 this targets, and __rdtsc()
-// reads the fixed-rate CNTVCT_EL0 on arm64 -- so a couple of milliseconds
-// is plenty. Residual error is the nanosecond-scale cost of the counter
-// reads spread over the window (well under 0.1%), far below the precision
-// the timing reports claim. It is also no less representative than the old
-// sleep: a sleeping core sits at its lowest P-state, so on the parts whose
-// TSC is *not* invariant, sleep(1) measured precisely the frequency the
-// aligner never runs at.
-static uint64_t calibrate_proc_freq(void)
-{
-    // 5 ms, doubling per retry. nanosleep() returns early when a signal
-    // arrives; we divide by the *measured* elapsed time rather than the
-    // requested one, so a short window is still usable -- but if it came
-    // back too short to divide by with any precision, try again on a
-    // longer one.
-    const long base_window_ns = 5L * 1000 * 1000;
-    const int max_attempts = 4;
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
-        struct timespec window = {0, base_window_ns << attempt};
-        // Zero-initialized so that a failing clock_gettime() -- which
-        // CLOCK_MONOTONIC does not do in practice, but which would
-        // otherwise leave these indeterminate -- yields elapsed == 0 and
-        // falls into the retry below rather than reading uninitialized
-        // memory and dividing by garbage.
-        struct timespec t0 = {0, 0}, t1 = {0, 0};
-
-        clock_gettime(CLOCK_MONOTONIC, &t0);
-        uint64_t c0 = __rdtsc();
-        nanosleep(&window, NULL);
-        uint64_t c1 = __rdtsc();
-        clock_gettime(CLOCK_MONOTONIC, &t1);
-
-        double elapsed = (double)(t1.tv_sec - t0.tv_sec)
-                       + (double)(t1.tv_nsec - t0.tv_nsec) * 1e-9;
-        if (elapsed >= 1e-4 && c1 > c0)
-            return (uint64_t)((double)(c1 - c0) / elapsed + 0.5);
-    }
-    // Not reachable in practice (it would take max_attempts consecutive
-    // windows cut short to under 100 us). Say so on stderr rather than
-    // silently returning a bogus rate: without this, a pathological
-    // environment -- nanosleep() blocked by a seccomp filter, a process
-    // under relentless signal pressure -- would print implausible timings
-    // with nothing explaining why. stderr only, so the SAM on stdout is
-    // unaffected.
-    fprintf(stderr, "[W::%s] could not calibrate the processor tick rate in "
-                    "%d attempts; timing reports will be meaningless.\n",
-            __func__, max_attempts);
-    // Return 1 rather than 0 so the reports print implausible seconds
-    // instead of dividing by zero.
-    return 1;
 }
 
 #ifdef USE_MIMALLOC
@@ -281,9 +215,6 @@ int main(int argc, char* argv[])
 {
     bwamem3_simd_init();
 
-    // ---------------------------------
-    proc_freq = calibrate_proc_freq();
-
     int ret = -1;
     if (argc < 2) return usage();
 
@@ -316,13 +247,23 @@ int main(int argc, char* argv[])
                        (strcmp(argv[2], "-h") == 0 && strcmp(argv[1], "mem") != 0));
     if (strcmp(argv[1], "version") != 0 && !wants_help) {
         bwamem3_enforce_host_floor();
+
+        // Open the window proc_freq is measured over (x86; aarch64 reads the
+        // rate from CNTFRQ_EL0 instead); the first timing report closes it
+        // (proc_freq_resolve, profiling.cpp). Only after the precheck:
+        // profiling.cpp is built at BASELINE_ARCH, so this can execute AVX
+        // instructions, and on a host below the floor it must not run before
+        // the precheck has refused cleanly. `version` and help never read the
+        // rate, so they skip it and stay runnable on such a host.
+        proc_freq_mark_start();
     }
 
     if (strcmp(argv[1], "index") == 0)
     {
          uint64_t tim = __rdtsc();
          ret = bwa_index(argc-1, argv+1);
-         fprintf(stderr, "Total time taken: %0.4lf\n", (__rdtsc() - tim)*1.0/proc_freq);
+         tim = __rdtsc() - tim;
+         fprintf(stderr, "Total time taken: %0.4lf\n", tim*1.0/proc_freq_resolve());
          return ret;
     }
     else if (strcmp(argv[1], "mem") == 0)

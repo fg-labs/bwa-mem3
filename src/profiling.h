@@ -45,7 +45,33 @@ struct tprof_row_t {
 };
 
 int display_stats(int );
+/* proc_freq is the __rdtsc() tick rate (ticks per second) every timing report
+ * divides by. Nothing sets it at start-up, so it reads 0 until resolved: code
+ * that divides by it must call proc_freq_resolve() first (or use its return
+ * value). A library consumer or test may pre-set a nonzero proc_freq, and
+ * proc_freq_resolve() keeps it.
+ *
+ * proc_freq_resolve() sets proc_freq the first time a report needs it
+ * (display_stats(), the `index` "Total time taken" line) and returns it. On
+ * aarch64 it reads the counter's frequency register, CNTFRQ_EL0, and trusts
+ * any nonzero value. Elsewhere, and on aarch64 if CNTFRQ_EL0 reads 0, it
+ * measures the rate over the window proc_freq_mark_start() opened at the
+ * start of main(), falling back to a short sleep when that window was never
+ * opened (a library consumer that does not go through main()), is under 1 ms,
+ * spans a system suspend, or cannot be measured (clock_gettime() failed, or
+ * the counter did not advance). A suspend is detected only on Linux (with
+ * CLOCK_BOOTTIME) and macOS; elsewhere, or when a suspend-clock read fails,
+ * the window is used unchecked and a suspend skews the rate without warning.
+ * At -v 4 it names the source it used on stderr,
+ * once, including "the caller" for a pre-set rate.
+ *
+ * Neither is thread-safe (they touch unsynchronised globals): call them from
+ * the main thread, proc_freq_mark_start() at start-up and proc_freq_resolve()
+ * at the end of the run after the workers have joined, as main() and the
+ * reports do. */
 extern uint64_t proc_freq;
+void proc_freq_mark_start(void);
+uint64_t proc_freq_resolve(void);
 extern tprof_row_t tprof[LIM_R];
 extern uint64_t prof[LIM_R];
 #endif
