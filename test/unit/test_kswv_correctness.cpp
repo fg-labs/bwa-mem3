@@ -17,6 +17,7 @@
 #include "doctest/doctest.h"
 
 #include "kswr_cmp.h"
+#include "scoped_env.h"
 #include "ksw_runner.h"
 #include "kswv_runner.h"
 #include "scoring.h"
@@ -76,28 +77,7 @@ std::vector<bwa_tests::TestPair> build_bulk_random(std::mt19937 &rng, int n) {
     return pairs;
 }
 
-// RAII override of an environment variable: set on construction, restore the
-// prior value (or unset if it was absent) on destruction, so doctest run order
-// cannot leak an override into a sibling case that assumes the defaults.
-class ScopedEnv {
-public:
-    ScopedEnv(const char *name, const char *value) : name_(name) {
-        const char *cur = getenv(name);
-        had_ = cur != nullptr;
-        if (had_) saved_ = cur;
-        setenv(name, value, 1);
-    }
-    ~ScopedEnv() {
-        if (had_) setenv(name_.c_str(), saved_.c_str(), 1);
-        else      unsetenv(name_.c_str());
-    }
-    ScopedEnv(const ScopedEnv &) = delete;
-    ScopedEnv &operator=(const ScopedEnv &) = delete;
-private:
-    std::string name_;
-    std::string saved_;
-    bool had_ = false;
-};
+using bwa_tests::ScopedEnv;   // scoped_env.h
 
 using bwa_tests::kswr_all_fields_eq;   // strict all-field equality (kswr_cmp.h)
 
@@ -296,22 +276,25 @@ TEST_CASE("kswv handles every curated edge case identically to scalar"
 
 // The two-row (KSWV_NEON_U8_CELL_PAIR) and one-row (KSWV_NEON_U8_CELL) macros
 // restate the same u8-rescue recurrence, so a change applied to one but not the
-// other would diverge silently. rescue_rowpair_enabled() reads BWA3_RESCUE_ROWPAIR
-// on every call (the NEON u8 kernel only), so this drives one batch through
-// getScores8 with pairing off then on. Two gates:
+// other would diverge silently; the AVX-512BW u8 FScan body pairs rows the same
+// way (its one-row and two-row cells restate the recurrence too).
+// rescue_rowpair_enabled() reads BWA3_RESCUE_ROWPAIR on every call, so this
+// drives one batch through getScores8 with pairing off then on. Two gates:
 //   * strict all-field A/B (one-row == two-row) catches drift between the macros;
-//   * an INDEPENDENT scalar oracle on the one-row arm — the shared KSWV_U8_EPILOGUE
-//     means a bug there shifts BOTH arms together, so the A/B alone would stay
+//   * an INDEPENDENT scalar oracle on the one-row arm — the shared row epilogue
+//     (KSWV_U8_EPILOGUE on NEON, KSWV512_U8_EPILOGUE on AVX-512BW) means a bug
+//     there shifts BOTH arms together, so the A/B alone would stay
 //     green; the existing scalar-oracle cases run only the default (pairing-on)
 //     mode, leaving the one-row path without a reference otherwise.
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_ROWPAIR off == on, and one-row matches scalar"
           * doctest::test_suite("unit/kswv")) {
 
-#if !defined(__ARM_NEON) && !defined(__aarch64__)
-    // BWA3_RESCUE_ROWPAIR gates only the NEON u8 rescue kernel; on x86 tiers
-    // run_kswv_batch dispatches to kswv256/512_u8 where both arms run identical
-    // code, so this case would pass without exercising the row-pair logic.
-    MESSAGE("skipped: BWA3_RESCUE_ROWPAIR affects the NEON u8 rescue kernel only");
+#if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(__AVX512BW__)
+    // BWA3_RESCUE_ROWPAIR gates the NEON u8 kernel and the AVX-512BW u8 FScan
+    // body; an AVX2 build's run_kswv_batch binds kswv256_u8, where both arms run
+    // identical code, so this case would pass without exercising the row-pair
+    // logic (test_kswv_rowpair_u8.cpp gates the AVX-512BW pair at runtime tier).
+    MESSAGE("skipped: BWA3_RESCUE_ROWPAIR affects the NEON and AVX-512BW u8 rescue kernels only");
     return;
 #else
     auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
@@ -556,6 +539,8 @@ TEST_CASE("kswv u16 rescue: ROWPAIR/LAZYQE configurations agree, and one-row mat
 // (`if (j < jend_) { ...; d1 = d1b; }`) handles. No other case drives USQADD=0.
 // Pairing is held ON so it is the two-row biased body (and its odd tail) that
 // USQADD toggles; the odd query lengths in build_edge_cases make the tail odd.
+// AVX-512BW builds also run every check with pairing OFF, since there the
+// default u8 FScan bodies pair rows and the one-row sweeps need their own arm.
 // Strict all-field A/B against the default (saturating) arm, plus the biased arm
 // against the independent scalar oracle.
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches scalar"
@@ -576,9 +561,17 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
     scalar_aln.reserve(pairs.size());
     for (const auto &p : pairs) scalar_aln.push_back(bwa_tests::run_scalar_ksw(p, mat));
 
-    std::vector<kswr_t> biased, saturating;
-    {
-        ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "1");
+    // On AVX-512BW the u8 FScan bodies pair rows by default, so also run both
+    // bodies with ROWPAIR=0 there to keep their one-row sweeps covered.
+#if defined(__AVX512BW__)
+    const char *const rowpairs[] = {"1", "0"};
+#else
+    const char *const rowpairs[] = {"1"};
+#endif
+    for (const char *rowpair : rowpairs) {
+        CAPTURE(std::string(rowpair));
+        ScopedEnv rp("BWA3_RESCUE_ROWPAIR", rowpair);
+        std::vector<kswr_t> biased, saturating;
         {
             ScopedEnv uq("BWA3_RESCUE_USQADD", "0");
             biased = bwa_tests::run_kswv_batch(pairs, mat);
@@ -587,63 +580,63 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
             ScopedEnv uq("BWA3_RESCUE_USQADD", "1");
             saturating = bwa_tests::run_kswv_batch(pairs, mat);
         }
-    }
 
-    REQUIRE(biased.size() == pairs.size());
-    REQUIRE(saturating.size() == pairs.size());
+        REQUIRE(biased.size() == pairs.size());
+        REQUIRE(saturating.size() == pairs.size());
 
-    int drift = 0, oracle_mism = 0;
-    for (size_t i = 0; i < pairs.size(); i++) {
-        const kswr_t &a = biased[i];
-        const kswr_t &b = saturating[i];
-        if (!kswr_all_fields_eq(a, b)) {
-            ++drift;
-            CAPTURE(i); CAPTURE(pairs[i].tag);
-            CAPTURE(a.score); CAPTURE(b.score);
-            CAPTURE(a.te); CAPTURE(b.te); CAPTURE(a.qe); CAPTURE(b.qe);
-            CHECK(kswr_all_fields_eq(a, b));
+        int drift = 0, oracle_mism = 0;
+        for (size_t i = 0; i < pairs.size(); i++) {
+            const kswr_t &a = biased[i];
+            const kswr_t &b = saturating[i];
+            if (!kswr_all_fields_eq(a, b)) {
+                ++drift;
+                CAPTURE(i); CAPTURE(pairs[i].tag);
+                CAPTURE(a.score); CAPTURE(b.score);
+                CAPTURE(a.te); CAPTURE(b.te); CAPTURE(a.qe); CAPTURE(b.qe);
+                CHECK(kswr_all_fields_eq(a, b));
+            }
+            const bool o_score  = bwa_tests::kswr_score_eq(scalar_aln[i], a);
+            const bool o_coord  = bwa_tests::kswr_coords_eq(scalar_aln[i], a);
+            const bool o_score2 = bwa_tests::kswr_score2_eq(scalar_aln[i], a);
+            if (!(o_score && o_coord && o_score2)) {
+                ++oracle_mism;
+                CAPTURE(i); CAPTURE(pairs[i].tag);
+                CAPTURE(scalar_aln[i].score); CAPTURE(a.score);
+                CHECK(o_score); CHECK(o_coord); CHECK(o_score2);
+            }
         }
-        const bool o_score  = bwa_tests::kswr_score_eq(scalar_aln[i], a);
-        const bool o_coord  = bwa_tests::kswr_coords_eq(scalar_aln[i], a);
-        const bool o_score2 = bwa_tests::kswr_score2_eq(scalar_aln[i], a);
-        if (!(o_score && o_coord && o_score2)) {
-            ++oracle_mism;
-            CAPTURE(i); CAPTURE(pairs[i].tag);
-            CAPTURE(scalar_aln[i].score); CAPTURE(a.score);
-            CHECK(o_score); CHECK(o_coord); CHECK(o_score2);
-        }
-    }
-    MESSAGE("usqadd off-vs-on drift=" << drift << ", biased vs scalar mism="
-            << oracle_mism << " over " << pairs.size() << " pairs");
-    CHECK(drift == 0);
-    CHECK(oracle_mism == 0);
+        MESSAGE("rowpair=" << std::string(rowpair) << " usqadd off-vs-on drift=" << drift << ", biased vs scalar mism="
+                << oracle_mism << " over " << pairs.size() << " pairs");
+        CHECK(drift == 0);
+        CHECK(oracle_mism == 0);
 
-    // The AVX2 signed-domain FScan body takes gap constants up to 127 as positive int8 and falls
-    // back to the biased FScan body above that; off must equal on at the boundary (open-plus-extend
-    // 127, reached by a large open and by a large extend) and one past it (128), and the default
-    // (on) arm must match the independent scalar oracle at each.
-    const int gaps[][2] = {{100, 27}, {6, 121}, {121, 7}};
-    for (const auto &g : gaps) {
-        CAPTURE(g[0]); CAPTURE(g[1]);
-        std::vector<kswr_t> off, on;
-        {
-            ScopedEnv uq("BWA3_RESCUE_USQADD", "0");
-            off = bwa_tests::run_kswv_batch(pairs, mat, g[0], g[1]);
+        // The AVX2 signed-domain FScan body takes gap constants up to 127 as positive int8 and falls
+        // back to the biased FScan body above that; off must equal on at the boundary (open-plus-extend
+        // 127, reached by a large open and by a large extend) and one past it (128), and the default
+        // (on) arm must match the independent scalar oracle at each.
+        const int gaps[][2] = {{100, 27}, {6, 121}, {121, 7}};
+        for (const auto &g : gaps) {
+            CAPTURE(g[0]); CAPTURE(g[1]);
+            std::vector<kswr_t> off, on;
+            {
+                ScopedEnv uq("BWA3_RESCUE_USQADD", "0");
+                off = bwa_tests::run_kswv_batch(pairs, mat, g[0], g[1]);
+            }
+            {
+                ScopedEnv uq("BWA3_RESCUE_USQADD", "1");
+                on = bwa_tests::run_kswv_batch(pairs, mat, g[0], g[1]);
+            }
+            REQUIRE(off.size() == on.size());
+            int gdrift = 0, gmism = 0;
+            for (size_t i = 0; i < off.size(); i++) {
+                gdrift += !kswr_all_fields_eq(off[i], on[i]);
+                const kswr_t sc = bwa_tests::run_scalar_ksw(pairs[i], mat, g[0], g[1]);
+                gmism += !(bwa_tests::kswr_score_eq(sc, on[i]) && bwa_tests::kswr_coords_eq(sc, on[i])
+                           && bwa_tests::kswr_score2_eq(sc, on[i]));
+            }
+            CHECK(gdrift == 0);
+            CHECK(gmism == 0);
         }
-        {
-            ScopedEnv uq("BWA3_RESCUE_USQADD", "1");
-            on = bwa_tests::run_kswv_batch(pairs, mat, g[0], g[1]);
-        }
-        REQUIRE(off.size() == on.size());
-        int gdrift = 0, gmism = 0;
-        for (size_t i = 0; i < off.size(); i++) {
-            gdrift += !kswr_all_fields_eq(off[i], on[i]);
-            const kswr_t sc = bwa_tests::run_scalar_ksw(pairs[i], mat, g[0], g[1]);
-            gmism += !(bwa_tests::kswr_score_eq(sc, on[i]) && bwa_tests::kswr_coords_eq(sc, on[i])
-                       && bwa_tests::kswr_score2_eq(sc, on[i]));
-        }
-        CHECK(gdrift == 0);
-        CHECK(gmism == 0);
     }
 #endif
 }
@@ -659,7 +652,8 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
 // AVX-512BW (it reports SKIP otherwise). For each body the flag reaches -- on
 // NEON one-row, two-row inline argmax, two-row lazy, and the biased (USQADD=0)
 // two-row body; on x86 the signed-domain form (the default, which USQADD
-// selects) and the biased form of each tier's body -- one batch runs
+// selects) and the biased form of each tier's body, and on AVX-512BW both again
+// with ROWPAIR=0, since its default u8 FScan bodies pair rows -- one batch runs
 // with FSCAN off then on and must agree on every field. The FSCAN arm of the
 // default configuration is also checked against the independent scalar
 // oracle. build_edge_cases' ragged lengths put pad rows and pad columns in most
@@ -693,6 +687,12 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
 #else
         {"x86",             "1", "1", "1", true},   // AVX2 / AVX-512BW: the signed-domain FScan body
         {"x86 biased",      "1", "1", "0", false},  // AVX2 / AVX-512BW: the biased FScan body (USQADD=0)
+#if defined(__AVX512BW__)
+        // AVX-512BW pairs rows in its u8 FScan bodies, so the defaults above run
+        // the two-row sweep; these keep its one-row sweep under both regimes.
+        {"x86 one-row",        "0", "1", "1", false},
+        {"x86 one-row biased", "0", "1", "0", false},
+#endif
 #endif
     };
     int oracle_mism = 0;
@@ -788,17 +788,23 @@ TEST_CASE("kswv u8 FScan: the two-row sweep agrees with FSCAN off and scalar at 
         {"default (B4 O6 E1)",        4, 6, 1},
         {"adjacent gaps (B20 O1 E1)", 20, 1, 1},
     };
-    struct Config { std::string name; const char *lazyqe, *usqadd; bool oracle; };
+    struct Config { std::string name; const char *rowpair, *lazyqe, *usqadd; bool oracle; };
     const Config configs[] = {
-        {"two-row lazy",   "1", "1", true},   // the production default
-        {"two-row inline", "0", "1", false},
-        {"two-row biased", "1", "0", false},
+        {"two-row lazy",   "1", "1", "1", true},   // the production default
+        {"two-row inline", "1", "0", "1", false},
+        {"two-row biased", "1", "1", "0", false},
+#if defined(__AVX512BW__)
+        // AVX-512BW's default u8 FScan bodies pair rows; keep the one-row sweeps
+        // covered at every short query length too.
+        {"one-row",        "0", "1", "1", false},
+        {"one-row biased", "0", "1", "0", false},
+#endif
     };
     int oracle_mism = 0;
     for (const Regime &r : regimes) {
         auto mat = bwa_tests::build_scoring_matrix(1, r.mismatch, 1);
         for (const Config &c : configs) {
-            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "1");
+            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", c.rowpair);
             ScopedEnv lq("BWA3_RESCUE_LAZYQE", c.lazyqe);
             ScopedEnv uq("BWA3_RESCUE_USQADD", c.usqadd);
             std::vector<kswr_t> off, on;
@@ -1162,9 +1168,23 @@ void check_fscan_off_on(const std::string &what, const std::vector<bwa_tests::Te
 #else
         {"x86",            "1", "1", "1", true},   // AVX2 / AVX-512BW: the signed-domain FScan body
         {"x86 biased",     "1", "1", "0", false},  // x86 u8 only: the biased FScan body (USQADD=0)
+#if defined(__AVX512BW__)
+        // u8 only: the AVX-512BW u8 FScan bodies pair rows by default; these keep
+        // their one-row sweep (ROWPAIR does not reach the x86 16-bit bodies).
+        {"x86 one-row",        "0", "1", "1", false},
+        {"x86 one-row biased", "0", "1", "0", false},
+#endif
 #endif
     };
-    auto runs = [use16](const Config &c) { return !(use16 && std::strcmp(c.usqadd, "0") == 0); };
+#if defined(__ARM_NEON) || defined(__aarch64__)
+    constexpr bool rowpair16 = true;    // NEON pairs rows in its 16-bit bodies too
+#else
+    constexpr bool rowpair16 = false;
+#endif
+    auto runs = [use16](const Config &c) {
+        return !(use16 && (std::strcmp(c.usqadd, "0") == 0
+                           || (!rowpair16 && std::strcmp(c.rowpair, "0") == 0)));
+    };
     size_t n_rot = 0;
     for (const Config &c : configs) n_rot += runs(c) && !c.oracle;
     size_t rot = 0;

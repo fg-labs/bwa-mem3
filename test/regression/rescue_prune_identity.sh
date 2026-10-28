@@ -9,9 +9,10 @@
 #
 #   REF_ENV (below): every BWA3_RESCUE_* shortcut off
 #                        -> every rescue window computed in full by kswv with its
-#                           original cell and its original NEON forms (USQADD,
-#                           ROWPAIR, LAZYQE off), and every post-rescue dedup run in
-#                           full (reference; every other leg runs the defaults)
+#                           original cell and its original forms (USQADD and
+#                           ROWPAIR off on NEON and the x86 FScan bodies that have
+#                           them, LAZYQE off on NEON), and every post-rescue dedup
+#                           run in full (reference; every other leg runs the defaults)
 #   BWA3_RESCUE_PRUNE=0 BWA3_RESCUE_BAND=0
 #                        -> as the reference, but a dedup proven to be a no-op is
 #                           skipped and a one-record insert done in O(n)
@@ -288,7 +289,9 @@ host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9
 # (BWA3_RESCUE_LAZYQE reaches only the NEON two-row sweep); the kswv unit tests
 # check it against the scalar ksw_align2. BWA3_RESCUE_USQADD reaches the NEON u8
 # body and the AVX2 and AVX-512BW FScan bodies, so the reference's USQADD=0
-# checks each tier's signed-domain body end to end.
+# checks each tier's signed-domain body end to end; BWA3_RESCUE_ROWPAIR reaches
+# the NEON kswv bodies and the AVX-512BW u8 FScan bodies, so ROWPAIR=0 checks
+# their two-row sweeps the same way.
 # BWA3_RESCUE_PADCOLS reaches only the NEON u8 FScan body with USQADD on, which
 # the reference does not run, so there the default legs compare any all-pad
 # columns the fixture's lane groups have against the original body's gathered

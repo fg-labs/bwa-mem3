@@ -538,7 +538,9 @@ static inline bool rescue_meth_rel_matrix_ok(const int8_t *mat, int hyp, int a, 
  * default -k 19 prunes like -A 1 does (Zen 5 AVX-512BW, prune on vs off, -t 16, 3 reps, wgs-5M:
  * -A 2 -2.5 %, -A 2 -B 8 -O 12 -E 2 -2.2 %, -A 3 -B 12 -O 18 -E 3 -1.7 %; wes-5M flat). The gate
  * covers 16-bit jobs too, which every job at -A 2 with 150 bp mates is: the same filter decides
- * them, and the kswv they save is the 16-bit kernel, which has half the lanes. */
+ * them, and the kswv they save is the 16-bit kernel, which has half the lanes. The Zen 5 AVX-512BW
+ * figures were measured on the one-row u8 kswv body; its two-row sweep (BWA3_RESCUE_ROWPAIR) makes
+ * each kswv cell cheaper, which moves both break-evens, so re-measure against it before retuning. */
 static inline bool rescue_prune_cost_ok(const rescue_prune_params &p, bool meth, bool meth_fits, bool avx512)
 {
 #if defined(__aarch64__)
