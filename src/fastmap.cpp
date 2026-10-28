@@ -39,6 +39,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <sstream>
 #include <getopt.h>
 #include <cmath>      /* std::isfinite: reject non-finite -I insert-size values */
+#include <sys/stat.h> /* stat(): the pre-load input existence check */
 #include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
 #include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
 #ifdef BWA_MEM3_DEBUG_RESCUE_STATS
@@ -3776,31 +3777,6 @@ int main_mem(int argc, char *argv[])
         }
     }
 
-    /* D3: fail fast with an actionable message if the `.meth` seed index is
-     * absent — distinguishing a never-built index from a stale D1 `.bwameth.c2t`
-     * index (the format changed; the user must re-run `index --meth`). */
-    if (opt->meth_mode) {
-        char probe[PATH_MAX];
-        snprintf(probe, sizeof(probe), "%s%s", ref_prefix, ".bwt.2bit.64");
-        if (access(probe, F_OK) != 0) {
-            const char *orig = (meth_orig_ref_prefix != NULL) ? meth_orig_ref_prefix
-                                                              : argv[optind];
-            char old_probe[PATH_MAX];
-            snprintf(old_probe, sizeof(old_probe), "%s.bwameth.c2t.bwt.2bit.64", orig);
-            if (access(old_probe, F_OK) == 0)
-                fprintf(stderr,
-                        "ERROR: --meth found a legacy '.bwameth.c2t' index, but the "
-                        "format changed. Re-run: bwa-mem3 index --meth %s\n", orig);
-            else
-                fprintf(stderr,
-                        "ERROR: --meth seed index '%s.*' not found. Run: "
-                        "bwa-mem3 index --meth %s\n", ref_prefix, orig);
-            free(opt);
-            if (out_opened) fclose(aux.fp);
-            return 1;
-        }
-    }
-
     if (opt->seed_emit_order != SEED_ORDER_OFF)
         fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
     if (fast) {
@@ -3858,6 +3834,70 @@ int main_mem(int argc, char *argv[])
         free(opt);
         if (out_opened) fclose(aux.fp);
         return 1;
+    }
+
+    /* Report an input that cannot be read before the index load, which can take
+     * minutes on a large reference, rather than after it. Any stat() failure
+     * counts (a missing file, but also ENOTDIR, ENAMETOOLONG, or EACCES on a
+     * parent directory), and so does a directory. Only names kopen() opens as
+     * paths are checked: "-", a `<cmd`, http:// and ftp:// are left to it, and
+     * under -p the second positional is ignored as before. The check opens
+     * nothing -- the real open and the reader's format sniff stay after the
+     * load, so stdin, a `<cmd` or a FIFO that is slow to start never holds the
+     * load up -- and a file that exists but cannot be opened (permissions) is
+     * still reported after the load.
+     *
+     * The messages and exit status are the ones the opens below use, so for a
+     * missing or unreachable path only the timing changes, and with it which
+     * error can appear first: an input error now precedes an index error; if
+     * R1 exists but cannot be opened and R2 is missing, R2 is reported first;
+     * and an input created while the index loads, which used to be found, is
+     * now rejected (one removed while it loads still fails at the open after
+     * the load, and one replaced is read as it is at that open). A directory is the exception: it used to fail after
+     * the load with the reader's error ("read failed", or "[gzread] Is a
+     * directory" under --legacy-reader) and now gets "fail to open file"
+     * ("failed to open file" as R2) before it. */
+    {
+        int n_in = (optind + 2 < argc && !(opt->flag & MEM_F_PE)) ? 2 : 1;
+        for (int k = 1; k <= n_in; ++k) {
+            const char *fn = argv[optind + k];
+            struct stat st;
+            if (!kopen_is_local_path(fn)) continue;
+            if (stat(fn, &st) != 0 || S_ISDIR(st.st_mode)) {
+                fprintf(stderr, "[E::%s] %s to open file `%s'.\n", __func__,
+                        k == 1 ? "fail" : "failed", fn);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
+    }
+
+    /* D3: fail fast with an actionable message if the `.meth` seed index is
+     * absent — distinguishing a never-built index from a stale D1 `.bwameth.c2t`
+     * index (the format changed; the user must re-run `index --meth`). It runs
+     * after the input check above, so a missing input is reported before a
+     * missing seed index, as it is before any other index error. */
+    if (opt->meth_mode) {
+        char probe[PATH_MAX];
+        snprintf(probe, sizeof(probe), "%s%s", ref_prefix, ".bwt.2bit.64");
+        if (access(probe, F_OK) != 0) {
+            const char *orig = (meth_orig_ref_prefix != NULL) ? meth_orig_ref_prefix
+                                                              : argv[optind];
+            char old_probe[PATH_MAX];
+            snprintf(old_probe, sizeof(old_probe), "%s.bwameth.c2t.bwt.2bit.64", orig);
+            if (access(old_probe, F_OK) == 0)
+                fprintf(stderr,
+                        "ERROR: --meth found a legacy '.bwameth.c2t' index, but the "
+                        "format changed. Re-run: bwa-mem3 index --meth %s\n", orig);
+            else
+                fprintf(stderr,
+                        "ERROR: --meth seed index '%s.*' not found. Run: "
+                        "bwa-mem3 index --meth %s\n", ref_prefix, orig);
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
     }
 
     /* Load bwt2/FMI index */

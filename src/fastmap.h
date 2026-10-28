@@ -175,6 +175,7 @@ typedef struct {
 
     
 void *kopen(const char *fn, int *_fd);
+int kopen_is_local_path(const char *fn);   /* 0 for "-", `<cmd`, http://, ftp:// */
 int kclose(void *a);
 int main_mem(int argc, char *argv[]);
 

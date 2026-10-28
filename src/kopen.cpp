@@ -401,11 +401,34 @@ typedef struct {
 	pid_t pid;
 } koaux_t;
 
+/* 1 if kopen() opens `fn` as a filesystem path, 0 if it treats the name
+ * specially: an http:// or ftp:// URL, "-" (stdin), or a `<cmd` producer
+ * (leading whitespace allowed before the '<'). The single source of truth for
+ * that split: kopen() below branches on it first, and mem's pre-load input
+ * check uses it to decide what to stat(). */
+int kopen_is_local_path(const char *fn)
+{
+	const char *p;
+	if (strstr(fn, "http://") == fn || strstr(fn, "ftp://") == fn) return 0;
+	if (strcmp(fn, "-") == 0) return 0;
+	for (p = fn; *p; ++p)
+		if (!isspace((unsigned char)*p)) break;
+	return *p != '<';
+}
+
 void *kopen(const char *fn, int *_fd)
 {
 	koaux_t *aux = 0;
 	*_fd = -1;
-	if (strstr(fn, "http://") == fn) {
+	if (kopen_is_local_path(fn)) {
+		*_fd = open(fn, O_RDONLY);
+		if (*_fd >= 0) {
+			aux = (koaux_t*) calloc(1, sizeof(koaux_t));
+			xassert(aux != NULL, "kopen: calloc failed");
+			aux->type = KO_FILE;
+			aux->fd = *_fd;
+		}
+	} else if (strstr(fn, "http://") == fn) {
 		int hfd = http_open(fn);
 		// http_open returns -1 on any failure; return NULL like the plain-file
 		// path so the caller's `ko == 0` check fires (it never inspects fd).
@@ -426,11 +449,11 @@ void *kopen(const char *fn, int *_fd)
 		xassert(aux != NULL, "kopen: calloc failed");
 		aux->type = KO_STDIN;
 		aux->fd = STDIN_FILENO;
-	} else {
+	} else { // not a path, not a URL, not "-": a `<cmd` producer (*p == '<')
 		const char *p, *q;
 		for (p = fn; *p; ++p)
-			if (!isspace(*p)) break;
-		if (*p == '<') { // pipe open
+			if (!isspace((unsigned char)*p)) break;
+		{ // pipe open
 			int need_shell, pfd[2];
 			pid_t pid;
 			char **argv = 0;
@@ -496,14 +519,6 @@ void *kopen(const char *fn, int *_fd)
 				aux->type = KO_PIPE;
 				aux->fd = pfd[0];
 				aux->pid = pid;
-			}
-		} else {
-			*_fd = open(fn, O_RDONLY);
-			if (*_fd >= 0) {
-				aux = (koaux_t*) calloc(1, sizeof(koaux_t));
-				xassert(aux != NULL, "kopen: calloc failed");
-				aux->type = KO_FILE;
-				aux->fd = *_fd;
 			}
 		}
 	}
