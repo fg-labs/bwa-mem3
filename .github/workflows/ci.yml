@@ -2052,7 +2052,7 @@ jobs:
                    meth_rescue_batched_identical meth_rescue_strand \
                    meth_collapsed_scoring \
                    meth_tags meth_flag_footguns meth_5base_alias meth_context_cli \
-                   meth_seed_prune meth_nul_base; do
+                   meth_context_cpg meth_seed_prune meth_nul_base; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 

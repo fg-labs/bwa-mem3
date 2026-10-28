@@ -50,6 +50,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "rescue_env.h"
 #include "rescue_rb_index.h"
 #include "meth_xm.h"   /* meth_chem_t: exact rescue pruning under --meth is EM-seq only */
+#include "meth_model.h" /* --meth-context cpg: the 7-code rescue matrices and window labelling */
 #include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
@@ -565,6 +566,9 @@ static bool rescue_meth_rel(const mem_opt_t *opt)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_PRUNE_REL", 1);
     if (!opt->meth_mode || mode == 0 || (mode == 1 && opt->meth_chem != METH_CHEM_TAPS)) return false;
+    /* --meth-context cpg frees the conversion only at a CpG, which the
+     * relation (a 5-code matrix property) does not model. */
+    if (meth_cpg_on(opt)) return false;
     return rescue_meth_rel_matrix_ok(opt->mat_ot, 1, opt->a, opt->b)
            && rescue_meth_rel_matrix_ok(opt->mat_ob, 0, opt->a, opt->b);
 }
@@ -607,6 +611,9 @@ static bool rescue_band_meth_on(const mem_opt_t *opt, bool run_prunes)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_BAND_METH", 1);
     if (!rescue_prune_on() || !rescue_band_enabled() || mode == 0) return false;
+    /* --meth-context cpg: the band kernels score 5-code matrices only, and the
+     * cpg rescue runs on the scalar ksw_align2 (meth_scoring_batched_expressible). */
+    if (meth_cpg_on(opt)) return false;
     /* Pruning applies only without --rescue-kmer (rescue_prune_applies), so a --rescue-kmer run
      * (--fast sets it) prunes nothing and bands as an unpruned run does. */
     const bool prunes = run_prunes && !opt->rescue_kmer;
@@ -640,7 +647,7 @@ struct rescue_run_t {
     /* The inputs the decisions are derived from, so a mem_opt_t rebuilt at the same address or
      * edited in place is derived anew: the opt, the fields the derivation reads (RESCUE_RUN_KEYS of
      * them, rescue_run_key) and, under --meth, the two matrices (rescue_meth_rel). */
-    static const int RESCUE_RUN_KEYS = 10;
+    static const int RESCUE_RUN_KEYS = 11;
     const mem_opt_t *opt = NULL;
     int key[RESCUE_RUN_KEYS] = {0};
     int8_t mat_ot[25] = {0}, mat_ob[25] = {0};
@@ -653,7 +660,7 @@ static void rescue_run_key(const mem_opt_t *opt, int key[rescue_run_t::RESCUE_RU
 {
     key[0] = opt->a; key[1] = opt->b; key[2] = opt->o_del; key[3] = opt->e_del; key[4] = opt->o_ins;
     key[5] = opt->e_ins; key[6] = opt->min_seed_len; key[7] = opt->meth_mode; key[8] = opt->meth_chem;
-    key[9] = opt->rescue_kmer;
+    key[9] = opt->rescue_kmer; key[10] = opt->meth_context;
 }
 static void rescue_run_derive(rescue_run_t &r, const mem_opt_t *opt, const int key[rescue_run_t::RESCUE_RUN_KEYS])
 {
@@ -1443,7 +1450,10 @@ static bool meth_freed_cell_tier_supported()
  * with mem_opt_fill_meth_mat and the kswv mat-aware ctor. */
 static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
 {
-    (void)opt;   /* every mem_opt_fill_meth_mat matrix is kernel-expressible */
+    /* Every mem_opt_fill_meth_mat matrix is kernel-expressible. The
+     * --meth-context cpg matrices (7 codes, meth_model.h) are not yet: their
+     * rescue takes the scalar ksw_align2 on a labelled window. */
+    if (meth_cpg_on(opt)) return false;
     return meth_freed_cell_tier_supported();
 }
 
@@ -2890,8 +2900,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                      * (Replaces the old both-matrices keep-max, which cost 2x SW to
                      * rediscover this same matrix.) */
                     meth_won_hyp = (mate_meth_ot ^ is_rev) & 1;
-                    const int8_t *mm = mem_opt_meth_mat(opt, meth_won_hyp);
-                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, mm,
+                    /* --meth-context cpg: the 7-code matrix on the window
+                     * labelled in its fetch frame (ref_rw is this job's private
+                     * copy; ksw_align2's in-place reversal keeps the labels). */
+                    int mm_m;
+                    const int8_t *mm = meth_model_mat(opt, meth_won_hyp, &mm_m);
+                    if (mm_m == METH_M)
+                        meth_label_window(ref_rw, ref_len, rb, rid, bns, pac, NULL);
+                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, mm_m, mm,
                                      opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
                 } else {
                     aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,

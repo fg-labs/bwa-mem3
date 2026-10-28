@@ -126,13 +126,16 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 // it returns true only for an asymmetric matrix (bisulfite OT/OB), which pays
 // the heavier generic prepass. N cells are handled separately, so only the
 // ACGT submatrix is inspected. w_mismatch is the kernel's stored (negated)
-// penalty, matching how mat off-diagonals are encoded.
-static inline bool bsw_generic_matrix(const int8_t *mat, int8_t w_match, int8_t w_mismatch)
+// penalty, matching how mat off-diagonals are encoded. `m` is the matrix's
+// alphabet size (row stride): 5, or 7 for a --meth-context cpg matrix, whose
+// ACGT submatrix is read the same way (its CpG rows 5/6 are not inspected).
+static inline bool bsw_generic_matrix(const int8_t *mat, int8_t w_match, int8_t w_mismatch,
+                                      int m = 5)
 {
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             int8_t expect = (i == j) ? w_match : w_mismatch;
-            if (mat[i * 5 + j] != expect) return true;
+            if (mat[i * m + j] != expect) return true;
         }
     return false;
 }
@@ -172,7 +175,7 @@ static inline bool bsw_force_generic_matrix()
 // freed to 0), which is single but not rank1.
 struct BswFreedCell { bool rank1; bool single; int8_t ref; int8_t read; int8_t value; };
 static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
-                                          int8_t w_mismatch, bool forced)
+                                          int8_t w_mismatch, bool forced, int m = 5)
 {
     int n_freed = 0;
     int8_t fr_ref = 0, fr_read = 0, fr_val = w_match;
@@ -180,10 +183,10 @@ static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             int8_t expect = (i == j) ? w_match : w_mismatch;
-            if (mat[i * 5 + j] == expect) continue;
+            if (mat[i * m + j] == expect) continue;
             if (i != j) {                                // off-diagonal freed (any value)
                 n_freed++; fr_ref = (int8_t)i; fr_read = (int8_t)j;
-                fr_val = mat[i * 5 + j];
+                fr_val = mat[i * m + j];
             } else {
                 ok = false;                              // diagonal change: not expressible
             }
@@ -208,7 +211,7 @@ static inline BswFreedCell bsw_freed_cell(const int8_t *mat, int8_t w_match,
 // (refA,readA) is the primary cell, (refB,readB) its mirror.
 struct BswFreedPair { bool supported; int8_t refA, readA, refB, readB; };
 static inline BswFreedPair bsw_freed_pair(const int8_t *mat, int8_t w_match,
-                                          int8_t w_mismatch)
+                                          int8_t w_mismatch, int m = 5)
 {
     int n_freed = 0;
     int8_t r[2] = {0, 0}, c[2] = {0, 0};
@@ -216,8 +219,8 @@ static inline BswFreedPair bsw_freed_pair(const int8_t *mat, int8_t w_match,
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++) {
             int8_t expect = (i == j) ? w_match : w_mismatch;
-            if (mat[i * 5 + j] == expect) continue;
-            if (i != j && mat[i * 5 + j] == w_match) {   // off-diagonal freed to match
+            if (mat[i * m + j] == expect) continue;
+            if (i != j && mat[i * m + j] == w_match) {   // off-diagonal freed to match
                 if (n_freed < 2) { r[n_freed] = (int8_t)i; c[n_freed] = (int8_t)j; }
                 n_freed++;
             } else {
@@ -446,11 +449,15 @@ public:
 };
 
 /* Factory: returns a per-tier concrete BandedPairWiseSW. Construction
- * arguments mirror the BandedPairWiseSW ctor exactly. */
+ * arguments mirror the BandedPairWiseSW ctor exactly. `m` is the alphabet size
+ * of `mat` (its row stride, target-major mat[ref*m + read]): 5, or 7 for a
+ * --meth-context cpg matrix (meth_model.h). Only the scalar kernel
+ * (scalarBandedSWA) scores an m = 7 alphabet; the SIMD kernels read the ACGT
+ * submatrix at stride m and are not given labelled targets. */
 std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
     int o_del, int e_del, int o_ins, int e_ins, int zdrop,
     int end_bonus, const int8_t *mat,
-    int8_t w_match, int8_t w_mismatch, int numThreads);
+    int8_t w_match, int8_t w_mismatch, int numThreads, int m = 5);
 
 /* The x86 8-bit extension kernels broadcast each gap penalty as the byte of its int value
  * ((uint8_t)(o + e) and (uint8_t) e, as _mm512_set1_epi8 / _mm256_set1_epi8 truncate). The
@@ -470,6 +477,17 @@ static inline bool bsw8_gap_bytes_fit_int8(int o_del, int e_del, int o_ins, int 
  * class without exposing the class layout to the dispatcher TU (which
  * previously caused an ODR size mismatch / heap corruption). */
 #if defined(__x86_64__) || defined(__i386__)
+/* As make_bsw_kernel_<tier>, plus the matrix's alphabet size `m` (the ctor's). */
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_sse41(int, int, int, int, int, int,
+                                                      const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_sse42(int, int, int, int, int, int,
+                                                      const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_avx(int, int, int, int, int, int,
+                                                    const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_avx2(int, int, int, int, int, int,
+                                                     const int8_t*, int8_t, int8_t, int, int);
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m_avx512bw(int, int, int, int, int, int,
+                                                         const int8_t*, int8_t, int8_t, int, int);
 extern "C" IBandedPairWiseSW *make_bsw_kernel_sse41(int, int, int, int, int, int,
                                                     const int8_t*, int8_t, int8_t, int);
 extern "C" IBandedPairWiseSW *make_bsw_kernel_sse42(int, int, int, int, int, int,
@@ -488,10 +506,12 @@ class BandedPairWiseSW final : public IBandedPairWiseSW {
 public:
     uint64_t SW_cells;
 
+    /* `m_` is the alphabet size of `mat_` (see make_banded_pair_wise_sw). */
     BandedPairWiseSW(const int o_del, const int e_del, const int o_ins,
                      const int e_ins, const int zdrop,
                      const int end_bonus, const int8_t *mat_,
-                     const int8_t w_match, const int8_t w_mismatch, int numThreads);
+                     const int8_t w_match, const int8_t w_mismatch, int numThreads,
+                     int m_ = 5);
     ~BandedPairWiseSW();
 
     // Owns dp_slab_ via raw pointer; copying or moving would alias the
@@ -774,7 +794,7 @@ private:
                                                int32_t w,
                                                int K);
 #endif
-    int m;
+    int m;            // alphabet size of mat (its row stride): 5, or 7 under --meth-context cpg
     int end_bonus, zdrop;
     int o_del, o_ins, e_del, e_ins;
     const int8_t *mat;

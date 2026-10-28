@@ -321,12 +321,13 @@ static inline void build_pmat16_lut(int16_t out[32],
 // For a symmetric matrix this reproduces build_pmat16's scores exactly (the
 // diagonal is w_match, every off-diagonal is w_mismatch), so the default path
 // stays bit-identical; an asymmetric off-diagonal (e.g. ref-C x read-T freed)
-// is now honored where the XOR-LUT could not represent it.
-static inline void build_amat16(int8_t out[16], const int8_t *mat)
+// is now honored where the XOR-LUT could not represent it. `m` is mat's row
+// stride (5, or 7 for a --meth-context cpg matrix; only codes 0..3 are read).
+static inline void build_amat16(int8_t out[16], const int8_t *mat, int m)
 {
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
-            out[(i << 2) | j] = mat[i * 5 + j];
+            out[(i << 2) | j] = mat[i * m + j];
 }
 
 // Defensive: numThreads must be ≥ 1 — _mm_malloc(0, 64) is implementation-
@@ -349,11 +350,12 @@ static inline T effective_threads(T n) { return n < 1 ? T(1) : n; }
 BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o_ins,
                                    const int e_ins, const int zdrop,
                                    const int end_bonus, const int8_t *mat_,
-                                   const int8_t w_match, const int8_t w_mismatch, int numThreads)
+                                   const int8_t w_match, const int8_t w_mismatch, int numThreads,
+                                   int m_)
 {
     compact_groups_ = BSW8_COMPACT_GROUPS_TIER;
     mat = mat_;
-    this->m = 5;
+    this->m = m_;
     this->end_bonus = end_bonus;
     this->zdrop = zdrop;
     this->o_del = o_del;
@@ -423,18 +425,18 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
 // identical to what every kernel recomputed per SIMD-batch -- this just hoists
 // it off the hot path. Uses the same this-> values (negated w_mismatch,
 // DEFAULT_AMBIG) the kernels pass, so the cached bytes/predicates are bit-exact.
-// Invariant: this caches the *contents* of the pointed-to matrix (*mat, 25
-// bytes), not just the mat pointer -- valid because the scoring matrix is
+// Invariant: this caches the *contents* of the pointed-to matrix (*mat, m*m
+// bytes, of which the ACGT cells at stride m are read), not just the mat pointer -- valid because the scoring matrix is
 // run-constant for the instance's lifetime and nothing mutates *mat after
 // construction (the pre-hoist kernels re-read it every call). If a future path
 // mutates a scoring matrix in place between batches, this cache must be rebuilt.
 void BandedPairWiseSW::bsw_build_mat_cache() {
     const bool forced = bsw_force_generic_matrix();  // ctor-local; not a member (no kernel reads it)
-    bsw_gen_mat_ = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+    bsw_gen_mat_ = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch, this->m)
                    || forced;
-    bsw_fc_      = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    bsw_fc_      = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced, this->m);
     build_pmat16(bsw_pmat_bytes_, this->w_match, this->w_mismatch, this->w_ambig);
-    build_amat16(bsw_amat_bytes_, this->mat);
+    build_amat16(bsw_amat_bytes_, this->mat, this->m);
     build_pmat16_lut(bsw_pmat16_lut_, this->w_match, this->w_mismatch, this->w_ambig);
 }
 
@@ -7667,6 +7669,17 @@ extern "C" IBandedPairWiseSW *make_bsw_kernel(
 {
     return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
                                 mat, w_match, w_mismatch, numThreads);
+}
+
+/* As make_bsw_kernel, for a matrix of alphabet size `m` (mangled likewise to
+ * make_bsw_kernel_m_<tier>). */
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m(
+    int o_del, int e_del, int o_ins, int e_ins, int zdrop,
+    int end_bonus, const int8_t *mat,
+    int8_t w_match, int8_t w_mismatch, int numThreads, int m)
+{
+    return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                mat, w_match, w_mismatch, numThreads, m);
 }
 
 /* Test-only hook: the BSW8_ROW_LEAN setting this copy of the TU was built with,

@@ -20,6 +20,8 @@
 
 #include "bntseq.h"
 #include "bwamem.h"
+#include "meth_opts.h"
+#include "utils.h"
 
 enum { METH_A = 0, METH_C = 1, METH_G = 2, METH_T = 3, METH_N = 4,
        METH_C5 = 5, METH_G6 = 6, METH_M = 7 };
@@ -58,5 +60,47 @@ void meth_label_cpg(uint8_t *win, int64_t len, int64_t rb, int rid,
 
 /* Map C5 -> C and G6 -> G in place, for a consumer that needs plain codes. */
 void meth_unlabel(uint8_t *win, int64_t len);
+
+/* Whether this run scores under --meth-context cpg. */
+static inline int meth_cpg_on(const mem_opt_t *opt)
+{
+    return opt->meth_mode && opt->meth_context == METH_CTX_CPG;
+}
+
+/* The substitution model for a (strand-adjusted) hypothesis: under cpg with a
+ * hypothesis, the 7-code matrix (mat7_ot / mat7_ob) and *m = 7, so the
+ * reference window must be labelled (meth_label_cpg) before it is scored;
+ * otherwise mem_opt_meth_mat's 5-code matrix and *m = 5, on plain codes. */
+static inline const int8_t *meth_model_mat(const mem_opt_t *opt, int hyp, int *m)
+{
+    if (meth_cpg_on(opt) && hyp >= 0) {
+        *m = METH_M;
+        return (hyp & 1) ? opt->mat7_ot : opt->mat7_ob;
+    }
+    *m = 5;
+    return mem_opt_meth_mat(opt, hyp);
+}
+
+/* The alphabet size of a matrix meth_model_mat or mem_opt_meth_mat returned:
+ * 7 for mat7_ot / mat7_ob, 5 for every other. For a consumer handed only the
+ * matrix pointer (mem_seed_sw, mem_patch_reg). */
+static inline int meth_mat_m(const mem_opt_t *opt, const int8_t *mat)
+{
+    return (mat == opt->mat7_ot || mat == opt->mat7_ob) ? METH_M : 5;
+}
+
+/* Label a fetched window for an m = 7 consumer: meth_label_cpg with the
+ * caller contract checked (rid valid, the window not inside a loaded reference
+ * image: under --meth no .0123 is loaded, so `ref_string` is NULL and every
+ * window is a private decode). bns/pac must be the original-reference handles. */
+static inline void meth_label_window(uint8_t *win, int64_t len, int64_t rb, int rid,
+                                     const bntseq_t *bns, const uint8_t *pac,
+                                     const uint8_t *ref_string)
+{
+    xassert(ref_string == NULL, "meth_label_window: a loaded reference image must never be labelled in place");
+    xassert(bns != NULL && pac != NULL, "meth_label_window: no reference handles");
+    xassert(rid >= 0 && rid < bns->n_seqs, "meth_label_window: window has no valid contig");
+    meth_label_cpg(win, len, rb, rid, bns, pac);
+}
 
 #endif

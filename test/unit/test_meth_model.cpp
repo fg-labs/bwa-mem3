@@ -16,8 +16,11 @@
 #include "bntseq.h"
 #include "meth_model.h"
 #include "meth_orig_ref_fixture.h"
+#include "matesw_u8.h"
+#include "ksw.h"
 
 #include <cstdlib>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -457,4 +460,269 @@ TEST_CASE("meth_label_cpg masks a merged multi-base ambs run exactly"
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// --meth-context cpg on the scalar consumers: bwa_gen_cigar4 at m = 7, the
+// scalar banded extension at m = 7, and the model helpers.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<uint8_t> codes_of(const std::string &s)
+{
+    std::vector<uint8_t> v(s.size());
+    for (size_t i = 0; i < s.size(); ++i) v[i] = meth_test::base_to_2bit(s[i]);
+    return v;
+}
+
+struct Cigar4Out {
+    int score = 0, nm = -1;
+    std::string cigar, md;
+};
+
+// bwa_gen_cigar4 over doubled window [rb, re) with `query` (codes, in the
+// window's fetch frame, as mem_reg2aln passes it), NM from the matrix and MD.
+Cigar4Out gen_cigar4(const bntseq_t *bns, const uint8_t *pac, const int8_t *mat, int m,
+                     std::vector<uint8_t> query, int64_t rb, int64_t re, int w)
+{
+    Cigar4Out o;
+    int n_cigar = 0;
+    uint32_t *c = bwa_gen_cigar4(mat, m, bns, 6, 1, 6, 1, w, bns->l_pac, pac,
+                                 (int)query.size(), query.data(), rb, re, &o.score,
+                                 &n_cigar, &o.nm, 1, 1);
+    REQUIRE(c != NULL);
+    for (int k = 0; k < n_cigar; ++k)
+        o.cigar += std::to_string(c[k] >> 4) + "MIDSH"[c[k] & 0xf];
+    o.md = (const char *)(c + n_cigar);
+    free(c);
+    return o;
+}
+
+}  // namespace
+
+TEST_CASE("bwa_gen_cigar4 m=7 frees a conversion only at a CpG"
+          * doctest::test_suite("unit/meth_model"))
+{
+    //                   0123456789012345
+    const std::string g = "TTACGATTCATTGGAT";   // CpG C at 3, plain C at 8
+    OrigRefFixture f(g);
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
+    std::string r = g;
+    r[3] = 'T'; r[8] = 'T';
+    // cpg: the CpG conversion is free (0), the plain one a mismatch (-4).
+    Cigar4Out c7 = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ot, 7, codes_of(r), 0, 16, 0);
+    CHECK(c7.cigar == "16M");
+    CHECK(c7.score == 14 * 1 + 0 - 4);
+    CHECK(c7.nm == 1);
+    CHECK(c7.md == "3C4C7");          // MD stays literal and prints the plain base
+    // all (the 5-code matrix): both free.
+    Cigar4Out c5 = gen_cigar4(f.orig_bns, f.orig_pac, o->mat_ot, 5, codes_of(r), 0, 16, 0);
+    CHECK(c5.score == 14);
+    CHECK(c5.nm == 0);
+    CHECK(c5.md == "3C4C7");
+    // The MD-free walk counts NM the same way.
+    {
+        std::vector<uint8_t> q = codes_of(r);
+        int sc = 0, n_cigar = 0, nm = -1;
+        uint32_t *c = bwa_gen_cigar4(o->mat7_ot, 7, f.orig_bns, 6, 1, 6, 1, 0, f.bns.l_pac,
+                                     f.orig_pac, 16, q.data(), 0, 16, &sc, &n_cigar, &nm, 1, 0);
+        REQUIRE(c != NULL);
+        CHECK(nm == 1);
+        CHECK(sc == c7.score);
+        free(c);
+    }
+    free(o);
+}
+
+TEST_CASE("bwa_gen_cigar4 m=7 through the global DP (a deletion)"
+          * doctest::test_suite("unit/meth_model"))
+{
+    //                   0         1         2         3
+    //                   0123456789012345678901234567890123456789
+    const std::string g = "GATTACGATTCAGTAGGATCCATAGTTAGCATAGGATTAC";
+    OrigRefFixture f(g);
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
+    // Read: CpG C at 5 and plain C at 10 converted, base 22 (T) deleted.
+    std::string r = g;
+    r[5] = 'T'; r[10] = 'T';
+    r.erase(22, 1);
+    Cigar4Out c7 = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ot, 7, codes_of(r), 0, 40, 10);
+    CHECK(c7.cigar == "22M1D17M");
+    CHECK(c7.score == 37 - 4 - 7);    // 37 matches, the plain C->T, a 1-base deletion
+    CHECK(c7.nm == 2);
+    CHECK(c7.md == "5C4C11^T17");
+    Cigar4Out c5 = gen_cigar4(f.orig_bns, f.orig_pac, o->mat_ot, 5, codes_of(r), 0, 40, 10);
+    CHECK(c5.cigar == c7.cigar);
+    CHECK(c5.score == 37 - 7);
+    CHECK(c5.nm == 1);
+    // The MD-free walk counts the gapped NM the same way.
+    {
+        std::vector<uint8_t> q = codes_of(r);
+        int sc = 0, n_cigar = 0, nm = -1;
+        uint32_t *c = bwa_gen_cigar4(o->mat7_ot, 7, f.orig_bns, 6, 1, 6, 1, 10, f.bns.l_pac,
+                                     f.orig_pac, (int)q.size(), q.data(), 0, 40, &sc, &n_cigar, &nm, 1, 0);
+        REQUIRE(c != NULL);
+        CHECK(n_cigar == 3);
+        CHECK(nm == 2);
+        CHECK(sc == c7.score);
+        free(c);
+    }
+    free(o);
+}
+
+TEST_CASE("bwa_gen_cigar4 m=7: a reverse-strand window gets the forward twin's freed cells"
+          * doctest::test_suite("unit/meth_model"))
+{
+    // Review focus: an OT read aligned on the reverse strand (hypothesis flipped
+    // to OB) frees exactly the cells its forward-strand alignment frees.
+    const std::string g = "TTACGATTCATTGGATCGAA";   // CpG Cs at 3 and 16, plain C at 8
+    OrigRefFixture f(g);
+    const int64_t L = f.bns.l_pac;
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
+    std::string r = g;
+    r[3] = 'T'; r[8] = 'T'; r[16] = 'T';
+    Cigar4Out fwd = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ot, 7, codes_of(r), 0, L, 0);
+    Cigar4Out rev = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ob, 7, codes_of(revcomp(r)), L, 2 * L, 0);
+    CHECK(fwd.score == 17 - 4);
+    CHECK(fwd.nm == 1);
+    CHECK(rev.score == fwd.score);
+    CHECK(rev.nm == fwd.nm);
+    CHECK(rev.cigar == fwd.cigar);
+    CHECK(fwd.md == "3C4C7C3");
+    // The reverse record's MD is in forward coordinates too: the same string.
+    CHECK(rev.md == fwd.md);
+    free(o);
+}
+
+TEST_CASE("bwa_gen_cigar4 m=7: a CpG straddling the window's last base is freed"
+          * doctest::test_suite("unit/meth_model"))
+{
+    const std::string g = "AATTGGATCGTT";   // CpG at 8-9
+    OrigRefFixture f(g);
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
+    // Window [0, 9) ends on the CpG's C; its G is outside the alignment.
+    std::string r = g.substr(0, 9);
+    r[8] = 'T';
+    Cigar4Out c = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ot, 7, codes_of(r), 0, 9, 0);
+    CHECK(c.score == 8);
+    CHECK(c.nm == 0);
+    // And the reverse window that starts on the CpG's G (frame C before it).
+    const int64_t L = f.bns.l_pac;
+    // revcomp(g) = AACGATCCAATT: frame [3, 12) starts on the CpG's G, whose C
+    // (frame 2) is outside the window.
+    std::string rr = revcomp(g).substr(3, 9);
+    REQUIRE(rr[0] == 'G');
+    rr[0] = 'A';
+    Cigar4Out cr = gen_cigar4(f.orig_bns, f.orig_pac, o->mat7_ob, 7, codes_of(rr), L + 3, L + 12, 0);
+    CHECK(cr.score == 8);
+    CHECK(cr.nm == 0);
+    free(o);
+}
+
+TEST_CASE("scalarBandedSWA at m=7 equals ksw_extend2 at m=7 on labelled targets"
+          * doctest::test_suite("unit/meth_model"))
+{
+    std::mt19937 rng(20261028);
+    const char *bases = "ACGT";
+    const int scorings[] = { MEM_METH_SCORING_GENOMIC, MEM_METH_SCORING_NEUTRAL };
+    for (int sc : scorings) {
+        mem_opt_t *o = opt_for(sc, 1, 4);
+        for (int hyp = 0; hyp < 2; ++hyp) {
+            const int8_t *mat = hyp ? o->mat7_ot : o->mat7_ob;
+            auto k = make_banded_pair_wise_sw(o->o_del, o->e_del, o->o_ins, o->e_ins,
+                                              o->zdrop, o->pen_clip5, mat, o->a, o->b, 1, 7);
+            int n_diff_unlabelled = 0;
+            for (int it = 0; it < 300; ++it) {
+                const int tlen = 20 + (int)(rng() % 60), qlen = 10 + (int)(rng() % 50);
+                std::string t;
+                for (int i = 0; i < tlen; ++i) t += bases[rng() % 4];
+                OrigRefFixture f(t);
+                std::vector<uint8_t> raw = fetch_raw(f.orig_bns, f.orig_pac, 0, tlen);
+                std::vector<uint8_t> lab = raw;
+                meth_label_cpg(lab.data(), tlen, 0, 0, f.orig_bns, f.orig_pac);
+                // Query: the target's prefix with conversions and noise.
+                std::vector<uint8_t> q;
+                for (int i = 0; i < qlen; ++i) {
+                    uint8_t b = i < tlen ? raw[i] : (uint8_t)(rng() % 4);
+                    const unsigned u = rng() % 100;
+                    if (hyp && b == METH_C && u < 60) b = METH_T;
+                    else if (!hyp && b == METH_G && u < 60) b = METH_A;
+                    else if (u < 6) b = (uint8_t)(rng() % 5);
+                    q.push_back(b);
+                }
+                const int h0 = 5 + (int)(rng() % 30), w = 5 + (int)(rng() % 40);
+                int r1[5], r2[5];
+                const int s1 = k->scalarBandedSWA(qlen, q.data(), tlen, lab.data(), w, h0,
+                                                  &r1[0], &r1[1], &r1[2], &r1[3], &r1[4]);
+                const int s2 = ksw_extend2(qlen, q.data(), tlen, lab.data(), 7, mat,
+                                           o->o_del, o->e_del, o->o_ins, o->e_ins, w,
+                                           o->pen_clip5, o->zdrop, h0,
+                                           &r2[0], &r2[1], &r2[2], &r2[3], &r2[4]);
+                CAPTURE(sc); CAPTURE(hyp); CAPTURE(it);
+                CHECK(s1 == s2);
+                for (int j = 0; j < 5; ++j) CHECK(r1[j] == r2[j]);
+                int u[5];
+                if (k->scalarBandedSWA(qlen, q.data(), tlen, raw.data(), w, h0,
+                                       &u[0], &u[1], &u[2], &u[3], &u[4]) != s1)
+                    ++n_diff_unlabelled;
+            }
+            // The labels matter: plain codes score the CpG conversions as mismatches.
+            CHECK(n_diff_unlabelled > 0);
+        }
+        free(o);
+    }
+}
+
+TEST_CASE("kernel matrix caches read a 7-code matrix at stride 7"
+          * doctest::test_suite("unit/meth_model"))
+{
+    // Rows/cols 0..3 of mat7 are the plain symmetric matrix (the freed cells live
+    // in rows 5/6), so at stride 7 the SIMD-side detectors see a symmetric matrix.
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_GENOMIC, 1, 4);
+    const int8_t a = (int8_t)o->a, mm = (int8_t)-o->b;
+    for (const int8_t *mat : { o->mat7_ot, o->mat7_ob }) {
+        CHECK_FALSE(bsw_generic_matrix(mat, a, mm, 7));
+        CHECK_FALSE(bsw_freed_cell(mat, a, mm, false, 7).single);
+        CHECK_FALSE(bsw_freed_pair(mat, a, mm, 7).supported);
+    }
+    // ...while the 5-code OT matrix is the single freed cell, as before.
+    CHECK(bsw_freed_cell(o->mat_ot, a, mm, false).rank1);
+    // Constructing a kernel object on a 49-entry matrix is safe on every tier.
+    auto k = make_banded_pair_wise_sw(o->o_del, o->e_del, o->o_ins, o->e_ins, o->zdrop,
+                                      o->pen_clip5, o->mat7_ot, o->a, o->b, 1, 7);
+    CHECK(k != nullptr);
+    free(o);
+}
+
+TEST_CASE("meth_model_mat and the u8 rescue admission under cpg"
+          * doctest::test_suite("unit/meth_model"))
+{
+    mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
+    o->meth_mode = 1;
+    int m = 0;
+    o->meth_context = METH_CTX_ALL;
+    CHECK(meth_model_mat(o, 1, &m) == o->mat_ot);
+    CHECK(m == 5);
+    CHECK(meth_model_mat(o, -1, &m) == o->mat);
+    CHECK(m == 5);
+    const int shift_all = matesw_u8_shift_for(o, o->mat), qmax_all = matesw_u8_qmax_for(o, o->mat);
+    o->meth_context = METH_CTX_CPG;
+    CHECK(meth_model_mat(o, 1, &m) == o->mat7_ot);
+    CHECK(m == 7);
+    CHECK(meth_model_mat(o, 0, &m) == o->mat7_ob);
+    CHECK(m == 7);
+    CHECK(meth_model_mat(o, -1, &m) == o->mat);   // no hypothesis: plain codes
+    CHECK(m == 5);
+    CHECK(meth_mat_m(o, o->mat7_ob) == 7);
+    CHECK(meth_mat_m(o, o->mat_ob) == 5);
+    // mat7 holds the same values as mat/mat_ot/mat_ob, so the 8-bit admission is unchanged.
+    CHECK(matesw_u8_shift(o->mat7_ot, 7) == matesw_u8_shift(o->mat_ot));
+    CHECK(matesw_u8_qmax(o->mat7_ot, 7) == matesw_u8_qmax(o->mat_ot));
+    CHECK(matesw_u8_shift_for(o, o->mat) == shift_all);
+    CHECK(matesw_u8_qmax_for(o, o->mat) == qmax_all);
+    o->meth_mode = 0;
+    CHECK(meth_model_mat(o, 1, &m) == o->mat);   // cpg is a --meth option
+    CHECK(m == 5);
+    free(o);
 }

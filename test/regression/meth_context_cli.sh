@@ -3,7 +3,7 @@
 #
 # Regression: the --meth-context command line. Pins the contract that the
 # option parser, the cross-option validation and the stray-value diagnosis keep,
-# independent of what cpg later does to the alignment.
+# and that each accepted spelling and scoring reaches the alignment (by AS).
 #
 # Asserted here:
 #  1. Each of the four rejections prints its exact message and exits non-zero:
@@ -11,9 +11,11 @@
 #     and --meth-context without --meth.
 #  2. `--meth=5base --meth-context all` is record-for-record identical to
 #     `--meth=5base` alone (all is the default), and the `--meth-context=cpg`
-#     spelling with '=' is accepted like the separated one.
+#     spelling with '=' gives the separated spelling's records, on a read that
+#     cpg and all score differently.
 #  3. cpg is accepted with taps, 5base and 5-base, and the read still maps
-#     forward at its locus.
+#     forward at its locus; an explicit --meth-scoring genomic is honoured
+#     under cpg (a freed CpG conversion scores +A rather than neutral's 0).
 #  4. A stray `cpg` (`--meth=5base cpg ref r1`) is diagnosed by the stray-value
 #     check, naming --meth-context, rather than reported as a missing index.
 #
@@ -43,6 +45,15 @@ printf '>chrA\n%s\n' "$REF" > ref.fa
 # One 100 bp read with a converted CpG (CG -> TG), as a 5-base library gives.
 read=${REF:200:100}
 printf '@r\n%s\n+\n%s\n' "${read/CG/TG}" "$(printf 'I%.0s' $(seq 1 100))" > r.fq
+# One 100 bp read with a non-CpG conversion mid-read (CA -> TA), which cpg scores as a
+# mismatch and all frees, so the two contexts give it different records.
+read2=${REF:600:100}
+tail2=${read2:30}
+case "$tail2" in *CA*) ;; *) fail "no CA after offset 30 in read2" ;; esac
+head2=${tail2%%CA*}
+nc_pos=$((30 + ${#head2})) # the first C of a CA at or after offset 30
+read2="${read2:0:$nc_pos}T${read2:$((nc_pos + 1))}"
+printf '@r2\n%s\n+\n%s\n' "$read2" "$(printf 'I%.0s' $(seq 1 100))" > r2.fq
 
 records() { grep -v '^@' "$1"; }
 
@@ -89,10 +100,29 @@ for chem in taps 5base 5-base; do
     loc="$(records "cpg-$chem.sam" | cut -f 2-4 | tr '\t' ' ')"
     [ "$loc" = "0 chrA 201" ] || fail "--meth=$chem --meth-context cpg: want FLAG 0 at chrA:201, got '$loc'"
 done
-"$BWA_MEM3" mem --meth=taps --meth-context=cpg -t 1 ref.fa r.fq > eq.sam 2> eq.err \
+as_of() { records "$1" | grep -o 'AS:i:-\{0,1\}[0-9]*' | cut -d: -f3; }
+"$BWA_MEM3" mem --meth=taps --meth-context=cpg -t 1 ref.fa r2.fq > eq.sam 2> eq.err \
     || fail "--meth-context=cpg (with '=') rejected: $(head -2 eq.err | tr '\n' ' ')"
-"$BWA_MEM3" mem --meth=taps --meth-context cpg --meth-scoring genomic -t 1 ref.fa r.fq > /dev/null 2> g.err \
+"$BWA_MEM3" mem --meth=taps --meth-context cpg -t 1 ref.fa r2.fq > sep.sam 2> sep.err \
+    || fail "--meth-context cpg (separated) on r2 rejected: $(head -2 sep.err | tr '\n' ' ')"
+"$BWA_MEM3" mem --meth=taps --meth-context all -t 1 ref.fa r2.fq > all2.sam 2> all2.err \
+    || fail "--meth-context all on r2 rejected: $(head -2 all2.err | tr '\n' ' ')"
+diff <(records sep.sam) <(records eq.sam) > eq.diff \
+    || fail "--meth-context=cpg differs from --meth-context cpg: $(head -4 eq.diff | cut -c1-200 | tr '\n' ' ')"
+# The comparison only means something if r2 tells the contexts apart: cpg charges
+# its non-CpG conversion as a mismatch, so its AS is below all's.
+as_cpg=$(as_of sep.sam)
+as_all=$(as_of all2.sam)
+[ -n "$as_cpg" ] && [ -n "$as_all" ] && [ "$as_cpg" -lt "$as_all" ] \
+    || fail "r2 does not separate cpg from all: AS cpg='$as_cpg' all='$as_all'"
+"$BWA_MEM3" mem --meth=taps --meth-context cpg --meth-scoring genomic -t 1 ref.fa r.fq > g.sam 2> g.err \
     || fail "cpg with explicit genomic scoring rejected: $(head -2 g.err | tr '\n' ' ')"
+# r's one conversion is at a CpG, freed under cpg: genomic scores it +A (1), neutral
+# (the taps default, cpg-taps.sam above) scores it 0, so AS is exactly one higher.
+as_g=$(as_of g.sam)
+as_n=$(as_of cpg-taps.sam)
+[ -n "$as_g" ] && [ -n "$as_n" ] && [ "$as_g" -eq $((as_n + 1)) ] \
+    || fail "cpg + genomic: want AS one above neutral's, got genomic='$as_g' neutral='$as_n'"
 
 # --- 4. a stray cpg is diagnosed ---------------------------------------------
 if "$BWA_MEM3" mem --meth=5base cpg ref.fa r.fq > /dev/null 2> stray.txt; then
@@ -105,4 +135,4 @@ grep -Fq -- "the value for --meth-context and no such file exists" stray.txt \
 grep -Fq -- "--meth-context cpg." stray.txt \
     || fail "stray cpg: advice does not name '--meth-context cpg'; got: $(tail -2 stray.txt | tr '\n' ' ')"
 
-echo "PASS: meth_context_cli (unknown value, cpg+emseq, cpg+collapsed and no --meth rejected with exact copy; all == default; cpg accepted with taps/5base/5-base; stray cpg diagnosed)"
+echo "PASS: meth_context_cli (unknown value, cpg+emseq, cpg+collapsed and no --meth rejected with exact copy; all == default; --meth-context=cpg == separated; cpg accepted with taps/5base/5-base; genomic honoured under cpg; stray cpg diagnosed)"

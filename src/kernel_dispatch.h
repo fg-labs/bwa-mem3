@@ -80,6 +80,7 @@
     * the right per-tier concrete class without needing the class layout
     * visible at the dispatcher's translation unit. */
 #  define make_bsw_kernel    BWAMEM3_PASTE(make_bsw_kernel,    KERNEL_VARIANT)
+#  define make_bsw_kernel_m  BWAMEM3_PASTE(make_bsw_kernel_m,  KERNEL_VARIANT)
    /* Test-only: the BSW8_ROW_LEAN setting a bandedSWA.cpp copy was built with,
     * so test/unit/test_bandedswa_row_lean.cpp (which declares it) can tell its
     * two aarch64 copies apart. */
