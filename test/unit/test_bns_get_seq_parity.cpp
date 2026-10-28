@@ -17,12 +17,19 @@
 //   - bridging forward/reverse boundary (returns *len = 0)
 //   - boundary edges (beg = 0, end = 2*l_pac)
 //   - swapped beg/end (legacy code does an XOR-swap on entry)
+// Every bns_get_seq_into check (check_range) also asserts that nothing is
+// written outside the window (canary bytes on both sides of it), and one case
+// puts the packed reference between two inaccessible pages, so a read before
+// pac[0] or past its last byte faults rather than passing unseen.
 
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <random>
 #include <vector>
+
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "doctest/doctest.h"
 
@@ -74,16 +81,31 @@ void build_synthetic_ref(std::mt19937 &rng, int64_t l_pac, std::vector<uint8_t> 
 // Skip cases where bns_get_seq_into reports *len_out = 0 (boundary-bridging).
 void check_range(int64_t l_pac, const uint8_t *pac, const uint8_t *ref_string,
                  int64_t beg, int64_t end) {
-    // bns_get_seq_into needs caller buffer >= |end - beg|. Allocate worst-case
-    // (2 * l_pac) and zero so any unwritten bytes show up as a CHECK miss.
-    std::vector<uint8_t> into_buf(2 * l_pac, 0xff);
+    // bns_get_seq_into needs caller buffer >= |end - beg|. Give it exactly that,
+    // between kCanary-byte canaries, all 0xff so any unwritten byte inside the
+    // window shows up as a CHECK miss and any write outside it as a canary miss.
+    constexpr int64_t kCanary = 64;
+    const int64_t span = end > beg ? end - beg : beg - end;
+    std::vector<uint8_t> buf(kCanary + span + kCanary, 0xff);
+    uint8_t *into = buf.data() + kCanary;
     int64_t len_into = 0;
-    bns_get_seq_into(l_pac, pac, beg, end, into_buf.data(), &len_into);
+    bns_get_seq_into(l_pac, pac, beg, end, into, &len_into);
+    {
+        CAPTURE(beg);
+        CAPTURE(end);
+        REQUIRE(len_into >= 0);
+        REQUIRE(len_into <= span);
+        bool before_ok = true, after_ok = true;
+        for (int64_t i = 0; i < kCanary; ++i) before_ok &= buf[i] == 0xff;
+        for (int64_t i = kCanary + len_into; i < (int64_t)buf.size(); ++i) after_ok &= buf[i] == 0xff;
+        CHECK(before_ok);  // nothing written before dst[0]
+        CHECK(after_ok);   // nothing written at or past dst[len_into]
+    }
 
     // bns_get_seq_v2 expects a scratch buffer (`seqb`); the function ignores
     // it (returns a ref_string pointer directly), but we pass a real one to
     // match the production call shape.
-    std::vector<uint8_t> scratch(2 * l_pac, 0xff);
+    std::vector<uint8_t> scratch(span + 1, 0xff);
     int64_t len_v2 = 0;
     uint8_t *v2 = bns_get_seq_v2(l_pac, pac, beg, end, &len_v2,
                                  const_cast<uint8_t *>(ref_string), scratch.data());
@@ -94,11 +116,15 @@ void check_range(int64_t l_pac, const uint8_t *pac, const uint8_t *ref_string,
         return;
     }
     REQUIRE(v2 != nullptr);
-    for (int64_t i = 0; i < len_into; ++i) {
-        CAPTURE(beg);
-        CAPTURE(end);
-        CAPTURE(i);
-        CHECK(static_cast<int>(into_buf[i]) == static_cast<int>(v2[i]));
+    // Compare the whole window first; walk it per byte only on a mismatch, so the
+    // failure names each differing index without a doctest assertion per base.
+    if (std::memcmp(into, v2, (size_t)len_into) != 0) {
+        for (int64_t i = 0; i < len_into; ++i) {
+            CAPTURE(beg);
+            CAPTURE(end);
+            CAPTURE(i);
+            CHECK(static_cast<int>(into[i]) == static_cast<int>(v2[i]));
+        }
     }
 }
 
@@ -249,13 +275,15 @@ TEST_CASE("bns_get_seq_into vs v2: large random ref, randomized ranges") {
 }
 
 TEST_CASE("bns_get_seq_into vs v2: SIMD block-boundary and phase sweep") {
-    // The forward/reverse whole-byte unpack loops each process 64 bases (16 packed
-    // bytes) per SIMD step, entered only when a byte-aligned k satisfies k+64<=end
-    // (fwd) / k-64>=beg_f (rev), with scalar leading/trailing partials on either side.
-    // The exhaustive L=64 cases above fire the forward SIMD loop for essentially one
-    // window (beg=0,end=64); this case drives BOTH loops across many 64-base block
-    // boundaries and all four low-byte phases (beg mod 4), comparing the code under
-    // test against the independent ref_string oracle via check_range.
+    // In SIMD builds a window is written as scalar leading bases up to a byte
+    // boundary, then 64-base blocks (16 packed bytes), then a tail written either
+    // at any base phase or by the LUT and scalar trailing loops ("Window tails" in
+    // src/bntseq.cpp describes the choice and its thresholds).
+    // This case drives these paths on both strands across many block boundaries and
+    // all four low-byte phases, against the independent ref_string oracle via
+    // check_range. The beg sweep from each strand's start crosses the forward start
+    // floor (windows near base 0), and the end sweep to each strand's end crosses
+    // the reverse start floor (windows ending near 2*l_pac).
     MESSAGE("BNS_SIMD_UNPACK exercised (per ISA mirror, else scalar-LUT fallback): "
             << TEST_BNS_SIMD_UNPACK_ACTIVE);
 
@@ -270,14 +298,20 @@ TEST_CASE("bns_get_seq_into vs v2: SIMD block-boundary and phase sweep") {
                              66, 127, 128, 129, 200, 256, 511, 512, 1000};
 
     // Sweep beg across all phases and block-straddling offsets near the strand start
-    // (0..95 covers >64, i.e. every phase in the first two blocks and beyond) plus a
-    // few interior block boundaries, on each strand. No bridging (fwd end<=L; rev
-    // beg>=L) so every window returns a non-empty range.
+    // (0..95 covers >64, i.e. every phase in the first two blocks and beyond), end
+    // likewise near the strand end, plus a few interior block boundaries, on each
+    // strand. No bridging (fwd end<=L; rev beg>=L) so every window returns a
+    // non-empty range.
     auto sweep = [&](int64_t lo, int64_t hi) {
         for (int64_t beg = lo; beg < lo + 96; ++beg)
             for (int64_t span : spans) {
                 int64_t end = beg + span;
                 if (end <= hi) check_range(L, pac.data(), ref_string.data(), beg, end);
+            }
+        for (int64_t end = hi; end > hi - 96; --end)
+            for (int64_t span : spans) {
+                int64_t beg = end - span;
+                if (beg >= lo) check_range(L, pac.data(), ref_string.data(), beg, end);
             }
         for (int64_t center : {lo + 1024, lo + 2048, lo + 3072})
             for (int64_t off = -3; off <= 3; ++off)
@@ -289,4 +323,46 @@ TEST_CASE("bns_get_seq_into vs v2: SIMD block-boundary and phase sweep") {
     };
     sweep(/*forward*/ 0, L);
     sweep(/*reverse*/ L, 2 * L);
+}
+
+TEST_CASE("bns_get_seq_into: windows at both ends of pac read and write nothing outside it"
+          * doctest::test_suite("unit/bns_get_seq")) {
+    // The any-phase pieces load the 8 packed bytes ending at their own last base,
+    // so only their guards keep a window whose lowest forward base is near base 0
+    // from reading before pac[0]; the whole-byte blocks and the pieces must also
+    // stop at the last byte that holds a base. The packed reference fills exactly one page, with
+    // an inaccessible page on either side: a read outside it faults here. Every
+    // window starting in the first 48 bases or ending in the last 48, at every
+    // base phase and length 1..128 (so the tail's extra block runs too), on both
+    // strands, is checked against the ref_string oracle, with canaries around the
+    // destination (check_range).
+    const long page = sysconf(_SC_PAGESIZE);
+    REQUIRE(page > 0);
+    // a whole last byte, and a last byte holding one base (3 unused slots)
+    for (int64_t L : {int64_t{4} * page, int64_t{4} * page - 3}) {
+        CAPTURE(L);
+        std::mt19937 rng(0x6A4Du + (uint32_t)L);
+        std::vector<uint8_t> pac_v, ref_string;
+        build_synthetic_ref(rng, L, pac_v, ref_string);
+        REQUIRE((int64_t)pac_v.size() == page);
+        // Unmapped on every exit, including a REQUIRE that throws mid-sweep.
+        struct Mapping {
+            void *p;
+            size_t n;
+            ~Mapping() { if (p != MAP_FAILED) munmap(p, n); }
+        } map{mmap(nullptr, (size_t)(3 * page), PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0),
+              (size_t)(3 * page)};
+        REQUIRE(map.p != MAP_FAILED);
+        uint8_t *pac = (uint8_t *)map.p + page;
+        REQUIRE(mprotect(pac, (size_t)page, PROT_READ | PROT_WRITE) == 0);
+        memcpy(pac, pac_v.data(), (size_t)page);
+        REQUIRE(mprotect(pac, (size_t)page, PROT_READ) == 0);
+        for (int64_t a = 0; a < 48; ++a)
+            for (int64_t span = 1; span <= 128; ++span) {
+                check_range(L, pac, ref_string.data(), a, a + span);                  // fwd, near base 0
+                check_range(L, pac, ref_string.data(), L - a - span, L - a);          // fwd, near l_pac
+                check_range(L, pac, ref_string.data(), L + a, L + a + span);          // rev, near l_pac
+                check_range(L, pac, ref_string.data(), 2 * L - a - span, 2 * L - a);  // rev, near base 0
+            }
+    }
 }
