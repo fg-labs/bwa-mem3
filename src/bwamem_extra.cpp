@@ -33,6 +33,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwamem.h"
 #include "bntseq.h"
 #include "kstring.h"
+#include <string.h>
+#include <vector>
 
 
 /***********************
@@ -61,10 +63,20 @@ static inline int get_pri_idx(double XA_drop_ratio, const mem_alnreg_t *a, int i
 	return -1;
 }
 
+/* One computed XA hit of mem_gen_alt's duplicate-hit memo: its key and its global
+ * alignment, the n_cigar ops at t_memo_ops[off] and NM. */
+typedef struct { mem_core_key_t key; int n_cigar, NM; size_t off; } xa_memo_t;
+
+/* The memo stops taking entries at this size, which bounds the linear scan per hit
+ * when -h raises the hit caps; later hits are computed as usual. */
+#define XA_MEMO_MAX 256
+
+thread_local long mem_gen_alt_n_reused = 0;
+
 // Okay, returning strings is bad, but this has happened a lot elsewhere. If I have time, I need serious code cleanup.
 // When out_hn is non-NULL, it is set to a newly-allocated int[a->n] of per-primary
 // hit counts (cnt[r]) so callers can emit the HN:i tag; caller owns the buffer.
-char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query) // ONLY work after mem_mark_primary_se()
+char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query, int want0, int want1) // ONLY work after mem_mark_primary_se()
 {
 	int i, k, r, *cnt, tot;
 	kstring_t *aln = 0, str = {0,0,0};
@@ -99,16 +111,41 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	if (tot == 0) goto end_gen_alt;
 	aln = (kstring_t*) calloc(a->n, sizeof(kstring_t));
     xassert(aln != NULL, "out of memory: aln");
+	static thread_local std::vector<xa_memo_t> t_memo;
+	static thread_local std::vector<uint32_t> t_memo_ops;
+	t_memo.clear(); t_memo_ops.clear();
 	for (i = 0; i < a->n; ++i) {
 		mem_aln_t t;
 		if ((r = get_pri_idx(opt->XA_drop_ratio, a->a, i)) < 0) continue;
+		if (want0 >= 0 && r != want0 && r != want1) continue; // XA[r] is never read: leave it NULL
 		if (cnt[r] > opt->max_XA_hits_alt || (!has_alt[r] && cnt[r] > opt->max_XA_hits)) continue;
 		/* Pass meth_orig_query so each XA sub-entry regenerates under the SAME
 		 * NM/MD policy as the primary record. Omitting it silently falls back to
 		 * the literal predicate, so one record would report matrix-derived NM:i:
 		 * on the primary and conversion-counting NM inside its own XA:Z.
 		 * The XA entry takes only the CIGAR and NM, so build no MD (want_md 0). */
-		t = mem_reg2aln(opt, bns, pac, l_query, query, &a->a[i], meth_orig_query, /*want_md=*/0);
+		{
+			/* Duplicate hits (an ALT contig or a segmental duplication repeating the
+			 * same bases) are common: reuse the global alignment of an earlier hit
+			 * with an equal key instead of recomputing it. */
+			const mem_alnreg_t *p = &a->a[i];
+			mem_core_key_t key;
+			const int keyed = mem_core_key(bns, p, &key);
+			const xa_memo_t *hit = 0;
+			if (keyed)
+				for (size_t m = 0; m < t_memo.size(); ++m)
+					if (mem_core_key_equal(bns, pac, &t_memo[m].key, &key)) { hit = &t_memo[m]; break; }
+			if (hit) {
+				const mem_cigar_core_t core = { t_memo_ops.data() + hit->off, hit->n_cigar, hit->NM };
+				t = mem_reg2aln(opt, bns, pac, l_query, query, p, meth_orig_query, /*want_md=*/0, &core);
+				++mem_gen_alt_n_reused;
+			} else if (keyed && t_memo.size() < XA_MEMO_MAX) {
+				xa_memo_t e = { key, 0, 0, t_memo_ops.size() };
+				t = mem_reg2aln(opt, bns, pac, l_query, query, p, meth_orig_query, /*want_md=*/0, 0, &t_memo_ops, &e.NM);
+				e.n_cigar = (int)(t_memo_ops.size() - e.off);
+				t_memo.push_back(e);
+			} else t = mem_reg2aln(opt, bns, pac, l_query, query, p, meth_orig_query, /*want_md=*/0);
+		}
 		str.l = 0;
 		kputs(bns->anns[t.rid].name, &str);
 		kputc(',', &str); kputc("+-"[t.is_rev], &str); kputl(t.pos + 1, &str);

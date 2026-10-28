@@ -1959,10 +1959,6 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                           kswr_t **myaln, mem_cache *mmc,
                           int32_t &gcnt, int tid)
 {
-    extern char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                              const mem_alnreg_v *a, int l_query, const char *query,
-                              int **out_hn, const char *meth_orig_query);
-
     int i, j, z[2], n_pri[2], n_aa[2], q_se[2], extra_flag, paired;
     kstring_t str;
     mem_aln_t h[2], g[2], aa[2][2];
@@ -1986,9 +1982,13 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     if (paired) {
         char **XA[2];
         int *HN[2] = { 0, 0 };
+        /* Each end's emitted ALT record (-1: none). Only two XA strings of an end are
+         * read below, the pair's primary z[i] and alt[i]: build just those. */
+        const int alt[2] = { mem_pe_alt_slot(opt, &a[0], n_pri[0]), mem_pe_alt_slot(opt, &a[1], n_pri[1]) };
         if (!(opt->flag & MEM_F_ALL)) {
             for (i = 0; i < 2; ++i)
-                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i], s[i].meth_orig_seq);
+                XA[i] = mem_gen_alt(opt, bns, pac, &a[i], s[i].l_seq, s[i].seq, &HN[i], s[i].meth_orig_seq,
+                                    z[i], alt[i]);
         } else XA[0] = XA[1] = 0;
         // write SAM
         for (i = 0; i < 2; ++i) {
@@ -1999,13 +1999,12 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             h[i].XA = XA[i]? XA[i][z[i]] : 0;
             h[i].HN = HN[i]? HN[i][z[i]] : -1;
             aa[i][n_aa[i]++] = h[i];
-            if (n_pri[i] < a[i].n) { // the read has ALT hits
-                mem_alnreg_t *p = &a[i].a[n_pri[i]];
-                if (p->score < opt->T || p->secondary >= 0 || !p->is_alt) continue;
+            if (alt[i] >= 0) { // the read has an emitted ALT hit
+                mem_alnreg_t *p = &a[i].a[alt[i]];
                 g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
-                g[i].XA = XA[i]? XA[i][n_pri[i]] : 0;
-                g[i].HN = HN[i]? HN[i][n_pri[i]] : -1;
+                g[i].XA = XA[i]? XA[i][alt[i]] : 0;
+                g[i].HN = HN[i]? HN[i][alt[i]] : -1;
                 if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
                     g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
                 aa[i][n_aa[i]++] = g[i];
