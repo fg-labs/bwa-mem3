@@ -938,6 +938,15 @@ int mem_proper_pair_extra_flag(const mem_opt_t *opt, int64_t l_pac,
                                const mem_alnreg_v a[2], const int which[2],
                                const mem_pestat_t pes[4]);
 
+/* Pick the best proper pair among the first n_pri[r] regions of each end. Returns the
+ * best pair score (0 when no pair forms), writes the indices of the pair's regions to
+ * z[], the runner-up pair score to *sub, and to *n_sub the number of pairs below the
+ * best that score within one mismatch or gap of the runner-up. Defined in
+ * bwamem_pair.cpp. */
+int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+             const mem_pestat_t pes[4], bseq1_t s[2], mem_alnreg_v a[2], int id,
+             int *sub, int *n_sub, int z[2], int n_pri[2]);
+
 int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                      int64_t &pcnt, int64_t &pcnt8, kswr_t *aln,
                      int32_t, int32_t, int tid);

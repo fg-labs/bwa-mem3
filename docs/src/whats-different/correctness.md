@@ -795,6 +795,34 @@ scalar `ksw_align2` over a matrix whose `-` column is `w_ambig`. It checks only 
 score fields, not mate orientation, rescue selection or the resulting records; the 8-bit case fails on the AVX2 and
 AVX-512BW tiers without the fix, and the 16-bit case on AVX-512BW.
 
+## `--meth` pair with a negative-score end on aarch64 (PR #659)
+
+`mem_pair` packs each pairing candidate's score into the high 32 bits of a `uint64_t` sort key
+and read it back with `y >> 32`, which zero-extends. Upstream never sees a negative score, but
+under `--meth` the seed is rescored in original space against the per-strand matrix, so a seed
+whose converted-space match hides penalized cells scores below zero and its extended region keeps
+that score. Read back zero-extended, a negative score became about 4.29e9, and the `int`
+conversion of the pair score overflowed, which is undefined. x86-64 builds produced `INT_MIN`,
+which clamps to 0, so the candidate never paired. aarch64 saturated to `INT_MAX`, so the read
+paired; its single-end `q_se = raw_mapq(score - csub)` came out negative and was written as
+`MAPQ` 191 or 209 (the low byte of a negative number), and `AS:i` was dropped because the score
+was negative.
+
+The fix reads the scores back signed and scores any candidate with a negative-score end as 0, on
+every target. That is the value x86 builds produced. The candidate is still counted toward the
+runner-up pair score and the near-pair count, as it was on x86, so a real pair beside such a
+candidate keeps the `MAPQ` it had on x86. The same line also stops converting a non-finite pair
+score: an insert size far enough into the tail underflows `erfc` to 0, and the conversion of
+`log(0) = -inf` is undefined. It is now 0, which both architectures already produced.
+
+Scope: **`--meth` paired-end on aarch64 only.** Without `--meth` no region scores below zero, so
+that output is byte-identical by construction, and x86 `--meth` output is byte-identical because
+the fix defines the value x86 already produced. On real TAPS data (NovaSeq X 2x151, five samples
+including GIAB HG001/HG002, 2 M pairs each, `--meth=taps`, hg38, Apple silicon) the previous
+release wrote `MAPQ` above 60 or no `AS` on 2.6–3.2% of reads, and those were exactly the reads
+the fix changes. Pinned by `test/unit/test_mem_pair_negative_score.cpp`, which fails on aarch64
+without the fix.
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -850,6 +878,7 @@ shipped, because parity with that release is its contract (see
 | All chains dropped by the weight filter: default follows bwa | [#489](https://github.com/fg-labs/bwa-mem3/pull/489) | — ([#310](https://github.com/fg-labs/bwa-mem3/issues/310)) | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
 | Suffix-array sentinel offset in the prefetch lookup | [#469](https://github.com/fg-labs/bwa-mem3/pull/469) | — | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
 | A read base `-` is scored as `N` | [#639](https://github.com/fg-labs/bwa-mem3/pull/639) | — | fork-only, also under `--compat` (reads containing `-` only; upstream scores it by an out-of-row matrix read and prints a NUL in SEQ; input with no `-` byte-identical by construction; other pairs in a batch with `-` reads can change only through the insert-size estimate) |
+| `--meth` pair with a negative-score end on aarch64 | [#659](https://github.com/fg-labs/bwa-mem3/pull/659) | — | fork-only (`--meth` paired-end on aarch64 only, where a read with a negative-score end paired at `MAPQ` 191/209 with no `AS`; it now scores as x86 builds did; x86 and non-`--meth` output byte-identical by construction — see the correctness note above) |
 
 ---
 

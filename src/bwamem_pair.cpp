@@ -33,6 +33,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <string.h>
 #include <stdio.h>
 #include <math.h>
+#include <cmath>           /* std::isfinite: mem_pair's pair-score conversion */
 #include "kstring.h"
 #include "bwamem.h"
 #include "bam_writer.h"
@@ -1215,8 +1216,23 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
                 // is 0/0=NaN, the (int) cast of NaN is UB, and pairing silently
                 // collapses (q=0 for every pair).
                 ns = pes[dir].std > 0. ? (dist - pes[dir].avg) / pes[dir].std : 0.;
-                q = (int)((v.a[i].y>>32) + (v.a[k].y>>32) + .721 * log(2. * erfc(fabs(ns) * M_SQRT1_2)) * opt->a + .499); // .721 = 1/log(4)
-                if (q < 0) q = 0;
+                /* The scores ride in the key's high 32 bits: read them back signed. A
+                 * region scores below zero only under --meth, where the seed is rescored
+                 * against the per-strand matrix. A candidate with such an end scores q = 0,
+                 * so it is never the chosen pair, but it is still pushed to u and counts
+                 * toward *sub / *n_sub (a `continue` would change both, and with them
+                 * q_pe). The pair score is converted to int only when it is finite and
+                 * non-negative: a far-off insert size underflows erfc to 0, and the int
+                 * conversion of log(0) = -inf is undefined. Every other input gives the
+                 * same q as before; test/unit/test_mem_pair_negative_score.cpp has the
+                 * per-architecture history. */
+                const int sc_i = (int32_t)(uint32_t)(v.a[i].y >> 32);
+                const int sc_k = (int32_t)(uint32_t)(v.a[k].y >> 32);
+                if (sc_i < 0 || sc_k < 0) q = 0;
+                else {
+                    const double qd = (double)sc_i + sc_k + .721 * log(2. * erfc(fabs(ns) * M_SQRT1_2)) * opt->a + .499; // .721 = 1/log(4)
+                    q = qd >= 0. && std::isfinite(qd) ? (int)qd : 0;
+                }
                 p = kv_pushp(pair64_t, u);
                 p->y = (uint64_t)k<<32 | i;
                 p->x = (uint64_t)q<<32 | (hash_64(p->y ^ id<<8) & 0xffffffffU);
