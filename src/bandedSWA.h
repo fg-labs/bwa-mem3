@@ -321,15 +321,16 @@ struct BswScoreDomainCounts {
 #define BSW_CPG_C5 5
 #define BSW_CPG_G6 6
 
-/* Function alignment of the extension DP kernels (the smithWaterman*_8 / _16
- * kernels and the 8-bit lane-compaction drivers, which hold the cell loops).
- * Their hot loops are sensitive to where they fall relative to 64-byte
- * boundaries: as template instantiations each is a COMDAT section with the
- * default 16-byte alignment, so its 64-byte phase depends on link order, and
- * one such shift measured -3.5% on the AVX2 16-bit kernel (clang 19,
- * Sapphire Rapids) with byte-identical instructions. Pinning them to 64 bytes
- * makes the phase fixed. On the declarations: clang does not apply the
- * attribute from an out-of-class template definition alone. */
+/* Function alignment of the smithWaterman*_8 / _16 extension kernels. Their
+ * cell loops are sensitive to where they fall relative to 64-byte boundaries:
+ * as template instantiations each is a COMDAT section with the default
+ * 16-byte alignment, so its 64-byte phase depends on link order, and one such
+ * shift measured -3.5% on the AVX2 16-bit kernel (clang 19, Sapphire Rapids)
+ * with byte-identical instructions. At 64 bytes every tier's kernel measured
+ * within noise of the pre-template build. The 8-bit lane-compaction drivers
+ * keep the default: at 64 bytes the AVX2 one measured 1-2% slower. On the
+ * declarations: clang does not apply the attribute from an out-of-class
+ * template definition alone. */
 #define BSW_KERNEL_ALIGN __attribute__((aligned(64)))
 
 #include "kernel_dispatch.h"  /* must come before BandedPairWiseSW class so per-tier compiles see the renamed symbol */
@@ -628,7 +629,6 @@ public:
     // Same-row lane compaction: superblocks of K 16-lane groups in row lockstep; see
     // bandedSWA_compact.inc and set_lane_compaction.
     template <bool CPG>
-    BSW_KERNEL_ALIGN
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                            uint8_t *seqBufRef,
                                            uint8_t *seqBufQer,
@@ -704,7 +704,6 @@ public:
     // Same-row lane compaction: superblocks of K 32-lane groups in row lockstep; see
     // bandedSWA_compact256.inc and set_lane_compaction.
     template <bool CPG>
-    BSW_KERNEL_ALIGN
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                            uint8_t *seqBufRef,
                                            uint8_t *seqBufQer,
@@ -841,7 +840,6 @@ private:
                                 int32_t w,
                                 uint8_t myband[]);
     template <bool SIGNED8, bool CPG>
-    BSW_KERNEL_ALIGN
     void smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                                                uint8_t *seqBufRef,
                                                uint8_t *seqBufQer,
