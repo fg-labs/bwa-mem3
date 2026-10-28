@@ -30,6 +30,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "bwamem.h"
 #include "meth_opts.h"   /* METH_CTX_ALL */
+#include "meth_model.h"  /* meth_model_fill_mats */
 #include "chain_seed_pool.h"
 #include "ext_reverse_copy.h"
 #include "chain_window_prefetch.h"
@@ -889,6 +890,7 @@ void mem_opt_fill_meth_mat(mem_opt_t *o) {
         o->mat_ot[3 * 5 + 1] = o->a;   /* OT: ref T / read C → match */
         o->mat_ob[0 * 5 + 2] = o->a;   /* OB: ref A / read G → match */
     }
+    meth_model_fill_mats(o);
 }
 
 /* See bwamem.h for the contract. The `* opt->a` factors are the fix for -A

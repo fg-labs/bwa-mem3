@@ -244,6 +244,8 @@ typedef struct mem_opt_t {
      * (1 = OT, 0 = OB) via mem_opt_meth_mat(). */
     int8_t mat_ot[25];      // OT (C→T) meth matrix; valid only under --meth
     int8_t mat_ob[25];      // OB (G→A) meth matrix; valid only under --meth
+    int8_t mat7_ot[49];     // 7x7 OT/OB matrices over the --meth-context cpg
+    int8_t mat7_ob[49];     // alphabet (meth_model.h); conversion freed at CpG only
     int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam). Orthogonal
                             // to meth_mode: --meth picks alignment semantics, --bam
                             // picks the container, on every mode alike.
@@ -685,7 +687,8 @@ int mem_skip_contained_ext_sound(const mem_opt_t *opt);
  * the caller must fall back to the exact full-width ladder. No-op at default
  * parameters. Defined in bwamem.cpp. */
 int mem_band_cert_params_safe(const mem_opt_t *opt);
-/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob) from opt->mat +
+/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob, and the 7x7
+ * mat7_ot/mat7_ob of meth_model.h) from opt->mat +
  * opt->a. Call after any rebuild of opt->mat (e.g. CLI -A/-B/-x parsing) so meth
  * scoring tracks the user's options instead of the init-time defaults. */
 void mem_opt_fill_meth_mat(mem_opt_t *opt);
