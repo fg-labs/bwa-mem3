@@ -73,9 +73,9 @@ Per-base methylation call. Each character corresponds to one SEQ base:
 
 > **Case depends on the chemistry.** Which observed base means "methylated" is
 > inverted between EM-seq and TAPS, so the same read yields opposite-case `XM:Z`
-> under `--meth` and `--meth=taps`:
+> under `--meth` and `--meth=taps` (or `--meth=5base`):
 >
-> | Read base at a reference C | `--meth` (em-seq) | `--meth=taps` |
+> | Read base at a reference C | `--meth` (em-seq) | `--meth=taps` or `=5base` |
 > |---|---|---|
 > | `C` (retained) | methylated (`Z`) | **un**methylated (`z`) |
 > | `T` (converted) | **un**methylated (`z`) | methylated (`Z`) |
@@ -85,7 +85,7 @@ Per-base methylation call. Each character corresponds to one SEQ base:
 > therefore produces a fully inverted call string (measured: Pearson r = −0.956
 > against truth, versus +0.956 with `=taps`), and percent methylation comes out
 > as `1 − truth` with no warning. See
-> [Flags](flags.md#--methemseqtaps).
+> [Flags](flags.md#--methemseqtaps5base).
 
 The string is in SEQ orientation (matches the BAM SEQ field): for reads
 with the `0x10` flag set, both SEQ and `XM:Z` are reverse-complemented

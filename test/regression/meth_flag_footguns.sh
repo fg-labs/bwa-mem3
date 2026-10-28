@@ -18,7 +18,10 @@
 #
 # Asserted here:
 #  1. Both spellings are rejected with a message that names the offending token
-#     AND the flag it belongs to, so the fix is readable off the error.
+#     AND the flag it belongs to, so the fix is readable off the error. For an
+#     optional-argument flag the advice names the value the user meant in the
+#     vocabulary's own spelling (`--meth TAPS` -> write --meth=taps), never a
+#     different value (for --meth that would be the opposite call polarity).
 #  2. The check is gated on the token not existing: a reference genuinely named
 #     `taps` (a value in the vocabulary) still aligns normally. A guard that
 #     blocks a legitimate filename would be worse than the footgun.
@@ -81,6 +84,33 @@ expect_diagnosed "--meth-scoring orphan" genomic --meth-scoring mem --meth --met
 # (space, no '=') silently selects spec30 and orphans `baseline` into <idxbase>.
 # Diagnose it by name rather than letting it slide into a missing-index error.
 expect_diagnosed "--meth-seed-prune orphan" baseline --meth-seed-prune mem --meth --meth-seed-prune baseline ref.fa r.fq
+
+# The advice for an optional-argument flag names the value the user typed, in
+# the vocabulary's spelling: the parsers are case-sensitive, so echoing `TAPS`
+# would advise a value the next run rejects, and a fixed example would name a
+# different chemistry (emseq advised as taps inverts every call).
+expect_advice() { # $1 = label, $2 = advice that must appear, $3 = advice that must not, rest = argv
+    local label="$1" want="$2" never="$3"
+    shift 3
+    if "$BWA_MEM3" "$@" > /dev/null 2> err.txt; then
+        fail "$label: exited 0; the stray value must be rejected"
+    fi
+    grep -Fq -- "$want" err.txt \
+        || fail "$label: advice is not '$want'; got: $(tail -2 err.txt | tr '\n' ' ')"
+    if [ -n "$never" ] && grep -Fq -- "$never" err.txt; then
+        fail "$label: advice names '$never', a different value"
+    fi
+}
+expect_advice "--meth emseq" "write --meth=emseq, not --meth emseq" "--meth=taps" \
+    mem --meth emseq ref.fa r.fq
+expect_advice "--meth 5base" "write --meth=5base, not --meth 5base" "--meth=taps" \
+    mem --meth 5base ref.fa r.fq
+expect_advice "--meth TAPS (case)" "write --meth=taps, not --meth taps" "--meth=TAPS" \
+    mem --meth TAPS ref.fa r.fq
+expect_advice "--meth-seed-prune OFF (case)" "write --meth-seed-prune=off, not --meth-seed-prune off" "baseline" \
+    mem --meth --meth-seed-prune OFF ref.fa r.fq
+expect_advice "--meth-scoring Neutral (case)" "--meth-scoring neutral." "" \
+    mem --meth --meth-scoring collapsed Neutral ref.fa r.fq
 
 # --- 2. no false positive on a real file with a vocabulary name -------------
 # A reference genuinely named `taps` must still work: the guard fires only when

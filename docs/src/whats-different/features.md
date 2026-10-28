@@ -13,8 +13,11 @@ which now read `bwa-mem3`).
 no [bwameth.py](https://github.com/brentp/bwa-meth) dependency. In the default
 `--meth-scoring collapsed` mode it reproduces bwameth.py's read *placement* (a
 placement drop-in, not a byte-for-byte clone); `--meth-scoring genomic` and
-`--meth-scoring neutral` (the `--meth=taps` default) opt into variant-aware
-scoring bwameth cannot produce.
+`--meth-scoring neutral` (the `--meth=taps` / `--meth=5base` default) opt into
+variant-aware scoring bwameth cannot produce. `--meth=5base` (Illumina 5-base)
+selects the TAPS chemistry and is record-for-record identical to `--meth=taps`
+([5-base libraries](../methylation/5base.md),
+[#650](https://github.com/fg-labs/bwa-mem3/pull/650)).
 
 ```bash
 bwa-mem3 index --meth ref.fa          # once per reference

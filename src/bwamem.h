@@ -261,11 +261,13 @@ typedef struct mem_opt_t {
                             // feature, no upstream reference to preserve); --meth-seed-prune
                             // =off|baseline (or env BWAMEM3_METH_SEED_PRUNE) overrides.
                             // ~30% faster --meth at ~0 truth accuracy cost; NOT byte-identical.
-    int    meth_chem;       // methylation chemistry (--meth=emseq|taps): meth_chem_t.
-                            // Selects XM:Z call polarity ONLY -- seeding, the
-                            // converted index and the scoring matrices are shared,
-                            // because both chemistries produce the same C->T /
-                            // G->A base change as far as the aligner can see.
+    int    meth_chem;       // methylation chemistry (--meth=emseq|taps|5base): meth_chem_t.
+                            // Selects the XM:Z call polarity and the defaults that
+                            // follow from conversion density (--meth-scoring, the
+                            // rescue-prune mode); seeding, the converted index and
+                            // each mode's scoring matrix are shared, because every
+                            // chemistry produces the same C->T / G->A base change
+                            // as far as the aligner can see. 5base is TAPS.
     int    meth_tags;       // bitmask of Bismark tags to emit (--meth-tags):
                             // MEM_METH_TAG_{XR,XG,XM}. Tags not selected are
                             // neither computed nor emitted -- clearing XM skips

@@ -152,6 +152,10 @@ reject_with "accepts true|false" "--rescue-skip=1"
 # silently enabling the skip and swallowing 'false' as <idxbase>.
 reject_with "write --rescue-skip=false, not --rescue-skip false" \
     "--rescue-skip" "false" "--rescue-kmer=6"
+# The advice names the value as typed (and in the vocabulary's case): `true`
+# must not be advised as =false, the opposite setting.
+reject_with "write --rescue-skip=true, not --rescue-skip true" \
+    "--rescue-skip" "TRUE" "--rescue-kmer=6"
 
 # --- interaction with --fast -------------------------------------------------
 # --rescue-skip is deliberately NOT in --fast: it drops rescues rather than

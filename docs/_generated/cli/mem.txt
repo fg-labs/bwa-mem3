@@ -152,12 +152,16 @@ Methylation (--meth) options:
                           (aliases: em-seq, bisulfite)
                    taps   TET-assisted pyridine borane, METHYLATED C converts;
                           also defaults --meth-scoring to neutral
+                   5base  Illumina 5-base, METHYLATED C (5mC) converts; same
+                          aligner semantics as taps (alias: 5-base)
                  NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS
-                 data without =taps inverts every methylation call.
+                 or 5-base data without =taps or =5base inverts every
+                 methylation call.
    --meth-scoring collapsed|genomic|neutral
                  scoring mode. Default depends on chemistry: collapsed for
-                 --meth/--meth=emseq, neutral for --meth=taps (TAPS conversions
-                 are sparse, so collapsing costs specificity it can't repay).
+                 --meth/--meth=emseq, neutral for --meth=taps|5base (their
+                 conversions are sparse, so collapsing costs specificity it
+                 can't repay).
                  collapsed: C/T (and G/A) interchangeable, bwameth-compatible
                  placement (sets -B 2).
                  genomic: free only the conversion direction, scored as a full

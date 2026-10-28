@@ -10,16 +10,19 @@
 extern "C" {
 #endif
 
-/* Methylation chemistry. Both chemistries produce the SAME aligner-visible
+/* Methylation chemistry. Every chemistry produces the SAME aligner-visible
  * base change (C->T on the converted strand, G->A on its complement) and so
- * share seeding, the converted index, and the scoring matrices. They differ
- * only in which class of cytosine converts, which inverts the meaning of the
- * observed base when CALLING methylation:
+ * shares seeding, the converted index, and each --meth-scoring mode's matrix.
+ * They differ in which class of cytosine converts, which inverts the meaning of
+ * the observed base when CALLING methylation (and, through conversion density,
+ * sets the default --meth-scoring mode):
  *
  *   EMSEQ (bisulfite / em-seq): UNmethylated C converts. A retained C is
  *     methylated; a T at a reference C is unmethylated.
  *   TAPS  (TET-assisted pyridine borane): METHYLATED C (5mC/5hmC) converts.
  *     A retained C is UNmethylated; a T at a reference C is METHYLATED.
+ *     Illumina 5-base (--meth=5base) converts 5mC alone, with the same
+ *     aligner-visible change and call polarity, so it maps onto TAPS.
  *
  * Context classification (CpG/CHG/CHH, and which base is the C of interest
  * per strand) is chemistry-INDEPENDENT -- it is a property of the reference.

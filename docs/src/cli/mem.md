@@ -487,7 +487,7 @@ individual flags are unaffected.
 > When `--meth` is active, bwa-mem3 applies `-L 10 -U 100 -T 40 -M -C` plus a
 > mode-dependent mismatch penalty: `-B 2` for `--meth-scoring collapsed` (the
 > `--meth`/`--meth=emseq` default, bwameth-compatible) and `-B 4` for
-> `--meth-scoring genomic` and `neutral` (`neutral` is the `--meth=taps` default).
+> `--meth-scoring genomic` and `neutral` (`neutral` is the `--meth=taps` / `--meth=5base` default).
 > This mirrors bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for
 > paired-end). The scoring values (`-B`, `-L`, `-U`, `-T`) can still be overridden
 > by passing the flag explicitly, in any position relative to `--meth`; `-M` and
@@ -938,6 +938,11 @@ seeds in the converted `.meth` seed index, then extended and scored against the
 `XR:Z`/`XG:Z`/`XM:Z`, opt-in chimera QC). The reference must have been indexed with
 `bwa-mem3 index --meth`.
 
+An optional chemistry selects the `XM:Z` call polarity and the scoring default:
+`--meth` / `--meth=emseq` for bisulfite and EM-seq, `--meth=taps` for TAPS, and
+`--meth=5base` for Illumina 5-base (the TAPS chemistry; see
+[Illumina 5-base libraries](../methylation/5base.md)). Write it with `=`.
+
 `--meth` does not choose an output format: records are SAM text by default and BAM
 under `--bam`, the same rule as without `--meth`. Both containers serialize the same
 `bam1_t` and differ only in the `htsFile` mode string, so the two decode to identical
@@ -960,7 +965,7 @@ Selects how the 4-letter matrix treats converted bases. `collapsed` (the
 placement, sets `-B 2`); `genomic` frees only the conversion direction scored as
 a full match, keeping real variants as mismatches (variant-aware: variants outside
 the conversion direction count toward `NM`, keeps `-B 4`); `neutral` (the
-`--meth=taps` default) frees only the conversion direction but scores it `0` —
+`--meth=taps` / `--meth=5base` default) frees only the conversion direction but scores it `0` —
 tolerated, not rewarded — best for the sparse conversions of TAPS (keeps `-B 4`;
 variants count toward `NM` as in `genomic`). In both, a genuine variant in
 the conversion direction itself (a C→T at a reference `C`) shares the freed cell

@@ -2024,9 +2024,11 @@ jobs:
         # ^exclusion) plus its guarantee that tag selection leaves the alignment
         # untouched; the --meth-family flag footguns (a value orphaned by
         # `--meth taps` / `--meth-tags XR XG` / `--meth-seed-prune baseline` is
-        # diagnosed by name instead of being aligned to as the reference, a
-        # reference genuinely named after one of those values still works, and
-        # `-XM` == `^XM`); and the --meth-seed-prune seed prune (the num_smem==1
+        # diagnosed by name, with advice naming the value meant, instead of
+        # being aligned to as the reference, a reference genuinely named after
+        # one of those values still works, and `-XM` == `^XM`); --meth=5base and
+        # its alias 5-base being --meth=taps record for record, with the TAPS
+        # call polarity, and --meth=illumina rejected; and the --meth-seed-prune seed prune (the num_smem==1
         # must-fix maps; default==spec30; off/spec30 placement-invariant;
         # -t1==-t4 determinism; flag/env equivalence; malformed-value handling;
         # and stats-verified that the prune removes seeds, regime-A keeps all,
@@ -2041,12 +2043,16 @@ jobs:
           # lost the apt package would turn the whole step into a green no-op.
           command -v samtools >/dev/null 2>&1 \
             || { echo "FAIL: samtools not on PATH; the --meth regressions would all SKIP"; exit 1; }
+          # Likewise mawk, which the tag checks read SAM/BAM through.
+          command -v mawk >/dev/null 2>&1 \
+            || { echo "FAIL: mawk not on PATH; the --meth tag checks would SKIP"; exit 1; }
           for t in meth_seed_index meth_mixed_pe_asym meth_pe_placement \
                    meth_output_integrity meth_reverse_strand_conversion \
                    meth_seed_unpacked_ref_not_loaded \
                    meth_rescue_batched_identical meth_rescue_strand \
                    meth_collapsed_scoring \
-                   meth_tags meth_flag_footguns meth_seed_prune meth_nul_base; do
+                   meth_tags meth_flag_footguns meth_5base_alias \
+                   meth_seed_prune meth_nul_base; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 

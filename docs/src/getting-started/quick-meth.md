@@ -17,7 +17,7 @@ postprocessing step are required.
 > conversion and is not counted in `NM`, see
 > [which real variants stay visible](../methylation/overview.md#which-real-variants-stay-visible);
 > one BAM for both methylation and variant calling), or `--meth-scoring neutral` — the
-> `--meth=taps` default — which is variant-aware too but scores the conversion `0` instead of a
+> `--meth=taps` / `--meth=5base` default — which is variant-aware too but scores the conversion `0` instead of a
 > match.
 
 ## Index the reference for methylation

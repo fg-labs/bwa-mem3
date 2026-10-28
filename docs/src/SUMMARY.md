@@ -48,6 +48,7 @@
   - [bwameth.py drop-in mapping](methylation/bwameth-mapping.md)
   - [Conversion details (C->T, G->A)](methylation/conversion.md)
   - [TAPS libraries](methylation/taps.md)
+  - [Illumina 5-base libraries](methylation/5base.md)
   - [SAM tags: XR, XG, XM](methylation/tags.md)
   - [Chimera QC and header construction](methylation/post-processing.md)
   - [Flags: --meth chemistry, --meth-scoring, QC](methylation/flags.md)
