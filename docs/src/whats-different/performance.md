@@ -437,6 +437,24 @@ at 32/32.
   dropped 0.50 % (WGS) / 0.14 % (WES) on AWS Graviton 4 (arm64, NEON tier) and 0.82 % (WGS) on
   AMD Zen 5 (x86-64, AVX-512BW tier; WES there was within that host's rep-to-rep noise), clang
   19.1.7, with record md5 identical, also under both `--compat` targets.
+- **x86 wavefront boundary handling (PR #651).** The AVX2 and AVX-512BW wavefront kernels of that
+  global re-alignment (`ksw_global2`) now handle band-edge chunks as the NEON kernels do: a
+  boundary chunk stores its direction bytes whole instead of lane by lane, the final score is
+  read from the H ring once per diagonal, a band-edge chunk clear of row 0 and column 0 masks
+  only its E and F edge lanes, and the ring slots are carried as loop state. The score lookup
+  is cheaper too: AVX2 forms the index and looks it up in bytes before one widening convert, and
+  AVX-512BW looks it up in the scores pre-widened to the lane width. With the cheaper kernels the
+  int16 kernel is entered from band width 4 instead of 10 on both x86 tiers. Byte-identical by the same proof as the NEON
+  kernels (the comment atop `src/ksw_global2_wave.h`). On a 5M-pair WGS slice (HG00096, hg38,
+  150 bp paired) at `-t 16`, clang 19.1.7, whole-aligner wall (both changes together) dropped
+  0.8 % on AMD EPYC 9R14 (Zen 4, AVX-512BW tier) and 1.2 % on the same host with the tier forced
+  to AVX2, each over 5 interleaved rounds with record md5 identical. Split by the entry width on
+  the AVX-512BW tier, the new kernels alone (width 10) were +0.2 %, width 6 -0.5 % and width 4
+  -0.8 %; with the tier forced to AVX2, -0.7 %, -1.2 % and -1.2 %. On AMD EPYC 7R13 (Zen 3, AVX2 tier) it dropped
+  0.4 %, which is within that host's code-layout noise (a layout-only control moved it 0.6 %).
+  On Intel Xeon Platinum 8488C (Sapphire Rapids, AVX-512BW tier) it was neutral: +0.1 %, within
+  that host's round-to-round noise of about 1 %, over 5 interleaved rounds with record md5
+  identical. The gain is therefore an AMD one. ARM is unchanged.
 
 ## Mate rescue
 

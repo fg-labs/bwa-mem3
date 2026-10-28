@@ -994,6 +994,34 @@ extern "C" int ksw_g2_wave_wmin(void) {
 static thread_local KswWaveScratch g_ksw_wave_scratch;
 extern "C" unsigned long ksw_g2_wave_zr_capacity(void) { return (unsigned long)g_ksw_wave_scratch.zr.capacity(); }
 
+/* Test-only: when set to a byte value (0..255), every wavefront call on this
+ * thread first fills the whole direction-byte store zr with it, so a direction
+ * byte the backtrack reads that no diagonal of the same call wrote changes the
+ * CIGAR (the kernels store whole chunks and rely on later diagonals to overwrite
+ * the overhang, Lemma 9). -1, the default, leaves zr alone. Not set on any
+ * production path. */
+static thread_local int g_ksw_wave_zr_poison = -1;
+extern "C" void ksw_g2_wave_set_zr_poison(int byte)
+{
+	xassert(byte >= -1 && byte <= 255, "ksw_g2_wave_set_zr_poison: byte must be 0..255, or -1 to disable");
+	g_ksw_wave_zr_poison = byte;
+}
+#if defined(KSW_WAVE16_WMIN) || defined(KSW_WAVE_WMIN)
+static inline void ksw_wave_prepare(int qlen, int tlen, int w)
+{
+	g_ksw_wave_scratch.ensure(qlen, tlen, w);
+	if (__builtin_expect(g_ksw_wave_zr_poison >= 0, 0)) {   /* test-only; keep the memset out of line */
+		/* Only the bytes this call can touch: ksw_wave_zneed bounds every offset
+		 * the kernels store and the backtrack reads (+64 slack included), so
+		 * poisoning the retained high-water capacity would only cost time. */
+		const size_t need = (size_t)ksw_wave_zneed(qlen, tlen, w);
+		const size_t have = g_ksw_wave_scratch.zr.size();
+		memset(g_ksw_wave_scratch.zr.data(), g_ksw_wave_zr_poison, need < have ? need : have);
+	}
+	++g_ksw_wave_exec_count;
+}
+#endif
+
 /* The wavefront kernels' proof needs w >= |tlen-qlen|+3. bwa_gen_cigar3 keeps that floor
  * for unequal lengths; for equal lengths it may pass a narrower certified band
  * (bwa_global_cert_band), down to 1. Certified bands >= 3 meet the floor; bands of 1 and 2
@@ -1011,9 +1039,13 @@ static_assert(KSW_WAVE_WMIN >= 3, "the int32 wavefront kernel must not see w < 3
  *   - the standard DNA alphabet is in use (m == 5), and
  *   - the direction-byte store area fits int (ksw_g2_wave_area_ok — only a
  *     pathological multi-megabase region fails this), and
+ *   - the band meets the kernels' proof floor (w >= |tlen-qlen|+3), and
  *   - the band is wide enough that SIMD beats scalar on this arch (w >= WMIN).
- * Output is byte-identical for every w the kernels' proof covers (w >= |tlen-qlen|+3);
- * above that floor the width gate is purely a throughput choice (narrow bands are
+ * Output is byte-identical for every w the kernels' proof covers (w >= |tlen-qlen|+3).
+ * The only production caller (bwa_gen_cigar3) always meets that floor, so the floor
+ * test only keeps an out-of-contract caller of this public API on the scalar path,
+ * which returns MINUS_INF for an infeasible band where a wavefront kernel would not.
+ * Above the floor the width gate is purely a throughput choice (narrow bands are
  * faster scalar — see the per-arch crossover), and it also keeps equal-length certified
  * bands below the floor (1 and 2) on the scalar path (static_asserts above). Anything
  * that misses a precondition (qlen == 0, an over-large region, tiers without a
@@ -1030,20 +1062,19 @@ int ksw_global2(int qlen, const uint8_t *query, int tlen, const uint8_t *target,
 	 *   3. scalar      — narrow bands and everything else.
 	 * All tiers share one per-thread scratch. */
 #if defined(KSW_WAVE16_WMIN) || defined(KSW_WAVE_WMIN)
-	if (qlen >= 1 && n_cigar_ && cigar_ && m == 5 && ksw_g2_wave_area_ok(qlen, tlen, w)) {
+	if (qlen >= 1 && n_cigar_ && cigar_ && m == 5 && w >= (tlen > qlen ? tlen - qlen : qlen - tlen) + 3
+	    && ksw_g2_wave_area_ok(qlen, tlen, w)) {
 #  ifdef KSW_WAVE16_WMIN
 		if (w >= KSW_WAVE16_WMIN &&
 		    ksw_g2_wave16_safe(qlen, tlen, w, o_del, e_del, o_ins, e_ins, m, mat)) {
-			g_ksw_wave_scratch.ensure(qlen, tlen, w);
-			++g_ksw_wave_exec_count;
+			ksw_wave_prepare(qlen, tlen, w);
 			++g_ksw_wave16_exec_count;
 			return ksw_g2_wave16(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_, g_ksw_wave_scratch);
 		}
 #  endif
 #  ifdef KSW_WAVE_WMIN
 		if (w >= KSW_WAVE_WMIN) {
-			g_ksw_wave_scratch.ensure(qlen, tlen, w);
-			++g_ksw_wave_exec_count;
+			ksw_wave_prepare(qlen, tlen, w);
 			return ksw_g2_wave(qlen, query, tlen, target, m, mat, o_del, e_del, o_ins, e_ins, w, n_cigar_, cigar_, g_ksw_wave_scratch);
 		}
 #  endif
