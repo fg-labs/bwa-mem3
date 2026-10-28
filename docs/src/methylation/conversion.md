@@ -67,7 +67,8 @@ is freed as well, but it scores `0` rather than a match: a converted base is
 tolerated, not rewarded. Both `genomic` and `neutral` leave the mirror cell a real
 mismatch, so a genuine variant *in that direction* stays a mismatch and `NM`
 remains variant-aware; a variant in the conversion direction itself shares the freed
-cell with a conversion and is not counted in `NM` in any mode (`MD` lists it). See
+cell with a conversion and is not counted in `NM` in any mode (`MD` lists it);
+under `--meth-context cpg` this holds only at a CpG. See
 [Overview → `--meth-scoring`](overview.md#three-scoring-modes---meth-scoring) and
 [which real variants stay visible](overview.md#which-real-variants-stay-visible).
 
@@ -79,6 +80,66 @@ as a conversion and does not penalize placement. Under `--meth-scoring neutral` 
 mirror cell is a mismatch as in `genomic`, and a seed-internal converted base
 contributes `0` instead of a match — so a conversion lowers `AS` relative to
 `genomic`, just by less than a mismatch would.
+
+### CpG context: `--meth-context cpg`
+
+Everything above is `--meth-context all`, the default: the conversion cell is
+freed at every reference `C` (OT) or `G` (OB). A 5-code matrix cannot do more,
+because a cell sees one reference base and not its neighbour. `--meth-context
+cpg` frees the cell only at a CpG, and so it scores against a 7-code reference
+alphabet:
+
+| Code | Reference base |
+|------|----------------|
+| `0`–`4` | `A` `C` `G` `T` `N`, as without context |
+| `5` (C5) | a `C` whose next base is `G` |
+| `6` (G6) | a `G` whose previous base is `C` |
+
+Read codes stay `0`–`4`. Each strand hypothesis gets a 7×7 matrix (row =
+reference code, column = read code). Rows and columns `0`–`4` are the 5-code
+matrix with **no** cell freed, so a conversion at a plain `C` or `G` is an
+ordinary mismatch. Rows C5 and G6 copy the `C` and `G` rows except for one
+cell: OT frees C5 × read-`T` and OB frees G6 × read-`A`, each scored as
+`--meth-scoring` says (`0` under `neutral`, a match under `genomic`). The mirror
+cell is never freed, which is why `cpg` refuses `collapsed`.
+
+Labels are assigned in place, right after each reference window is fetched and
+before anything scores it:
+
+- **In the fetch frame.** A reverse-strand window arrives already
+  reverse-complemented and is labelled in that orientation. A CpG is its own
+  reverse complement, so the same CpG gets the same two labels on either
+  strand, and a read aligned to the reverse strand frees exactly the cells
+  the forward-strand alignment of the same fragment frees.
+- **Past the window edge.** The CpG test reads one base beyond the window (the
+  next base for C5, the previous one for G6) from the packed reference, so a
+  CpG split by a window edge is labelled as if the window were one base wider.
+- **Not across contigs, never at an N.** A neighbour in another contig never
+  forms a CpG. The packed reference stores an original `N` as a random base;
+  the ambiguity records mark those positions, and an `N` is neither labelled
+  nor a CpG neighbour.
+
+Every consumer of the substitution model takes the 7-code alphabet: banded
+extension at every SIMD tier and both widths, seed-score recomputation,
+deduplication, CIGAR and score regeneration, `NM`/`MD`, the paired-end score
+recomputations and mate rescue. The SIMD kernels carry the alphabet as the
+plain base plus a per-row CpG flag that gates the one freed cell; their records
+are identical to the scalar path at every tier (AVX2, AVX-512BW and NEON).
+
+What changes in the output, and what does not:
+
+- **`NM`** follows the matrix, as always. A conversion at a non-CpG `C` is
+  a mismatch under `cpg` and counts toward `NM`; under `all` it does not.
+- **`XM:Z`** is unchanged. It still classifies every reference `C` by context
+  (`z/Z`, `x/X`, `h/H`) from the read's bases, so a non-CpG conversion still
+  shows as an upper-case `X` or `H`. The non-CpG call rate remains the
+  chemistry-noise readout.
+- **Mate-rescue shortcuts.** The rescue pre-filter and banded rescue model
+  5-code matrices, so under `cpg` every rescue window runs the full SIMD
+  rescue kernel. Results are unaffected; this is part of `cpg`'s extra run
+  time ([measurements](5base.md#choosing---meth-context-cpg)).
+- Output with `--meth-context all`, and without `--meth`, is byte-identical to
+  a build without the option.
 
 ## Sequence restoration in the BAM SEQ field
 

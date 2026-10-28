@@ -81,7 +81,10 @@ G→A at a reference `G` on OB — lands on that same freed cell and is therefor
 *absent* from `NM`: it is byte-indistinguishable from a conversion in a
 single read, so no aligner can separate the two. Under `collapsed` the mirror
 cell is freed as well, so C/T and G/A variants are hidden from `NM` in both
-directions. `MD` lists all of them in every mode.
+directions. Under `--meth-context cpg` (`genomic` or `neutral` only) the conversion
+cell is freed only at a CpG, so a conversion-direction variant is absent from `NM`
+only there; at any other `C` (or `G` on OB) it is a mismatch and counts. `MD` lists
+all of them in every mode.
 
 > **This is a deliberate deviation from the SAM specification**
 > ([#332](https://github.com/fg-labs/bwa-mem3/pull/332), [#550](https://github.com/fg-labs/bwa-mem3/pull/550)), which defines `NM` as
@@ -118,7 +121,7 @@ about converted bases. This is controlled by `--meth-scoring`:
 | Mode | Default? | Matrix | `-B` | Behavior |
 |------|----------|--------|------|----------|
 | **`collapsed`** | **`--meth` / `--meth=emseq`** | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ` on typical WGBS/EM-seq ([full caveat](bwameth-mapping.md)), so re-validate if pinned to a bwameth release. |
-| **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and counts toward `NM`, making the BAM usable for variant calling. A variant in the conversion direction itself is still not counted in `NM`, though `MD` lists it ([why](#which-real-variants-stay-visible)). |
+| **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and counts toward `NM`, making the BAM usable for variant calling. A variant in the conversion direction itself is still not counted in `NM` (under `--meth-context cpg`, only at a CpG), though `MD` lists it ([why](#which-real-variants-stay-visible)). |
 | **`neutral`** | **`--meth=taps`**, **`--meth=5base`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants count toward `NM` on the same terms as `genomic`; +0.24–0.28 pp placement over `genomic`, measured on 4.07 M simulated TAPS reads against full hg38 across three methylation loads ([full arms and method](taps.md#what---methtaps-changes)). |
 
 The default follows the chemistry: `--meth` and `--meth=emseq` default to
@@ -134,6 +137,19 @@ but it is a placement drop-in — **not** byte-identical: ~1% of records differ 
 `POS`/`CIGAR`/`MAPQ`, so re-validate if you are pinned to a specific bwameth
 release. See [bwameth.py drop-in mapping](bwameth-mapping.md) for the full
 placement-compatibility caveat, and [TAPS](taps.md) for the `neutral` measurements.
+
+### Where a conversion is free: `--meth-context`
+
+`--meth-scoring` decides what a conversion scores; `--meth-context` decides
+where it is allowed. `all` (the default for every chemistry) frees it at every
+reference `C`, as the table above describes. `cpg` frees it only at a CpG and
+scores a conversion at any other `C` as a mismatch, so it applies to `genomic`
+and `neutral` only, and only to the chemistries that convert methylated
+cytosines (`--meth=taps`, `--meth=5base`). For EM-seq and bisulfite, where
+every unmethylated `C` converts, it is refused, as it is with `collapsed`. See
+[Conversion details → CpG context](conversion.md#cpg-context---meth-context-cpg)
+for the model and [Illumina 5-base](5base.md#choosing---meth-context-cpg) for
+when to use it.
 
 ## Pipeline at a glance
 

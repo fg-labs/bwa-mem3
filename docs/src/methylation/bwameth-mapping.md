@@ -120,7 +120,8 @@ differ:
     differ solely in what that cell scores (a full match vs. `0`) and both leave
     the *mirror* cell penalised — so both keep a real variant in the *opposite*
     direction (ref `T` × read `C` on OT) in `NM`. A real variant in the
-    conversion direction itself (a genuine C→T SNP at a reference C) is
+    conversion direction itself (a genuine C→T SNP at a reference C, or only at
+    a CpG under `--meth-context cpg`) is
     indistinguishable from a conversion in a single read under any mode — that
     aliasing is resolved downstream at the pileup, not by the aligner. See
     [which real variants stay visible](overview.md#which-real-variants-stay-visible).

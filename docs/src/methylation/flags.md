@@ -80,7 +80,8 @@ conversion (bwameth-style), keep it variant-aware, or merely tolerate it.
   or G/A variant on that mirror cell (ref `T` × read `C` on OT, ref `A` × read
   `G` on OB) is penalized and counts toward `NM`, making the BAM usable
   for variant calling; a variant in the conversion direction itself shares the
-  freed cell with a conversion and is not counted in `NM`
+  freed cell with a conversion and is not counted in `NM` (under
+  `--meth-context cpg`, only at a CpG; see below)
   ([why](overview.md#which-real-variants-stay-visible)). Keeps bwa's default `-B 4`.
 - `neutral` (**default for `--meth=taps` and `--meth=5base`**) — free only the conversion direction,
   but score it `0` rather than `+A`: tolerated but not rewarded. Best for TAPS,
@@ -149,8 +150,12 @@ from tolerating conversions that the chemistry does not produce.
 - without `--meth`.
 
 The value is required and case-sensitive. Write it with a space or with `=`
-(`--meth-context cpg` or `--meth-context=cpg`). Output with `all` is
-byte-identical to a run without the option.
+(`--meth-context cpg` or `--meth-context=cpg`). Alignment records with `all`
+are byte-identical to a run without the option; only the `@PG` `CL:` record
+differs, because it records the flag. See
+[Conversion details → CpG context](conversion.md#cpg-context---meth-context-cpg)
+for the model and [Illumina 5-base](5base.md#choosing---meth-context-cpg) for
+measurements and when to choose it.
 
 ## `--meth-tags SPEC`
 
