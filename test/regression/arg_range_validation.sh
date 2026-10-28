@@ -178,8 +178,8 @@ check_accept() {
 # wraps: -A 128 becomes -128, and -A 256 zeroes kswv's maximum substitution
 # score, which its score2 window divides by (SIGFPE at the AVX-512BW tier). A
 # match score of 0 or less is refused too: nothing can score above zero, so
-# the same divide traps on x86, and the pairing and mapping-quality formulas
-# overflow on negative scores, differently per SIMD tier. -A is held to 1..127
+# the same divide traps on x86, and the mapping-quality formula divides by
+# the match score, differently per architecture at 0. -A is held to 1..127
 # at parse, which also keeps update_a()'s scaled defaults inside int and their
 # signs unchanged.
 A_RANGE="ERROR: -A match score must be an integer in 1..127"

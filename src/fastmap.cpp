@@ -2477,10 +2477,10 @@ int main_mem(int argc, char *argv[])
              * substitution score and its score2 window divides by it. A zero or
              * negative -A is refused too: no alignment can score above zero, so
              * kswv's score2 window divides by a zero maximum (SIGFPE on x86), and
-             * the pairing and mapping-quality formulas (mem_pair's packed score,
-             * raw_mapq) overflow on negative scores, with results that differ by
-             * SIMD tier. The bound also keeps update_a()'s scaled defaults inside
-             * int and their signs unchanged. */
+             * the mapping-quality formula (raw_mapq) divides by the match score,
+             * so a zero -A takes the int conversion of an infinity, which is
+             * undefined and differs by architecture. The bound also keeps
+             * update_a()'s scaled defaults inside int and their signs unchanged. */
             int64_t v;
             if (parse_bounded_i64(optarg, 1, INT8_MAX, &v) != 0) {
                 fprintf(stderr, "ERROR: -A match score must be an integer in 1..%d (got %s): "
