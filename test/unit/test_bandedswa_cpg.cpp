@@ -102,6 +102,7 @@ struct Corpus {
     std::vector<SeqPair> pairs;
     int n = 0;
     long labelled = 0, bases = 0;   // labelled (C5/G6) target positions, all target positions
+    long ref_n = 0;                 // target positions holding a reference N
 };
 
 // n pairs: a labelled window (forward or reverse strand) as the target and a
@@ -126,6 +127,11 @@ Corpus make_corpus(const meth_test::OrigRefFixture &f, const Params &P, int widt
         bns_get_seq_into(L, f.orig_pac, rb, rb + tlen, t.data(), &got);
         REQUIRE(got == tlen);
         meth_label_cpg(t.data(), tlen, rb, 0, f.orig_bns, f.orig_pac);
+        // A reference N (code 4) in one window in eight, at ~3% of its positions, labelled or
+        // not: --meth references hold none, but the arm must keep scoring it from w_ambig.
+        if (rng() % 8 == 0)
+            for (int i = 0; i < tlen; ++i)
+                if (rng() % 100 < 3) t[(size_t)i] = METH_N;
 
         // The query: the target's plain bases, with conversions at about half of
         // the convertible positions (CpG or not), ~3% substitutions, rare
@@ -167,6 +173,7 @@ Corpus make_corpus(const meth_test::OrigRefFixture &f, const Params &P, int widt
         for (int i = 0; i < tlen; ++i) {
             s1[i] = t[(size_t)i];
             c.labelled += t[(size_t)i] >= METH_C5;
+            c.ref_n += t[(size_t)i] == METH_N;
         }
         c.bases += tlen;
         for (int i = 0; i < qlen; ++i) s2[i] = q[(size_t)i];
@@ -178,6 +185,17 @@ Corpus make_corpus(const meth_test::OrigRefFixture &f, const Params &P, int widt
         ++c.n;
     }
     return c;
+}
+
+// The tiers whose getScores8 has a lane-compaction driver.
+bool tier_has_compaction()
+{
+#if defined(__aarch64__)
+    return true;
+#else
+    const int t = bwamem3_simd_tier();
+    return t == BWAMEM3_TIER_AVX2 || t == BWAMEM3_TIER_AVX512BW;
+#endif
 }
 
 mem_opt_t *opt_for(int scoring, int a, int b)
@@ -219,6 +237,7 @@ Outcome run_one(const meth_test::OrigRefFixture &f, const Params &P, int scoring
 
     Corpus c = make_corpus(f, P, width, hyp, 400, seed);
     CHECK((double)c.labelled >= 0.10 * (double)c.bases);
+    CHECK(c.ref_n > 0);
 
     std::vector<ExtResult> oracle((size_t)c.n);
     Outcome out;
@@ -242,6 +261,13 @@ Outcome run_one(const meth_test::OrigRefFixture &f, const Params &P, int scoring
     const BswScoreDomainCounts dc = k->bsw8_score_domain_counts();
     if (width == 8 && dc.signed_batches + dc.unsigned_batches > 0)
         CHECK((bsw8_gap_bytes_fit_int8(P.o, P.e, P.o, P.e) ? dc.signed_batches : dc.unsigned_batches) > 0);
+    // Compaction on, at a band the driver takes: on the tiers with a driver (NEON, AVX2,
+    // AVX-512BW) it ran and moved lanes, so the CpG arm ran on moved lanes too.
+    if (width == 8 && compact > 0 && P.w >= BSW_COMPACT_MIN_W_DEFAULT && tier_has_compaction()) {
+        const BswCompactCounts cc = k->lane_compaction_counts();
+        CHECK(cc.superblocks > 0);
+        CHECK(cc.moves > 0);
+    }
     for (int i = 0; i < c.n; ++i) {
         const SeqPair &p = c.pairs[(size_t)i];
         const ExtResult &R = oracle[(size_t)p.id];

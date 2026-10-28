@@ -486,6 +486,10 @@ void BandedPairWiseSW::set_meth_cpg(int fr_ref_base, int fr_read, int fr_val)
     xassert(fr_val <= this->w_match, "set_meth_cpg: fr_val must not exceed the match score");
     xassert(!bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch, this->m),
             "set_meth_cpg: the matrix's ACGT block is not the plain symmetric matrix");
+    // N (reference row 4, read column 4) is scored from w_ambig by every kernel, not from mat.
+    for (int k = 0; k < 7; k++)
+        xassert(this->mat[k * 7 + 4] == this->w_ambig && (k > 4 || this->mat[4 * 7 + k] == this->w_ambig),
+                "set_meth_cpg: the matrix's N row / column is not w_ambig");
     for (int r = 5; r <= 6; r++)
         for (int c = 0; c <= 4; c++) {
             const bool gated = r == fr_ref_base + 4 && c == fr_read;
@@ -922,6 +926,8 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     int64_t startTick, endTick;
 
     {
@@ -2005,6 +2011,8 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    uint16_t numThreads,
                                    int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     int64_t startTick, endTick;
 
     {
@@ -3002,6 +3010,8 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     static_assert(SIMD_WIDTH8 == 64 && SIMD_WIDTH16 == 32, "AVX512 kernel requires 64x8-bit and 32x16-bit lanes");
     int i;
     int64_t startTick, endTick;
@@ -4073,6 +4083,8 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    uint16_t numThreads,
                                    int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     int i;
     int64_t startTick, endTick;
 
@@ -5098,6 +5110,8 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    uint16_t numThreads,
                                    int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
         if (cpg_) smithWatermanBatchWrapper16<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
@@ -6049,11 +6063,13 @@ static inline __m128i bsw8_sbt_nomin8(__m128i v)
 // mapped once per kernel call so every cell score they yield is free of -128: the XOR LUT pmat128,
 // gathered directly as the signed score (bsw8_sbt_nomin8(pmat) is exactly SBT_SPLIT8's
 // pos - neg), and the vectors the RANK1/AMAT prepasses select a score from. A new score source
-// for those prepasses must be added here.
+// for those prepasses must be added here. cpgval128 is the CpG arm's fr_val (never -128, so a
+// no-op that keeps the rule; dead code outside the CPG instantiations).
 #define BSW8_SCORES_NOMIN8()                                            \
     do {                                                                \
         pmat128     = bsw8_sbt_nomin8(pmat128);                         \
         match128    = bsw8_sbt_nomin8(match128);                        \
+        cpgval128   = bsw8_sbt_nomin8(cpgval128);                       \
         amat128     = bsw8_sbt_nomin8(amat128);                         \
         w_ambig_128 = bsw8_sbt_nomin8(w_ambig_128);                     \
     } while (0)
@@ -6439,6 +6455,8 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     static_assert(SIMD_WIDTH8 == 16 && SIMD_WIDTH16 == 8, "SSE/NEON kernel requires 16x8-bit and 8x16-bit lanes");
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
@@ -6836,8 +6854,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 #endif
     __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi8(3);                     // N threshold (base > 3)
-    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm"). fr_val is
-    // never -128 (set_meth_cpg), so it needs no BSW8_SCORES_NOMIN8 mapping.
+    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm")
     __m128i cpgref128  = _mm_set1_epi8(this->cpg_ref_code_);
     __m128i cpgread128 = _mm_set1_epi8(this->cpg_read_);
     __m128i cpgval128  = _mm_set1_epi8(this->cpg_val_);
