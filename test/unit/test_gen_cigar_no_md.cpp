@@ -12,7 +12,10 @@
 // form still carries its MD through them, with and without the --meth regen).
 // Both forms share one NM rule, so hand-built alignments pin the NM values
 // themselves, and mem_gen_alt's XA string is checked against one written out
-// by hand.
+// by hand. Both forms' score and NM, and the MD form's MD, are also checked
+// against a naive scalar walk of the returned CIGAR (gen_cigar_oracle), so an
+// error the two forms share (the vector M-op walks, or the reverse-strand
+// flips) cannot pass by agreeing with itself.
 
 #include "doctest/doctest.h"
 
@@ -20,6 +23,7 @@
 #include "bwamem.h"
 #include "meth_orig_ref_fixture.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -89,8 +93,9 @@ struct Case {
     int n_edits = 0;
 };
 
-Case make_case(const std::string &ref, std::mt19937 &rng, bool rev, int pad_l, int pad_r) {
-    const int len = 40 + (int)(rng() % 160);
+Case make_case(const std::string &ref, std::mt19937 &rng, bool rev, int pad_l, int pad_r,
+               int len = 0) {
+    if (len <= 0) len = 40 + (int)(rng() % 160);
     const int at = 50 + (int)(rng() % (kRefLen - len - 100));
     std::string fwd = ref.substr(at, len);
     std::string edited;
@@ -172,7 +177,259 @@ int cigar_ref_span(const uint32_t *cigar, int n) {
     return span;
 }
 
+// What bwa_gen_cigar4 must return for a CIGAR, computed the slow way. The
+// window [rb, re) and the query are put in the frame the walk runs in: on the
+// reverse strand (rb >= l_pac) the window is the complement of forward bases
+// [2 l_pac - re, 2 l_pac - rb) read in forward order, and the query is reversed;
+// MD then names a reference base by its forward-strand letter. The score is the
+// global alignment score of the CIGAR's path (mat over M columns, o + e * len
+// per gap). NM counts every literal mismatch (or, under nm_from_mat, only those
+// mat penalises), every inserted base and the deleted bases of a D that is not
+// the first or the last op; MD lists the M ops' literal mismatches and those
+// internal deletions.
+struct Oracle {
+    int score = 0, nm = 0;
+    int freed = 0;  // literal mismatches NM skipped under nm_from_mat
+    std::string md;
+};
+
+Oracle gen_cigar_oracle(const std::string &ref, const int8_t *mat, int o_del, int e_del,
+                        int o_ins, int e_ins, const std::vector<uint8_t> &query, int64_t rb,
+                        int64_t re, const uint32_t *cigar, int n_cigar, int nm_from_mat) {
+    const int64_t l_pac = (int64_t)ref.size();
+    const bool rev = rb >= l_pac;
+    const int lq = (int)query.size(), rlen = (int)(re - rb);
+    std::vector<uint8_t> q(query), r(rlen);
+    if (rev) std::reverse(q.begin(), q.end());
+    for (int i = 0; i < rlen; ++i)
+        r[i] = rev ? (uint8_t)(3 - nt4(ref[2 * l_pac - re + i])) : nt4(ref[rb + i]);
+    const char *int2base = rev ? "TGCAN" : "ACGTN";
+    Oracle o;
+    int x = 0, y = 0, u = 0;
+    for (int k = 0; k < n_cigar; ++k) {
+        const int op = cigar[k] & 0xf, len = (int)(cigar[k] >> 4);
+        if (op == 0) {
+            for (int i = 0; i < len; ++i, ++x, ++y) {
+                o.score += mat[r[y] * 5 + q[x]];
+                if (q[x] != r[y]) {
+                    o.md += std::to_string(u);
+                    o.md += int2base[r[y]];
+                    u = 0;
+                    if (!nm_from_mat || mat[r[y] * 5 + q[x]] < 0) ++o.nm;
+                    else ++o.freed;
+                } else {
+                    ++u;
+                }
+            }
+        } else if (op == 1) {
+            o.score -= o_ins + e_ins * len;
+            o.nm += len;
+            x += len;
+        } else if (op == 2) {
+            o.score -= o_del + e_del * len;
+            if (k > 0 && k < n_cigar - 1) {
+                o.md += std::to_string(u) + "^";
+                for (int i = 0; i < len; ++i) o.md += int2base[r[y + i]];
+                u = 0;
+                o.nm += len;
+            }
+            y += len;
+        }
+    }
+    o.md += std::to_string(u);
+    CHECK(x == lq);
+    CHECK(y == rlen);
+    return o;
+}
+
 }  // namespace
+
+TEST_CASE("bwa_gen_cigar4: score, NM and MD match a naive walk of the CIGAR" *
+          doctest::test_suite("unit/gen_cigar")) {
+#if defined(__AVX2__)
+    MESSAGE(std::string("M-op walks: AVX2 32-column blocks"));
+#else
+    MESSAGE(std::string("M-op walks: scalar loops (no AVX2 on this target)"));
+#endif
+    const std::string ref = make_reference(kRefLen);
+    meth_test::OrigRefFixture fx(ref);
+    std::mt19937 rng(23);
+    int n_rev = 0, n_gapped = 0, n_n = 0, n_short = 0, n_freed_zero = 0;
+    // The freed --meth cell scores 1, then 0: NM under nm_from_mat skips a
+    // column whose cell is not negative, so 0 is the edge of that test.
+    for (int freed_score : {1, 0}) {
+        const Matrices m(freed_score);
+        // Every query length from 1 to 200, so the 32-column blocks, the
+        // remainder loads at either end and the scalar fallback of short ops
+        // all run.
+        for (int len = 1; len <= 200; ++len) {
+            for (int rep = 0; rep < 6; ++rep) {
+                const bool rev = rep & 1;
+                const int pad_l = (rep == 2) ? 1 + (int)(rng() % 3) : 0;
+                const int pad_r = (rep == 3) ? 1 + (int)(rng() % 3) : 0;
+                Case c = make_case(ref, rng, rev, pad_l, pad_r, len);
+                // substitutions and Ns anywhere, including the first and last bases
+                for (uint8_t &b : c.query) {
+                    const uint32_t p = rng() % 100;
+                    if (p < 4) b = (uint8_t)((b + 1 + rng() % 3) & 3);
+                    else if (p < 6) b = 4;
+                }
+                static const int kBands[] = {0, 3, 10, 50, 100};
+                const int band = kBands[rng() % 5];
+                for (int combo = 0; combo < 3; ++combo) {
+                    const int nm_from_mat = combo == 2;
+                    const int8_t *mat = combo == 0 ? m.sym : m.meth;
+                    CAPTURE(freed_score);
+                    CAPTURE(len);
+                    CAPTURE(rep);
+                    CAPTURE(combo);
+                    CAPTURE(band);
+                    GenCigarOut md = run_gen_cigar(fx, mat, c.query, c.rb, c.re, band, nm_from_mat, 1);
+                    REQUIRE(md.cigar != nullptr);
+                    const Oracle o = gen_cigar_oracle(ref, mat, 6, 1, 6, 1, c.query, c.rb, c.re,
+                                                      md.cigar, md.n_cigar, nm_from_mat);
+                    CHECK(md.score == o.score);
+                    CHECK(md.nm == o.nm);
+                    CHECK(std::string((const char *)(md.cigar + md.n_cigar)) == o.md);
+                    CHECK(md.query_after == c.query);
+                    // the MD-free form counts NM with its own walks (a lane
+                    // mask under AVX2), so it is held to the oracle as well
+                    GenCigarOut no = run_gen_cigar(fx, mat, c.query, c.rb, c.re, band, nm_from_mat, 0);
+                    REQUIRE(no.cigar != nullptr);
+                    CHECK(no.score == o.score);
+                    CHECK(no.nm == o.nm);
+                    CHECK(words(no.cigar, no.n_cigar) == words(md.cigar, md.n_cigar));
+                    CHECK(no.query_after == c.query);
+                    n_rev += rev;
+                    n_gapped += md.n_cigar > 1;
+                    n_short += c.query.size() < 32;
+                    if (freed_score == 0) n_freed_zero += o.freed > 0;
+                    for (uint8_t b : c.query) n_n += b == 4;
+                    free(md.cigar);
+                    free(no.cigar);
+                }
+            }
+        }
+    }
+    // the cases reached both strands, gapped CIGARs, query Ns, short queries and
+    // freed columns whose cell scores exactly 0
+    CHECK(n_rev > 1000);
+    CHECK(n_gapped > 500);
+    CHECK(n_n > 1000);
+    CHECK(n_short > 300);
+    CHECK(n_freed_zero > 20);
+}
+
+// Test-only hook in bwa.cpp: fills this thread's bwa_gen_cigar4 reference scratch
+// (at least min_size bytes) with `byte`, so the next call's headroom past rlen holds it.
+extern "C" void bwa_gen_cigar_fill_rseq_scratch(size_t min_size, int byte);
+
+namespace {
+
+// A query that aligns to a short reference window with long insertions: the
+// edited forward bases ref[at, at + L), with `tail_l` and `tail_r` random bases
+// before and after, in the read's own orientation, and the doubled-strand
+// window [rb, re) of the L bases. The window is shorter than a 32-column block
+// and the query longer, so an M op's forward remainder load reads the reference
+// headroom past rlen.
+Case make_short_window_case(const std::string &ref, std::mt19937 &rng, bool rev, int L,
+                            int tail_l, int tail_r) {
+    const int at = 50 + (int)(rng() % (kRefLen - 200));
+    std::string edited;
+    for (int i = 0; i < tail_l; ++i) edited += "ACGT"[rng() & 3];
+    for (int i = 0; i < L; ++i) {
+        const uint32_t p = rng() % 100;
+        edited += p < 8 ? "ACGT"[(nt4(ref[at + i]) + 1 + rng() % 3) & 3] : p < 10 ? 'N' : ref[at + i];
+    }
+    for (int i = 0; i < tail_r; ++i) edited += "ACGT"[rng() & 3];
+    if (rev) {
+        std::string rc(edited.rbegin(), edited.rend());
+        for (char &ch : rc) ch = ch == 'A' ? 'T' : ch == 'C' ? 'G' : ch == 'G' ? 'C' : ch == 'T' ? 'A' : 'N';
+        edited = rc;
+    }
+    Case c;
+    for (char ch : edited) c.query.push_back(nt4(ch));
+    c.rb = rev ? 2 * (int64_t)kRefLen - (at + L) : at;
+    c.re = rev ? 2 * (int64_t)kRefLen - at : at + L;
+    return c;
+}
+
+// The M ops of a CIGAR (in the walk's frame) whose vector remainder is the
+// forward load and reads past rlen: cig_blocks' condition, written out.
+int forward_loads_past_rlen(const uint32_t *cigar, int n_cigar, int l_query, int rlen) {
+    int x = 0, y = 0, n = 0;
+    for (int k = 0; k < n_cigar; ++k) {
+        const int op = cigar[k] & 0xf, len = (int)(cigar[k] >> 4);
+        if (op == 0) {
+            const int rem = len % 32, i = len - rem;
+            if (rem && !(x + len >= 32 && y + len >= 32) && l_query - x - i >= 32 && y + i + 32 > rlen) ++n;
+            x += len, y += len;
+        } else if (op == 1) {
+            x += len;
+        } else if (op == 2) {
+            y += len;
+        }
+    }
+    return n;
+}
+
+}  // namespace
+
+TEST_CASE("bwa_gen_cigar4: bytes with the high bits set in the reference headroom change nothing" *
+          doctest::test_suite("unit/gen_cigar")) {
+    // The vector walks' forward remainder load reads up to 31 reference bytes
+    // past rlen, which no call writes, and relies on the lane masks alone to
+    // keep them out of the score, NM and MD (cig_lut_get's r << 2 carries a high
+    // byte's top bits into the next lane, which is masked as well). Fill that
+    // headroom with such bytes before every call and hold both forms to the
+    // naive walk.
+    const std::string ref = make_reference(kRefLen);
+    meth_test::OrigRefFixture fx(ref);
+    std::mt19937 rng(31);
+    int n_past = 0;
+    for (int fill : {0xff, 0x80, 0x7f}) {
+        const Matrices m(0);
+        for (int iter = 0; iter < 600; ++iter) {
+            const bool rev = iter & 1;
+            const int L = 1 + (int)(rng() % 31);
+            const int tail = 32 + (int)(rng() % 17);
+            const int split = (iter / 2) % 3;  // the insertions after, before or around the window
+            const int tail_l = split == 0 ? 0 : split == 1 ? tail : tail / 2;
+            const Case c = make_short_window_case(ref, rng, rev, L, tail_l, tail - tail_l);
+            const size_t need = (size_t)(c.re - c.rb) + 64;
+            for (int combo = 0; combo < 3; ++combo) {
+                const int nm_from_mat = combo == 2;
+                const int8_t *mat = combo == 0 ? m.sym : m.meth;
+                CAPTURE(fill);
+                CAPTURE(iter);
+                CAPTURE(combo);
+                bwa_gen_cigar_fill_rseq_scratch(need, fill);
+                GenCigarOut md = run_gen_cigar(fx, mat, c.query, c.rb, c.re, 100, nm_from_mat, 1);
+                bwa_gen_cigar_fill_rseq_scratch(need, fill);
+                GenCigarOut no = run_gen_cigar(fx, mat, c.query, c.rb, c.re, 100, nm_from_mat, 0);
+                REQUIRE(md.cigar != nullptr);
+                REQUIRE(no.cigar != nullptr);
+                const Oracle o = gen_cigar_oracle(ref, mat, 6, 1, 6, 1, c.query, c.rb, c.re,
+                                                  md.cigar, md.n_cigar, nm_from_mat);
+                CHECK(md.score == o.score);
+                CHECK(md.nm == o.nm);
+                CHECK(std::string((const char *)(md.cigar + md.n_cigar)) == o.md);
+                CHECK(no.score == o.score);
+                CHECK(no.nm == o.nm);
+                CHECK(words(no.cigar, no.n_cigar) == words(md.cigar, md.n_cigar));
+                CHECK(md.query_after == c.query);
+                CHECK(no.query_after == c.query);
+                n_past += forward_loads_past_rlen(md.cigar, md.n_cigar, (int)c.query.size(),
+                                                  (int)(c.re - c.rb));
+                free(md.cigar);
+                free(no.cigar);
+            }
+        }
+    }
+    bwa_gen_cigar_fill_rseq_scratch(0, 0);
+    // the forward remainder load read past rlen in many of the calls
+    CHECK(n_past > 1000);
+}
 
 TEST_CASE("bwa_gen_cigar4: want_md 0 gives the same score, CIGAR and NM as the MD form" *
           doctest::test_suite("unit/gen_cigar")) {
