@@ -274,6 +274,9 @@ typedef struct mem_opt_t {
                             // the per-read meth_build_xm() pass entirely.
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
+    int    meth_context;    // --meth-context: where a conversion is free, a meth_ctx_t
+                            // value (meth_opts.h): METH_CTX_ALL (default; every C) or
+                            // METH_CTX_CPG (only at a CpG).
     /* Derive the proper-pair FLAG bit (0x2) from the alignment actually EMITTED
      * (a[which]) instead of the top-scoring region (a[0]). Opt-in; 0 = match
      * bwa and bwa-mem2, which both use a[0] unconditionally.

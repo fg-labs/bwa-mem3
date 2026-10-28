@@ -51,6 +51,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "FMI_search.h"
 #include "bam_writer.h"
 #include "meth_bam.h"
+#include "meth_opts.h"
 #include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps|5base */
 #include "stage_prof.h"
 #include "seed_order.h"
@@ -1773,53 +1774,22 @@ static int path_exists(const char *p)
     return 0;
 }
 
-/* Every --meth=CHEM spelling and the chemistry it selects. The one list both
- * the --meth parser and the stray-value check read, so a new alias cannot be
- * accepted by one and missed by the other. 5base/5-base (Illumina 5-base)
- * convert only 5mC to T, directionally: the same aligner-visible change, call
- * polarity and sparsity as TAPS, so they are TAPS here. The one chemistry
- * difference, 5hmC (TAPS converts it, 5-base does not), changes what a call
- * measures, not how a read aligns. */
-static const struct { const char *name; meth_chem_t chem; } meth_chem_names[] = {
-    { "emseq",  METH_CHEM_EMSEQ }, { "em-seq", METH_CHEM_EMSEQ }, { "bisulfite", METH_CHEM_EMSEQ },
-    { "taps",   METH_CHEM_TAPS  }, { "5base",  METH_CHEM_TAPS  }, { "5-base",    METH_CHEM_TAPS  },
-};
-
 /* If `s` is a value that belongs to one of the --meth family's options rather
  * than a path, return the flag it belongs to; else NULL. Deliberately narrow:
  * every token here is a closed-vocabulary keyword no one would name a reference
  * after, and the caller additionally requires that no such path exists. The
  * match ignores case, so `--meth TAPS` is caught too; when `canon` is non-NULL
  * it receives the vocabulary's own spelling (the parsers are case-sensitive),
- * or NULL for the `^` form, which has none. */
+ * or NULL for the `^` form, which has none. The --meth family's vocabulary
+ * lives in meth_opts.cpp; --rescue-skip's is the only one local to `mem`. */
 static const char *stray_option_value_flag(const char *s, const char **canon)
 {
-    static const struct { const char *value, *flag; } known[] = {
-        { "collapsed", "--meth-scoring" }, { "genomic",   "--meth-scoring" },
-        { "neutral",   "--meth-scoring" },
-        { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
-        { "XM",        "--meth-tags"    }, { "all",       "--meth-tags" },
-        { "none",      "--meth-tags"    },
-        { "spec30",    "--meth-seed-prune" }, { "baseline",  "--meth-seed-prune" },
-        { "off",       "--meth-seed-prune" },
-        { "true",      "--rescue-skip"  }, { "false",     "--rescue-skip" },
-    };
-    if (canon != NULL) *canon = NULL;
-    if (s == NULL) return NULL;
-    /* A `^`-prefixed exclusion can only have come from --meth-tags. Its `-XM`
-     * synonym needs no case here: `X` takes an argument in the short optstring,
-     * so getopt binds `-XM` as `-X M` and it never reaches a positional slot. */
-    if (s[0] == '^') return "--meth-tags";
-    for (size_t i = 0; i < sizeof(meth_chem_names) / sizeof(meth_chem_names[0]); ++i)
-        if (strcasecmp(s, meth_chem_names[i].name) == 0) {
-            if (canon != NULL) *canon = meth_chem_names[i].name;
-            return "--meth";
-        }
-    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); ++i)
-        if (strcasecmp(s, known[i].value) == 0) {
-            if (canon != NULL) *canon = known[i].value;
-            return known[i].flag;
-        }
+    const char *flag = meth_opts_stray_flag(s, canon);
+    if (flag != NULL) return flag;
+    if (s != NULL && (strcasecmp(s, "true") == 0 || strcasecmp(s, "false") == 0)) {
+        if (canon != NULL) *canon = strcasecmp(s, "true") == 0 ? "true" : "false";
+        return "--rescue-skip";
+    }
     return NULL;
 }
 
@@ -1837,8 +1807,8 @@ static const char *stray_option_value_advice(const char *s)
     if (strcmp(flag, "--meth-tags") == 0)
         return "       --meth-tags takes ONE comma-separated list, not a space-separated one:\n"
                "       write --meth-tags XR,XG (or --meth-tags '^XM'), not --meth-tags XR XG.";
-    if (strcmp(flag, "--meth-scoring") == 0) {
-        snprintf(buf, sizeof(buf), "       Pass it as the argument to that flag: --meth-scoring %s.", canon);
+    if (strcmp(flag, "--meth-scoring") == 0 || strcmp(flag, "--meth-context") == 0) {
+        snprintf(buf, sizeof(buf), "       Pass it as the argument to that flag: %s %s.", flag, canon);
     } else {
         /* --meth, --meth-seed-prune and --rescue-skip take an OPTIONAL argument. */
         snprintf(buf, sizeof(buf),
@@ -2005,63 +1975,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 Sets the FR distribution only and skips inference, so FF/RF/RR get none:\n");
     fprintf(stderr, "                 no proper-pair flag or mate rescue there. As in bwa/bwa-mem2. [inferred]\n");
     fprintf(stderr, "Methylation (--meth) options:\n");
-    fprintf(stderr, "   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware\n");
-    fprintf(stderr, "                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,\n");
-    fprintf(stderr, "                 as without --meth; add --bam for BAM. Requires the reference to\n");
-    fprintf(stderr, "                 have been built with `bwa-mem3 index --meth` (emits the original\n");
-    fprintf(stderr, "                 index plus a ref.fa.meth.* converted seed index).\n");
-    fprintf(stderr, "                 CHEM selects the chemistry and thus the XM:Z call polarity:\n");
-    fprintf(stderr, "                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]\n");
-    fprintf(stderr, "                          (aliases: em-seq, bisulfite)\n");
-    fprintf(stderr, "                   taps   TET-assisted pyridine borane, METHYLATED C converts;\n");
-    fprintf(stderr, "                          also defaults --meth-scoring to neutral\n");
-    fprintf(stderr, "                   5base  Illumina 5-base, METHYLATED C (5mC) converts; same\n");
-    fprintf(stderr, "                          aligner semantics as taps (alias: 5-base)\n");
-    fprintf(stderr, "                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS\n");
-    fprintf(stderr, "                 or 5-base data without =taps or =5base inverts every\n");
-    fprintf(stderr, "                 methylation call.\n");
-    fprintf(stderr, "   --meth-scoring collapsed|genomic|neutral\n");
-    fprintf(stderr, "                 scoring mode. Default depends on chemistry: collapsed for\n");
-    fprintf(stderr, "                 --meth/--meth=emseq, neutral for --meth=taps|5base (their\n");
-    fprintf(stderr, "                 conversions are sparse, so collapsing costs specificity it\n");
-    fprintf(stderr, "                 can't repay).\n");
-    fprintf(stderr, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
-    fprintf(stderr, "                 placement (sets -B 2).\n");
-    fprintf(stderr, "                 genomic: free only the conversion direction, scored as a full\n");
-    fprintf(stderr, "                 match, keep variants as mismatches (variant-aware: variants\n");
-    fprintf(stderr, "                 outside the conversion direction counted in NM; -B 4).\n");
-    fprintf(stderr, "                 neutral: free only the conversion direction but score it 0\n");
-    fprintf(stderr, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
-    fprintf(stderr, "                 variants counted in NM as in genomic; -B 4).\n");
-    fprintf(stderr, "                 In genomic/neutral a real variant in the conversion direction\n");
-    fprintf(stderr, "                 itself (C->T at a reference C) is indistinguishable from a\n");
-    fprintf(stderr, "                 conversion and is not counted in NM.\n");
-    fprintf(stderr, "   --meth-seed-prune[=spec30|baseline|off]\n");
-    fprintf(stderr, "                 prune the 3-letter alphabet's short, repetitive spurious SMEMs\n");
-    fprintf(stderr, "                 before SA resolution: ~30%% faster --meth at ~0 accuracy cost\n");
-    fprintf(stderr, "                 vs truth (measured WGS/WES/em-seq, mapq>=20 accuracy identical).\n");
-    fprintf(stderr, "                 ON by default under --meth (spec30) -- --meth is bwa-mem3-native,\n");
-    fprintf(stderr, "                 so there is no upstream reference output to preserve. spec30:\n");
-    fprintf(stderr, "                 per-read two-regime rule; baseline: drop len<25 & SA-count>1;\n");
-    fprintf(stderr, "                 off: restore the un-pruned seeding (byte-identical). NOT\n");
-    fprintf(stderr, "                 byte-identical vs off. Env BWAMEM3_METH_SEED_PRUNE (off|spec30|\n");
-    fprintf(stderr, "                 baseline) overrides this flag for A/B testing.\n");
-    fprintf(stderr, "   --meth-tags SPEC\n");
-    fprintf(stderr, "                 which Bismark tags to emit: 'all' (default), 'none', a\n");
-    fprintf(stderr, "                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).\n");
-    fprintf(stderr, "                 Comma-separated, NOT space-separated (a second word becomes\n");
-    fprintf(stderr, "                 the reference). An exclusion may be written ^XM or -XM; prefer\n");
-    fprintf(stderr, "                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).\n");
-    fprintf(stderr, "                 Unselected tags are not computed. XM:Z is a read-length string\n");
-    fprintf(stderr, "                 and dominates the BAM's aux payload; '^XM' drops it for callers\n");
-    fprintf(stderr, "                 that recompute from the reference (MethylDackel, biscuit).\n");
-    fprintf(stderr, "                 Keep XM for Bismark-family tools (bismark_methylation_extractor,\n");
-    fprintf(stderr, "                 methylKit, methtuple, DMRfinder, epialleleR).\n");
-    fprintf(stderr, "   --set-as-failed f|r\n");
-    fprintf(stderr, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
-    fprintf(stderr, "   --chimera-qc\n");
-    fprintf(stderr, "                 enable the bwameth.py-style longest-match <44%% chimera heuristic\n");
-    fprintf(stderr, "                 (sets 0x200, clears 0x2, caps MAPQ at 1). Off by default; not in Bismark.\n");
+    meth_opts_usage_shared(stderr);
+    meth_opts_usage_mem_only(stderr);
     fprintf(stderr, "Supplementary MAPQ rescoring (fg-labs extension):\n");
     fprintf(stderr, "   --supp-rep-hard-cap INT\n");
     fprintf(stderr, "                 force MAPQ=0 for supplementary alignments whose chain contains any seed\n");
@@ -2303,6 +2218,8 @@ int main_mem(int argc, char *argv[])
     aux.fp = stdout;
     aux.opt = opt = mem_opt_init();
     memset(&opt0, 0, sizeof(mem_opt_t));
+    meth_cli_t meth_cli;
+    memset(&meth_cli, 0, sizeof(meth_cli));
 
     /* Parse input arguments */
     // comment: added option '5' in the list
@@ -2317,12 +2234,6 @@ int main_mem(int argc, char *argv[])
     enum {
         OPT_BAM = 1000,
         OPT_BAM_THREADS,
-        OPT_METH,
-        OPT_METH_SCORING,
-        OPT_METH_SEED_PRUNE,
-        OPT_METH_TAGS,
-        OPT_METH_SET_AS_FAILED,
-        OPT_METH_CHIMERA_QC,
         OPT_SUPP_REP_HARD_CAP,
         OPT_PROPER_PAIR_FROM_EMITTED,
         OPT_LEGACY_READER,
@@ -2386,12 +2297,8 @@ int main_mem(int argc, char *argv[])
         {"extend-tie-frac",          required_argument, 0, OPT_EXTEND_TIE_FRAC},
         {"extend-tie-floor",         required_argument, 0, OPT_EXTEND_TIE_FLOOR},
         {"extend-csub",              no_argument,       0, OPT_EXTEND_CSUB},
-        {"meth",                     optional_argument, 0, OPT_METH},
-        {"meth-scoring",             required_argument, 0, OPT_METH_SCORING},
-        {"meth-seed-prune",          optional_argument, 0, OPT_METH_SEED_PRUNE},
-        {"meth-tags",                required_argument, 0, OPT_METH_TAGS},
-        {"set-as-failed",            required_argument, 0, OPT_METH_SET_AS_FAILED},
-        {"chimera-qc",               no_argument,       0, OPT_METH_CHIMERA_QC},
+        METH_LONG_OPTIONS_SHARED
+        METH_LONG_OPTIONS_MEM_ONLY
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
@@ -2793,95 +2700,8 @@ int main_mem(int argc, char *argv[])
             profile_path = optarg;
         }
 #endif
-        else if (c == OPT_METH) {
-            opt->meth_mode = 1;
-            /* --meth selects bisulfite ALIGNMENT semantics only; the output
-             * container is --bam's job here exactly as it is without --meth.
-             * (Through 0.7.x this set bam_mode=1, which made text SAM
-             * unreachable under --meth — there was no flag that undid it.) */
-            /* Optional chemistry argument. getopt_long's optional_argument only
-             * accepts the `--meth=taps` form (a separate word is treated as a
-             * positional), so a bare `--meth` leaves optarg NULL => em-seq. */
-            if (optarg != NULL) {
-                size_t k = 0, n = sizeof(meth_chem_names) / sizeof(meth_chem_names[0]);
-                while (k < n && strcmp(optarg, meth_chem_names[k].name) != 0) ++k;
-                if (k == n) {
-                    fprintf(stderr, "ERROR: --meth accepts 'emseq' (default; aliases em-seq, bisulfite), "
-                                    "'taps', or '5base' (alias 5-base), got '%s'\n", optarg);
-                    free(opt);
-                    if (out_opened) fclose(aux.fp);
-                    return 1;
-                }
-                opt->meth_chem = meth_chem_names[k].chem;
-            }
-        }
-        else if (c == OPT_METH_SCORING) {
-            if (optarg != NULL && strcmp(optarg, "collapsed") == 0) {
-                opt->meth_scoring = MEM_METH_SCORING_COLLAPSED;
-                opt0.meth_scoring = 1;
-            } else if (optarg != NULL && strcmp(optarg, "genomic") == 0) {
-                opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
-                opt0.meth_scoring = 1;
-            } else if (optarg != NULL && strcmp(optarg, "neutral") == 0) {
-                opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
-                opt0.meth_scoring = 1;
-            } else {
-                fprintf(stderr, "ERROR: --meth-scoring requires 'collapsed', 'genomic', or 'neutral'\n");
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-        }
-        else if (c == OPT_METH_SEED_PRUNE) {
-            /* --meth-seed-prune[=spec30|baseline|off]: prune the 3-letter
-             * over-seeding before SA resolution (~30% faster --meth at ~0 truth
-             * accuracy cost; NOT byte-identical). ON by default under --meth
-             * (SPEC30, set in the meth-default block below); pass =off to restore
-             * byte-identical seeding. getopt_long's optional_argument only binds
-             * with '=' (a bare word is a positional), so a plain --meth-seed-prune
-             * leaves optarg NULL => spec30 (the recommended rule). */
-            if (optarg == NULL || strcmp(optarg, "spec30") == 0) {
-                opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
-            } else if (strcmp(optarg, "baseline") == 0) {
-                opt->meth_seed_prune = MEM_METH_PRUNE_BASELINE;
-            } else if (strcmp(optarg, "off") == 0) {
-                opt->meth_seed_prune = MEM_METH_PRUNE_OFF;
-            } else {
-                /* optarg is non-NULL here (NULL took the spec30 branch), so the
-                 * value was bound with '=' -- the orphaned-space case cannot
-                 * reach this branch, and a "use =, not a space" note would
-                 * misdirect. Just name the accepted vocabulary. */
-                fprintf(stderr, "ERROR: --meth-seed-prune accepts 'spec30' (default), 'baseline', or 'off'\n");
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-            opt0.meth_seed_prune = 1;   /* explicit: wins over the --meth spec30 default below */
-        }
-        else if (c == OPT_METH_TAGS) {
-            const char *tag_err = NULL;
-            if (mem_opt_parse_meth_tags(optarg, &opt->meth_tags, &tag_err) != 0) {
-                fprintf(stderr, "ERROR: --meth-tags '%s': %s\n"
-                                "       expected 'all', 'none', a comma-separated list "
-                                "(e.g. XR,XG), or ^-prefixed exclusions (e.g. ^XM)\n",
-                        optarg != NULL ? optarg : "", tag_err);
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-            opt0.meth_tags = 1;
-        }
-        else if (c == OPT_METH_SET_AS_FAILED) {
-            if (optarg == NULL || !(optarg[0] == 'f' || optarg[0] == 'r') || optarg[1] != '\0') {
-                fprintf(stderr, "ERROR: --set-as-failed requires 'f' or 'r'\n");
-                free(opt);
-                if (out_opened) fclose(aux.fp);
-                return 1;
-            }
-            opt->meth_set_as_failed = optarg[0];
-        }
-        else if (c == OPT_METH_CHIMERA_QC) {
-            opt->meth_chimera_qc = 1;
+        else if (meth_opts_parse(c, optarg, opt, &meth_cli)) {
+            /* The --meth family: parsed and range-checked in meth_opts.cpp. */
         }
         else if (c == OPT_SUPP_REP_HARD_CAP) {
             char *end = NULL;
@@ -3698,37 +3518,11 @@ int main_mem(int argc, char *argv[])
      * NB: those constants are quoted at bwameth's match score (a == 1) and are
      * scaled by opt->a inside mem_opt_apply_meth_defaults — see bwamem.h. Before
      * that, they were applied flat and silently discarded -A. */
+    /* Cross-option checks and the chemistry defaults (TAPS -> neutral scoring,
+     * spec30 seed pruning); runs before the scored defaults below read the
+     * resolved scoring mode. */
+    meth_opts_finalize(opt, &meth_cli);
     if (opt->meth_mode) {
-        /* TAPS (and 5base, which is TAPS here) defaults to NEUTRAL scoring.
-         * TAPS converts only the METHYLATED cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
-         * 3.2% of C vs 94.6% on chr22 @ 12x). The collapsed 3-letter alphabet buys
-         * little at that density and costs specificity. NEUTRAL goes one step
-         * further: it scores the conversion cell as 0 rather than a full match,
-         * so a sparse TAPS conversion is tolerated without over-crediting spurious
-         * C->T alignments. Measured on 4.07M simulated TAPS reads vs full hg38,
-         * across three methylation loads: NEUTRAL placed 95.95-96.01% (essentially
-         * the 96.02% unconverted ceiling) vs GENOMIC 95.68-95.73% and COLLAPSED
-         * 95.37-95.43% -- a robust +0.24-0.28 pp over genomic -- with IDENTICAL
-         * MAPQ calibration (60+ bin 99.99% both) and NM (1.966 vs 1.969), so the
-         * gain is not bought with over-confidence or inflated edit distance.
-         * NEUTRAL's freed cell is not rank-1, but the generalized kswv freed-cell
-         * blend scores it to its matrix value, so mate rescue stays on the batched
-         * kernel on the freed-capable tiers (NEON/AVX2/AVX512BW) and falls back to
-         * scalar ksw_align2 only on the freed-less x86 tiers (sse41/sse42/avx),
-         * exactly as GENOMIC and COLLAPSED do. An explicit --meth-scoring still wins.
-         * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
-         * off the resolved scoring mode. */
-        if (opt->meth_chem == METH_CHEM_TAPS && !opt0.meth_scoring)
-            opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
-        /* --meth-seed-prune defaults to spec30 under --meth. Unlike non-meth, --meth
-         * is a bwa-mem3-native feature -- bwa/bwa-mem2 never had a bisulfite mode, so
-         * there is no upstream reference output to stay byte-identical to. spec30 is
-         * ~30% faster on em-seq at ~0 truth-based accuracy cost (mapq>=20 accuracy
-         * identical; 8x fewer newly-unmapped than the `baseline` rule). An explicit
-         * --meth-seed-prune=off|baseline (or the BWAMEM3_METH_SEED_PRUNE env) still
-         * wins; no effect outside --meth (the prune is gated on the meth remap). */
-        if (!opt0.meth_seed_prune)
-            opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
         /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);

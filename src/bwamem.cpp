@@ -29,6 +29,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "meth_opts.h"   /* METH_CTX_ALL */
 #include "chain_seed_pool.h"
 #include "ext_reverse_copy.h"
 #include "chain_window_prefetch.h"
@@ -784,6 +785,7 @@ mem_opt_t *mem_opt_init()
     o->meth_seed_prune = 0;                        /* base default off; --meth turns it on
                                                       (SPEC30), set in fastmap.cpp */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
+    o->meth_context = METH_CTX_ALL;                /* --meth-context default: every C converts */
     o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
     /* Match bwa and bwa-mem2, which both derive FLAG 0x2 from a[0]. Explicit

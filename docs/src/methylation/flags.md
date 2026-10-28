@@ -1,6 +1,7 @@
-# Flags: --meth chemistry, --meth-scoring, --meth-tags, --set-as-failed, --chimera-qc
+# Flags: --meth chemistry, --meth-context, --meth-scoring, --meth-tags, --set-as-failed, --chimera-qc
 
 `--meth` itself takes an optional chemistry argument. Alongside it,
+`--meth-context` selects where a conversion is free,
 `--meth-scoring` selects the scoring model and `--meth-tags` selects which
 Bismark tags are emitted; `--set-as-failed` and `--chimera-qc`
 control QC behavior during BAM post-processing (both affect the chimera QC and
@@ -129,6 +130,27 @@ simulated 5-base reads ([measurement](5base.md#measured-on-simulated-5-base-read
 > explicit `-B` overrides the mode default and still reaches the per-strand
 > matrices, whether it appears before or after `--meth`. The other `--meth`
 > defaults (`-L 10 -U 100 -T 40 -M -C`) are the same across modes.
+
+## `--meth-context {all|cpg}`
+
+Where a methylation conversion is free. `all` (the default, for every chemistry)
+frees the conversion at every cytosine, exactly as `--meth-scoring` describes.
+`cpg` frees it only at a CpG: a C-to-T change at a cytosine that is not followed
+by a G scores as an ordinary mismatch. TAPS and 5-base convert only methylated
+cytosines, and in mammals those are almost all CpG, so `cpg` stops the aligner
+from tolerating conversions that the chemistry does not produce.
+
+`cpg` is rejected, with the message naming the cause, in three cases:
+
+- under `--meth=emseq` (and its aliases `em-seq`, `bisulfite`), where every
+  unmethylated C converts, so conversions are not confined to CpG;
+- with `--meth-scoring collapsed`, which also frees reference T against read C,
+  a change with no CpG meaning;
+- without `--meth`.
+
+The value is required and case-sensitive. Write it with a space or with `=`
+(`--meth-context cpg` or `--meth-context=cpg`). Output with `all` is
+byte-identical to a run without the option.
 
 ## `--meth-tags SPEC`
 
