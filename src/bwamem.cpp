@@ -5608,7 +5608,10 @@ static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
  * the reference length and forward-strand start (whose bases mem_core_key_equal
  * compares), the true score and band that set the DP band and the retry loop, and
  * the --meth hypothesis that picks the matrix. The read itself and `opt` are the
- * same for every region of one mem_gen_alt call, so they are not part of it. */
+ * same for every region of one mem_gen_alt call, so they are not part of it.
+ * Under --meth-context cpg the CpG labels of the window also read the bases
+ * beyond it, which this key does not cover, so mem_gen_alt does not key a hit
+ * that regenerates on labels. */
 int mem_core_key(const bntseq_t *bns, const mem_alnreg_t *ar, mem_core_key_t *k)
 {
     const int64_t l_pac = bns->l_pac;

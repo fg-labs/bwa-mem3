@@ -23,6 +23,7 @@
 #include "bwa.h"
 #include "bwamem.h"
 #include "bntseq.h"
+#include "meth_opts.h"
 #include "meth_orig_ref_fixture.h"
 
 #include <sys/mman.h>
@@ -362,6 +363,53 @@ void check_meth_hypothesis(mem_opt_t *opt) {
     check_gen_alt(opt, rd, regs, rd.seq.data(), 2, {{h0, h1}});
 }
 
+// --meth-context cpg: the CpG labels of a window read the reference base on
+// either side of it, which the key does not hold. Two copies of a segment that
+// ends in C, one followed by G (a CpG) and one by A, regenerate a read with a T
+// there differently: a conversion at the CpG, a C/T mismatch at the other.
+void check_cpg_flank(mem_opt_t *opt) {
+    Dups d;
+    const int kRef = Dups::kRef, seg_len = Dups::seg_len;
+    std::string seg = d.seg;
+    seg[seg_len - 1] = 'C';
+    d.ref.replace(Dups::seg_at, seg_len, seg);
+    d.ref[Dups::seg_at + seg_len] = 'G';
+    d.ref.replace(1000, seg_len, seg);
+    d.ref[1000 + seg_len] = 'G';
+    d.ref.replace(2000, seg_len, seg);
+    d.ref[2000 + seg_len] = 'A';
+    // The same on the reverse strand: forward copies of revcomp(seg), whose window
+    // (the reverse-complement frame) ends in that C and continues into the forward
+    // base before the copy, complemented: C there makes the CpG, T does not.
+    const std::string rc = revcomp(seg);
+    d.ref.replace(3000, seg_len, rc);
+    d.ref[3000 - 1] = 'C';
+    d.ref.replace(4000, seg_len, rc);
+    d.ref[4000 - 1] = 'T';
+    std::string read = seg;
+    read[seg_len - 1] = 'T';
+    Reads rd(d.ref, read);
+    opt->max_XA_hits = opt->max_XA_hits_alt = 50;
+    std::vector<mem_alnreg_t> regs;
+    auto add = [&](int64_t fb, bool rev) {
+        // the hypothesis is the genome strand's: OT (1) on the forward half, OB (0) on the reverse
+        regs.push_back(region(kRef, fb, fb + seg_len, rev, 0, seg_len, 140, 150, opt->w, regs.empty() ? -1 : 0,
+                              rev ? 0 : 1));
+        return (int)regs.size() - 1;
+    };
+    add(Dups::seg_at, false);
+    const int cpg = add(1000, false), non_cpg = add(2000, false);
+    const int rev_cpg = add(3000, true), rev_non_cpg = add(4000, true);
+    for (const auto &pr : {std::make_pair(cpg, non_cpg), std::make_pair(rev_cpg, rev_non_cpg)}) {
+        mem_core_key_t k0, k1;
+        REQUIRE(mem_core_key(rd.fx.orig_bns, &regs[pr.first], &k0));
+        REQUIRE(mem_core_key(rd.fx.orig_bns, &regs[pr.second], &k1));
+        REQUIRE(mem_core_key_equal(rd.fx.orig_bns, rd.fx.orig_pac, &k0, &k1));  // equal key, yet ...
+    }
+    // ... distinct: no reuse, on either strand
+    check_gen_alt(opt, rd, regs, rd.seq.data(), 0, {{cpg, non_cpg}, {rev_cpg, rev_non_cpg}});
+}
+
 }  // namespace
 
 TEST_CASE("mem_gen_alt: a reused duplicate hit gives the XA entry of a fresh regeneration" *
@@ -374,6 +422,15 @@ TEST_CASE("mem_gen_alt: a reused duplicate hit gives the XA entry of a fresh reg
         mem_opt_fill_meth_mat(meth);
         check_duplicates(meth);
         check_meth_hypothesis(meth);
+        free(meth);
+    }
+    SUBCASE("--meth-context cpg") {
+        mem_opt_t *meth = mem_opt_init();
+        meth->meth_mode = 1;
+        meth->meth_scoring = MEM_METH_SCORING_GENOMIC;
+        meth->meth_context = METH_CTX_CPG;
+        mem_opt_fill_meth_mat(meth);
+        check_cpg_flank(meth);
         free(meth);
     }
 }

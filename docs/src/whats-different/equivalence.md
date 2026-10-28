@@ -340,6 +340,21 @@ that set and on phiX. See
 `FG-METH-DIVERGENCE` row in the catalog below is generated from the divergence registry and does
 not yet carry this change.
 
+`--meth-context` ([#663](https://github.com/fg-labs/bwa-mem3/pull/663)) is opt-in and changes
+nothing by default: with `all`, or without the option, alignment records are byte-identical to
+the previous build (`@PG` excluded). Measured without `--meth` and with `--meth=5base` on
+338,790 simulated 2×150 bp chr22 5-base reads on Intel Sapphire Rapids (x86_64, AVX2 and
+AVX-512BW, clang 19.1.7) and Apple M2 Max (arm64, NEON, Apple clang 21), where the only arm64
+differences were the 67 pairs that [#659](https://github.com/fg-labs/bwa-mem3/pull/659) fixes;
+and on three 2 M-pair real TAPS libraries (`--meth=taps`), 2 M pairs of plain WGS and of EM-seq
+`--meth` on Apple silicon (arm64, NEON, Apple clang 21), against a build that includes #659.
+`test/regression/meth_context_identity.sh` checks `all` against omitting the option in CI, and
+against a previous build when one is supplied. Under `--meth-context cpg`, `XA:Z` generation does
+not reuse one hit's global alignment for another hit with an equal key when the hit carries a
+methylation hypothesis. Such a hit is scored on a CpG-labelled window, and the labels depend on the
+reference base on either side of the window and on the contig and `N`-run bounds, which the key
+does not hold, so each such hit is regenerated on its own. Every other hit is reused as before.
+
 ## Degenerate numeric inputs (fail-fast, not silent)
 
 Six kinds of degenerate command line that upstream bwa/bwa-mem2 accept but then mishandle
