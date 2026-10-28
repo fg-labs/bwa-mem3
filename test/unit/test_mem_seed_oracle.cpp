@@ -545,6 +545,7 @@ std::vector<Smem> run_collect(FMI_search *fmi, Batch &b, const mem_opt_t *opt) {
     _mm_free(mmc->matchArray[0]);
     _mm_free(mmc->smem_sort_scratch[0].cnt);
     _mm_free(mmc->smem_sort_scratch[0].tmp);
+    _mm_free(mmc->smem_sort_scratch[0].pairs);
     return v;
 }
 
