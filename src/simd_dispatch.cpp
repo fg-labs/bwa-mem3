@@ -414,27 +414,27 @@ std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
     int numThreads, int32_t maxRefLen, int32_t maxQerLen,
-    const int8_t *mat25)
+    const int8_t *mat25, bool meth_cpg)
 {
     bwamem3_simd_init();
     Ikswv *raw;
     switch (g_tier) {
       case BWAMEM3_TIER_AVX512BW:
         raw = make_kswv_kernel_avx512bw_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                            numThreads, maxRefLen, maxQerLen, mat25); break;
+                                            numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_AVX2:
         raw = make_kswv_kernel_avx2_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                        numThreads, maxRefLen, maxQerLen, mat25); break;
+                                        numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_AVX:
         raw = make_kswv_kernel_avx_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                       numThreads, maxRefLen, maxQerLen, mat25); break;
+                                       numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_SSE42:
         raw = make_kswv_kernel_sse42_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                         numThreads, maxRefLen, maxQerLen, mat25); break;
+                                         numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
       case BWAMEM3_TIER_SSE41:
       default:
         raw = make_kswv_kernel_sse41_mat(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                                         numThreads, maxRefLen, maxQerLen, mat25); break;
+                                         numThreads, maxRefLen, maxQerLen, mat25, meth_cpg); break;
     }
     return std::unique_ptr<Ikswv>(raw);
 }
@@ -468,11 +468,11 @@ std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
     int numThreads, int32_t maxRefLen, int32_t maxQerLen,
-    const int8_t *mat25)
+    const int8_t *mat25, bool meth_cpg)
 {
     return std::unique_ptr<Ikswv>(
         new kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch,
-                 numThreads, maxRefLen, maxQerLen, mat25));
+                 numThreads, maxRefLen, maxQerLen, mat25, meth_cpg));
 }
 
 /* 9-arg factory: delegates with mat25 == nullptr (original behavior). */

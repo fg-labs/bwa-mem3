@@ -134,6 +134,15 @@ const kswr_t g_defr = { 0, -1, -1, -1, -1, -1, -1 };
 
 #endif
 
+/* Function alignment of the templated kswv kernel bodies (the *_impl
+ * instantiations). Each instantiation is its own COMDAT section at the default
+ * alignment, so its phase against 64-byte boundaries follows link order and
+ * moves whenever an instantiation is added or removed; the extension kernels
+ * measured that as -3.5% on byte-identical code (BSW_KERNEL_ALIGN in
+ * bandedSWA.h). 64 bytes pins it. On the in-class declarations, where clang
+ * applies it to implicit instantiations. */
+#define KSWV_KERNEL_ALIGN __attribute__((aligned(64)))
+
 #include "kernel_dispatch.h"  /* must come before kswv class so per-tier compiles see the renamed symbol */
 
 #include <memory>
@@ -200,12 +209,21 @@ std::unique_ptr<Ikswv> make_kswv(
  * matrix) reproduces the 9-arg behavior exactly. The sign convention matches
  * make_kswv's existing callers: w_match is +a, w_mismatch is -b (negative),
  * and mat25's off-diagonals are likewise the negated penalty — passed straight
- * through to the Task-1 detectors without re-negation. */
+ * through to the Task-1 detectors without re-negation.
+ *
+ * meth_cpg (--meth-context cpg): `mat25` is then a 7-code matrix (stride 7,
+ * mat7_ot / mat7_ob in meth_model.h) and the targets the kernels score are
+ * CpG-labelled windows (codes 0..4 plus C5 = 5 and G6 = 6). The ctor accepts
+ * exactly one freed cell, on a labelled row (C5 or G6) against a base read,
+ * with every other cell of rows 5/6 equal to its base row; the kernels then
+ * free that cell only on rows whose reference byte carries the label, and score
+ * every other cell of a labelled row as its base. Anything else, and every tier
+ * without the freed-cell kernels, reports needsScalar(). */
 std::unique_ptr<Ikswv> make_kswv(
     int o_del, int e_del, int o_ins, int e_ins,
     int8_t w_match, int8_t w_mismatch,
     int numThreads, int32_t maxRefLen, int32_t maxQerLen,
-    const int8_t *mat25);
+    const int8_t *mat25, bool meth_cpg = false);
 
 /* Per-tier factory function forward declarations.
  * Defined in kswv.<tier>.o (each kernel TU compile).
@@ -224,19 +242,20 @@ extern "C" Ikswv *make_kswv_kernel_avx2(int, int, int, int, int8_t, int8_t,
 extern "C" Ikswv *make_kswv_kernel_avx512bw(int, int, int, int, int8_t, int8_t,
                                             int, int32_t, int32_t);
 
-/* Mat-aware 10-arg per-tier overloads (issue 173). Distinct C symbols (the
- * `_mat` suffix) since C linkage has no overloading; the trailing arg is the
- * 5x5 scoring matrix forwarded to the ctor for freed-cell detection. */
+/* Mat-aware per-tier overloads (issue 173). Distinct C symbols (the `_mat`
+ * suffix) since C linkage has no overloading; the trailing args are the
+ * scoring matrix and the --meth-context cpg flag, forwarded to the ctor for
+ * freed-cell detection (see the mat-aware make_kswv). */
 extern "C" Ikswv *make_kswv_kernel_sse41_mat(int, int, int, int, int8_t, int8_t,
-                                             int, int32_t, int32_t, const int8_t *);
+                                             int, int32_t, int32_t, const int8_t *, bool);
 extern "C" Ikswv *make_kswv_kernel_sse42_mat(int, int, int, int, int8_t, int8_t,
-                                             int, int32_t, int32_t, const int8_t *);
+                                             int, int32_t, int32_t, const int8_t *, bool);
 extern "C" Ikswv *make_kswv_kernel_avx_mat(int, int, int, int, int8_t, int8_t,
-                                           int, int32_t, int32_t, const int8_t *);
+                                           int, int32_t, int32_t, const int8_t *, bool);
 extern "C" Ikswv *make_kswv_kernel_avx2_mat(int, int, int, int, int8_t, int8_t,
-                                            int, int32_t, int32_t, const int8_t *);
+                                            int, int32_t, int32_t, const int8_t *, bool);
 extern "C" Ikswv *make_kswv_kernel_avx512bw_mat(int, int, int, int, int8_t, int8_t,
-                                                int, int32_t, int32_t, const int8_t *);
+                                                int, int32_t, int32_t, const int8_t *, bool);
 #endif
 
 
@@ -254,7 +273,7 @@ public:
 	kswv(const int o_del, const int e_del, const int o_ins,
 		 const int e_ins, const int8_t w_match, const int8_t w_mismatch,
 		 int numThreads, int32_t maxRefLen, int32_t maxQerLen,
-		 const int8_t *mat25);
+		 const int8_t *mat25, bool meth_cpg = false);
 
 	~kswv() override;
 
@@ -328,8 +347,13 @@ private:
 	 * blocks compile out entirely. LazyQE selects, for the two-row sweep only,
 	 * post-row query-end recovery from the stored H (true) over the per-cell
 	 * argmax blend (false); it is meaningless when RowPair is false. FScan
-	 * selects the G-based cell; see rescue_fscan_enabled. */
-	template<bool HasFreed, bool USQADD, bool RowPair, bool LazyQE, bool FScan>
+	 * selects the G-based cell; see rescue_fscan_enabled. Cpg (with HasFreed
+	 * only) is the --meth-context cpg arm: the reference bytes carry CpG
+	 * labels, each row is decoded to base codes once, and the freed cell
+	 * applies only where the raw byte is the label fr_ref + 4 (see `cpg`).
+	 * Every other instantiation is instruction-identical to the pre-Cpg body. */
+	template<bool HasFreed, bool Cpg, bool USQADD, bool RowPair, bool LazyQE, bool FScan>
+	KSWV_KERNEL_ALIGN
 	int kswv_neon_u8_impl(uint8_t seq1SoA[],
 					      uint8_t seq2SoA[],
 					      int16_t nrow,
@@ -366,7 +390,8 @@ private:
 	 * two-row sweep and its lazy query-end recovery (LazyQE is meaningless
 	 * when RowPair is false; the one-row body is always lazy). FScan selects
 	 * the G-based cell; see rescue_fscan_enabled. */
-	template<bool HasFreed, bool RowPair, bool LazyQE, bool FScan>
+	template<bool HasFreed, bool Cpg, bool RowPair, bool LazyQE, bool FScan>
+	KSWV_KERNEL_ALIGN
 	int kswv_neon_16_impl(int16_t seq1SoA[],
                           int16_t seq2SoA[],
                           int16_t nrow,
@@ -412,7 +437,8 @@ private:
 				   int phase);
 
 	/* Templated u8 kernel body; see kswv_neon_u8_impl. Sgn: the signed-domain FScan body. */
-	template<bool HasFreed, bool FScan, bool Sgn>
+	template<bool HasFreed, bool Cpg, bool FScan, bool Sgn>
+	KSWV_KERNEL_ALIGN
 	int kswv256_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
@@ -445,7 +471,8 @@ private:
 				   int phase);
 
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed, bool FScan>
+	template<bool HasFreed, bool Cpg, bool FScan>
+	KSWV_KERNEL_ALIGN
 	int kswv256_16_impl(int16_t seq1SoA[],
 				   int16_t seq2SoA[],
 				   int16_t nrow,
@@ -481,7 +508,8 @@ private:
 
 	/* Templated u8 kernel body; see kswv_neon_u8_impl. RowPair sweeps two
 	 * target rows per column (FScan bodies only; BWA3_RESCUE_ROWPAIR). */
-	template<bool HasFreed, bool FScan, bool Sgn, bool RowPair>
+	template<bool HasFreed, bool Cpg, bool FScan, bool Sgn, bool RowPair>
+	KSWV_KERNEL_ALIGN
 	int kswv512_u8_impl(uint8_t seq1SoA[],
 				   uint8_t seq2SoA[],
 				   int16_t nrow,
@@ -514,7 +542,8 @@ private:
                    int phase);
 
 	/* Templated i16 kernel body; see kswv_neon_u8_impl. */
-	template<bool HasFreed, bool FScan>
+	template<bool HasFreed, bool Cpg, bool FScan>
+	KSWV_KERNEL_ALIGN
 	int kswv512_16_impl(int16_t seq1SoA[],
                    int16_t seq2SoA[],
                    int16_t nrow,
@@ -536,6 +565,9 @@ private:
 						  int xtra); // the first gap costs -(_o+_e)
 	
 	void bwa_fill_scmat(int8_t mat[25]);
+
+	/* --meth-context cpg detection on a 7-code matrix; see kswv.cpp. */
+	void init_meth_cpg(const int8_t *mat7);
 		
 	int m;
 	int o_del, o_ins, e_del, e_ins;
@@ -618,6 +650,15 @@ private:
 	int64_t setupTicks;
 	int64_t swTicks;
 	int64_t sort2Ticks;
+
+	/* --meth-context cpg (the mat-aware ctor's meth_cpg): the targets are
+	 * CpG-labelled, and the single freed cell (fr_ref x fr_read, fr_ref the
+	 * BASE code C or G) is gated by the row's label. Each kernel's Cpg arm
+	 * decodes a labelled reference byte (fr_ref + 4, or the other label) to its
+	 * base once per row and frees the cell only where the byte was fr_ref + 4.
+	 * Implies has_freed; fr_ref2/fr_read2 equal fr_ref/fr_read. Last member,
+	 * so every other member keeps its offset. */
+	bool cpg = false;
 };
 
 #endif

@@ -590,6 +590,10 @@ static bool rescue_prune_runs(const mem_opt_t *opt, const rescue_prune_params &p
         bwamem3_simd_init();
         return bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
     }();
+    /* --meth-context cpg never prunes: the filter's bounds model 5-code matrices, and its
+     * repeat reuse compares the unlabelled window with a staged, CpG-labelled one. (The cost
+     * gate refuses every cpg run anyway: cpg excludes EM-seq and the relation.) */
+    if (meth_cpg_on(opt)) return false;
     return rescue_prune_on() && p.valid
         && rescue_prune_cost_ok(p, opt->meth_mode != 0,
                                 opt->meth_chem == METH_CHEM_EMSEQ || rescue_meth_rel(opt), avx512);
@@ -611,8 +615,9 @@ static bool rescue_band_meth_on(const mem_opt_t *opt, bool run_prunes)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_BAND_METH", 1);
     if (!rescue_prune_on() || !rescue_band_enabled() || mode == 0) return false;
-    /* --meth-context cpg: the band kernels score 5-code matrices only, and the
-     * cpg rescue runs on the scalar ksw_align2 (meth_scoring_batched_expressible). */
+    /* --meth-context cpg: the band kernels score 5-code matrices only and have no
+     * CpG gate, so a cpg rescue runs through kswv alone (its Cpg arm) or, on a tier
+     * without the freed-cell kernels, the scalar ksw_align2. */
     if (meth_cpg_on(opt)) return false;
     /* Pruning applies only without --rescue-kmer (rescue_prune_applies), so a --rescue-kmer run
      * (--fast sets it) prunes nothing and bands as an unpruned run does. */
@@ -1450,10 +1455,13 @@ static bool meth_freed_cell_tier_supported()
  * with mem_opt_fill_meth_mat and the kswv mat-aware ctor. */
 static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
 {
-    /* Every mem_opt_fill_meth_mat matrix is kernel-expressible. The
-     * --meth-context cpg matrices (7 codes, meth_model.h) are not yet: their
-     * rescue takes the scalar ksw_align2 on a labelled window. */
-    if (meth_cpg_on(opt)) return false;
+    /* Every mem_opt_fill_meth_mat matrix is kernel-expressible, and so are the
+     * --meth-context cpg matrices (mat7_ot / mat7_ob, meth_model.h): the kernels'
+     * Cpg arm frees the conversion only on rows whose reference byte carries the
+     * CpG label, which _pre writes into the staged window (meth_label_window).
+     * So cpg, too, is batched exactly where the tier has the freed-cell kernels,
+     * and takes the scalar ksw_align2 at m = 7 everywhere else. */
+    (void) opt;
     return meth_freed_cell_tier_supported();
 }
 
@@ -1603,12 +1611,15 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         // the 16-bit shift headroom (a group is <= pcnt <= wsize_pair pairs).
         SeqPair *scratch = mmc->seqPairArrayRight128[tid];
 
+        /* --meth-context cpg: the 7-code matrices on the CpG-labelled windows _pre
+         * staged (meth_model_mat's matrices for hyp 1 / 0); the kernels' Cpg arm. */
+        const bool cpg = meth_cpg_on(opt) != 0;
         auto pwsw_ot = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                  opt->a, -1*opt->b, nthreads,
-                                 maxRefLen, maxQerLen, opt->mat_ot);
+                                 maxRefLen, maxQerLen, cpg ? opt->mat7_ot : opt->mat_ot, cpg);
         auto pwsw_ob = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                  opt->a, -1*opt->b, nthreads,
-                                 maxRefLen, maxQerLen, opt->mat_ob);
+                                 maxRefLen, maxQerLen, cpg ? opt->mat7_ob : opt->mat_ob, cpg);
         // The batched kernel expresses exactly the matrices mem_opt_fill_meth_mat
         // produces: GENOMIC (one freed cell to +a), NEUTRAL (one freed cell to 0),
         // and COLLAPSED (the conversion cell PLUS its mirror — a symmetric
@@ -2416,11 +2427,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * is reachable via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch) or on
              * a freed-less SIMD tier (sse41/sse42/avx), where the kswv kernel has
              * no freed-cell override and every scoring mode must score scalar. */
-            /* --meth-context cpg takes this route too (meth_scoring_batched_expressible
-             * is false), so every cpg job leaves here: the k-mer anchor scan,
-             * --rescue-kmer narrowing, --rescue-skip and rescue pruning below never
-             * run for it, and the window unpacked above is unused. _post re-fetches
-             * the window into a private copy, labels it and scores it at m = 7. */
+            /* --meth-context cpg takes this route only where the batched path does not
+             * run (the escape hatch, or a tier without the freed-cell kernels); _post
+             * then re-fetches the window into a private copy, labels it and scores it
+             * at m = 7. On the batched path the window is labelled where it is staged
+             * below; the k-mer anchor scan and --rescue-kmer narrowing before that read
+             * the plain window, and rescue pruning never runs under cpg
+             * (rescue_prune_runs). */
             if (opt->meth_mode && (!meth_batched_rescue_enabled()
                     || !meth_scoring_batched_expressible(opt))) {
                 // Escape hatch (env=0) or freed-less tier: keep the legacy scalar
@@ -2681,6 +2694,17 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                  * The per-byte loop is kept as memcpy (same bytes, matches the
                  * _post ref_rw memcpy), which is byte-identical. */
                 memcpy(rs, ref, (size_t)sp.len1);
+                /* --meth-context cpg: label the staged copy (this pair's own bytes in the
+                 * thread's seqBufRef, never the fetch scratch or a loaded reference) in
+                 * its fetch frame, from its own start rb. That is where any narrowing
+                 * (--rescue-kmer) left rb, and it is exactly the labelling of the full
+                 * window narrowed afterwards: meth_label_cpg reads an edge base's
+                 * neighbour beyond the window from pac, in the same frame and contig.
+                 * The kernels' Cpg arm reads the labels (mem_sam_pe_batch builds the
+                 * kswv objects on mat7_ot / mat7_ob); the between-phase reversal keeps
+                 * them, as ksw_align2's does on the scalar path. */
+                if (meth_cpg_on(opt))
+                    meth_label_window(rs, sp.len1, rb, rid, bns, pac, mmc->ref_string);
                 /* Query: stage the mate bases directly from $ms (no `rev`
                  * scratch). For is_rev, reverse-complement into qs; this is
                  * byte-identical to the removed two-step (build rev, then

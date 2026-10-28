@@ -540,7 +540,7 @@ jobs:
           TEST_BIN=./test/bwa_mem3_tests_unit \
           OUT_DIR=/tmp/ci-out \
           ARCH_LABEL="$MATRIX_ARCH" \
-          SUITE_ARGS="--test-suite=unit/kswv,unit/bandedswa" \
+          SUITE_ARGS="--test-suite=unit/kswv,unit/kswv_cpg,unit/bandedswa" \
             bash .github/scripts/kswv-tier-sweep.sh
 
       - name: Upload kswv unit test JUnit reports
