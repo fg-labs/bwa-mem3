@@ -234,6 +234,13 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
   probe. Where the B-tree's answer depends on its node layout (two chains with
   the same position) or a read has more than `BWA3_CHAIN_FLAT_CAP` chains, the
   read is replayed through the unchanged B-tree path.
+- **Per-seed chaining helpers inlined ([PR #664](https://github.com/fg-labs/bwa-mem3/pull/664)).** The three helpers each
+  resolved seed passes through (`chain_add_seed`, the flat index's insert and
+  the B-tree fallback) were declared `inline`, but clang kept them out of line,
+  so every seed paid two calls. They are now `always_inline`. On the 5M-pair WGS
+  slice at `-t 16` (clang 19, 10 interleaved rounds) the chaining stage drops
+  7.4 % on AMD Zen 4 (AVX-512BW) and 9.1 % on Graviton 4 (NEON), and wall time
+  0.56 % and 0.43 %, with identical output.
 
 | Variable | Effect |
 |---|---|
