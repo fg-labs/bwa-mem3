@@ -319,7 +319,7 @@ runs=(
     "h2|-h 2"
     "z75|-z 0.75"
     "z76|-z 0.76"
-    "all|-a"
+    "xa|-a"
     "intractg|-x intractg"
     "pacbio|-x pacbio"
 )
@@ -423,10 +423,10 @@ for tier in $(mem_cli_tiers); do
     mem_cli_expect "$tier: -h 1 inR XA HN" " 2" "$(mem_cli_tag "$rec" XA) $(mem_cli_tag "$rec" HN)"
     mem_cli_expect "$tier: -z 0.75 inS XA" "ctg2,+2101,100M,5;" "$(mem_cli_tag "$(mem_cli_primary "$(s z75)" inS)" XA)"
     mem_cli_expect "$tier: -z 0.76 inS XA" "" "$(mem_cli_tag "$(mem_cli_primary "$(s z76)" inS)" XA)"
-    rec="$(record "$(s all)" inS 256)"
+    rec="$(record "$(s xa)" inS 256)"
     mem_cli_expect "$tier: -a inS secondary" "256 ctg2 2101 100M 75 5" "$(fields "$rec") $(mem_cli_tag "$rec" NM)"
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
-    mem_cli_expect "$tier: -a inR secondaries" 2 "$(mem_cli_count "$(s all)" '$1 == "inR" && int($2 / 256) % 2 == 1')"
+    mem_cli_expect "$tier: -a inR secondaries" 2 "$(mem_cli_count "$(s xa)" '$1 == "inR" && int($2 / 256) % 2 == 1')"
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
     mem_cli_expect "$tier: default inS secondaries" 0 \
         "$(mem_cli_count "$(s default)" '$1 == "inS" && int($2 / 256) % 2 == 1')"
