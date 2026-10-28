@@ -315,6 +315,12 @@ struct BswScoreDomainCounts {
     uint64_t signed_batches = 0, unsigned_batches = 0;
 };
 
+/* --meth-context cpg reference codes in the kernels' reference stream (the
+ * values of METH_C5 / METH_G6 in meth_model.h; test_bandedswa_cpg.cpp checks
+ * they agree). See "CpG arm" in bandedSWA.cpp. */
+#define BSW_CPG_C5 5
+#define BSW_CPG_G6 6
+
 #include "kernel_dispatch.h"  /* must come before BandedPairWiseSW class so per-tier compiles see the renamed symbol */
 
 #include <memory>
@@ -426,6 +432,19 @@ public:
      * before any (possibly multi-threaded) getScores call. */
     virtual void set_guard_overshoot(bool on) = 0;
 
+    /* --meth-context cpg: switch getScores8/16 to the CpG arm. The object must
+     * be built on a 7-code matrix (m = 7, meth_model.h) whose ACGT block is the
+     * plain symmetric matrix and whose only other difference from it is one
+     * cell: reference code fr_ref_base + 4 (C5 or G6) x read fr_read, worth
+     * fr_val, which must not exceed w_match (the band clamp and the 8-bit
+     * envelope bound a cell by w_match). The targets it scores are
+     * CpG-labelled windows (codes 0..3, 5, 6).
+     * Every result equals scalarBandedSWA's on the same object. OT passes
+     * (METH_C, METH_T, mat7_ot's C5 x T cell), OB (METH_G, METH_A, mat7_ob's
+     * G6 x A cell). Set once at setup, before any getScores call; there is no
+     * way back. */
+    virtual void set_meth_cpg(int fr_ref_base, int fr_read, int fr_val) = 0;
+
     /* Same-row lane compaction in getScores8 (NEON, AVX2 and AVX-512BW tiers; a no-op on the
      * others). A batch runs in superblocks of `groups` lane groups in row lockstep, and the
      * live lanes of a group are moved into dead lanes of the others once they fit, so finished
@@ -451,9 +470,10 @@ public:
 /* Factory: returns a per-tier concrete BandedPairWiseSW. Construction
  * arguments mirror the BandedPairWiseSW ctor exactly. `m` is the alphabet size
  * of `mat` (its row stride, target-major mat[ref*m + read]): 5, or 7 for a
- * --meth-context cpg matrix (meth_model.h). Only the scalar kernel
- * (scalarBandedSWA) scores an m = 7 alphabet; the SIMD kernels read the ACGT
- * submatrix at stride m and are not given labelled targets. */
+ * --meth-context cpg matrix (meth_model.h). The SIMD kernels read the ACGT
+ * submatrix at stride m; an m = 7 object scores CpG-labelled targets in its
+ * SIMD kernels only after set_meth_cpg (scalarBandedSWA scores them at any
+ * time). */
 std::unique_ptr<IBandedPairWiseSW> make_banded_pair_wise_sw(
     int o_del, int e_del, int o_ins, int e_ins, int zdrop,
     int end_bonus, const int8_t *mat,
@@ -529,6 +549,8 @@ public:
     bool guard_overshoot_ = false;
     void set_guard_overshoot(bool on) override { guard_overshoot_ = on; }
 
+    void set_meth_cpg(int fr_ref_base, int fr_read, int fr_val) override;
+
     // Same-row lane compaction settings, read by getScores8 on the NEON, AVX2 and AVX-512BW tiers
     // (unused elsewhere). The constructor sets the tier's default; see set_lane_compaction.
     int compact_groups_ = 0;
@@ -570,6 +592,7 @@ public:
                     uint16_t numThreads,
                     int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper8(SeqPair *pairArray,
                                    uint8_t *seqBufRef,
                                    uint8_t *seqBufQer,
@@ -577,6 +600,7 @@ public:
                                    uint16_t numThreads,
                                    int32_t w);
 
+    template <bool CPG>
     void smithWaterman128_8(uint8_t seq1SoA[],
                             uint8_t seq2SoA[],
                             int nrow,
@@ -591,6 +615,7 @@ public:
 #if defined(__aarch64__)
     // Same-row lane compaction: superblocks of K 16-lane groups in row lockstep; see
     // bandedSWA_compact.inc and set_lane_compaction.
+    template <bool CPG>
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                            uint8_t *seqBufRef,
                                            uint8_t *seqBufQer,
@@ -606,6 +631,7 @@ public:
                      uint16_t numThreads,
                      int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
                                      uint8_t *seqBufQer,
@@ -613,6 +639,7 @@ public:
                                      uint16_t numThreads,
                                      int32_t w);
 
+    template <bool CPG>
     void smithWaterman128_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -639,6 +666,7 @@ public:
                     uint16_t numThreads,
                     int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper8(SeqPair *pairArray,
                                    uint8_t *seqBufRef,
                                    uint8_t *seqBufQer,
@@ -646,6 +674,7 @@ public:
                                    uint16_t numThreads,
                                    int32_t w);
 
+    template <bool CPG>
     void smithWaterman256_8(uint8_t seq1SoA[],
                             uint8_t seq2SoA[],
                             int nrow,
@@ -659,6 +688,7 @@ public:
                             uint8_t myband[]);
     // Same-row lane compaction: superblocks of K 32-lane groups in row lockstep; see
     // bandedSWA_compact256.inc and set_lane_compaction.
+    template <bool CPG>
     void smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                            uint8_t *seqBufRef,
                                            uint8_t *seqBufQer,
@@ -673,6 +703,7 @@ public:
                      uint16_t numThreads,
                      int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
                                      uint8_t *seqBufQer,
@@ -680,6 +711,7 @@ public:
                                      uint16_t numThreads,
                                      int32_t w);
 
+    template <bool CPG>
     void smithWaterman256_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -734,6 +766,7 @@ public:
                      uint16_t numThreads,
                      int32_t w) override;
 
+    template <bool CPG>
     void smithWatermanBatchWrapper16(SeqPair *pairArray,
                                      uint8_t *seqBufRef,
                                      uint8_t *seqBufQer,
@@ -741,6 +774,7 @@ public:
                                      uint16_t numThreads,
                                      int32_t w);
     
+    template <bool CPG>
     void smithWaterman512_16(uint16_t seq1SoA[],
                              uint16_t seq2SoA[],
                              uint16_t nrow,
@@ -766,15 +800,16 @@ private:
     // score ^ 0x80; else the unsigned score). Private: each instantiation requires H to be
     // seeded in its domain, which only the public wrappers above guarantee, deciding the domain
     // once per call from the gap penalty bytes (bsw8_gap_bytes_fit_int8). See the score-domain
-    // note above MAIN_CODE8_CORE in bandedSWA.cpp.
-    template <bool SIGNED8>
+    // note above MAIN_CODE8_CORE in bandedSWA.cpp. CPG selects the CpG arm (set_meth_cpg; the
+    // wrappers pass cpg_), as on every tier's kernel templates.
+    template <bool SIGNED8, bool CPG>
     void smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
                                         uint8_t *seqBufRef,
                                         uint8_t *seqBufQer,
                                         int32_t numPairs,
                                         uint16_t numThreads,
                                         int32_t w);
-    template <bool SIGNED8>
+    template <bool SIGNED8, bool CPG>
     void smithWaterman512_8Impl(uint8_t seq1SoA[],
                                 uint8_t seq2SoA[],
                                 int nrow,
@@ -786,7 +821,7 @@ private:
                                 int zdrop,
                                 int32_t w,
                                 uint8_t myband[]);
-    template <bool SIGNED8>
+    template <bool SIGNED8, bool CPG>
     void smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                                                uint8_t *seqBufRef,
                                                uint8_t *seqBufQer,
@@ -854,6 +889,13 @@ private:
     int8_t  *sbt8_;
     int16_t *sbt16_;
     void *dp_slab_;
+
+    // The CpG arm (set_meth_cpg): when cpg_ is set the wrappers run the kernels'
+    // CPG = true instantiations, which score the one gated cell
+    // (row code cpg_ref_code_ x read cpg_read_ -> cpg_val_). Read-only during scoring.
+    // Last in the class, so the non-cpg fields keep their offsets.
+    bool cpg_ = false;
+    int8_t cpg_ref_code_ = 0, cpg_read_ = 0, cpg_val_ = 0;
 
     int64_t sort1Ticks;
     int64_t setupTicks;

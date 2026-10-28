@@ -6694,12 +6694,9 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
                         base_scratch, hist);
         return;
     }
-    /* --meth-context cpg: the OT/OB pairs carry CpG-labelled targets and 7-code
-     * matrices, which only the scalar kernel (scalarBandedSWA, stride m) scores,
-     * so every partition of this tier runs on it. The scalar kernel is the
-     * reference the 8- and 16-bit kernels are byte-identical to, so the SYM
-     * partition's scores are unchanged by the routing. */
-    if (meth_cpg_on(opt)) tier = BSW_TIER_SCALAR;
+    /* --meth-context cpg needs no routing here: the OT/OB objects score their
+     * CpG-labelled targets in the kernels' CpG arm (set_meth_cpg, set where they
+     * are built), on every tier, and the SYM pairs carry plain targets. */
     /* Dutch-flag partition into [OT (key 0) | OB (key 1) | SYM (key 2)]. Order
      * within/among runs is irrelevant: the kernel re-sorts by length and the
      * caller maps each result back to its alnreg by seqid/regid. */
@@ -8535,8 +8532,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     std::unique_ptr<IBandedPairWiseSW> bswLeftOt, bswLeftOb, bswRightOt, bswRightOb;
     if (opt->meth_mode) {
         /* Under --meth-context cpg the 7-code matrices (mat_m = 7): the windows
-         * of chains with a hypothesis are labelled (derive_chain_window), and
-         * bsw_run_tier scores them on the scalar kernel. */
+         * of chains with a hypothesis are labelled (derive_chain_window), and the
+         * objects run the kernels' CpG arm on the one gated cell of each matrix
+         * (set_meth_cpg below). */
         int mat_m;
         const int8_t *m_ot = meth_model_mat(opt, 1, &mat_m);   /* OT: frees C->T */
         const int8_t *m_ob = meth_model_mat(opt, 0, &mat_m);   /* OB: frees G->A */
@@ -8556,6 +8554,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         bswLeftOb->set_guard_overshoot(true);
         bswRightOt->set_guard_overshoot(true);
         bswRightOb->set_guard_overshoot(true);
+        if (mat_m == METH_M) {
+            const int ot_val = m_ot[METH_C5 * METH_M + METH_T];   /* C5 x read T */
+            const int ob_val = m_ob[METH_G6 * METH_M + METH_A];   /* G6 x read A */
+            bswLeftOt->set_meth_cpg(METH_C, METH_T, ot_val);
+            bswRightOt->set_meth_cpg(METH_C, METH_T, ot_val);
+            bswLeftOb->set_meth_cpg(METH_G, METH_A, ob_val);
+            bswRightOb->set_meth_cpg(METH_G, METH_A, ob_val);
+        }
     }
 
     int i;

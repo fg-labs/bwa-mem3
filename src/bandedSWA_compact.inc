@@ -67,6 +67,7 @@ static inline uint32_t bsw8c_lane_mask(__m128i m)
     return (uint32_t) vaddv_u8(vget_low_u8(b)) | ((uint32_t) vaddv_u8(vget_high_u8(b)) << 8);
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                                          uint8_t *seqBufRef,
                                                          uint8_t *seqBufQer,
@@ -124,6 +125,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
 #endif
     __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi8(3);
+    // CpG arm (CPG only; see "CpG arm" in bandedSWA.cpp), as smithWaterman128_8
+    __m128i cpgref128  = _mm_set1_epi8(this->cpg_ref_code_);
+    __m128i cpgread128 = _mm_set1_epi8(this->cpg_read_);
+    __m128i cpgval128  = _mm_set1_epi8(this->cpg_val_);
     BSW8_SCORES_NOMIN8();
     __m128i e_del128    = _mm_set1_epi8(this->e_del);
     __m128i oe_del128   = _mm_set1_epi8(this->o_del + this->e_del);
@@ -332,7 +337,11 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
             __m128i hband128, hwid128;
             bsw8_hband128(head128, tail128, &hband128, &hwid128);
             /* the cell loops of smithWaterman128_8, through its own macros */
-            if (!gen_mat) {
+            if (CPG) {
+                __m128i rowcpg;
+                BSW_CPG_ROW8_128(s10, rowcpg, cpgref128);
+                EXT13_RUN_SPLIT8_128(EXT13_SBT8_CPG);
+            } else if (!gen_mat) {
                 EXT13_RUN_SPLIT8_128(EXT13_SBT8_XOR);
             } else if (fc.rank1) {
                 __m128i rowfreed = _mm_cmpeq_epi8(s10, frref128);

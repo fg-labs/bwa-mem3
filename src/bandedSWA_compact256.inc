@@ -33,6 +33,7 @@ struct Bsw8CBuf256 {
 /* Per-thread scratch, grown on demand and kept until thread exit (see bandedSWA_compact512.inc). */
 static thread_local Bsw8CBuf256 g_bsw8c_buf256;
 
+template <bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                                          uint8_t *seqBufRef,
                                                          uint8_t *seqBufQer,
@@ -88,6 +89,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
     __m256i frread256 = _mm256_set1_epi8(fc.read);
     __m256i amat256 = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m256i three256_8 = _mm256_set1_epi8(3);
+    // CpG arm (CPG only; see "CpG arm" in bandedSWA.cpp), as smithWaterman256_8
+    __m256i cpgref256  = _mm256_set1_epi8(this->cpg_ref_code_);
+    __m256i cpgread256 = _mm256_set1_epi8(this->cpg_read_);
+    __m256i cpgval256  = _mm256_set1_epi8(this->cpg_val_);
     __m256i e_del256    = _mm256_set1_epi8(this->e_del);
     __m256i oe_del256   = _mm256_set1_epi8(this->o_del + this->e_del);
     __m256i e_ins256    = _mm256_set1_epi8(this->e_ins);
@@ -268,7 +273,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 exit0 = _mm256_andnot_si256(cmpim, exit0);
             }
             const __m256i qsent256 = bsw8_qsent256(qlen_off256, qlen_valid256, tail256, exit0);
-            if (!gen_mat) {
+            if (CPG) {
+                // CpG arm (see "CpG arm"): the row split, then the per-cell score
+                __m256i rowcpg;
+                BSW_CPG_ROW8_256(s10, rowcpg, cpgref256);
+                for (int jp = beg; jp < end; jp++) {
+                    __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
+                    __m256i sbt11;
+                    SBT_PREPASS8_RANK1(s10, s2, rowcpg, sbt11, pmat256, cpgval256, cpgread256);
+                    _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+                }
+            } else if (!gen_mat) {
                 for (int jp = beg; jp < end; jp++) {
                     __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
                     __m256i sbt11;
