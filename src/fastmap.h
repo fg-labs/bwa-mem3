@@ -136,10 +136,17 @@ typedef struct {
 	/* THP-fallback stderr check (bwa_thp.h), driven from the write step. */
 	bwa_thp_monitor_t thp;
 	/* Output streaming (stream_emit_prefix in fastmap.cpp): the process step
-	 * writes an item's finished SAM records while its last pass still runs.
+	 * writes an item's finished records while its last pass still runs (SAM
+	 * text: every item; --bam=0: the last item, see stream_bam_last).
 	 * Set once before the pipeline starts; see process() for when it is on. */
 	int     stream_output;
-	int     stream_stats;      /* BWA_MEM3_STREAM_STATS: per-batch stderr line */
+	/* --bam=0: stream only the LAST item (one whose read hit end of input), whose
+	 * write step would otherwise run after every compute pass has ended. Earlier
+	 * items' BAM writes already overlap the next item's compute. */
+	int     stream_bam_last;
+	/* BWA_MEM3_STREAM_STATS: one stderr line per batch armed to stream (every
+	 * batch for SAM text, the last batch at --bam=0). */
+	int     stream_stats;
 	int64_t items_processed;   /* pipeline order of the next process step; step 1 only */
 	/* Write steps finished, in pipeline order. Item k may write early only once
 	 * this equals k. Stored by the write step (release), loaded by the process
@@ -171,6 +178,10 @@ typedef struct {
 	 * released, so step 2 starts there. */
 	int64_t  seq;
 	int      n_streamed;
+	/* Set by the read step when its read came back short or empty: the input
+	 * ran out, so no later item carries reads (stream_bam_last). Not set on a
+	 * full read that happens to end exactly at end of input. */
+	int      input_ended;
 } ktp_data_t;
 
     

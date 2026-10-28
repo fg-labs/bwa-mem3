@@ -1020,11 +1020,27 @@ the reads it has finished are written in order, so most of a batch's output has
 left by the time the batch is done. The output is byte-identical either way.
 Without streaming, the last batch's whole output is written after the compute
 has ended, which is all of the output for a one-batch input and is paced by
-whatever reads the output (a pipe into another tool, for example). BAM output
-(`--bam`), `--meth` and `-p` are not streamed. `BWA_MEM3_STREAM_OUTPUT=0` turns
-streaming off, for A/B timing; `1` or an empty value keeps the default, and any
+whatever reads the output (a pipe into another tool, for example). Uncompressed
+BAM output (`--bam=0`, the default `--bam` level) streams only the last batch,
+the one whose read reached the end of the input: earlier batches' writes already
+overlap the next batch's compute. The BAM file is byte-identical either way.
+One exception: when the input ends exactly where a full, unsliced batch is
+satisfied, end of input only shows on the next (empty) read, so that last batch
+is not recognised and is written as before. With a near-full last batch on a
+4.2M-pair WGS input (HG00096, 2x150 bp, hg38), clang 19.1.7, NEON, 6 interleaved
+rounds per host, streaming cut wall time by 5.2% at `-t 64` on a 64-vCPU
+Graviton4 (m8g.16xlarge, arm64) and by 1.8% at `-t 16` on a 16-vCPU Graviton4
+(m8g.4xlarge). A last batch is about half full on average, so we estimate about
+half of that on a typical input (an estimate from last-batch fullness, not a
+measurement). Compressed BAM (`--bam=1..9`) is not streamed: at `--bam=6` and
+`-t 64` on m8g.16xlarge the BGZF deflate pool was still busy with the previous
+batch for the whole last pass, and streaming measured no wall-time change. The
+gate is the level, not `--bam-threads`. `--meth` and `-p` are not streamed.
+`BWA_MEM3_STREAM_OUTPUT=0` turns streaming off (SAM text and `--bam=0` alike),
+for A/B timing; `1` or an empty value keeps the default, and any
 other value is reported on stderr and ignored. `BWA_MEM3_STREAM_STATS=1` prints,
-per batch, how many of its reads were written early (`[0000] stream_output: N
+for each batch that streams (every batch for SAM text, the last batch at
+`--bam=0`), how many of its reads were written early (`[0000] stream_output: N
 of M reads written early`); measurement only, the output is unchanged.
 
 ### Memory

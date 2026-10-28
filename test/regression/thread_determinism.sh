@@ -81,8 +81,9 @@ dup=$(awk -F'dup=' '{split($2, a, " "); print a[1]}' <<< "$stats")
 echo "PASS: fixed -K $K, $nb batches: -t 1 == -t 3 == -t 4 unsorted, --dedup-reads on == off ($dup duplicate pairs, $(grep -cv '^@' fk.off.t1.sam || true) records)"
 
 # (3) Output streaming. The process step writes each finished work item's SAM
-# records while the worker_sam pass is still running, and the write step writes
-# the rest (stream_emit_prefix in src/fastmap.cpp). On must equal off
+# records (and, at --bam=0, the last batch's BAM records) while the worker_sam
+# pass is still running, and the write step writes the rest
+# (stream_emit_prefix in src/fastmap.cpp). On must equal off
 # (BWA_MEM3_STREAM_OUTPUT=0) byte for byte, unsorted, over the same several
 # batches: paired and single-end, at -t 2, 3 and 4, to a file and through a
 # consumer slower than the aligner (about 10k lines/s), so the output stays
@@ -168,10 +169,75 @@ for sink in file stall; do
     cmp -s "so.pe.$fx.off.sam" "so.$tag.sam" || fail "streaming $tag (every cohort sliced) differs from off"
     [[ $(early "$tag") -gt 0 ]] || fail "streaming $tag wrote nothing early"
 done
-# BAM output is written by the write step alone: its records are bam1_t, not
-# the sam strings the process step would write.
-BWA_MEM3_STREAM_STATS=1 "$BWA_MEM3" mem -K "$K" -t 4 --bam -o so.bam.out "$CHR22_FA" sk.r1.fq sk.r2.fq 2> so.bam.err \
-    || fail "mem (--bam)"
-[[ -s so.bam.out ]] || fail "empty output (--bam)"
-[[ $(grep -c 'stream_output:' so.bam.err || true) -eq 0 ]] || fail "streaming: --bam output was streamed"
-echo "PASS: output streaming on == off (paired and single-end, -t 1..4, file and slow pipe, sliced cohorts, not --bam; $(early pe.t4.stall) paired reads written early at -t 4)"
+# --bam=0 streams the LAST batch only (the one whose read hit end of input);
+# earlier batches, and every batch at --bam>=1, are written by the write step
+# alone. The hard gate is the BAM file: streaming on must equal off byte for
+# byte (same -o name, so @PG CL matches). BWA_MEM3_STREAM_STATS prints one line
+# per batch armed to stream, so at --bam=0 there must be exactly one, for the
+# last batch (its read count must be the last batch's). Whether that batch
+# actually writes early is timing dependent (the previous batch's write must
+# finish first), so it is reported, not required; a few attempts give it the
+# chance, and every attempt is compared byte for byte.
+bam_run() { # <lvl> <out> <K> <input prefix> [env...]
+    local lvl=$1 out=$2 k=$3 fx=$4
+    shift 4
+    env BWA_MEM3_STREAM_STATS=1 "$@" "$BWA_MEM3" mem -K "$k" -t 4 --bam="$lvl" -o so.bam.cur \
+        "$CHR22_FA" "$fx.r1.fq" "$fx.r2.fq" 2> "$out.err" || fail "mem (--bam=$lvl $out)"
+    [[ -s so.bam.cur ]] || fail "empty output (--bam=$lvl $out)"
+    mv so.bam.cur "$out"
+}
+stat_lines() { grep -c 'stream_output:' "$1.err" || true; }
+# reads in the last batch (cohort): read_chunk lines tagged "(cohort slice)"
+# accumulate into the cohort that the next untagged line completes
+last_batch_n() {
+    awk '/read_chunk:/ { n = $0; sub(/.*nseq: /, "", n); acc += n + 0
+                         if ($0 !~ /cohort slice/) { if (acc > 0) last = acc; acc = 0 } }
+         END { print last + 0 }' "$1.err"
+}
+bam0_leg() { # <tag> <K> <input prefix> [env...]: --bam=0 on == off, one stats line, for the last batch
+    local tag=$1 k=$2 fx=$3
+    shift 3
+    bam_run 0 "so.$tag.off" "$k" "$fx" BWA_MEM3_STREAM_OUTPUT=0 "$@"
+    [[ $(stat_lines "so.$tag.off") -eq 0 ]] || fail "$tag: streamed with BWA_MEM3_STREAM_OUTPUT=0"
+    local attempt line early=0
+    for attempt in 1 2 3 4 5; do
+        bam_run 0 "so.$tag.on" "$k" "$fx" "$@"
+        cmp -s "so.$tag.off" "so.$tag.on" || fail "$tag: --bam=0 streaming on differs from off (attempt $attempt)"
+        [[ $(stat_lines "so.$tag.on") -eq 1 ]] \
+            || fail "$tag: $(stat_lines "so.$tag.on") batches armed to stream at --bam=0, expected only the last"
+        line=$(grep 'stream_output:' "so.$tag.on.err")
+        [[ $(awk '{ print $5 }' <<< "$line") == "$(last_batch_n "so.$tag.on")" ]] \
+            || fail "$tag: the batch armed to stream is not the last one ($line)"
+        early=$(awk '{ print $3 }' <<< "$line")
+        [[ $early -gt 0 ]] && break
+    done
+    echo "  $tag: last batch wrote $early reads early (attempt $attempt; informational)"
+}
+# Exact end of input: every batch is exactly full (fixed-length reads, -K a
+# whole number of pairs that divides the input), so the last batch's read is
+# not short and end of input only shows on the next, empty read. That batch is
+# documented as not streamed; output must still match.
+rl=$(awk 'NR % 4 == 2 { print length($0) }' sk.r1.fq sk.r2.fq | sort -u)
+[[ $(wc -l <<< "$rl") -eq 1 ]] || fail "exact-boundary leg needs fixed-length reads (lengths: $(tr '\n' ' ' <<< "$rl"))"
+npairs=$(($(wc -l < sk.r1.fq) / 4))
+((npairs % 4 == 0)) || fail "exact-boundary leg needs a pair count divisible by 4 ($npairs)"
+KX=$((npairs * 2 * rl / 4))
+bam_run 0 so.bamx.off "$KX" sk BWA_MEM3_STREAM_OUTPUT=0
+bam_run 0 so.bamx.on "$KX" sk
+[[ $(grep 'read_chunk:' so.bamx.on.err | grep -v 'cohort slice' | grep -vc 'nseq: 0$' || true) -eq 4 ]] \
+    || fail "exact-boundary leg: expected 4 full batches at -K $KX"
+cmp -s so.bamx.off so.bamx.on || fail "exact-boundary: --bam=0 streaming on differs from off"
+[[ $(stat_lines so.bamx.on) -eq 0 ]] \
+    || fail "exact-boundary: a batch was armed to stream; an exactly full last batch is documented as not streamed"
+echo "  exact end of input (-K $KX, 4 full batches): not streamed, BAM identical"
+bam0_leg bam0 "$K" sk
+# Every cohort sliced: the last cohort is paired and emitted through
+# mem_pair_and_emit_cohort rather than mem_process_seqs.
+bam0_leg bam0.slice "$K" fk BWA_MEM3_COHORT_SLICE_ALL=1
+grep -q 'slicing every' so.bam0.slice.on.err || fail "bam0.slice: the cohorts were not sliced"
+# --bam=6 (compressed) never streams: the level gates it.
+bam_run 6 so.bam6.off "$K" sk BWA_MEM3_STREAM_OUTPUT=0
+bam_run 6 so.bam6.on "$K" sk
+cmp -s so.bam6.off so.bam6.on || fail "--bam=6 streaming on differs from off"
+[[ $(stat_lines so.bam6.on) -eq 0 ]] || fail "--bam=6 was armed to stream (level 0 only)"
+echo "PASS: output streaming on == off (paired and single-end, -t 1..4, file and slow pipe, sliced cohorts, --bam=0 last batch only; $(early pe.t4.stall) paired reads written early at -t 4)"

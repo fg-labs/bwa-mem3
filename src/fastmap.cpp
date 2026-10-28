@@ -579,6 +579,22 @@ static void write_sam_text(FILE *fp, bseq1_t *s)
         bam_writer_free((struct bam1_t *)s->bams[j]);
 }
 
+/* The write step's per-record calls for (non---meth) --bam output, shared with
+ * stream_emit_prefix so an early-written record goes through exactly the same
+ * calls. */
+static void write_bam_records(struct bam_writer_s *bw, bseq1_t *s)
+{
+    for (int j = 0; j < s->n_bams; ++j) {
+#ifndef DISABLE_OUTPUT
+        if (bam_writer_write(bw, (struct bam1_t *)s->bams[j]) < 0)
+            err_fatal(__func__, "failed to write BAM record");
+#else
+        (void) bw;
+#endif
+        bam_writer_free((struct bam1_t *)s->bams[j]);
+    }
+}
+
 /* Free one written record's per-read allocations. PIPE-F6: name/seq/qual are
  * carved from the item's read_arena, which the write step frees once -- do NOT
  * free them here. comment stays heap-owned (see the reader / --meth notes), and
@@ -592,7 +608,8 @@ static void release_read_record(bseq1_t *s)
     free(s->meth_orig_seq);
 }
 
-/* Output streaming. Without it an item's records are all written by its write
+/* Output streaming (SAM text: every item; --bam=0: the last item only, see
+ * stream_item). Without it an item's records are all written by its write
  * step, after the process step's last kt_for pass (worker_sam) has finished
  * every read. Earlier items' writes overlap the next item's compute, but the
  * last item's write overlaps nothing, so every run ends with one item's worth
@@ -602,8 +619,8 @@ static void release_read_record(bseq1_t *s)
  * work item's records as soon as that item and every earlier one are done
  * (kt_for_prefix), and the write step writes the rest.
  *
- * Output is byte-identical: the same strings go to the same FILE in the same
- * order. Records leave in read order (kt_for_prefix offers items in order and
+ * Output is byte-identical: the same strings go to the same FILE (the same
+ * bam1_t to the same BAM writer) in the same order. Records leave in read order (kt_for_prefix offers items in order and
  * items tile the reads in order); none is written before the previous
  * pipeline item's write step has returned (items_written == seq, an
  * acquire-load of the write step's release-store); the write step resumes at
@@ -635,19 +652,28 @@ static int stream_emit_prefix(void *ctx_, int st, int ed)
         c->turn = 1;
     }
     xassert(st == c->ret->n_streamed, "stream_emit_prefix: reads offered out of order");
+    struct bam_writer_s *const bw = c->aux->bam_writer;
     for (int i = st; i < ed; ++i) {
-        write_sam_text(c->aux->fp, &c->seqs[i]);
+        if (bw != NULL) write_bam_records(bw, &c->seqs[i]);
+        else            write_sam_text(c->aux->fp, &c->seqs[i]);
         release_read_record(&c->seqs[i]);
     }
     c->ret->n_streamed = ed;
     return 1;
 }
 
+/* Does this item stream? SAM text: every item (stream_output). --bam=0: only
+ * the item whose read hit end of input (stream_bam_last, input_ended). */
+static inline int stream_item(const ktp_aux_t *aux, const ktp_data_t *ret)
+{
+    return aux->stream_output || (aux->stream_bam_last && ret->input_ended);
+}
+
 /* Arm streaming on w for a worker_sam pass over `seqs` (the process step's
  * cohort array, which becomes ret->seqs), or leave it off. */
 static void stream_arm(worker_t &w, stream_ctx_t *c, ktp_aux_t *aux, ktp_data_t *ret, bseq1_t *seqs)
 {
-    if (!aux->stream_output) return;
+    if (!stream_item(aux, ret)) return;
     c->aux = aux; c->ret = ret; c->seqs = seqs; c->turn = 0;
     w.emit_prefix = stream_emit_prefix;
     w.emit_prefix_ctx = c;
@@ -807,9 +833,14 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
          * items, and cohort_n belongs to step 1. Captured before the bookkeeping
          * below resets it. */
         const int mid_cohort = (aux->cohort_slice > 0);
-        ret->cohort_complete = (sz < slice_target) ||
-                               (aux->cohort_bases >= aux->task_size) ||
-                               (ret->seqs == NULL) || (ret->n_seqs == 0);
+        /* The input ran out during (or before) this read. Not set when the
+         * input ends exactly where a read is satisfied: that read is full, and
+         * EOF only shows on the next, empty read. For an unsliced cohort that
+         * empty read is dropped, so its last batch is not marked (and, at
+         * --bam=0, not streamed); a sliced cohort is flushed by an empty item,
+         * which is marked. */
+        ret->input_ended = (sz < slice_target) || (ret->seqs == NULL) || (ret->n_seqs == 0);
+        ret->cohort_complete = ret->input_ended || (aux->cohort_bases >= aux->task_size);
         if (ret->cohort_complete) {
             aux->cohort_bases = 0;
             aux->cohort_slice = 0;
@@ -1370,15 +1401,8 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     free(group);
                 }
             } else if (out_bam_bw != NULL) {
-                for (int k = 0; k < group_size; ++k) {
-                    for (int j = 0; j < ret->seqs[i+k].n_bams; ++j) {
-#ifndef DISABLE_OUTPUT
-                        if (bam_writer_write(out_bam_bw, (struct bam1_t *)ret->seqs[i+k].bams[j]) < 0)
-                            err_fatal(__func__, "failed to write BAM record");
-#endif
-                        bam_writer_free((struct bam1_t *)ret->seqs[i+k].bams[j]);
-                    }
-                }
+                for (int k = 0; k < group_size; ++k)
+                    write_bam_records(out_bam_bw, &ret->seqs[i+k]);
             } else {
                 for (int k = 0; k < group_size; ++k)
                     write_sam_text(aux->fp, &ret->seqs[i+k]);
@@ -1391,8 +1415,9 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
             i += group_size;
         }
         /* BWA_MEM3_STREAM_STATS=1 only, so a test can tell that streaming
-         * engaged; measurement only, stderr only. */
-        if (aux->stream_stats && aux->stream_output && ret->n_seqs > 0)
+         * engaged: one line per item that was armed to stream (every item for
+         * SAM text, the last one at --bam=0); measurement only, stderr only. */
+        if (aux->stream_stats && stream_item(aux, ret) && ret->n_seqs > 0)
             fprintf(stderr, "[0000] stream_output: %d of %d reads written early\n",
                     ret->n_streamed, ret->n_seqs);
         /* Every record of this item is out: let the next item write early. */
@@ -1537,8 +1562,9 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     int p_nt = pipe_threads; // 2;
     int n_steps = 3;
 
-    /* Output streaming (stream_emit_prefix). SAM text only: the BAM and --meth
-     * writers and -p (whose two passes move the records afterwards) keep
+    /* Output streaming (stream_emit_prefix). SAM text streams every item;
+     * --bam=0 streams only the last item (stream_bam_last); compressed --bam,
+     * --meth and -p (whose two passes move the records afterwards) keep
      * writing in step 2 alone. Needs a second pipeline thread, so -t 1 and
      * single-threaded I/O keep their thread use. BWA_MEM3_STREAM_OUTPUT=0
      * turns it off (A/B runs); the output is the same either way. Only 0 and
@@ -1559,6 +1585,15 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
         aux->stream_output = !so_off && p_nt > 1 && aux->bam_writer == NULL
                              && !opt->meth_mode && !(opt->flag & MEM_F_SMARTPE);
 #endif
+        /* --bam: the last item only (stream_bam_last); earlier items' writes
+         * already overlap the next item's compute. Level 0 only (the level,
+         * not --bam-threads, gates it):
+         * at --bam>=1 the deflate pool is still busy with the previous batch for
+         * the whole last pass (m8g.16xlarge -t64 --bam=6: no wall change, 2x
+         * involuntary context switches). */
+        aux->stream_bam_last = !so_off && p_nt > 1 && aux->bam_writer != NULL
+                               && opt->bam_level == 0
+                               && !opt->meth_mode && !(opt->flag & MEM_F_SMARTPE);
         (void) so_off;
         const char *ss_env = getenv("BWA_MEM3_STREAM_STATS");
         aux->stream_stats = ss_env && *ss_env && strcmp(ss_env, "0") != 0;
