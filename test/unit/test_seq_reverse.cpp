@@ -1,11 +1,13 @@
-// Unit tests for src/seq_reverse.h. The mate-rescue revseq must leave exactly
-// what the scalar swap loop it replaced leaves, so that loop is the oracle here.
-// Both entry points are checked: seq_reverse_inplace (the 16-byte NEON/SSSE3
-// blocks where the target has them, as every shipped target does) and
-// seq_reverse_inplace_u64 (the 8-byte bswap + single-byte fallback, which
-// seq_reverse_inplace alone would never run on a host with a vector path).
-// Lengths 0..300 cover the block loops, the overlapping block pairs and the
-// single-byte tail, at every buffer alignment, with guard bytes around.
+// Unit tests for src/seq_reverse.h. The mate-rescue revseq and bwa_gen_cigar4's
+// reverse-strand flips must leave exactly what the scalar swap loop they
+// replaced leaves, so that loop is the oracle here. Both entry points are
+// checked: seq_reverse_inplace (the 32-byte AVX2 blocks and the 16-byte
+// NEON/SSSE3 blocks where the target has them, as every shipped target has the
+// latter) and seq_reverse_inplace_u64 (the 8-byte bswap + single-byte fallback,
+// which seq_reverse_inplace alone would never run on a host with a vector
+// path). Lengths 0..300 cover the block loops, the overlapping block pairs and
+// the single-byte tail, at every alignment within a 32-byte block, with guard
+// bytes around.
 
 #include "doctest/doctest.h"
 
@@ -34,7 +36,7 @@ long check_against_oracle(F reverse)
     const int guard = 32;
     long cases = 0, mismatches = 0;
     for (int n = 0; n <= 300; ++n) {
-        for (int off = 0; off < 16; ++off) {
+        for (int off = 0; off < 32; ++off) {
             for (int rep = 0; rep < 2; ++rep) {
                 std::vector<uint8_t> buf(guard + off + n + guard);
                 for (auto &b : buf) b = (uint8_t)rng();
@@ -55,13 +57,16 @@ long check_against_oracle(F reverse)
     return cases;
 }
 
-const long kCases = 301L * 16 * 2;
+const long kCases = 301L * 32 * 2;
 
 } // namespace
 
 TEST_CASE("seq_reverse_inplace matches the scalar swap loop for lengths 0..300"
           * doctest::test_suite("unit/seq_reverse"))
 {
+#if defined(__AVX2__)
+    MESSAGE(std::string("32-byte vector path: AVX2"));
+#endif
 #if defined(BWA3_SEQ_REV_VEC16)
     MESSAGE(std::string(BWA3_SEQ_REV_VEC16 == 1 ? "16-byte vector path: NEON" : "16-byte vector path: SSSE3"));
 #else
