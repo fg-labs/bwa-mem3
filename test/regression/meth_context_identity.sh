@@ -190,12 +190,20 @@ run() {
         extra=(-k 15 -T 15)
     fi
     local -a pre=(env)
-    [ "$tier" != "-" ] && pre+=("BWAMEM3_FORCE_TIER=$tier")
+    [ "$tier" != "-" ] && pre+=("BWAMEM3_FORCE_TIER=$tier" "BWAMEM3_DEBUG_SIMD=1")
     [ "$envkv" != "-" ] && pre+=("$envkv")
     "${pre[@]}" "$bin" mem -t 1 ${extra[@]+"${extra[@]}"} "$@" "$ref" "${inputs[@]}" \
         2> "$out.log" | samtools view - > "$out.sam" \
         || fail "$out: mem exited nonzero ($(tail -3 "$out.log" | tr '\n' ' '))"
     [ -s "$out.sam" ] || fail "$out: empty output"
+    if [ "$tier" != "-" ]; then
+        # An ignored force would compare native output with itself: confirm from
+        # this run's own log that the tier it ran at is the one it was told to.
+        local active
+        active="$(sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' "$out.log" | head -1)"
+        [ "$active" = "$tier" ] \
+            || fail "$out: BWAMEM3_FORCE_TIER=$tier was not honoured (active tier '${active:-none}')"
+    fi
     check_invariants "$out" "$set"
 }
 
@@ -232,6 +240,7 @@ compare() { # compare WHAT A B
 }
 
 NCMP=0
+NCROSS=0
 for set in pe5 em se; do
     # (a) context all == default
     run "a_${set}_default" - - "$BIN" ref.fa "$set" --meth=5base
@@ -250,6 +259,11 @@ for set in pe5 em se; do
             run "b_${set}_cpg_$t" "$t" - "$BIN" ref.fa "$set" --meth=5base --meth-context cpg
             compare "(b) $set" "b_${set}_cpg_native" "b_${set}_cpg_$t"
             NCMP=$((NCMP + 1))
+            if [ "$t" = "$HOST_TIER" ]; then
+                echo "note: (b) $set: forced $t is the native tier; not a cross-tier comparison"
+            else
+                NCROSS=$((NCROSS + 1))
+            fi
         done
     fi
 
@@ -273,8 +287,10 @@ for set in pe5 em se; do
     done
 done
 
-if [ "${#TIERS[@]}" -le 1 ]; then
-    echo "SKIP: (b) cross-tier -- one runnable tier on this host (${TIERS[*]:-none}); nothing to compare"
+if [ "$NCROSS" -eq 0 ]; then
+    echo "SKIP: (b) cross-tier -- no runnable tier differs from the native one (host $HOST_TIER; swept ${TIERS[*]:-none}); nothing was compared across tiers"
+else
+    echo "(b) cross-tier: $NCROSS comparison(s) against a tier other than the native $HOST_TIER"
 fi
 
 # (d) no --meth: identical to the base binary

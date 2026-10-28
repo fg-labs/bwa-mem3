@@ -2065,6 +2065,8 @@ jobs:
             || { echo "FAIL: samtools not on PATH; meth_context_identity would SKIP"; exit 1; }
           command -v mawk >/dev/null 2>&1 \
             || { echo "FAIL: mawk not on PATH; meth_context_identity would SKIP"; exit 1; }
+          command -v python3 >/dev/null 2>&1 \
+            || { echo "FAIL: python3 not on PATH; meth_context_identity would SKIP"; exit 1; }
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/meth_context_identity.sh
 
