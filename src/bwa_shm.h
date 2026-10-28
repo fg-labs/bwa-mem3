@@ -106,6 +106,11 @@ extern "C" {
 	int       bwa_shm_stage(const char *prefix, bool bns_only = false,
 	                        int target_sa_compx = -1,
 	                        int n_threads = 1); /* loads from disk, packs, stages */
+	/* Test-only hook (see bwa_shm.cpp): bwa_shm_stage calls it with its
+	 * writable index mapping right after the map and before the pack fills it,
+	 * so a unit test can inspect that mapping while it exists. NULL on every
+	 * production path. */
+	extern void (*bwa_shm_stage_map_hook)(const void *base, size_t len);
 	int       bwa_shm_destroy(void);                                 /* drops all (matches v1 -d) */
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */

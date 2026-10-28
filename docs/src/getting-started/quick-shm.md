@@ -84,6 +84,11 @@ It provides little benefit when:
   load time.
 - The available RAM is insufficient to hold the index alongside the operating system and
   alignment worker processes.
+- `/dev/shm` is mounted with the default `huge=never`, which puts the segment on 4 KB pages:
+  alignment then uses about 26–33 % more CPU than with an index loaded from disk (hg38, 5M read
+  pairs, `mem -t 16`, clang 19: +33 % on AMD Zen 4 (m7a.4xlarge) with AVX-512BW, +26 % on
+  Graviton4 (m8g.4xlarge) with NEON). Mount it `huge=advise` or `huge=within_size` and re-stage; see
+  [`shm` → Huge pages](../cli/shm.md#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size).
 
 > **Warning — No staleness check — always drop before re-indexing**
 >

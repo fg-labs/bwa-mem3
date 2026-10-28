@@ -68,8 +68,10 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
  *
  * The destination stays the _mm_malloc'd + MADV_HUGEPAGE buffer, so the
  * transparent-hugepage coverage the hot Occ-lookup loop relies on is preserved
- * -- unlike an mmap/shm alias of the file, which lands on non-THP pages and
- * slows alignment enough to erase the load saving.
+ * -- unlike an mmap alias of the file, which lands on non-THP pages and slows
+ * alignment enough to erase the load saving. (An shm segment is advised the
+ * same way, but gets huge pages only if /dev/shm is mounted huge=advise or
+ * huge=within_size; see idx_segment_map in bwa_shm.cpp.)
  */
 
 /* Declared in FMI_search.h; see there for the contract. Uses a floor division

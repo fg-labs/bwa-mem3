@@ -134,6 +134,43 @@ above is a measurement (see the scope stated with the table) and scales with how
 resolve-heavy the workload is and how large the reference is, so treat the
 percentages as indicative rather than a guarantee for your data.
 
+### Huge pages: mount `/dev/shm` with `huge=advise` or `huge=within_size`
+
+An index loaded from disk sits on 2 MB transparent huge pages. A staged segment
+lives in the `/dev/shm` tmpfs, and its page size comes from that mount's `huge=`
+option, which defaults to `never`. On 4 KB pages the FM-index and SA lookups miss
+the TLB far more often, and an alignment attached from shm uses more CPU than
+one that loads the index from disk:
+
+| hg38, 5M read pairs, `mem -t 16`, clang 19 | disk load | shm, 2 MB pages | shm, 4 KB pages (`huge=never`) |
+|---|---|---|---|
+| Zen 4 (m7a.4xlarge), AVX-512BW: CPU s (wall s) | 497 (32.6) | 495 (32.4) | 661 (43.1), +33 % CPU |
+| Graviton4 (m8g.4xlarge), NEON: CPU s (wall s) | 529 (34.5) | 527 (34.3) | 665 (43.2), +26 % CPU |
+
+Output is byte-identical in every column. `bwa-mem3 shm` and `mem` ask for huge
+pages on the segment (`madvise(MADV_HUGEPAGE)`), and with either of these mounts
+a kernel with transparent huge pages backs it with 2 MB pages, which gave
+disk-load speed in the benchmark above. The advice is best-effort: when the
+kernel can't supply huge pages the segment stays on 4 KB pages, so confirm the
+backing as shown below. Remount, then re-stage, since a segment keeps the page
+size it was written with:
+
+```bash
+sudo mount -o remount,huge=advise /dev/shm   # or huge=within_size
+bwa-mem3 shm -d
+bwa-mem3 shm ref.fa
+grep ShmemHugePages /proc/meminfo            # host-wide: non-zero once anything is on shmem huge pages
+```
+
+`ShmemHugePages` totals every shmem huge page on the host, so it can be non-zero
+because of another tmpfs. To check this index's segment, look at its entry in
+`/proc/<pid>/smaps` of a running `mem`: `ShmemPmdMapped` is non-zero when the
+segment is mapped on 2 MB pages.
+
+On a `huge=never` mount the request is ignored. Staging still saves the index
+load, but each run then pays the CPU cost above, which on a large sample can
+exceed the load time saved.
+
 ## Notes / Gotchas
 
 > **Warning — No staleness check — always destroy before re-indexing**

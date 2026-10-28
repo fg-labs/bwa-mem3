@@ -418,6 +418,22 @@ The Zen 5 timings were taken before PR #588 raised the Zen 5 lockstep widths to
 output identity was re-checked after #588, but the Zen 5 gain was not re-measured
 at 32/32.
 
+## Huge pages for the shared-memory index ([PR #657](https://github.com/fg-labs/bwa-mem3/pull/657))
+
+An index loaded from disk is advised `MADV_HUGEPAGE`, so the FM-index and SA
+lookups run on 2 MB pages. The shared-memory segment that `bwa-mem3 shm` stages
+was mapped with no advice, so even on a `/dev/shm` mounted `huge=advise` it sat on
+4 KB pages, and an alignment attached from it used 26–33 % more CPU (25–32 % more
+wall) than a disk load: hg38, 5M read pairs, `-t 16`, clang 19, on AMD Zen 4
+(m7a.4xlarge, AVX-512BW) and AWS Graviton4 (m8g.4xlarge). The stager now advises
+its mapping before it writes the segment (tmpfs fixes a page's size at first
+write), and the attach advises its own mapping. On a `huge=advise` or
+`huge=within_size` mount, shm-attached runs now match the disk-load CPU and wall
+time; the default `huge=never` mount ignores the advice (see
+[`shm` → Huge pages](../cli/shm.md#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size)).
+Output is byte-identical: the advice changes only how the kernel backs the
+mapping.
+
 ## CIGAR generation
 
 - **Certified band for equal-length regions (PR #575).** The global re-alignment that builds
