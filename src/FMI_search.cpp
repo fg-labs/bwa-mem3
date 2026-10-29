@@ -375,6 +375,8 @@ FMI_search::FMI_search(const char *fname)
     cp_occ = NULL;
     shm_base = NULL;
     shm_len = 0;
+    seed_jump = NULL;
+    seed_jump_depth = 0;
 
     /* one_hot_mask_array is now a file-scope compile-time constant table (see
      * FMI_search.h); nothing to allocate or initialize here. */
@@ -395,6 +397,8 @@ FMI_search::~FMI_search()
         if (sa_ls_word) _mm_free(sa_ls_word);
         if (cp_occ)     _mm_free(cp_occ);
     }
+    /* Process-private on both paths (never part of the shm segment). */
+    if (seed_jump) _mm_free(seed_jump);
 }
 
 int64_t FMI_search::cp_occ_size_bytes() const {
@@ -403,6 +407,147 @@ int64_t FMI_search::cp_occ_size_bytes() const {
 
 int64_t FMI_search::sa_sample_count() const {
     return (reference_seq_len >> sa_compx) + 1;
+}
+
+/* ===== Seed jump table (see FMI_search.h, seed_jump) =====
+ *
+ * Used by the bwtSeed walks (bsd_plan_jump) and the SMEM forward walks
+ * (ls_init_slot, ls_advance_forward_table), so despite its name
+ * BWA3_BWTSEED_JUMP also sets the table for the first- and second-pass SMEM
+ * walks.
+ * Depth: BWA3_BWTSEED_JUMP (0 = no table, so every walk steps from its first
+ * base as before; 2..SEED_JUMP_DEPTH_MAX = the table's depth), default
+ * SEED_JUMP_DEPTH_DEFAULT. Unset or empty silently means the default, as for
+ * the other integer knobs; any other value is reported and the default used. An internal tuning knob: output is byte-identical
+ * at every value. At depth D the table holds (4^(D+1) - 4) / 3 entries of 24
+ * bytes: 2 MB at 8, 33.6 MB at 10, 134 MB at 11, 537 MB at 12. */
+#define SEED_JUMP_DEPTH_DEFAULT 10
+#define SEED_JUMP_DEPTH_MAX     12
+/* Levels 1..SEED_JUMP_PREFIX are built serially; deeper levels are built per
+ * subtree of a SEED_JUMP_PREFIX-base prefix (64 of them), one subtree at a time
+ * per worker, so no level needs a barrier. */
+#define SEED_JUMP_PREFIX        3
+/* Parents ahead whose two cp_occ blocks a builder prefetches. */
+#define SEED_JUMP_PF            16
+
+static int seed_jump_env_depth()
+{
+    const char *e = getenv("BWA3_BWTSEED_JUMP");
+    if (e == NULL || *e == '\0') return SEED_JUMP_DEPTH_DEFAULT;
+    /* Digits only: strtol alone would also take leading space and a sign. */
+    char *end = NULL;
+    errno = 0;
+    long v = strtol(e, &end, 10);
+    if (*e < '0' || *e > '9' || errno != 0 || end == e || *end != '\0'
+        || v == 1 || v > SEED_JUMP_DEPTH_MAX) {
+        fprintf(stderr, "ERROR: BWA3_BWTSEED_JUMP=\"%s\" is not 0 or an integer in [2, %d]; "
+                "ignoring it and using the default depth %d\n", e, SEED_JUMP_DEPTH_MAX,
+                SEED_JUMP_DEPTH_DEFAULT);
+        return SEED_JUMP_DEPTH_DEFAULT;
+    }
+    return (int)v;
+}
+
+/* Level L's children of the level L - 1 strings [first, first + n): child c
+ * of parent q is q * 4 + c, computed exactly as bsd_advance_step steps (swap
+ * k <-> l, backwardExt with 3 - c, swap back). */
+void FMI_search::seed_jump_children(int L, int64_t first, int64_t n)
+{
+    const SeedJumpEntry *par = seed_jump + seed_jump_level_off(L - 1) + first;
+    SeedJumpEntry *ch = seed_jump + seed_jump_level_off(L) + first * 4;
+    for (int64_t i = 0; i < n; i++) {
+#ifdef ENABLE_PREFETCH
+        if (i + SEED_JUMP_PF < n) {
+            const SeedJumpEntry &q = par[i + SEED_JUMP_PF];
+            _mm_prefetch((const char *)(&cp_occ[(q.l >> CP_SHIFT)]), _MM_HINT_T0);
+            _mm_prefetch((const char *)(&cp_occ[((q.l + q.s) >> CP_SHIFT)]), _MM_HINT_T0);
+        }
+#endif
+        SMEM smem_;
+        memset(&smem_, 0, sizeof(smem_));
+        smem_.k = par[i].l;
+        smem_.l = par[i].k;
+        smem_.s = par[i].s;
+        /* All four before any store, so the compiler can share the two
+         * blocks' loads and popcounts among them (a store to ch[] may alias
+         * cp_occ). */
+        SMEM r[4];
+        for (int c = 0; c < 4; c++) r[c] = backwardExt(smem_, (uint8_t)(3 - c));
+        for (int c = 0; c < 4; c++) {
+            ch[i * 4 + c].k = r[c].l;
+            ch[i * 4 + c].l = r[c].k;
+            ch[i * 4 + c].s = r[c].s;
+        }
+    }
+}
+
+namespace {
+struct SeedJumpBuild {
+    FMI_search          *fmi;
+    std::atomic<int64_t> next;
+    int64_t              n_prefix;
+};
+}  // namespace
+
+void *FMI_search::seed_jump_worker(void *arg)
+{
+    SeedJumpBuild *b = (SeedJumpBuild *)arg;
+    for (;;) {
+        const int64_t p = b->next.fetch_add(1, std::memory_order_relaxed);
+        if (p >= b->n_prefix) break;
+        /* Every level below prefix p, level by level. */
+        for (int L = SEED_JUMP_PREFIX + 1; L <= b->fmi->seed_jump_depth; L++) {
+            const int64_t n = (int64_t)1 << (2 * (L - 1 - SEED_JUMP_PREFIX));
+            b->fmi->seed_jump_children(L, p * n, n);
+        }
+    }
+    return NULL;
+}
+
+void FMI_search::build_seed_jump_table(int n_threads)
+{
+    if (seed_jump != NULL) { _mm_free(seed_jump); seed_jump = NULL; }
+    seed_jump_depth = 0;
+    const int D = seed_jump_env_depth();
+    if (D < 2) return;
+
+    const int64_t total = seed_jump_level_off(D + 1);
+    const size_t bytes = (size_t)total * sizeof(SeedJumpEntry);
+    seed_jump = (SeedJumpEntry *)_mm_malloc(bytes, 64);
+    if (seed_jump == NULL) {
+        /* The table only saves steps, so run without it rather than fail. */
+        fprintf(stderr, "ERROR: could not allocate the %.1f MB seed jump table "
+                "(BWA3_BWTSEED_JUMP depth %d); seeding without it\n", bytes / 1e6, D);
+        return;
+    }
+    bwamem_madv_hugepage(seed_jump, bytes);
+    seed_jump_depth = D;
+
+    for (int a = 0; a < 4; a++) {   // bsd_init_slot's 1-base interval
+        seed_jump[a].k = count[a];
+        seed_jump[a].l = count[3 - a];
+        seed_jump[a].s = count[a + 1] - count[a];
+    }
+    const int P = D < SEED_JUMP_PREFIX ? D : SEED_JUMP_PREFIX;
+    for (int L = 2; L <= P; L++)
+        seed_jump_children(L, 0, (int64_t)1 << (2 * (L - 1)));
+    if (D == P) return;
+
+    SeedJumpBuild b;
+    b.fmi = this;
+    b.next.store(0, std::memory_order_relaxed);
+    b.n_prefix = (int64_t)1 << (2 * P);
+    int nt = n_threads > 0 ? n_threads : 1;
+    if (nt > b.n_prefix) nt = (int)b.n_prefix;
+    std::vector<pthread_t> tids((size_t)nt);
+    std::vector<bool>      spawned((size_t)nt, false);
+    /* A failed spawn only makes the build less parallel: the main thread's
+     * loop takes every prefix no worker took. */
+    for (int i = 1; i < nt; i++)
+        spawned[i] = pthread_create(&tids[i], NULL, seed_jump_worker, &b) == 0;
+    seed_jump_worker(&b);
+    for (int i = 1; i < nt; i++)
+        if (spawned[i]) pthread_join(tids[i], NULL);
 }
 
 void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
@@ -660,7 +805,7 @@ int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
-void FMI_search::load_index(bool load_pac, int n_threads)
+void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
@@ -673,6 +818,9 @@ void FMI_search::load_index(bool load_pac, int n_threads)
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
+            /* The seed jump table is process-private (not part of the staged
+             * segment), so an attached index builds its own. */
+            if (build_seed_jump) build_seed_jump_table(index_load_threads(n_threads));
             fprintf(stderr, "* FMI+BNS%s attached from shm; "
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             return;
@@ -858,6 +1006,9 @@ void FMI_search::load_index(bool load_pac, int n_threads)
     }
     fprintf(stderr, "\nsentinel_index: %lld\n", (long long)x);
     #endif
+
+    // cp_occ, count[] and sentinel_index are in: build the seed jump table.
+    if (build_seed_jump) build_seed_jump_table(load_nt);
 
     fprintf(stderr, "* Count:\n");
     for(x = 0; x < 5; x++)
@@ -1112,7 +1263,8 @@ enum LockstepPhase : uint8_t {
     PH_BWD      = 2,  // backward search outer loop active
     PH_DONE     = 3,  // slot finished (ready: match_buf not yet retired) or idle
     PH_S1_LF    = 4,  // unique forward match: LF walk from k to a sampled SA row
-    PH_S1_CMP   = 5   // unique forward match: compare the rest of the read with the text
+    PH_S1_CMP   = 5,  // unique forward match: compare the rest of the read with the text
+    PH_FWD_TABLE = 6  // forward walk's first visit: its first steps from seed_jump
 };
 
 /* A phase-1 forward walk that reaches a unique match (s == 1) goes on comparing
@@ -1266,6 +1418,13 @@ struct FMI_search::BatchSlot {
     // row and step count, then (PH_S1_CMP) the text position of read base j.
     int64_t lf_row;
     int64_t lf_off;
+    // The walk's first steps from the jump table (seed_jump): when read[x ..
+    // x + jdp) is jdp >= 2 ACGT bases (jdp <= seed_jump_depth), jcode is their
+    // 2-bit code, first base most significant, and the slot's first forward
+    // visit (PH_FWD_TABLE, ls_advance_forward_table) takes depths 2..jdp from
+    // the table. jdp == 0: every step is a backwardExt.
+    uint32_t jcode;
+    int32_t  jdp;
 };
 
 void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
@@ -1324,9 +1483,35 @@ void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
 #endif
 }
 
+// The 2-bit code of q[0..n), first base most significant, for a jump-table
+// lookup; *any is the OR of the n bases, so *any >= 4 when one is an N.
+static inline uint32_t seed_jump_pack(const uint8_t *q, int32_t n, uint32_t *any)
+{
+    uint32_t code = 0, a = 0;
+    for (int32_t i = 0; i < n; i++) {
+        code = (code << 2) | (q[i] & 3u);
+        a |= q[i];
+    }
+    *any = a;
+    return code;
+}
+
+// Hint a jump-table entry: a 24-byte entry can straddle two lines.
+inline void FMI_search::seed_jump_prefetch(const SeedJumpEntry *e)
+{
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)e, _MM_HINT_T0);
+    _mm_prefetch((const char *)e + sizeof(SeedJumpEntry) - 1, _MM_HINT_T0);
+#else
+    (void)e;
+#endif
+}
+
 // Populate a slot from the caller's input arrays at the given input_idx.
 // After this call either:
 //   phase == PH_FWD  — slot is ready to step the forward-extension inner loop
+//   phase == PH_FWD_TABLE — the same, with its first steps planned from the
+//                      jump table (ls_advance_forward_table)
 //   phase == PH_DONE — the first base is non-ACGT; scalar skips this read, so
 //                      we match that (zero matches emitted, ready to retire).
 void FMI_search::ls_init_slot(BatchSlot *s,
@@ -1369,6 +1554,35 @@ void FMI_search::ls_init_slot(BatchSlot *s,
         s->smem.s   = count[a + 1] - count[a];
         s->j        = x + 1;
         s->phase    = PH_FWD;
+        /* Plan the walk's first steps from the jump table: the longest run
+         * read[x .. x + jdp) of ACGT bases with jdp <= seed_jump_depth (0 when
+         * there is no table), and hint the entries of depths 2..jdp a pass
+         * ahead of the visit that reads them (between the cp_occ blocks the
+         * other slots stream, even levels 5-7, 512 KB, miss L2 unhinted). */
+        s->jdp = 0;
+        int32_t lim = s->readlength - x;
+        if (lim > seed_jump_depth) lim = seed_jump_depth;
+        if (lim >= 2) {
+            const uint8_t *q = enc_qdb + s->offset + x;
+            uint32_t any;
+            uint32_t code = seed_jump_pack(q, lim, &any);
+            int32_t d = lim;
+            if (any >= 4) {   // an N: the run ends at the first one
+                d = 1;
+                while (q[d] < 4) d++;
+                code >>= 2 * (lim - d);
+            }
+            if (d >= 2) {
+                s->jcode = code;
+                s->jdp   = d;
+                s->phase = PH_FWD_TABLE;
+#ifdef ENABLE_PREFETCH
+                for (int32_t L = 2; L <= d; L++) {
+                    seed_jump_prefetch(seed_jump + seed_jump_level_off(L) + (code >> (2 * (d - L))));
+                }
+#endif
+            }
+        }
     } else {
         // Scalar path skips the whole read when the first base is N.
         // Match that by going straight to DONE with zero matches.
@@ -1608,6 +1822,72 @@ void FMI_search::ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
     s->phase = PH_BWD_INIT;
 }
 
+// A walk's first forward visit when ls_init_slot planned table steps (jdp >= 2):
+// the steps to depths 2..jdp, read[x + 1 .. x + jdp), each one as
+// ls_advance_forward_step takes it, with the new interval read from the jump
+// table instead of a backwardExt. A table entry is the interval the walk's own
+// forward step reaches from the 1-base interval (seed_jump_children), and
+// read[x .. x + jdp) is ACGT inside the read, so only the step's s < min_intv
+// exit (phase 2's min_intv = s + 1 included) and the unique-match hand-off to
+// PH_S1_LF can end the run early. Otherwise the slot steps on from depth
+// jdp + 1 with the same prefetch as a forward step.
+void FMI_search::ls_advance_forward_table(BatchSlot *s, bool s1_text)
+{
+    const int32_t dp = s->jdp;
+    const uint32_t code = s->jcode;
+    const int32_t x = s->start_pos;
+    const int32_t min_intv = s->min_intv;
+    SMEM *const prev = s->prev;
+    int32_t numPrev = s->numPrev;
+    SMEM cur = s->smem;
+    s->jdp = 0;
+
+    int64_t off = seed_jump_level_off(1);
+    for (int32_t d = 2; d <= dp; d++) {
+        off = off * 4 + 4;   // seed_jump_level_off(d)
+        const SeedJumpEntry *e = seed_jump + off + (code >> (2 * (dp - d)));
+        const int32_t j = x + d - 1;
+        SMEM nw = cur;
+        nw.k = e->k;
+        nw.l = e->l;
+        nw.s = e->s;
+        nw.n = j;
+
+        prev[numPrev] = cur;
+        numPrev += (nw.s != cur.s);
+
+        if (nw.s < min_intv) {
+            s->numPrev = numPrev;
+            s->smem = cur;
+            s->j = j;
+            s->next_x = j;
+            s->phase = PH_BWD_INIT;
+            return;
+        }
+        cur = nw;
+        if (s1_text && nw.s == 1 && s->readlength - (j + 1) >= LS_S1_MIN_REST) {
+            s->numPrev = numPrev;
+            s->smem = cur;
+            s->j = j + 1;
+            s->next_x = j + 1;
+            s->lf_row = nw.k;
+            s->lf_off = 0;
+            s->phase  = PH_S1_LF;
+            ls_prefetch_sa_row(nw.k);
+            return;
+        }
+    }
+    s->numPrev = numPrev;
+    s->smem = cur;
+    s->j = x + dp;
+    s->next_x = x + dp;
+    s->phase = PH_FWD;
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_occ[(cur.l) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_occ[(cur.l + cur.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+}
+
 // Between-phases housekeeping: reverse prev[] and set up backward-phase
 // cursors. After this call the slot is either PH_BWD (ready for
 // ls_advance_backward_step) or PH_DONE (nothing to do — backward outer
@@ -1800,6 +2080,10 @@ struct FMI_search::BwtSeedSlot {
     bool    ready;
 
     SMEM   *match_buf;     // -> thread-local cache slice, sized = max_readlength
+
+    // Jump-table entry for read[x .. x + jd), planned (and prefetched) when the
+    // walk started at x and taken on the slot's next visit; NULL = step.
+    const SeedJumpEntry *jump;
 };
 
 // Same-slot T0 prefetch for the next inner-j step. The bwtSeed walk is
@@ -1833,16 +2117,35 @@ void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
 #endif
 }
 
+// Plan the jump for a walk that starts at s->x (smem already the 1-base
+// interval, j = x + 1): when read[x .. x + jd) is jd ACGT bases, point s->jump
+// at that string's entry in the level-jd table jlev and prefetch it; the next
+// visit (bsd_advance_step) takes it. Otherwise s->jump stays NULL and the walk
+// steps from x as before, reaching the N or the read end exactly as it did.
+void FMI_search::bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
+                               const SeedJumpEntry *jlev, int32_t jd)
+{
+    if (s->x + jd > s->readlength) return;
+    const uint8_t *q = enc_qdb + s->offset + s->x;
+    uint32_t any;
+    const uint32_t code = seed_jump_pack(q, jd, &any);
+    if (any >= 4) return;   // some base >= 4 (N): the walk stops there
+    s->jump = jlev + code;
+    seed_jump_prefetch(s->jump);
+}
+
 // Initialize a fresh slot for the given input read. Scans forward from
 // x=0 for the first ACGT base (matching the scalar's outer while-loop
-// skipping non-ACGT) and either enters BSD_FWD with smem seeded, or jumps
-// straight to BSD_DONE when the read is entirely non-ACGT.
+// skipping non-ACGT) and either enters BSD_FWD with smem seeded (and its
+// jump planned, bsd_plan_jump), or jumps straight to BSD_DONE when the read
+// is entirely non-ACGT.
 void FMI_search::bsd_init_slot(BwtSeedSlot *s,
                                int32_t input_idx,
                                const int32_t *max_intv_array,
                                const bseq1_t *seq_,
                                const int32_t *query_cum_len_ar,
-                               const uint8_t *enc_qdb)
+                               const uint8_t *enc_qdb,
+                               const SeedJumpEntry *jlev, int32_t jd)
 {
     s->input_idx   = input_idx;
     s->max_intv    = max_intv_array[input_idx];
@@ -1850,6 +2153,7 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
     s->offset      = query_cum_len_ar[input_idx];
     s->match_count = 0;
     s->ready       = false;
+    s->jump        = nullptr;
 
     int32_t x = 0;
     while (x < s->readlength && enc_qdb[s->offset + x] >= 4) x++;
@@ -1869,13 +2173,16 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
     s->smem.s   = count[a + 1] - count[a];
     s->j        = x + 1;
     s->phase    = BSD_FWD;
+    if (jd > 0) bsd_plan_jump(s, enc_qdb, jlev, jd);
 }
 
-// Advance one slot by one unit of work. Always does at least one cp_occ
-// access per call when the slot is active, so the lockstep pipeline keeps
-// uniform per-pass memory parallelism (Heng action 2a — collapse outer
-// transition into the step function rather than burning a stepping-pass
-// on housekeeping).
+// Advance one slot by one unit of work. Does one cp_occ access per call when
+// the slot is active, so the lockstep pipeline keeps uniform per-pass memory
+// parallelism (Heng action 2a — collapse outer transition into the step
+// function rather than burning a stepping-pass on housekeeping), except at a
+// walk's start when a jump is planned: that visit only prefetches the jump
+// table entry, and the next one loads it in place of the walk's first
+// jd - 1 steps.
 //
 // The semantics are identical to the scalar bwtSeedStrategyAllPosOneThread
 // inner-j body + outer-x advancement:
@@ -1893,8 +2200,24 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
 //   x = next_x;
 void FMI_search::bsd_advance_step(BwtSeedSlot *s,
                                   const uint8_t *enc_qdb,
-                                  int32_t minSeedLen)
+                                  int32_t minSeedLen,
+                                  const SeedJumpEntry *jlev, int32_t jd)
 {
+    // Jump planned when this walk started at x (prefetched then): the interval
+    // of read[x .. x + jd), the state the walk reaches after jd - 1 steps, none
+    // of which can exit (length < minSeedLen, no N, inside the read).
+    if (s->jump != nullptr) {
+        const SeedJumpEntry e = *s->jump;
+        s->jump   = nullptr;
+        s->smem.k = e.k;
+        s->smem.l = e.l;
+        s->smem.s = e.s;
+        s->smem.n = s->x + jd - 1;
+        s->j      = s->x + jd;
+        bsd_prefetch_cp_occ(s);
+        return;
+    }
+
     // Outer seek: if j < 0 the slot just broke out of an inner-j extension
     // and needs to (re-)init smem at the next ACGT x. Spin through non-ACGT
     // bases inline (scalar does the same — at most O(N_run) here, and N runs
@@ -1914,6 +2237,10 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         s->smem.l   = count[3 - a];
         s->smem.s   = count[a + 1] - count[a];
         s->j        = s->x + 1;
+        if (jd > 0) {
+            bsd_plan_jump(s, enc_qdb, jlev, jd);
+            if (s->jump != nullptr) return;   // jump on the next visit
+        }
         // Fall through to inner-j step.
     }
 
@@ -2160,6 +2487,12 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                     ls_s1_compare(sl, enc_qdb, s1_pac, s1_l_pac);
                     ls_prepare_backward(sl);
                     break;
+                case PH_FWD_TABLE:
+                    ls_advance_forward_table(sl, s1_text);
+                    if (sl->phase == PH_BWD_INIT) {
+                        ls_prepare_backward(sl);
+                    }
+                    break;
                 case PH_BWD_INIT:
                     ls_prepare_backward(sl);
                     break;
@@ -2376,11 +2709,22 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
         slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;
     }
 
+    // Jump depth for this call: walks jump from their first base to length
+    // jd = min(table depth, minSeedLen - 1) (bsd_plan_jump); 0 = step only
+    // (no table, BWA3_BWTSEED_JUMP=0, or jd < 2, where there is nothing to skip).
+    int32_t jd = 0;
+    const SeedJumpEntry *jlev = nullptr;
+    if (seed_jump != nullptr) {
+        jd = seed_jump_depth < minSeedLen - 1 ? seed_jump_depth : minSeedLen - 1;
+        if (jd >= 2) jlev = seed_jump + seed_jump_level_off(jd);
+        else jd = 0;
+    }
+
     // Seed the first min(N, numReads) slots.
     const int32_t initial = (numReads < N) ? numReads : N;
     for (int32_t s = 0; s < initial; s++) {
-        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb);
-        if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd);
+        if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr) bsd_prefetch_cp_occ(&slots[s]);
     }
     // Unused slots get input_idx = -1 so the flush pass skips them.
     for (int32_t s = initial; s < N; s++) {
@@ -2398,7 +2742,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
         // Stepping pass: advance each active slot by one unit of work.
         for (int32_t s = 0; s < N; s++) {
             if (slots[s].phase == BSD_FWD) {
-                bsd_advance_step(&slots[s], enc_qdb, minSeedLen);
+                bsd_advance_step(&slots[s], enc_qdb, minSeedLen, jlev, jd);
             }
             // Cross-slot T1 lookahead — same pattern as the SMEM lockstep's
             // (s + N/2) % N L2 prefetch.
@@ -2424,8 +2768,9 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 
             if (next_input < numReads) {
                 bsd_init_slot(&slots[s], next_input,
-                              max_intv_array, seq_, query_cum_len_ar, enc_qdb);
-                if (slots[s].phase == BSD_FWD) bsd_prefetch_cp_occ(&slots[s]);
+                              max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd);
+                if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr)
+                    bsd_prefetch_cp_occ(&slots[s]);
                 next_input++;
             } else {
                 slots[s].input_idx = -1;

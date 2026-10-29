@@ -80,7 +80,7 @@ typedef struct FmiSeed FmiSeed;               /* lets C consumers name the type 
 extern "C" {
 #endif
 
-FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index(load_pac=false) */
+FmiSeed       *fmi_seed_open(const char *prefix);            /* new FMI_search + load_index(load_pac=false, no seed jump table) */
 void           fmi_seed_close(FmiSeed *h);                   /* delete */
 const CP_OCC  *fmi_seed_cp_occ(const FmiSeed *h);             /* cp_occ_data() */
 const int64_t *fmi_seed_count(const FmiSeed *h);              /* count_data() */

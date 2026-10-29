@@ -361,6 +361,51 @@ rounds, and every round of this one was 0.3-0.5% lower. A window of 4 reads per
 slot measured the same as 8 on Graviton 4 and less on Zen 4 (SMEM stage −1.6% / −1.8%);
 2 reads per slot measured less on both.
 
+## Seed jump table ([PR #672](https://github.com/fg-labs/bwa-mem3/pull/672))
+
+Every SMEM forward walk, in the first pass and in the second-pass re-seeding
+(`min_intv = s + 1`), and every third-pass re-seeding (bwtSeed) walk starts from
+a 1-base interval and extends it one base at a time, so the first steps of all
+walks repeat the intervals of the same few short strings. At index load,
+bwa-mem3 now builds a table of the interval of every string of 1 to D bases,
+where D is the table depth (default 10), each computed exactly as the walk's own
+forward step computes it, and a walk takes its first steps from the table
+instead of the FM index: an SMEM walk up to the read end, the first `N` or depth
+D, and a bwtSeed walk straight to length `min(D, minSeedLen - 1)`, where it
+cannot yet stop. Only the lockstep drivers read the table; a build with
+lockstep disabled (`SMEM_LOCKSTEP_N` or `BWTSEED_LOCKSTEP_N` set to 1 or less)
+still builds it but steps that pass's walks from the FM index, as before. The
+walks reach the same intervals and take the same exits, so
+output is expected to be byte-identical. It was measured byte-identical on the
+HG00096 slice on the three hosts and SIMD tiers in the table below, and the unit
+tests check interval parity on the phiX fixture.
+
+Each process builds its own table, with the index-load threads: 33.6 MB at the
+default depth. That includes an index attached from shared memory
+(`bwa-mem3 shm`), which builds its copy after the attach, because the table is
+not part of the staged segment.
+
+Whole-aligner `mem -t 16` on a 5M-pair WGS slice (HG00096, 2x150, hg38), clang
+19.1.7, index in shared memory (so every run includes the table build), median
+of the paired per-rep difference against the same build without the table over
+6 interleaved reps, with its bootstrap 95% CI. Output was byte-identical on every run
+on each of these hosts.
+
+| host | tier | wall | CPU (user) |
+|---|---|---:|---:|
+| AWS c7i.4xlarge (Sapphire Rapids, x86-64) | AVX-512BW | −1.84% [−1.88, −1.70] | −1.80% [−1.97, −1.74] |
+| AWS c6a.4xlarge (Zen 3, x86-64) | AVX2 | −2.77% [−3.97, −1.48] | −2.72% [−4.00, −1.47] |
+| AWS c8g.4xlarge (Graviton 4, arm64) | NEON | −1.60% [−2.91, −1.24] | −1.80% [−3.05, −1.37] |
+
+On the first 200k pairs of the same slice, with the index loaded from the page
+cache on every run (so the load and the table build are a larger share of the
+wall), 12 reps gave −0.61% to −0.71% wall on the three hosts. On those runs
+peak RSS rose by 26 MB to 44 MB (paired median), in line with the table's size.
+
+| Variable | Effect |
+|---|---|
+| `BWA3_BWTSEED_JUMP=<n>` | Table depth, for all three seeding passes (the first- and second-pass SMEM walks and the third-pass bwtSeed walks): `0` builds no table (every walk steps from its first base), `2`–`12` sets the depth (2 MB at 8, 33.6 MB at 10, 134 MB at 11, 537 MB at 12; default 10). An unset or empty value (`BWA3_BWTSEED_JUMP=`) silently keeps the default; any other value is reported to stderr and the default used. Output is identical at every value. |
+
 ## Thread idle tail ([PR #590](https://github.com/fg-labs/bwa-mem3/pull/590))
 
 A timeline trace of each `kt_for` pass and pipeline step, on top of

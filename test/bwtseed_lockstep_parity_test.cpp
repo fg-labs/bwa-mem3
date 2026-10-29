@@ -16,7 +16,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <string>
+#include <vector>
 #include "FMI_search.h"
+#include "seed_jump_test_util.h"
 #include "bwa.h"
 
 /* A degenerate N=1 build would invoke bwtSeedStrategyAllPosOneThread_lockstep
@@ -612,6 +615,28 @@ int main(int argc, char *argv[]) {
         run_case(fmi, "Case 12p: phiX with mid-read N (real matches)",
                  numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,
                  enc_qdb, seq_, cum_len, /*expect_min_seeds=*/3);
+        free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 13j: reads shorter than the seed jump depth, and minSeedLen around
+     * it. A walk jumps to length min(depth, minSeedLen - 1) only when that many
+     * ACGT bases follow its start, and not at all below length 2 (minSeedLen
+     * 2), so these reads take the jump, stop short of it at the read end or an
+     * N, or skip it, at every minSeedLen here. */
+    {
+        const std::vector<std::string> rs = jump_depth_reads();
+        std::vector<const char *> reads;
+        for (const std::string &r : rs) reads.push_back(r.c_str());
+        const int32_t numReads = (int32_t)reads.size();
+        uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+        encode_reads(reads.data(), numReads, &enc_qdb, &seq_, &cum_len);
+        const int32_t min_seeds[] = {2, 3, 4, 5, 11, 12, 13};
+        for (const int32_t msl : min_seeds) {
+            char name[96];
+            snprintf(name, sizeof name, "Case 13j: reads of 1-14 bases, minSeedLen %d", (int)msl);
+            run_case(fmi, name, numReads, /*max_readlength=*/14, msl, /*max_intv=*/50,
+                     enc_qdb, seq_, cum_len, /*expect_min_seeds=*/1);
+        }
         free(enc_qdb); free(seq_); free(cum_len);
     }
 

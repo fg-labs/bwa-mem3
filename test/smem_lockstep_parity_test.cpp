@@ -27,6 +27,7 @@
 #include <string>
 #include <vector>
 #include "FMI_search.h"
+#include "seed_jump_test_util.h"
 #include "smem_parked.h"
 #include "bwa.h"
 
@@ -1476,6 +1477,37 @@ int main(int argc, char *argv[]) {
             free(enc_qdb); free(seq_); free(cum_len);
         }
         free(ref);
+    }
+
+    /* Case 20: reads shorter than the seed jump depth. A forward walk takes its
+     * first steps from the table up to the read end or the first N, so walks
+     * from every start of reads of 1-14 bases (and of a 14-base read with an N
+     * at each position) cover table runs of every length up past the default
+     * depth, at min_intv 1 and at min_intv values that end a run early. */
+    {
+        const std::vector<std::string> rs = jump_depth_reads();
+        std::vector<const char *> reads;
+        for (const std::string &r : rs) reads.push_back(r.c_str());
+        uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+        encode_reads(reads.data(), (int32_t)reads.size(), &enc_qdb, &seq_, &cum_len);
+        std::vector<int32_t> qpa, rid;
+        for (size_t r = 0; r < rs.size(); r++)
+            for (size_t x = 0; x < rs[r].size(); x++) {
+                qpa.push_back((int32_t)x);
+                rid.push_back((int32_t)r);
+            }
+        const int32_t n = (int32_t)qpa.size();
+        const int32_t min_intvs[] = {1, 4, 30};
+        for (const int32_t mi : min_intvs) {
+            std::vector<int32_t> q = qpa, r = rid, m((size_t)n, mi);
+            char name[96];
+            snprintf(name, sizeof name, "Case 20: walks from every start of reads of 1-14 bases, min_intv %d",
+                     (int)mi);
+            run_case(fmi, name, n, /*max_readlength=*/14, /*minSeedLen=*/3,
+                     enc_qdb, q.data(), m.data(), r.data(), seq_, cum_len,
+                     /*expect_min_smem=*/1);
+        }
+        free(enc_qdb); free(seq_); free(cum_len);
     }
 
     /* Case 19: s1_tag_contained's rules (no index needed). */
