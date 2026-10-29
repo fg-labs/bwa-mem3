@@ -1985,13 +1985,13 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         if (a > 3) goto DONE;
 
         /* numPrev==1 straight-line path: the two-loop machinery and the curr_s
-         * dedup collapse to a single element. Byte-identical. This is a hand-kept
-         * specialization of the two general loops below (the emit predicate, the
-         * prefetch pair, and the numCurr/j-- bookkeeping are duplicated here) — a
-         * future edit to that logic in the general loops MUST be mirrored into
-         * this block, or numPrev==1 reads (unique matches — the common case this
-         * path accelerates) silently diverge. The lockstep parity test guards
-         * this (see Case 13, which drives real interior-start backward walks). */
+         * dedup collapse to a single element. Byte-identical. A hand-kept copy
+         * of the general loops below (emit predicate, prefetch pair, numCurr/j--
+         * bookkeeping): mirror any edit to that logic here, or numPrev==1 reads
+         * (unique matches, the common case) silently diverge; the lockstep
+         * parity test's Case 13 guards it. It keeps the member call and s->
+         * reads on purpose: one step has no per-iteration reloads for the
+         * general loops' hoisted locals to save. */
         if (s->numPrev == 1) {
             SMEM smem = s->prev[0];
             SMEM newSmem = backwardExt_konly(smem, a);
@@ -2016,42 +2016,55 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
             return;
         }
 
+        /* The slot's fields, cp_occ and count[a] are read once into locals for
+         * the two general loops, and numPrev / j written back once after them.
+         * Read through s and this, clang reloads them after every prev[] store
+         * (the SMEM stores may alias them as far as it can tell), an extra L1
+         * load ahead of each prev[p] load, compare and prefetch. prev[] and
+         * match_buf[] are driver-owned buffers that overlap neither the slot nor
+         * the index, so this is byte-identical. */
+        SMEM *const prev = s->prev;
+        const int32_t numPrev = s->numPrev;
+        const int32_t min_intv = s->min_intv;
+        const int32_t j = s->j;
+        const CP_OCC *const cpo = cp_occ;
+        const int64_t count_a = count[a];
         int p;
-        for (p = 0; p < s->numPrev; p++) {
-            SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt_konly(smem, a);
-            newSmem.m = s->j;
-            if ((newSmem.s < s->min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
-                s->cur_j = s->j;
+        for (p = 0; p < numPrev; p++) {
+            SMEM smem = prev[p];
+            SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
+            newSmem.m = j;
+            if ((newSmem.s < min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
+                s->cur_j = j;
                 s->match_buf[s->match_count++] = smem;
                 break;
             }
-            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+            if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
                 curr_s = newSmem.s;
-                s->prev[numCurr++] = newSmem;
+                prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
                 break;
             }
         }
         p++;
-        for (; p < s->numPrev; p++) {
-            SMEM smem = s->prev[p];
-            SMEM newSmem = backwardExt_konly(smem, a);
-            newSmem.m = s->j;
-            if ((newSmem.s >= s->min_intv) && (newSmem.s != curr_s)) {
+        for (; p < numPrev; p++) {
+            SMEM smem = prev[p];
+            SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
+            newSmem.m = j;
+            if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
                 curr_s = newSmem.s;
-                s->prev[numCurr++] = newSmem;
+                prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
             }
         }
         s->numPrev = numCurr;
-        s->j--;                // advance for the next outer step
+        s->j = j - 1;          // advance for the next outer step
         if (numCurr == 0) goto DONE;
         return;                // stay in PH_BWD; next call continues
     }
