@@ -186,10 +186,12 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)
  *     max(w_match, w_ambig, 1) = max(opt->a, 1).
  *   - h0 + min(len1,len2)*a < 255 - maxStep : the MAX ATTAINABLE score (seed
  *     plus an all-match diagonal over the shorter sequence) stays below the byte
- *     ceiling, so no row max can ever reach it. This is also what bounds h0
- *     itself, which is why there is no separate h0 gate: the former
+ *     ceiling, so no row max can ever reach it. This also bounds h0 from
+ *     above, which is why there is no upper h0 gate: the former
  *     h0 <= zdrop + 1 condition existed to zero the removed re-baseline floor
  *     and was dropped in EXT-4 (see bsw8_envelope_ok below).
+ *   - h0 >= 0 : the seed byte cannot hold a negative h0 (--meth), and clamping
+ *     it to 0 turns the seed's diagonal into a local restart.
  *
  * NOTE: minval (= h0 + min(len)*a) is still used by sortPairsLenExt as the
  * counting-sort bin index (hist[minval]) and must stay < MAX_SEQ_LEN8 there for
@@ -213,8 +215,7 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)
                                           second role is moot, so this bound is now conservative
                                           rather than tight. See smithWaterman128_8 h0-prefix seed. */
 
-static inline int bsw8_envelope_ok(int len1, int len2, int w,
-                                   int score_a, int zdrop, int h0)
+int bsw8_envelope_ok(int len1, int len2, int w, int score_a, int zdrop, int h0)
 {
     /* Dev A/B hook: BWAMEM3_DISABLE_BSW8=1 forces every pair off the 8-bit path
      * onto the 16-bit (then scalar) buckets. Used to validate that the 8-bit
@@ -237,7 +238,7 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
      * shorter sequence. Must stay strictly below the byte ceiling 255 - max_step
      * so no row max can ever reach it; that alone makes the kernel an exact
      * unsigned [0,255] SW, and since h0 <= max_score it also bounds the seed
-     * byte, so no separate h0 gate is needed. */
+     * byte from above; h0 >= 0 below bounds it from below. */
     int64_t max_score = (int64_t)h0 + shorter * (int64_t)score_a;
     return len1 < MAX_SEQ_LEN8 && len2 < MAX_SEQ_LEN8 &&
            /* target (rows, len1) >= query (cols, len2). The re-baseline 8-bit
@@ -257,8 +258,9 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
             * introduced to force the per-lane re-baseline floor B0 = max(0, h0 -
             * (zdrop+1)) to zero; that re-baseline machinery was removed (the 8-bit
             * DP is now a plain unsigned [0,255] SW), so h0's only remaining
-            * constraint is that the seed byte fit a uint8 — guaranteed by the
-            * max_score bound below (h0 <= max_score < 255 - max_step). A second,
+            * constraint is that the seed byte fit a uint8: from above by the
+            * max_score bound below (h0 <= max_score < 255 - max_step), from below
+            * by h0 >= 0. A second,
             * subtler role — bounding the seed against the z-drop horizon so a
             * high-h0 lane does not z-drop before its row max builds up — was fixed
             * in the kernel by #273 (correct 8-bit z-drop/seed clamp at high seed
@@ -267,7 +269,14 @@ static inline int bsw8_envelope_ok(int len1, int len2, int w,
             * harsh scoring sweeps (see test/bandedswa_high_h0_zdrop_test.cpp).
             * Admitting these pairs moves ~7.41% of Illumina extension pairs from
             * the 8-lane 16-bit tier to the 16-lane 8-bit tier. */
-           max_score < 255 - max_step;
+           max_score < 255 - max_step &&
+           /* A negative h0 (--meth rescores the seed in original space) has no
+            * byte: the kernels clamp it to 0, which their recurrence reads as a
+            * local restart on the seed's diagonal, while scalar and 16-bit carry
+            * it. With a match score above 1, h0 in (-a, 0) then lets those start
+            * a positive diagonal that the 8-bit kernel cannot, so the pair goes
+            * to 16-bit (test/bandedswa_negative_h0_test.cpp). */
+           h0 >= 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -5904,9 +5913,9 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
     return nptr;
 }
 
-inline void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
-                            int32_t *hist, int &numPairs128, int &numPairs16,
-                            int &numPairs1, int score_a, int w, int zdrop)
+void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
+                     int32_t *hist, int &numPairs128, int &numPairs16,
+                     int &numPairs1, int score_a, int w, int zdrop)
 {
     int32_t i;
     numPairs128 = numPairs16 = numPairs1 = 0;
