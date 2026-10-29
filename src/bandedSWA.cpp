@@ -940,7 +940,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // The h0-prefix column/row seed below is unsigned-saturating [0,255] and
         // is seeded from the raw seed score h0 (no re-baseline floor): the only
         // requirement is that the seed byte fit a uint8, which bsw8_envelope_ok()
-        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255).
+        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255, and
+        // h0 >= 0).
         assert(this->zdrop >= 0 && "8-bit banded SW: negative zdrop");
 
         int nstart = 0, nend = numPairs;
@@ -972,7 +973,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 // seed uses unsigned-saturating ops, so the only bound is that the
                 // seed byte fit a uint8 -- guaranteed by bsw8_envelope_ok(), which
                 // admits a pair only when h0 + min(len1,len2)*maxStep < 255 - maxStep
-                // (hence h0 < 255). The previous prefix clamp min(h0, zdrop+1) existed
+                // (hence h0 < 255) and h0 >= 0. The previous prefix clamp min(h0, zdrop+1) existed
                 // only to keep the removed floor B0 = max(0, h0 - (zdrop+1)) at zero;
                 // with B gone it is pure loss -- it truncated the seed relative to
                 // best_abs (which records the raw h0), so a high-h0 pair that never
@@ -2953,7 +2954,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
         // The h0-prefix column/row seed below is unsigned-saturating [0,255] and
         // is seeded from the raw seed score h0 (no re-baseline floor): the only
         // requirement is that the seed byte fit a uint8, which bsw8_envelope_ok()
-        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255).
+        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255, and
+        // h0 >= 0).
         assert(this->zdrop >= 0 && "8-bit banded SW: negative zdrop");
 
         int nstart = 0, nend = numPairs;
@@ -2984,7 +2986,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
                 // seed uses unsigned-saturating ops, so the only bound is that the
                 // seed byte fit a uint8 -- guaranteed by bsw8_envelope_ok(), which
                 // admits a pair only when h0 + min(len1,len2)*maxStep < 255 - maxStep
-                // (hence h0 < 255). The previous prefix clamp min(h0, zdrop+1) existed
+                // (hence h0 < 255) and h0 >= 0. The previous prefix clamp min(h0, zdrop+1) existed
                 // only to keep the removed floor B0 = max(0, h0 - (zdrop+1)) at zero;
                 // with B gone it is pure loss -- it truncated the seed relative to
                 // best_abs (which records the raw h0), so a high-h0 pair that never
@@ -6299,7 +6301,8 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
         // The h0-prefix column/row seed below is unsigned-saturating [0,255] and
         // is seeded from the raw seed score h0 (no re-baseline floor): the only
         // requirement is that the seed byte fit a uint8, which bsw8_envelope_ok()
-        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255).
+        // guarantees (h0 + min(len1,len2)*maxStep < 255 - maxStep => h0 < 255, and
+        // h0 >= 0).
         assert(this->zdrop >= 0 && "8-bit banded SW: negative zdrop");
 
         int nstart = 0, nend = numPairs;
@@ -6334,7 +6337,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 // seed uses unsigned-saturating ops, so the only bound is that the
                 // seed byte fit a uint8 -- guaranteed by bsw8_envelope_ok(), which
                 // admits a pair only when h0 + min(len1,len2)*maxStep < 255 - maxStep
-                // (hence h0 < 255). The previous prefix clamp min(h0, zdrop+1) existed
+                // (hence h0 < 255) and h0 >= 0. The previous prefix clamp min(h0, zdrop+1) existed
                 // only to keep the removed floor B0 = max(0, h0 - (zdrop+1)) at zero;
                 // with B gone it is pure loss -- it truncated the seed relative to
                 // best_abs (which records the raw h0), so a high-h0 pair that never

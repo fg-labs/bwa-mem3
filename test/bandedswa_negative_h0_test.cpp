@@ -17,7 +17,14 @@
 //      an advancing pair in one group, and among many pairs, and that equals
 //      the scalar oracle;
 //   2. random mixed batches (negative and positive h0) give every pair the same
-//      result as that pair scored alone and as the scalar oracle.
+//      result as that pair scored alone and as the scalar oracle;
+//   3. with a match score of 1, 2 and 3, a pair routed as production routes it
+//      (bsw8_envelope_ok picks getScores8 or getScores16) matches the scalar
+//      oracle for h0 from -(a+1) to 0. The 8-bit kernels clamp the seed byte at
+//      0, which matches scalar only while h0 + a <= 0 on the seed's diagonal, so
+//      the gate must keep a negative h0 off the 8-bit kernel;
+//   4. the production classifier (sortPairsLenExt) sends a negative-h0 pair
+//      whose h0 + min(len1,len2)*a is negative to the scalar tier, not 16-bit.
 // Exits non-zero on any mismatch.
 
 #include <cstdio>
@@ -26,6 +33,7 @@
 #include <vector>
 
 #include "bandedSWA.h"
+#include "bwamem.h"
 #include "framework/ext_result.h"
 
 namespace {
@@ -33,8 +41,10 @@ namespace {
 struct Pair { int h0; std::vector<uint8_t> ref, qer; };
 using bwa_tests::ExtResult;
 
-// Score `pairs` in one batch (vector or scalar); results in input order.
-std::vector<ExtResult> score(BandedPairWiseSW &bsw, const std::vector<Pair> &pairs, bool scalar, int w)
+enum Kernel { SCALAR, K8, K16 };
+
+// Score `pairs` in one batch with `kernel`; results in input order.
+std::vector<ExtResult> score_with(BandedPairWiseSW &bsw, const std::vector<Pair> &pairs, Kernel kernel, int w)
 {
     std::vector<uint8_t> ref, qer;
     const int n = (int)pairs.size();
@@ -52,8 +62,9 @@ std::vector<ExtResult> score(BandedPairWiseSW &bsw, const std::vector<Pair> &pai
     }
     ref.resize(ref.size() + 256);
     qer.resize(qer.size() + 256);
-    if (scalar) bsw.scalarBandedSWAWrapper(sp.data(), ref.data(), qer.data(), n, 1, w);
-    else        bsw.getScores8(sp.data(), ref.data(), qer.data(), n, 1, w);
+    if (kernel == SCALAR)  bsw.scalarBandedSWAWrapper(sp.data(), ref.data(), qer.data(), n, 1, w);
+    else if (kernel == K8) bsw.getScores8(sp.data(), ref.data(), qer.data(), n, 1, w);
+    else                   bsw.getScores16(sp.data(), ref.data(), qer.data(), n, 1, w);
     std::vector<ExtResult> out(n);
     for (int i = 0; i < n; i++) {
         const SeqPair &p = sp[i];
@@ -62,6 +73,11 @@ std::vector<ExtResult> score(BandedPairWiseSW &bsw, const std::vector<Pair> &pai
         o.gscore = p.gscore; o.gtle = p.gtle; o.max_off = p.max_off;
     }
     return out;
+}
+
+std::vector<ExtResult> score(BandedPairWiseSW &bsw, const std::vector<Pair> &pairs, bool scalar, int w)
+{
+    return score_with(bsw, pairs, scalar ? SCALAR : K8, w);
 }
 
 Pair make_pair(std::mt19937 &rng, int h0, int len1, int len2, bool copy)
@@ -146,6 +162,74 @@ int main()
                         oracle[i].score, oracle[i].gscore, oracle[i].tle, oracle[i].qle);
                 if (++fails > 20) return 1;
             }
+        }
+    }
+
+    // 3. Routed through the production gate at a = 1, 2, 3. Each query copies the
+    //    start of its reference, so the seed's diagonal scores a per base and an
+    //    h0 in (-a, 0) can start a positive extension.
+    for (int8_t ra = 1; ra <= 3; ra++) {
+        int8_t rmat[25];
+        { int k = 0;
+          for (int i = 0; i < 4; ++i) { for (int j = 0; j < 4; ++j) rmat[k++] = (i == j) ? ra : -b; rmat[k++] = ambig; }
+          for (int j = 0; j < 5; ++j) rmat[k++] = ambig; }
+        BandedPairWiseSW rbsw(o, e, o, e, zdrop, end_bonus, rmat, ra, b, 1);
+        for (int h0 = -(ra + 1); h0 <= 0; h0++) {
+            std::vector<Pair> v8, v16;
+            for (int i = 0; i < 100; i++) {
+                const int len2 = 20 + (int)(rng() % 20), len1 = len2 + (int)(rng() % 20);
+                Pair p = make_pair(rng, h0, len1, len2, true);
+                (bsw8_envelope_ok(len1, len2, w, ra, zdrop, h0) ? v8 : v16).push_back(p);
+            }
+            // The gate rejects every negative seed by design, but must admit the
+            // h0 = 0 control, or the check below never reaches getScores8.
+            if (h0 == 0 && v8.empty()) {
+                fprintf(stderr, "routed a=%d h0=0: no pair reached getScores8\n", ra);
+                fails++;
+            }
+            for (const std::vector<Pair> *v : {&v8, &v16}) {
+                if (v->empty()) continue;
+                const Kernel k = v == &v8 ? K8 : K16;
+                const std::vector<ExtResult> got = score_with(rbsw, *v, k, w);
+                const std::vector<ExtResult> oracle = score_with(rbsw, *v, SCALAR, w);
+                for (size_t i = 0; i < v->size(); i++) {
+                    if (got[i] == oracle[i]) continue;
+                    fprintf(stderr, "routed a=%d h0=%d pair %zu (len1=%zu len2=%zu) on %s: score=%d qle=%d tle=%d gscore=%d, "
+                            "scalar score=%d qle=%d tle=%d gscore=%d\n", ra, h0, i, (*v)[i].ref.size(), (*v)[i].qer.size(),
+                            k == K8 ? "getScores8" : "getScores16", got[i].score, got[i].qle, got[i].tle, got[i].gscore,
+                            oracle[i].score, oracle[i].qle, oracle[i].tle, oracle[i].gscore);
+                    if (++fails > 20) return 1;
+                }
+            }
+        }
+    }
+
+    // 4. The production classifier (sortPairsLenExt) at a = 1, len1 = len2 = 20:
+    //    h0 = 0 takes the 8-bit tier; h0 = -1 (minval 19) leaves it for 16-bit;
+    //    h0 = -30 (minval -10) has no 16-bit bin and must go to the scalar tier.
+    {
+        const int ra = 1, len = 20;
+        const int h0s[3] = {0, -1, -30};
+        std::vector<SeqPair> sp(3), tmp(3);
+        for (int i = 0; i < 3; i++) {
+            SeqPair p = {};
+            p.id = i; p.seqid = i;
+            p.len1 = p.len2 = len;
+            p.h0 = h0s[i];
+            sp[i] = p;
+        }
+        std::vector<int32_t> hist(MAX_SEQ_LEN8 + MAX_SEQ_LEN16 + 1);
+        int n8 = -1, n16 = -1, n1 = -1;
+        sortPairsLenExt(sp.data(), 3, tmp.data(), hist.data(), n8, n16, n1, ra, w, zdrop);
+        if (n8 != 1 || n16 != 1 || n1 != 1) {
+            fprintf(stderr, "classifier: tier counts 8-bit=%d 16-bit=%d scalar=%d, expected 1/1/1\n", n8, n16, n1);
+            fails++;
+        }
+        // Tiers are laid out 8-bit, then 16-bit, then scalar.
+        for (int i = 0; i < 3; i++) {
+            if (sp[i].h0 == h0s[i]) continue;
+            fprintf(stderr, "classifier: slot %d holds h0=%d, expected %d\n", i, sp[i].h0, h0s[i]);
+            fails++;
         }
     }
 

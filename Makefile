@@ -1101,8 +1101,8 @@ bandedswa_highzdrop_seed_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test
 
 # Negative-h0 regression: an 8-bit lane whose seed score is negative (--meth
 # rescores seeds in original space) must score the same alone as in any group.
-bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
-	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBS) -o $@
+bandedswa_negative_h0_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) src/bandedSWA.native.o test/bandedswa_negative_h0_test.o
+	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/bandedswa_negative_h0_test.o src/bandedSWA.native.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
 # High-h0 / small-zdrop z-drop regression: getScores8 vs scalar with the seed
 # score h0 above zdrop+1 at small zdrop (the region a relaxed 8-bit routing
