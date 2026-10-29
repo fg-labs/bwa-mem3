@@ -686,6 +686,22 @@ generated jobs.
   on AWS Graviton 4, 5M-pair WGS slice at `-t 16`: band pass 0 -2.7%, pass 1
   -1.4%, filter -2.1%, user CPU -0.44%.
   ([#623](https://github.com/fg-labs/bwa-mem3/pull/623))
+- **Rescue kernel buffers apart modulo 4 KiB (x86).** The rescue kernels' three
+  column rails were three allocations of one size, and the x86 8-bit kernels'
+  per-call query buffer a fourth. Where they land modulo 4 KiB is up to the
+  allocator, and all four could share one offset. A cell's stores to two rails
+  then matched the next cell's loads from the others on address bits 11:0, and
+  the core held the loads until the stores resolved. The rails are now one
+  block, 1 KiB apart modulo 4 KiB, and the query buffer is placed 3 KiB off
+  them whatever the allocator returns. Layout only: SAM records were identical
+  to `main` on every timed run below, and the rescue kernels' per-pair results
+  matched field for field at both tiers. On AMD Zen 4
+  (m7a.4xlarge), clang 19.1.7, 5M-pair WGS slice at `-t 16`: at the AVX-512BW
+  tier kswv pass 0 -6.6%, wall -0.9%, user+sys CPU -1.0%; at forced AVX2 pass 0
+  -1.5%, wall and CPU flat. The NEON rails move too, with no measured effect:
+  on Apple M2 Max, the rescue kernel run in isolation on 100, 150 and 250 bp
+  pairs was neutral.
+  ([#658](https://github.com/fg-labs/bwa-mem3/pull/658))
 
 | Variable | Effect |
 |---|---|
