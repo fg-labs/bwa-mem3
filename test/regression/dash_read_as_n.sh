@@ -59,15 +59,16 @@ done
 grep -q -- '-' "$W/dash_1.fq" || fail "the '-' fixture has no '-'"
 cmp -s "$W/dash_1.fq" "$W/n_1.fq" && fail "the '-' and N fixtures are identical"
 
-# Tiers: the host's own (unforced) and every x86 tier at or below it.
-host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BWA_MEM3" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
-[ -n "$host_tier" ] || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
-case "$host_tier" in
-    avx512bw) tiers=(host avx2 avx512bw) ;;
-    avx2) tiers=(host avx2) ;;
-    *) tiers=(host) ;;
-esac
-echo "Host tier: $host_tier; tiers checked: ${tiers[*]}"
+# Tiers: the host's own (unforced) and every x86 tier at or below it that
+# simd_sweep_tiers covers (none below avx2, which has no batched kswv kernel).
+# shellcheck source=test/framework/simd_tiers.sh
+source "$HERE/../framework/simd_tiers.sh"
+simd_sweep_tiers "$BWA_MEM3" || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
+tiers=(host)
+for t in ${SIMD_TIERS[@]+"${SIMD_TIERS[@]}"}; do
+    [ "$t" = neon ] || tiers+=("$t")
+done
+echo "Host tier: $SIMD_HOST_TIER; tiers checked: ${tiers[*]}"
 
 # run <out> <tier> <threads> <mode: pe|se> <prefix> <env/flags...>
 run() {
