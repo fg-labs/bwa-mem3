@@ -38,6 +38,8 @@
 
 # shellcheck source=test/framework/simd_tiers.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/simd_tiers.sh"
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/dna.sh"
 
 # mem_cli_init <script-name>
 #   Checks BWA_MEM3, resolves the SIMD tiers to run (mem_cli_tiers), makes the
@@ -180,11 +182,6 @@ mem_cli_seq() {
         echo "FAIL: ${MEM_CLI_NAME:-mem_cli}: mem_cli_seq $2:$3+$4 is outside the reference $1" >&2
         return 1
     fi
-}
-
-# mem_cli_revcomp <seq>
-mem_cli_revcomp() {
-    printf '%s\n' "$1" | rev | tr 'ACGTNacgtn' 'TGCANtgcan'
 }
 
 # mem_cli_subst <seq> <pos> <base>

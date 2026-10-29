@@ -155,6 +155,8 @@ rec="$(mem_cli_primary "$work/a.sam" r1)"
 check "mem_cli_tag: a present tag" 4 "$(mem_cli_tag "$rec" AS)"
 check "mem_cli_tag: an absent tag" "" "$(mem_cli_tag "$rec" XS)"
 
+check "dna_revcomp: reverses, complements, keeps case, N and '-'" "-nacgtNACGT" "$(dna_revcomp "ACGTNacgtn-")"
+
 printf '>c\nACGTACGT\n' > "$work/ref.fa"
 check "mem_cli_seq: an in-range slice" GTAC "$(mem_cli_seq "$work/ref.fa" c 3 4)"
 rc=0

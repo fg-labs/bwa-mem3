@@ -37,6 +37,8 @@
 #   HIC_WORK_DIR    — directory for fixture-private intermediates
 
 set -euo pipefail
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 : "${HIC_PHIX_FA:?HIC_PHIX_FA must be set}"
@@ -64,7 +66,7 @@ n_pairs=0
 for off in $(seq 100 200 4700); do
     s1="${seq:$off:$L}"
     s2fwd="${seq:$((off + G)):$L}"
-    s2="$(printf '%s' "$s2fwd" | rev | tr 'ACGT' 'TGCA')"
+    s2="$(dna_revcomp "$s2fwd")"
     [ "${#s1}" -eq "$L" ] && [ "${#s2}" -eq "$L" ] || continue
     q="$(printf 'I%.0s' $(seq 1 "$L"))"
     printf '@pair%d/1\n%s\n+\n%s\n' "$n_pairs" "$s1" "$q" >> "$r1"

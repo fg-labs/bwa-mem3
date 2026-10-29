@@ -88,7 +88,7 @@ rev_qual_sam="$(printf '%s\n' "$rev_qual" | rev)"
 
 {
     mem_cli_fq exact "$exact"
-    mem_cli_fq rev "$(mem_cli_revcomp "$rev_fwd")" "$rev_qual"
+    mem_cli_fq rev "$(dna_revcomp "$rev_fwd")" "$rev_qual"
     mem_cli_fq mm "$mm"
     mem_cli_fq del2 "$del2"
     mem_cli_fq inR "$in_r"

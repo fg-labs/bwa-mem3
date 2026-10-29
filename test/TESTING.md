@@ -214,4 +214,5 @@ For a test using `std::mt19937(seed)`, reproduce locally by editing the seed and
 | `framework/stderr_capture.h`     | `StderrCapture`, `QuietStderr`: scoped stderr redirection |
 | `framework/temp_index.h`         | `TempIndex`: a real index of test contigs, built and loaded in a `TempDir`; `nt4`, `revcomp` |
 | `framework/simd_tiers.sh`        | `simd_sweep_tiers`: the SIMD tiers a regression script sweeps; `simd_detect_tier`, `simd_tier_rank`: the tier a binary dispatches to, and tier order |
+| `framework/dna.sh`               | `dna_revcomp`: the reverse complement regression scripts build reads with |
 | `framework/mem_cli.sh`           | Source-only shell helpers for the `mem` CLI regression scripts |

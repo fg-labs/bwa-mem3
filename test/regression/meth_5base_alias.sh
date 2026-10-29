@@ -31,6 +31,8 @@
 #              PATH, or a path to the binary (a relative one is made absolute
 #              before the `cd "$WORK"` below)
 set -euo pipefail
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 case "$BWA_MEM3" in
     */*) BWA_MEM3="$(cd "$(dirname "$BWA_MEM3")" && pwd)/$(basename "$BWA_MEM3")" ;;
@@ -54,7 +56,6 @@ printf '>chrA\n%s\n' "$REF" > ref.fa
 # reverse complement of its far end, so both mates carry that strand's C->T.
 # On the top strand a converted CpG reads TG; on the bottom strand its C is
 # the top strand's G, so in top-strand coordinates the CpG reads CA.
-revcomp() { printf '%s' "$1" | rev | tr ACGT TGCA; }
 qual=$(printf 'I%.0s' $(seq 1 100))
 add_pair() { # $1 = name, $2 = R1, $3 = R2
     printf '@%s\n%s\n+\n%s\n' "$1" "$2" "$qual" >> r1.fq
@@ -62,10 +63,10 @@ add_pair() { # $1 = name, $2 = R1, $3 = R2
 }
 ot_left=${REF:200:100}
 ot_right=${REF:400:100}
-add_pair ot "${ot_left/CG/TG}" "$(revcomp "${ot_right/CG/TG}")"
+add_pair ot "${ot_left/CG/TG}" "$(dna_revcomp "${ot_right/CG/TG}")"
 ob_left=${REF:600:100}
 ob_right=${REF:800:100}
-add_pair ob "$(revcomp "${ob_right/CG/CA}")" "${ob_left/CG/CA}"
+add_pair ob "$(dna_revcomp "${ob_right/CG/CA}")" "${ob_left/CG/CA}"
 
 align() { # $1 = output, rest = --meth spelling
     local out="$1"

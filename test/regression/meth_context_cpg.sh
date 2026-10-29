@@ -59,6 +59,8 @@
 #              PATH, or a path to the binary (a relative one is made absolute
 #              before the `cd "$WORK"` below)
 set -euo pipefail
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 case "$BWA_MEM3" in
     */*) BWA_MEM3="$(cd "$(dirname "$BWA_MEM3")" && pwd)/$(basename "$BWA_MEM3")" ;;
@@ -89,7 +91,6 @@ lcg_seq() { # lcg_seq SEED LEN
     done
     printf '%s' "$seq"
 }
-revcomp() { printf '%s' "$1" | rev | tr ACGT TGCA; }
 # set_base STR OFFSET BASE: STR with the base at 0-based OFFSET replaced.
 set_base() { printf '%s' "${1:0:$2}$3${1:$(($2 + 1))}"; }
 
@@ -97,7 +98,7 @@ C1=$(lcg_seq 12345 2000)
 C2=$(lcg_seq 67890 2000)
 printf '>chr1\n%s\n>chr2\n%s\n' "$C1" "$C2" > ref.fa
 # The twin reference: chr1 reverse-complemented, chr2 unchanged.
-printf '>chr1rc\n%s\n>chr2\n%s\n' "$(revcomp "$C1")" "$C2" > ref_rc.fa
+printf '>chr1rc\n%s\n>chr2\n%s\n' "$(dna_revcomp "$C1")" "$C2" > ref_rc.fa
 
 # Offsets (within win[0,100)) of the Cs followed by G inside the window, of
 # the Cs not followed by G, and of the Gs preceded by C. The neighbour is read
@@ -159,7 +160,7 @@ for o in $(plain_c "$C1" $A); do
 done
 [ -n "$NONCPG" ] || fail "fixture: no non-CpG C in chr1[$((A + 30)), $((A + 70))]"
 R1B=$(set_base "$R1A" "$NONCPG" T)
-R2A=$(revcomp "${C1:$((A + 200)):100}")
+R2A=$(dna_revcomp "${C1:$((A + 200)):100}")
 add_pair ot3 "$R1A" "$R2A"
 add_pair ot3plain "$R1B" "$R2A"
 
@@ -170,7 +171,7 @@ B=400
 read -r -a CPG_B <<< "$(pick 3 10 89 "$(cpg_g "$C2" $B)")"
 WB=${C2:$B:100}
 for o in "${CPG_B[@]}"; do WB=$(set_base "$WB" "$o" A); done
-add_pair ob3 "$(revcomp "$WB")" "${C2:200:100}"
+add_pair ob3 "$(dna_revcomp "$WB")" "${C2:200:100}"
 
 # Pair 4: a CpG at read 1's last base: chr2[e - 99, e + 1) with C at e and
 # G at e + 1, so the G lies just past the alignment. Read 2 = the reverse
@@ -184,7 +185,7 @@ for ((k = 1000; k < 1600; k++)); do
 done
 [ -n "$E" ] || fail "fixture: no CpG in chr2[1000, 1600)"
 R1E=$(set_base "${C2:$((E - 99)):100}" 99 T)
-add_pair edge "$R1E" "$(revcomp "${C2:$((E + 101)):100}")"
+add_pair edge "$R1E" "$(dna_revcomp "${C2:$((E + 101)):100}")"
 
 # Pair 5: an OT fragment chr1[x, x + 300) whose read 1 has two CpG Cs in
 # offsets [1, 15], a plain C in [8, 15] and an A or T at offset 17. Read 1
@@ -220,7 +221,7 @@ read -r -a CPG_X <<< "$(pick 2 1 15 "$(cpg_c "$C1" $X)")"
 R1X=${C1:$X:100}
 for o in "${CPG_X[@]}" "$PLAIN_X"; do R1X=$(set_base "$R1X" "$o" T); done
 [ "${R1X:17:1}" = A ] && R1X=$(set_base "$R1X" 17 T) || R1X=$(set_base "$R1X" 17 A)
-add_pair ext "$R1X" "$(revcomp "${C1:$((X + 200)):100}")"
+add_pair ext "$R1X" "$(dna_revcomp "${C1:$((X + 200)):100}")"
 
 # Rescue pairs. mutate_unseedable CONTIG START NCPG NPLAIN: the forward 100-mer
 # CONTIG[START, START + 100) with C->T at NCPG CpG Cs in [5, 95] and NPLAIN
@@ -266,11 +267,11 @@ mutate_unseedable() {
 }
 # Pair 6 (a, b): an OT fragment chr1[1200, 1500); read 1 = chr1[1200, 1300),
 # read 2 = the reverse complement of the unseedable chr1[1400, 1500).
-add_pair resc2cpg "${C1:1200:100}" "$(revcomp "$(mutate_unseedable "$C1" 1400 2 0)")"
-add_pair resc2plain "${C1:1200:100}" "$(revcomp "$(mutate_unseedable "$C1" 1400 2 1)")"
+add_pair resc2cpg "${C1:1200:100}" "$(dna_revcomp "$(mutate_unseedable "$C1" 1400 2 0)")"
+add_pair resc2plain "${C1:1200:100}" "$(dna_revcomp "$(mutate_unseedable "$C1" 1400 2 1)")"
 # Pair 7: an OT fragment chr1[1650, 1950); read 1 = the unseedable
 # chr1[1650, 1750), read 2 = the reverse complement of chr1[1850, 1950).
-add_pair resc1plain "$(mutate_unseedable "$C1" 1650 2 1)" "$(revcomp "${C1:1850:100}")"
+add_pair resc1plain "$(mutate_unseedable "$C1" 1650 2 1)" "$(dna_revcomp "${C1:1850:100}")"
 
 "$BWA_MEM3" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth ref.fa nonzero exit"
 "$BWA_MEM3" index --meth ref_rc.fa > /dev/null 2>&1 || fail "index --meth ref_rc.fa nonzero exit"

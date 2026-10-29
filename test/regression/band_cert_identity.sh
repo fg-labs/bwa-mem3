@@ -43,6 +43,8 @@
 #   BAND_CERT_WORK_DIR — directory for fixture-private intermediates
 
 set -euo pipefail
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 # Any command that fails unexpectedly (index/aligner/diff/conversion) exits via
 # set -e; surface it as a FAIL: record with the failing line and status rather
 # than dying silently.
@@ -77,7 +79,7 @@ n_pairs=0
 for off in 200 900 1600 2300 3000 3700; do
     s1="${seq:$off:$L}"
     s2fwd="${seq:$((off + G)):$L}"
-    s2="$(printf '%s' "$s2fwd" | rev | tr 'ACGT' 'TGCA')"
+    s2="$(dna_revcomp "$s2fwd")"
     [ "${#s1}" -eq "$L" ] && [ "${#s2}" -eq "$L" ] || continue
     q="$(printf 'I%.0s' $(seq 1 "$L"))"
     printf '@pair%d/1\n%s\n+\n%s\n' "$n_pairs" "$s1" "$q" >> "$r1"
@@ -108,7 +110,7 @@ n_del=0
 for off in 500 1500 2500 3500; do
     d1="${seq:$off:$L1}${seq:$((off + L1 + DEL)):$L2}"
     d2fwd="${seq:$((off + 700)):120}"
-    d2="$(printf '%s' "$d2fwd" | rev | tr 'ACGT' 'TGCA')"
+    d2="$(dna_revcomp "$d2fwd")"
     [ "${#d1}" -eq "$((L1 + L2))" ] && [ "${#d2}" -eq 120 ] || continue
     q1="$(printf 'I%.0s' $(seq 1 "$((L1 + L2))"))"
     q2="$(printf 'I%.0s' $(seq 1 120))"
