@@ -5,11 +5,13 @@
  * aligned prefix of each surviving query and reference window in place. For
  * the plain swap loop, clang 19.1.7 at -O3 emits an unrolled scalar byte swap
  * (ldrb/strb pairs, no vector code). A Graviton4 cycle profile (5M WGS pairs,
- * -t 16) put those two inlined loops at ~0.48% of total cycles.
+ * -t 16) put those two inlined loops at ~0.48% of total cycles. bwa_gen_cigar4
+ * reverses a reverse-strand query and its reference window the same way.
  *
- * seq_reverse_inplace swaps 16-byte blocks from both ends, each block reversed
- * with one shuffle (NEON vext+vrev64, SSSE3 pshufb), then 8-byte blocks
- * (bswap64), then single bytes. Every output byte is
+ * seq_reverse_inplace swaps 32-byte blocks from both ends under AVX2 (vpshufb
+ * within each 128-bit lane, then vpermq to swap the lanes), then 16-byte
+ * blocks, each reversed with one shuffle (NEON vext+vrev64, SSSE3 pshufb), then
+ * 8-byte blocks (bswap64), then single bytes. Every output byte is
  * s_out[k] = s_in[n - 1 - k], exactly what the scalar swap loop produces.
  *
  * When fewer than two blocks' worth remains, the last block pair overlaps in
@@ -33,6 +35,9 @@
 #  include <tmmintrin.h>
 #  define BWA3_SEQ_REV_VEC16 2
 #endif
+#if defined(__AVX2__)
+#  include <immintrin.h>
+#endif
 
 #if defined(BWA3_SEQ_REV_VEC16) && BWA3_SEQ_REV_VEC16 == 1
 typedef uint8x16_t seq_rev_v16;
@@ -52,8 +57,19 @@ static inline seq_rev_v16 seq_rev_rev16(seq_rev_v16 v)
 }
 #endif
 
+#if defined(__AVX2__)
+static inline __m256i seq_rev_rev32(__m256i v)
+{
+    const __m256i lane_rev = _mm256_setr_epi8(15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0,
+                                              15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0);
+    return _mm256_permute4x64_epi64(_mm256_shuffle_epi8(v, lane_rev), 0x4e);
+}
+#endif
+
 static inline uint64_t seq_rev_ld8(const uint8_t *p) { uint64_t x; memcpy(&x, p, 8); return x; }
 static inline void seq_rev_st8(uint8_t *p, uint64_t x) { memcpy(p, &x, 8); }
+static inline uint32_t seq_rev_ld4(const uint8_t *p) { uint32_t x; memcpy(&x, p, 4); return x; }
+static inline void seq_rev_st4(uint8_t *p, uint32_t x) { memcpy(p, &x, 4); }
 
 /* Reverse s[i, j) in place with 8-byte bswap blocks, then single bytes. A span
  * j - i < 2 (including a negative one left by an overlapping block pair) is a
@@ -84,6 +100,15 @@ static inline void seq_reverse_inplace(uint8_t *s, int n)
 {
     if (n < 2) return;
     int i = 0, j = n; /* s[i, j) is the part not yet reversed */
+#if defined(__AVX2__)
+    while (j - i >= 32) {
+        const __m256i L = _mm256_loadu_si256((const __m256i *)(s + i));
+        const __m256i R = _mm256_loadu_si256((const __m256i *)(s + j - 32));
+        _mm256_storeu_si256((__m256i *)(s + i), seq_rev_rev32(R));
+        _mm256_storeu_si256((__m256i *)(s + j - 32), seq_rev_rev32(L));
+        i += 32; j -= 32;
+    }
+#endif
 #ifdef BWA3_SEQ_REV_VEC16
     while (j - i >= 16) {
         const seq_rev_v16 L = seq_rev_ld16(s + i), R = seq_rev_ld16(s + j - 16);

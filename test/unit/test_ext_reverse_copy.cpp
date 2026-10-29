@@ -1,11 +1,13 @@
 // test/unit/test_ext_reverse_copy.cpp
 //
 // ext_reverse_copy (src/ext_reverse_copy.h) writes dst[i] = src[n - 1 - i]: the
-// reversed left-extension windows of stage_seed_extension. The compiler may
-// vectorize it in blocks with a byte-loop tail, so every length around the
-// block sizes, at every destination offset mod 64, is checked against
-// std::reverse_copy, with guard bytes on either side of the destination left
-// untouched.
+// reversed left-extension windows of stage_seed_extension. Under AVX2 it is
+// written in 32-byte blocks ending with one overlapping block, with two
+// overlapping 16-, 8- or 4-byte reversals (or single bytes) below 32; elsewhere
+// the compiler may vectorize the byte loop in blocks with a byte tail. So every
+// length from 0 to 70 and around larger block multiples, at every destination
+// offset mod 64, is checked against std::reverse_copy, with guard bytes on
+// either side of the destination left untouched.
 
 #include <algorithm>
 #include <cstdint>
