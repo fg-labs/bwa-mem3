@@ -12,8 +12,10 @@
 // differ from the kernels', so a HIT there would have changed output -- and checks
 // that a dying diagonal (E3) needs no guard. It also pins that an ambiguous base
 // (code 4, the only one real input carries, or any code up to 127) in the 16-wide
-// blocks or the scalar tail sends the pair to the ladder, that the run-length walk
-// equals the per-base walk, and that a TIGHT result's score is the byte walk's.
+// blocks or the tail sends the pair to the ladder, that the tail reads and counts
+// exactly the bases in [0, N) of each sequence (buffers flush against a guard page),
+// that the run-length walk equals the per-base walk, and that a TIGHT result's score
+// is the byte walk's.
 //
 // Adversarial shapes:
 //   * tie at the query end: a mismatch followed by exactly b/a matches, so the
@@ -27,12 +29,14 @@
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "../guarded_seq_test_util.h"
 #include "ext_ladder.h"
 #include "ungapped_ext.h"
 
 using bwa_tests::ExtPair;
 using bwa_tests::ExtResult;
 using bwa_tests::ExtScoring;
+using bwa_tests::GuardedSeq;
 using bwa_tests::LadderOutcome;
 
 namespace {
@@ -332,20 +336,23 @@ TEST_CASE("unit/ungapped_fastpath: guard E1 -- at -w 1 the ladder records a->w =
     CHECK(analyze(sc, p, 2).status == FP_STATUS_HIT);
 }
 
-TEST_CASE("unit/ungapped_fastpath: an ambiguous base anywhere, including the scalar tail, falls back"
+TEST_CASE("unit/ungapped_fastpath: an ambiguous base anywhere, including the tail, falls back"
           * doctest::test_suite("unit/ungapped_fastpath")) {
-    // The tail (< 16 bases past the last 16-wide block) folds its ambiguity test into a
-    // mask and decides after the loop, so pin it per tail position, on each side. The
-    // codes cover every bit above the two base bits (4, 8, 16, 64) and values whose low
-    // two bits alias a real base (5, 15), so a mask narrower than ~3 is caught. The
-    // 16-wide blocks test ambiguity with a signed byte compare, so their control stays
-    // below 128 (real input is 0..4).
+    // The tail (< 16 bases past the last 16-wide block) tests ambiguity apart from the
+    // blocks (one masked 16-byte step on x86 AVX2 and up, a branch-free loop that decides
+    // after the last base elsewhere), so pin it per tail position, on each side. The
+    // codes cover every bit above the two base bits (4, 8, 16, 64, 128) and values whose
+    // low two bits alias a real base (5, 15, 255), so a mask narrower than ~3 is caught.
+    // Below 16 bases the whole read is the tail (on AVX2, x86_soa_tail16's short-read
+    // loads); N = 16 has an empty tail, so its perfect diagonal must still be a HIT. The
+    // 16-wide blocks test ambiguity with a signed byte compare, so codes >= 128 go in
+    // tail positions only and the block probe stays below 128 (real input is 0..4).
     ExtScoring sc; sc.a = 1; sc.b = 4; sc.o_del = sc.o_ins = 6; sc.e_del = sc.e_ins = 1;
     sc.pen_clip = 5; sc.zdrop = 100; sc.fill_mat();
     std::mt19937_64 rng(29);
-    const uint8_t codes[] = {4, 5, 8, 15, 16, 64};
+    const uint8_t codes[] = {4, 5, 8, 15, 16, 64, 128, 255};
     int n_tail = 0, n_block = 0;
-    for (const int N : {17, 31, 33, 47, 100}) {
+    for (const int N : {1, 2, 3, 5, 9, 15, 16, 17, 31, 33, 47, 100}) {
         const ExtPair p = make_pair(rng, N, 10, std::vector<int>(), 30);   // perfect diagonal
         CAPTURE(N);
         REQUIRE(analyze(sc, p, 2).status == FP_STATUS_HIT);
@@ -359,6 +366,7 @@ TEST_CASE("unit/ungapped_fastpath: an ambiguous base anywhere, including the sca
                     REQUIRE(analyze(sc, q, 2).status == FP_STATUS_FALLBACK);
                     ++n_tail;
                 }
+                if (N < 16 || c >= 128) continue;   // no 16-wide block, or a code it lets through
                 ExtPair v = p;
                 (side == 0 ? v.query : v.target)[N / 32 * 16] = c;   // inside a 16-wide block
                 REQUIRE(analyze(sc, v, 2).status == FP_STATUS_FALLBACK);
@@ -366,8 +374,10 @@ TEST_CASE("unit/ungapped_fastpath: an ambiguous base anywhere, including the sca
             }
         }
     }
-    REQUIRE(n_tail == 432);   // 36 tail positions over the five lengths, x 6 codes x 2 sides
-    REQUIRE(n_block == 60);
+    // 71 tail positions: 35 below 16 (N = 1, 2, 3, 5, 9, 15), none at 16, 36 over
+    // N = 17, 31, 33, 47, 100; x 8 codes x 2 sides.
+    REQUIRE(n_tail == 1136);
+    REQUIRE(n_block == 72);   // 6 lengths >= 16 x 6 codes below 128 x 2 sides
 }
 
 TEST_CASE("unit/ungapped_fastpath: the run-length walk equals the per-base walk on every mask"
@@ -430,4 +440,91 @@ TEST_CASE("unit/ungapped_fastpath: a TIGHT result scores the pair like the byte 
         ++n_tight;
     }
     REQUIRE(n_tight > 1000);
+}
+
+TEST_CASE("unit/ungapped_fastpath: the tail reads only [0, N) of each sequence and counts every mismatch in it"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    // Every tail length 0..15, several times, with mismatches packed into the last 16
+    // bases: they fill both the tail and the bytes before it that a 16-byte tail step
+    // may carry in its masked-off lanes. Each sequence sits flush against a guard page
+    // (after its last byte, or before its first), so a tail read past either end
+    // faults. The third layout puts ambiguous codes in the target's 16 bytes past N
+    // (its guard page moves out with them): it checks that bytes past N never reach a
+    // valid lane, while layout 0 carries the proof that the target is not read past N.
+    // The oracle is the scalar mismatch bitmap: HIT iff its count is within x_threshold
+    // (z-drop off), with the walk's fields; otherwise TIGHT with the byte walk's score
+    // (N <= FP_TIGHT_MAX), or FALLBACK above it.
+    ExtScoring sc; sc.a = 1; sc.b = 4; sc.o_del = sc.o_ins = 6; sc.e_del = sc.e_ins = 1;
+    sc.pen_clip = 5; sc.zdrop = 0; sc.fill_mat();
+    const int w = 100;
+    const int X = sc.x_threshold(w);
+    REQUIRE(X >= 0);
+    std::mt19937_64 rng(43);
+    const uint8_t amb[] = {4, 128, 255};
+    std::vector<int> lens;
+    for (int N = 1; N <= 80; ++N) lens.push_back(N);
+    for (const int N : {127, 128, 129, 143, FP_N_MAX - 1, FP_N_MAX}) lens.push_back(N);
+    int n = 0, n_hit = 0, n_tight = 0, n_fallback = 0;
+    for (const int N : lens) {
+        for (int rep = 0; rep < 6; ++rep) {
+            const int lo = N > 16 ? N - 16 : 0;
+            const int k = rep == 0 ? 0 : (int)(rng() % (uint64_t)(N - lo + 1));
+            std::vector<int> pos;
+            for (int j = 0; j < k; ++j) pos.push_back(lo + (int)(rng() % (uint64_t)(N - lo)));
+            ExtPair p = make_pair(rng, N, 0, pos, 1 + (int)(rng() % 60));
+            const int layout = rep % 3;   // 0: guards after, 1: guards before, 2: ambiguous slack
+            if (layout == 2)
+                for (int t = 0; t < 16; ++t) p.target.push_back(amb[t % 3]);
+            const GuardedSeq q(p.query, layout != 1), r(p.target, layout != 1);
+            FpOut o;
+            o.status = ungapped_analyze(q.data(), r.data(), N, p.h0, sc.a, sc.b, sc.o_min(), sc.e_min(),
+                                        X, w, sc.zdrop, &o.score, &o.qle, &o.gscore, &o.gtle, &o.tb);
+            int actual = 0;
+            for (int j = 0; j < N; ++j) actual += (p.query[j] != p.target[j]);
+            CAPTURE(N); CAPTURE(rep); CAPTURE(actual);
+            if (actual <= X) {
+                const FpOut wo = walk_only(sc, p);
+                REQUIRE(o.status == FP_STATUS_HIT);
+                REQUIRE(o.score == wo.score);
+                REQUIRE(o.qle == wo.qle);
+                REQUIRE(o.gscore == wo.gscore);
+                REQUIRE(o.gtle == wo.gtle);
+                ++n_hit;
+            } else if (N <= FP_TIGHT_MAX) {
+                REQUIRE(o.status == FP_STATUS_TIGHT);
+                REQUIRE(o.score == ungapped_walk_score(p.query.data(), p.target.data(), N, p.h0, sc.a, sc.b));
+                ++n_tight;
+            } else {
+                REQUIRE(o.status == FP_STATUS_FALLBACK);
+                ++n_fallback;
+            }
+            ++n;
+        }
+    }
+    REQUIRE(n == 86 * 6);
+    REQUIRE(n_hit > 86);   // rep 0 of every length is a perfect diagonal
+    REQUIRE(n_tight > 100);
+    REQUIRE(n_fallback > 0);
+
+    // The ambiguity test covers the tail's own positions only. A 16-byte tail step carries
+    // bytes of the last 16-wide block in its masked-off lanes, so put there a code the
+    // block lets through (>= 128 on both sides: equal, and missed by the block's signed
+    // compare; real input never carries one): only the mask keeps it from a FALLBACK.
+    // The HIT expectation relies on that signed compare not flagging codes >= 128 (the
+    // tail flags them). If the block test is ever made unsigned, these pairs fall back
+    // in the block, so invert or remove this check then.
+    int n_masked = 0;
+    for (const int N : {17, 20, 31, 33, 47, 100}) {
+        const ExtPair p = make_pair(rng, N, 0, std::vector<int>(), 30);   // perfect diagonal
+        for (int j = N - 16; j < N - N % 16; ++j) {
+            for (const uint8_t c : {(uint8_t)128, (uint8_t)255}) {
+                ExtPair q = p;
+                q.query[j] = q.target[j] = c;
+                CAPTURE(N); CAPTURE(j); CAPTURE((int)c);
+                REQUIRE(analyze(sc, q, w).status == FP_STATUS_HIT);
+                ++n_masked;
+            }
+        }
+    }
+    REQUIRE(n_masked == 112);   // 56 block positions (15 + 12 + 1 + 15 + 1 + 12) x 2 codes
 }
