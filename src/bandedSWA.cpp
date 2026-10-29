@@ -624,6 +624,17 @@ void BandedPairWiseSW::scalarBandedSWAWrapper(SeqPair *seqPairArray,
 // MACROs
 // ------------------------ vec-8 ---------------------------------------------
 
+// The AVX2 twin of bsw8_qsent128 (see there for why j256 == qsent256 is exactly the
+// four-term query-end conjunction): qlen_off where tail == qlen_off, qlen_valid and exit0
+// all hold, -128 elsewhere. Built once per row, after tail and exit0 are final.
+static inline __m256i bsw8_qsent256(__m256i qlen_off, __m256i qlen_valid, __m256i tail,
+                                    __m256i exit0)
+{
+    const __m256i gate = _mm256_and_si256(_mm256_and_si256(_mm256_cmpeq_epi8(tail, qlen_off),
+                                                           qlen_valid), exit0);
+    return _mm256_blendv_epi8(_mm256_set1_epi8(-128), qlen_off, gate);
+}
+
 
 
 // ------------------------ vec 16 --------------------------------------------------
@@ -1409,6 +1420,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         cmpim = _mm256_or_si256(cmpim, cmpht);
 
         exit0 = _mm256_andnot_si256(cmpim, exit0);
+        const __m256i qsent256 = bsw8_qsent256(qlen_off256, qlen_valid256, tail256, exit0);
 
 #if RDT
         tim1 = __rdtsc();
@@ -1475,18 +1487,18 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             j256 = _mm256_add_epi8(j256, one256); \
             MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256, \
                             e_ins256, oe_ins256, e_del256, oe_del256);
-#define EXT13_CELL8_256_GSCORE \
-            if (j >= minq) { \
-                __m256i cmp = _mm256_cmpeq_epi8(j256, qlen_off256); \
-                cmp = _mm256_and_si256(cmp, _mm256_cmpeq_epi8(tail256, qlen_off256)); \
-                cmp = _mm256_and_si256(cmp, qlen_valid256); \
-                cmp = _mm256_and_si256(cmp, exit0); \
+        // The query-end (gscore) capture, j256 already advanced past the column: the sentinel
+        // compare of BSW8_QE_CAPTURE8_128 (qsent256, built once per row by bsw8_qsent256).
+        // QE is j >= minq (EXT13_RUN8_256).
+#define EXT13_CELL8_256_GSCORE(QE) \
+            if (QE) { \
+                const __m256i cmp = _mm256_cmpeq_epi8(j256, qsent256); \
                 hqe256   = _mm256_blendv_epi8(hqe256, h11, cmp); \
-                qfire256 = _mm256_blendv_epi8(qfire256, ff256, cmp); \
+                qfire256 = _mm256_or_si256(qfire256, cmp); \
             }
         // Masked body: the pre-EXT-13 inline loop, with the F store zeroing from column
         // tail on (see the lane-independence note at the top of the file).
-#define EXT13_CELL8_256_MASKED { \
+#define EXT13_CELL8_256_MASKED(QE) { \
             EXT13_CELL8_256_COMMON \
             __m256i cmp1 = _mm256_cmpgt_epi8(head256, pj256); \
             __m256i cmp2 = _mm256_cmpgt_epi8(pj256, tail256); \
@@ -1503,7 +1515,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21); \
             _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10); \
             h10 = h11; \
-            EXT13_CELL8_256_GSCORE \
+            EXT13_CELL8_256_GSCORE(QE) \
         }
         // Debug-only (off by default) envelope guard; see BSW8_ASSERT_FAST8_128.
 #ifdef BSW8_ASSERT_ENVELOPE
@@ -1520,7 +1532,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 #endif
         // Fast body: band mask all-ones here, so h/f stores go unmasked and the
         // argmax updates without the cmp1 (out-of-band) exclusion.
-#define EXT13_CELL8_256_FAST { \
+#define EXT13_CELL8_256_FAST(QE) { \
             EXT13_CELL8_256_COMMON \
             BSW8_ASSERT_FAST8_256(pj256, j256); \
             maxRS1 =_mm256_max_epu8(maxRS1, h11); \
@@ -1529,16 +1541,20 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
             _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH8), f21); \
             _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH8), h10); \
             h10 = h11; \
-            EXT13_CELL8_256_GSCORE \
+            EXT13_CELL8_256_GSCORE(QE) \
         }
-#pragma unroll(4)
-        for (j = beg; j < fast_lo; j++)   EXT13_CELL8_256_MASKED
-#pragma unroll(4)
-        for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_256_FAST
-#pragma unroll(4)
-        for (j = fast_hi; j < end; j++)   EXT13_CELL8_256_MASKED
-        /* EXT13_CELL8_256_* and BSW8_ASSERT_FAST8_256 stay defined: the AVX2 lane-compaction
-         * driver (bandedSWA_compact256.inc, included after this kernel) reuses them. */
+        // Columns [lo_, hi_) through BODY, capturing the query end from minq on (a column
+        // below it cannot be any lane's query end).
+#define EXT13_RUN8_256(lo_, hi_, BODY) { \
+            _Pragma("unroll(4)") \
+            for (j = (lo_); j < (hi_); j++) BODY(j >= minq) \
+        }
+        EXT13_RUN8_256(beg, fast_lo, EXT13_CELL8_256_MASKED)
+        EXT13_RUN8_256(fast_lo, fast_hi, EXT13_CELL8_256_FAST)
+        EXT13_RUN8_256(fast_hi, end, EXT13_CELL8_256_MASKED)
+        /* EXT13_CELL8_256_*, EXT13_RUN8_256 and BSW8_ASSERT_FAST8_256 stay defined: the AVX2
+         * lane-compaction driver (bandedSWA_compact256.inc, included after this kernel)
+         * reuses them. */
         __m256i cmp1 = _mm256_cmpgt_epi8(head256, j256);
         __m256i cmp2 = _mm256_cmpgt_epi8(j256, tail256);
         cmp1 = _mm256_or_si256(cmp1, cmp2);
@@ -1870,6 +1886,7 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
 #undef EXT13_CELL8_256_GSCORE
 #undef EXT13_CELL8_256_MASKED
 #undef EXT13_CELL8_256_FAST
+#undef EXT13_RUN8_256
 #undef BSW8_ASSERT_FAST8_256
 
 // ------------------------- AVX2 - 16 bit SIMD_LANES ---------------------------
