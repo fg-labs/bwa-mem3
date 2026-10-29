@@ -361,7 +361,7 @@ header_insert_test: header_insert_test.o ../libbwa.a
 packed_text_test: packed_text_test.o packed_text_lib.o ../libbwa.a
 	$(CXX) $(LDFLAGS) -o $@ $(filter %.o,$^) $(LIBS)
 
-packed_text_test.o: ../src/packed_text.h
+packed_text_test.o: ../src/packed_text.h framework/temp_path.h
 packed_text_lib.o: ../src/packed_text.cpp ../src/packed_text.h
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $< -o $@
 
@@ -442,4 +442,4 @@ sa_lookup_sentinel_parity_test.o: $(FMI_TEST_HEADERS)
 backwardext_parity_test.o: $(FMI_TEST_HEADERS)
 seed_jump_table_test.o: $(FMI_TEST_HEADERS) ../src/bwa_shm.h ../src/fmi_seed_api.h seed_jump_test_util.h
 sa_resolve_parity_test.o: $(FMI_TEST_HEADERS)
-header_insert_test.o: ../src/bwa.h
+header_insert_test.o: ../src/bwa.h framework/temp_path.h

@@ -58,6 +58,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "framework/temp_path.h"
+
 /* Declared in src/fastmap.h; forward-declared here to keep the test lean and
  * free of the aligner headers. Signatures must match src/kopen.cpp. */
 void *kopen(const char *fn, int *_fd);
@@ -123,7 +125,8 @@ static int check_empty_cmd_rejected(const char *spec)
  * proving the descendant was terminated, not just that kclose returned. */
 static int check_process_group_cleanup(void)
 {
-    char pidfile[] = "/tmp/kopen_pgtest_XXXXXX";
+    char pidfile[4096];
+    if (bwa_test_temp_template(pidfile, sizeof pidfile, "kopen_pgtest") != 0) return 1;
     int pf = mkstemp(pidfile);
     if (pf < 0) {
         fprintf(stderr, "FAIL: process_group_cleanup: mkstemp failed\n");

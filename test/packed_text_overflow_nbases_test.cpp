@@ -14,6 +14,7 @@
 // overflow, it is masked by an accident of the current codegen).
 
 #include "packed_text.h"
+#include "framework/temp_path.h"
 
 #include <climits>
 #include <cstdio>
@@ -23,7 +24,8 @@
 #include <unistd.h>
 
 int main() {
-    char path[] = "/tmp/pt_overflow_nbases_XXXXXX";
+    char path[4096];
+    if (bwa_test_temp_template(path, sizeof path, "pt_overflow_nbases") != 0) return 1;
     int fd = mkstemp(path);
     if (fd < 0) { perror("mkstemp"); return 1; }
     const char pac[8] = {0};

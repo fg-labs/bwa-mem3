@@ -10,6 +10,7 @@
 // message -- which the parent detects as the failure.
 
 #include "packed_text.h"
+#include "framework/temp_path.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,7 +19,8 @@
 #include <unistd.h>
 
 int main() {
-    char path[] = "/tmp/pt_neg_nbases_XXXXXX";
+    char path[4096];
+    if (bwa_test_temp_template(path, sizeof path, "pt_neg_nbases") != 0) return 1;
     int fd = mkstemp(path);
     if (fd < 0) { perror("mkstemp"); return 1; }
     const char pac[8] = {0};

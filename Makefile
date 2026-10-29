@@ -1304,7 +1304,7 @@ src/fr_fastq.o: src/fr_fastq.c
 # Standalone stage_prof helper unit test (stats + clocks + NaN init). Links only
 # pthread + libm, so it needs no bwa-mem3/htslib build. Built with -DSTAGE_PROF
 # so the real implementation (not the no-op inlines) is exercised.
-stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp
+stage_prof_test: src/stage_prof.cpp src/stage_prof.h test/stage_prof_test.cpp test/framework/temp_dir.h test/framework/temp_path.h
 	$(CXX) -O2 -std=gnu++14 -DSTAGE_PROF=1 -Isrc src/stage_prof.cpp test/stage_prof_test.cpp -lpthread -lm -o $@
 
 # Standalone fast_reader correctness self-test (plain/gzip/multi-member/BGZF
@@ -1330,14 +1330,14 @@ ifeq ($(UNAME_S),Darwin)
         FAST_READER_TEST_LIB += -L$(ZLIBNG_PREFIX)/lib
     endif
 endif
-fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
+fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test_util.h test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Wall -Wextra $(FAST_READER_TEST_INC) test/fast_reader_selftest.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Differential test: fr_fastq vs kseq, byte-identical record parsing. Links only
 # zlib + zlib-ng + libdeflate (kseq.h is header-only), so it needs no bwa-mem3 build.
 # Built with $(SRC_CFLAGS), the flags the aligner's reader TUs get, so it checks
 # the parser at the shipped optimization level and ISA flags.
-fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
+fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
 	$(CC) $(SRC_CFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
@@ -1350,13 +1350,13 @@ fr_fastq_bench: src/fr_fastq.c src/fast_reader.c test/fr_fastq_bench.c $(FAST_RE
 # but capacity is checked once). Always built with ASan so the overflowing write
 # aborts on regression; links only the reader TUs (no bwa-mem3 build), like
 # fr_fastq_diff_test. Built and run per-row by the CI matrix (ci.yml).
-bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c $(FAST_READER_TEST_DEP)
+bseq_read_pe_oob_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_pe_oob_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O1 -g -fsanitize=address -fno-omit-frame-pointer -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_pe_oob_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Coverage for bseq_read_fast's copy_comment/-C gate (bseq1_t.comment set only
 # when the caller asked AND the record had a comment), across SE/PE. The parser
 # is covered by fr_fastq_diff_test; this drives the adapter. Reader TUs only.
-bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c $(FAST_READER_TEST_DEP)
+bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_comment_copy_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_comment_copy_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Regression: bseq_read_fast must abort (err_fatal), not swallow a truncated
@@ -1364,7 +1364,7 @@ bseq_read_comment_copy_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bs
 # bseq_read_fast chain over a mid-member-truncated .fq.gz; the forked child must
 # die by SIGABRT rather than reach a clean n==0 EOF. Reader TUs only (no
 # bwa-mem3 build), like bseq_read_comment_copy_test. Built and run in ci.yml.
-bseq_read_truncated_gzip_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_truncated_gzip_test.c test/gz_test_util.h $(FAST_READER_TEST_DEP)
+bseq_read_truncated_gzip_test: src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c test/bseq_read_truncated_gzip_test.c test/gz_test_util.h test/framework/temp_path.h $(FAST_READER_TEST_DEP)
 	$(CC) -O2 -Isrc -Wall -Wextra $(FAST_READER_TEST_INC) test/bseq_read_truncated_gzip_test.c src/fr_fastq.c src/fast_reader.c src/fast_reader_bseq.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 # kvec_alloc_fail_test -- forces the backing realloc to fail and asserts kvec.h's
 # growth macros abort loudly (SIGABRT + an out-of-memory diagnostic) instead of

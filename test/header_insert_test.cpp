@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "bwa.h"
+#include "framework/temp_path.h"
 
 static char *per_line_baseline(const std::vector<std::string> &lines, char *hdr)
 {
@@ -35,7 +36,8 @@ static char *per_line_baseline(const std::vector<std::string> &lines, char *hdr)
 
 static std::string write_tmp(const std::vector<std::string> &lines)
 {
-    char tmpl[] = "/tmp/bwa_hdr_test_XXXXXX";
+    char tmpl[4096];
+    if (bwa_test_temp_template(tmpl, sizeof tmpl, "bwa_hdr_test") != 0) abort();
     int fd = mkstemp(tmpl);
     assert(fd >= 0);
     FILE *fp = fdopen(fd, "w");

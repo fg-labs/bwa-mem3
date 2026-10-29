@@ -24,6 +24,7 @@
 #include "fast_reader_bseq.h"
 #include "gz_test_util.h"   /* gz_member(), GZ_TRUNCATE_TAIL_DROP */
 #include "read_arena.h"
+#include "framework/temp_path.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -50,7 +51,7 @@ void   err_fatal(const char *h, const char *fmt, ...)
  * caller must unlink()+free(). */
 static char *write_temp(const unsigned char *buf, size_t len)
 {
-    char *path = strdup("/tmp/bseq_trunc_XXXXXX");
+    char *path = bwa_test_temp_alloc("bseq_trunc");
     int fd = mkstemp(path);
     assert(fd >= 0);
     size_t off = 0;

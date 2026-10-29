@@ -6,7 +6,6 @@
 #ifndef BWA_TESTS_TEMP_DIR_H
 #define BWA_TESTS_TEMP_DIR_H
 
-#include <dirent.h>
 #include <errno.h>
 #include <unistd.h>
 
@@ -17,14 +16,14 @@
 #include <string>
 #include <vector>
 
+#include "temp_path.h"
+
 namespace bwa_tests {
 
-// The scratch root: $TMPDIR when set and non-empty, else /tmp. CI points
-// TMPDIR at a writable scratch area, and /tmp is RAM-backed on several
-// distributions.
+// The scratch root (bwa_test_temp_root: $TMPDIR, else /tmp), with a trailing
+// slash.
 inline std::string temp_root() {
-    const char *t = getenv("TMPDIR");
-    std::string root = (t != NULL && t[0] != '\0') ? t : "/tmp";
+    std::string root = bwa_test_temp_root();
     if (root.back() != '/') root += '/';
     return root;
 }
@@ -62,14 +61,7 @@ public:
         path_ = buf.data();
     }
     ~TempDir() {
-        if (DIR *d = opendir(path_.c_str())) {
-            while (struct dirent *e = readdir(d)) {
-                if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-                unlink((path_ + "/" + e->d_name).c_str());
-            }
-            closedir(d);
-        }
-        if (rmdir(path_.c_str()) != 0)
+        if (bwa_test_remove_flat_dir(path_.c_str()) != 0)
             fprintf(stderr, "warning: TempDir could not remove %s: %s\n", path_.c_str(), strerror(errno));
     }
     TempDir(const TempDir &) = delete;

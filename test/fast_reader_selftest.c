@@ -11,6 +11,7 @@
  */
 #include "fast_reader.h"
 #include "gz_test_util.h"   /* gz_member(), GZ_TRUNCATE_TAIL_DROP */
+#include "framework/temp_path.h"
 
 #include <zlib.h>
 #include <libdeflate.h>
@@ -147,6 +148,13 @@ static int reports_read_error(const char *path)
     return saw_error;
 }
 
+/* The scratch directory main() creates; scratch() names a file in it. */
+static char g_dir[4096];
+static void scratch(char *out, size_t n, const char *name)
+{
+    if (snprintf(out, n, "%s/%s", g_dir, name) >= (int)n) abort();
+}
+
 int main(void)
 {
     /* --- fr_detect --- */
@@ -168,12 +176,19 @@ int main(void)
     CHECK(fr_detect(gz2,2) == FR_GZIP,                        "fr_detect: 2-byte gzip magic -> gzip");
     CHECK(fr_detect(one,1) == FR_PLAIN,                       "fr_detect: 1-byte 0x1f -> plain");
 
+    if (bwa_test_temp_template(g_dir, sizeof g_dir, "fast_reader_selftest") != 0 || mkdtemp(g_dir) == NULL) {
+        fprintf(stderr, "FAIL: cannot create a scratch directory\n");
+        return 1;
+    }
+
     size_t n; unsigned char *pay = make_payload(&n);
     fprintf(stderr, "payload: %zu bytes\n", n);
 
     /* --- plain --- */
-    write_file("/tmp/fr_plain.fq", pay, n);
-    CHECK(roundtrip("/tmp/fr_plain.fq", pay, n, FR_PLAIN), "roundtrip: plain");
+    char plain_fq[4096];
+    scratch(plain_fq, sizeof plain_fq, "fr_plain.fq");
+    write_file(plain_fq, pay, n);
+    CHECK(roundtrip(plain_fq, pay, n, FR_PLAIN), "roundtrip: plain");
 
     /* --- single-member gzip --- */
     {
@@ -181,16 +196,20 @@ int main(void)
         unsigned char *gzb;
         XMALLOC(gzb, cap);
         size_t gl = gz_member(pay, n, gzb, cap);
-        write_file("/tmp/fr_one.fq.gz", gzb, gl);
-        CHECK(roundtrip("/tmp/fr_one.fq.gz", pay, n, FR_GZIP), "roundtrip: single-member gzip");
+        char one_gz[4096];
+        scratch(one_gz, sizeof one_gz, "fr_one.fq.gz");
+        write_file(one_gz, gzb, gl);
+        CHECK(roundtrip(one_gz, pay, n, FR_GZIP), "roundtrip: single-member gzip");
 
         /* Truncated single-member gzip: dropping the tail (final deflate block
          * bytes + the 8-byte CRC32/ISIZE trailer) means the member never reaches
          * Z_STREAM_END. fast_reader_read must surface -1, not a short clean read
          * that the FASTQ layer above would mistake for end-of-file. */
         assert(gl > 64);
-        write_file("/tmp/fr_trunc.fq.gz", gzb, gl - GZ_TRUNCATE_TAIL_DROP);
-        CHECK(reports_read_error("/tmp/fr_trunc.fq.gz"),
+        char trunc_gz[4096];
+        scratch(trunc_gz, sizeof trunc_gz, "fr_trunc.fq.gz");
+        write_file(trunc_gz, gzb, gl - GZ_TRUNCATE_TAIL_DROP);
+        CHECK(reports_read_error(trunc_gz),
               "truncated gzip -> fast_reader_read returns -1");
         free(gzb);
     }
@@ -209,8 +228,10 @@ int main(void)
         size_t chunk = n > 60000 ? 60000 : n;
         size_t bl = bgzf_block(c, pay, chunk, bgz);
         assert(bl > 16);
-        write_file("/tmp/fr_trunc.bgzf.gz", bgz, bl - 8);   /* cut inside the block */
-        CHECK(reports_read_error("/tmp/fr_trunc.bgzf.gz"),
+        char trunc_bgzf[4096];
+        scratch(trunc_bgzf, sizeof trunc_bgzf, "fr_trunc.bgzf.gz");
+        write_file(trunc_bgzf, bgz, bl - 8);   /* cut inside the block */
+        CHECK(reports_read_error(trunc_bgzf),
               "mid-block-truncated bgzf -> fast_reader_read returns -1");
         libdeflate_free_compressor(c);
         free(bgz);
@@ -228,8 +249,10 @@ int main(void)
         unsigned char *cat;
         XMALLOC(cat, la + lb);
         memcpy(cat, a, la); memcpy(cat + la, b, lb);
-        write_file("/tmp/fr_multi.fq.gz", cat, la + lb);
-        CHECK(roundtrip("/tmp/fr_multi.fq.gz", pay, n, FR_GZIP), "roundtrip: multi-member gzip");
+        char multi_gz[4096];
+        scratch(multi_gz, sizeof multi_gz, "fr_multi.fq.gz");
+        write_file(multi_gz, cat, la + lb);
+        CHECK(roundtrip(multi_gz, pay, n, FR_GZIP), "roundtrip: multi-member gzip");
         free(a); free(b); free(cat);
     }
 
@@ -246,8 +269,10 @@ int main(void)
             src += chunk;
         }
         off += bgzf_block(c, NULL, 0, bgz + off);                       /* EOF marker */
-        write_file("/tmp/fr_bgzf.fq.gz", bgz, off);
-        CHECK(roundtrip("/tmp/fr_bgzf.fq.gz", pay, n, FR_BGZF), "roundtrip: bgzf");
+        char bgzf_gz[4096];
+        scratch(bgzf_gz, sizeof bgzf_gz, "fr_bgzf.fq.gz");
+        write_file(bgzf_gz, bgz, off);
+        CHECK(roundtrip(bgzf_gz, pay, n, FR_BGZF), "roundtrip: bgzf");
         libdeflate_free_compressor(c);
         free(bgz);
     }
@@ -257,8 +282,10 @@ int main(void)
      * plumbing around it (the FR_DOPEN_FAIL path). --- */
     {
         unsigned char bz2[8] = {0x42,0x5a,0x68,0x39,0x31,0x41,0x59,0x26};   /* "BZh91AY&" */
-        write_file("/tmp/fr_unsupported.bz2", bz2, sizeof bz2);
-        int ufd = open("/tmp/fr_unsupported.bz2", O_RDONLY); assert(ufd >= 0);
+        char bz2_path[4096];
+        scratch(bz2_path, sizeof bz2_path, "fr_unsupported.bz2");
+        write_file(bz2_path, bz2, sizeof bz2);
+        int ufd = open(bz2_path, O_RDONLY); assert(ufd >= 0);
         const char *uerr = NULL;
         fast_reader_t *ufr = fast_reader_dopen(ufd, &uerr);
         CHECK(ufr == NULL && uerr != NULL, "dopen: unsupported codec -> NULL + err set");
@@ -266,6 +293,7 @@ int main(void)
     }
 
     free(pay);
+    if (bwa_test_remove_flat_dir(g_dir) != 0) fprintf(stderr, "warning: could not remove %s\n", g_dir);
     fprintf(stderr, g_fail ? "\nSELFTEST FAILED\n" : "\nSELFTEST PASSED\n");
     return g_fail;
 }

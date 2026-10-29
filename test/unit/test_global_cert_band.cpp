@@ -48,6 +48,7 @@
 
 #include "doctest/doctest.h"
 #include "stderr_capture.h"
+#include "temp_dir.h"
 
 #include "bntseq.h"   // _set_pac
 #include "bwa.h"
@@ -391,23 +392,15 @@ std::vector<uint8_t> edit_unequal(std::mt19937_64 &g, const std::vector<uint8_t>
 }
 
 // Captures bwa_gen_cigar3's -v 4 trace: band(fn) runs fn with bwa_verbose at 4 and stderr
-// redirected to one temporary file (under TMPDIR, as the other stderr-capturing tests do),
+// redirected to one already-unlinked temporary file (anon_temp_fd, under TMPDIR),
 // and returns the band from its "* Global bandwidth: <w>" line, or -1 when it printed none
 // (no DP ran). A guard restores stderr and bwa_verbose even if fn throws.
 class BandTrace {
   public:
     BandTrace()
     {
-        const char *tmpdir = getenv("TMPDIR");
-        if (tmpdir == NULL || tmpdir[0] == '\0') tmpdir = "/tmp";
-        std::string tmpl_s = tmpdir;
-        if (tmpl_s[tmpl_s.size() - 1] != '/') tmpl_s += '/';
-        tmpl_s += "cert_band_trace_XXXXXX";
-        std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
-        tmpl.push_back('\0');
-        fd_ = mkstemp(tmpl.data());
+        fd_ = bwa_tests::anon_temp_fd("cert_band_trace");
         REQUIRE(fd_ >= 0);
-        unlink(tmpl.data());
     }
     ~BandTrace() { if (fd_ >= 0) close(fd_); }
 

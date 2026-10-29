@@ -1,6 +1,7 @@
 // Exercises PackedText::get_base / get_kmer on a deterministic pac buffer
 // built with the same _set_pac convention used by bwa-mem3 index.
 #include "packed_text.h"
+#include "framework/temp_path.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,7 +29,8 @@ int main() {
         _set_pac(pac, l, l & 3);
     }
     // Spill to tmp file and mmap.
-    char path[] = "/tmp/packed_text_test_XXXXXX";
+    char path[4096];
+    if (bwa_test_temp_template(path, sizeof path, "packed_text_test") != 0) abort();
     int fd = mkstemp(path);
     CHECK(fd >= 0);
     ssize_t nw = write(fd, pac, sizeof(pac));
@@ -70,7 +72,8 @@ int main() {
     // Zero-byte pac: n_bases == 0 means the file has zero bytes, and
     // mmap(length=0) is EINVAL on Linux. PackedText must short-circuit
     // and instantiate cleanly with data_ == nullptr / n_ == 0.
-    char zpath[] = "/tmp/packed_text_test_zero_XXXXXX";
+    char zpath[4096];
+    if (bwa_test_temp_template(zpath, sizeof zpath, "packed_text_test_zero") != 0) abort();
     int zfd = mkstemp(zpath);
     CHECK(zfd >= 0);
     close(zfd);

@@ -1,6 +1,7 @@
 /* Unit test for the pure helpers of stage_prof (stats + clocks + NaN init).
  * Builds standalone: no htslib, no index, no pipeline. */
 #include "../src/stage_prof.h"
+#include "framework/temp_dir.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -129,6 +130,7 @@ static void force_one_drop(void) {
 }
 
 int main(void) {
+    bwa_tests::TempDir dir("stage_prof_test");
     /* sp_chunk_init sets the maybe-N/A doubles to NaN */
     prof_chunk_t c;
     sp_chunk_init(&c);
@@ -164,7 +166,8 @@ int main(void) {
 
     /* Aggregate N/A semantics: when every chunk reports read_bytes_in/bgzf_blocks
      * as N/A (-1), the aggregate row must stay blank, not collapse to a false 0. */
-    const char *tsv = "/tmp/stage_prof_test.tsv";
+    const std::string tsv_path = dir.file("stage_prof_test.tsv");
+    const char *tsv = tsv_path.c_str();
     remove(tsv);
     sp_init(tsv, "t", "v", "x86_64", 4, "sam", -1, "in");
     assert(sp_enabled() == 1);
@@ -187,9 +190,12 @@ int main(void) {
      * the chunk count and idle time directly; the OOM-drop counter resets via
      * the same statement (see sp_init) and is forced nonzero deterministically
      * in the dedicated OOM-drop block below. */
-    const char *tsv2 = "/tmp/stage_prof_test2.tsv";
-    const char *err1 = "/tmp/stage_prof_test1.err";
-    const char *err2 = "/tmp/stage_prof_test2.err";
+    const std::string tsv2_path = dir.file("stage_prof_test2.tsv");
+    const char *tsv2 = tsv2_path.c_str();
+    const std::string err1_path = dir.file("stage_prof_test1.err");
+    const char *err1 = err1_path.c_str();
+    const std::string err2_path = dir.file("stage_prof_test2.err");
+    const char *err2 = err2_path.c_str();
     char errbuf[1024];
     remove(tsv);
     remove(tsv2);
@@ -235,8 +241,10 @@ int main(void) {
      * chunk must NOT appear in the report, the already-stored rows must remain
      * valid, and sp_finish must emit the "incomplete" diagnostic naming the
      * exact dropped count -- all without relying on host OOM. */
-    const char *tsv3 = "/tmp/stage_prof_test3.tsv";
-    const char *err3 = "/tmp/stage_prof_test3.err";
+    const std::string tsv3_path = dir.file("stage_prof_test3.tsv");
+    const char *tsv3 = tsv3_path.c_str();
+    const std::string err3_path = dir.file("stage_prof_test3.err");
+    const char *err3 = err3_path.c_str();
     remove(tsv3);
     remove(err3);
     sp_init(tsv3, "t", "v", "x86_64", 4, "sam", -1, "in");

@@ -20,14 +20,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include "framework/temp_dir.h"
 #include "io_utils.h"
 
 static int fails = 0;
 
 int main(void)
 {
-    char tmpl[] = "/tmp/pwrite_status_XXXXXX";
-    int fd = mkstemp(tmpl);
+    int fd = bwa_tests::anon_temp_fd("pwrite_status");
     if (fd < 0) { perror("mkstemp"); return 1; }
 
     /* Good write: whole buffer at a non-zero offset, status 0, bytes land. */
@@ -60,7 +60,6 @@ int main(void)
     rc = pwrite_all_status(fd, msg, sizeof msg, 0);   /* fd is now closed -> EBADF */
     if (rc <= 0) { fprintf(stderr, "FAIL: write to closed fd returned %d (expected positive errno)\n", rc); ++fails; }
 
-    unlink(tmpl);
     if (fails) { fprintf(stderr, "pwrite_all_status_test: %d failure(s)\n", fails); return 1; }
     printf("PASS: pwrite_all_status_test\n");
     return 0;
