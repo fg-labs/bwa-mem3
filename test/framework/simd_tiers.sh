@@ -6,8 +6,8 @@
 # kernel that it can use on this host (BWAMEM3_FORCE_TIER), so that every such
 # script parses the dispatcher, ranks tiers and sweeps them the same way. Used
 # by all_tiers_parity.sh, band_cert_identity.sh, dash_read_as_n.sh,
-# rescue_prune_identity.sh and, through test/framework/mem_cli.sh,
-# mem_cli_basics.sh. Keeps to bash 3.2 (macOS /bin/bash).
+# meth_context_identity.sh, rescue_prune_identity.sh and, through
+# test/framework/mem_cli.sh, mem_cli_basics.sh. Keeps to bash 3.2 (macOS /bin/bash).
 #
 #     source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/simd_tiers.sh"
 #     simd_sweep_tiers "$BWA_MEM3" || exit $?
@@ -39,8 +39,9 @@ SIMD_SWEEP_TIERS=(avx2 avx512bw neon)
 # separate from SIMD_SWEEP_TIERS so that narrowing the sweep does not turn a
 # correctly-detected low-tier host into a bogus "detection broke" failure: an
 # sse41-baseline build reports sse41, which is a perfectly good detection and
-# simply has no tiers to sweep.
-SIMD_KNOWN_TIERS=(sse41 sse42 avx avx2 avx512bw neon)
+# simply has no tiers to sweep. scalar is BWAMEM3_TIER_NONE (no SIMD at all;
+# src/simd_dispatch.cpp's tier names).
+SIMD_KNOWN_TIERS=(scalar sse41 sse42 avx avx2 avx512bw neon)
 
 # simd_tier_rank <tier>
 #   Prints the tier's index in SIMD_KNOWN_TIERS (low to high), or -1 for a name

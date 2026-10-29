@@ -567,8 +567,11 @@ sc_note="$sc_note$lever_note"
 tier_note=""
 if [ -n "${RESCUE_TIERS:-}" ]; then
     [ -n "$host_tier" ] || fail "could not detect the host SIMD tier: $(cat simd_tier.err)"
-    rank() { # tier -> rank among the x86 tiers (simd_tier_rank, neon excluded), or -1
-        if [ "$1" = neon ]; then echo -1; else simd_tier_rank "$1"; fi
+    rank() { # tier -> rank among the x86 SIMD tiers (simd_tier_rank without neon and scalar), or -1
+        case "$1" in
+            neon | scalar) echo -1 ;;
+            *) simd_tier_rank "$1" ;;
+        esac
     }
     host_rank="$(rank "$host_tier")"
     [ "$host_rank" -ge 0 ] || fail "RESCUE_TIERS is set but the host tier '$host_tier' is not an x86 tier"

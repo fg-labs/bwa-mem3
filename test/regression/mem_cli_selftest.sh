@@ -76,6 +76,39 @@ rc=0
     simd_sweep_tiers "$bin"
 ) 2> /dev/null || rc=$?
 check "simd_sweep_tiers on an unparseable tier returns 2" 2 "$rc"
+bin="$(stub scalar)"
+got="$(
+    # shellcheck source=test/framework/simd_tiers.sh
+    source "$framework/simd_tiers.sh"
+    simd_sweep_tiers "$bin" && echo "$SIMD_HOST_TIER:${SIMD_TIERS[*]-}"
+)"
+check "simd_sweep_tiers on a scalar host: detected, nothing to sweep" "scalar:" "$got"
+
+# --- simd_detect_tier and simd_tier_rank ------------------------------------
+# A stub whose dispatcher reports the forced tier, or avx512bw unforced.
+bin="$work/stub-forceable"
+# The stub's own ${BWAMEM3_FORCE_TIER:-} is expanded when the stub runs.
+# shellcheck disable=SC2016
+printf '#!/bin/sh\necho "[M::main] SIMD tier: ${BWAMEM3_FORCE_TIER:-avx512bw} (build baseline: x)" >&2\nexit 1\n' > "$bin"
+chmod +x "$bin"
+got="$(
+    # shellcheck source=test/framework/simd_tiers.sh
+    source "$framework/simd_tiers.sh"
+    BWAMEM3_FORCE_TIER=avx2 simd_detect_tier "$bin" && echo "$SIMD_HOST_TIER"
+)"
+check "simd_detect_tier honours the caller's BWAMEM3_FORCE_TIER" avx2 "$got"
+got="$(
+    # shellcheck source=test/framework/simd_tiers.sh
+    source "$framework/simd_tiers.sh"
+    BWAMEM3_FORCE_TIER=avx2 simd_sweep_tiers "$bin" && echo "$SIMD_HOST_TIER"
+)"
+check "simd_sweep_tiers reads the unforced tier from the same binary" avx512bw "$got"
+got="$(
+    # shellcheck source=test/framework/simd_tiers.sh
+    source "$framework/simd_tiers.sh"
+    for t in scalar sse41 sse42 avx avx2 avx512bw neon bogus; do printf '%s ' "$(simd_tier_rank "$t")"; done
+)"
+check "simd_tier_rank orders the tiers and gives -1 for an unknown name" "0 1 2 3 4 5 6 -1 " "$got"
 
 # --- mem_cli_init and mem_cli_verdict (each in its own script) -------------
 # run_script <name> <env...> -- <body>: runs a script that sources mem_cli.sh;

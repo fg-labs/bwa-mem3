@@ -35,6 +35,8 @@
 #   BWA_MEM3      -- the bwa-mem3 binary under test
 #   BWA_MEM3_BASE -- optional: the base commit's binary, for (d)
 set -euo pipefail
+# shellcheck source=test/framework/simd_tiers.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/simd_tiers.sh"
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 abspath() { printf '%s' "$(cd "$(dirname "$1")" && pwd)/$(basename "$1")"; }
 case "$BWA_MEM3" in
@@ -168,15 +170,9 @@ if [ -n "$BASE_BIN" ]; then
 fi
 
 # Tiers (b) can sweep: avx2 and avx512bw up to the host's, or the one native tier.
-HOST_RAW="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 || true)"
-HOST_TIER="$(printf '%s\n' "$HOST_RAW" | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1)"
-case "$HOST_TIER" in
-    neon) TIERS=(neon) ;;
-    avx512bw) TIERS=(avx2 avx512bw) ;;
-    avx2) TIERS=(avx2) ;;
-    sse41 | sse42 | avx) TIERS=() ;;
-    *) fail "could not detect the host SIMD tier (parsed '$HOST_TIER')" ;;
-esac
+simd_sweep_tiers "$BIN" || fail "could not detect the host SIMD tier"
+HOST_TIER="$SIMD_HOST_TIER"
+TIERS=(${SIMD_TIERS[@]+"${SIMD_TIERS[@]}"})
 echo "Host tier: $HOST_TIER; sweeping: ${TIERS[*]:-none}"
 
 # run LABEL TIER|- ENV=VAL|- BINARY INDEX_REF SET MEM_ARGS... -> LABEL.sam (records only)
