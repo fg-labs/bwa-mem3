@@ -2111,7 +2111,9 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * largest high over usable orientations. Those windows are random DRAM misses
  * (bns_get_seq_into's hottest instructions are its first pac loads), so hint
  * them a couple of pairs ahead. Only a[0] is covered; secondary anchors within
- * pen_unpaired are rare. Pure hints: byte-identical. */
+ * pen_unpaired are rare. A window's lowest SIMD piece can start up to 4 bytes
+ * below its lowest pac byte, so a window at the low edge of the span may also
+ * touch the line below it, which is not hinted. Pure hints: byte-identical. */
 void mem_prefetch_rescue_pac(const bntseq_t *bns, const uint8_t *pac,
                              const mem_pestat_t pes[4],
                              const bseq1_t *seqs, const mem_alnreg_v *regs)

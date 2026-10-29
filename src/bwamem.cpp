@@ -2083,9 +2083,12 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
          * ~DRAM-latency load. The head start is modest — only the scratch-resize check and
          * bns_pos2rid sit between the hint and the load — but the window is bounded by
          * MEM_SHORT_EXT (~13 packed bytes), so the pre-clamp rb used here and the post-clamp start
-         * bns_get_seq_into actually reads almost always land in the same cache line. bns_depos maps
-         * the strand-dependent window start (fwd pac[rb>>2]; rev pac[(2*l_pac-1-rb)>>2]). Pure hint
-         * -> byte-identical. */
+         * bns_get_seq_into actually reads almost always land in the same cache line. A short
+         * window's first SIMD loads may start up to 4 bytes below its lowest pac byte (the
+         * window-start byte on the forward strand), so they can also touch the line below, which
+         * this hint does not cover.
+         * bns_depos maps the strand-dependent window start (fwd pac[rb>>2]; rev
+         * pac[(2*l_pac-1-rb)>>2]). Pure hint -> byte-identical. */
         {
             int is_rev_pf;  // discarded; bns_depos also reports the strand
             __builtin_prefetch(&pac[bns_depos(bns, rb, &is_rev_pf) >> 2], 0, 3);
@@ -4565,6 +4568,9 @@ static void worker_copy_regs(void *data, int seq_id, int batch_size, int tid)
  * fetch is a random ~DRAM-latency load; a hint issued ahead of it hides the miss.
  * The window-start byte mirrors bns_get_seq_into's strand split: forward
  * (rb < l_pac) touches pac[rb>>2]; reverse touches pac[((2*l_pac-1-rb)>>2)].
+ * A short forward window's first SIMD loads may start up to 4 bytes below
+ * that byte, so they can also touch the line below, which this hint does not
+ * cover.
  * locality=0 (streaming/NTA): bns_get_seq_into reads the window once and never
  * revisits it, so per simd_compat.h's locality convention this must not evict
  * L1-resident data (L1-keep, locality 3, is reserved there for genuine reuse
