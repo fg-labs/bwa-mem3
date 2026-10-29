@@ -33,6 +33,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwamem.h"
 #include "bntseq.h"
 #include "kstring.h"
+#include "meth_model.h"
 #include <string.h>
 #include <vector>
 
@@ -130,7 +131,12 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 			 * with an equal key instead of recomputing it. */
 			const mem_alnreg_t *p = &a->a[i];
 			mem_core_key_t key;
-			const int keyed = mem_core_key(bns, p, &key);
+			/* Under --meth-context cpg a hit with a hypothesis regenerates on a
+			 * CpG-labelled window, and its labels read the reference base on either
+			 * side of the window (and the contig and N-run bounds), which the key
+			 * does not hold: such a hit is never keyed. */
+			const int cpg_regen = meth_cpg_on(opt) && meth_orig_query != NULL && p->meth_hypothesis >= 0;
+			const int keyed = !cpg_regen && mem_core_key(bns, p, &key);
 			const xa_memo_t *hit = 0;
 			if (keyed)
 				for (size_t m = 0; m < t_memo.size(); ++m)

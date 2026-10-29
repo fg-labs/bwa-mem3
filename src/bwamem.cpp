@@ -29,6 +29,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 *****************************************************************************************/
 
 #include "bwamem.h"
+#include "meth_opts.h"   /* METH_CTX_ALL */
+#include "meth_model.h"  /* meth_model_fill_mats */
 #include "chain_seed_pool.h"
 #include "ext_reverse_copy.h"
 #include "chain_window_prefetch.h"
@@ -784,6 +786,7 @@ mem_opt_t *mem_opt_init()
     o->meth_seed_prune = 0;                        /* base default off; --meth turns it on
                                                       (SPEC30), set in fastmap.cpp */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
+    o->meth_context = METH_CTX_ALL;                /* --meth-context default: every C converts */
     o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
     /* Match bwa and bwa-mem2, which both derive FLAG 0x2 from a[0]. Explicit
@@ -887,6 +890,7 @@ void mem_opt_fill_meth_mat(mem_opt_t *o) {
         o->mat_ot[3 * 5 + 1] = o->a;   /* OT: ref T / read C → match */
         o->mat_ob[0 * 5 + 2] = o->a;   /* OB: ref A / read G → match */
     }
+    meth_model_fill_mats(o);
 }
 
 /* See bwamem.h for the contract. The `* opt->a` factors are the fix for -A
@@ -1624,9 +1628,11 @@ int mem_patch_reg(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
     if (bwa_verbose >= 4)
         fprintf(stderr, "* test potential hit merge with global alignment; w=%d\n", w);
 
-    bwa_gen_cigar2(mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w,
+    /* bwa_gen_cigar2's call (no NM, MD unused), at mat's alphabet: under
+     * --meth-context cpg a mat7 matrix, whose window bwa_gen_cigar4 labels. */
+    bwa_gen_cigar4(mat, meth_mat_m(opt, mat), bns, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w,
                    bns->l_pac, pac, b->qe - a->qb, query + a->qb, a->rb, b->re,
-                   &score, 0, 0);
+                   &score, 0, 0, 0, 1);
 
     q_s = (int)((double)(b->qe - a->qb) / ((b->qe - b->qb) + (a->qe - a->qb)) *
                 (b->score + a->score) + .499); // predicted score from query
@@ -2099,9 +2105,13 @@ int mem_seed_sw(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
         int64_t rlen;
         bns_fetch_seq_into(bns, pac, &rb, mid, &re, &rid, t_rseq.v.a, &rlen);
         rseq = t_rseq.v.a;
+        /* --meth-context cpg: a mat7 matrix scores the CpG-labelled window
+         * (labelled in its fetch frame, before ksw_align2's in-place reversal). */
+        const int m = meth_mat_m(opt, mat);
+        if (m == METH_M) meth_label_window(rseq, rlen, rb, rid, bns, pac, NULL);
         // No qry-profile cache: each seed slices a different sub-query
         // (query+qb, qe-qb), so ksw_align2 always builds a fresh profile.
-        x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, 5, mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, NULL);
+        x = ksw_align2(qe - qb, (uint8_t*)query + qb, re - rb, rseq, m, mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, KSW_XSTART, NULL);
         /* rseq aliases thread-local scratch; do not free. */
     }
     return x.score;
@@ -2294,7 +2304,8 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
              * against the RC reference, flipping the conversion's freed cell. */
             int hyp = c->meth_hypothesis;
             if (hyp >= 0 && c->seeds[0].rbeg >= bns->l_pac) hyp ^= 1;
-            mat = mem_opt_meth_mat(opt, hyp);
+            int m_unused;   /* mem_seed_sw reads it back from the matrix (meth_mat_m) */
+            mat = meth_model_mat(opt, hyp, &m_unused);
         }
 
         for (j = k = 0; j < c->n; ++j)
@@ -4269,7 +4280,8 @@ int mem_kernel2_core(FMI_search *fmi,
             /* per-read STRAND-ADJUSTED hypothesis (see meth_strand_hyp); take the
              * first alnreg's (dedup-patch shares one matrix across the read). */
             int hyp = (regs[l].n > 0) ? regs[l].a[0].meth_strand_hyp : -1;
-            dd_mat = mem_opt_meth_mat(opt, hyp);
+            int m_unused;   /* mem_patch_reg reads it back from the matrix (meth_mat_m) */
+            dd_mat = meth_model_mat(opt, hyp, &m_unused);
         }
         regs[l].n = mem_sort_dedup_patch(opt, aln_bns,
                                          aln_pac,
@@ -5596,7 +5608,10 @@ static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
  * the reference length and forward-strand start (whose bases mem_core_key_equal
  * compares), the true score and band that set the DP band and the retry loop, and
  * the --meth hypothesis that picks the matrix. The read itself and `opt` are the
- * same for every region of one mem_gen_alt call, so they are not part of it. */
+ * same for every region of one mem_gen_alt call, so they are not part of it.
+ * Under --meth-context cpg the CpG labels of the window also read the bases
+ * beyond it, which this key does not cover, so mem_gen_alt does not key a hit
+ * that regenerates on labels. */
 int mem_core_key(const bntseq_t *bns, const mem_alnreg_t *ar, mem_core_key_t *k)
 {
     const int64_t l_pac = bns->l_pac;
@@ -5709,12 +5724,15 @@ static void mem_reg2aln_global(const mem_opt_t *opt, const bntseq_t *bns, const 
      * and their conversions become CIGAR mismatches / soft-clips. */
     int regen_hyp = ar->meth_hypothesis;
     if (regen_hyp >= 0 && ar->rb >= bns->l_pac) regen_hyp ^= 1;
+    /* Under --meth-context cpg the 7-code matrix (regen_m = 7), whose window
+     * bwa_gen_cigar4 labels. */
+    int regen_m = 5;
     const int8_t *regen_mat = use_meth_orig
-        ? mem_opt_meth_mat(opt, regen_hyp) : opt->mat;
+        ? meth_model_mat(opt, regen_hyp, &regen_m) : opt->mat;
     do {
         free(a->cigar);
         w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a->cigar = bwa_gen_cigar4(regen_mat, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a->n_cigar, NM, use_meth_orig, want_md);
+        a->cigar = bwa_gen_cigar4(regen_mat, regen_m, bns, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a->n_cigar, NM, use_meth_orig, want_md);
         if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
         if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
         last_sc = score;
@@ -6679,6 +6697,9 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
                         base_scratch, hist);
         return;
     }
+    /* --meth-context cpg needs no routing here: the OT/OB objects score their
+     * CpG-labelled targets in the kernels' CpG arm (set_meth_cpg, set where they
+     * are built), on every tier, and the SYM pairs carry plain targets. */
     /* Dutch-flag partition into [OT (key 0) | OB (key 1) | SYM (key 2)]. Order
      * within/among runs is irrelevant: the kernel re-sorts by length and the
      * caller maps each result back to its alnreg by seqid/regid. */
@@ -8121,11 +8142,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                               const uint8_t *rseq_w, const uint8_t *query_w) -> int {
         int sc = sd->len * opt->a;
         if (opt->meth_mode && ar->meth_strand_hyp >= 0) {
-            const int8_t *seed_mat = mem_opt_meth_mat(opt, ar->meth_strand_hyp);
+            /* Under --meth-context cpg the 7-code matrix: the window is labelled
+             * (derive_chain_window labels every chain with a hypothesis). */
+            int sm;
+            const int8_t *seed_mat = meth_model_mat(opt, ar->meth_strand_hyp, &sm);
             const int64_t roff = sd->rbeg - rmax[0];
             sc = 0;
             for (int _i = 0; _i < sd->len; ++_i)
-                sc += seed_mat[ rseq_w[roff + _i] * 5 + query_w[sd->qbeg + _i] ];
+                sc += seed_mat[ rseq_w[roff + _i] * sm + query_w[sd->qbeg + _i] ];
         }
         return sc;
     };
@@ -8214,6 +8238,13 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                                     &rmax[1], cc->rid, &rid, ref_string,
                                     (uint8_t*) seqPairArrayAux);
             assert(cc->rid == rid);
+            /* --meth-context cpg: a chain with a hypothesis is scored with the
+             * 7-code matrices (seed_ext_score, the OT/OB kernel objects), so
+             * label its window, in its fetch frame, before the staging copies
+             * (ext_reverse_copy reverses the left one). A chain without one
+             * stays on plain codes and the symmetric object. */
+            if (meth_cpg_on(opt) && cc->meth_hypothesis >= 0)
+                meth_label_window(rseq_out, rmax[1] - rmax[0], rmax[0], rid, bns, pac, ref_string);
         }
         (void)max;
         chain_max_n_hits_out = chain_max_n_hits;
@@ -8503,16 +8534,21 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
      * symmetric objects above. */
     std::unique_ptr<IBandedPairWiseSW> bswLeftOt, bswLeftOb, bswRightOt, bswRightOb;
     if (opt->meth_mode) {
-        const int8_t *m_ot = mem_opt_meth_mat(opt, 1);   /* OT: frees C->T */
-        const int8_t *m_ob = mem_opt_meth_mat(opt, 0);   /* OB: frees G->A */
+        /* Under --meth-context cpg the 7-code matrices (mat_m = 7): the windows
+         * of chains with a hypothesis are labelled (derive_chain_window), and the
+         * objects run the kernels' CpG arm on the one gated cell of each matrix
+         * (set_meth_cpg below). */
+        int mat_m;
+        const int8_t *m_ot = meth_model_mat(opt, 1, &mat_m);   /* OT: frees C->T */
+        const int8_t *m_ob = meth_model_mat(opt, 0, &mat_m);   /* OB: frees G->A */
         bswLeftOt  = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                              opt->zdrop, opt->pen_clip5, m_ot, opt->a, opt->b, nthreads);
+                                              opt->zdrop, opt->pen_clip5, m_ot, opt->a, opt->b, nthreads, mat_m);
         bswLeftOb  = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                              opt->zdrop, opt->pen_clip5, m_ob, opt->a, opt->b, nthreads);
+                                              opt->zdrop, opt->pen_clip5, m_ob, opt->a, opt->b, nthreads, mat_m);
         bswRightOt = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                              opt->zdrop, opt->pen_clip3, m_ot, opt->a, opt->b, nthreads);
+                                              opt->zdrop, opt->pen_clip3, m_ot, opt->a, opt->b, nthreads, mat_m);
         bswRightOb = make_banded_pair_wise_sw(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                                              opt->zdrop, opt->pen_clip3, m_ob, opt->a, opt->b, nthreads);
+                                              opt->zdrop, opt->pen_clip3, m_ob, opt->a, opt->b, nthreads, mat_m);
         /* OT/OB kernels score a SUB-SLICE of the pair array in bsw_run_tier, so
          * their padding-lane overshoot would corrupt the next slice: enable the
          * guard on exactly these objects. The SYM object (bswLeft/bswRight) is a
@@ -8521,6 +8557,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
         bswLeftOb->set_guard_overshoot(true);
         bswRightOt->set_guard_overshoot(true);
         bswRightOb->set_guard_overshoot(true);
+        if (mat_m == METH_M) {
+            const int ot_val = m_ot[METH_C5 * METH_M + METH_T];   /* C5 x read T */
+            const int ob_val = m_ob[METH_G6 * METH_M + METH_A];   /* G6 x read A */
+            bswLeftOt->set_meth_cpg(METH_C, METH_T, ot_val);
+            bswRightOt->set_meth_cpg(METH_C, METH_T, ot_val);
+            bswLeftOb->set_meth_cpg(METH_G, METH_A, ob_val);
+            bswRightOb->set_meth_cpg(METH_G, METH_A, ob_val);
+        }
     }
 
     int i;
@@ -9248,6 +9292,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                                              &rmax[1], gc->rid, &grid, ref_string,
                                              (uint8_t *) seqPairArrayAux);
                     xassert(gc->rid == grid, "two-wave: chain rid mismatch on window re-fetch");
+                    /* Labelled exactly as derive_chain_window labels it in Pass 1. */
+                    if (meth_cpg_on(opt) && gc->meth_hypothesis >= 0)
+                        meth_label_window(grseq, rmax[1] - rmax[0], rmax[0], grid, bns, pac, ref_string);
                     gchain_band = ks_pending[pi].chain_band;
                     gquery = extension_query(gl, gl_query);
                     gwin = true;

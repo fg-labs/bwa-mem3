@@ -244,6 +244,8 @@ typedef struct mem_opt_t {
      * (1 = OT, 0 = OB) via mem_opt_meth_mat(). */
     int8_t mat_ot[25];      // OT (C→T) meth matrix; valid only under --meth
     int8_t mat_ob[25];      // OB (G→A) meth matrix; valid only under --meth
+    int8_t mat7_ot[49];     // 7x7 OT/OB matrices over the --meth-context cpg
+    int8_t mat7_ob[49];     // alphabet (meth_model.h); conversion freed at CpG only
     int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam). Orthogonal
                             // to meth_mode: --meth picks alignment semantics, --bam
                             // picks the container, on every mode alike.
@@ -274,6 +276,9 @@ typedef struct mem_opt_t {
                             // the per-read meth_build_xm() pass entirely.
     char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
+    int    meth_context;    // --meth-context: where a conversion is free, a meth_ctx_t
+                            // value (meth_opts.h): METH_CTX_ALL (default; every C) or
+                            // METH_CTX_CPG (only at a CpG).
     /* Derive the proper-pair FLAG bit (0x2) from the alignment actually EMITTED
      * (a[which]) instead of the top-scoring region (a[0]). Opt-in; 0 = match
      * bwa and bwa-mem2, which both use a[0] unconditionally.
@@ -682,7 +687,8 @@ int mem_skip_contained_ext_sound(const mem_opt_t *opt);
  * the caller must fall back to the exact full-width ladder. No-op at default
  * parameters. Defined in bwamem.cpp. */
 int mem_band_cert_params_safe(const mem_opt_t *opt);
-/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob) from opt->mat +
+/* (Re)derive the --meth per-hypothesis matrices (mat_ot/mat_ob, and the 7x7
+ * mat7_ot/mat7_ob of meth_model.h) from opt->mat +
  * opt->a. Call after any rebuild of opt->mat (e.g. CLI -A/-B/-x parsing) so meth
  * scoring tracks the user's options instead of the init-time defaults. */
 void mem_opt_fill_meth_mat(mem_opt_t *opt);

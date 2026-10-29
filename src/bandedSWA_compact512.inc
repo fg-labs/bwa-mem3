@@ -36,7 +36,7 @@ struct Bsw8CBuf512 {
  * be allocated and faulted in again each time. */
 static thread_local Bsw8CBuf512 g_bsw8c_buf512;
 
-template <bool SIGNED8>
+template <bool SIGNED8, bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                                                              uint8_t *seqBufRef,
                                                              uint8_t *seqBufQer,
@@ -91,6 +91,10 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
     __m512i frread512 = _mm512_set1_epi8(fc.read);
     __m512i amat512 = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m512i three512_8 = _mm512_set1_epi8(3);
+    // CpG arm (CPG only; see "CpG arm" in bandedSWA.cpp), as smithWaterman512_8Impl
+    __m512i cpgref512  = _mm512_set1_epi8(this->cpg_ref_code_);
+    __m512i cpgread512 = _mm512_set1_epi8(this->cpg_read_);
+    __m512i cpgval512  = _mm512_set1_epi8(this->cpg_val_);
     __m512i e_del512    = _mm512_set1_epi8(this->e_del);
     __m512i oe_del512   = _mm512_set1_epi8(this->o_del + this->e_del);
     __m512i e_ins512    = _mm512_set1_epi8(this->e_ins);
@@ -276,7 +280,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8CompactImpl(SeqPair *pairArray,
                 cmpim = cmpim | _mm512_cmpeq_epi8_mask(tail512, head512) | _mm512_cmpgt_epi8_mask(head512, tail512);
                 exit0 = _mm512_mask_blend_epi8(cmpim, exit0, zero512);
             }
-            if (!gen_mat) {
+            if (CPG) {
+                // CpG arm (see "CpG arm"): the row split, then the per-cell score
+                __mmask64 rowcpg;
+                BSW_CPG_ROW8_512(s10, rowcpg, cpgref512);
+                for (int jp = beg; jp < end; jp++) {
+                    __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
+                    __m512i sbt11;
+                    SBT_PREPASS8_RANK1(s10, s2, rowcpg, sbt11, pmat512, cpgval512, cpgread512);
+                    _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+                }
+            } else if (!gen_mat) {
                 for (int jp = beg; jp < end; jp++) {
                     __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
                     __m512i sbt11;
@@ -633,10 +647,15 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                                                          int32_t w,
                                                          int K)
 {
-    if (bsw8_gap_bytes_fit_int8(o_del, e_del, o_ins, e_ins))
-        smithWatermanBatchWrapper8CompactImpl<true>(pairArray, seqBufRef, seqBufQer, numPairs, w, K);
+    if (cpg_) {
+        if (bsw8_gap_bytes_fit_int8(o_del, e_del, o_ins, e_ins))
+            smithWatermanBatchWrapper8CompactImpl<true, true>(pairArray, seqBufRef, seqBufQer, numPairs, w, K);
+        else
+            smithWatermanBatchWrapper8CompactImpl<false, true>(pairArray, seqBufRef, seqBufQer, numPairs, w, K);
+    } else if (bsw8_gap_bytes_fit_int8(o_del, e_del, o_ins, e_ins))
+        smithWatermanBatchWrapper8CompactImpl<true, false>(pairArray, seqBufRef, seqBufQer, numPairs, w, K);
     else
-        smithWatermanBatchWrapper8CompactImpl<false>(pairArray, seqBufRef, seqBufQer, numPairs, w, K);
+        smithWatermanBatchWrapper8CompactImpl<false, false>(pairArray, seqBufRef, seqBufQer, numPairs, w, K);
 }
 
 #endif  /* __AVX512BW__ */

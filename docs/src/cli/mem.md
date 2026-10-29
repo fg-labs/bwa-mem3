@@ -969,10 +969,27 @@ the conversion direction count toward `NM`, keeps `-B 4`); `neutral` (the
 tolerated, not rewarded — best for the sparse conversions of TAPS (keeps `-B 4`;
 variants count toward `NM` as in `genomic`). In both, a genuine variant in
 the conversion direction itself (a C→T at a reference `C`) shares the freed cell
-with a conversion and is not counted in `NM`
+with a conversion and is not counted in `NM`; under `--meth-context cpg` that holds
+only at a CpG, and a C→T at any other `C` counts
 ([why](../methylation/overview.md#which-real-variants-stay-visible)). Only meaningful
 with `--meth`.
 See [Flags → --meth-scoring](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral).
+
+#### `--meth-context {all|cpg}` — where a conversion is free
+
+`all` (the default for every chemistry) frees the conversion at every reference
+`C`. `cpg` frees it only at a CpG, so a C→T at a non-CpG `C` scores as a mismatch
+and counts toward `NM`; `XM:Z` is unchanged. Requires `--meth=taps` or
+`--meth=5base` and a `--meth-scoring` other than `collapsed`; any other
+combination is an error. Alignment records with `all` are byte-identical to
+omitting the option; only the `@PG` `CL:` record differs, because it records the
+flag. On the 2×150 bp 5-base set, `cpg` adds 5–7 % wall time on x86 (AVX-512BW)
+and 7–9 % on arm64 (NEON); see
+[the measurements](../methylation/5base.md#choosing---meth-context-cpg) for the
+hosts and thread counts. The default stays `all` for now;
+see [Illumina 5-base → Choosing --meth-context cpg](../methylation/5base.md#choosing---meth-context-cpg)
+for the accuracy trade-off and
+[Flags → --meth-context](../methylation/flags.md#--meth-context-allcpg).
 
 #### `--meth-tags SPEC` — select which Bismark tags are emitted
 

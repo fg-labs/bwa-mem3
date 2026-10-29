@@ -38,6 +38,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "ksw.h"
 #include "utils.h"
 #include "kstring.h"
+#include "meth_model.h"  /* METH_M, meth_code_base, meth_label_window: the cpg alphabet in bwa_gen_cigar4 */
 #include "kvec.h"
 #include "u8vec_scratch.h"
 #include "seq_reverse.h"
@@ -354,11 +355,21 @@ void bwa_fill_scmat(int a, int b, int8_t mat[25])
  *
  * Returns kc (at least |d|), or -1 when the bound does not apply (amax + e_ins + e_del <= 0, a
  * negative gap open, or an empty sequence). */
-int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
-                         int qlen, const uint8_t *query, int tlen, const uint8_t *rseq)
+/* The plain base of reference code r for an alphabet of size M: r itself for
+ * M = 5, meth_code_base(r) for the --meth-context cpg alphabet (M = 7), whose
+ * labels C5/G6 read as C/G. */
+template <int M> static inline uint8_t bwa_ref_base(uint8_t r)
+{
+    return M == 5 ? r : meth_code_base(r);
+}
+
+/* bwa_global_cert_band over a matrix of alphabet size M (row stride M). */
+template <int M>
+static int bwa_global_cert_band_m(const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins,
+                                  int qlen, const uint8_t *query, int tlen, const uint8_t *rseq)
 {
     int amax = mat[0];
-    for (int k = 1; k < 25; ++k) amax = mat[k] > amax ? mat[k] : amax;
+    for (int k = 1; k < M * M; ++k) amax = mat[k] > amax ? mat[k] : amax;
     const int64_t slope = (int64_t) amax + e_ins + e_del;
     if (slope <= 0 || o_ins < 0 || o_del < 0 || qlen <= 0 || tlen <= 0) return -1;
     const int64_t d = (int64_t) tlen - qlen, ad = d < 0 ? -d : d;
@@ -366,14 +377,14 @@ int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     // column score of the lower-bound alignment
     int64_t cols = 0;
     if (d == 0) {   // ungapped
-        for (int k = 0; k < L; ++k) cols += mat[rseq[k] * 5 + query[k]];
+        for (int k = 0; k < L; ++k) cols += mat[rseq[k] * M + query[k]];
     } else {
         // diagonal 0 before the gap (s0), the end diagonal after it (s1); the best gap
         // position maximises the prefix sum of s0 - s1
         const uint8_t *r1 = d > 0 ? rseq + d : rseq, *q1 = d < 0 ? query - d : query;
         int64_t run = 0, best = 0;
         for (int k = 0; k < L; ++k) {
-            const int s0 = mat[rseq[k] * 5 + query[k]], s1 = mat[r1[k] * 5 + q1[k]];
+            const int s0 = mat[rseq[k] * M + query[k]], s1 = mat[r1[k] * M + q1[k]];
             cols += s1;
             run += s0 - s1;
             best = run > best ? run : best;
@@ -385,6 +396,12 @@ int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     const int64_t num = (int64_t) amax * L - cols - o_other;
     const int64_t kc = ad + (num < 0 ? 0 : num / slope);
     return kc > INT32_MAX ? INT32_MAX : (int) kc;
+}
+
+int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
+                         int qlen, const uint8_t *query, int tlen, const uint8_t *rseq)
+{
+    return bwa_global_cert_band_m<5>(mat, o_del, e_del, o_ins, e_ins, qlen, query, tlen, rseq);
 }
 
 #if defined(__AVX2__)
@@ -443,18 +460,22 @@ static inline uint32_t cig_mismatch(__m256i q, __m256i r)
 }
 #endif
 
-/* Whether an aligned column (reference base r, query base q) is an edit for NM: a literal
- * difference, and with `nm_from_mat` only one the matrix penalises (see bwa_gen_cigar4). The
- * rule has two forms, which must change together, or an XA hit's NM drifts from its primary's:
+/* Whether an aligned column (reference code r, query base q) is an edit for NM: a literal
+ * difference (of r's plain base), and with `nm_from_mat` only one the matrix penalises (see
+ * bwa_gen_cigar4), read at r's own row, so under --meth-context cpg a conversion at a CpG
+ * (C5/G6) is free and one at a plain C/G is not. The rule has two forms, which must change
+ * together, or an XA hit's NM drifts from its primary's:
  *   - bwa_nm_edit, per column: the MD-building walk, the scalar remainder loops of the MD-free
- *     walks, and the whole of every walk on a target without __AVX2__;
+ *     walks, and the whole of every walk on a target without __AVX2__ or at M = 7;
  *   - cig_nm_edits, its lane-mask form for 32 columns: the vector blocks of the MD-free walks
- *     (the fused ungapped score/NM loop and the NM-only walk) under __AVX2__.
+ *     (the fused ungapped score/NM loop and the NM-only walk) under __AVX2__, at M = 5 only (it
+ *     compares raw bytes and reads a 25-entry matrix).
  * test/unit/test_gen_cigar_no_md.cpp checks NM from both walks against a naive walk of the
  * CIGAR; the lane-mask form is compiled, and so checked, only on an __AVX2__ build. */
-static inline int bwa_nm_edit(const int8_t mat[25], uint8_t r, uint8_t q, int nm_from_mat)
+template <int M>
+static inline int bwa_nm_edit(const int8_t *mat, uint8_t r, uint8_t q, int nm_from_mat)
 {
-    return r != q && (!nm_from_mat || mat[r * 5 + q] < 0);
+    return bwa_ref_base<M>(r) != q && (!nm_from_mat || mat[r * M + q] < 0);
 }
 
 #if defined(__AVX2__)
@@ -575,7 +596,8 @@ extern "C" void bwa_gen_cigar_fill_rseq_scratch(size_t min_size, int byte)
  * same rule (bwa_nm_edit per column, cig_nm_edits for the vector blocks under __AVX2__), but
  * nothing is appended to the CIGAR buffer, which then holds just the n_cigar ops (no trailing
  * NUL). For callers that never read MD (the XA hits in mem_gen_alt). */
-uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
+template <int M>
+static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
 {
     uint32_t *cigar = 0;
     uint8_t *rseq;
@@ -591,6 +613,14 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
     rseq = bwa_gen_cigar_rseq_reserve((size_t)(re - rb) + GEN_CIGAR_RSEQ_HEADROOM);
     bns_get_seq_into(l_pac, pac, rb, re, rseq, &rlen);
     if (re - rb != rlen) goto ret_gen_cigar; // possible if out of range
+    if (M == METH_M) {
+        /* --meth-context cpg: label the window in its fetch frame, before the
+         * reversal below (labels are per base, so they survive it). Its
+         * contig is that of the window's first base. */
+        int is_rev_w;
+        const int rid_w = bns_pos2rid(bns, bns_depos(bns, rb, &is_rev_w));
+        meth_label_window(rseq, rlen, rb, rid_w, bns, pac, NULL);
+    }
     if (rb >= l_pac) { // then reverse both query and rseq; this is to ensure indels to be placed at the leftmost position
         // vector blocks from both ends (seq_reverse.h); clang 19 leaves the swap loops scalar
         seq_reverse_inplace(query, l_query);
@@ -619,7 +649,7 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
             // there the certificate can only help when w is above it. kc is at least
             // |rlen - l_query|, so kc == 0 (no DP) only happens at equal lengths.
             if (rlen == l_query || w > min_w) {
-                const int kc = bwa_global_cert_band(mat, o_del, e_del, o_ins, e_ins, l_query, query, (int)rlen, rseq);
+                const int kc = bwa_global_cert_band_m<M>(mat, o_del, e_del, o_ins, e_ins, l_query, query, (int)rlen, rseq);
                 if (kc == 0) ungapped = 1;
                 else if (kc > 0 && kc < w) w = rlen == l_query || kc > min_w? kc : min_w;
             }
@@ -643,7 +673,7 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 int n_mm = 0, sc = 0;
                 i = 0;
 #if defined(__AVX2__)
-                {
+                if (M == 5) {
                     const cig_lut_t lut = cig_lut_make(mat);
                     __m256i acc = _mm256_setzero_si256();
                     i = cig_blocks(query, rseq, l_query, 0, l_query, 0,
@@ -656,8 +686,8 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 }
 #endif
                 for (; i < l_query; ++i) {
-                    sc += mat[rseq[i]*5 + query[i]];
-                    n_mm += bwa_nm_edit(mat, rseq[i], query[i], nm_from_mat);
+                    sc += mat[rseq[i]*M + query[i]];
+                    n_mm += bwa_nm_edit<M>(mat, rseq[i], query[i], nm_from_mat);
                 }
                 *score = sc;
                 *NM = n_mm;
@@ -667,7 +697,7 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 int sc = 0;
                 i = 0;
 #if defined(__AVX2__)
-                {
+                if (M == 5) {
                     const cig_lut_t lut = cig_lut_make(mat);
                     __m256i acc = _mm256_setzero_si256();
                     i = cig_blocks(query, rseq, l_query, 0, l_query, 0,
@@ -678,30 +708,31 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 }
 #endif
                 for (; i < l_query; ++i)
-                    sc += mat[rseq[i]*5 + query[i]];
+                    sc += mat[rseq[i]*M + query[i]];
                 *score = sc;
             }
         } else {
             // NW alignment
             if (bwa_verbose >= 4) {
                 fprintf(stderr, "* Global bandwidth: %d\n", w);
-                fprintf(stderr, "* Global ref:   "); for (i = 0; i < rlen; ++i) fputc("ACGTN"[(int)rseq[i]], stderr); fputc('\n', stderr);
+                fprintf(stderr, "* Global ref:   "); for (i = 0; i < rlen; ++i) fputc("ACGTN"[(int)bwa_ref_base<M>(rseq[i])], stderr); fputc('\n', stderr);
                 fprintf(stderr, "* Global query: "); for (i = 0; i < l_query; ++i) fputc("ACGTN"[(int)query[i]], stderr); fputc('\n', stderr);
             }
-            *score = ksw_global2(l_query, query, rlen, rseq, 5, mat, o_del, e_del, o_ins, e_ins, w, n_cigar, &cigar);
+            *score = ksw_global2(l_query, query, rlen, rseq, M, mat, o_del, e_del, o_ins, e_ins, w, n_cigar, &cigar);
         }
     } // ungapped / NW block
     if (NM && n_cigar && !want_md) { // compute NM only: the MD walk below without the appends
         int k, x, y, n_mm = 0, n_gap = 0;
 #if defined(__AVX2__)
         cig_lut_t lut = {};
-        if (nm_from_mat) lut = cig_lut_make(mat); // read only under nm_from_mat
+        if (M == 5 && nm_from_mat) lut = cig_lut_make(mat); // read only under nm_from_mat, at M = 5
 #endif
         for (k = 0, x = y = 0; k < *n_cigar; ++k) {
             int op = cigar[k]&0xf, len = cigar[k]>>4;
             if (op == 0) { // match
                 i = 0;
 #if defined(__AVX2__)
+                if (M == 5)
                 i = cig_blocks(query + x, rseq + y, len, x, l_query - x, y,
                                [&](__m256i qv, __m256i rv, uint32_t keep, __m256i, int) {
                     n_mm += __builtin_popcount(cig_nm_edits(qv, rv, keep, nm_from_mat,
@@ -709,7 +740,7 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 });
 #endif
                 for (; i < len; ++i)
-                    n_mm += bwa_nm_edit(mat, rseq[y + i], query[x + i], nm_from_mat);
+                    n_mm += bwa_nm_edit<M>(mat, rseq[y + i], query[x + i], nm_from_mat);
                 x += len; y += len;
             } else if (op == 2) { // deletion
                 if (k > 0 && k < *n_cigar - 1) n_gap += len; // not if D is the first or the last CIGAR
@@ -731,13 +762,14 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 auto put_mismatch = [&](int p) {
                     u += p - last;
                     kputw(u, &str);
-                    kputc(int2base[rseq[y + p]], &str);
+                    kputc(int2base[bwa_ref_base<M>(rseq[y + p])], &str);
                     u = 0; last = p + 1;
                     /* NM increment; see the nm_from_mat contract above */
-                    n_mm += bwa_nm_edit(mat, rseq[y + p], query[x + p], nm_from_mat);
+                    n_mm += bwa_nm_edit<M>(mat, rseq[y + p], query[x + p], nm_from_mat);
                 };
                 i = 0;
 #if defined(__AVX2__)
+                if (M == 5)
                 i = cig_blocks(query + x, rseq + y, len, x, l_query - x, y,
                                [&](__m256i qv, __m256i rv, uint32_t keep, __m256i, int base) {
                     for (uint32_t m = cig_mismatch(qv, rv) & keep; m; m &= m - 1)
@@ -745,14 +777,14 @@ uint32_t *bwa_gen_cigar4(const int8_t mat[25], int o_del, int e_del, int o_ins, 
                 });
 #endif
                 for (; i < len; ++i)
-                    if (query[x + i] != rseq[y + i]) put_mismatch(i);
+                    if (query[x + i] != bwa_ref_base<M>(rseq[y + i])) put_mismatch(i);
                 u += len - last;
                 x += len; y += len;
             } else if (op == 2) { // deletion
                 if (k > 0 && k < *n_cigar - 1) { // don't do the following if D is the first or the last CIGAR
                     kputw(u, &str); kputc('^', &str);
                     for (i = 0; i < len; ++i)
-                        kputc(int2base[rseq[y+i]], &str);
+                        kputc(int2base[bwa_ref_base<M>(rseq[y+i])], &str);
                     u = 0; n_gap += len;
                 }
                 y += len;
@@ -771,9 +803,20 @@ ret_gen_cigar:
     return cigar;
 }
 
+uint32_t *bwa_gen_cigar4(const int8_t *mat, int m, const bntseq_t *bns, int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
+{
+    if (m == METH_M) {
+        xassert(bns != NULL && bns->l_pac == l_pac,
+                "bwa_gen_cigar4: the 7-code alphabet needs the reference's bns to label the window");
+        return bwa_gen_cigar4_m<METH_M>(mat, bns, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, want_md);
+    }
+    xassert(m == 5, "bwa_gen_cigar4: alphabet size must be 5 or 7");
+    return bwa_gen_cigar4_m<5>(mat, bns, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, want_md);
+}
+
 uint32_t *bwa_gen_cigar3(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM, int nm_from_mat)
 {
-    return bwa_gen_cigar4(mat, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, 1);
+    return bwa_gen_cigar4(mat, 5, NULL, o_del, e_del, o_ins, e_ins, w_, l_pac, pac, l_query, query, rb, re, score, n_cigar, NM, nm_from_mat, 1);
 }
 
 uint32_t *bwa_gen_cigar2(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins, int w_, int64_t l_pac, const uint8_t *pac, int l_query, uint8_t *query, int64_t rb, int64_t re, int *score, int *n_cigar, int *NM)

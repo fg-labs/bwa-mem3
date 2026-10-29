@@ -50,6 +50,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "rescue_env.h"
 #include "rescue_rb_index.h"
 #include "meth_xm.h"   /* meth_chem_t: exact rescue pruning under --meth is EM-seq only */
+#include "meth_model.h" /* --meth-context cpg: the 7-code rescue matrices and window labelling */
 #include <chrono>
 
 #ifdef USE_MALLOC_WRAPPERS
@@ -565,6 +566,9 @@ static bool rescue_meth_rel(const mem_opt_t *opt)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_PRUNE_REL", 1);
     if (!opt->meth_mode || mode == 0 || (mode == 1 && opt->meth_chem != METH_CHEM_TAPS)) return false;
+    /* --meth-context cpg frees the conversion only at a CpG, which the
+     * relation (a 5-code matrix property) does not model. */
+    if (meth_cpg_on(opt)) return false;
     return rescue_meth_rel_matrix_ok(opt->mat_ot, 1, opt->a, opt->b)
            && rescue_meth_rel_matrix_ok(opt->mat_ob, 0, opt->a, opt->b);
 }
@@ -586,6 +590,10 @@ static bool rescue_prune_runs(const mem_opt_t *opt, const rescue_prune_params &p
         bwamem3_simd_init();
         return bwamem3_simd_tier() == BWAMEM3_TIER_AVX512BW;
     }();
+    /* --meth-context cpg never prunes: the filter's bounds model 5-code matrices, and its
+     * repeat reuse compares the unlabelled window with a staged, CpG-labelled one. (The cost
+     * gate refuses every cpg run anyway: cpg excludes EM-seq and the relation.) */
+    if (meth_cpg_on(opt)) return false;
     return rescue_prune_on() && p.valid
         && rescue_prune_cost_ok(p, opt->meth_mode != 0,
                                 opt->meth_chem == METH_CHEM_EMSEQ || rescue_meth_rel(opt), avx512);
@@ -607,6 +615,10 @@ static bool rescue_band_meth_on(const mem_opt_t *opt, bool run_prunes)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_BAND_METH", 1);
     if (!rescue_prune_on() || !rescue_band_enabled() || mode == 0) return false;
+    /* --meth-context cpg: the band kernels score 5-code matrices only and have no
+     * CpG gate, so a cpg rescue runs through kswv alone (its Cpg arm) or, on a tier
+     * without the freed-cell kernels, the scalar ksw_align2. */
+    if (meth_cpg_on(opt)) return false;
     /* Pruning applies only without --rescue-kmer (rescue_prune_applies), so a --rescue-kmer run
      * (--fast sets it) prunes nothing and bands as an unpruned run does. */
     const bool prunes = run_prunes && !opt->rescue_kmer;
@@ -640,7 +652,7 @@ struct rescue_run_t {
     /* The inputs the decisions are derived from, so a mem_opt_t rebuilt at the same address or
      * edited in place is derived anew: the opt, the fields the derivation reads (RESCUE_RUN_KEYS of
      * them, rescue_run_key) and, under --meth, the two matrices (rescue_meth_rel). */
-    static const int RESCUE_RUN_KEYS = 10;
+    static const int RESCUE_RUN_KEYS = 11;
     const mem_opt_t *opt = NULL;
     int key[RESCUE_RUN_KEYS] = {0};
     int8_t mat_ot[25] = {0}, mat_ob[25] = {0};
@@ -653,7 +665,7 @@ static void rescue_run_key(const mem_opt_t *opt, int key[rescue_run_t::RESCUE_RU
 {
     key[0] = opt->a; key[1] = opt->b; key[2] = opt->o_del; key[3] = opt->e_del; key[4] = opt->o_ins;
     key[5] = opt->e_ins; key[6] = opt->min_seed_len; key[7] = opt->meth_mode; key[8] = opt->meth_chem;
-    key[9] = opt->rescue_kmer;
+    key[9] = opt->rescue_kmer; key[10] = opt->meth_context;
 }
 static void rescue_run_derive(rescue_run_t &r, const mem_opt_t *opt, const int key[rescue_run_t::RESCUE_RUN_KEYS])
 {
@@ -1443,7 +1455,13 @@ static bool meth_freed_cell_tier_supported()
  * with mem_opt_fill_meth_mat and the kswv mat-aware ctor. */
 static inline bool meth_scoring_batched_expressible(const mem_opt_t *opt)
 {
-    (void)opt;   /* every mem_opt_fill_meth_mat matrix is kernel-expressible */
+    /* Every mem_opt_fill_meth_mat matrix is kernel-expressible, and so are the
+     * --meth-context cpg matrices (mat7_ot / mat7_ob, meth_model.h): the kernels'
+     * Cpg arm frees the conversion only on rows whose reference byte carries the
+     * CpG label, which _pre writes into the staged window (meth_label_window).
+     * So cpg, too, is batched exactly where the tier has the freed-cell kernels,
+     * and takes the scalar ksw_align2 at m = 7 everywhere else. */
+    (void) opt;
     return meth_freed_cell_tier_supported();
 }
 
@@ -1555,8 +1573,13 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         int xtra = sp.h0;
         uint8_t *qs = seqBufQer + sp.idq;
         uint8_t *rs = seqBufRef + sp.idr;
-        aln[i] = ksw_align2(sp.len2, qs, sp.len1, rs, 5,
-                            opt->mat, opt->o_del, opt->e_del,
+        /* --meth-context cpg: rs is a CpG-labelled window (_pre), so score it with
+         * the pair's 7-code matrix at m = 7 (meth_model_mat), as _post's scalar path does. */
+        int m = 5;
+        const int8_t *mm = opt->mat;
+        if (meth_cpg_on(opt)) mm = meth_model_mat(opt, sp.meth_hyp, &m);
+        aln[i] = ksw_align2(sp.len2, qs, sp.len1, rs, m,
+                            mm, opt->o_del, opt->e_del,
                             opt->o_ins, opt->e_ins, xtra, 0);
     }
     // tprof[SAM2][0] += __rdtsc() - tim;
@@ -1593,23 +1616,29 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
         // the 16-bit shift headroom (a group is <= pcnt <= wsize_pair pairs).
         SeqPair *scratch = mmc->seqPairArrayRight128[tid];
 
+        /* --meth-context cpg: the 7-code matrices on the CpG-labelled windows _pre
+         * staged (meth_model_mat's matrices for hyp 1 / 0); the kernels' Cpg arm. */
+        const bool cpg = meth_cpg_on(opt) != 0;
         auto pwsw_ot = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                  opt->a, -1*opt->b, nthreads,
-                                 maxRefLen, maxQerLen, opt->mat_ot);
+                                 maxRefLen, maxQerLen, cpg ? opt->mat7_ot : opt->mat_ot, cpg);
         auto pwsw_ob = make_kswv(opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
                                  opt->a, -1*opt->b, nthreads,
-                                 maxRefLen, maxQerLen, opt->mat_ob);
+                                 maxRefLen, maxQerLen, cpg ? opt->mat7_ob : opt->mat_ob, cpg);
         // The batched kernel expresses exactly the matrices mem_opt_fill_meth_mat
         // produces: GENOMIC (one freed cell to +a), NEUTRAL (one freed cell to 0),
         // and COLLAPSED (the conversion cell PLUS its mirror — a symmetric
-        // (i,j)/(j,i) pair). The freed-less x86 tiers never reach here —
+        // (i,j)/(j,i) pair) — plus, under --meth-context cpg, the 7-code mat7_ot /
+        // mat7_ob (one freed cell on the C5 / G6 row, gated per row by the CpG
+        // label; kswv::init_meth_cpg). The freed-less x86 tiers never reach here —
         // meth_scoring_batched_expressible() gates this branch on the running
         // tier — so needsScalar() is always false. Guard it at RUNTIME rather
         // than with a bare assert(): under NDEBUG assert is a no-op, which would
         // let a future unsupported matrix run the batched kernel and silently
         // mis-score. Fail loudly instead — this can only fire on a programming
-        // error in mem_opt_fill_meth_mat (a matrix that is neither a single freed
-        // cell nor a mirror pair) or a tier gate that drifted out of lockstep
+        // error in mem_opt_fill_meth_mat / meth_model_fill_mats (a matrix that is
+        // neither a single freed cell nor a mirror pair, or a cpg matrix that is not
+        // one gated CpG cell) or a tier gate that drifted out of lockstep
         // with the kswv mat-aware ctor.
         if (pwsw_ot->needsScalar() || pwsw_ob->needsScalar())
             err_fatal(__func__,
@@ -2406,6 +2435,13 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * is reachable via BWAMEM3_METH_BATCHED_RESCUE=0 (escape hatch) or on
              * a freed-less SIMD tier (sse41/sse42/avx), where the kswv kernel has
              * no freed-cell override and every scoring mode must score scalar. */
+            /* --meth-context cpg takes this route only where the batched path does not
+             * run (the escape hatch, or a tier without the freed-cell kernels); _post
+             * then re-fetches the window into a private copy, labels it and scores it
+             * at m = 7. On the batched path the window is labelled where it is staged
+             * below; the k-mer anchor scan and --rescue-kmer narrowing before that read
+             * the plain window, and rescue pruning never runs under cpg
+             * (rescue_prune_runs). */
             if (opt->meth_mode && (!meth_batched_rescue_enabled()
                     || !meth_scoring_batched_expressible(opt))) {
                 // Escape hatch (env=0) or freed-less tier: keep the legacy scalar
@@ -2666,6 +2702,17 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                  * The per-byte loop is kept as memcpy (same bytes, matches the
                  * _post ref_rw memcpy), which is byte-identical. */
                 memcpy(rs, ref, (size_t)sp.len1);
+                /* --meth-context cpg: label the staged copy (this pair's own bytes in the
+                 * thread's seqBufRef, never the fetch scratch or a loaded reference) in
+                 * its fetch frame, from its own start rb. That is where any narrowing
+                 * (--rescue-kmer) left rb, and it is exactly the labelling of the full
+                 * window narrowed afterwards: meth_label_cpg reads an edge base's
+                 * neighbour beyond the window from pac, in the same frame and contig.
+                 * The kernels' Cpg arm reads the labels (mem_sam_pe_batch builds the
+                 * kswv objects on mat7_ot / mat7_ob); the between-phase reversal keeps
+                 * them, as ksw_align2's does on the scalar path. */
+                if (meth_cpg_on(opt))   // rs is this pair's private staged copy, never a loaded image
+                    meth_label_window(rs, sp.len1, rb, rid, bns, pac, NULL);
                 /* Query: stage the mate bases directly from $ms (no `rev`
                  * scratch). For is_rev, reverse-complement into qs; this is
                  * byte-identical to the removed two-step (build rev, then
@@ -2890,8 +2937,14 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                      * (Replaces the old both-matrices keep-max, which cost 2x SW to
                      * rediscover this same matrix.) */
                     meth_won_hyp = (mate_meth_ot ^ is_rev) & 1;
-                    const int8_t *mm = mem_opt_meth_mat(opt, meth_won_hyp);
-                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5, mm,
+                    /* --meth-context cpg: the 7-code matrix on the window
+                     * labelled in its fetch frame (ref_rw is this job's private
+                     * copy; ksw_align2's in-place reversal keeps the labels). */
+                    int mm_m;
+                    const int8_t *mm = meth_model_mat(opt, meth_won_hyp, &mm_m);
+                    if (mm_m == METH_M)
+                        meth_label_window(ref_rw, ref_len, rb, rid, bns, pac, NULL);
+                    aln = ksw_align2(l_ms, seq, ref_len, ref_rw, mm_m, mm,
                                      opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, xtra, 0);
                 } else {
                     aln = ksw_align2(l_ms, seq, ref_len, ref_rw, 5,

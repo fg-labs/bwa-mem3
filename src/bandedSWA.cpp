@@ -259,6 +259,34 @@ extern uint64_t prof[10][112];
 #define DUMMY1 99
 #define DUMMY2 100
 
+// ------------------------------------------------------------------------------------
+// CpG arm (--meth-context cpg; set_meth_cpg). Every kernel and wrapper below is a template on
+// `bool CPG`, and the wrappers run CPG = true only on an object set_meth_cpg switched on. In the
+// CPG = false instantiation every `if (CPG)` block is dead and the code is the non-cpg kernel's.
+//
+// Encoding. A cpg object's targets are CpG-labelled windows: codes 0..3, plus BSW_CPG_C5 (5, a C
+// followed by G) and BSW_CPG_G6 (6, a G preceded by C). The packers copy reference bytes through
+// unchanged apart from N (4), so the labelled code itself reaches the kernel's reference stream
+// (SoA row i holds row i's code in every lane). It is base code + 4 * (CpG flag), and the kernel
+// splits it once per row, where it loads the row vector s10:
+//     flag = (s10 == fr_ref_base + 4)       the row is the gated reference code (C5 for OT, G6 for OB)
+//     s10  = s10 - 4 where s10 is 5 or 6     back to the base code (C or G) for the base prepass
+// Codes 5 and 6 collide with no other reference value in any stream: N is 4 (8-bit, and the
+// 128-bit x86 16-bit LUT encoding), 0xFFFF (16-bit SYM / RANK1 / AMAT) or AMBR16 = 15 (AVX-512
+// 16-bit LUT), and the pads are DUMMY1 = 99 / DUMMY2 = 100. Under --meth the reference holds no
+// N at all (pac stores N as random bases), but the arm does not rely on it: a 4 stays an N.
+// Read codes are 0..4 as always (fr_read is 0..3).
+//
+// Score. The score of the decoded codes from the tier's symmetric (!gen_mat) prepass
+// (set_meth_cpg clears gen_mat, so the wrappers pack N in that prepass's encoding), overridden
+// to fr_val where
+//     flag && read == fr_read.
+// That is mat7[ref * 7 + read] for every code: under cpg both NEUTRAL and GENOMIC differ from the
+// plain matrix in exactly that one cell (set_meth_cpg checks it). The 8-bit form is the RANK1
+// prepass with its row mask taken from the flag and its match score replaced by fr_val; the
+// 16-bit form adds the same override after the symmetric prepass. The flag and decode cost a few
+// ops per row; the override costs the RANK1 arm's per-cell ops.
+
 #if defined(__AVX2__)
 /* Tiled SoA packing for the AVX2 / AVX-512BW 8-bit batch wrappers. */
 #include "x86_soa_pack.h"
@@ -321,12 +349,13 @@ static inline void build_pmat16_lut(int16_t out[32],
 // For a symmetric matrix this reproduces build_pmat16's scores exactly (the
 // diagonal is w_match, every off-diagonal is w_mismatch), so the default path
 // stays bit-identical; an asymmetric off-diagonal (e.g. ref-C x read-T freed)
-// is now honored where the XOR-LUT could not represent it.
-static inline void build_amat16(int8_t out[16], const int8_t *mat)
+// is now honored where the XOR-LUT could not represent it. `m` is mat's row
+// stride (5, or 7 for a --meth-context cpg matrix; only codes 0..3 are read).
+static inline void build_amat16(int8_t out[16], const int8_t *mat, int m)
 {
     for (int i = 0; i < 4; i++)
         for (int j = 0; j < 4; j++)
-            out[(i << 2) | j] = mat[i * 5 + j];
+            out[(i << 2) | j] = mat[i * m + j];
 }
 
 // Defensive: numThreads must be ≥ 1 — _mm_malloc(0, 64) is implementation-
@@ -349,11 +378,12 @@ static inline T effective_threads(T n) { return n < 1 ? T(1) : n; }
 BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o_ins,
                                    const int e_ins, const int zdrop,
                                    const int end_bonus, const int8_t *mat_,
-                                   const int8_t w_match, const int8_t w_mismatch, int numThreads)
+                                   const int8_t w_match, const int8_t w_mismatch, int numThreads,
+                                   int m_)
 {
     compact_groups_ = BSW8_COMPACT_GROUPS_TIER;
     mat = mat_;
-    this->m = 5;
+    this->m = m_;
     this->end_bonus = end_bonus;
     this->zdrop = zdrop;
     this->o_del = o_del;
@@ -423,19 +453,55 @@ BandedPairWiseSW::BandedPairWiseSW(const int o_del, const int e_del, const int o
 // identical to what every kernel recomputed per SIMD-batch -- this just hoists
 // it off the hot path. Uses the same this-> values (negated w_mismatch,
 // DEFAULT_AMBIG) the kernels pass, so the cached bytes/predicates are bit-exact.
-// Invariant: this caches the *contents* of the pointed-to matrix (*mat, 25
-// bytes), not just the mat pointer -- valid because the scoring matrix is
+// Invariant: this caches the *contents* of the pointed-to matrix (*mat, m*m
+// bytes, of which the ACGT cells at stride m are read), not just the mat pointer -- valid because the scoring matrix is
 // run-constant for the instance's lifetime and nothing mutates *mat after
 // construction (the pre-hoist kernels re-read it every call). If a future path
 // mutates a scoring matrix in place between batches, this cache must be rebuilt.
 void BandedPairWiseSW::bsw_build_mat_cache() {
     const bool forced = bsw_force_generic_matrix();  // ctor-local; not a member (no kernel reads it)
-    bsw_gen_mat_ = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch)
+    bsw_gen_mat_ = bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch, this->m)
                    || forced;
-    bsw_fc_      = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced);
+    bsw_fc_      = bsw_freed_cell(this->mat, this->w_match, this->w_mismatch, forced, this->m);
     build_pmat16(bsw_pmat_bytes_, this->w_match, this->w_mismatch, this->w_ambig);
-    build_amat16(bsw_amat_bytes_, this->mat);
+    build_amat16(bsw_amat_bytes_, this->mat, this->m);
     build_pmat16_lut(bsw_pmat16_lut_, this->w_match, this->w_mismatch, this->w_ambig);
+}
+
+// --meth-context cpg (see IBandedPairWiseSW::set_meth_cpg). The CpG arm scores a cell as the
+// plain symmetric 4x4 score of the base codes (the XOR / SYM / LUT prepasses, built from
+// w_match / w_mismatch / w_ambig) overridden to fr_val on the one gated cell. That equals
+// mat[ref * 7 + read] for every reference code 0..6 exactly when the checks below hold, so they
+// are the arm's precondition. The arm reads the base-code prepass and its N encoding, so the
+// generic-matrix knob (BWAMEM3_FORCE_GENMAT) does not apply to a cpg object: gen_mat is cleared.
+void BandedPairWiseSW::set_meth_cpg(int fr_ref_base, int fr_read, int fr_val)
+{
+    xassert(this->m == 7, "set_meth_cpg: the object's matrix is not a 7-code matrix");
+    xassert(fr_ref_base == 1 || fr_ref_base == 2, "set_meth_cpg: fr_ref_base must be C (1) or G (2)");
+    xassert(fr_read >= 0 && fr_read <= 3, "set_meth_cpg: fr_read must be a base code 0..3");
+    xassert(fr_val > -128 && fr_val <= 127, "set_meth_cpg: fr_val must fit an int8 other than -128");
+    // The band clamp and the 8-bit envelope take the largest cell score from w_match / w_mismatch /
+    // w_ambig, not from the gated cell, so a gated cell above w_match would let them under-reach
+    // scalarBandedSWA. --meth-context cpg sets the cell to the match score (genomic) or 0 (neutral).
+    xassert(fr_val <= this->w_match, "set_meth_cpg: fr_val must not exceed the match score");
+    xassert(!bsw_generic_matrix(this->mat, this->w_match, this->w_mismatch, this->m),
+            "set_meth_cpg: the matrix's ACGT block is not the plain symmetric matrix");
+    // N (reference row 4, read column 4) is scored from w_ambig by every kernel, not from mat.
+    for (int k = 0; k < 7; k++)
+        xassert(this->mat[k * 7 + 4] == this->w_ambig && (k > 4 || this->mat[4 * 7 + k] == this->w_ambig),
+                "set_meth_cpg: the matrix's N row / column is not w_ambig");
+    for (int r = 5; r <= 6; r++)
+        for (int c = 0; c <= 4; c++) {
+            const bool gated = r == fr_ref_base + 4 && c == fr_read;
+            const int want = gated ? fr_val : this->mat[(r - 4) * 7 + c];
+            xassert(this->mat[r * 7 + c] == want,
+                    "set_meth_cpg: the matrix differs from its base rows elsewhere than the gated cell");
+        }
+    bsw_gen_mat_  = false;
+    cpg_          = true;
+    cpg_ref_code_ = (int8_t)(fr_ref_base + 4);
+    cpg_read_     = (int8_t)fr_read;
+    cpg_val_      = (int8_t)fr_val;
 }
 
 // destructor
@@ -712,6 +778,16 @@ static inline __m256i bsw8_qsent256(__m256i qlen_off, __m256i qlen_valid, __m256
         sbt11_out = _mm256_blendv_epi8(sbt_, match256, freed_);        \
     }
 
+// CpG arm (see "CpG arm" above): split row vector s1 into the gated-row flag (rowcpg) and its
+// base codes, in place.
+#define BSW_CPG_ROW8_256(s1, rowcpg, cpgref256)                          \
+    {                                                                   \
+        rowcpg = _mm256_cmpeq_epi8(s1, cpgref256);                      \
+        __m256i lab_ = _mm256_or_si256(_mm256_cmpeq_epi8(s1, _mm256_set1_epi8(BSW_CPG_C5)), \
+                                       _mm256_cmpeq_epi8(s1, _mm256_set1_epi8(BSW_CPG_G6))); \
+        s1 = _mm256_sub_epi8(s1, _mm256_and_si256(lab_, _mm256_set1_epi8(4))); \
+    }
+
 #define MAIN_CODE8_CORE(sbt11, h00, h11, e11, f11, f21, zero256, e_ins256, oe_ins256, e_del256, oe_del256) \
     {                                                                   \
         /* M = max(0, h00 + sbt) computed in UNSIGNED-saturating form so a    \
@@ -759,6 +835,21 @@ static inline __m256i bsw8_qsent256(__m256i qlen_off, __m256i qlen_valid, __m256
         __m256i sbt_ = _mm256_blendv_epi16(mismatch256, match256, ism_); \
         __m256i nmax_ = _mm256_max_epu16(s1, s2);                       \
         sbt11_out = _mm256_blendv_epi16(sbt_, w_ambig_256, nmax_);      \
+    }
+
+// CpG arm (see "CpG arm" above), 16-bit lanes: the row split, and the gated-cell override of a
+// base score sbt11 (read s2 == fr_read on a flagged row -> fr_val).
+#define BSW_CPG_ROW16_256(s1, rowcpg, cpgref256)                         \
+    {                                                                   \
+        rowcpg = _mm256_cmpeq_epi16(s1, cpgref256);                     \
+        __m256i lab_ = _mm256_or_si256(_mm256_cmpeq_epi16(s1, _mm256_set1_epi16(BSW_CPG_C5)), \
+                                       _mm256_cmpeq_epi16(s1, _mm256_set1_epi16(BSW_CPG_G6))); \
+        s1 = _mm256_sub_epi16(s1, _mm256_and_si256(lab_, _mm256_set1_epi16(4))); \
+    }
+#define BSW_CPG_OVERRIDE16_256(s2, rowcpg, sbt11, cpgval256, cpgread256) \
+    {                                                                   \
+        __m256i g_ = _mm256_and_si256(rowcpg, _mm256_cmpeq_epi16(s2, cpgread256)); \
+        sbt11 = _mm256_blendv_epi8(sbt11, cpgval256, g_);               \
     }
 
 // D3 generic-matrix seam (gated; >=2 freed cells / non-match freed values). LUT
@@ -835,15 +926,21 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     int64_t startTick, endTick;
 
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
         /* same-row lane compaction (bandedSWA_compact256.inc; see set_lane_compaction) */
         if (compact_groups_ > 0 && w >= compact_min_w_ && numPairs > SIMD_WIDTH8)
-            smithWatermanBatchWrapper8Compact(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
-        else
-            smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        {
+            if (cpg_) smithWatermanBatchWrapper8Compact<true>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
+            else      smithWatermanBatchWrapper8Compact<false>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
+        } else {
+            if (cpg_) smithWatermanBatchWrapper8<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+            else      smithWatermanBatchWrapper8<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        }
     }
 
 #if MAXI
@@ -859,6 +956,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
     
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint8_t *seqBufRef,
                                                   uint8_t *seqBufQer,
@@ -1092,17 +1190,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 }
             }
             
-            smithWaterman256_8(mySeq1SoA,
-                               mySeq2SoA,
-                               maxLen1,
-                               maxLen2,
-                               pairArray + i,
-                               h0,
-                               tid,
-                               numPairs,
-                               zdrop,
-                               bsize,
-                               myband);
+            smithWaterman256_8<CPG>(mySeq1SoA,
+                                    mySeq2SoA,
+                                    maxLen1,
+                                    maxLen2,
+                                    pairArray + i,
+                                    h0,
+                                    tid,
+                                    numPairs,
+                                    zdrop,
+                                    bsize,
+                                    myband);
         }
     }
 
@@ -1127,6 +1225,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 }
 
 
+template <bool CPG>
 void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
                                           uint8_t seq2SoA[],
                                           int nrow,
@@ -1158,6 +1257,10 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
     __m256i frread256 = _mm256_set1_epi8(fc.read);
     __m256i amat256 = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m256i three256_8 = _mm256_set1_epi8(3);
+    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm")
+    __m256i cpgref256  = _mm256_set1_epi8(this->cpg_ref_code_);
+    __m256i cpgread256 = _mm256_set1_epi8(this->cpg_read_);
+    __m256i cpgval256  = _mm256_set1_epi8(this->cpg_val_);
 
     __m256i e_del256    = _mm256_set1_epi8(this->e_del);
     __m256i oe_del256   = _mm256_set1_epi8(this->o_del + this->e_del);
@@ -1430,7 +1533,17 @@ void BandedPairWiseSW::smithWaterman256_8(uint8_t seq1SoA[],
         // once. Independent per-j, so vectorized loads/stores run at peak
         // throughput without carrying the DP core's dep chain. gen_mat branch is
         // loop-invariant (once per row): symmetric keeps the XOR LUT.
-        if (!gen_mat) {
+        if (CPG) {
+            // CpG arm (see "CpG arm"): the row split, then the per-cell score
+            __m256i rowcpg;
+            BSW_CPG_ROW8_256(s10, rowcpg, cpgref256);
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m256i sbt11;
+                SBT_PREPASS8_RANK1(s10, s2, rowcpg, sbt11, pmat256, cpgval256, cpgread256);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else if (!gen_mat) {
             for (int jp = beg; jp < end; jp++) {
                 __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
                 __m256i sbt11;
@@ -1898,11 +2011,14 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    uint16_t numThreads,
                                    int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     int64_t startTick, endTick;
 
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
-        smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        if (cpg_) smithWatermanBatchWrapper16<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        else      smithWatermanBatchWrapper16<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
 #if MAXI
@@ -1919,6 +2035,7 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
     
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint8_t *seqBufRef,
                                                    uint8_t *seqBufQer,
@@ -2095,18 +2212,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 }
             }
 
-            smithWaterman256_16(mySeq1SoA,
-                                mySeq2SoA,
-                                maxLen1,
-                                maxLen2,
-                                pairArray + i,
-                                h0,
-                                tid,
-                                numPairs,
-                                zdrop,
-                                bsize, 
-                                qlen,
-                                myband);
+            smithWaterman256_16<CPG>(mySeq1SoA,
+                                     mySeq2SoA,
+                                     maxLen1,
+                                     maxLen2,
+                                     pairArray + i,
+                                     h0,
+                                     tid,
+                                     numPairs,
+                                     zdrop,
+                                     bsize, 
+                                     qlen,
+                                     myband);
         }
     }
 
@@ -2130,6 +2247,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     return;
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
                                            uint16_t seq2SoA[],
                                            uint16_t nrow,
@@ -2158,6 +2276,10 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     __m256i frread256 = _mm256_set1_epi16(fc.read);
     __m256i amat256   = _mm256_broadcastsi128_si256(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m256i three256  = _mm256_set1_epi16(3);
+    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm")
+    __m256i cpgref256  = _mm256_set1_epi16(this->cpg_ref_code_);
+    __m256i cpgread256 = _mm256_set1_epi16(this->cpg_read_);
+    __m256i cpgval256  = _mm256_set1_epi16(this->cpg_val_);
 
     __m256i e_del256    = _mm256_set1_epi16(this->e_del);
     __m256i oe_del256   = _mm256_set1_epi16(this->o_del + this->e_del);
@@ -2333,7 +2455,18 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         
         // PR 17: AVX2 16-bit score pre-pass (fission). gen_mat branch is
         // loop-invariant: symmetric keeps the cheap SYM prepass.
-        if (!gen_mat) {
+        if (CPG) {
+            // CpG arm (see "CpG arm"): the row split, then the per-cell score
+            __m256i rowcpg;
+            BSW_CPG_ROW16_256(s10, rowcpg, cpgref256);
+            for (int jp = beg; jp < end; jp++) {
+                __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m256i sbt11;
+                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch256, match256, w_ambig_256);
+                BSW_CPG_OVERRIDE16_256(s2, rowcpg, sbt11, cpgval256, cpgread256);
+                _mm256_store_si256((__m256i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else if (!gen_mat) {
             for (int jp = beg; jp < end; jp++) {
                 __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH16));
                 __m256i sbt11;
@@ -2684,6 +2817,16 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         sbt11_out = _mm512_mask_blend_epi8(freed_, sbt_, match512);    \
     }
 
+// CpG arm (see "CpG arm" above): split row vector s1 into the gated-row mask (rowcpg) and its
+// base codes, in place.
+#define BSW_CPG_ROW8_512(s1, rowcpg, cpgref512)                          \
+    {                                                                   \
+        rowcpg = _mm512_cmpeq_epi8_mask(s1, cpgref512);                 \
+        __mmask64 lab_ = _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8(BSW_CPG_C5)) | \
+                         _mm512_cmpeq_epi8_mask(s1, _mm512_set1_epi8(BSW_CPG_G6)); \
+        s1 = _mm512_mask_sub_epi8(s1, lab_, s1, _mm512_set1_epi8(4));   \
+    }
+
 // --- Score domain of the 8-bit kernel (smithWaterman512_8Impl<SIGNED8>) ---
 // SIGNED8 == false: every H/E/F byte is the unsigned score in [0,255] (max_epu8 / subs_epu8 /
 // cmpgt_epu8, score 0 == 0x00).
@@ -2786,6 +2929,21 @@ template <bool S> static inline __m512i bsw8_hf_or512(__m512i f, __m512i h, __m5
         sbt11_out = _mm512_mask_blend_epi16(amb_, sbt_, w_ambig_512);   \
     }
 
+// CpG arm (see "CpG arm" above), 16-bit lanes: the row split, and the gated-cell override of a
+// base score sbt11 (read s2 == fr_read on a flagged row -> fr_val).
+#define BSW_CPG_ROW16_512(s1, rowcpg, cpgref512)                         \
+    {                                                                   \
+        rowcpg = _mm512_cmpeq_epi16_mask(s1, cpgref512);                \
+        __mmask32 lab_ = _mm512_cmpeq_epi16_mask(s1, _mm512_set1_epi16(BSW_CPG_C5)) | \
+                         _mm512_cmpeq_epi16_mask(s1, _mm512_set1_epi16(BSW_CPG_G6)); \
+        s1 = _mm512_mask_sub_epi16(s1, lab_, s1, _mm512_set1_epi16(4)); \
+    }
+#define BSW_CPG_OVERRIDE16_512(s2, rowcpg, sbt11, cpgval512, cpgread512) \
+    {                                                                   \
+        __mmask32 g_ = rowcpg & _mm512_cmpeq_epi16_mask(s2, cpgread512); \
+        sbt11 = _mm512_mask_blend_epi16(g_, sbt11, cpgval512);          \
+    }
+
 // D3 generic-matrix seam (gated; >=2 freed cells / non-match freed values). LUT
 // amat[(ref<<2)|read] for both-ACGT lanes; non-ACGT is mismatch-or-ambig. Byte LUT
 // score in low byte -> sign-extend. acgt mask via cmpeq(max_epu16(maxb,3),3).
@@ -2852,6 +3010,8 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     static_assert(SIMD_WIDTH8 == 64 && SIMD_WIDTH16 == 32, "AVX512 kernel requires 64x8-bit and 32x16-bit lanes");
     int i;
     int64_t startTick, endTick;
@@ -2879,7 +3039,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
 
 }
 
-template <bool SIGNED8>
+template <bool SIGNED8, bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
                                                       uint8_t *seqBufRef,
                                                       uint8_t *seqBufQer,
@@ -3099,17 +3259,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Impl(SeqPair *pairArray,
             }
 
             (SIGNED8 ? domain_counts_.signed_batches : domain_counts_.unsigned_batches)++;
-            smithWaterman512_8Impl<SIGNED8>(mySeq1SoA,
-                                            mySeq2SoA,
-                                            maxLen1,
-                                            maxLen2,
-                                            pairArray + i,
-                                            h0,
-                                            tid,
-                                            numPairs,
-                                            zdrop,
-                                            bsize,
-                                            myband);
+            smithWaterman512_8Impl<SIGNED8, CPG>(mySeq1SoA,
+                                                 mySeq2SoA,
+                                                 maxLen1,
+                                                 maxLen2,
+                                                 pairArray + i,
+                                                 h0,
+                                                 tid,
+                                                 numPairs,
+                                                 zdrop,
+                                                 bsize,
+                                                 myband);
         }
     }
 
@@ -3142,13 +3302,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint16_t numThreads,
                                                   int32_t w)
 {
-    if (bsw8_gap_bytes_fit_int8(o_del, e_del, o_ins, e_ins))
-        smithWatermanBatchWrapper8Impl<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    if (cpg_) {
+        if (bsw8_gap_bytes_fit_int8(o_del, e_del, o_ins, e_ins))
+            smithWatermanBatchWrapper8Impl<true, true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        else
+            smithWatermanBatchWrapper8Impl<false, true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+    } else if (bsw8_gap_bytes_fit_int8(o_del, e_del, o_ins, e_ins))
+        smithWatermanBatchWrapper8Impl<true, false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     else
-        smithWatermanBatchWrapper8Impl<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        smithWatermanBatchWrapper8Impl<false, false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
 }
 
-template <bool SIGNED8>
+template <bool SIGNED8, bool CPG>
 void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
                                               uint8_t seq2SoA[],
                                               int nrow,
@@ -3182,6 +3347,10 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
     __m512i frread512 = _mm512_set1_epi8(fc.read);
     __m512i amat512 = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m512i three512_8 = _mm512_set1_epi8(3);
+    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm")
+    __m512i cpgref512  = _mm512_set1_epi8(this->cpg_ref_code_);
+    __m512i cpgread512 = _mm512_set1_epi8(this->cpg_read_);
+    __m512i cpgval512  = _mm512_set1_epi8(this->cpg_val_);
 
     __m512i e_del512    = _mm512_set1_epi8(this->e_del);
     __m512i oe_del512   = _mm512_set1_epi8(this->o_del + this->e_del);
@@ -3460,7 +3629,17 @@ void BandedPairWiseSW::smithWaterman512_8Impl(uint8_t seq1SoA[],
 
         // PR 17+16: AVX-512 8-bit score pre-pass via LUT. gen_mat branch is
         // loop-invariant: symmetric keeps the cheap XOR LUT.
-        if (!gen_mat) {
+        if (CPG) {
+            // CpG arm (see "CpG arm"): the row split, then the per-cell score
+            __mmask64 rowcpg;
+            BSW_CPG_ROW8_512(s10, rowcpg, cpgref512);
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
+                __m512i sbt11;
+                SBT_PREPASS8_RANK1(s10, s2, rowcpg, sbt11, pmat512, cpgval512, cpgread512);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH8), sbt11);
+            }
+        } else if (!gen_mat) {
             for (int jp = beg; jp < end; jp++) {
                 __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH8));
                 __m512i sbt11;
@@ -3904,12 +4083,15 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    uint16_t numThreads,
                                    int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     int i;
     int64_t startTick, endTick;
 
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
-        smithWatermanBatchWrapper16(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        if (cpg_) smithWatermanBatchWrapper16<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        else      smithWatermanBatchWrapper16<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
 
 #if MAXI
@@ -3926,6 +4108,7 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
 
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint8_t *seqBufRef,
                                                    uint8_t *seqBufQer,
@@ -4112,18 +4295,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 }
             }
 
-            smithWaterman512_16(mySeq1SoA,
-                                mySeq2SoA,
-                                maxLen1,
-                                maxLen2,
-                                pairArray + i,
-                                h0,
-                                tid,
-                                numPairs,
-                                zdrop,
-                                bsize,
-                                qlen,
-                                myband);
+            smithWaterman512_16<CPG>(mySeq1SoA,
+                                     mySeq2SoA,
+                                     maxLen1,
+                                     maxLen2,
+                                     pairArray + i,
+                                     h0,
+                                     tid,
+                                     numPairs,
+                                     zdrop,
+                                     bsize,
+                                     qlen,
+                                     myband);
         }
     }
 
@@ -4147,6 +4330,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     return;
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
                                            uint16_t seq2SoA[],
                                            uint16_t nrow,
@@ -4179,6 +4363,10 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
     __m512i frread512 = _mm512_set1_epi16(fc.read);
     __m512i amat512   = _mm512_broadcast_i32x4(_mm_load_si128((__m128i *)bsw_amat_bytes_));
     __m512i three512  = _mm512_set1_epi16(3);
+    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm")
+    __m512i cpgref512  = _mm512_set1_epi16(this->cpg_ref_code_);
+    __m512i cpgread512 = _mm512_set1_epi16(this->cpg_read_);
+    __m512i cpgval512  = _mm512_set1_epi16(this->cpg_val_);
 
     // PR: 32-entry int16 LUT for the symmetric-path permutexvar prepass
     // (SBT_PREPASS16_LUT). Built once per invocation; consumed only when
@@ -4360,7 +4548,18 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
         // loop-invariant: the symmetric path uses the 2-op permutexvar LUT
         // (requires the asymmetric AMBR16/AMBQ16 SoA encoding); the generic-
         // matrix RANK1/AMAT paths keep the legacy symmetric-encoding prepass.
-        if (!gen_mat) {
+        if (CPG) {
+            // CpG arm (see "CpG arm"): the row split, then the per-cell score
+            __mmask32 rowcpg;
+            BSW_CPG_ROW16_512(s10, rowcpg, cpgref512);
+            for (int jp = beg; jp < end; jp++) {
+                __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m512i sbt11;
+                SBT_PREPASS16_LUT(s10, s2, sbt11, pmat16_512);
+                BSW_CPG_OVERRIDE16_512(s2, rowcpg, sbt11, cpgval512, cpgread512);
+                _mm512_store_si512((__m512i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else if (!gen_mat) {
             for (int jp = beg; jp < end; jp++) {
                 __m512i s2 = _mm512_load_si512((__m512i *)(seq2SoA + jp * SIMD_WIDTH16));
                 __m512i sbt11;
@@ -4823,6 +5022,21 @@ static inline __m128i shuffle_lut_lowidx8(__m128i tbl, __m128i idx)
         sbt11_out = _mm_blendv_epi16(sbt_, w_ambig_128, nN_);          \
     }
 
+// CpG arm (see "CpG arm" above), 16-bit lanes: the row split, and the gated-cell override of a
+// base score sbt11 (read s2 == fr_read on a flagged row -> fr_val).
+#define BSW_CPG_ROW16_128(s1, rowcpg, cpgref128)                         \
+    {                                                                   \
+        rowcpg = _mm_cmpeq_epi16(s1, cpgref128);                        \
+        __m128i lab_ = _mm_or_si128(_mm_cmpeq_epi16(s1, _mm_set1_epi16(BSW_CPG_C5)), \
+                                    _mm_cmpeq_epi16(s1, _mm_set1_epi16(BSW_CPG_G6))); \
+        s1 = _mm_sub_epi16(s1, _mm_and_si128(lab_, _mm_set1_epi16(4))); \
+    }
+#define BSW_CPG_OVERRIDE16_128(s2, rowcpg, sbt11, cpgval128, cpgread128) \
+    {                                                                   \
+        __m128i g_ = _mm_and_si128(rowcpg, _mm_cmpeq_epi16(s2, cpgread128)); \
+        sbt11 = _mm_blendv_epi16(sbt11, cpgval128, g_);                 \
+    }
+
 // D3 generic-matrix seam (gated on an asymmetric matrix; the default symmetric
 // path uses SBT_PREPASS16_SYM above and is untouched). For both-ACGT lanes the
 // score comes from a target-major LUT amat[(ref<<2)|read], so an asymmetric
@@ -4896,9 +5110,12 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
                                    uint16_t numThreads,
                                    int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
-        smithWatermanBatchWrapper16(pairArray, seqBufRef,
+        if (cpg_) smithWatermanBatchWrapper16<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        else      smithWatermanBatchWrapper16<false>(pairArray, seqBufRef,
                                     seqBufQer, numPairs,
                                     numThreads, w);
     }
@@ -4915,6 +5132,7 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
 
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                                                    uint8_t *seqBufRef,
                                                    uint8_t *seqBufQer,
@@ -5136,18 +5354,18 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
                 }
             }
 
-            smithWaterman128_16(mySeq1SoA,
-                                mySeq2SoA,
-                                maxLen1,
-                                maxLen2,
-                                pairArray + i,
-                                h0,
-                                tid,
-                                numPairs,
-                                zdrop,
-                                bsize,
-                                qlen,
-                                myband);
+            smithWaterman128_16<CPG>(mySeq1SoA,
+                                     mySeq2SoA,
+                                     maxLen1,
+                                     maxLen2,
+                                     pairArray + i,
+                                     h0,
+                                     tid,
+                                     numPairs,
+                                     zdrop,
+                                     bsize,
+                                     qlen,
+                                     myband);
         }
     }
 
@@ -5171,6 +5389,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper16(SeqPair *pairArray,
     return;
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
                                            uint16_t seq2SoA[],
                                            uint16_t nrow,
@@ -5204,6 +5423,10 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     __m128i frread128 = _mm_set1_epi16(fc.read);
     __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi16(3);                    // ACGT mask (base <= 3)
+    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm")
+    __m128i cpgref128  = _mm_set1_epi16(this->cpg_ref_code_);
+    __m128i cpgread128 = _mm_set1_epi16(this->cpg_read_);
+    __m128i cpgval128  = _mm_set1_epi16(this->cpg_val_);
 
     // 16-byte int8 LUT for the x86 symmetric-path byte-LUT prepass
     // (SBT_PREPASS16_LUT128). Reuses build_pmat16 (the 8-bit XOR LUT); the small
@@ -5383,7 +5606,22 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         // PR 17: 16-bit pre-pass. Same shape as the 8-bit path. The gen_mat
         // branch is loop-invariant across the whole kernel call (once per row,
         // perfectly predicted), so the symmetric default keeps its fast prepass.
-        if (!gen_mat) {
+        if (CPG) {
+            // CpG arm: the symmetric prepass on the row's base codes, then the gated cell.
+            __m128i rowcpg;
+            BSW_CPG_ROW16_128(s10, rowcpg, cpgref128);
+            for (int jp = beg; jp < end; jp++) {
+                __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
+                __m128i sbt11;
+#if defined(__ARM_NEON) || defined(__aarch64__)
+                SBT_PREPASS16_SYM(s10, s2, sbt11, mismatch128, match128, w_ambig_128, ff128);
+#else
+                SBT_PREPASS16_LUT128(s10, s2, sbt11, pmat16_128);
+#endif
+                BSW_CPG_OVERRIDE16_128(s2, rowcpg, sbt11, cpgval128, cpgread128);
+                _mm_store_si128((__m128i *)(sbt_buf + jp * SIMD_WIDTH16), sbt11);
+            }
+        } else if (!gen_mat) {
             for (int jp = beg; jp < end; jp++) {
                 __m128i s2 = _mm_load_si128((__m128i *)(seq2SoA + jp * SIMD_WIDTH16));
                 __m128i sbt11;
@@ -5750,6 +5988,16 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         sbt11_out = blendv_fullmask8(sbt_, match128, freed_);            \
     }
 
+// CpG arm (see "CpG arm" above): split row vector s1 into the gated-row flag (rowcpg) and its
+// base codes, in place.
+#define BSW_CPG_ROW8_128(s1, rowcpg, cpgref128)                          \
+    {                                                                   \
+        rowcpg = _mm_cmpeq_epi8(s1, cpgref128);                         \
+        __m128i lab_ = _mm_or_si128(_mm_cmpeq_epi8(s1, _mm_set1_epi8(BSW_CPG_C5)), \
+                                    _mm_cmpeq_epi8(s1, _mm_set1_epi8(BSW_CPG_G6))); \
+        s1 = _mm_sub_epi8(s1, _mm_and_si128(lab_, _mm_set1_epi8(4)));   \
+    }
+
 // The diagonal term m11 = clamp(h00 + s, 0, 255) of a cell's signed substitution score s.
 // x86 adds the score PRE-SPLIT into its +bonus (S_pos) and -penalty (S_neg) halves (SBT_SPLIT8):
 // adds_epu8 (no wrap past 255) then subs_epu8 (floors at 0). One half is zero in every lane, so
@@ -5815,11 +6063,13 @@ static inline __m128i bsw8_sbt_nomin8(__m128i v)
 // mapped once per kernel call so every cell score they yield is free of -128: the XOR LUT pmat128,
 // gathered directly as the signed score (bsw8_sbt_nomin8(pmat) is exactly SBT_SPLIT8's
 // pos - neg), and the vectors the RANK1/AMAT prepasses select a score from. A new score source
-// for those prepasses must be added here.
+// for those prepasses must be added here. cpgval128 is the CpG arm's fr_val (never -128, so a
+// no-op that keeps the rule; dead code outside the CPG instantiations).
 #define BSW8_SCORES_NOMIN8()                                            \
     do {                                                                \
         pmat128     = bsw8_sbt_nomin8(pmat128);                         \
         match128    = bsw8_sbt_nomin8(match128);                        \
+        cpgval128   = bsw8_sbt_nomin8(cpgval128);                       \
         amat128     = bsw8_sbt_nomin8(amat128);                         \
         w_ambig_128 = bsw8_sbt_nomin8(w_ambig_128);                     \
     } while (0)
@@ -6205,16 +6455,23 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
                                   uint16_t numThreads,
                                   int32_t w)
 {
+    // An m = 7 object's targets carry the CpG codes 5 / 6, which only the CpG arm scores.
+    xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     static_assert(SIMD_WIDTH8 == 16 && SIMD_WIDTH16 == 8, "SSE/NEON kernel requires 16x8-bit and 8x16-bit lanes");
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH8, guard_overshoot_);
 #if defined(__aarch64__)
         /* same-row lane compaction (bandedSWA_compact.inc; see set_lane_compaction) */
         if (compact_groups_ > 0 && w >= compact_min_w_ && numPairs > SIMD_WIDTH8)
-            smithWatermanBatchWrapper8Compact(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
-        else
+        {
+            if (cpg_) smithWatermanBatchWrapper8Compact<true>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
+            else      smithWatermanBatchWrapper8Compact<false>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact_groups_);
+        } else
 #endif
-            smithWatermanBatchWrapper8(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        {
+            if (cpg_) smithWatermanBatchWrapper8<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+            else      smithWatermanBatchWrapper8<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
+        }
     }
 
 #if MAXI
@@ -6231,6 +6488,7 @@ void BandedPairWiseSW::getScores8(SeqPair *pairArray,
     
 }
 
+template <bool CPG>
 void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                                                   uint8_t *seqBufRef,
                                                   uint8_t *seqBufQer,
@@ -6513,17 +6771,17 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
                 }
             }
 
-            smithWaterman128_8(mySeq1SoA,
-                               mySeq2SoA,
-                               maxLen1,
-                               maxLen2,
-                               pairArray + i,
-                               h0,
-                               tid,
-                               numPairs,
-                               zdrop,
-                               bsize,
-                               myband);         
+            smithWaterman128_8<CPG>(mySeq1SoA,
+                                    mySeq2SoA,
+                                    maxLen1,
+                                    maxLen2,
+                                    pairArray + i,
+                                    h0,
+                                    tid,
+                                    numPairs,
+                                    zdrop,
+                                    bsize,
+                                    myband);         
         }
     }
 #if RDT
@@ -6552,6 +6810,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8(SeqPair *pairArray,
 #undef BSW8_NF_TRACK
 #define BSW8_NF_TRACK(hs_, fs_, pj_) BSW8_NF_TRACK_ON(hs_, fs_, pj_)
 #endif
+template <bool CPG>
 void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
                                           uint8_t seq2SoA[],
                                           int nrow,
@@ -6595,6 +6854,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 #endif
     __m128i amat128 = _mm_load_si128((__m128i *)bsw_amat_bytes_);
     __m128i three128 = _mm_set1_epi8(3);                     // N threshold (base > 3)
+    // CpG arm (CPG only): the gated reference code, read and score (see "CpG arm")
+    __m128i cpgref128  = _mm_set1_epi8(this->cpg_ref_code_);
+    __m128i cpgread128 = _mm_set1_epi8(this->cpg_read_);
+    __m128i cpgval128  = _mm_set1_epi8(this->cpg_val_);
     BSW8_SCORES_NOMIN8();
 
     __m128i e_del128    = _mm_set1_epi8(this->e_del);
@@ -7067,6 +7330,10 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
             __m128i S##_sgn; \
             SBT_PREPASS8_AMAT(s10, S##_s2, S##_sgn, amat128, w_ambig_128, three128);
+#define EXT13_SBT8_CPG_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_sgn; \
+            SBT_PREPASS8_RANK1(s10, S##_s2, rowcpg, S##_sgn, pmat128, cpgval128, cpgread128);
 #else
 #define EXT13_SBT8_XOR_AT(jj, S) \
             __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
@@ -7083,8 +7350,17 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
             __m128i S##_sbt, S##_pos, S##_neg; \
             SBT_PREPASS8_AMAT(s10, S##_s2, S##_sbt, amat128, w_ambig_128, three128); \
             SBT_SPLIT8(S##_sbt, S##_pos, S##_neg, zero128);
+#define EXT13_SBT8_CPG_AT(jj, S) \
+            __m128i S##_s2 = _mm_load_si128((__m128i *)(seq2SoA + (jj) * SIMD_WIDTH8)); \
+            __m128i S##_sbt, S##_pos, S##_neg; \
+            SBT_PREPASS8_RANK1(s10, S##_s2, rowcpg, S##_sbt, pmat128, cpgval128, cpgread128); \
+            SBT_SPLIT8(S##_sbt, S##_pos, S##_neg, zero128);
 #endif
-        if (!gen_mat) {
+        if (CPG) {
+            __m128i rowcpg;
+            BSW_CPG_ROW8_128(s10, rowcpg, cpgref128);
+            EXT13_RUN_SPLIT8_128(EXT13_SBT8_CPG);
+        } else if (!gen_mat) {
             EXT13_RUN_SPLIT8_128(EXT13_SBT8_XOR);
         } else if (fc.rank1) {
             __m128i rowfreed = _mm_cmpeq_epi8(s10, frref128);
@@ -7645,6 +7921,7 @@ void BandedPairWiseSW::smithWaterman128_8(uint8_t seq1SoA[],
 #undef EXT13_SBT8_XOR_AT
 #undef EXT13_SBT8_RANK1_AT
 #undef EXT13_SBT8_AMAT_AT
+#undef EXT13_SBT8_CPG_AT
 #undef BSW8_NF_TRACK
 #undef BSW8_NF_TRACK_ON
 #undef BSW8_NF_TRACK_OFF
@@ -7667,6 +7944,17 @@ extern "C" IBandedPairWiseSW *make_bsw_kernel(
 {
     return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
                                 mat, w_match, w_mismatch, numThreads);
+}
+
+/* As make_bsw_kernel, for a matrix of alphabet size `m` (mangled likewise to
+ * make_bsw_kernel_m_<tier>). */
+extern "C" IBandedPairWiseSW *make_bsw_kernel_m(
+    int o_del, int e_del, int o_ins, int e_ins, int zdrop,
+    int end_bonus, const int8_t *mat,
+    int8_t w_match, int8_t w_mismatch, int numThreads, int m)
+{
+    return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus,
+                                mat, w_match, w_mismatch, numThreads, m);
 }
 
 /* Test-only hook: the BSW8_ROW_LEAN setting this copy of the TU was built with,

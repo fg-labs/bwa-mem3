@@ -40,7 +40,8 @@
 #                 turn "we lost the avx512bw leg" into a hard error.
 #   SUMMARY_FILE  file to append a markdown summary to (default $GITHUB_STEP_SUMMARY)
 #   SUITE_ARGS    doctest --test-suite filter selecting which unit suites to sweep
-#                 per tier (default: "--test-suite=unit/kswv"). doctest ORs a single
+#                 per tier (default: "--test-suite=unit/kswv,unit/kswv_cpg", the kswv
+#                 kernels and their --meth-context cpg gate). doctest ORs a single
 #                 --test-suite's comma-separated values (repeating the flag does NOT
 #                 OR -- the last one wins), so sweep several kernel suites at once with
 #                 "--test-suite=unit/kswv,unit/bandedswa". This is how a vector kernel
@@ -63,7 +64,7 @@ set -euo pipefail
 
 SUMMARY_FILE="${SUMMARY_FILE:-${GITHUB_STEP_SUMMARY:-/dev/null}}"
 REQUIRE_TIERS="${REQUIRE_TIERS:-}"
-SUITE_ARGS="${SUITE_ARGS:---test-suite=unit/kswv}"
+SUITE_ARGS="${SUITE_ARGS:---test-suite=unit/kswv,unit/kswv_cpg}"
 
 mkdir -p "$OUT_DIR"
 

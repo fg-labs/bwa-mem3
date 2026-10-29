@@ -72,7 +72,7 @@ GenCigarOut run_gen_cigar(const meth_test::OrigRefFixture &fx, const int8_t *mat
                           int nm_from_mat, int want_md) {
     GenCigarOut out;
     out.query_after = query;
-    out.cigar = bwa_gen_cigar4(mat, 6, 1, 6, 1, band, fx.bns.l_pac, fx.orig_pac,
+    out.cigar = bwa_gen_cigar4(mat, 5, NULL, 6, 1, 6, 1, band, fx.bns.l_pac, fx.orig_pac,
                                (int)query.size(), out.query_after.data(), rb, re, &out.score,
                                &out.n_cigar, &out.nm, nm_from_mat, want_md);
     return out;

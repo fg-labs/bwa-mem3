@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 #include "bwamem.h"
+#include "meth_model.h"   /* meth_cpg_on, METH_M */
 
 /* ------------------------------------------------------------------------- *
  * u8 mate-rescue admission (tier selection)
@@ -31,11 +32,12 @@
  * admissions the tightened bound opens up.
  * ------------------------------------------------------------------------- */
 
-/* Kernel score bias for a 5x5 scoring matrix, matching ksw_qinit's
- * `256 - (uint8_t)min` reduction. >= 1 for any real matrix (min <= 0). */
-static inline int matesw_u8_shift(const int8_t *mat) {
+/* Kernel score bias for an m x m scoring matrix (5, or 7 for a --meth-context
+ * cpg matrix), matching ksw_qinit's `256 - (uint8_t)min` reduction over its
+ * m*m entries. >= 1 for any real matrix (min <= 0). */
+static inline int matesw_u8_shift(const int8_t *mat, int m = 5) {
     int mn = 0;
-    for (int i = 0; i < 25; ++i) if (mat[i] < mn) mn = mat[i];
+    for (int i = 0; i < m * m; ++i) if (mat[i] < mn) mn = mat[i];
     int s = -mn;
     return s < 1 ? 1 : s;
 }
@@ -52,6 +54,12 @@ static inline int matesw_u8_shift_for(const mem_opt_t *opt, const int8_t *base_m
         int sb = matesw_u8_shift(opt->mat_ob);
         if (so > s) s = so;
         if (sb > s) s = sb;
+        if (meth_cpg_on(opt)) {   /* the 7-code matrices the cpg rescue scores with */
+            so = matesw_u8_shift(opt->mat7_ot, METH_M);
+            sb = matesw_u8_shift(opt->mat7_ob, METH_M);
+            if (so > s) s = so;
+            if (sb > s) s = sb;
+        }
     }
     return s;
 }
@@ -62,9 +70,9 @@ static inline int matesw_u8_shift_for(const mem_opt_t *opt, const int8_t *base_m
  * a negative mismatch penalty makes the mismatch the larger. Folding the --meth
  * matrices in, as matesw_u8_shift_for does, can only route MORE pairs to the
  * 16-bit tier. */
-static inline int matesw_u8_qmax(const int8_t *mat) {
+static inline int matesw_u8_qmax(const int8_t *mat, int m = 5) {
     int mx = mat[0];
-    for (int i = 1; i < 25; ++i) if (mat[i] > mx) mx = mat[i];
+    for (int i = 1; i < m * m; ++i) if (mat[i] > mx) mx = mat[i];
     return mx;
 }
 
@@ -75,6 +83,12 @@ static inline int matesw_u8_qmax_for(const mem_opt_t *opt, const int8_t *base_ma
         int qb = matesw_u8_qmax(opt->mat_ob);
         if (qo > q) q = qo;
         if (qb > q) q = qb;
+        if (meth_cpg_on(opt)) {   /* the 7-code matrices the cpg rescue scores with */
+            qo = matesw_u8_qmax(opt->mat7_ot, METH_M);
+            qb = matesw_u8_qmax(opt->mat7_ob, METH_M);
+            if (qo > q) q = qo;
+            if (qb > q) q = qb;
+        }
     }
     return q;
 }

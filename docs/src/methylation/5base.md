@@ -70,6 +70,70 @@ Methylated CpG calls were unbiased on all four strand × read combinations
 (OT/OB × R1/R2), and 0.07 % of non-CpG calls read as methylated, which is the
 simulated sequencing-error floor.
 
+## Choosing `--meth-context cpg`
+
+5-base converts only methylated cytosines, and in mammalian somatic tissue
+those are almost all at CpG. Under the default `--meth-context all` the aligner
+still tolerates a conversion at every `C`, so every candidate locus that
+differs from the read only by C/T scores close to the true one and `MAPQ`
+drops. `--meth-context cpg` tolerates a conversion only at a CpG
+([model](conversion.md#cpg-context---meth-context-cpg)); a C→T at a non-CpG `C`
+(off-target conversion, damage, a variant) costs a mismatch.
+
+```bash
+bwa-mem3 mem --meth=5base --meth-context cpg -t 16 ref.fa R1.fq.gz R2.fq.gz
+```
+
+Measured on simulated directional 5-base reads from hg38 chr22, with
+chemistry noise modelled on real 5-base libraries (1.2 % off-target conversion
+of unmethylated C in every context, 3 % failed conversion of methylated CpG).
+Correct placement / wrong placement, primary records:
+
+| set | `MAPQ` | `all` | `cpg` | CpG-only reference |
+|---|---|---|---|---|
+| 2×150 bp, 338,790 reads | ≥ 20 | 97.43 / 0.05 % | **97.59 / 0.06 %** | 97.84 / 0.06 % |
+| 2×150 bp | any | 98.73 / 1.27 % | 98.74 / 1.26 % | 98.81 / 1.19 % |
+| 20–40 bp SE, `-k 14 -T 18`, 228,683 reads | ≥ 20 | 74.26 / 0.13 % | **76.24 / 0.18 %** | 75.52 / 0.08 % |
+| 20–40 bp SE | any | 84.74 / 13.54 % | 84.21 / 13.12 % | 85.80 / 12.46 % |
+
+The CpG-only reference is the same reads with every true conversion undone
+and the off-target noise kept, aligned without `--meth`. On 2×150 bp reads it
+bounds `cpg`. On 20–40 bp reads it does not bound it at `MAPQ` ≥ 20: the
+`--meth` pipeline assigns `MAPQ` differently from plain alignment (`cpg` is
+above the reference even on reads with no conversions), so compare the SE
+`MAPQ` ≥ 20 cells between `all` and `cpg` only.
+
+At `MAPQ` ≥ 20 `cpg` gains at every conversion load and on reads carrying a
+real SNV, in both sets. On 2×150 bp reads the gain is confident placements
+(any-`MAPQ` placement is unchanged), and it closes about 40 % of the gap to the
+reference. On 20–40 bp reads it adds 2 points at `MAPQ` ≥ 20, with a higher
+wrong rate (0.13 → 0.18 %), but places 0.5 points fewer reads overall: when a
+20–29 bp read carries an off-target conversion inside its seed, that
+conversion now costs a mismatch, which can drop the read below `-T`.
+Hypermethylated short reads stay weak under both modes (20–29 bp with 3+
+conversions: 48.0 % for `cpg` at `MAPQ` ≥ 20 against 66.6 % for the
+reference), mostly because `neutral` scores a free conversion `0` rather than
+a match; with `--meth-scoring genomic` that stratum reaches 61.8 % under
+`cpg`. `XM:Z` is the same in both modes (Z-count equal to the read's true CpG
+conversions for 99.97 % of correctly placed 2×150 reads).
+
+`cpg` costs run time: on the 2×150 bp set, +5–7 % wall on x86 (AVX-512BW,
+clang 19.1.7, 16 threads) and +7–9 % on arm64 (Apple M2 Max, NEON, clang 21,
+8 threads), split between the pairing stage (mate rescue, CIGAR and score
+regeneration) and banded extension.
+
+**The default stays `all`.** These measurements cover chr22 only. A later
+release may make `cpg` the 5-base default once the same comparison holds on the
+full genome, overall and on the hypermethylated and SNV-carrying reads.
+The gain is modest on standard reads (+0.16 points at `MAPQ` ≥ 20 on
+2×150 bp), and on 20–40 bp reads it trades more confident placements for
+fewer placements overall. `cpg` is worth it for mammalian 5-base libraries
+when the downstream analysis filters on `MAPQ` (for example `MAPQ` ≥ 20), most
+of all for short fragments. Keep `all` where non-CpG methylation is real
+biology (see [TAPS](taps.md#--meth-context-stays-all-for-taps)), where recall
+of very short fragments at any `MAPQ` matters most, or where the extra run
+time is not worth a small gain.
+
 ## Before aligning
 
 - **Trim the UMI cycles.** 5-base reads start with a 7-base UMI and one skipped

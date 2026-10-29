@@ -157,6 +157,12 @@ Methylation (--meth) options:
                  NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS
                  or 5-base data without =taps or =5base inverts every
                  methylation call.
+   --meth-context all|cpg
+                 where a conversion is free. all (default): at every C, as the
+                 chemistry converts it. cpg: only at a CpG, so a C->T at a
+                 non-CpG C scores as a mismatch. Needs --meth=taps or --meth=5base
+                 (EM-seq/bisulfite convert every unmethylated C) and a --meth-scoring
+                 other than collapsed.
    --meth-scoring collapsed|genomic|neutral
                  scoring mode. Default depends on chemistry: collapsed for
                  --meth/--meth=emseq, neutral for --meth=taps|5base (their
@@ -172,7 +178,19 @@ Methylation (--meth) options:
                  variants counted in NM as in genomic; -B 4).
                  In genomic/neutral a real variant in the conversion direction
                  itself (C->T at a reference C) is indistinguishable from a
-                 conversion and is not counted in NM.
+                 conversion and is not counted in NM; under --meth-context cpg
+                 only at a CpG (a C->T at any other C counts).
+   --meth-tags SPEC
+                 which Bismark tags to emit: 'all' (default), 'none', a
+                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).
+                 Comma-separated, NOT space-separated (a second word becomes
+                 the reference). An exclusion may be written ^XM or -XM; prefer
+                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).
+                 Unselected tags are not computed. XM:Z is a read-length string
+                 and dominates the BAM's aux payload; '^XM' drops it for callers
+                 that recompute calls from the reference and the read.
+                 Keep XM for Bismark-family tools (bismark_methylation_extractor)
+                 and other callers that read the per-base calls from XM:Z.
    --meth-seed-prune[=spec30|baseline|off]
                  prune the 3-letter alphabet's short, repetitive spurious SMEMs
                  before SA resolution: ~30% faster --meth at ~0 accuracy cost
@@ -183,17 +201,6 @@ Methylation (--meth) options:
                  off: restore the un-pruned seeding (byte-identical). NOT
                  byte-identical vs off. Env BWAMEM3_METH_SEED_PRUNE (off|spec30|
                  baseline) overrides this flag for A/B testing.
-   --meth-tags SPEC
-                 which Bismark tags to emit: 'all' (default), 'none', a
-                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).
-                 Comma-separated, NOT space-separated (a second word becomes
-                 the reference). An exclusion may be written ^XM or -XM; prefer
-                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).
-                 Unselected tags are not computed. XM:Z is a read-length string
-                 and dominates the BAM's aux payload; '^XM' drops it for callers
-                 that recompute from the reference (MethylDackel, biscuit).
-                 Keep XM for Bismark-family tools (bismark_methylation_extractor,
-                 methylKit, methtuple, DMRfinder, epialleleR).
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --chimera-qc

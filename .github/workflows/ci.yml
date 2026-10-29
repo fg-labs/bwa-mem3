@@ -2051,10 +2051,24 @@ jobs:
                    meth_seed_unpacked_ref_not_loaded \
                    meth_rescue_batched_identical meth_rescue_strand \
                    meth_collapsed_scoring \
-                   meth_tags meth_flag_footguns meth_5base_alias \
-                   meth_seed_prune meth_nul_base; do
+                   meth_tags meth_flag_footguns meth_5base_alias meth_context_cli \
+                   meth_context_cpg meth_seed_prune meth_nul_base; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
+
+      - name: --meth-context identity (generated fixtures)
+        # all == default, cpg identical across the tiers the runner has and with
+        # batched rescue on and off, MAPQ/AS invariants. No base binary in CI, so
+        # the no-meth identity leg reports SKIP:.
+        run: |
+          command -v samtools >/dev/null 2>&1 \
+            || { echo "FAIL: samtools not on PATH; meth_context_identity would SKIP"; exit 1; }
+          command -v mawk >/dev/null 2>&1 \
+            || { echo "FAIL: mawk not on PATH; meth_context_identity would SKIP"; exit 1; }
+          command -v python3 >/dev/null 2>&1 \
+            || { echo "FAIL: python3 not on PATH; meth_context_identity would SKIP"; exit 1; }
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/meth_context_identity.sh
 
       - name: ccache statistics
         if: always()

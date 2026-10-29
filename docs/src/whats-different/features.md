@@ -51,6 +51,20 @@ rather than in collapsed space — so it is not byte-for-byte identical to bwame
 output. Stacks on PR #12 (`--bam`). See the
 [Methylation Reference](../methylation/overview.md) for full details.
 
+## `--meth-context {all|cpg}` CpG-only conversion scoring
+
+*Introduced in [PR #663](https://github.com/fg-labs/bwa-mem3/pull/663).*
+
+**Default: `all`**, for every chemistry: a conversion is free at every
+reference `C`, and alignment records are byte-identical to a run without the
+option (only the `@PG` `CL:` record differs). The opt-in `cpg` frees a
+conversion only at a CpG, so a C→T at a non-CpG `C` scores as a mismatch and
+counts toward `NM`; `XM:Z` is unchanged. `cpg` requires `--meth=taps` or
+`--meth=5base` and a `--meth-scoring` other than `collapsed`. See
+[Flags → --meth-context](../methylation/flags.md#--meth-context-allcpg) and
+[Illumina 5-base → Choosing --meth-context cpg](../methylation/5base.md#choosing---meth-context-cpg)
+for the accuracy and run-time measurements.
+
 ## `--meth-seed-prune` bisulfite seed prune
 
 *Introduced in [PR #441](https://github.com/fg-labs/bwa-mem3/pull/441).*

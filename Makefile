@@ -511,7 +511,7 @@ OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/compat_target.o \
 			src/FMI_search.o src/fmi_seed_api.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
 			src/bwamem_extra.o src/kopen.o src/bam_writer.o src/meth_bam.o \
-			src/meth_xm.o \
+			src/meth_xm.o src/meth_opts.o src/meth_model.o \
 			src/packed_text.o src/fm_index_writer.o src/index_prelude.o \
 			src/system.o src/libsais_build.o \
 			src/bwa_shm.o src/bwa_hugepages.o src/bwa_thp.o src/simd_dispatch.o \

@@ -70,6 +70,25 @@ inflated edit distance. An explicit `--meth-scoring` always overrides the defaul
 Illumina 5-base libraries take the same path; see
 [Illumina 5-base libraries](5base.md).
 
+## `--meth-context` stays `all` for TAPS
+
+`--meth=taps` accepts `--meth-context cpg`, which frees a conversion only at a
+CpG ([model](conversion.md#cpg-context---meth-context-cpg)), but the default
+is `all` and is not planned to change. The evidence for `cpg` is
+5-base-specific ([measurements](5base.md#choosing---meth-context-cpg)), and
+TAPS differs from 5-base in three ways that matter here:
+
+- **Off-target conversion is higher**, about 2 % of unmethylated C on real
+  mouse ES-cell TAPS data versus 0.4–0.5 % by WGBS on the same sample. Under
+  `cpg` each one outside a CpG costs a mismatch.
+- **Typical TAPS samples carry real non-CpG methylation** (ES cells, brain).
+  `cpg` scores every such conversion as a mismatch.
+- **TAPS converts 5hmC as well as 5mC**, which the 5-base measurements do not
+  model.
+
+Choose `cpg` for TAPS only after checking those on your own samples, for
+example with the non-CpG rate in `XM:Z`, which `cpg` leaves unchanged.
+
 ## Downstream methylation calling
 
 **Most extractors assume bisulfite polarity.** MethylDackel reports the
