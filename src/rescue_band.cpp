@@ -82,7 +82,10 @@ bool rescue_band_enabled()
  * lanes; pruning and banded pass 1 (whose cost model compares a band against kswv on the same rows,
  * take_pass1) are unchanged there. The single-thread band harness over WGS dumps still shows a
  * small per-job pass-0 win at that tier (3.79 -> 3.71 us at 85), so this is a whole-run finding to
- * revisit with a 64-lane band kernel. On NEON the default is 100: since the two-row band kernel
+ * revisit with a 64-lane band kernel. Re-measured after the two-row u8 kswv sweep (#646) made a hull
+ * cell cheaper still (Zen 4, wgs-5M, -t 16, 5 interleaved reps, wall vs 0): 40 +0.07 %, 85 -0.06 %,
+ * 100 -0.08 %, all inside the 0.6 s round spread, the band pass spending about what it saved in kswv
+ * pass 0 (1.0 / 4.1 / 5.6 thread-s), so 0 stays. On NEON the default is 100: since the two-row band kernel
  * (rb_dp_wave2) a band cell costs no more than a kswv hull cell, and in whole runs on Graviton4
  * (-t 16, interleaved reps) 100 beat 85 on wgs-5M by 0.7 % wall (3 reps; 120 and 150 within
  * 0.15 % of 100, 60 worse than 85) and on wes-5M by 0.5 % (3 reps). The AVX2 tier keeps 85: on
