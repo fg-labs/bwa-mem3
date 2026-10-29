@@ -15,7 +15,8 @@
  * also lets the pure-backward SMEM phase skip maintaining the (dead) l-chain
  * (see backwardExt_konly in FMI_search.h), and the lockstep driver's
  * unique-match text compare (ls_s1_compare in FMI_search.cpp) leave `l` at its
- * last forward-step value.
+ * last forward-step value, which the third-pass seed the lockstep bwtSeed
+ * driver takes from a BsdFirstWalk record then carries too.
  *
  * Precondition: identical SMEMs are adjacent in the array (guaranteed after
  * smem_sort_rid_mn's rid + (m, n) sort in mem_collect_smem). */

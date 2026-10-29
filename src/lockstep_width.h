@@ -249,8 +249,11 @@ void bwa3_init_smem_lockstep_width(const void *base, int64_t n_blocks,
  * there rests on the driver's SMEM-order parity design (pinned by the parity
  * harness and the driver-identity regression), not on a measurement there.
  *
- * Output is byte-identical either way (same SMEM emission order; the lockstep
- * parity harness pins it) -- this is a scheduling choice, never a result one. */
+ * Output is byte-identical either way: both drivers emit the same
+ * (rid, m, n, k, s) stream in the same order (the lockstep parity harness pins
+ * it), and the SAM output matches. The one field that can differ is l of a
+ * lockstep seed taken from a BsdFirstWalk record (m = 0), which may be stale
+ * and is never read. This is a scheduling choice, never a result one. */
 
 /* Runtime switch read by mem_collect_smem: nonzero selects the lockstep driver,
  * zero the scalar one. Initialized to the compiled default (on) so a binary that
