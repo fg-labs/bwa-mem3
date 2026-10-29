@@ -410,6 +410,70 @@ TEST_CASE("unit/ungapped_fastpath: the run-length walk equals the per-base walk 
     REQUIRE(n == 4000);
 }
 
+TEST_CASE("unit/ungapped_fastpath: the run-length walk equals the per-base walk at word and length boundaries"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    // The run walk visits the bitmap's set bits one 64-bit word at a time, then scores
+    // the run after the last mismatch up to N. Pin the boundaries the random masks above
+    // only reach by chance: representative word-boundary lengths (N a multiple of 64, one
+    // past or short of a word, the full bitmap FP_N_MAX), mismatches at bit 0 / 63 of a
+    // word and at N - 1 (empty final run), no mismatches, every base a mismatch, and a
+    // score that reaches 0 with set bits left in the same word, and on a word's last set
+    // bit with set bits left only in a later word. Positions past N are clipped, so short
+    // N runs a truncated version of each pattern.
+    const int lengths[] = {1, 2, 63, 64, 65, 127, 128, 129, 191, 192, 448, FP_N_MAX - 1, FP_N_MAX};
+    struct Sc { int a, b, h0; };
+    const Sc scs[] = {{1, 4, 30}, {1, 4, 3}, {1, 0, 1}, {2, 3, 60}, {1, 6, 1}};
+    constexpr int kPatterns = 8;
+    int n = 0, n_died_same_word = 0, n_died_later_word = 0, n_empty_last_run = 0;
+    for (const int N : lengths) {
+        for (int pat = 0; pat < kPatterns; ++pat) {
+            uint64_t mis[FP_MIS_NWORDS] = {0};
+            auto set = [&](int j) { if (j >= 0 && j < N) mis[j >> 6] |= 1ULL << (j & 63); };
+            switch (pat) {
+            case 0: break;                                              // no mismatches
+            case 1: for (int j = 0; j < N; ++j) set(j); break;          // every base
+            case 2: set(N - 1); break;                                  // only the last base
+            case 3: for (int w = 0; w * 64 < N; ++w) { set(w * 64); set(w * 64 + 63); } break;
+            case 4: set(N / 2); set(N - 1); break;                      // last run empty
+            case 5: for (int j = 0; j < 12; ++j) set(2 * j); set(N - 1); break;  // dies early
+            case 6: for (int j = 60; j < 70; ++j) set(j); set(N - 2); break;     // straddles a word
+            case 7: set(0); set(N - 1); break;   // N > 64: word 0's only bit, then a later word
+            }
+            int last = -1;
+            for (int j = 0; j < N; ++j)
+                if ((mis[j >> 6] >> (j & 63)) & 1ULL) last = j;
+            for (const Sc &s : scs) {
+                int ms, mi, cur, rms, rmi, rcur;
+                ungapped_walk_mis(mis, N, s.h0, s.a, s.b, &ms, &mi, &cur);
+                ungapped_walk_mis_perbase(mis, N, s.h0, s.a, s.b, &rms, &rmi, &rcur);
+                CAPTURE(N); CAPTURE(pat); CAPTURE(s.a); CAPTURE(s.b); CAPTURE(s.h0);
+                REQUIRE(ms == rms);
+                REQUIRE(mi == rmi);
+                REQUIRE(cur == rcur);
+                if (last == N - 1 && rcur > 0) ++n_empty_last_run;
+                if (rcur == 0) {   // the walk froze: was a later mismatch left unvisited?
+                    int c = s.h0, die = -1;
+                    for (int j = 0; j < N && die < 0; ++j) {
+                        const bool m = (mis[j >> 6] >> (j & 63)) & 1ULL;
+                        c = m ? (c - s.b < 0 ? 0 : c - s.b) : c + s.a;
+                        if (c == 0) die = j;
+                    }
+                    if (die >= 0 && die < last) {
+                        const uint64_t above = (die & 63) == 63 ? 0 : mis[die >> 6] >> ((die & 63) + 1);
+                        if (above) ++n_died_same_word;
+                        else       ++n_died_later_word;
+                    }
+                }
+                ++n;
+            }
+        }
+    }
+    REQUIRE(n == (int)(sizeof(lengths) / sizeof(lengths[0]) * kPatterns * (sizeof(scs) / sizeof(scs[0]))));
+    REQUIRE(n_died_same_word > 0);
+    REQUIRE(n_died_later_word > 0);
+    REQUIRE(n_empty_last_run > 0);
+}
+
 TEST_CASE("unit/ungapped_fastpath: a TIGHT result scores the pair like the byte walk"
           * doctest::test_suite("unit/ungapped_fastpath")) {
     // Too many mismatches for a HIT on a short pair gives TIGHT, whose band is derived
