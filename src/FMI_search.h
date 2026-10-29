@@ -378,11 +378,36 @@ class FMI_search: public indexEle
      * --compat=bwa-mem2; see compat_target_t::sa_sentinel_drop_offset). */
     int64_t call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
                           int drop_sentinel_offset = 0);
+    /* trust_s1_tag: smemArray comes from bwa-mem3's seeding path
+     * (mem_collect_smem), so an s == 1 SMEM carrying the lockstep driver's
+     * text-position tag in info is written from it without an LF walk
+     * (FMI_search.cpp, ls_s1_sa_tag); used only at drop_sentinel_offset 0.
+     * External callers (the fmi_seed_sa_prefetch facade) leave it false. */
     void get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                  int64_t *coordCountArray, int64_t count,
                                  const int32_t max_occ, int tid, int64_t &id_,
-                                 int drop_sentinel_offset = 0);
-    
+                                 int drop_sentinel_offset = 0,
+                                 bool trust_s1_tag = false);
+    /* One read's SMEMs a[0..n), sorted by (m, n) as mem_collect_smem sorts
+     * them: an untagged s == 1 SMEM that lies inside a tagged one gives it the
+     * same tag (FMI_search.cpp, ls_s1_sa_tag), so get_sa_entries_prefetch
+     * writes its coordinate without an LF walk too. */
+    static void s1_tag_contained(SMEM *a, int64_t n);
+    /* s1_tag_contained over each read's run of a[0..n), an array sorted by rid
+     * and then (m, n), as mem_collect_smem sorts it (and calls this). */
+    static inline void s1_tag_contained_reads(SMEM *a, int64_t n)
+    {
+        for (int64_t b0 = 0, b1; b0 < n; b0 = b1) {
+            for (b1 = b0 + 1; b1 < n && a[b1].rid == a[b0].rid; b1++) {}
+            if (b1 - b0 > 1)
+                s1_tag_contained(&a[b0], b1 - b0);
+        }
+    }
+    /* True when the lockstep SMEM driver compares unique matches with the
+     * reference text and so can tag SMEMs (the index's pac is loaded and
+     * matches the BWT text length). When false no SMEM carries a tag. */
+    bool s1_text_available() const;
+
     int64_t reference_seq_len;
     int64_t sentinel_index;
     int64_t sa_compx;        // SA sample shift; sample rate 1/(1<<sa_compx). Loaded per-index.
@@ -501,8 +526,10 @@ private:
          * in the parity harness (test/smem_lockstep_parity_test.cpp); both have
          * been updated to drop `l`, so an emitted seed's identity is (rid,m,n,k,s).
          * NOTE this means the l this phase emits is intentionally stale (frozen at
-         * its forward-phase value); it must never be resurrected as an observable
-         * field without also restoring the l-chain here. Dropping the l-chain
+         * its forward-phase value); so is the l of every seed the forward phase's
+         * unique-match text compare finishes (ls_s1_compare in FMI_search.cpp
+         * never steps l). It must never be resurrected as an observable field
+         * without also restoring the l-chain here and in that compare. Dropping the l-chain
          * removes the sentinel test, the l cumulation, and (on x86) six of eight
          * popcounts — same two cache lines read, far fewer instructions.
          * Byte-identical in observable (SAM) output.
@@ -560,7 +587,12 @@ private:
                       const uint8_t *enc_qdb);
     void ls_prefetch_cp_occ(const BatchSlot *s);
     void ls_prefetch_cp_occ_t1(const BatchSlot *s);
-    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb);
+    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
+                                 bool s1_text);
+    inline void ls_prefetch_sa_row(int64_t p) const;
+    void ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac);
+    void ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
+                       const uint8_t *pac, int64_t l_pac);
     void ls_prepare_backward(BatchSlot *s);
     void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,

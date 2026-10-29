@@ -921,6 +921,7 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
         if(a < 4)
         {
             SMEM smem;
+            smem.info = 0;   // carries no SA tag (ls_s1_sa_tag)
             smem.rid = rid;
             smem.m = x;
             smem.n = x;
@@ -1109,8 +1110,105 @@ enum LockstepPhase : uint8_t {
     PH_FWD      = 0,  // forward extension inner loop active
     PH_BWD_INIT = 1,  // between-phases housekeeping pending
     PH_BWD      = 2,  // backward search outer loop active
-    PH_DONE     = 3   // slot finished (ready: match_buf not yet retired) or idle
+    PH_DONE     = 3,  // slot finished (ready: match_buf not yet retired) or idle
+    PH_S1_LF    = 4,  // unique forward match: LF walk from k to a sampled SA row
+    PH_S1_CMP   = 5   // unique forward match: compare the rest of the read with the text
 };
+
+/* A phase-1 forward walk that reaches a unique match (s == 1) goes on comparing
+ * the read with the reference text only when at least this many read bases are
+ * left: resolving the match's text position costs an LF walk to a sampled SA
+ * row (the SA is sampled by row, so about 7 steps on average at the default
+ * 1 sample in 8 rows; sa_compx is per index) and a pac read. */
+static constexpr int32_t LS_S1_MIN_REST = 16;
+
+/* The text position of a unique forward match, kept in SMEM.info (a field
+ * nothing else reads) for SA resolution. When ls_s1_lf_step resolves
+ * v = SA[k] for a walk that started at start_pos (the match's m), it stores
+ * q = v - start_pos with bit 63 set. Every SMEM the walk emits from that
+ * entry, the entry itself or a backward extension of it, has s == 1 and
+ * SA[k] = q + m: a backward step that keeps s == 1 moves the one suffix's
+ * start a base left (SA[LF(k)] = SA[k] - 1) as it moves m a base left.
+ * get_sa_entries_prefetch then writes the coordinate q + m instead of walking
+ * k to a sampled row a second time, when its caller trusts the tag (see
+ * trust_s1_tag there). mem_collect_smem then passes the tag on by containment
+ * (s1_tag_contained). Every other SMEM the seeding path makes has info 0. */
+static constexpr uint64_t LS_S1_SA_TAG = 1ULL << 63;
+static inline uint64_t ls_s1_sa_tag(int64_t q)
+{
+    return LS_S1_SA_TAG | ((uint64_t)q & ~LS_S1_SA_TAG);
+}
+static inline int64_t ls_s1_sa_q(uint64_t info)
+{
+    return (int64_t)(info << 1) >> 1;   // q, sign-extended from bit 62
+}
+/* A unique match carrying the tag, and its one SA coordinate (q + m). */
+static inline bool ls_s1_tagged(const SMEM &smem)
+{
+    return smem.s == 1 && (smem.info & LS_S1_SA_TAG) != 0;
+}
+static inline int64_t ls_s1_sa_coord(const SMEM &smem)
+{
+    return ls_s1_sa_q(smem.info) + (int64_t)smem.m;
+}
+
+/* An untagged s == 1 SMEM U of a read that lies inside a tagged SMEM T of the
+ * same read (m_T <= m_U and n_U <= n_T) takes T's info unchanged: read[m_U..n_U]
+ * occurs once in the text, and T's one occurrence, at q_T + m_T, holds it at
+ * q_T + m_U, so SA[k_U] = q_T + m_U, the relation the tag states. Any T that
+ * contains U gives the same q. a[0..n) is one read's SMEMs sorted by (m, n)
+ * (mem_collect_smem's per-read sort), so one forward pass keeps, of the tagged
+ * SMEMs before i, the one with the largest n (all have m_T <= m_i). A U whose
+ * only container has the same m sorts before it (n_U <= n_T), so a tagged T
+ * also tags the untagged s == 1 SMEMs of its m run that precede it. Containment
+ * is transitive, so SMEMs tagged here need not join the running maximum.
+ * The common case (an untagged SMEM) takes no data-dependent branch.
+ * Every step above relies on the one-read, (m, n)-sorted precondition: an
+ * unsorted or mixed-read array would hand a tag to an SMEM that is not inside
+ * its source and so write a wrong coordinate without any other symptom. The
+ * precondition is therefore checked (one predictable compare per SMEM). */
+void FMI_search::s1_tag_contained(SMEM *a, int64_t n)
+{
+    int64_t best_n = -1;      // largest n_T over the tagged s == 1 SMEMs before i
+    uint64_t best_info = 0;
+    int64_t run = 0;          // first index of i's m run
+    uint32_t m_prev = UINT32_MAX;
+    for (int64_t i = 0; i < n; i++) {
+        const uint64_t info = a[i].info;
+        const uint32_t m = a[i].m;
+        const bool s1 = a[i].s == 1;
+        const int64_t ni = (int64_t)a[i].n;
+        if (__builtin_expect(i != 0 && !(a[i].rid == a[0].rid &&
+                                         (m > m_prev || (m == m_prev && a[i].n >= a[i - 1].n))), 0))
+            err_fatal(__func__, "SMEMs must be one read's, sorted by (m, n), but SMEM %lld "
+                      "(rid %u, m %u, n %u) follows SMEM %lld (rid %u, m %u, n %u) and the "
+                      "run started at rid %u", (long long)i, a[i].rid, a[i].m, a[i].n,
+                      (long long)(i - 1), a[i - 1].rid, a[i - 1].m, a[i - 1].n, a[0].rid);
+        run = (m == m_prev) ? run : i;
+        m_prev = m;
+        if (s1 & ((info & LS_S1_SA_TAG) != 0)) {
+            for (int64_t j = run; j < i; j++)
+                if (a[j].s == 1 && (a[j].info & LS_S1_SA_TAG) == 0) a[j].info = info;
+            if (ni > best_n) {
+                best_n = ni;
+                best_info = info;
+            }
+        } else {
+            a[i].info = (s1 & (ni <= best_n)) ? best_info : info;
+        }
+    }
+}
+
+/* The unique-match text compare (ls_s1_*), and with it every SA tag, needs the
+ * reference this index was built from: its pac, loaded with the index unless
+ * the caller skipped it (--meth loads the seed index without), and of the
+ * length the index's text implies (forward + reverse complement + sentinel). */
+bool FMI_search::s1_text_available() const
+{
+    return idx != nullptr && idx->pac != nullptr && idx->bns != nullptr &&
+           2 * idx->bns->l_pac + 1 == reference_seq_len;
+}
+
 
 // Per-thread cache for the lockstep SMEM driver's prev[]/match_buf[]
 // buffers. RAII wrapper exists so the buffers are released at thread
@@ -1163,6 +1261,11 @@ struct FMI_search::BatchSlot {
     // by max_readlength).
     SMEM    *prev;
     SMEM    *match_buf;
+
+    // Unique-match text compare (PH_S1_LF, PH_S1_CMP): the LF walk's current
+    // row and step count, then (PH_S1_CMP) the text position of read base j.
+    int64_t lf_row;
+    int64_t lf_off;
 };
 
 void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
@@ -1257,6 +1360,7 @@ void FMI_search::ls_init_slot(BatchSlot *s,
     int32_t x = s->start_pos;
     uint8_t a = enc_qdb[s->offset + x];
     if (a < 4) {
+        s->smem.info = 0;   // no text position yet (ls_s1_sa_tag)
         s->smem.rid = s->rid;
         s->smem.m   = x;
         s->smem.n   = x;
@@ -1276,8 +1380,11 @@ void FMI_search::ls_init_slot(BatchSlot *s,
 // Mirrors the inner j-loop body of the scalar getSMEMsOnePosOneThread
 // (src/FMI_search.cpp — the for(j = x+1; j < readlength; j++) loop).
 // On the step that exits forward-ext (end-of-read, non-ACGT at j, or
-// s < min_intv), transitions phase to PH_BWD_INIT.
-void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
+// s < min_intv), transitions phase to PH_BWD_INIT. When s1_text is set and the
+// step leaves a unique match (s == 1) with at least LS_S1_MIN_REST read bases
+// to go, transitions to PH_S1_LF instead (ls_s1_lf_step, ls_s1_compare).
+void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
+                                         bool s1_text)
 {
     if (s->j >= s->readlength) {
         // Ran off the end of the read; keep the still-valid smem if any.
@@ -1320,6 +1427,18 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
 
     s->smem = newSmem;
     s->j++;
+    /* A unique match (s == 1; newSmem.s >= min_intv above, so min_intv <= 1)
+     * keeps its k on every further forward step: the one suffix it names is
+     * either extended or dropped. So instead of stepping the rest of the read
+     * one base at a time, resolve that suffix's text position from k and
+     * compare the read with the text (ls_s1_lf_step, ls_s1_compare). */
+    if (s1_text && newSmem.s == 1 && s->readlength - s->j >= LS_S1_MIN_REST) {
+        s->lf_row = newSmem.k;
+        s->lf_off = 0;
+        s->phase  = PH_S1_LF;
+        ls_prefetch_sa_row(newSmem.k);
+        return;
+    }
 #ifdef ENABLE_PREFETCH
     /* The NEXT forward step swaps k<->l (see smem_ above) before calling
      * backwardExt, which reads sp = smem.k and ep = smem.k + smem.s. After the
@@ -1332,6 +1451,161 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb)
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
+}
+
+// Prefetch what the next call_one_step on row p reads: the SA sample lines
+// for a sampled row, else the row's checkpoint block (the same selection as
+// get_sa_entries_prefetch's prefetch_row). A hint only.
+inline void FMI_search::ls_prefetch_sa_row(int64_t p) const
+{
+#ifdef ENABLE_PREFETCH
+    uintptr_t m = (uintptr_t)0 - (uintptr_t)((p & sa_compx_mask) == 0);
+    BWA_OPAQUE(m);
+    const uintptr_t cp = (uintptr_t)&cp_occ[p >> CP_SHIFT];
+    const uintptr_t ms = (uintptr_t)&sa_ms_byte[p >> sa_compx];
+    const uintptr_t ls = (uintptr_t)&sa_ls_word[p >> sa_compx];
+    _mm_prefetch((const char *)((ms & m) | (cp & ~m)), _MM_HINT_T0);
+    _mm_prefetch((const char *)((ls & m) | (cp & ~m)), _MM_HINT_T0);
+#else
+    (void)p;
+#endif
+}
+
+// The bidirectional index's text is the forward reference (pac, l_pac bases)
+// followed by its reverse complement (libsais_build.cpp, write_doubled_pac).
+// ls_text_match compares read bases q[j..rl) with text bases t.. and returns
+// the first j at which they differ or the text ends (t reaches 2 * l_pac), or
+// rl. A non-ACGT read base (> 3) never equals a text base. The aligned bodies
+// compare 8 bases at a time: a pac byte expands through a table to its four
+// bases, one per byte in text order (forward), or complemented in reverse
+// order (the reverse-complement half, read from the end of pac backwards).
+struct LsPacLut {
+    uint32_t fwd[256];
+    uint32_t rev[256];
+    constexpr LsPacLut() : fwd(), rev() {
+        for (int b = 0; b < 256; b++) {
+            uint32_t f = 0, r = 0;
+            for (int i = 0; i < 4; i++) {
+                const uint32_t base = (uint32_t)(b >> (6 - 2 * i)) & 3;  // _get_pac order
+                f |= base << (8 * i);
+                r |= (3 - base) << (8 * (3 - i));
+            }
+            fwd[b] = f;
+            rev[b] = r;
+        }
+    }
+};
+static constexpr LsPacLut ls_pac_lut{};
+
+static inline int32_t ls_text_match(const uint8_t *q, int32_t j, int32_t rl,
+                                    const uint8_t *pac, int64_t l_pac, int64_t t)
+{
+    const int64_t tend = 2 * l_pac;
+    while (j < rl && t < l_pac) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if ((t & 3) == 0) {
+            while (j + 8 <= rl && t + 8 <= l_pac) {
+                uint64_t r;
+                memcpy(&r, q + j, 8);
+                const uint8_t *pb = pac + (t >> 2);
+                const uint64_t x = r ^ ((uint64_t)ls_pac_lut.fwd[pb[0]] |
+                                        ((uint64_t)ls_pac_lut.fwd[pb[1]] << 32));
+                if (x != 0) return j + (int32_t)(__builtin_ctzll(x) >> 3);
+                j += 8;
+                t += 8;
+            }
+            if (!(j < rl && t < l_pac)) break;
+        }
+#endif
+        if (q[j] != (uint8_t)_get_pac(pac, t)) return j;
+        j++;
+        t++;
+    }
+    while (j < rl && t < tend) {
+        const int64_t u = tend - 1 - t;   // pac base whose complement is text base t
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+        if ((u & 3) == 3) {
+            int64_t uu = u;
+            while (j + 8 <= rl && uu >= 7) {
+                uint64_t r;
+                memcpy(&r, q + j, 8);
+                const uint8_t *pb = pac + (uu >> 2);
+                const uint64_t x = r ^ ((uint64_t)ls_pac_lut.rev[pb[0]] |
+                                        ((uint64_t)ls_pac_lut.rev[pb[-1]] << 32));
+                if (x != 0) return j + (int32_t)(__builtin_ctzll(x) >> 3);
+                j += 8;
+                uu -= 8;
+            }
+            t = tend - 1 - uu;
+            if (!(j < rl && t < tend)) break;
+            if (q[j] != (uint8_t)(3 - _get_pac(pac, uu))) return j;
+            j++;
+            t++;
+            continue;
+        }
+#endif
+        if (q[j] != (uint8_t)(3 - _get_pac(pac, u))) return j;
+        j++;
+        t++;
+    }
+    return j;
+}
+
+// One pass of a unique match's SA walk: one LF step from lf_row toward a
+// sampled row, or, on a sampled (or the sentinel) row, the match's text
+// position. call_one_step is the SA resolver's own step, with the exact
+// sentinel offset (drop_sentinel_offset 0) under every --compat, since the
+// position here locates text, not a reported coordinate.
+void FMI_search::ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac)
+{
+    int64_t v;
+    if (call_one_step(s->lf_row, v, s->lf_off, 0) == 0) {
+        s->lf_row = v;
+        ls_prefetch_sa_row(v);
+        return;
+    }
+    // v = SA[k], where read[m..n] starts in the text; read base j = n + 1
+    // faces text base v + (j - m). Keep v for SA resolution (ls_s1_sa_tag);
+    // m is still the walk's start_pos here.
+    s->smem.info = ls_s1_sa_tag(v - (int64_t)s->smem.m);
+    const int64_t t = v + (int64_t)(s->j - (int32_t)s->smem.m);
+    s->lf_row = t;
+    s->phase  = PH_S1_CMP;
+#ifdef ENABLE_PREFETCH
+    // The bases still to compare span at most a couple of pac lines: hint the
+    // first and the last (clamped to the text; the walk stops at its end).
+    const int64_t tend = 2 * l_pac;
+    int64_t t_last = t + (int64_t)(s->readlength - s->j) - 1;
+    if (t_last > tend - 1) t_last = tend - 1;
+    const int64_t t0 = t < tend ? t : tend - 1;
+    const int64_t b0 = (t0 < l_pac ? t0 : tend - 1 - t0) >> 2;
+    const int64_t b1 = (t_last < l_pac ? t_last : tend - 1 - t_last) >> 2;
+    _mm_prefetch((const char *)&pac[b0], _MM_HINT_T0);
+    _mm_prefetch((const char *)&pac[b1], _MM_HINT_T0);
+#else
+    (void)l_pac;
+#endif
+}
+
+// Finish a unique match's forward walk by comparing read bases j.. with text
+// bases lf_row.., and take the exit the base-at-a-time walk would take at the
+// first base that ends it: the read's end (next_x stays readlength), a
+// non-ACGT read base (next_x = j + 1), or a base the text does not continue
+// with, the text's end (the sentinel) included (next_x = j). Every exit keeps
+// the match (s = 1 >= min_intv) as the walk's last prev entry, with n = j - 1;
+// k and s are those the walk would end with. l is left stale, as the backward
+// phase's backwardExt_konly leaves it: nothing reads l after seeding.
+void FMI_search::ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
+                               const uint8_t *pac, int64_t l_pac)
+{
+    const uint8_t *q = enc_qdb + s->offset;
+    const int32_t rl = s->readlength;
+    const int32_t j = ls_text_match(q, s->j, rl, pac, l_pac, s->lf_row);
+    const int32_t next_x = j >= rl ? rl : q[j] > 3 ? j + 1 : j;
+    s->smem.n = j - 1;
+    s->next_x = next_x;
+    s->prev[s->numPrev++] = s->smem;
+    s->phase = PH_BWD_INIT;
 }
 
 // Between-phases housekeeping: reverse prev[] and set up backward-phase
@@ -1586,6 +1860,7 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
         return;
     }
     uint8_t a = enc_qdb[s->offset + x];
+    s->smem.info = 0;   // untagged: get_sa_entries_prefetch reads info
     s->smem.rid = (uint32_t)input_idx;
     s->smem.m   = x;
     s->smem.n   = x;
@@ -1807,6 +2082,12 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
      * (env pin, opt-in probe, host-tuned default, or compile-time default). */
     BatchSlot slots[SMEM_LOCKSTEP_N_MAX] = {};
     static thread_local LockstepSmemCache cache;
+    /* The unique-match text compare (ls_s1_*) runs only when the index's
+     * reference is at hand (s1_text_available); otherwise the forward walk
+     * steps every base. */
+    const bool s1_text = s1_text_available();
+    const uint8_t *s1_pac = s1_text ? idx->pac : nullptr;
+    const int64_t s1_l_pac = s1_text ? idx->bns->l_pac : 0;
     const size_t per_slot_smems = (size_t)max_readlength;
     if (per_slot_smems > cache.per_slot || N > cache.n_slots) {
         if (cache.prev  != nullptr) _mm_free(cache.prev);
@@ -1864,13 +2145,20 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
             BatchSlot *sl = &slots[s];
             switch (sl->phase) {
                 case PH_FWD:
-                    ls_advance_forward_step(sl, enc_qdb);
+                    ls_advance_forward_step(sl, enc_qdb, s1_text);
                     // If forward just transitioned to PH_BWD_INIT, run the
                     // between-phases housekeeping immediately. prepare_backward
                     // may transition straight to PH_DONE (e.g. empty prev[]).
                     if (sl->phase == PH_BWD_INIT) {
                         ls_prepare_backward(sl);
                     }
+                    break;
+                case PH_S1_LF:
+                    ls_s1_lf_step(sl, s1_pac, s1_l_pac);
+                    break;
+                case PH_S1_CMP:
+                    ls_s1_compare(sl, enc_qdb, s1_pac, s1_l_pac);
+                    ls_prepare_backward(sl);
                     break;
                 case PH_BWD_INIT:
                     ls_prepare_backward(sl);
@@ -1957,6 +2245,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
 
             // Forward search
             SMEM smem;
+            smem.info = 0;   // carries no SA tag (ls_s1_sa_tag)
             smem.rid = i;
             smem.m = x;
             smem.n = x;
@@ -2890,8 +3179,13 @@ struct KsDedupTable {
 };
 } // namespace
 
-/* Stats: distinct-vs-total resolved POSITIONS (weighted by min(s,max_occ), the
- * actual resolve cost), summed across threads, printed once at exit. */
+/* Stats: distinct-vs-total resolved POSITIONS (weighted by min(s,max_occ)),
+ * summed across threads, printed once at exit. These count coordinates: an SMEM
+ * whose coordinate comes from its SA tag (trust_s1_tag) counts as a distinct
+ * position although nothing is walked for it. The AUTO controller's inputs
+ * (ks_distinct_positions, ks_dup_positions) count LF walks instead, so the two
+ * differ when tags are trusted; "saved" here is the share of coordinates that
+ * dedup copies, not of LF walks. */
 static std::atomic<uint64_t> g_ksdedup_total_pos{0};
 static std::atomic<uint64_t> g_ksdedup_distinct_pos{0};
 
@@ -2919,7 +3213,7 @@ static struct KsDedupStatsDumper {
 void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                                          int64_t *coordCountArray, int64_t count,
                                          const int32_t max_occ, int tid, int64_t &id_,
-                                         int drop_sentinel_offset)
+                                         int drop_sentinel_offset, bool trust_s1_tag)
 {
     // Internal invariant for direct callers. max_occ is a divisor below
     // (`step = s / max_occ`) and the dedup slot-run width `c = min(s, max_occ)`,
@@ -2996,17 +3290,40 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
      * Thread-local + grow-only to avoid per-chunk allocation. */
     static thread_local std::vector<int64_t> ks_dup_base, ks_rep_base, ks_dup_cnt;
     static thread_local KsDedupTable ks_tab;
-    /* Maps each staged pos_ar entry -> its destination coordArray slot. In the
-     * plain path staging index == coordArray slot (1:1), but the dedup path
-     * skips duplicate intervals, so pos_ar compacts and the two diverge: a
-     * rep's k-th staged position must land in its OWN slot-run base + k, not in
-     * the compacted pos_ar index. The pipeline reads this to place each result.
-     * (Sized to mem_lim like pos_ar; only used when dedup is on.) */
+    /* Maps each staged pos_ar entry -> its destination coordArray slot. When
+     * every SMEM is staged (the plain path with SA tags not trusted), staging
+     * index == coordArray slot (1:1). The dedup path skips duplicate intervals
+     * and, with SA tags trusted (use_tag below), both paths skip tagged SMEMs,
+     * so pos_ar compacts and the two diverge: a staged position must land in
+     * its OWN slot (a rep's slot-run base + k), not in the compacted pos_ar
+     * index. The pipeline reads this to place each result. (Sized to mem_lim
+     * like pos_ar; only used when dedup is on or SA tags are trusted.) */
     static thread_local std::vector<int64_t> ks_dst;
+    /* A unique match whose text position the seeding path already resolved
+     * (ls_s1_sa_tag, FMI_search.cpp's lockstep SMEM driver) gets its one
+     * coordinate written here, at staging, and no LF walk. Only a caller whose
+     * SMEMs all come from bwa-mem3's own seeding (which leaves info 0 on every
+     * SMEM it does not tag) passes trust_s1_tag; the fmi_seed_sa_prefetch
+     * facade takes SMEMs from external code and does not.
+     * CONTRACT: trusting the tag is only correct if every SMEM producer on the
+     * seeding path leaves info 0 on an SMEM it does not tag. Nothing checks it
+     * here (a stale bit 63 on an s == 1 SMEM would be written as a wrong
+     * coordinate), so a new or changed producer must zero info. The SMEM parity
+     * tests check info == 0 on the untagged output of every producer
+     * (getSMEMsOnePosOneThread and its lockstep driver, and both
+     * bwtSeedStrategyAllPosOneThread drivers). The tag holds the
+     * exact SA value, so it is used only at drop_sentinel_offset 0: under
+     * --compat=bwa-mem2 a walk that reaches the sentinel row reports 0, and
+     * how far a walk goes before it meets a sampled row is not bounded (the SA
+     * is sampled by row). Skipping SMEMs breaks the plain path's staging index
+     * == coordArray slot identity, so with the tag trusted every staged
+     * position records its slot in ks_dst, as the dedup path does. */
+    const bool use_tag = trust_s1_tag && drop_sentinel_offset == 0;
+    const bool remap = dedup || use_tag;
     /* Grow-only (like the pos_ar scratch): only indices [0, id) are written
      * before they are read, so a plain resize every call would re-zero the tail
      * and thrash the allocator for no benefit. Keep the high-water capacity. */
-    if (dedup && ks_dst.size() < (size_t)mem_lim) ks_dst.resize((size_t)mem_lim);
+    if (remap && ks_dst.size() < (size_t)mem_lim) ks_dst.resize((size_t)mem_lim);
 
     if (!dedup) {
         for(int i = 0; i < count; i++)
@@ -3014,6 +3331,24 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             int32_t c = 0;
             SMEM smem = smemArray[i];
             if (smem.s < 0) smem.s = 0;   // clamp negative/empty interval (see mem_lim loop)
+            if (use_tag) {
+                if (ls_s1_tagged(smem)) {
+                    coordArray[totalCoordCount] = ls_s1_sa_coord(smem);
+                    *coordCountArray += 1;
+                    totalCoordCount += 1;
+                    continue;
+                }
+                int64_t hi = smem.k + smem.s;
+                int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
+                for(int64_t j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
+                {
+                    ks_dst[id] = totalCoordCount + c;
+                    pos_ar[id++] = j;
+                }
+                *coordCountArray += c;
+                totalCoordCount += c;
+                continue;
+            }
             int64_t hi = smem.k + smem.s;
             int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
             int64_t j;
@@ -3040,11 +3375,15 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         if (ks_measure) ks_t_stage0 = std::chrono::steady_clock::now();
         ks_tab.reset(count);
         ks_dup_base.clear(); ks_rep_base.clear(); ks_dup_cnt.clear();
-        uint64_t stat_total = 0, stat_distinct = 0;
+        uint64_t stat_total = 0, stat_distinct = 0, stat_dup_walk = 0;
         for(int i = 0; i < count; i++)
         {
             SMEM smem = smemArray[i];
             if (smem.s < 0) smem.s = 0;   // clamp negative/empty interval (see mem_lim loop)
+            /* A tagged SMEM (see use_tag) keeps its rep/duplicate role: a rep
+             * has its coordinate written here instead of staged, and a
+             * duplicate copies its rep's slot as any duplicate does. */
+            const bool tagged = use_tag && ls_s1_tagged(smem);
             int64_t hi = smem.k + smem.s;
             int64_t step = (smem.s > max_occ) ? smem.s / max_occ : 1;
             /* c is min(s, max_occ) -- the slot-run width. Compute it up front
@@ -3062,10 +3401,14 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                  * coordArray destination (run_base + cc) so the pipeline writes
                  * results into this rep's own slot-run, not the compacted
                  * pos_ar index. */
-                int32_t cc = 0;
-                for(int64_t j = smem.k; (j < hi) && (cc < max_occ); j+=step, cc++) {
-                    ks_dst[id] = run_base + cc;
-                    pos_ar[id++] = j;
+                if (tagged) {
+                    coordArray[run_base] = ls_s1_sa_coord(smem);
+                } else {
+                    int32_t cc = 0;
+                    for(int64_t j = smem.k; (j < hi) && (cc < max_occ); j+=step, cc++) {
+                        ks_dst[id] = run_base + cc;
+                        pos_ar[id++] = j;
+                    }
                 }
                 stat_distinct += (uint64_t)c;
             } else {
@@ -3073,6 +3416,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 ks_dup_base.push_back(run_base);
                 ks_rep_base.push_back(ks_tab.base[rep]);
                 ks_dup_cnt.push_back(c);
+                if (!tagged) stat_dup_walk += (uint64_t)c;
             }
             *coordCountArray += c;
             totalCoordCount  += c;
@@ -3081,8 +3425,12 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         if (ks_measure) {
             ks_stage_ns = std::chrono::duration<double, std::nano>(
                               std::chrono::steady_clock::now() - ks_t_stage0).count();
-            ks_distinct_positions = (int64_t)stat_distinct;
-            ks_dup_positions      = (int64_t)(stat_total - stat_distinct);
+            /* The controller prices LF walks: the positions walked (id; every
+             * distinct position but a tagged rep's) and the duplicates whose
+             * walk dedup skips (a tagged duplicate has none to skip). Without
+             * tags these are stat_distinct and stat_total - stat_distinct. */
+            ks_distinct_positions = id;
+            ks_dup_positions      = (int64_t)stat_dup_walk;
         }
         if (ks_dedup_stats_on()) {
             g_ksdedup_total_pos.fetch_add(stat_total, std::memory_order_relaxed);
@@ -3091,13 +3439,15 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     }
     
     /* Out-param is the resolved-COORDINATE count, not the compacted staging
-     * count. In the plain path these are equal (staging index == coordArray
-     * slot, 1:1), but the dedup path stages only reps into pos_ar (local `id`),
-     * so `id` under-counts by the skipped duplicates. totalCoordCount advances
-     * by min(s,max_occ) for every SMEM in both paths, so accumulating it keeps
-     * *id_ mode-invariant -- the fmi_seed_sa_prefetch facade documents *id as
-     * the coordinate count, and external consumers must not see it shrink when
-     * 'auto'/'on' dedup engages. (`id` stays the pipeline's compacted bound.) */
+     * count. These are equal only when every SMEM is staged (the plain path
+     * with SA tags not trusted). The dedup path stages only reps into pos_ar
+     * (local `id`), and with SA tags trusted both paths skip tagged SMEMs, so
+     * `id` under-counts by the skipped duplicates and tagged SMEMs.
+     * totalCoordCount advances by min(s,max_occ) for every SMEM in both paths,
+     * so accumulating it keeps *id_ invariant to dedup and to tags -- the
+     * fmi_seed_sa_prefetch facade documents *id as the coordinate count, and
+     * external consumers must not see it shrink when 'auto'/'on' dedup engages.
+     * (`id` stays the pipeline's compacted bound.) */
     id_ += totalCoordCount;
 
     /* Number of SA rows walked concurrently. Each lane's next checkpoint block
@@ -3149,7 +3499,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     {
         int64_t pos =  pos_ar[i];
         working_set[j] = pos;
-        map_pos[j] = dedup ? ks_dst[i] : i;   // dedup remaps to the rep's slot-run
+        map_pos[j] = remap ? ks_dst[i] : i;   // dedup or a tag remaps to the slot
         offset[j] = 0;
         
         prefetch_row(pos);
@@ -3181,7 +3531,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
                 {
                     pos = pos_ar[i];
                     working_set[k] = pos;
-                    map_pos[k] = dedup ? ks_dst[i] : i;   // dedup remaps to the rep's slot-run
+                    map_pos[k] = remap ? ks_dst[i] : i;   // dedup or a tag remaps to the slot
                     i++;
                     offset[k] = 0;
                     

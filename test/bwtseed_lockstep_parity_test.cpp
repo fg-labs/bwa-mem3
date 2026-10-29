@@ -28,14 +28,17 @@
 
 /* Field-by-field SMEM equality. memcmp is unsuitable because the SMEM struct
  * has implicit padding between `n` and `k` that upstream leaves
- * uninitialized — the padding bytes are not part of the semantic contract. */
+ * uninitialized — the padding bytes are not part of the semantic contract.
+ * Neither driver tags its seeds, so both must leave info 0: SA resolution
+ * trusts a tag in info (get_sa_entries_prefetch's trust_s1_tag). */
 static bool smem_fields_equal(const SMEM &a, const SMEM &b) {
     return a.rid == b.rid &&
            a.m   == b.m   &&
            a.n   == b.n   &&
            a.k   == b.k   &&
            a.l   == b.l   &&
-           a.s   == b.s;
+           a.s   == b.s   &&
+           a.info == 0 && b.info == 0;
 }
 
 static int64_t smem_array_first_mismatch(const SMEM *a, const SMEM *b, int64_t n) {
@@ -99,11 +102,13 @@ static bool run_case(FMI_search *fmi,
             const SMEM &a = scalar_out[mism];
             const SMEM &b = lockstep_out[mism];
             fprintf(stderr, "[FAIL] %s: SMEM field mismatch at index %lld:\n"
-                    "  scalar   rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n"
-                    "  lockstep rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n",
+                    "  scalar   rid=%d m=%u n=%u k=%lld l=%lld s=%lld info=%#llx\n"
+                    "  lockstep rid=%d m=%u n=%u k=%lld l=%lld s=%lld info=%#llx\n",
                     case_name, (long long)mism,
                     a.rid, a.m, a.n, (long long)a.k, (long long)a.l, (long long)a.s,
-                    b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s);
+                    (unsigned long long)a.info,
+                    b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s,
+                    (unsigned long long)b.info);
             ok = false;
         }
     }
