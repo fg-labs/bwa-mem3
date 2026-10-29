@@ -137,7 +137,7 @@ Additional integration shell scripts in `test/`:
 | `shm_round_trip_test.sh` | `bwa-mem3 shm` load / list / drop cycle |
 | `shm_meth_test.sh` | `--meth` index compatibility with `shm` |
 | `help_prescan_test.sh` | `--help` prints without running alignment |
-| `proc_freq_calibration_test.sh` | startup does not sleep to calibrate `proc_freq`, and the calibrated tick rate is plausible |
+| `proc_freq_calibration_test.sh` | startup does not sleep to calibrate `proc_freq`; `mem` reports a tick rate inside a generous MHz band, and at `-v 4` that it came from CNTFRQ_EL0 (aarch64) or the run window rather than a sleep; `index` prints a finite "Total time taken" no longer than the wall time measured around it (the branches of `proc_freq_resolve()` are unit-tested in `test/unit/test_proc_freq.cpp`) |
 | `bam_compress_warn_test.sh` | the `--bam=N` single-writer-thread warning fires once, for the resolved level only |
 | `libsais_*.sh` | libsais index correctness vs. BWA / determinism |
 

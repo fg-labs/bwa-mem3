@@ -160,7 +160,9 @@ ok "help_prescan_test"
 # --- proc_freq_calibration_test -------------------------------------------
 # Startup must not sleep to calibrate proc_freq (it used to sleep(1) on
 # every invocation, which dominated this very suite), and the replacement
-# short-window calibration must still report a plausible tick rate.
+# (proc_freq_resolve in src/profiling.cpp: CNTFRQ_EL0 on aarch64, measured
+# over the run elsewhere) must still report a plausible tick rate and index
+# time. test/unit/test_proc_freq.cpp covers its branches.
 "$HERE/proc_freq_calibration_test.sh" "$BWAMEM3" "$FIXTURES" || fail "proc_freq_calibration_test failed"
 ok "proc_freq_calibration_test"
 
