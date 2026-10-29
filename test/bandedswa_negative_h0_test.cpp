@@ -206,7 +206,8 @@ int main()
 
     // 4. The production classifier (sortPairsLenExt) at a = 1, len1 = len2 = 20:
     //    h0 = 0 takes the 8-bit tier; h0 = -1 (minval 19) leaves it for 16-bit;
-    //    h0 = -30 (minval -10) has no 16-bit bin and must go to the scalar tier.
+    //    h0 = -30 (minval -10) fails the 16-bit range check (minval < 0), so goes to the
+    //    scalar tier.
     {
         const int ra = 1, len = 20;
         const int h0s[3] = {0, -1, -30};
@@ -218,9 +219,8 @@ int main()
             p.h0 = h0s[i];
             sp[i] = p;
         }
-        std::vector<int32_t> hist(MAX_SEQ_LEN8 + MAX_SEQ_LEN16 + 1);
         int n8 = -1, n16 = -1, n1 = -1;
-        sortPairsLenExt(sp.data(), 3, tmp.data(), hist.data(), n8, n16, n1, ra, w, zdrop);
+        sortPairsLenExt(sp.data(), 3, tmp.data(), n8, n16, n1, ra, w, zdrop);
         if (n8 != 1 || n16 != 1 || n1 != 1) {
             fprintf(stderr, "classifier: tier counts 8-bit=%d 16-bit=%d scalar=%d, expected 1/1/1\n", n8, n16, n1);
             fails++;
