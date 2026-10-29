@@ -482,7 +482,9 @@ static inline uint64_t rescue_prune_memo_hits()
  * pairs, wall, 400 vs 1000: neutral +2.6 %, genomic +2.7 %, 10 reps, p < 1e-4). On x86, 400 with banding too: the x86
  * kswv kernels are cheap enough that the extra filter work on dense windows does not pay (prune +
  * band, wall, 1000 vs 400: Zen 3 AVX2 wgs-5M 74.52 vs 73.57 s, wes-5M 38.57 vs 37.65 s; Zen 5
- * AVX-512 wgs-5M 27.53 vs 26.73 s). Output is identical at every value. */
+ * AVX-512 wgs-5M 27.53 vs 26.73 s). Re-measured at the AVX-512BW tier after the u8 kswv kernel's
+ * two-row sweep (#646) made a hull cell cheaper (Zen 4, wgs-5M, -t 16, 5 interleaved reps, wall):
+ * 400 31.57 s, 1000 31.58 s, 2000 31.73 s, so 400 stays. Output is identical at every value. */
 static inline int rescue_prune_max_hits_default(bool banding, bool meth)
 {
 #if defined(__aarch64__)
@@ -533,7 +535,9 @@ static inline bool rescue_meth_rel_matrix_ok(const int8_t *mat, int hyp, int a, 
  * tier from seed length 25 (-k 25; minsc >= 25 a, since minsc = min_seed_len * a): there
  * the 64-lane kswv is cheap and few rescues pass at a long seed length, so the filter costs more
  * than it saves (Zen 5 wgs-5M: +1.0 / +2.4 / +1.2 / +1.3 % at -k 25 / 28 / 32 / 40; wes-5M
- * -1.3 / +0.9 / -0.8 / -1.2 %). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). The gate is on the
+ * -1.3 / +0.9 / -0.8 / -1.2 %). Re-measured after the two-row u8 kswv sweep (#646): dropping the
+ * gate still loses (Zen 4 wgs-5M, 5 interleaved reps, wall: +0.7 % at -k 25, +0.6 % at -k 32; the
+ * filter's 12-13 thread-s exceed the 7-10 thread-s of kswv it saves). AVX2 still wins at -k 32 (Zen 3 wes-5M -3.8 %). The gate is on the
  * seed length, not on minsc: scaling a scales every score and the threshold alike, so -A 2 at the
  * default -k 19 prunes like -A 1 does (Zen 5 AVX-512BW, prune on vs off, -t 16, 3 reps, wgs-5M:
  * -A 2 -2.5 %, -A 2 -B 8 -O 12 -E 2 -2.2 %, -A 3 -B 12 -O 18 -E 3 -1.7 %; wes-5M flat). The gate
