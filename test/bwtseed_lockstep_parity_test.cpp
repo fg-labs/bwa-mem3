@@ -2,6 +2,11 @@
  * variant. Both functions are given identical inputs; outputs (matchArray
  * bytes, returned numSeed) must be byte-identical.
  *
+ * Both drivers end a read once no later walk can emit (x_end), so a wrong
+ * bound shared by the two would pass the scalar-vs-lockstep compare. Every
+ * case therefore also checks both against reference_bwtseed below, the scalar
+ * walk as it was before that bound: every outer x up to the read end.
+ *
  * Usage: bwtseed_lockstep_parity_test <bwa-mem3 index prefix>
  *   e.g. bwtseed_lockstep_parity_test test/fixtures/phix.fa
  *
@@ -18,7 +23,10 @@
 #include <stdint.h>
 #include <string>
 #include <vector>
+/* reference_bwtseed needs count[] and backwardExt. */
+#define private public
 #include "FMI_search.h"
+#undef private
 #include "seed_jump_test_util.h"
 #include "bwa.h"
 
@@ -51,6 +59,88 @@ static int64_t smem_array_first_mismatch(const SMEM *a, const SMEM *b, int64_t n
     return -1;
 }
 
+/* The scalar third-round walk with no early end: every outer x in
+ * [0, readlength) is walked, so a read only ends at its last base. It is the
+ * scalar driver's walk from before the x_end bound, less the prefetch hint,
+ * and is the oracle that bound is checked against. The length test keeps the
+ * driver's unsigned compare (SMEM m and n are uint32_t), so a negative
+ * minSeedLen emits nothing here, as it does there. */
+static int64_t reference_bwtseed(const FMI_search *fmi, const uint8_t *enc_qdb,
+                                 const int32_t *max_intv_array, int32_t numReads,
+                                 const bseq1_t *seq_, const int32_t *query_cum_len_ar,
+                                 int32_t minSeedLen, SMEM *matchArray)
+{
+    int64_t numTotalSeed = 0;
+    for (int32_t i = 0; i < numReads; i++) {
+        const int readlength = seq_[i].l_seq;
+        const int offset = query_cum_len_ar[i];
+        int32_t x = 0;
+        while (x < readlength) {
+            int next_x = x + 1;
+            SMEM smem;
+            memset(&smem, 0, sizeof smem);
+            smem.rid = i;
+            smem.m = x;
+            smem.n = x;
+            uint8_t a = enc_qdb[offset + x];
+            if (a < 4) {
+                smem.k = fmi->count[a];
+                smem.l = fmi->count[3 - a];
+                smem.s = fmi->count[a + 1] - fmi->count[a];
+                for (int j = x + 1; j < readlength; j++) {
+                    next_x = j + 1;
+                    a = enc_qdb[offset + j];
+                    if (a >= 4) break;
+                    /* Forward extension: backward extension on the swapped interval. */
+                    SMEM smem_ = smem;
+                    smem_.k = smem.l;
+                    smem_.l = smem.k;
+                    SMEM newSmem_ = fmi->backwardExt(smem_, 3 - a);
+                    SMEM newSmem = newSmem_;
+                    newSmem.k = newSmem_.l;
+                    newSmem.l = newSmem_.k;
+                    newSmem.n = j;
+                    smem = newSmem;
+                    if (smem.s < max_intv_array[i] && (smem.n - smem.m + 1) >= (uint32_t)minSeedLen) {
+                        if (smem.s > 0) matchArray[numTotalSeed++] = smem;
+                        break;
+                    }
+                }
+            }
+            x = next_x;
+        }
+    }
+    return numTotalSeed;
+}
+
+/* Compare two drivers' outputs (count, then every SMEM's fields); prints and
+ * returns false on the first difference. */
+static bool check_same(const char *case_name,
+                       const char *name_a, const SMEM *a_out, int64_t n_a,
+                       const char *name_b, const SMEM *b_out, int64_t n_b)
+{
+    if (n_a != n_b) {
+        fprintf(stderr, "[FAIL] %s: numSeed mismatch: %s=%lld %s=%lld\n",
+                case_name, name_a, (long long)n_a, name_b, (long long)n_b);
+        return false;
+    }
+    const int64_t mism = smem_array_first_mismatch(a_out, b_out, n_a);
+    if (mism >= 0) {
+        const SMEM &a = a_out[mism];
+        const SMEM &b = b_out[mism];
+        fprintf(stderr, "[FAIL] %s: SMEM field mismatch at index %lld:\n"
+                "  %-9s rid=%d m=%u n=%u k=%lld l=%lld s=%lld info=%#llx\n"
+                "  %-9s rid=%d m=%u n=%u k=%lld l=%lld s=%lld info=%#llx\n",
+                case_name, (long long)mism,
+                name_a, a.rid, a.m, a.n, (long long)a.k, (long long)a.l, (long long)a.s,
+                (unsigned long long)a.info,
+                name_b, b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s,
+                (unsigned long long)b.info);
+        return false;
+    }
+    return true;
+}
+
 static int32_t total_cases = 0;
 static int32_t passed_cases = 0;
 
@@ -72,19 +162,23 @@ static bool run_case(FMI_search *fmi,
                      const bseq1_t *seq_,
                      int32_t *query_cum_len_ar,
                      int32_t expect_min_seeds = 0,
-                     bool expect_seed_per_read = false)
+                     bool expect_seed_per_read = false,
+                     bool expect_end_seed = false)
 {
     /* Scalar emits at most one SMEM per outer-x ∈ [0, l_seq), so
      * numReads * max_readlength is a tight upper bound for both paths. */
     const int32_t max_out = numReads * max_readlength;
-    SMEM *scalar_out   = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
-    SMEM *lockstep_out = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
+    const size_t out_bytes = (size_t)(max_out > 0 ? max_out : 1) * sizeof(SMEM);
+    SMEM *scalar_out   = (SMEM *)_mm_malloc(out_bytes, 64);
+    SMEM *lockstep_out = (SMEM *)_mm_malloc(out_bytes, 64);
+    SMEM *ref_out      = (SMEM *)_mm_malloc(out_bytes, 64);
 
     /* max_intv_array per-read; mutated copies for each path so a buggy
      * implementation that writes to its input array would still parity-check. */
     int32_t *mia_s = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *mia_l = (int32_t *)malloc(numReads * sizeof(int32_t));
-    for (int i = 0; i < numReads; i++) { mia_s[i] = max_intv; mia_l[i] = max_intv; }
+    int32_t *mia_r = (int32_t *)malloc(numReads * sizeof(int32_t));
+    for (int i = 0; i < numReads; i++) { mia_s[i] = max_intv; mia_l[i] = max_intv; mia_r[i] = max_intv; }
 
     int64_t n_scalar = fmi->bwtSeedStrategyAllPosOneThread(
             enc_qdb, mia_s, numReads, seq_, query_cum_len_ar,
@@ -92,29 +186,19 @@ static bool run_case(FMI_search *fmi,
     int64_t n_lockstep = fmi->bwtSeedStrategyAllPosOneThread_lockstep(
             enc_qdb, mia_l, numReads, seq_, query_cum_len_ar,
             minSeedLen, lockstep_out, max_readlength);
+    const int64_t n_ref = reference_bwtseed(fmi, enc_qdb, mia_r, numReads, seq_,
+                                            query_cum_len_ar, minSeedLen, ref_out);
 
     total_cases++;
-    bool ok = true;
-    if (n_scalar != n_lockstep) {
-        fprintf(stderr, "[FAIL] %s: numSeed mismatch: scalar=%lld lockstep=%lld\n",
-                case_name, (long long)n_scalar, (long long)n_lockstep);
-        ok = false;
-    } else {
-        int64_t mism = smem_array_first_mismatch(scalar_out, lockstep_out, n_scalar);
-        if (mism >= 0) {
-            const SMEM &a = scalar_out[mism];
-            const SMEM &b = lockstep_out[mism];
-            fprintf(stderr, "[FAIL] %s: SMEM field mismatch at index %lld:\n"
-                    "  scalar   rid=%d m=%u n=%u k=%lld l=%lld s=%lld info=%#llx\n"
-                    "  lockstep rid=%d m=%u n=%u k=%lld l=%lld s=%lld info=%#llx\n",
-                    case_name, (long long)mism,
-                    a.rid, a.m, a.n, (long long)a.k, (long long)a.l, (long long)a.s,
-                    (unsigned long long)a.info,
-                    b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s,
-                    (unsigned long long)b.info);
-            ok = false;
-        }
-    }
+    /* All three comparisons run, so a failure names the driver that left the
+     * reference rather than only reporting that the two drivers differ. */
+    const bool same_sl = check_same(case_name, "scalar", scalar_out, n_scalar,
+                                    "lockstep", lockstep_out, n_lockstep);
+    const bool same_rs = check_same(case_name, "reference", ref_out, n_ref,
+                                    "scalar", scalar_out, n_scalar);
+    const bool same_rl = check_same(case_name, "reference", ref_out, n_ref,
+                                    "lockstep", lockstep_out, n_lockstep);
+    bool ok = same_sl && same_rs && same_rl;
 
     /* Emission-path cases must actually emit seeds. Byte-identity between two
      * paths that both return zero seeds proves nothing about the buffered
@@ -151,6 +235,24 @@ static bool run_case(FMI_search *fmi,
         }
     }
 
+    /* A case built to reach the bound: some read's last walk that can emit,
+     * the one from l_seq - max(minSeedLen, 2), must emit at the read's last
+     * base. Without that seed the x_end boundary is not exercised. */
+    if (ok && expect_end_seed) {
+        const int32_t span = minSeedLen > 2 ? minSeedLen : 2;
+        bool found = false;
+        for (int64_t j = 0; j < n_scalar && !found; j++) {
+            const SMEM &a = scalar_out[j];
+            const int32_t l = seq_[a.rid].l_seq;
+            found = (int32_t)a.n == l - 1 && (int32_t)a.m == l - span;
+        }
+        if (!found) {
+            fprintf(stderr, "[FAIL] %s: no read emitted a seed from its last emitting "
+                    "start (l_seq - %d) to its last base\n", case_name, (int)span);
+            ok = false;
+        }
+    }
+
     if (ok) {
         fprintf(stderr, "[PASS] %s  (n_seed=%lld)\n", case_name, (long long)n_scalar);
         passed_cases++;
@@ -158,7 +260,8 @@ static bool run_case(FMI_search *fmi,
 
     _mm_free(scalar_out);
     _mm_free(lockstep_out);
-    free(mia_s); free(mia_l);
+    _mm_free(ref_out);
+    free(mia_s); free(mia_l); free(mia_r);
     return ok;
 }
 
@@ -638,6 +741,62 @@ int main(int argc, char *argv[]) {
                      enc_qdb, seq_, cum_len, /*expect_min_seeds=*/1);
         }
         free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 13r: the read-end bound. Both drivers end a read at
+     * x_end = l_seq - minSeedLen + 1 (the read end for minSeedLen <= 1), where
+     * no later walk can emit. Reads of every length from 0 to
+     * 3 * max(minSeedLen, 2) + 2 over phiX, and the same reads with an N just
+     * before, at and after the last start that can emit and at the last base,
+     * put a walk's start, its N or the read end on each side of the bound. At
+     * max_intv 1000 every walk long enough emits at its first chance, so the
+     * read whose length is a multiple of the seed length emits from its last
+     * emitting start to its last base (required). At max_intv 5 walks also run
+     * off the read end for minSeedLen 0-3; at 10 and 20 every phiX substring of
+     * that length is already under 5, so those runs match max_intv 1000. At
+     * max_intv 1 nothing emits (exact phiX substrings never reach s == 0), so
+     * every walk from below x_end, through its jump at the larger minSeedLen,
+     * runs to an N or the read end and the read retires there. minSeedLen -1
+     * emits nothing (the length test is unsigned), 0 and 1 take the read end
+     * as the bound, the rest x_end. Each run is checked against the unbounded
+     * reference walk. */
+    {
+        const std::string src =
+            "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAA"
+            "ATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTTACGAATTAAATCGAAGTGGACTGCT";
+        const int32_t min_seeds[] = {-1, 0, 1, 2, 3, 10, 20};
+        const int32_t max_intvs[] = {1000, 5, 1};
+        for (const int32_t msl : min_seeds) {
+            const int32_t span = msl > 2 ? msl : 2;
+            const int32_t max_len = 3 * span + 2;
+            std::vector<std::string> rs;
+            for (int32_t L = 0; L <= max_len; L++) {
+                const std::string r = src.substr(3, (size_t)L);
+                rs.push_back(r);
+                const int32_t ns[] = {L - span - 1, L - span, L - span + 1, L - 1};
+                for (const int32_t p : ns) {
+                    if (p < 0 || p >= L) continue;
+                    std::string rn = r;
+                    rn[(size_t)p] = 'N';
+                    rs.push_back(rn);
+                }
+            }
+            std::vector<const char *> reads;
+            for (const std::string &r : rs) reads.push_back(r.c_str());
+            const int32_t numReads = (int32_t)reads.size();
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads.data(), numReads, &enc_qdb, &seq_, &cum_len);
+            for (const int32_t mi : max_intvs) {
+                char name[112];
+                snprintf(name, sizeof name, "Case 13r: read-end bound, reads of 0-%d bases, "
+                         "minSeedLen %d, max_intv %d", (int)max_len, (int)msl, (int)mi);
+                run_case(fmi, name, numReads, max_len, msl, mi, enc_qdb, seq_, cum_len,
+                         /*expect_min_seeds=*/msl < 0 || mi == 1 ? 0 : 1,
+                         /*expect_seed_per_read=*/false,
+                         /*expect_end_seed=*/msl >= 0 && mi == 1000);
+            }
+            free(enc_qdb); free(seq_); free(cum_len);
+        }
     }
 
     /* Case 10: long reads (1000bp, 1500bp) — exercises the heap-allocated

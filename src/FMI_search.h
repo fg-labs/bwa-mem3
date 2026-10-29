@@ -641,7 +641,8 @@ private:
                        const bseq1_t *seq_,
                        const int32_t *query_cum_len_ar,
                        const uint8_t *enc_qdb,
-                       const SeedJumpEntry *jlev, int32_t jd);
+                       const SeedJumpEntry *jlev, int32_t jd,
+                       int32_t minSeedLen);
     void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
     void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
     void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
