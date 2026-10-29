@@ -495,6 +495,19 @@ batch boundaries — and therefore `mem_pestat` and record order — match betwe
 the two streams being compared (`-t`/`-K` change batching and so must be held
 equal across a byte-identity comparison). See
 [Features → Certified adaptive extension band](features.md#certified-adaptive-extension-band-default-on---no-band-cert-to-disable).
+
+The probe groups the pairs it can certify into buckets by the band each needs, and runs
+each bucket at its ceiling: 8, 16, 24 or 30 (until
+[#695](https://github.com/fg-labs/bwa-mem3/pull/695): 4, 8, 12, 16, 20, 24, 28 and 30).
+Below the top admissible ceiling a bucket keeps only whole SIMD lane groups and passes its
+remainder to the next ceiling, so a pair may run at a wider band than it needs. Ceilings
+above the startup probe width of 20 are used only where the envelope still holds at that
+width; the widest admissible width, `w_cap`, starts at 20, which the startup check already
+proved, and a bucket whose ceiling exceeds `w_cap` runs at `w_cap` (for example the 24
+bucket runs at 20 under `-d 68..79` or `-w 30..35` at default scoring). Whatever bucket a
+pair lands in, it is certified at the band it actually ran at and otherwise falls through
+to the ladder, so the bucketing changes speed only, never a record.
+
 This is distinct from the aggressive, opt-in, *not* byte-identical `--adaptive-band`
 narrowing catalogued under [opt-in divergences](#divergences-that-are-latent-opt-in-or-per-architecture).
 Until [#540](https://github.com/fg-labs/bwa-mem3/pull/540) the ceiling ladder, with or

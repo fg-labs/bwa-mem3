@@ -59,6 +59,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "sam_encode.h"
 #include "stage_prof.h"
 #include "seed_order.h"
+#include "simd_dispatch.h"  /* bwamem3_simd_tier: the probe rung's lane-group size */
 /* Not including <htslib/sam.h>: its kstring.h shares the KSTRING_H guard
  * with bwa-mem3's. Opaque bam1_t wrappers live in bam_writer.h. */
 
@@ -6912,12 +6913,14 @@ static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
  * that envelope at their own width via mem_band_cert_params_safe_w, see Gate B below).
  *
  * Eligibility (gate A): opt->band_cert AND 0 < tight_band AND w_need(tb) <= w_cap,
- * where w_cap is the widest bucket ceiling whose control-flow envelope still holds
- * (ADAPTIVE_BAND_START = 20 at minimum, 30 at default params -- Gate B). Ineligible
- * pairs (no proof, or a band wider than w_cap) skip the rung and reach the untouched
- * ladder unchanged. Uncertified pairs GAP2-restore a->score and fall through to the
- * ladder too. The rung returns the count of pairs left for the ladder (ineligible +
- * uncertified), compacted to the front of pair_ar.
+ * where w_cap is the widest width whose control-flow envelope still holds (Gate B): the
+ * widest admissible bucket ceiling above ADAPTIVE_BAND_START (30 at default params, 24
+ * when only 30 fails), else ADAPTIVE_BAND_START itself, the width the startup gate proved
+ * (-d 68..79 or -w 30..35 at default scoring). A bucket runs at min(ceiling, w_cap).
+ * Ineligible pairs (no proof, or a band wider than w_cap) skip the rung and reach the
+ * untouched ladder unchanged. Uncertified pairs GAP2-restore a->score and fall through
+ * to the ladder too. The rung returns the count of pairs left for the ladder
+ * (ineligible + uncertified), compacted to the front of pair_ar.
  *
  * The bucket call scores a sub-slice of pair_ar, so its padding-lane overshoot
  * would clobber the following region: guard the sym object for its duration
@@ -6929,6 +6932,29 @@ static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
  * blocks further down this file. */
 static inline void ugp_record_left_outcome(const SeqPair *sp, int a_match, int tid);
 static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
+
+/* Lanes in one SIMD group of the kernel `tier`'s calls run on at the dispatched tier
+ * (BWAMEM3_FORCE_TIER included), which the bucket carry rounds to: 64 / 32 / 16 8-bit lanes
+ * on AVX-512BW / AVX2 / 128-bit (SSE4.1-AVX, NEON), half for 16-bit, 1 in a scalar build.
+ * Must match SIMD_WIDTH8 of each kernel make_banded_pair_wise_sw dispatches to. The final
+ * `: 1` (BSW_TIER_SCALAR) arm is unreachable: the rung only passes BSW_TIER_16 / _8. */
+static int bsw_rung_group_lanes(BswMethTier tier)
+{
+#if !HAVE_BSW_VECTOR_8_16
+    (void)tier;
+    return 1;
+#else
+    static const int lanes8 = [] {
+        bwamem3_simd_init();   /* idempotent; guarantees the tier is set */
+        switch (bwamem3_simd_tier()) {
+        case BWAMEM3_TIER_AVX512BW: return 64;
+        case BWAMEM3_TIER_AVX2:     return 32;
+        default:                    return 16;
+        }
+    }();
+    return tier == BSW_TIER_8 ? lanes8 : tier == BSW_TIER_16 ? lanes8 / 2 : 1;
+#endif
+}
 
 static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_alnreg_v *av_v,
         IBandedPairWiseSW *sym, IBandedPairWiseSW *ot, IBandedPairWiseSW *ob,
@@ -6945,19 +6971,26 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
      * what band opt->w does. The certificate is evaluated at the bucket ceiling W_b >= tb,
      * so acceptance is byte-identical for every ceiling.
      *
+     * The ceilings are 8 apart, not 4: every non-empty bucket is its own bsw_run_tier call
+     * (a length sort, a wrapper setup and a partial last lane group), and on the short-read
+     * cases fewer, fuller calls cost less than the narrower bands save.
+     *
      * Gate B: ceilings ABOVE ADAPTIVE_BAND_START (20) recover the ~10-17% of eligible pairs
      * whose w_need exceeds the startup probe width. They may only be used where the certificate's
      * control-flow envelope still holds AT the wider band, so each such ceiling is admitted only
      * when mem_band_cert_params_safe_w(opt, W_b) passes. Because that predicate tightens
      * monotonically in W_b, the admissible ceilings form a prefix up to a single cap w_cap
      * (= 30 at default params, where the zdrop margin binds: zdrop 100 > 7 + 3*30). Ceilings
-     * <= 20 are already covered by the startup gate (opt->band_cert on <=> _w(opt,20) passed). */
-    static const int32_t BUCKET_CEIL[] = {4, 8, 12, 16, ADAPTIVE_BAND_START, 24, 28, 30};
+     * <= 20 are already covered by the startup gate (opt->band_cert on <=> _w(opt,20) passed).
+     * 20 itself is not a ceiling: w_cap starts there and stays there when 24 fails, and a
+     * bucket whose ceiling exceeds w_cap runs at w_cap instead (Wb below), so the pairs
+     * with w_need 17..20 still certify in the rung, at 20. */
+    static const int32_t BUCKET_CEIL[] = {8, 16, 24, 30};
     const int NBUCK = (int)(sizeof(BUCKET_CEIL) / sizeof(BUCKET_CEIL[0]));
-    int w_cap = ADAPTIVE_BAND_START;
+    int w_cap = ADAPTIVE_BAND_START;   /* the startup gate's width: always admissible */
     for (int b = 0; b < NBUCK; b++) {
         const int32_t Wc = BUCKET_CEIL[b];
-        if (Wc <= ADAPTIVE_BAND_START) { w_cap = Wc; continue; }
+        if (Wc <= ADAPTIVE_BAND_START) continue;
         if (!mem_band_cert_params_safe_w(opt, Wc)) break;  /* monotone: wider ceilings also fail */
         w_cap = Wc;
     }
@@ -6996,13 +7029,44 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
       for (int l = 0; l < n_elig; l++) { int b = bucket_of(w_need_of(elig[l].tight_band)); scratch[cur[b]++] = elig[l]; }
       for (int l = 0; l < n_elig; l++) elig[l] = scratch[l]; }
 
-    /* Score each non-empty bucket at its ceiling and certify there; failures from
-     * all buckets compact after the ineligible run (write cursor <= read cursor)
-     * for the untouched ladder. Guard the sym object: each bucket is a sub-slice. */
+    /* Carry each bucket's partial last lane group up a ceiling. Every non-empty bucket is
+     * its own bsw_run_tier call, and a call's last group runs all its rows at the cost of
+     * a full group (its padding lanes leave every row of it in the kernels' masked cell
+     * loop). So below the top admissible ceiling a bucket keeps whole groups of
+     * group_lanes pairs (bsw_rung_group_lanes: the dispatched kernel's group) and its
+     * cnt % group_lanes remainder joins the next ceiling, cascading up to w_cap. It rounds the
+     * count before dedup and outside --meth; either can leave a kernel call fewer pairs.
+     *
+     * Byte-identical for any assignment: the accept below runs band_cert_ok at the ceiling
+     * Wb the pair actually ran at, so a certified pair's fields are the full ladder's and
+     * an uncertified one falls through, whichever bucket the batch's counts put it in. The
+     * one load-bearing bound is Wb <= w_cap (Gate B's envelope), which the run width
+     * min(ceiling, w_cap) holds for every bucket; the carry stops at b_top = bucket_of(w_cap),
+     * the bucket that runs at w_cap. Every admissible width is below opt->w (the envelope's
+     * first-rung condition), so a->w = max_(a->w, Wb) is unchanged. The rest only avoids
+     * ladder fallbacks: the carried pairs are each bucket's tail, so segment b ends at or
+     * before bucket b's end and no pair runs below its w_need, and a pair that certifies at
+     * its own ceiling certifies at a wider one (same in-band optimum S, and band_cert_ok's
+     * w >= d_max only gets easier as w grows). */
+    {
+      const int group_lanes = bsw_rung_group_lanes(tier);
+      const int b_top = bucket_of(w_cap);
+      int carry = 0;
+      for (int b = 0; b < NBUCK; b++) {
+        const int tot = cnt[b] + carry;
+        carry = (b < b_top) ? tot % group_lanes : 0;
+        cnt[b] = tot - carry;
+      }
+      for (int b = 1; b < NBUCK; b++) off[b] = off[b - 1] + cnt[b - 1];
+    }
+
+    /* Score each non-empty bucket at its ceiling, capped at w_cap, and certify there;
+     * failures from all buckets compact after the ineligible run (write cursor <= read
+     * cursor) for the untouched ladder. Guard the sym object: each bucket is a sub-slice. */
     int n_fail = 0;
     for (int b = 0; b < NBUCK; b++) {
       if (cnt[b] <= 0) continue;
-      const int32_t Wb = BUCKET_CEIL[b];
+      const int32_t Wb = min_(BUCKET_CEIL[b], (int32_t)w_cap);
       SeqPair *bkt = elig + off[b];
       sym->set_guard_overshoot(true);
       bsw_run_tier(tier, opt, av_v, sym, ot, ob,
@@ -8823,7 +8887,8 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     init_w = INIT_W(opt->w);
     /* item 2: certified tight_band probe rung on the 16-bit tier, as a PURE PREPEND. The 16-bit
      * ladder already probes narrow (its first rung is INIT_W(opt->w) = 20); the rung certifies the
-     * proven-narrow (tb>0, w_need <= w_cap) pairs at a per-w_need bucket <= 20/30 and removes them
+     * proven-narrow (tb>0, w_need <= w_cap) pairs at the per-w_need ceiling (BUCKET_CEIL in
+     * bsw_tb_probe_rung, capped at w_cap) and removes them
      * early, byte-identically (a certified pair's fields are band-invariant beyond its bucket, so
      * the bucket and the width-20 probe finalize identically). Everything else -- ineligible pairs
      * (tb=0, or w_need > w_cap) and the rare uncertified pair -- falls through to the UNCHANGED
