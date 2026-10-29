@@ -81,6 +81,7 @@ SeqPair make_pair(const Template &t, int idx)
     p.gscore = idx + 15; p.max_off = idx + 16;
     p.tight_band = idx % 7; p.chain_band = idx % 5; p.ugp_walk_score = idx + 17;
     p.ugp_r_attempted = (uint8_t)(idx & 1); p.meth_hyp = (int8_t)(idx % 3 - 1);
+    p.probe_band = (int16_t)(idx % 11 - 1);  // -1 is FP_PROBE_BAND_NUM0
     return p;
 }
 
@@ -91,7 +92,8 @@ bool same_record(const SeqPair &a, const SeqPair &b)
            a.score == b.score && a.tle == b.tle && a.gtle == b.gtle && a.qle == b.qle &&
            a.gscore == b.gscore && a.max_off == b.max_off && a.tight_band == b.tight_band &&
            a.chain_band == b.chain_band && a.ugp_walk_score == b.ugp_walk_score &&
-           a.ugp_r_attempted == b.ugp_r_attempted && a.meth_hyp == b.meth_hyp;
+           a.ugp_r_attempted == b.ugp_r_attempted && a.meth_hyp == b.meth_hyp &&
+           a.probe_band == b.probe_band;
 }
 
 // Partition `in` (templates by index into kTemplates) and check it against the oracle.

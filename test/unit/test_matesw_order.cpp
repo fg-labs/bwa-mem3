@@ -94,6 +94,7 @@ std::vector<SeqPair> make_batch(std::mt19937 &rng, int64_t n, int pct8, int lo, 
         p.ugp_walk_score = (int32_t)(7000 + i);
         p.ugp_r_attempted = (uint8_t)(i & 1);
         p.meth_hyp = meth ? (int8_t)bit(rng) : (int8_t)-1;
+        p.probe_band = (int16_t)((int)(i % 83) - 1);  // -1 is FP_PROBE_BAND_NUM0
         sp[i] = p;
     }
     // The batch arrives in enqueue order, not regid order.
@@ -110,7 +111,7 @@ bool same_pair(const SeqPair &a, const SeqPair &b)
            a.tle == b.tle && a.gtle == b.gtle && a.qle == b.qle && a.gscore == b.gscore &&
            a.max_off == b.max_off && a.tight_band == b.tight_band && a.chain_band == b.chain_band &&
            a.ugp_walk_score == b.ugp_walk_score && a.ugp_r_attempted == b.ugp_r_attempted &&
-           a.meth_hyp == b.meth_hyp;
+           a.meth_hyp == b.meth_hyp && a.probe_band == b.probe_band;
 }
 
 bool same_batch(const std::vector<SeqPair> &a, const std::vector<SeqPair> &b)

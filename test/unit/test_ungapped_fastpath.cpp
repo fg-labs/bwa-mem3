@@ -15,7 +15,11 @@
 // blocks or the tail sends the pair to the ladder, that the tail reads and counts
 // exactly the bases in [0, N) of each sequence (buffers flush against a guard page),
 // that the run-length walk equals the per-base walk, and that a TIGHT result's score
-// is the byte walk's.
+// is the byte walk's. Through ungapped_analyze_pb it checks the certified probe rung's
+// band: equal to tight_band on a TIGHT pair, the FP_PROBE_BAND_NUM0 marker when the band
+// numerator is <= 0, set with tight_band untouched on a non-HIT pair longer than
+// FP_TIGHT_MAX, and 0 on every pair that is a HIT, an E2 fallback, ambiguous, too long,
+// or has the fast path off, over the shared scoring grid.
 //
 // Adversarial shapes:
 //   * tie at the query end: a mismatch followed by exactly b/a matches, so the
@@ -591,4 +595,185 @@ TEST_CASE("unit/ungapped_fastpath: the tail reads only [0, N) of each sequence a
         }
     }
     REQUIRE(n_masked == 112);   // 56 block positions (15 + 12 + 1 + 15 + 1 + 12) x 2 codes
+}
+
+namespace {
+
+constexpr int kUnwritten = 0x7EADBEEF;   // tight_band sentinel: the analysis must leave it as is
+constexpr int kPbUnwritten = 0x5EEDBA2D;   // probe-band preset: every pb check proves a write
+
+struct PbOut { int status, tb, pb; };
+
+// ungapped_analyze_pb with tight_band preset to kUnwritten and the probe band to
+// kPbUnwritten.
+PbOut analyze_pb(const ExtScoring &sc, const ExtPair &p, int w) {
+    PbOut o;
+    int score, qle, gscore, gtle;
+    o.tb = kUnwritten;
+    o.pb = kPbUnwritten;
+    o.status = ungapped_analyze_pb(p.query.data(), p.target.data(), (int)p.query.size(), p.h0,
+                                   sc.a, sc.b, sc.o_min(), sc.e_min(), sc.x_threshold(w), w,
+                                   sc.zdrop, &score, &qle, &gscore, &gtle, &o.tb, &o.pb);
+    return o;
+}
+
+// The probe band the header specifies for a non-HIT pair, from the byte walk (an
+// independent implementation of the floored diagonal score): FP_PROBE_BAND_NUM0 when
+// the band numerator N*a + h0 - S - o_min is <= 0, else ceil(numerator / e_min), or 0
+// when that exceeds the default band w.
+int expected_probe_band(const ExtScoring &sc, const ExtPair &p, int w) {
+    const int N = (int)p.query.size();
+    const int S = ungapped_walk_score(p.query.data(), p.target.data(), N, p.h0, sc.a, sc.b);
+    const int64_t num = (int64_t)N * sc.a + p.h0 - S - sc.o_min();
+    if (num <= 0) return FP_PROBE_BAND_NUM0;
+    const int band = (int)((num + sc.e_min() - 1) / sc.e_min());
+    return band > w ? 0 : band;
+}
+
+// A pair of length N with more than X mismatches: clustered at the start (a large
+// band numerator), at the end (a numerator <= 0 once the record is before them), or
+// at random positions.
+ExtPair non_hit_pair(std::mt19937_64 &rng, int N, int X, int shape) {
+    const int k = X + 1 + (int)(rng() % 6);
+    std::vector<int> pos;
+    for (int j = 0; j < k && j < N; ++j)
+        pos.push_back(shape == 0 ? j : shape == 1 ? N - 1 - j : (int)(rng() % (uint64_t)N));
+    return make_pair(rng, N, (int)(rng() % 20), pos, 1 + (int)(rng() % 80));
+}
+
+// Probe-band coverage counts over the grid: a band within w, a band past w (0), and
+// the NUM0 marker, overall and with e_min > 1 (where ceil and floor of the band
+// differ).
+struct PbCounts { int band = 0, over_w = 0, num0 = 0, band_e2 = 0, inexact_e2 = 0; };
+
+// Runs `reps` non-HIT pairs of length in [n_lo, n_hi] through every grid cell whose
+// fast path is on (x_threshold(w) >= 0; the probe band is 0 otherwise, see the case
+// below) and calls check(sc, p, w, o, want) on each.
+template <class Check>
+PbCounts probe_band_grid(std::mt19937_64 &rng, int n_lo, int n_hi, int reps, Check check) {
+    PbCounts c;
+    const std::vector<GridCell> g = grid();
+    for (size_t ic = 0; ic < g.size(); ++ic) {
+        const ExtScoring sc = scoring_of(g[ic]);
+        const int w = g[ic].w;
+        const int X = sc.x_threshold(w);
+        if (X < 0) continue;
+        for (int rep = 0; rep < reps; ++rep) {
+            const int N = n_lo + (int)(rng() % (uint64_t)(n_hi - n_lo + 1));
+            const ExtPair p = non_hit_pair(rng, N, X, rep % 3);
+            int actual = 0;
+            for (int j = 0; j < N; ++j) actual += (p.query[j] != p.target[j]);
+            if (actual <= X) continue;
+            const PbOut o = analyze_pb(sc, p, w);
+            const int want = expected_probe_band(sc, p, w);
+            CAPTURE(ic); CAPTURE(rep); CAPTURE(N); CAPTURE(w); CAPTURE(p.h0); CAPTURE(actual);
+            CAPTURE(sc.a); CAPTURE(sc.b); CAPTURE(sc.o_min()); CAPTURE(sc.e_min());
+            check(sc, p, w, o, want);
+            if (want == FP_PROBE_BAND_NUM0) {
+                ++c.num0;
+            } else if (want == 0) {
+                ++c.over_w;
+            } else {
+                ++c.band;
+                if (sc.e_min() > 1) {
+                    ++c.band_e2;
+                    const int S = ungapped_walk_score(p.query.data(), p.target.data(), N, p.h0, sc.a, sc.b);
+                    c.inexact_e2 += ((int64_t)N * sc.a + p.h0 - S - sc.o_min()) % sc.e_min() != 0;
+                }
+            }
+        }
+    }
+    return c;
+}
+
+void check_pb_counts(const PbCounts &c) {
+    CHECK(c.band > 100);
+    CHECK(c.over_w > 100);
+    CHECK(c.num0 > 100);
+    CHECK(c.inexact_e2 > 20);
+}
+
+} // namespace
+
+TEST_CASE("unit/ungapped_fastpath: the probe band of a short non-HIT pair is its tight_band, or the NUM0 marker"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    // N <= FP_TIGHT_MAX and too many mismatches for a HIT: TIGHT. With a band
+    // numerator > 0 the probe band equals tight_band (both 0 when the band exceeds the
+    // default w); with a numerator <= 0, tight_band is the 0 sentinel and the probe
+    // band is FP_PROBE_BAND_NUM0. Every grid scoring with the fast path on.
+    std::mt19937_64 rng(43);
+    const PbCounts c = probe_band_grid(rng, 1, FP_TIGHT_MAX, 12,
+        [](const ExtScoring &, const ExtPair &, int, const PbOut &o, int want) {
+            REQUIRE(o.status == FP_STATUS_TIGHT);
+            REQUIRE(o.pb == want);
+            REQUIRE(o.tb == (want == FP_PROBE_BAND_NUM0 ? 0 : want));
+        });
+    check_pb_counts(c);
+}
+
+TEST_CASE("unit/ungapped_fastpath: a non-HIT pair longer than FP_TIGHT_MAX falls back with only the probe band set"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    // FP_TIGHT_MAX < N <= FP_N_MAX: FALLBACK, tight_band left unwritten, the probe band
+    // set as for a short pair. The ungapped_analyze wrapper gives the same FALLBACK and
+    // also leaves tight_band unwritten. Every grid scoring with the fast path on.
+    std::mt19937_64 rng(47);
+    const PbCounts c = probe_band_grid(rng, FP_TIGHT_MAX + 1, FP_N_MAX, 12,
+        [](const ExtScoring &sc, const ExtPair &p, int w, const PbOut &o, int want) {
+            REQUIRE(o.status == FP_STATUS_FALLBACK);
+            REQUIRE(o.tb == kUnwritten);
+            REQUIRE(o.pb == want);
+            int score, qle, gscore, gtle, tb = kUnwritten;
+            REQUIRE(ungapped_analyze(p.query.data(), p.target.data(), (int)p.query.size(), p.h0,
+                                     sc.a, sc.b, sc.o_min(), sc.e_min(), sc.x_threshold(w), w,
+                                     sc.zdrop, &score, &qle, &gscore, &gtle, &tb)
+                    == FP_STATUS_FALLBACK);
+            REQUIRE(tb == kUnwritten);
+        });
+    check_pb_counts(c);
+}
+
+TEST_CASE("unit/ungapped_fastpath: HIT, E2, ambiguous, too long and fast-path-off pairs carry no probe band"
+          * doctest::test_suite("unit/ungapped_fastpath")) {
+    ExtScoring sc; sc.a = 1; sc.b = 4; sc.o_del = sc.o_ins = 6; sc.e_del = sc.e_ins = 1;
+    sc.pen_clip = 5; sc.zdrop = 100; sc.fill_mat();
+    std::mt19937_64 rng(53);
+    for (const int N : {1, 100, FP_TIGHT_MAX + 1, FP_N_MAX}) {
+        CAPTURE(N);
+        // HIT: a perfect diagonal
+        const ExtPair hit = make_pair(rng, N, 10, std::vector<int>(), 30);
+        PbOut o = analyze_pb(sc, hit, 100);
+        REQUIRE(o.status == FP_STATUS_HIT);
+        REQUIRE(o.pb == 0);
+        // E2: a HIT candidate (one mismatch, x_threshold 1) whose b*total_mis exceeds a
+        // positive zdrop
+        if (N >= 2) {
+            ExtScoring sz = sc; sz.zdrop = sc.b - 1;
+            REQUIRE(sz.x_threshold(100) == 1);
+            const ExtPair e2 = make_pair(rng, N, 10, std::vector<int>(1, N / 2), 30);
+            o = analyze_pb(sz, e2, 100);
+            REQUIRE(o.status == FP_STATUS_FALLBACK);
+            REQUIRE(o.pb == 0);
+            REQUIRE(o.tb == kUnwritten);
+        }
+        // ambiguous: an N base in an otherwise non-HIT pair
+        ExtPair amb = non_hit_pair(rng, N, sc.x_threshold(100), 0);
+        amb.query[N - 1] = 4;
+        o = analyze_pb(sc, amb, 100);
+        REQUIRE(o.status == FP_STATUS_FALLBACK);
+        REQUIRE(o.pb == 0);
+        REQUIRE(o.tb == kUnwritten);
+        // fast path off: at -w 1 x_threshold is -1 (guard E1)
+        const ExtPair nh = non_hit_pair(rng, N, sc.x_threshold(100), 0);
+        REQUIRE(sc.x_threshold(1) < 0);
+        o = analyze_pb(sc, nh, 1);
+        REQUIRE(o.status == FP_STATUS_FALLBACK);
+        REQUIRE(o.pb == 0);
+        REQUIRE(o.tb == kUnwritten);
+    }
+    // longer than FP_N_MAX
+    const ExtPair longp = non_hit_pair(rng, FP_N_MAX + 1, sc.x_threshold(100), 0);
+    const PbOut o = analyze_pb(sc, longp, 100);
+    REQUIRE(o.status == FP_STATUS_FALLBACK);
+    REQUIRE(o.pb == 0);
+    REQUIRE(o.tb == kUnwritten);
 }

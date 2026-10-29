@@ -190,7 +190,87 @@ if [ "$n_mm" -ne "$N_MM" ]; then
     echo "FAIL: built only $n_mm of $N_MM mismatch-bearing pairs (phix slicing regression?)" >&2
     exit 1
 fi
-echo "fixture: $n_pairs exact PE pairs + $n_del deletion-bearing pairs (DEL=$DEL > w0) + $n_mm mismatch-bearing pairs sliced from phix"
+
+# --- Long pairs: extensions longer than 128 bases. ---
+# The pairs above are at most 120 bp, so no extension is longer than 128 bases and
+# the certified probe rung never sees a probe band set past FP_TIGHT_MAX (128).
+# These N_LONG pairs have a 271-299 bp read1 with two substituted bases, so the
+# ungapped fast path declines their extensions longer than 128 bases and the
+# substitution-only pairs reach the rung with a probe band. Every third read1 also
+# carries a 6 bp deletion: its long extension gets probe band 0 (no band within -w
+# is proven), so it skips the rung and only the ladder scores it.
+# This block is rung-reachability coverage, checked with stderr counters in a
+# scratch build as for the mismatch-bearing pairs above. The A/B below cannot
+# detect a long pair the rung mis-certifies: mem_reg2aln re-aligns and masks the
+# extension difference. All of these long extensions land in the 16-bit tier;
+# long extensions in the 8-bit tier are covered by end-to-end runs on real reads.
+N_LONG=96
+n_long=0
+for ((i = 0; i < N_LONG; i++)); do
+    LL=$((271 + (i * 7) % 29))
+    off=$(((i * 41) % (${#seq} - LL - 520)))
+    w="${seq:$off:$((LL + 6))}"
+    if [ $((i % 3)) -eq 0 ]; then
+        w="${w:0:140}${w:146}"
+    else
+        w="${w:0:$LL}"
+    fi
+    mm="$w"
+    flip_at $((20 + i % 60))
+    flip_at $((LL - 30 - i % 50))
+    w="$mm"
+    m2fwd="${seq:$((off + 350)):150}"
+    m2="$(printf '%s' "$m2fwd" | rev | tr 'ACGT' 'TGCA')"
+    [ "${#w}" -eq "$LL" ] && [ "${#m2}" -eq 150 ] || continue
+    q1="$(printf 'I%.0s' $(seq 1 "$LL"))"
+    q2="$(printf 'I%.0s' $(seq 1 150))"
+    printf '@long%d/1\n%s\n+\n%s\n' "$n_long" "$w" "$q1" >> "$r1"
+    printf '@long%d/2\n%s\n+\n%s\n' "$n_long" "$m2" "$q2" >> "$r2"
+    n_long=$((n_long + 1))
+done
+if [ "$n_long" -ne "$N_LONG" ]; then
+    echo "FAIL: built only $n_long of $N_LONG long pairs (phix slicing regression?)" >&2
+    exit 1
+fi
+
+# --- Ungapped-optimal pairs: a band numerator <= 0. ---
+# Each read carries two substitutions two bases apart, e = 0..2 bases from each
+# end, so every extension's ungapped record comes before its last e + 3 bases.
+# At default scoring that makes the band numerator e + 3 - o_min <= 0: tight_band
+# keeps its 0 sentinel and the probe band is the FP_PROBE_BAND_NUM0 marker, which
+# the rung runs at its clip slack. No pair above reaches the rung with the marker
+# (a mismatch-bearing pair's second substitution is SUB_STEP bp in).
+# Like the long pairs, this block is rung-reachability coverage, checked with
+# stderr counters in a scratch build: the A/B below cannot detect a marker pair the
+# rung mis-certifies, because mem_reg2aln re-aligns and masks the difference.
+N_NUM0=64
+n_num0=0
+for ((j = 0; j < N_NUM0; j++)); do
+    off=$(((j * 53 + 11) % span))
+    e=$((j % 3))
+    mm="${seq:off:L}"
+    flip_at "$e"
+    flip_at $((e + 2))
+    flip_at $((L - 1 - e))
+    flip_at $((L - 3 - e))
+    m1="$mm"
+    p2=$((off + G))
+    mm="${rcseq:N-p2-L:L}"
+    flip_at "$e"
+    flip_at $((e + 2))
+    flip_at $((L - 1 - e))
+    flip_at $((L - 3 - e))
+    m2="$mm"
+    [ "${#m1}" -eq "$L" ] && [ "${#m2}" -eq "$L" ] || continue
+    printf '@num0_%d/1\n%s\n+\n%s\n' "$n_num0" "$m1" "$q" >> "$r1"
+    printf '@num0_%d/2\n%s\n+\n%s\n' "$n_num0" "$m2" "$q" >> "$r2"
+    n_num0=$((n_num0 + 1))
+done
+if [ "$n_num0" -ne "$N_NUM0" ]; then
+    echo "FAIL: built only $n_num0 of $N_NUM0 ungapped-optimal pairs (phix slicing regression?)" >&2
+    exit 1
+fi
+echo "fixture: $n_pairs exact PE pairs + $n_del deletion-bearing pairs (DEL=$DEL > w0) + $n_mm mismatch-bearing pairs + $n_long long pairs + $n_num0 ungapped-optimal pairs sliced from phix"
 
 # --- Index the reference. ---
 "$BWA_MEM3" index "$ref" > "$BAND_CERT_WORK_DIR/index.log" 2>&1
