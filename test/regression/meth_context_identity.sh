@@ -185,7 +185,9 @@ run() {
         inputs=(se.fq)
         extra=(-k 15 -T 15)
     fi
-    local -a pre=(env)
+    # Native legs run with the caller's BWAMEM3_FORCE_TIER unset, at the host
+    # tier simd_sweep_tiers read; a forced leg sets its own below.
+    local -a pre=(env -u BWAMEM3_FORCE_TIER)
     [ "$tier" != "-" ] && pre+=("BWAMEM3_FORCE_TIER=$tier" "BWAMEM3_DEBUG_SIMD=1")
     [ "$envkv" != "-" ] && pre+=("$envkv")
     "${pre[@]}" "$bin" mem -t 1 ${extra[@]+"${extra[@]}"} "$@" "$ref" "${inputs[@]}" \
@@ -196,7 +198,7 @@ run() {
         # An ignored force would compare native output with itself: confirm from
         # this run's own log that the tier it ran at is the one it was told to.
         local active
-        active="$(sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' "$out.log" | head -1)"
+        active="$(simd_parse_tier "$out.log")"
         [ "$active" = "$tier" ] \
             || fail "$out: BWAMEM3_FORCE_TIER=$tier was not honoured (active tier '${active:-none}')"
     fi

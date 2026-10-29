@@ -36,9 +36,8 @@ static char *per_line_baseline(const std::vector<std::string> &lines, char *hdr)
 
 static std::string write_tmp(const std::vector<std::string> &lines)
 {
-    char tmpl[4096];
-    if (bwa_test_temp_template(tmpl, sizeof tmpl, "bwa_hdr_test") != 0) abort();
-    int fd = mkstemp(tmpl);
+    char tmpl[BWA_TEST_PATH_MAX];
+    int fd = bwa_test_mkstemp(tmpl, sizeof tmpl, "bwa_hdr_test");
     assert(fd >= 0);
     FILE *fp = fdopen(fd, "w");
     assert(fp != nullptr);

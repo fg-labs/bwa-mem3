@@ -1,17 +1,20 @@
 // test/unit/test_temp_index.cpp
 //
 // Self-checks for the scratch-file helpers in test/framework/ that other unit
-// tests build on: TempDir removes what it made, StderrCapture and QuietStderr
+// tests build on: TempDir and the temp_path.h calls create their files under
+// $TMPDIR, TempDir removes what it made, StderrCapture and QuietStderr
 // restore stderr, and TempIndex builds and loads an index whose contig table,
 // ambiguity runs and packed sequence match the contigs it was given. A helper
 // that drifted would show up here rather than as a wrong expectation elsewhere.
 
 #include "doctest/doctest.h"
 #include "run_in_child.h"
+#include "scoped_env.h"
 #include "stderr_capture.h"
 #include "temp_dir.h"
 #include "temp_index.h"
 
+#include <dirent.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -19,6 +22,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -103,6 +108,75 @@ TEST_CASE("TempDir: makes a fresh directory per object and removes its files"
     }
     CHECK_FALSE(exists(file));
     CHECK_FALSE(exists(path));
+}
+
+TEST_CASE("TempDir: a forked child that destroys one leaves the parent's directory"
+          * doctest::test_suite("unit/test_framework")) {
+    // A child of run_in_child that exits through exit() (err_fatal, say) runs
+    // the static destructors it inherited, so a long-lived TempDir (a static
+    // test fixture) is destroyed in the child too; it must not remove the
+    // directory the parent still uses.
+    std::unique_ptr<bwa_tests::TempDir> dir(new bwa_tests::TempDir);
+    dir->write("x.txt", "hello\n");
+    const std::string file = dir->file("x.txt");
+    const int status = bwa_tests::run_in_child([&dir] {
+        dir.reset();
+        _exit(0);
+    });
+    CHECK((WIFEXITED(status) && WEXITSTATUS(status) == 0));
+    CHECK(exists(file));
+    const std::string path = dir->path();
+    dir.reset();   // the parent's own destructor still removes it
+    CHECK_FALSE(exists(path));
+}
+
+TEST_CASE("TempDir and temp_path.h: scratch paths go under $TMPDIR"
+          * doctest::test_suite("unit/test_framework")) {
+    bwa_tests::TempDir root("tmpdir_root");
+    auto under = [&](const std::string &path, const char *prefix) {
+        const std::string want = root.path() + "/" + prefix + ".";
+        return path.compare(0, want.size(), want) == 0 && path.size() == want.size() + 6;
+    };
+    // With and without a trailing slash, every helper names "<TMPDIR>/<prefix>.XXXXXX".
+    for (const std::string tmpdir : {root.path(), root.path() + "/"}) {
+        CAPTURE(tmpdir);
+        bwa_tests::ScopedEnv env("TMPDIR", tmpdir.c_str());
+        CHECK(bwa_tests::temp_root() == root.path() + "/");
+        {
+            bwa_tests::TempDir d("td");
+            CHECK(under(d.path(), "td"));
+        }
+        char buf[BWA_TEST_PATH_MAX];
+        REQUIRE(bwa_test_temp_template(buf, sizeof buf, "tt") == 0);
+        CHECK(std::string(buf) == root.path() + "/tt.XXXXXX");
+        const int fd = bwa_test_mkstemp(buf, sizeof buf, "ms");
+        REQUIRE(fd >= 0);
+        close(fd);
+        CHECK(under(buf, "ms"));
+        CHECK(unlink(buf) == 0);
+        REQUIRE(bwa_test_mkdtemp(buf, sizeof buf, "md") == 0);
+        CHECK(under(buf, "md"));
+        CHECK(bwa_test_remove_flat_dir(buf) == 0);
+        const int anon = bwa_tests::anon_temp_fd("af");
+        CHECK(anon >= 0);
+        if (anon >= 0) close(anon);
+    }
+    // Nothing is left in the root: TempDir removed its own directory,
+    // anon_temp_fd unlinked its file, and the loop removed the rest.
+    int left = 0;
+    if (DIR *d = opendir(root.path().c_str())) {
+        while (struct dirent *e = readdir(d))
+            if (strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0) ++left;
+        closedir(d);
+    }
+    CHECK(left == 0);
+
+    // A template that does not fit is refused rather than truncated.
+    char small[8];
+    {
+        bwa_tests::QuietStderr quiet;
+        CHECK(bwa_test_temp_template(small, sizeof small, "much_too_long") == -1);
+    }
 }
 
 TEST_CASE("StderrCapture: returns what was written and restores stderr"

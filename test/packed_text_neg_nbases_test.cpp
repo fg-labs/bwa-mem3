@@ -19,9 +19,8 @@
 #include <unistd.h>
 
 int main() {
-    char path[4096];
-    if (bwa_test_temp_template(path, sizeof path, "pt_neg_nbases") != 0) return 1;
-    int fd = mkstemp(path);
+    char path[BWA_TEST_PATH_MAX];
+    int fd = bwa_test_mkstemp(path, sizeof path, "pt_neg_nbases");
     if (fd < 0) { perror("mkstemp"); return 1; }
     const char pac[8] = {0};
     if (write(fd, pac, sizeof(pac)) != (ssize_t)sizeof(pac)) { perror("write"); return 1; }

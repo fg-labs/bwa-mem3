@@ -225,7 +225,7 @@ if [ -n "$host_tier" ]; then
             # the tier actually used, not the host's native tier.
             BWAMEM3_DEBUG_SIMD=1 BWAMEM3_FORCE_TIER="$t" "$BWA_MEM3" mem "$ref" "$r1" "$r2" 2> "$terr" \
                 | grep -v '^@PG' > "$tsam"
-            eff_tier="$(sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' "$terr" | head -1)"
+            eff_tier="$(simd_parse_tier "$terr")"
             if [ "$eff_tier" != "$t" ]; then
                 echo "FAIL: forced tier '$t' but dispatcher ran '${eff_tier:-<none>}' — cross-tier band_cert coverage would be vacuous" >&2
                 exit 1

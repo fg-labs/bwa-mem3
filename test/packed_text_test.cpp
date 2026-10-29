@@ -29,9 +29,8 @@ int main() {
         _set_pac(pac, l, l & 3);
     }
     // Spill to tmp file and mmap.
-    char path[4096];
-    if (bwa_test_temp_template(path, sizeof path, "packed_text_test") != 0) abort();
-    int fd = mkstemp(path);
+    char path[BWA_TEST_PATH_MAX];
+    int fd = bwa_test_mkstemp(path, sizeof path, "packed_text_test");
     CHECK(fd >= 0);
     ssize_t nw = write(fd, pac, sizeof(pac));
     CHECK(nw == (ssize_t)sizeof(pac));
@@ -72,9 +71,8 @@ int main() {
     // Zero-byte pac: n_bases == 0 means the file has zero bytes, and
     // mmap(length=0) is EINVAL on Linux. PackedText must short-circuit
     // and instantiate cleanly with data_ == nullptr / n_ == 0.
-    char zpath[4096];
-    if (bwa_test_temp_template(zpath, sizeof zpath, "packed_text_test_zero") != 0) abort();
-    int zfd = mkstemp(zpath);
+    char zpath[BWA_TEST_PATH_MAX];
+    int zfd = bwa_test_mkstemp(zpath, sizeof zpath, "packed_text_test_zero");
     CHECK(zfd >= 0);
     close(zfd);
     {

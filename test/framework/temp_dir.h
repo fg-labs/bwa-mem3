@@ -32,10 +32,8 @@ inline std::string temp_root() {
 // behind however the test ends), or -1 if mkstemp or the unlink fails. A
 // failed unlink closes the descriptor and names the leftover file on stderr.
 inline int anon_temp_fd(const std::string &prefix = "bwa_mem3_test") {
-    const std::string tmpl = temp_root() + prefix + ".XXXXXX";
-    std::vector<char> buf(tmpl.begin(), tmpl.end());
-    buf.push_back('\0');
-    const int fd = mkstemp(buf.data());
+    std::vector<char> buf(BWA_TEST_PATH_MAX);
+    const int fd = bwa_test_mkstemp(buf.data(), buf.size(), prefix.c_str());
     if (fd < 0) return -1;
     if (unlink(buf.data()) != 0) {
         const int err = errno;
@@ -51,16 +49,19 @@ inline int anon_temp_fd(const std::string &prefix = "bwa_mem3_test") {
 // concurrent unit-test shards never collide), removed with every regular file
 // in it on destruction. Flat: a test that makes subdirectories removes them;
 // a directory left non-empty is reported on stderr rather than leaked silently.
+// Only the process that made it removes it: a forked child (run_in_child.h)
+// that exits through exit() runs the static destructors it inherited, and must
+// not take a long-lived fixture's directory away from the parent.
 class TempDir {
 public:
     explicit TempDir(const std::string &prefix = "bwa_mem3_test") {
-        const std::string tmpl = temp_root() + prefix + ".XXXXXX";
-        std::vector<char> buf(tmpl.begin(), tmpl.end());
-        buf.push_back('\0');
-        if (mkdtemp(buf.data()) == NULL) throw std::runtime_error("mkdtemp failed for " + tmpl);
+        std::vector<char> buf(BWA_TEST_PATH_MAX);
+        if (bwa_test_mkdtemp(buf.data(), buf.size(), prefix.c_str()) != 0)
+            throw std::runtime_error("cannot create a scratch directory under " + temp_root());
         path_ = buf.data();
     }
     ~TempDir() {
+        if (getpid() != owner_) return;
         if (bwa_test_remove_flat_dir(path_.c_str()) != 0)
             fprintf(stderr, "warning: TempDir could not remove %s: %s\n", path_.c_str(), strerror(errno));
     }
@@ -79,6 +80,7 @@ public:
     }
 private:
     std::string path_;
+    pid_t owner_ = getpid();
 };
 
 } // namespace bwa_tests

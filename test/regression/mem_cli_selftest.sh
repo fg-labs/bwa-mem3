@@ -2,15 +2,23 @@
 # test/regression/mem_cli_selftest.sh
 #
 # Self-test for the shared shell helpers the mem CLI scripts are built on
-# (test/framework/mem_cli.sh and test/framework/simd_tiers.sh). A helper that
+# (test/framework/mem_cli.sh, test/framework/simd_tiers.sh and
+# test/framework/dna.sh). A helper that
 # stopped failing would make every script on it pass without checking
 # anything, so each one is driven here with inputs whose answer is known:
 #
 #   simd_sweep_tiers   stub binaries reporting each dispatcher tier, and one
 #                      reporting garbage: avx512bw -> avx2 avx512bw, avx2 ->
-#                      avx2, sse41 -> none, neon -> neon, garbage -> status 2;
-#                      a BWAMEM3_FORCE_TIER in the caller's environment is
-#                      ignored.
+#                      avx2, sse41 -> none, scalar -> none, neon -> neon,
+#                      garbage -> status 2; a BWAMEM3_FORCE_TIER in the
+#                      caller's environment is ignored, and a sweep entry
+#                      with no rank is skipped.
+#   simd_detect_tier   a forced tier is reported as forced (avx2 on an
+#                      avx512bw stub).
+#   simd_tier_rank     scalar < sse41 < ... < avx512bw < neon; -1 for an
+#                      unknown name.
+#   simd_parse_tier    the tier of the first "SIMD tier:" line, or nothing.
+#   dna_revcomp        reverses and complements, keeping case, N and '-'.
 #   mem_cli_init       MEM_CLI_TIERS that is whitespace only, names an
 #                      unknown tier or names a tier twice ends the script
 #                      with FAIL; an empty one counts as unset; a host below
@@ -83,6 +91,14 @@ got="$(
     simd_sweep_tiers "$bin" && echo "$SIMD_HOST_TIER:${SIMD_TIERS[*]-}"
 )"
 check "simd_sweep_tiers on a scalar host: detected, nothing to sweep" "scalar:" "$got"
+bin="$(stub avx2)"
+got="$(
+    # shellcheck source=test/framework/simd_tiers.sh
+    source "$framework/simd_tiers.sh"
+    SIMD_SWEEP_TIERS=(avx2 bogus neon)
+    simd_sweep_tiers "$bin" && echo "${SIMD_TIERS[*]-}"
+)"
+check "simd_sweep_tiers skips a sweep entry it cannot rank" avx2 "$got"
 
 # --- simd_detect_tier and simd_tier_rank ------------------------------------
 # A stub whose dispatcher reports the forced tier, or avx512bw unforced.
@@ -109,6 +125,13 @@ got="$(
     for t in scalar sse41 sse42 avx avx2 avx512bw neon bogus; do printf '%s ' "$(simd_tier_rank "$t")"; done
 )"
 check "simd_tier_rank orders the tiers and gives -1 for an unknown name" "0 1 2 3 4 5 6 -1 " "$got"
+printf 'x\n[M::main] SIMD tier: avx2 (build baseline: x)\n[M::main] SIMD tier: neon\n' > "$work/tiers.log"
+got="$(
+    # shellcheck source=test/framework/simd_tiers.sh
+    source "$framework/simd_tiers.sh"
+    printf '%s|%s' "$(simd_parse_tier "$work/tiers.log")" "$(simd_parse_tier /dev/null)"
+)"
+check "simd_parse_tier: the first SIMD tier line's tier, else nothing" "avx2|" "$got"
 
 # --- mem_cli_init and mem_cli_verdict (each in its own script) -------------
 # run_script <name> <env...> -- <body>: runs a script that sources mem_cli.sh;

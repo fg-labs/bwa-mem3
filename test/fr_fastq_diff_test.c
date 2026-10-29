@@ -145,9 +145,8 @@ static void report_field(const char *which, int rec, const field_t *k, const fie
 
 static void run_case(const char *name, const char *payload, size_t len)
 {
-    char path[4096];
-    if (bwa_test_temp_template(path, sizeof path, "fr_fastq_diff") != 0) abort();
-    int fd = mkstemp(path);
+    char path[BWA_TEST_PATH_MAX];
+    int fd = bwa_test_mkstemp(path, sizeof path, "fr_fastq_diff");
     assert(fd >= 0);
     { size_t off = 0; while (off < len) { ssize_t w = write(fd, payload + off, len - off); assert(w > 0); off += (size_t)w; } }
     close(fd);

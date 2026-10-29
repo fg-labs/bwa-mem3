@@ -1,17 +1,23 @@
 /* test/framework/temp_path.h
  *
- * Scratch files and directories for the standalone C tests in test/ (C++
- * tests use temp_dir.h, which builds on this). C99, header-only.
+ * Scratch files and directories under $TMPDIR, as a C99 header-only API, so
+ * that the standalone C tests in test/ and any C++ test that wants a plain
+ * path in a char buffer (e.g. one it hands to a child process) share one
+ * template and cleanup. temp_dir.h's TempDir and anon_temp_fd build on it.
  */
 
 #ifndef BWA_TESTS_TEMP_PATH_H
 #define BWA_TESTS_TEMP_PATH_H
 
 #include <dirent.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+/* Buffer size for a scratch path (the template, or a file in a scratch dir). */
+#define BWA_TEST_PATH_MAX 4096
 
 /* The scratch root: $TMPDIR when set and non-empty, else /tmp. CI points
  * TMPDIR at a writable scratch area, and /tmp is RAM-backed on several
@@ -46,6 +52,28 @@ static inline char *bwa_test_temp_alloc(const char *prefix)
     return buf;
 }
 
+/* Creates a fresh scratch file and leaves its path in buf (size n). Returns
+ * the open fd, or -1 with a message on stderr. */
+static inline int bwa_test_mkstemp(char *buf, size_t n, const char *prefix)
+{
+    if (bwa_test_temp_template(buf, n, prefix) != 0) return -1;
+    const int fd = mkstemp(buf);
+    if (fd < 0) fprintf(stderr, "FAIL: mkstemp(%s): %s\n", buf, strerror(errno));
+    return fd;
+}
+
+/* Creates a fresh scratch directory and leaves its path in buf (size n).
+ * Returns 0, or -1 with a message on stderr. */
+static inline int bwa_test_mkdtemp(char *buf, size_t n, const char *prefix)
+{
+    if (bwa_test_temp_template(buf, n, prefix) != 0) return -1;
+    if (mkdtemp(buf) == NULL) {
+        fprintf(stderr, "FAIL: mkdtemp(%s): %s\n", buf, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
 /* Removes every entry of `dir` (it must hold only regular files) and then
  * `dir` itself. Returns rmdir's result: 0, or -1 with errno set. */
 static inline int bwa_test_remove_flat_dir(const char *dir)
@@ -53,7 +81,7 @@ static inline int bwa_test_remove_flat_dir(const char *dir)
     DIR *d = opendir(dir);
     if (d != NULL) {
         struct dirent *e;
-        char path[4096];
+        char path[BWA_TEST_PATH_MAX];
         while ((e = readdir(d)) != NULL) {
             if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
             if (snprintf(path, sizeof path, "%s/%s", dir, e->d_name) < (int)sizeof path) unlink(path);

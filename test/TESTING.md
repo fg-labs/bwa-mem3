@@ -210,7 +210,7 @@ For a test using `std::mt19937(seed)`, reproduce locally by editing the seed and
 | `framework/junit_reporter.h`     | CI matrix-row banner                           |
 | `framework/test_main.cpp`        | Shared `main()` (single doctest IMPL TU)       |
 | `framework/temp_dir.h`           | `TempDir`: scratch directory, removed on destruction; `anon_temp_fd`: an already-unlinked scratch file |
-| `framework/temp_path.h`          | C99 scratch paths under `$TMPDIR` for the standalone C tests in `test/` (`temp_dir.h` builds on it) |
+| `framework/temp_path.h`          | C99 scratch files and directories under `$TMPDIR` (`bwa_test_mkstemp`, `bwa_test_mkdtemp`, `bwa_test_temp_template`), for the standalone C tests and any test that wants a plain path in a buffer; `temp_dir.h` builds on it |
 | `framework/stderr_capture.h`     | `StderrCapture`, `QuietStderr`: scoped stderr redirection |
 | `framework/temp_index.h`         | `TempIndex`: a real index of test contigs, built and loaded in a `TempDir`; `nt4`, `revcomp` |
 | `framework/simd_tiers.sh`        | `simd_sweep_tiers`: the SIMD tiers a regression script sweeps; `simd_detect_tier`, `simd_tier_rank`: the tier a binary dispatches to, and tier order |

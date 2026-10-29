@@ -57,18 +57,27 @@ simd_tier_rank() {
     echo -1
 }
 
+# simd_parse_tier <file>
+#   Prints the tier named by the first BWAMEM3_DEBUG_SIMD "SIMD tier: <tier>"
+#   line in <file>, or nothing. A run's own stderr, kept with
+#   BWAMEM3_DEBUG_SIMD=1, shows the tier it ran at after any force.
+simd_parse_tier() {
+    sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' "$1" | head -n 1
+}
+
 # simd_detect_tier <command...>
 #   Runs <command...> (a bwa-mem3 binary, optionally behind `env ...`) with
 #   BWAMEM3_DEBUG_SIMD=1 and sets SIMD_HOST_TIER to the tier its dispatcher
-#   reports, so a BWAMEM3_FORCE_TIER in the environment counts. Returns 2, with
-#   the dispatcher's output on stderr, when that is not a tier in
-#   SIMD_KNOWN_TIERS.
+#   reports. A BWAMEM3_FORCE_TIER in the environment counts, so SIMD_HOST_TIER
+#   is then the forced tier, not the host's own (simd_sweep_tiers unsets it to
+#   read the host's). Returns 2, with the dispatcher's output on stderr, when
+#   that is not a tier in SIMD_KNOWN_TIERS.
 simd_detect_tier() {
     local raw
     # bwa-mem3 with no args prints usage and exits non-zero; the dispatcher's
     # debug line goes to stderr.
     raw="$(BWAMEM3_DEBUG_SIMD=1 "$@" 2>&1 || true)"
-    SIMD_HOST_TIER="$(printf '%s\n' "$raw" | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -n 1)"
+    SIMD_HOST_TIER="$(simd_parse_tier <(printf '%s\n' "$raw"))"
     if [[ $(simd_tier_rank "$SIMD_HOST_TIER") -lt 0 ]]; then
         echo "FAIL: could not detect host SIMD tier from BWAMEM3_DEBUG_SIMD output" >&2
         echo "  parsed tier '$SIMD_HOST_TIER' (expected one of: ${SIMD_KNOWN_TIERS[*]})" >&2
@@ -99,10 +108,13 @@ simd_sweep_tiers() {
     # the host tier matches: an sse41 host never appears in the sweep list, so
     # such a walk would never stop and would "test" tiers above the host, which
     # BWAMEM3_FORCE_TIER (downgrade-only) refuses.
-    local host_rank t
+    # A sweep entry missing from SIMD_KNOWN_TIERS (rank -1) is skipped, not
+    # swept as if it were below every tier.
+    local host_rank rank t
     host_rank="$(simd_tier_rank "$SIMD_HOST_TIER")"
     for t in "${SIMD_SWEEP_TIERS[@]}"; do
         [[ $t == neon ]] && continue
-        if [[ $(simd_tier_rank "$t") -le $host_rank ]]; then SIMD_TIERS+=("$t"); fi
+        rank="$(simd_tier_rank "$t")"
+        if [[ $rank -ge 0 && $rank -le $host_rank ]]; then SIMD_TIERS+=("$t"); fi
     done
 }
