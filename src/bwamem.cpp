@@ -3314,11 +3314,12 @@ static inline void chain_init_new(mem_chain_t *tmp_, const bntseq_t *chain_bns,
  * (single pass, no buffering), while the opt-in reorder modes materialize all
  * seeds, order them, then replay them through here. Behaviour is identical to
  * the previous inline body; only the call site differs. */
-static inline void chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
-                                      const bntseq_t *chain_bns, kbtree_t(chn) *tree,
-                                      ChainSeedPool &pool, int seqid,
-                                      const mem_seed_t *seed_in,
-                                      int rid, int8_t meth_hyp)
+static inline __attribute__((always_inline)) void
+chain_add_one_seed(const mem_opt_t *opt, int64_t l_pac,
+                   const bntseq_t *chain_bns, kbtree_t(chn) *tree,
+                   ChainSeedPool &pool, int seqid,
+                   const mem_seed_t *seed_in,
+                   int rid, int8_t meth_hyp)
 {
     /* CHN-15: no local `mem_seed_t s = *seed_in` copy -- seed_in is const and is
      * never mutated here (test_and_merge takes const mem_seed_t*), so the probe
@@ -3405,9 +3406,10 @@ struct ChainFlat {
         active = true;
     }
     /* Chain one seed. TIE / CAP: the tree must take this read (nothing mutated). */
-    inline Verdict add(const mem_opt_t *opt, int64_t l_pac, const bntseq_t *chain_bns,
-                       ChainSeedPool &pool, int seqid, const mem_seed_t *seed_in, int rid,
-                       int8_t meth_hyp)
+    inline __attribute__((always_inline)) Verdict
+    add(const mem_opt_t *opt, int64_t l_pac, const bntseq_t *chain_bns,
+        ChainSeedPool &pool, int seqid, const mem_seed_t *seed_in, int rid,
+        int8_t meth_hyp)
     {
         const int64_t pos = seed_in->rbeg;
         /* Unpackable position (outside [0, 2^43); no real genome reaches it): the tree
@@ -3441,12 +3443,17 @@ struct ChainFlat {
  * for the rest of the read once the flat index declines. `prefix` is NULL when
  * seeds stream in (they are logged for a replay); the reorder path passes its
  * already-materialized recs[0, prefix_n) -- this seed last -- and is replayed
- * from them instead of a second copy. */
-static inline void chain_add_seed(ChainFlat &cf, const mem_opt_t *opt, int64_t l_pac,
-                                  const bntseq_t *chain_bns, kbtree_t(chn) *tree,
-                                  ChainSeedPool &pool, int seqid,
-                                  const mem_seed_t *seed_in, int rid, int8_t meth_hyp,
-                                  const seed_rec_t *prefix = NULL, int64_t prefix_n = 0)
+ * from them instead of a second copy.
+ *
+ * This, ChainFlat::add and chain_add_one_seed run once per resolved seed, and
+ * clang keeps all three out of line under plain `inline`; always_inline folds
+ * the whole per-seed walk into mem_chain_seeds. */
+static inline __attribute__((always_inline)) void
+chain_add_seed(ChainFlat &cf, const mem_opt_t *opt, int64_t l_pac,
+               const bntseq_t *chain_bns, kbtree_t(chn) *tree,
+               ChainSeedPool &pool, int seqid,
+               const mem_seed_t *seed_in, int rid, int8_t meth_hyp,
+               const seed_rec_t *prefix = NULL, int64_t prefix_n = 0)
 {
     if (cf.active) {
         if (prefix == NULL) {
