@@ -20,7 +20,7 @@
 /* Upper bound on the runtime width. Sizes the driver's on-stack slot array
  * (BatchSlot slots[SMEM_LOCKSTEP_N_MAX]) and caps the value the startup
  * memory-level-parallelism probe may select. Raise only in step with the
- * stack-array cost (~80 B per slot). */
+ * stack-array cost (160 B per slot). */
 #ifndef SMEM_LOCKSTEP_N_MAX
 #define SMEM_LOCKSTEP_N_MAX 64
 #endif
@@ -32,12 +32,12 @@
  * out of bounds, so reject it at compile time rather than miscompile.
  *
  * The upper bound is a STORAGE-safe cap, not merely INT32_MAX: both the
- * driver's BatchSlot slots[SMEM_LOCKSTEP_N_MAX] (~100 B/slot, FMI_search.cpp)
+ * driver's BatchSlot slots[SMEM_LOCKSTEP_N_MAX] (160 B/slot, FMI_search.cpp)
  * and the probe's uint64_t cur[SMEM_LOCKSTEP_N_MAX] (8 B/slot, lockstep_width.cpp)
  * are fixed-size STACK arrays sized by this bound. An INT32_MAX bound is
  * representable in int32_t but would demand a multi-gigabyte stack frame and
  * crash before the probe ever runs. Cap the override at a width whose
- * worst-case frame (~28 KB at 256) is safe on any thread stack, while still
+ * worst-case frame (~43 KB at 256) is safe on any thread stack, while still
  * leaving 4x headroom over the shipped default 64. */
 #define SMEM_LOCKSTEP_N_MAX_CAP 256
 #if !(SMEM_LOCKSTEP_N >= 1 && SMEM_LOCKSTEP_N <= SMEM_LOCKSTEP_N_MAX && SMEM_LOCKSTEP_N_MAX <= SMEM_LOCKSTEP_N_MAX_CAP)

@@ -667,7 +667,6 @@ private:
                       const uint8_t *enc_qdb,
                       BsdFirstWalkHint *bsd_hint);
     void ls_prefetch_cp_occ(const BatchSlot *s);
-    void ls_prefetch_cp_occ_t1(const BatchSlot *s);
     inline void ls_bsd_note(BatchSlot *s, int64_t k, int64_t l, int64_t sz);
     void ls_bsd_resolve(BatchSlot *s, const uint8_t *enc_qdb, int32_t p);
     void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
@@ -695,7 +694,6 @@ private:
                        int32_t minSeedLen,
                        const BsdFirstWalkHint *bsd_hint);
     void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
-    void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
     void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
                        const SeedJumpEntry *jlev, int32_t jd);
     void bsd_advance_step(BwtSeedSlot *s,

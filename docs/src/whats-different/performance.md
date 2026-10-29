@@ -273,7 +273,13 @@ AWS Graviton 4 (arm64, NEON tier). The AVX2 tier was checked on the WGS slice
   mask selects, instead of branching on the lookahead slot's phase. It now warms
   only the two blocks the slot reads next (the forward interval's `l` / `l + s`,
   or the first backward interval's `k` / `k + s`) rather than all four blocks of
-  the forward interval or both blocks of every backward interval.
+  the forward interval or both blocks of every backward interval. (Both lockstep
+  seeding drivers have since dropped this cross-slot prefetch in
+  [PR #676](https://github.com/fg-labs/bwa-mem3/pull/676): each slot's own
+  end-of-step prefetch already covers what it reads next. Dropping it measured
+  −2.13% wall on Sapphire Rapids (AVX-512BW), −1.11% on Zen 3 (AVX2) and −1.53%
+  on Graviton 4 (NEON), whole aligner at `-t 16` on a 5M-pair WGS slice, clang
+  19.1.7, so the figures below include a prefetch that is now gone.)
 
 Whole-aligner wall at `-t 16`, clang 19.1.7, against the previous `main`, mean
 paired difference of 4-8 interleaved reps per arm ± its standard error: AMD
