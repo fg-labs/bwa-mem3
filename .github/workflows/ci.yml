@@ -2306,10 +2306,17 @@ jobs:
           # the environment, which its `CXXFLAGS ?=` default yields to and its
           # `LDFLAGS +=` appends the htslib link flags to.
           "$GITHUB_WORKSPACE/bwa-mem3" index test/fixtures/phix.fa
+          # The SMEM parity test goes with it: its Case 21 fills each slot's
+          # prev buffer down to its base. All slots' prev buffers share one
+          # allocation, so an entry written one below slot 0's base lands
+          # before it, which changes no output and only asan sees; one written
+          # into the next-lower slot's buffer is in bounds for asan, and the
+          # case's parity check catches it instead.
           CXXFLAGS="-std=c++11 -O1 -g -fopenmp -mavx2 -fsanitize=address -fno-omit-frame-pointer" \
           LDFLAGS="-fsanitize=address" \
-            make -C test CXX=clang++-19 bwtseed_lockstep_parity_test
+            make -C test CXX=clang++-19 bwtseed_lockstep_parity_test smem_lockstep_parity_test
           (cd test && ./bwtseed_lockstep_parity_test fixtures/phix.fa)
+          (cd test && ./smem_lockstep_parity_test fixtures/phix.fa)
           # The pre-load input check returns early from mem; run its
           # regression against the asan binary so a memory error on that
           # return, or in the -p / URL / `<cmd` legs, fails the job.
@@ -2795,7 +2802,7 @@ jobs:
           make -j"$(nproc)" ASAN=1 arch=avx2 CXX=clang++-19 test-binaries
           CXXFLAGS="-std=c++11 -O1 -g -fopenmp -mavx2 -fsanitize=address -fno-omit-frame-pointer" \
           LDFLAGS="-fsanitize=address" \
-            make -C test CXX=clang++-19 bwtseed_lockstep_parity_test
+            make -C test CXX=clang++-19 bwtseed_lockstep_parity_test smem_lockstep_parity_test
 
       - name: Build (MSan padded-lane gate)
         if: matrix.kind == 'msan'

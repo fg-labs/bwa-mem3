@@ -1380,12 +1380,12 @@ struct LockstepSmemCache {
 };
 
 // LISA trick #4: hybrid SoA. The per-slot "hot" state stays compact
-// (160 bytes) so the driver's pass over slots[0..N) hits a tight
+// (168 bytes) so the driver's pass over slots[0..N) hits a tight
 // L1-resident array instead of jumping 32KB strides across embedded
 // buffers. The bulk arrays (prev[], match_buf[]; ~32 KB each) live in
-// separate per-slot allocations, referenced by pointer. Accessor syntax
-// (s->prev[i], s->match_buf[i]) is unchanged from the embedded-array
-// version.
+// separate per-slot allocations, referenced by pointer (prev and prev_top
+// bound the slot's prev entries; the forward phase writes them downward
+// from prev_top, see the members below).
 struct FMI_search::BatchSlot {
     // Input identity — copied at init, never mutated thereafter.
     int32_t input_idx;           // index into the caller's input arrays
@@ -1409,9 +1409,15 @@ struct FMI_search::BatchSlot {
     int32_t match_count;
     bool    ready;
 
-    // Pointers into per-slot bulk arrays (allocated by the driver, sized
-    // by max_readlength).
+    // Per-slot bulk arrays (driver-allocated, >= max_readlength entries). The
+    // forward phase writes its prev entries downward from prev_top (one past
+    // the slot's prev buffer); a walk from start_pos makes at most readlength -
+    // start_pos <= max_readlength of them, so the last, lowest one is at or
+    // above the buffer's base. ls_prepare_backward points prev at it, leaving
+    // prev[0..numPrev) in the reversed order the scalar path builds by
+    // swapping, with no swap; the backward phase reads and compacts via prev.
     SMEM    *prev;
+    SMEM    *prev_top;
     SMEM    *match_buf;
 
     // Unique-match text compare (PH_S1_LF, PH_S1_CMP): the LF walk's current
@@ -1610,7 +1616,8 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
     if (s->j >= s->readlength) {
         // Ran off the end of the read; keep the still-valid smem if any.
         if (s->smem.s >= s->min_intv) {
-            s->prev[s->numPrev++] = s->smem;
+            s->prev_top[-1 - s->numPrev] = s->smem;
+            s->numPrev++;
         }
         if (s->bsd_j != INT32_MAX) ls_bsd_resolve(s, enc_qdb, s->j);
         s->phase = PH_BWD_INIT;
@@ -1622,7 +1629,8 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
     if (a >= 4) {
         // Non-ACGT base terminates forward ext.
         if (s->smem.s >= s->min_intv) {
-            s->prev[s->numPrev++] = s->smem;
+            s->prev_top[-1 - s->numPrev] = s->smem;
+            s->numPrev++;
         }
         if (s->bsd_j != INT32_MAX) ls_bsd_resolve(s, enc_qdb, s->j);
         s->phase = PH_BWD_INIT;
@@ -1639,7 +1647,7 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
     newSmem.n = s->j;
 
     int32_t s_neq_mask = (newSmem.s != s->smem.s);
-    s->prev[s->numPrev] = s->smem;
+    s->prev_top[-1 - s->numPrev] = s->smem;
     s->numPrev += s_neq_mask;
 
     if (newSmem.s < s->min_intv) {
@@ -1847,7 +1855,8 @@ void FMI_search::ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
     }
     s->smem.n = j - 1;
     s->next_x = next_x;
-    s->prev[s->numPrev++] = s->smem;
+    s->prev_top[-1 - s->numPrev] = s->smem;
+    s->numPrev++;
     s->phase = PH_BWD_INIT;
 }
 
@@ -1867,7 +1876,7 @@ void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
     const uint32_t code = s->jcode;
     const int32_t x = s->start_pos;
     const int32_t min_intv = s->min_intv;
-    SMEM *const prev = s->prev;
+    SMEM *const top = s->prev_top;
     int32_t numPrev = s->numPrev;
     SMEM cur = s->smem;
     s->jdp = 0;
@@ -1883,7 +1892,7 @@ void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
         nw.s = e->s;
         nw.n = j;
 
-        prev[numPrev] = cur;
+        top[-1 - numPrev] = cur;
         numPrev += (nw.s != cur.s);
 
         if (nw.s < min_intv) {
@@ -1924,19 +1933,19 @@ void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
 #endif
 }
 
-// Between-phases housekeeping: reverse prev[] and set up backward-phase
-// cursors. After this call the slot is either PH_BWD (ready for
-// ls_advance_backward_step) or PH_DONE (nothing to do — backward outer
-// loop would terminate on the first step, so we short-circuit to the
-// final prev[0] emit and done).
+// Between-phases housekeeping: point prev at the forward phase's entries and
+// set up backward-phase cursors. The slot leaves as PH_BWD (ready for
+// ls_advance_backward_step) or PH_DONE (the backward outer loop would end on
+// its first step, so go straight to the final prev[0] emit).
 void FMI_search::ls_prepare_backward(BatchSlot *s)
 {
-    // Reverse prev[] in place (matches scalar behavior before backward loop).
-    for (int p = 0; p < (s->numPrev / 2); p++) {
-        SMEM tmp = s->prev[p];
-        s->prev[p] = s->prev[s->numPrev - p - 1];
-        s->prev[s->numPrev - p - 1] = tmp;
-    }
+    static_assert(sizeof(void *) != 8 || sizeof(BatchSlot) == 168,
+                  "BatchSlot size changed: update the slot-size comments");
+    // The forward phase wrote its numPrev entries downward from prev_top, so
+    // from the last one written they run in the reversed order the scalar path
+    // makes by swapping. The backward phase's compaction writes prev[numCurr]
+    // with numCurr <= p, at or below the entry it reads: inside the entries.
+    s->prev = s->prev_top - s->numPrev;
     s->cur_j = s->readlength;
     s->j = s->start_pos - 1;  // first position for the backward outer loop
 
@@ -2481,7 +2490,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     xassert(N >= 1 && N <= SMEM_LOCKSTEP_N_MAX,
             "g_smem_lockstep_n out of range [1, SMEM_LOCKSTEP_N_MAX]");
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
-    // state (160 B per slot: 2.5 KB at N=16, 5 KB at N=32; see BatchSlot).
+    // state (168 B per slot: ~2.6 KB at N=16, ~5.3 KB at N=32; see BatchSlot).
     // Bulk per-slot buffers (prev/match_buf) live separately and are reused
     // across calls via thread_local caches sized from the batch's
     // max_readlength so reads of any length fit (see issue #44 / PR #55).
@@ -2532,7 +2541,10 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
         cache.n_slots  = (int32_t)alloc_slots;
     }
     for (int32_t s = 0; s < N; s++) {
+        // The forward phase writes below prev_top; ls_prepare_backward moves
+        // prev to its last entry, so the base set here is only a defined value.
         slots[s].prev      = cache.prev  + (size_t)s * cache.per_slot;
+        slots[s].prev_top  = cache.prev  + (size_t)(s + 1) * cache.per_slot;
         slots[s].match_buf = cache.match + (size_t)s * cache.per_slot;
     }
 

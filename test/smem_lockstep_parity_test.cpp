@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 #include "FMI_search.h"
 #include "seed_jump_test_util.h"
@@ -1434,6 +1435,134 @@ int main(int argc, char *argv[]) {
                      /*expect_min_smem=*/1);
         }
         free(enc_qdb); free(seq_); free(cum_len);
+    }
+
+    /* Case 21: forward walks that fill a slot's prev buffer. The forward phase
+     * writes its prev entries downward from the top of the slot's buffer, so a
+     * walk of a read of max_readlength bases from start 0 whose interval size
+     * changes at every step writes max_readlength entries, the last at the
+     * buffer's base. All slots' prev buffers share one allocation: one entry
+     * too many lands in the next-lower slot's entries or, for slot 0, before
+     * the allocation, which CI's asan run of this test reports. To make the
+     * former change the output, every other read starts at position 1: a walk
+     * from x makes at most L - x entries, so it cannot reach its own base, but
+     * the backward phase reads its top entries, just below the next-higher
+     * slot's base, where that slot's extra entry lands. The driver's prev
+     * cache is thread_local and only grows (Case 11 sized it for 1500 bases),
+     * so the case runs on a new thread, where it is sized to exactly
+     * max_readlength = L per slot. The reads are reference substrings chosen
+     * by an oracle independent of the library: the occurrence counts of their
+     * prefixes of lengths 1..L in the index's text (reference + reverse
+     * complement) strictly decrease, so a walk from 0 records L entries. Each
+     * picked read's whole-read SMEM from the scalar driver must carry the
+     * oracle's count, so the oracle cannot drift from the index unnoticed.
+     * minSeedLen 1 so the base entry is emitted. */
+    {
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        if (!ref || ref_len < 200) {
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 21: could not read a reference FASTA of at least "
+                    "200 bases from '%s' (prev-capacity parity coverage needs it)\n", argv[1]);
+        } else {
+            const std::string fwd(ref, (size_t)ref_len);
+            const std::string text = fwd + revcomp(fwd);
+            std::thread t([&]() {
+                const int32_t saved_n = g_smem_lockstep_n;
+                enum { NR = 2 * SMEM_LOCKSTEP_N_MAX + 22 };
+                for (int32_t L = 2; L <= 7; L++) {
+                    std::vector<std::string> picked;
+                    std::vector<int64_t> picked_count;  // oracle count of the whole read
+                    for (int32_t off = 0; off + L <= ref_len && (int32_t)picked.size() < NR;
+                         off += 7) {
+                        const std::string r = fwd.substr((size_t)off, (size_t)L);
+                        int64_t last = INT64_MAX;
+                        bool ok = true;
+                        for (int32_t d = 1; d <= L && ok; d++) {
+                            const std::string p = r.substr(0, (size_t)d);
+                            int64_t c = 0;
+                            for (size_t at = text.find(p); at != std::string::npos;
+                                 at = text.find(p, at + 1))
+                                c++;
+                            ok = c >= 1 && c < last;
+                            last = c;
+                        }
+                        if (ok) {
+                            picked.push_back(r);
+                            picked_count.push_back(last);
+                        }
+                    }
+                    if (picked.empty()) {
+                        total_cases++;
+                        fprintf(stderr, "[FAIL] Case 21: no %d-base reference substring has strictly "
+                                "decreasing prefix counts\n", (int)L);
+                        continue;
+                    }
+                    {
+                        /* Oracle vs index: from x = 0, a picked read's
+                         * whole-read SMEM [0, L - 1] has the oracle's count. */
+                        const int32_t np = (int32_t)picked.size();
+                        std::vector<const char *> preads;
+                        std::vector<int32_t> pq((size_t)np, 0), pm((size_t)np, 1), pr;
+                        for (int32_t i = 0; i < np; i++) {
+                            preads.push_back(picked[(size_t)i].c_str());
+                            pr.push_back(i);
+                        }
+                        uint8_t *penc; bseq1_t *pseq; int32_t *pcum;
+                        encode_reads(preads.data(), np, &penc, &pseq, &pcum);
+                        std::vector<SMEM> out((size_t)np * (size_t)L);
+                        int64_t n_out = 0;
+                        fmi->getSMEMsOnePosOneThread(penc, pq.data(), pm.data(), pr.data(),
+                                                     np, np, pseq, pcum, /*max_readlength=*/L,
+                                                     /*minSeedLen=*/1, out.data(), &n_out);
+                        std::vector<int64_t> got((size_t)np, -1);
+                        for (int64_t j = 0; j < n_out; j++)
+                            if (out[(size_t)j].m == 0 && (int32_t)out[(size_t)j].n == L - 1)
+                                got[(size_t)out[(size_t)j].rid] = (int64_t)out[(size_t)j].s;
+                        total_cases++;
+                        int32_t bad = -1;
+                        for (int32_t i = 0; i < np && bad < 0; i++)
+                            if (got[(size_t)i] != picked_count[(size_t)i]) bad = i;
+                        if (bad >= 0) {
+                            fprintf(stderr, "[FAIL] Case 21: %d-base read %s: the scalar whole-read "
+                                    "SMEM has s = %lld, but the oracle counts %lld\n", (int)L,
+                                    picked[(size_t)bad].c_str(), (long long)got[(size_t)bad],
+                                    (long long)picked_count[(size_t)bad]);
+                        } else {
+                            fprintf(stderr, "[PASS] Case 21: %d-base oracle counts match the index "
+                                    "(%d picked reads)\n", (int)L, (int)np);
+                            passed_cases++;
+                        }
+                        free(penc); free(pseq); free(pcum);
+                    }
+                    std::vector<const char *> reads;
+                    std::vector<int32_t> qpa, mia, rid;
+                    for (int32_t i = 0; i < NR; i++) {
+                        reads.push_back(picked[(size_t)i % picked.size()].c_str());
+                        qpa.push_back(i % 2);
+                        mia.push_back(1);
+                        rid.push_back(i);
+                    }
+                    uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+                    encode_reads(reads.data(), NR, &enc_qdb, &seq_, &cum_len);
+                    const int32_t widths[] = {clamp_width(3), SMEM_LOCKSTEP_N, SMEM_LOCKSTEP_N_MAX};
+                    for (const int32_t w : widths) {
+                        std::vector<int32_t> q = qpa, m = mia, r = rid;
+                        char name[128];
+                        snprintf(name, sizeof name, "Case 21: %d-base walks fill the prev buffer "
+                                 "(%d picked reads), N = %d", (int)L, (int)picked.size(), (int)w);
+                        g_smem_lockstep_n = w;
+                        run_case(fmi, name, NR, /*max_readlength=*/L, /*minSeedLen=*/1,
+                                 enc_qdb, q.data(), m.data(), r.data(), seq_, cum_len,
+                                 /*expect_min_smem=*/NR);
+                    }
+                    free(enc_qdb); free(seq_); free(cum_len);
+                }
+                g_smem_lockstep_n = saved_n;
+            });
+            t.join();
+        }
+        free(ref);
     }
 
     /* Case 19: s1_tag_contained's rules (no index needed). */
