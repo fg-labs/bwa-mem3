@@ -223,6 +223,63 @@ CASES_TOTAL="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p
 [[ "$CASES_PASSED" == "$CASES_TOTAL" ]] || fail "bwtseed_lockstep_parity_test: $CASES_PASSED / $CASES_TOTAL cases passed"
 ok "bwtseed_lockstep_parity_test ($CASES_PASSED / $CASES_TOTAL)"
 
+# --- seed_jump_table_test --------------------------------------------------
+# Every seed jump table entry vs the stepped walk, at depths 2-5 and 10 and
+# several builder thread counts, and at depths 2-4 against a brute-force count
+# and suffix array of the index text; that both lockstep drivers read the table;
+# BWA3_BWTSEED_JUMP parsing; the build_seed_jump=false opt-out (load_index,
+# fmi_seed_open); and the shm attach path. Stages phiX in shm when the host
+# allows it and no index is already staged there (it skips rather than drop one).
+if OUT="$(cd "$HERE" && env -u BWA3_BWTSEED_JUMP ./seed_jump_table_test "$FIXTURES/phix.fa" 2>&1)"; then
+    CASES_PASSED="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\1/p')"
+    CASES_TOTAL="$(echo "$OUT" | sed -nE 's/^([0-9]+) \/ ([0-9]+) cases passed$/\2/p')"
+    [[ -n "$CASES_TOTAL" && "$CASES_PASSED" == "$CASES_TOTAL" ]] \
+        || {
+            echo "$OUT"
+            fail "seed_jump_table_test: ${CASES_PASSED:-?} / ${CASES_TOTAL:-?} cases passed"
+        }
+    ok "seed_jump_table_test ($CASES_PASSED / $CASES_TOTAL)"
+else
+    echo "$OUT"
+    fail "seed_jump_table_test: non-zero exit"
+fi
+
+# --- the two lockstep parity tests under BWA3_BWTSEED_JUMP ----------------
+# The jump-table depth is a speed knob only: every depth (0 = no table, 2..12;
+# 3 is the deepest level the table builder fills serially) must pass every
+# case with the same per-case lines (seed and SMEM counts) as the default
+# depth, and a malformed or out-of-range value must be reported, with the
+# default depth used, so its output also equals the default's.
+jump_case_lines() { grep -E '^\[(PASS|FAIL|SKIP)\]|cases passed$' || true; }
+for t in smem_lockstep_parity_test bwtseed_lockstep_parity_test; do
+    DEF_OUT="$(cd "$HERE" && env -u BWA3_BWTSEED_JUMP ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
+        || {
+            echo "$DEF_OUT"
+            fail "$t (default depth): non-zero exit"
+        }
+    DEF="$(printf '%s\n' "$DEF_OUT" | jump_case_lines)"
+    # A default run that printed no case lines would make every comparison
+    # below pass vacuously.
+    printf '%s\n' "$DEF" | grep -qE '^[0-9]+ / [0-9]+ cases passed$' \
+        || fail "$t (default depth): no case summary to compare the other depths with"
+    for depth in 0 2 3 12; do
+        OUT="$(cd "$HERE" && BWA3_BWTSEED_JUMP=$depth ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
+            || fail "$t (BWA3_BWTSEED_JUMP=$depth): non-zero exit"
+        [[ "$(printf '%s\n' "$OUT" | jump_case_lines)" == "$DEF" ]] \
+            || fail "$t (BWA3_BWTSEED_JUMP=$depth): case lines differ from the default depth"
+        ok "$t (BWA3_BWTSEED_JUMP=$depth)"
+    done
+    for bad in 1 13 abc; do
+        OUT="$(cd "$HERE" && BWA3_BWTSEED_JUMP=$bad ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
+            || fail "$t (BWA3_BWTSEED_JUMP=$bad): non-zero exit"
+        printf '%s\n' "$OUT" | grep -qF "BWA3_BWTSEED_JUMP=\"$bad\" is not 0 or an integer in [2, 12]; ignoring it and using the default depth 10" \
+            || fail "$t (BWA3_BWTSEED_JUMP=$bad): no invalid-value message"
+        [[ "$(printf '%s\n' "$OUT" | jump_case_lines)" == "$DEF" ]] \
+            || fail "$t (BWA3_BWTSEED_JUMP=$bad): case lines differ from the default depth"
+        ok "$t (BWA3_BWTSEED_JUMP=$bad reported, default used)"
+    done
+done
+
 # --- backwardext_konly_parity_test ----------------------------------------
 # Direct kernel parity: backwardExt_konly vs the full backwardExt across a sweep
 # of block offsets, locking the s==1 MSB-first bit path (bit CP_MASK-pos), which

@@ -21,8 +21,11 @@ FmiSeed *fmi_seed_open(const char *prefix) {
         // load_pac=false: this facade exposes only FM-index seeding data
         // (cp_occ/count/sentinel/SA resolution); the 2-bit packed reference
         // is never read through it, so skip the ~1.6 GB load (see
-        // FMI_search::load_index's doc comment).
-        h->fmi->load_index(/*load_pac=*/false);
+        // FMI_search::load_index's doc comment). It never runs the lockstep
+        // seeding drivers either, so skip the seed jump table (33.6 MB at
+        // the default depth).
+        h->fmi->load_index(/*load_pac=*/false, /*n_threads=*/1,
+                           /*build_seed_jump=*/false);
     } catch (...) {
         delete h->fmi;                    // null-safe if `new FMI_search` threw
         delete h;
