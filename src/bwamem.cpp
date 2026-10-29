@@ -442,8 +442,8 @@ static inline bool band_cert_accept(int sc, int pv, int mo, int w, int i, int nb
     /* No tight_band early-accept here (see ACCEPT_PAIR). At w >= opt->w this is exactly
      * the full-width ladder's stop clause, so the certified path is byte-identical to it by
      * construction: both run the same rungs and stop on the same test. On this path
-     * tight_band is read only by the certified probe rung, which finalizes on band_cert_ok,
-     * not on tb. */
+     * tight_band is not a stop input; the certified probe rung keys its buckets on
+     * probe_band and finalizes on band_cert_ok, not on either band. */
     return (i + 1 == nband) || (sc == pv || mo < ((w >> 1) + (w >> 2)));
 }
 static inline int band_cert_mat_max(const int8_t *mat) {
@@ -6897,10 +6897,10 @@ static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
 #endif
 
 /* ------------------------------------------------------------------------
- * Certified tight_band probe rung (tier-parameterized; see `tier`).
+ * Certified probe rung (tier-parameterized; see `tier`).
  *
  * 8-bit tier: its ladder starts at opt->w, so short-read extensions that carry a proven
- * tight_band still pay the full-width band. This rung gives it a narrow probe it lacked.
+ * probe band still pay the full-width band. This rung gives it a narrow probe it lacked.
  * 16-bit tier: its ladder already probes narrow (first rung INIT_W(opt->w) = 20); here the
  * rung REPLACES that single uniform-20 probe with a per-w_need bucketed one and the caller
  * then starts the ladder at opt->w. Both are byte-identical by the same certificate, and both
@@ -6913,15 +6913,20 @@ static inline void ugp_record_right_outcome(const SeqPair *sp, int tid);
  * w0 = 20 conditions cover a 20-wide probe verbatim; wider bucket ceilings re-check
  * that envelope at their own width via mem_band_cert_params_safe_w, see Gate B below).
  *
- * Eligibility (gate A): opt->band_cert AND 0 < tight_band AND w_need(tb) <= w_cap,
- * where w_cap is the widest width whose control-flow envelope still holds (Gate B): the
- * widest admissible bucket ceiling above ADAPTIVE_BAND_START (30 at default params, 24
- * when only 30 fails), else ADAPTIVE_BAND_START itself, the width the startup gate proved
- * (-d 68..79 or -w 30..35 at default scoring). A bucket runs at min(ceiling, w_cap).
- * Ineligible pairs (no proof, or a band wider than w_cap) skip the rung and reach the
- * untouched ladder unchanged. Uncertified pairs GAP2-restore a->score and fall through
- * to the ladder too. The rung returns the count of pairs left for the ladder
- * (ineligible + uncertified), compacted to the front of pair_ar.
+ * Eligibility (gate A): opt->band_cert AND tb != 0 AND w_need(tb) <= w_cap, where tb is the
+ * pair's probe_band and w_cap is the widest width whose control-flow envelope still holds
+ * (Gate B): the widest admissible bucket ceiling above ADAPTIVE_BAND_START (30 at default
+ * params, 24 when only 30 fails), else ADAPTIVE_BAND_START itself, the width the startup
+ * gate proved (-d 68..79 or -w 30..35 at default scoring). A bucket runs at
+ * min(ceiling, w_cap). probe_band equals tight_band on a TIGHT pair and is also set on
+ * non-HIT pairs with FP_TIGHT_MAX < len2 <= FP_N_MAX, whose tight_band stays 0 for
+ * --adaptive-band (see FP_TIGHT_MAX in ungapped_ext.h), and on non-HIT pairs whose band
+ * numerator is <= 0, as the negative marker FP_PROBE_BAND_NUM0 (w_need = clip slack) where
+ * tight_band keeps its 0 sentinel; tb picks only the bucket, and neither the certificate
+ * nor the envelope depends on tb or on len2. Ineligible pairs (no proof, or a band wider
+ * than w_cap) skip the rung and reach the untouched ladder unchanged. Uncertified pairs
+ * GAP2-restore a->score and fall through to the ladder too. The rung returns the count of
+ * pairs left for the ladder (ineligible + uncertified), compacted to the front of pair_ar.
  *
  * The bucket call scores a sub-slice of pair_ar, so its padding-lane overshoot
  * would clobber the following region: guard the sym object for its duration
@@ -6955,6 +6960,26 @@ static int bsw_rung_group_lanes(BswMethTier tier)
     }();
     return tier == BSW_TIER_8 ? lanes8 : tier == BSW_TIER_16 ? lanes8 / 2 : 1;
 #endif
+}
+
+/* Opt-in regression seam: inspect extension scores before CIGAR reconstruction can
+ * mask a difference. One fprintf keeps each row intact across worker threads. */
+static inline bool band_cert_trace_enabled()
+{
+    static const bool enabled = [] {
+        const char *e = getenv("BWA3_BAND_CERT_TRACE");
+        return e && strcmp(e, "1") == 0;
+    }();
+    return enabled;
+}
+
+static inline void band_cert_trace(const char *stage, const SeqPair *sp,
+        const bseq1_t *seq, int is_left, int eligible, const mem_alnreg_t *a)
+{
+    if (!band_cert_trace_enabled()) return;
+    fprintf(stderr, "[band-cert-trace]\t%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%d\n",
+            stage, seq[sp->seqid].id, sp->regid, is_left, seq[sp->seqid].name,
+            sp->len2, (int)sp->probe_band, eligible, a->score, a->truesc);
 }
 
 static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_alnreg_v *av_v,
@@ -6996,7 +7021,7 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
         w_cap = Wc;
     }
 
-    /* The certificate at run width W_b needs W_b >= tb + ceil(pen_clip/e_min): tight_band is
+    /* The certificate at run width W_b needs W_b >= tb + ceil(pen_clip/e_min): the probe band is
      * anchored on the raw ungapped score with no clip slack, but the accept below certifies at
      * S - pen_clip (the direction's clip). So key eligibility and buckets on the width the
      * certificate actually demands, w_need = tb + clip_slack, NOT tb -- otherwise the modal
@@ -7005,13 +7030,18 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
      * at the actual run width, so byte-identity is unchanged. */
     const int e_min = opt->e_del < opt->e_ins ? opt->e_del : opt->e_ins;
     const int clip_slack = (e_min > 0) ? (pen_clip + e_min - 1) / e_min : ADAPTIVE_BAND_START;
-    auto w_need_of = [&](int tb) { return tb + clip_slack; };
+    /* A negative probe band is FP_PROBE_BAND_NUM0 (ungapped_ext.h): a non-HIT pair whose band
+     * numerator is <= 0 needs no width beyond the clip slack, so it probes as tb = 0. */
+    auto w_need_of = [&](int tb) { return (tb < 0 ? 0 : tb) + clip_slack; };
 
     /* Partition [ineligible | eligible]; eligible = proven narrow (w_need <= w_cap). */
     int n_inelig = 0;
     for (int l = 0; l < nump; l++) {
-        int tb = pair_ar[l].tight_band;
-        if (!(tb > 0 && w_need_of(tb) <= w_cap)) {
+        int tb = pair_ar[l].probe_band;
+        const bool eligible = tb != 0 && w_need_of(tb) <= w_cap;
+        band_cert_trace("select", &pair_ar[l], seq_, is_left, eligible,
+                        &av_v[pair_ar[l].seqid].a[pair_ar[l].regid]);
+        if (!eligible) {
             SeqPair t = pair_ar[n_inelig]; pair_ar[n_inelig] = pair_ar[l]; pair_ar[l] = t;
             n_inelig++;
         }
@@ -7024,10 +7054,10 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
      * as temp; freed before any bsw_run_tier call reuses it as sort scratch). */
     int cnt[NBUCK] = {0}, off[NBUCK] = {0};
     auto bucket_of = [&](int w_need) { int b = 0; while (b < NBUCK - 1 && BUCKET_CEIL[b] < w_need) b++; return b; };
-    for (int l = 0; l < n_elig; l++) cnt[bucket_of(w_need_of(elig[l].tight_band))]++;
+    for (int l = 0; l < n_elig; l++) cnt[bucket_of(w_need_of(elig[l].probe_band))]++;
     for (int b = 1; b < NBUCK; b++) off[b] = off[b - 1] + cnt[b - 1];
     { int cur[NBUCK]; for (int b = 0; b < NBUCK; b++) cur[b] = off[b];
-      for (int l = 0; l < n_elig; l++) { int b = bucket_of(w_need_of(elig[l].tight_band)); scratch[cur[b]++] = elig[l]; }
+      for (int l = 0; l < n_elig; l++) { int b = bucket_of(w_need_of(elig[l].probe_band)); scratch[cur[b]++] = elig[l]; }
       for (int l = 0; l < n_elig; l++) elig[l] = scratch[l]; }
 
     /* Opt-in observations use the actual counts on both sides of the carry, so
@@ -7133,6 +7163,7 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
                 }
             }
             a->w = max_(a->w, Wb);
+            band_cert_trace("rung", sp, seq_, is_left, 1, a);
             if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_) {
                 int ii = 0;
                 for (ii = 0, a->seedcov = 0; ii < a->c->n; ++ii) {
@@ -7785,7 +7816,7 @@ static inline void stage_seed_extension(
 
         // ungapped analysis.
         //   HIT      → skip SW; fill a->* from ungapped.
-        //   TIGHT    → save sp.tight_band (probe rung / --adaptive-band stop).
+        //   TIGHT    → save sp.tight_band (--adaptive-band stop; the probe rung reads sp.probe_band).
         //   FALLBACK → use opt->w.
         /* D3 (--meth, PR-4): the ungapped fast path scores with
          * opt->a/opt->b hardcoded (ungapped_analyze) — it CANNOT
@@ -7796,14 +7827,14 @@ static inline void stage_seed_extension(
          * kernel. (Perf-only fast path; correctness-neutral to skip.) */
         if (!opt->meth_mode && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
             tprof[UGP_L_ATTEMPT][tid]++;
-            int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
-            int fp_st = ungapped_analyze(qs, rs, sp.len2,
-                                         sp.h0, opt->a, opt->b,
-                                         fp_o_min, fp_e_min,
-                                         fp_x_threshold, opt->w, opt->zdrop,
-                                         &fp_score, &fp_qle,
-                                         &fp_gscore, &fp_gtle,
-                                         &fp_band);
+            int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band, fp_pband;
+            int fp_st = ungapped_analyze_pb(qs, rs, sp.len2,
+                                            sp.h0, opt->a, opt->b,
+                                            fp_o_min, fp_e_min,
+                                            fp_x_threshold, opt->w, opt->zdrop,
+                                            &fp_score, &fp_qle,
+                                            &fp_gscore, &fp_gtle,
+                                            &fp_band, &fp_pband);
             if (fp_st == FP_STATUS_HIT) {
 #if BWAMEM3_UGP_PROFILE
                 tprof[UGP_L_HIT][tid]++;
@@ -7876,7 +7907,10 @@ static inline void stage_seed_extension(
                 else                     tprof[UGP_L_TB_33_MAX][tid]++;
 
             }
-            // FALLBACK: sp.tight_band stays 0.
+            // FALLBACK: sp.tight_band stays 0. sp.probe_band (certified probe rung only) equals a
+            // nonzero tight_band, keeps that band on a non-HIT pair past FP_TIGHT_MAX, is
+            // FP_PROBE_BAND_NUM0 if the band numerator is <= 0, and 0 otherwise or with the fast path off.
+            sp.probe_band = (int16_t)min_(fp_pband, INT16_MAX);   // min_: int16 guard for an extreme -w
         }
 
 #if BWAMEM3_UGP_PROFILE
@@ -8101,14 +8135,14 @@ static inline void stage_seed_extension(
             sp.ugp_r_attempted = 1;
             tprof[UGP_R_ATTEMPT][tid]++;
             int fp_h0 = a->score;  // the real h0 for right ext
-            int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
-            int fp_st = ungapped_analyze(qs, rs, sp.len2,
-                                         fp_h0, opt->a, opt->b,
-                                         fp_o_min, fp_e_min,
-                                         fp_x_threshold, opt->w, opt->zdrop,
-                                         &fp_score, &fp_qle,
-                                         &fp_gscore, &fp_gtle,
-                                         &fp_band);
+            int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band, fp_pband;
+            int fp_st = ungapped_analyze_pb(qs, rs, sp.len2,
+                                            fp_h0, opt->a, opt->b,
+                                            fp_o_min, fp_e_min,
+                                            fp_x_threshold, opt->w, opt->zdrop,
+                                            &fp_score, &fp_qle,
+                                            &fp_gscore, &fp_gtle,
+                                            &fp_band, &fp_pband);
             if (fp_st == FP_STATUS_HIT) {
                 tprof[UGP_R_HIT][tid]++;
                 tprof[UGP_R_UNGAPPED][tid]++;
@@ -8155,6 +8189,7 @@ static inline void stage_seed_extension(
                 else                     tprof[UGP_R_TB_33_MAX][tid]++;
 
             }
+            sp.probe_band = (int16_t)min_(fp_pband, INT16_MAX);   // probe rung only; min_: extreme -w guard
         }
 
         /* The RIGHT-side tier counters (numPairsRight128/16/1) are
@@ -8822,8 +8857,9 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     int nump = numPairsLeft1;
 
     // per-pair tight_band proofs are still piped in via sp->tight_band
-    // (consumed by the certified probe rung and the --adaptive-band ladder;
-    // the exact ladder does not stop on them, see ACCEPT_PAIR), but we no
+    // (consumed by the --adaptive-band ladder; the certified probe rung reads
+    // sp->probe_band, which equals any nonzero tight_band and also covers longer pairs;
+    // the exact ladder stops on neither, see ACCEPT_PAIR), but we no
     // longer narrow init_w from opt->w. A batched
     // SW pass shares one band across all pairs in the batch, so narrowing
     // would force FALLBACK pairs (no tight_band proof) to start with a
@@ -8872,6 +8908,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 }
 
                 a->w = max_(a->w, w);
+                band_cert_trace("ladder", sp, seq_, 1, 0, a);
                 if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -8904,13 +8941,13 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     nump = numPairsLeft16;
     init_w = INIT_W(opt->w);
-    /* item 2: certified tight_band probe rung on the 16-bit tier, as a PURE PREPEND. The 16-bit
+    /* item 2: certified probe rung on the 16-bit tier, as a PURE PREPEND. The 16-bit
      * ladder already probes narrow (its first rung is INIT_W(opt->w) = 20); the rung certifies the
-     * proven-narrow (tb>0, w_need <= w_cap) pairs at the per-w_need ceiling (BUCKET_CEIL in
+     * proven-narrow (tb != 0, w_need <= w_cap) pairs at the per-w_need ceiling (BUCKET_CEIL in
      * bsw_tb_probe_rung, capped at w_cap) and removes them
      * early, byte-identically (a certified pair's fields are band-invariant beyond its bucket, so
      * the bucket and the width-20 probe finalize identically). Everything else -- ineligible pairs
-     * (tb=0, or w_need > w_cap) and the rare uncertified pair -- falls through to the UNCHANGED
+     * (tb == 0, or w_need > w_cap) and the rare uncertified pair -- falls through to the UNCHANGED
      * [20, opt->w, ...] ladder and keeps its cheap w=20 first probe.
      *
      * init_w is deliberately NOT raised to opt->w here (it is on the 8-bit tier, which has no w=20
@@ -8961,6 +8998,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 }
 
                 a->w = max_(a->w, w);
+                band_cert_trace("ladder", sp, seq_, 1, 0, a);
                 if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -8989,7 +9027,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
 
     nump = numPairsLeft128;
     init_w = opt->w;
-    /* commit 4: certified tight_band probe rung. Finalizes the proven-narrow
+    /* commit 4: certified probe rung. Finalizes the proven-narrow
      * 8-bit pairs at the probe width (byte-identical); returns the count left
      * (ineligible + uncertified), compacted to the front, for the ladder. */
     nump = bsw_tb_probe_rung(BSW_TIER_8, opt, av_v, bswLeft.get(), bswLeftOt.get(), bswLeftOb.get(),
@@ -9042,6 +9080,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 }
 
                 a->w = max_(a->w, w);
+                band_cert_trace("ladder", sp, seq_, 1, 0, a);
                 if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -9079,7 +9118,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     // so no pair's HIT below writes a region whose score another pair's h0
     // reads.
     //   HIT    → fill a->* directly, compact the pair out of the array.
-    //   TIGHT  → set sp->tight_band (probe rung / --adaptive-band stop).
+    //   TIGHT  → set sp->tight_band (--adaptive-band stop; the probe rung reads sp->probe_band).
     //   FALL   → leave tight_band at construction default (typically 0).
 #ifdef BWA_MEM3_DEBUG_RIGHT_H0_XCHECK
     /* The one-pass h0 fill below relies on no two right pairs sharing a region.
@@ -9115,14 +9154,14 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                 tprof[UGP_R_ATTEMPT][tid]++;
                 const uint8_t *qs = seqBufRightQer + sp->idq;
                 const uint8_t *rs = seqBufRightRef + sp->idr;
-                int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band;
-                int fp_st = ungapped_analyze(qs, rs, sp->len2, sp->h0,
-                                              opt->a, opt->b,
-                                              fp_o_min, fp_e_min,
-                                              fp_x_threshold, opt->w, opt->zdrop,
-                                              &fp_score, &fp_qle,
-                                              &fp_gscore, &fp_gtle,
-                                              &fp_band);
+                int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band, fp_pband;
+                int fp_st = ungapped_analyze_pb(qs, rs, sp->len2, sp->h0,
+                                                 opt->a, opt->b,
+                                                 fp_o_min, fp_e_min,
+                                                 fp_x_threshold, opt->w, opt->zdrop,
+                                                 &fp_score, &fp_qle,
+                                                 &fp_gscore, &fp_gtle,
+                                                 &fp_band, &fp_pband);
                 if (fp_st == FP_STATUS_HIT) {
                     tprof[UGP_R_HIT][tid]++;
                     tprof[UGP_R_UNGAPPED][tid]++;
@@ -9161,6 +9200,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     else                     tprof[UGP_R_TB_33_MAX][tid]++;
 
                 }
+                if (keep) sp->probe_band = (int16_t)min_(fp_pband, INT16_MAX);   // probe rung only; min_: extreme -w guard
             }
             if (keep) {
                 if (compacted != l)
@@ -9270,6 +9310,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     a->truesc += sp->gscore - sp->h0;
                 }
                 a->w = max_(a->w, w);
+                band_cert_trace("ladder", sp, seq_, 0, 0, a);
                 if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -9297,7 +9338,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight16;
     init_w = INIT_W(opt->w);
-    /* item 2: certified tight_band probe rung on the 16-bit tier (mirror of the LEFT 16-bit
+    /* item 2: certified probe rung on the 16-bit tier (mirror of the LEFT 16-bit
      * rung; pen_clip3, is_left=0). See the LEFT block for the byte-identity argument and why
      * init_w stays at INIT_W(opt->w) (pure prepend; no short-read regression). */
     nump = bsw_tb_probe_rung(BSW_TIER_16, opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
@@ -9345,6 +9386,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     a->truesc += sp->gscore - sp->h0;
                 }
                 a->w = max_(a->w, w);
+                band_cert_trace("ladder", sp, seq_, 0, 0, a);
                 if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;
@@ -9373,7 +9415,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     pair_ar_aux = seqPairArrayAux;
     nump = numPairsRight128;
     init_w = opt->w;
-    /* commit 4: certified tight_band probe rung (mirror of the LEFT rung; pen_clip3). */
+    /* commit 4: certified probe rung (mirror of the LEFT rung; pen_clip3). */
     nump = bsw_tb_probe_rung(BSW_TIER_8, opt, av_v, bswRight.get(), bswRightOt.get(), bswRightOb.get(),
                              pair_ar, seqBufRightRef, seqBufRightQer, nump, nthreads,
                              pair_ar_aux, hist, seq_, opt->pen_clip3, /*is_left=*/0, tid);
@@ -9421,6 +9463,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
                     a->truesc += sp->gscore - sp->h0;
                 }
                 a->w = max_(a->w, w);
+                band_cert_trace("ladder", sp, seq_, 0, 0, a);
                 if (want_seedcov && a->rb != H0_ && a->qb != H0_ && a->qe != H0_ && a->re != H0_)
                 {
                     int i = 0;

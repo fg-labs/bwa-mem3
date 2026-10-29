@@ -190,7 +190,86 @@ if [ "$n_mm" -ne "$N_MM" ]; then
     echo "FAIL: built only $n_mm of $N_MM mismatch-bearing pairs (phix slicing regression?)" >&2
     exit 1
 fi
-echo "fixture: $n_pairs exact PE pairs + $n_del deletion-bearing pairs (DEL=$DEL > w0) + $n_mm mismatch-bearing pairs sliced from phix"
+
+# --- Long pairs: extensions longer than 128 bases. ---
+# The pairs above are at most 120 bp, so no extension is longer than 128 bases and
+# the certified probe rung never sees a probe band set past FP_TIGHT_MAX (128).
+# These N_LONG pairs have a 271-299 bp read1 with two substituted bases, so the
+# ungapped fast path declines their extensions longer than 128 bases and the
+# substitution-only pairs reach the rung with a probe band. Every third read1 also
+# carries a 6 bp deletion: its long extension gets probe band 0 (no band within -w
+# is proven), so it skips the rung and only the ladder scores it.
+# The committed trace check below observes the stored band at the real selector
+# and compares certified score/truesc with the full-width ladder before
+# mem_reg2aln can mask a difference. All of these long extensions land in the
+# 16-bit tier; long extensions in the 8-bit tier are covered by end-to-end runs.
+N_LONG=96
+n_long=0
+for ((i = 0; i < N_LONG; i++)); do
+    LL=$((271 + (i * 7) % 29))
+    off=$(((i * 41) % (${#seq} - LL - 520)))
+    w="${seq:$off:$((LL + 6))}"
+    if [ $((i % 3)) -eq 0 ]; then
+        w="${w:0:140}${w:146}"
+    else
+        w="${w:0:$LL}"
+    fi
+    mm="$w"
+    flip_at $((20 + i % 60))
+    flip_at $((LL - 30 - i % 50))
+    w="$mm"
+    m2fwd="${seq:$((off + 350)):150}"
+    m2="$(printf '%s' "$m2fwd" | rev | tr 'ACGT' 'TGCA')"
+    [ "${#w}" -eq "$LL" ] && [ "${#m2}" -eq 150 ] || continue
+    q1="$(printf 'I%.0s' $(seq 1 "$LL"))"
+    q2="$(printf 'I%.0s' $(seq 1 150))"
+    printf '@long%d/1\n%s\n+\n%s\n' "$n_long" "$w" "$q1" >> "$r1"
+    printf '@long%d/2\n%s\n+\n%s\n' "$n_long" "$m2" "$q2" >> "$r2"
+    n_long=$((n_long + 1))
+done
+if [ "$n_long" -ne "$N_LONG" ]; then
+    echo "FAIL: built only $n_long of $N_LONG long pairs (phix slicing regression?)" >&2
+    exit 1
+fi
+
+# --- Ungapped-optimal pairs: a band numerator <= 0. ---
+# Each read carries two substitutions two bases apart, e = 0..2 bases from each
+# end, so every extension's ungapped record comes before its last e + 3 bases.
+# At default scoring that makes the band numerator e + 3 - o_min <= 0: tight_band
+# keeps its 0 sentinel and the probe band is the FP_PROBE_BAND_NUM0 marker, which
+# the rung runs at its clip slack. No pair above reaches the rung with the marker
+# (a mismatch-bearing pair's second substitution is SUB_STEP bp in).
+# Like the long pairs, these must reach the real selector with their stored
+# marker band, certify, and match the full-width ladder score/truesc in the
+# committed trace check below.
+N_NUM0=64
+n_num0=0
+for ((j = 0; j < N_NUM0; j++)); do
+    off=$(((j * 53 + 11) % span))
+    e=$((j % 3))
+    mm="${seq:off:L}"
+    flip_at "$e"
+    flip_at $((e + 2))
+    flip_at $((L - 1 - e))
+    flip_at $((L - 3 - e))
+    m1="$mm"
+    p2=$((off + G))
+    mm="${rcseq:N-p2-L:L}"
+    flip_at "$e"
+    flip_at $((e + 2))
+    flip_at $((L - 1 - e))
+    flip_at $((L - 3 - e))
+    m2="$mm"
+    [ "${#m1}" -eq "$L" ] && [ "${#m2}" -eq "$L" ] || continue
+    printf '@num0_%d/1\n%s\n+\n%s\n' "$n_num0" "$m1" "$q" >> "$r1"
+    printf '@num0_%d/2\n%s\n+\n%s\n' "$n_num0" "$m2" "$q" >> "$r2"
+    n_num0=$((n_num0 + 1))
+done
+if [ "$n_num0" -ne "$N_NUM0" ]; then
+    echo "FAIL: built only $n_num0 of $N_NUM0 ungapped-optimal pairs (phix slicing regression?)" >&2
+    exit 1
+fi
+echo "fixture: $n_pairs exact PE pairs + $n_del deletion-bearing pairs (DEL=$DEL > w0) + $n_mm mismatch-bearing pairs + $n_long long pairs + $n_num0 ungapped-optimal pairs sliced from phix"
 
 # --- Index the reference. ---
 "$BWA_MEM3" index "$ref" > "$BAND_CERT_WORK_DIR/index.log" 2>&1
@@ -200,8 +279,50 @@ echo "fixture: $n_pairs exact PE pairs + $n_del deletion-bearing pairs (DEL=$DEL
 # between the two invocations. Everything else must match byte-for-byte.
 def_sam="$BAND_CERT_WORK_DIR/default.sam"
 raw_sam="$BAND_CERT_WORK_DIR/no_band_cert.sam"
-"$BWA_MEM3" mem "$ref" "$r1" "$r2" > "$def_sam" 2> /dev/null
-"$BWA_MEM3" mem --no-band-cert "$ref" "$r1" "$r2" > "$raw_sam" 2> /dev/null
+def_trace="$BAND_CERT_WORK_DIR/default.trace"
+raw_trace="$BAND_CERT_WORK_DIR/no_band_cert.trace"
+BWA3_BAND_CERT_TRACE=1 "$BWA_MEM3" mem "$ref" "$r1" "$r2" > "$def_sam" 2> "$def_trace"
+BWA3_BAND_CERT_TRACE=1 "$BWA_MEM3" mem --no-band-cert "$ref" "$r1" "$r2" > "$raw_sam" 2> "$raw_trace"
+
+# Observe the stored band at the real selector, then compare the real finalized
+# scores before mem_reg2aln can hide differences by rebuilding the alignment.
+# Measured on the canonical Linux AVX2 CI row and macOS NEON: each side selects
+# and certifies 64 long and 128 marker extensions. These floors leave modest
+# headroom, but reject losing most of the probe work. They are extension counts,
+# not fixture pair totals: deletion-bearing long pairs deliberately skip the rung.
+mawk -F '\t' '
+    BEGIN { min_long = 60; min_marker = 120 }
+    $1 != "[band-cert-trace]" { next }
+    { key = $3 ":" $4 ":" $5 }
+    FNR == NR {
+        if ($2 == "ladder") wide[key] = $10 ":" $11
+        next
+    }
+    $2 == "select" && $9 == 1 {
+        if ($6 ~ /^long/ && $7 > 128 && $8 != 0) long_selected[$5]++
+        if ($6 ~ /^num0_/ && $8 == -1) marker_selected[$5]++
+    }
+    $2 == "rung" && $9 == 1 {
+        if ($6 ~ /^long/ && $7 > 128 && $8 != 0) long_checked[$5]++
+        if ($6 ~ /^num0_/ && $8 == -1) marker_checked[$5]++
+        if (!(key in wide) || wide[key] != $10 ":" $11) {
+            print "FAIL: certified score/truesc differs from full-width ladder for " key > "/dev/stderr"
+            bad = 1
+        }
+    }
+    END {
+        for (side = 0; side <= 1; side++) {
+            printf "probe counts: is_left=%d long_selected=%d marker_selected=%d long_certified=%d marker_certified=%d\n", side, long_selected[side], marker_selected[side], long_checked[side], marker_checked[side]
+            if (long_selected[side] < min_long || marker_selected[side] < min_marker ||
+                long_checked[side] < min_long || marker_checked[side] < min_marker) {
+                printf "FAIL: probe trace selected or certified fewer than %d long or %d marker-band extensions (is_left=%d)\n", min_long, min_marker, side > "/dev/stderr"
+                bad = 1
+            }
+        }
+        if (bad) exit 1
+        print "PASS: stored long/marker bands reach the probe selector; certified score/truesc match the full-width ladder"
+    }
+' "$raw_trace" "$def_trace"
 
 # Non-vacuity: both runs must actually emit alignment records.
 if ! grep -q '^[^@]' "$def_sam" || ! grep -q '^[^@]' "$raw_sam"; then

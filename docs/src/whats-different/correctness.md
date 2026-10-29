@@ -515,8 +515,11 @@ extent fields were not provably the full ladder's either.
 The ladders that claim byte-identity (the default certified adaptive band, and the full-width
 ladder with it disabled, `--no-band-cert`) no longer stop on the bound. At every rung from
 `w = 100` up they apply exactly the full-width stop test, so they are **byte-identical to the
-full-width ladder by construction**. The bound still feeds the certified narrow probe, which
-finalizes on its own certificate. The non-byte-identical `--adaptive-band` ladder (also selected
+full-width ladder by construction**. The certified narrow probe reads a separate probe band:
+it equals the tight band on pairs that carry one, is also set for extensions of up to 512 bases
+that the ungapped fast path cannot finalize, and is set as a marker when the band bound's
+numerator is <= 0. It only decides whether a pair enters the probe and at which bucket width;
+the probe still finalizes on its own certificate, which is unchanged. The non-byte-identical `--adaptive-band` ladder (also selected
 by `--fast` unless `--no-adaptive-band`) keeps stopping on it on the tiers where it narrows the
 starting band; on the 8-bit tier, which starts at `w = 100` and handles the short extensions
 that carry a tight band, it now uses the exact ladder too, so `--adaptive-band` stays a no-op on
