@@ -540,6 +540,7 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    bandedswa_high_h0_zdrop_test bandedswa_negative_h0_test \
                    shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
+                   shm_thp_advise_test \
                    kt_for_pool_test bns_zero_calloc_test \
                    err_fgets_eof_test \
                    kernel_padded_lane_uninit_test bam_rec_scratch_test \
@@ -551,9 +552,10 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    pwrite_all_status_test x86_soa_pack_test
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
-# shm_pack_round_trip_test is excluded from `test:` because it runs via
-# test/shm_pack_round_trip_test.sh, which has to build a phiX index first.
-STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test,$(STANDALONE_TESTS))
+# shm_pack_round_trip_test and shm_thp_advise_test are excluded from `test:`
+# because they need a phiX index: test/run_unit_tests.sh runs them after
+# test/shm_pack_round_trip_test.sh has built it.
+STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test shm_thp_advise_test,$(STANDALONE_TESTS))
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
 ifeq ($(IS_ARM),)
@@ -1144,6 +1146,9 @@ shm_pack_round_trip_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_pack_ro
 shm_lock_destroy_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_lock_destroy_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_lock_destroy_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+shm_thp_advise_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_thp_advise_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_thp_advise_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
 kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kt_for_pool_test.o $(BWA_LIB) $(LIBS) -o $@
 
@@ -1493,6 +1498,9 @@ test/detect_sa_compx_test.o: test/detect_sa_compx_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_lock_destroy_test.o: test/shm_lock_destroy_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/shm_thp_advise_test.o: test/shm_thp_advise_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/kt_for_pool_test.o: test/kt_for_pool_test.cpp

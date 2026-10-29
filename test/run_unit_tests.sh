@@ -40,7 +40,7 @@ fi
 
 # Build any test binaries that live outside test/Makefile (MAKE_ARGS: see the header).
 read -r -a make_args <<< "${MAKE_ARGS:-}"
-(cd "$ROOT" && make -j4 ${make_args[@]+"${make_args[@]}"} shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test) > /dev/null \
+(cd "$ROOT" && make -j4 ${make_args[@]+"${make_args[@]}"} shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test shm_thp_advise_test fmi_seed_api_guards_test) > /dev/null \
     || fail "top-level make of the shm/fmi test binaries failed (MAKE_ARGS='${MAKE_ARGS:-}')"
 
 # synthetic_1mb.fa is checked in alongside its committed baselines so the
@@ -495,6 +495,21 @@ echo "OK:   fmi_seed_api_guards_test"
 # --- shm pack round-trip (unit: pack/unpack a phiX segment) ------------------
 (cd "$HERE" && ./shm_pack_round_trip_test.sh) || fail "shm_pack_round_trip_test"
 ok "shm_pack_round_trip_test"
+
+# --- shm THP advice (unit: the attached segment is advised MADV_HUGEPAGE) ----
+# Needs the phiX index the round-trip script above builds.
+# The binary prints SKIP: and exits 0 off Linux or without THP; report that as a skip.
+thp_out=$(cd "$ROOT" && ./shm_thp_advise_test "$FIXTURES/phix.fa") \
+    || {
+        printf '%s\n' "$thp_out"
+        fail "shm_thp_advise_test"
+    }
+printf '%s\n' "$thp_out"
+if grep -q '^SKIP:' <<< "$thp_out"; then
+    skip "shm_thp_advise_test (no THP advice to check on this host)"
+else
+    ok "shm_thp_advise_test"
+fi
 
 # --- shm end-to-end round-trip (byte-identical SAM with and without shm) -----
 (cd "$HERE" && ./shm_round_trip_test.sh) || fail "shm_round_trip_test"

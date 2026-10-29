@@ -2698,7 +2698,7 @@ jobs:
             # count changes no compile line, so the hashes match either way).
             make -C test -j"$jobs"
             make -j4 arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC" \
-              shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test fmi_seed_api_guards_test
+              shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test shm_thp_advise_test fmi_seed_api_guards_test
           fi
           if [ "$MATRIX_CANONICAL" = true ]; then
             # The second tree of the "AVX-512BW tier unit tests (kswv, ksw_global2/CIGAR, lane compaction, z-drop gates, signed domain; where the runner has it)"

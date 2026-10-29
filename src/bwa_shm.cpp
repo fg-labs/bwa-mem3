@@ -31,6 +31,7 @@
 #include "macro.h"         /* SA_COMPX */
 #include "bntseq.h"        /* bntseq_t, bns_restore, bns_destroy */
 #include "utils.h"         /* err_fread_noeof, err_fclose, xopen */
+#include "bwa_madvise.h"   /* bwamem_madv_hugepage */
 
 #include <stdio.h>
 #include <cstdlib>
@@ -169,6 +170,28 @@ static void ctl_close(void *m, int fd)
     if (m != NULL) munmap(m, BWA_SHM_CTL_SIZE);
     if (fd >= 0)   close(fd);
 }
+
+/* Map an index segment and ask for transparent huge pages on it, as the
+ * disk-load path does for its index buffers (FMI_search.cpp). On 4 KB pages
+ * the FM-index and SA lookups miss the dTLB about 12x as often, and an
+ * shm-attached alignment costs about a third more CPU than a disk load.
+ *
+ * tmpfs fixes a page's size when it is first written, so the stager must
+ * advise its mapping before the fill; the attach advises its own mapping too.
+ * The advice takes effect only if /dev/shm is mounted huge=advise (or
+ * huge=within_size, which needs no advice); the default huge=never ignores it.
+ * Returns MAP_FAILED on failure, like mmap. */
+static void *idx_segment_map(int fd, size_t len, int prot)
+{
+    void *m = mmap(NULL, len, prot, MAP_SHARED, fd, 0);
+    if (m != MAP_FAILED) bwamem_madv_hugepage(m, len);
+    return m;
+}
+
+/* Test-only hook: test/shm_thp_advise_test.cpp checks the stager's mapping
+ * for the huge-page advice through it, since bwa_shm_stage unmaps that mapping
+ * before it returns. Not set on any production path. */
+void (*bwa_shm_stage_map_hook)(const void *base, size_t len) = NULL;
 
 /* Walk the registry, calling `cb(l_mem, name, ctx)` for each entry. cb may
  * return 0 to continue or non-zero to stop. Returns the cb's last return
@@ -848,8 +871,8 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         bwa_shm_layout_free(&layout);
         return -1;
     }
-    void *idx_map = mmap(NULL, (size_t)layout.total_size,
-                         PROT_READ | PROT_WRITE, MAP_SHARED, idx_fd, 0);
+    void *idx_map = idx_segment_map(idx_fd, (size_t)layout.total_size,
+                                    PROT_READ | PROT_WRITE);
     if (idx_map == MAP_FAILED) {
         std::fprintf(stderr, "[E::%s] mmap(%s) failed: %s\n",
                      __func__, idx_path, std::strerror(errno));
@@ -860,6 +883,7 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         bwa_shm_layout_free(&layout);
         return -1;
     }
+    if (bwa_shm_stage_map_hook) bwa_shm_stage_map_hook(idx_map, (size_t)layout.total_size);
 
     /* 6. Stream-pack directly into the mmap'd region. No heap intermediate. */
     if (bwa_shm_pack_into(&layout, (uint8_t *)idx_map) != 0) {
@@ -929,7 +953,7 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
     }
     size_t len = (size_t)st.st_size;
 
-    void *m = mmap(NULL, len, PROT_READ, MAP_SHARED, fd, 0);
+    void *m = idx_segment_map(fd, len, PROT_READ);
     close(fd);
     if (m == MAP_FAILED) {
         std::fprintf(stderr, "[E::%s] mmap(%s, %llu) failed: %s\n",
