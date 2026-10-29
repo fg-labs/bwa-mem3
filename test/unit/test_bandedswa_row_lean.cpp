@@ -319,10 +319,11 @@ Totals run_mode(Mode mode, uint64_t seed, int nbatch)
         KernelPair k(sc);
         std::vector<const ExtPair *> order;
         for (const ExtPair &p : pairs) order.push_back(&p);
-        // 1. production order: stable sort by max(len1, len2), as bsw_score_batch does
+        // 1. production order: stable sort by len2 (the query length), mirroring
+        //    the key bsw_score_batch gives an 8-bit call (copied here, not a call to
+        //    sortPairsLen; w never exceeds 124, so the max-key divert is not run)
         std::stable_sort(order.begin(), order.end(), [](const ExtPair *x, const ExtPair *y) {
-            return std::max(x->target.size(), x->query.size()) <
-                   std::max(y->target.size(), y->query.size());
+            return x->query.size() < y->query.size();
         });
         compare_grouping(k, order, w, t);
         // 2. a random shuffle, 3. reversed
