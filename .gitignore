@@ -30,6 +30,9 @@ src/version.h
 # doctest suites built by test/Makefile
 /test/bwa_mem3_tests_unit
 /test/bwa_mem3_tests_integration
+
+# fixture tools built by test/Makefile
+/test/mem_synth_ref
 *.gcno
 *.gcda
 coverage.info

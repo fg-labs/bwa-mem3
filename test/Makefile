@@ -171,11 +171,11 @@ FRAMEWORK_INCLUDES := $(INCLUDES) -I$(FRAMEWORK_DIR)
 # $(INTEGRATION_DIR)/<name>.o, satisfied by the explicit pattern rule
 # further down.
 
-.PHONY: all framework unit integration clean libsais-objs
+.PHONY: all framework unit integration tools clean libsais-objs
 .SUFFIXES: .cpp .o
 
 # Default: build everything.
-all: framework unit integration $(EXE)
+all: framework unit integration tools $(EXE)
 
 # -- Framework static lib ----------------------------------------------------
 
@@ -186,6 +186,18 @@ $(FRAMEWORK_LIB): $(FRAMEWORK_OBJS)
 
 $(FRAMEWORK_DIR)/%.o: $(FRAMEWORK_DIR)/%.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(FRAMEWORK_INCLUDES) -MMD -MP $< -o $@
+
+# -- Fixture tools ------------------------------------------------------------
+
+# tools/mem_synth_ref.c regenerates test/fixtures/mem_synth.fa and, with --check,
+# verifies the committed copy (`make test` runs the check). Plain C99 with no
+# libbwa dependency, so it builds with the host's cc on every row.
+MEM_SYNTH_REF := mem_synth_ref
+
+tools: $(MEM_SYNTH_REF)
+
+$(MEM_SYNTH_REF): tools/mem_synth_ref.c
+	$(CC) -std=c99 -O2 -Wall -Wextra -o $@ $<
 
 # -- Doctest unit/integration binaries (populated in Task 12 + 13) ---------
 
@@ -399,7 +411,8 @@ $(FRAMEWORK_OBJS) $(UNIT_OBJS) $(INTEGRATION_TEST_OBJS) \
 clean:
 	rm -f $(TEST_FLAGS_STAMP) *.o *.d $(INTEGRATION_DIR)/*.o $(INTEGRATION_DIR)/*.d \
 	      $(UNIT_DIR)/*.o $(UNIT_DIR)/*.d \
-	      $(FRAMEWORK_OBJS) $(FRAMEWORK_DIR)/*.d $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS)
+	      $(FRAMEWORK_OBJS) $(FRAMEWORK_DIR)/*.d $(FRAMEWORK_LIB) $(EXE) $(DOCTEST_BINS) \
+	      $(MEM_SYNTH_REF)
 	rm -f *.gcno *.gcda $(INTEGRATION_DIR)/*.gcno $(INTEGRATION_DIR)/*.gcda \
 	      $(UNIT_DIR)/*.gcno $(UNIT_DIR)/*.gcda \
 	      $(FRAMEWORK_DIR)/*.gcno $(FRAMEWORK_DIR)/*.gcda

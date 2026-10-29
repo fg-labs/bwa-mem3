@@ -715,6 +715,21 @@ jobs:
         # ERROR: message rather than silently mis-aligning.
         run: BWA_MEM3=./bwa-mem3 bash test/regression/arg_range_validation.sh
 
+      - name: mem CLI helpers still fail on bad input
+        # The self-test of the shell helpers mem_cli_basics.sh is built on,
+        # run first: a helper that stopped failing would make it pass without
+        # checking anything.
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: bash test/regression/mem_cli_selftest.sh
+
+      - name: mem CLI basics (hand-derived records, each SIMD tier)
+        # Records whose every field is worked out by hand from the committed
+        # synthetic reference (test/fixtures/mem_synth.fa), under each tier the
+        # runner has. x86 runs it in canonical-regressions, which sweeps avx2
+        # and, where the runner has it, avx512bw; this row adds neon.
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_cli_basics.sh
+
       - name: Build doctest framework and unit binary
         # Invoke via the parent `test-binaries` target so ARCH_FLAGS
         # propagate from libbwa.a's build into the test CXXFLAGS. Ensures
@@ -744,6 +759,16 @@ jobs:
             make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" test-binaries \
               arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           fi
+
+      - name: Synthetic reference fixture matches its generator
+        # test/fixtures/mem_synth.fa is committed; its generator, built by
+        # test-binaries, checks that the file is its exact output, that the
+        # planted repeats sit where its header says and that every 19-mer
+        # outside them is unique, which the mem CLI scripts' expected values
+        # rely on. The script first confirms the check rejects corrupted
+        # copies. Platform-independent, so one row.
+        if: matrix.canonical == true
+        run: MEM_SYNTH_REF=./test/mem_synth_ref bash test/regression/mem_synth_ref_check.sh
 
       - name: Run unit tests (all rows)
         env:
@@ -1663,6 +1688,18 @@ jobs:
           PARITY_R1=/tmp/chr22-sim/reads.r1.fastq.gz \
           PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
           bash test/regression/all_tiers_parity.sh
+
+      - name: mem CLI helpers still fail on bad input
+        # Run before mem_cli_basics.sh, as on the Linux ARM64 row.
+        run: bash test/regression/mem_cli_selftest.sh
+
+      - name: mem CLI basics (hand-derived records, each SIMD tier)
+        # Records whose every field is worked out by hand from the committed
+        # synthetic reference (test/fixtures/mem_synth.fa): no download, no
+        # third-party tool, seconds of work. Run under avx2 and, where the
+        # runner has it, avx512bw, and required byte-identical across them;
+        # the Linux ARM64 row runs it under neon.
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/mem_cli_basics.sh
 
       - name: Rescue identity under each forced x86 tier (generated PE fixture)
         # The kswv rescue kernels differ per tier, so the 11-op cell (and the

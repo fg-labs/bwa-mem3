@@ -1123,7 +1123,7 @@ bandedswa_high_h0_zdrop_test: $(BWA_LIB) $(HTS_LIB) src/bandedSWA.native.o test/
 # callers that skip the bwa-mem3 binary build (which builds it as a
 # side-effect of $(EXE) deps) link-fail.
 test-binaries: $(BWA_LIB) $(HTS_LIB) $(ROWALT_KERNEL_OBJ)
-	$(MAKE) -C test framework unit integration \
+	$(MAKE) -C test framework unit integration tools \
 	    CXX="$(CXX)" \
 	    COVERAGE=$(COVERAGE) \
 	    COVERAGE_OPT='$(COVERAGE_OPT)' \
@@ -1405,6 +1405,7 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3
 	./test/bwa_mem3_tests_unit
 	./test/bwa_mem3_tests_integration
+	MEM_SYNTH_REF=./test/mem_synth_ref ./test/regression/mem_synth_ref_check.sh
 	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; ./$$t || exit 1; done
 	./kvec_alloc_fail_test
 	./klib_alloc_fail_test
@@ -1412,6 +1413,8 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh
+	./test/regression/mem_cli_selftest.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_cli_basics.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/calloc_interpose_flag_lint_selftest.sh
