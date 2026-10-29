@@ -1285,13 +1285,13 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      *     router picks the 16-bit kernel, which this hoist does not touch.
      *
      * The lever, if that ever matters: sort a phase-1 batch by len2 so each lane
-     * group's quanta agree and jsplit returns to ncol. bwamem.cpp:3462 already
-     * does precisely this for the extend path (sortPairsLen with key_by_max,
-     * "so ncol/minq are tight"), and it is byte-identical there because results
-     * scatter back by regid. Not done here because the end-to-end payoff is
-     * projected below the +/-0.5% noise floor: kswv is ~31% of mem CPU and phase 1
-     * is a fraction of that, and EXT-13 -- the same technique -- was predicted at
-     * 1-3% and measured -0.19%.
+     * group's quanta agree and jsplit returns to ncol. bwamem.cpp does this for
+     * the extend path (bsw_score_batch packs each 8-bit kernel call by len2 with
+     * sortPairsLen), byte-identical there because results scatter back by regid.
+     * Not done here because the end-to-end payoff is projected below the +/-0.5%
+     * noise floor: kswv is ~31% of mem CPU and phase 1 is a fraction of that.
+     * EXT-13's max(len1,len2) key reduced to len1 on the 8-bit tier and measured
+     * -0.19% (predicted 1-3%); the len2 key that replaced it tightens ncol/minq.
      * jsplit is taken over the real lanes only (kswv_real_lanes), so a
      * partial final group gets the same column split as a full one. minLen1
      * still spans the dummy lanes (len1 == 0 pins it to 0): it gates only the

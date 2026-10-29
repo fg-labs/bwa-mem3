@@ -26,9 +26,14 @@
 //      the zero gap at the phantom column).
 //   2. A broader backstop: generated batches (random and asymmetric scoring,
 //      negative seed scores, N bases, small z-drop, bands 0 to 124) scored in the
-//      generated order, reversed, shuffled and split into random sub-batches, and
-//      a sample next to wide partners. Coupled pairs are rare, so these batches
-//      are not what pins the fix; they keep the property honest on many shapes.
+//      generated order, reversed, shuffled, split into random sub-batches and
+//      sorted the way bsw_score_batch keys its calls (8-bit by query length,
+//      len2; 16-bit by target length, len1, as the 16-bit tier does), and a
+//      sample next to wide partners. The sort mirrors production's keys rather
+//      than calling sortPairsLen, and the 8-bit tier's w > BSW8_MAX_W divert to
+//      the 16-bit kernel (keyed on max(len1, len2)) is not exercised: no band
+//      here exceeds 124. Coupled pairs are rare, so these batches are not what
+//      pins the fix; they keep the property honest on many shapes.
 
 #include <algorithm>
 #include <cstdint>
@@ -340,10 +345,21 @@ void check_generated(int width, uint64_t seed, int nbatch)
                                                       : bwa_tests::run_mem3_scalar(sc, p, w));
             std::vector<int> order(batch.size());
             for (size_t q = 0; q < order.size(); q++) order[q] = (int)q;
-            // generated order, reversed, two shuffles, then random sub-batches
-            for (int g = 0; g < 5; g++) {
+            // generated order, reversed, two shuffles, random sub-batches, then a
+            // stable sort mirroring bsw_score_batch's key for this width (len2 for
+            // 8-bit, len1 as the 16-bit tier uses; not a call to sortPairsLen, and
+            // the w > BSW8_MAX_W max-key divert is not covered, as w <= 124 here;
+            // draws nothing from rng)
+            for (int g = 0; g < 6; g++) {
                 if (g == 1) std::reverse(order.begin(), order.end());
                 if (g == 2 || g == 3) std::shuffle(order.begin(), order.end(), rng);
+                if (g == 5) {
+                    for (size_t q = 0; q < order.size(); q++) order[q] = (int)q;
+                    std::stable_sort(order.begin(), order.end(), [&](int x, int y) {
+                        return width == 8 ? batch[x].query.size() < batch[y].query.size()
+                                          : batch[x].target.size() < batch[y].target.size();
+                    });
+                }
                 size_t s = 0;
                 while (s < order.size()) {
                     const size_t len = g == 4 ? 1 + rng() % 40 : order.size();
