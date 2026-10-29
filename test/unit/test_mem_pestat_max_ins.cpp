@@ -30,11 +30,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <vector>
-#include <unistd.h>
 
 #include "doctest/doctest.h"
 #include "bwamem.h"
+#include "stderr_capture.h"
 
 namespace {
 
@@ -70,38 +69,9 @@ void pestat_with_max_ins(int max_ins, mem_pestat_t pes[4])
  * the only externally visible difference, which makes it the thing to assert on. */
 std::string pestat_stderr_with_max_ins(int max_ins, mem_pestat_t pes[4])
 {
-    fflush(stderr);
-    const int saved_stderr = dup(fileno(stderr));
-    REQUIRE(saved_stderr >= 0);
-
-    /* Honour TMPDIR, as test/unit/test_fmi_pread_from_stream.cpp does: CI
-     * runners point it at a writable scratch area, and /tmp is RAM-backed
-     * tmpfs on several modern distributions. */
-    const char *tmpdir = getenv("TMPDIR");
-    if (tmpdir == NULL || tmpdir[0] == '\0') tmpdir = "/tmp";
-    std::string tmpl_s = tmpdir;
-    if (tmpl_s[tmpl_s.size() - 1] != '/') tmpl_s += '/';
-    tmpl_s += "pestat_stderr_XXXXXX";
-    std::vector<char> tmpl(tmpl_s.begin(), tmpl_s.end());
-    tmpl.push_back('\0');
-    const int fd = mkstemp(tmpl.data());
-    REQUIRE(fd >= 0);
-    REQUIRE(dup2(fd, fileno(stderr)) >= 0);
-
+    bwa_tests::StderrCapture capture;
     pestat_with_max_ins(max_ins, pes);
-
-    fflush(stderr);
-    REQUIRE(dup2(saved_stderr, fileno(stderr)) >= 0);
-    close(saved_stderr);
-
-    std::string captured;
-    REQUIRE(lseek(fd, 0, SEEK_SET) == 0);
-    char buf[4096];
-    ssize_t got;
-    while ((got = read(fd, buf, sizeof(buf))) > 0) captured.append(buf, (size_t)got);
-    close(fd);
-    unlink(tmpl.data());
-    return captured;
+    return capture.text();
 }
 
 } // namespace

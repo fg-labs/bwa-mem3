@@ -15,6 +15,7 @@
 
 #include "doctest/doctest.h"
 #include "../../src/io_utils.h"
+#include "temp_dir.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -97,20 +98,11 @@ TEST_CASE("pwrite_request_size makes progress and never over-writes"
 
 namespace {
 
-// Open an anonymous temp fd: honour $TMPDIR (fall back to /tmp) like the
-// sibling read-side test so CI and macOS use the per-user temp dir, and unlink
-// immediately so nothing lingers even if a later REQUIRE aborts the case.
+// An anonymous temp fd under $TMPDIR, unlinked at once so nothing lingers even
+// if a later REQUIRE aborts the case.
 int open_anon_tmp_fd()
 {
-    const char* dir = getenv("TMPDIR");
-    std::string tmpl = std::string(dir != NULL ? dir : "/tmp");
-    if (!tmpl.empty() && tmpl[tmpl.size() - 1] != '/') tmpl += '/';
-    tmpl += "bwa_pwrite_all_test_XXXXXX";
-    std::vector<char> tmpl_buf(tmpl.begin(), tmpl.end());
-    tmpl_buf.push_back('\0');
-    int fd = mkstemp(tmpl_buf.data());
-    if (fd >= 0) unlink(tmpl_buf.data());
-    return fd;
+    return bwa_tests::anon_temp_fd("bwa_pwrite_all_test");
 }
 
 // Write `src` at `off` via pwrite_all with the given per-call cap, then read it

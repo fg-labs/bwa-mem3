@@ -18,6 +18,7 @@
 
 #include "doctest/doctest.h"
 #include "run_in_child.h"
+#include "temp_dir.h"
 
 #include "bntseq.h"
 
@@ -36,42 +37,15 @@ namespace {
 /* A temporary index prefix holding the given .ann and .amb contents and an
  * empty .pac, plus a file for the child's stderr. Removed on destruction. */
 struct IndexFixture {
-    char dir[PATH_MAX];
+    bwa_tests::TempDir dir{"bns_restore_corrupt"};
     std::string ann, amb, pac, err;
 
-    IndexFixture(const std::string &ann_body, const std::string &amb_body) {
-        const char *tmpdir = getenv("TMPDIR");
-        if (tmpdir == NULL || tmpdir[0] == '\0') tmpdir = "/tmp";
-        const int n = snprintf(dir, sizeof(dir), "%s%sbns_restore_corrupt_XXXXXX",
-                               tmpdir, tmpdir[strlen(tmpdir) - 1] == '/' ? "" : "/");
-        REQUIRE(n > 0);
-        REQUIRE((size_t)n < sizeof(dir));
-        REQUIRE(mkdtemp(dir) != NULL);
-        ann = std::string(dir) + "/ref.ann";
-        amb = std::string(dir) + "/ref.amb";
-        pac = std::string(dir) + "/ref.pac";
-        err = std::string(dir) + "/stderr.txt";
-        write_file(ann, ann_body);
-        write_file(amb, amb_body);
-        write_file(pac, "");
-    }
-
-    ~IndexFixture() {
-        unlink(ann.c_str());
-        unlink(amb.c_str());
-        unlink(pac.c_str());
-        unlink(err.c_str());
-        rmdir(dir);
-    }
-
-    IndexFixture(const IndexFixture &)            = delete;
-    IndexFixture &operator=(const IndexFixture &) = delete;
-
-    static void write_file(const std::string &path, const std::string &body) {
-        FILE *fp = fopen(path.c_str(), "w");
-        REQUIRE(fp != NULL);
-        REQUIRE(fwrite(body.data(), 1, body.size(), fp) == body.size());
-        REQUIRE(fclose(fp) == 0);
+    IndexFixture(const std::string &ann_body, const std::string &amb_body)
+        : ann(dir.file("ref.ann")), amb(dir.file("ref.amb")), pac(dir.file("ref.pac")),
+          err(dir.file("stderr.txt")) {
+        dir.write("ref.ann", ann_body);
+        dir.write("ref.amb", amb_body);
+        dir.write("ref.pac", "");
     }
 
     /* What the last load wrote to stderr. */

@@ -47,6 +47,7 @@
 #include <vector>
 
 #include "doctest/doctest.h"
+#include "stderr_capture.h"
 
 #include "bntseq.h"   // _set_pac
 #include "bwa.h"
@@ -434,21 +435,10 @@ class BandTrace {
 
   private:
     struct Redirect {   // stderr -> fd and bwa_verbose 4 for its lifetime
-        int saved_fd, saved_verbose;
-        explicit Redirect(int fd) : saved_fd(dup(fileno(stderr))), saved_verbose(bwa_verbose)
-        {
-            REQUIRE(saved_fd >= 0);
-            REQUIRE(dup2(fd, fileno(stderr)) >= 0);
-            bwa_verbose = 4;
-        }
-        ~Redirect()
-        {
-            bwa_verbose = saved_verbose;
-            fflush(stderr);
-            const int ok = dup2(saved_fd, fileno(stderr));
-            close(saved_fd);
-            if (ok < 0) abort();   // stderr would stay redirected for the rest of the binary
-        }
+        bwa_tests::StderrRedirect redirect;
+        int saved_verbose;
+        explicit Redirect(int fd) : redirect(fd), saved_verbose(bwa_verbose) { bwa_verbose = 4; }
+        ~Redirect() { bwa_verbose = saved_verbose; }
     };
     int fd_ = -1;
 };
