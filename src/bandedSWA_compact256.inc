@@ -267,6 +267,7 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
                 cmpim = _mm256_or_si256(cmpim, _mm256_cmpgt_epi8(head256, tail256));
                 exit0 = _mm256_andnot_si256(cmpim, exit0);
             }
+            const __m256i qsent256 = bsw8_qsent256(qlen_off256, qlen_valid256, tail256, exit0);
             if (!gen_mat) {
                 for (int jp = beg; jp < end; jp++) {
                     __m256i s2 = _mm256_load_si256((__m256i *)(seq2SoA + jp * SIMD_WIDTH8));
@@ -306,12 +307,9 @@ void BandedPairWiseSW::smithWatermanBatchWrapper8Compact(SeqPair *pairArray,
             }
             j256 = _mm256_set1_epi8(beg - i);
             /* the cell loops of smithWaterman256_8, through its own macros */
-#pragma unroll(4)
-            for (j = beg; j < fast_lo; j++)   EXT13_CELL8_256_MASKED
-#pragma unroll(4)
-            for (j = fast_lo; j < fast_hi; j++) EXT13_CELL8_256_FAST
-#pragma unroll(4)
-            for (j = fast_hi; j < end; j++)   EXT13_CELL8_256_MASKED
+            EXT13_RUN8_256(beg, fast_lo, EXT13_CELL8_256_MASKED)
+            EXT13_RUN8_256(fast_lo, fast_hi, EXT13_CELL8_256_FAST)
+            EXT13_RUN8_256(fast_hi, end, EXT13_CELL8_256_MASKED)
             {
                 __m256i cmp1 = _mm256_or_si256(_mm256_cmpgt_epi8(head256, j256), _mm256_cmpgt_epi8(j256, tail256));
                 h10 = _mm256_andnot_si256(cmp1, h10);
