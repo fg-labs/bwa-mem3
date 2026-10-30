@@ -1417,6 +1417,7 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_cli_basics.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_io_cli.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_seed_cli.sh
+	BWA_MEM3=./bwa-mem3 ./test/regression/mem_pair_cli.sh
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/calloc_interpose_flag_lint_selftest.sh
