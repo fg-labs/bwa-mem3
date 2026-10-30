@@ -143,6 +143,13 @@ ifneq ($(COVERAGE),)
     CXXFLAGS += $(COVERAGE_OPT) --coverage
     LDFLAGS  += --coverage
 endif
+# ASAN=1 builds the test objects and links the binaries with AddressSanitizer,
+# to match a libbwa.a built with the parent's ASAN=1 (an instrumented library
+# needs the runtime at link). LeakSanitizer comes with it on Linux.
+ifneq ($(strip $(ASAN)),)
+    CXXFLAGS += -fsanitize=address -fno-omit-frame-pointer
+    LDFLAGS  += -fsanitize=address
+endif
 FRAMEWORK_SRCS := $(FRAMEWORK_DIR)/scoring.cpp \
                   $(FRAMEWORK_DIR)/meth_scoring.cpp \
                   $(FRAMEWORK_DIR)/seqpair_gen.cpp \
@@ -360,8 +367,8 @@ print-%:
 	@echo '$($*)'
 
 
-# Coverage stamp for this directory's objects, rewritten only when its text
-# changes (the parent's .build-flags trick): switching COVERAGE or COVERAGE_OPT
+# Coverage/sanitizer stamp for this directory's objects, rewritten only when its text
+# changes (the parent's .build-flags trick): switching COVERAGE, COVERAGE_OPT or ASAN
 # on an incremental build recompiles every test object instead of linking
 # objects instrumented at the old level (or not at all) against a libbwa.a
 # built at the new one. It is keyed on the coverage knobs only, not on the
@@ -372,11 +379,11 @@ print-%:
 # Written at parse time rather than by a FORCE recipe, so the stamp is a plain
 # file to make: a dry run (`make -n`, which test/regression/make_test_relink.sh
 # relies on) would otherwise assume a FORCE'd stamp was remade and report every
-# object and binary out of date. The value is two make flags (no quotes), and
+# object and binary out of date. The value is three make flags (no quotes), and
 # the write goes through a per-process temp file and mv, so concurrent makes
 # cannot leave a torn stamp.
 TEST_FLAGS_STAMP := .test-build-flags
-TEST_FLAGS_SIG := COVERAGE=$(COVERAGE)|COVERAGE_OPT=$(if $(COVERAGE),$(COVERAGE_OPT))
+TEST_FLAGS_SIG := COVERAGE=$(COVERAGE)|COVERAGE_OPT=$(if $(COVERAGE),$(COVERAGE_OPT))|ASAN=$(strip $(ASAN))
 ifneq ($(shell cat $(TEST_FLAGS_STAMP) 2>/dev/null),$(TEST_FLAGS_SIG))
     $(shell printf '%s\n' '$(TEST_FLAGS_SIG)' > $(TEST_FLAGS_STAMP).$$$$ && mv $(TEST_FLAGS_STAMP).$$$$ $(TEST_FLAGS_STAMP))
 endif

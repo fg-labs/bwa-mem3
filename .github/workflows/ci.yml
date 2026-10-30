@@ -2254,6 +2254,12 @@ jobs:
           make ASAN=1 arch=avx2 \
             CXX=clang++-19 cli_arg_safety_test
           ./cli_arg_safety_test
+          # mem_chain_flt frees the heap seed arrays of the chains it drops. Its
+          # unit test checks the survivors only, so a dropped free() changes no
+          # assertion; run that suite against the asan library so LeakSanitizer
+          # fails the job on the leak.
+          make -j"$(nproc)" ASAN=1 arch=avx2 CXX=clang++-19 test-binaries
+          ./test/bwa_mem3_tests_unit --test-suite=unit/chain_flt
           # The pre-load input check returns early from mem; run its
           # regression against the asan binary so a memory error on that
           # return, or in the -p / URL / `<cmd` legs, fails the job.
@@ -2736,6 +2742,7 @@ jobs:
           make clean
           make -j"$(nproc)" arch=avx2 CXX=clang++-19 ASAN=1
           make ASAN=1 arch=avx2 CXX=clang++-19 cli_arg_safety_test
+          make -j"$(nproc)" ASAN=1 arch=avx2 CXX=clang++-19 test-binaries
 
       - name: Build (MSan padded-lane gate)
         if: matrix.kind == 'msan'
