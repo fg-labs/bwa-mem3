@@ -213,6 +213,7 @@ For a test using `std::mt19937(seed)`, reproduce locally by editing the seed and
 | `framework/temp_path.h`          | C99 scratch files and directories under `$TMPDIR` (`bwa_test_mkstemp`, `bwa_test_mkdtemp`, `bwa_test_temp_template`), for the standalone C tests and any test that wants a plain path in a buffer; `temp_dir.h` builds on it |
 | `framework/stderr_capture.h`     | `StderrCapture`, `QuietStderr`: scoped stderr redirection |
 | `framework/temp_index.h`         | `TempIndex`: a real index of test contigs, built and loaded in a `TempDir`; `nt4`, `revcomp` |
+| `framework/mem_record_fixture.h` | Hand-built inputs for the record writers (`mem_aln2sam`, `mem_aln_to_bam`): a two-contig reference, a read and alignments, with no index |
 | `framework/simd_tiers.sh`        | `simd_sweep_tiers`: the SIMD tiers a regression script sweeps; `simd_detect_tier`, `simd_tier_rank`: the tier a binary dispatches to, and tier order |
 | `framework/dna.sh`               | `dna_revcomp`: the reverse complement regression scripts build reads with |
 | `framework/mem_cli.sh`           | Source-only shell helpers for the `mem` CLI regression scripts |
