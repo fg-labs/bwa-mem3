@@ -730,6 +730,13 @@ jobs:
         if: matrix.os == 'ubuntu-24.04-arm'
         run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_cli_basics.sh
 
+      - name: mem CLI chaining and extension (hand-derived records, each SIMD tier)
+        # mem_cli_basics.sh's approach applied to clipping, scoring, z-drop and
+        # patching, chaining, the band and the XA options; neon here, avx2 and
+        # avx512bw in canonical-regressions.
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_extend_cli.sh
+
       - name: Build doctest framework and unit binary
         # Invoke via the parent `test-binaries` target so ARCH_FLAGS
         # propagate from libbwa.a's build into the test CXXFLAGS. Ensures
@@ -1700,6 +1707,13 @@ jobs:
         # runner has it, avx512bw, and required byte-identical across them;
         # the Linux ARM64 row runs it under neon.
         run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/mem_cli_basics.sh
+
+      - name: mem CLI chaining and extension (hand-derived records, each SIMD tier)
+        # Clipping, scoring, z-drop and patching, chaining, the band and the XA
+        # options, by hand on the same reference, under avx2 and,
+        # where the runner has it, avx512bw; the Linux ARM64 row runs it under
+        # neon.
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/mem_extend_cli.sh
 
       - name: Rescue identity under each forced x86 tier (generated PE fixture)
         # The kswv rescue kernels differ per tier, so the 11-op cell (and the
