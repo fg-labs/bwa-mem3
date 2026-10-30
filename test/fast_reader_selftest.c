@@ -170,12 +170,20 @@ int main(void)
     CHECK(fr_detect(bg,18) == FR_BGZF,                        "fr_detect: bgzf");
     CHECK(fr_detect(bz,2) == FR_UNSUPPORTED,                  "fr_detect: bzip2 -> unsupported");
     CHECK(fr_detect(zs4,4) == FR_UNSUPPORTED,                 "fr_detect: zstd -> unsupported");
+    unsigned char xz[6]   = {0xfd,0x37,0x7a,0x58,0x5a,0x00};
+    CHECK(fr_detect(xz,6) == FR_UNSUPPORTED,                  "fr_detect: xz -> unsupported");
+    /* FEXTRA whose first subfield is not BC is plain gzip, not BGZF. */
+    unsigned char gx[18];
+    memcpy(gx, bg, sizeof gx);
+    gx[12] = 'X';
+    CHECK(fr_detect(gx,18) == FR_GZIP,                        "fr_detect: FEXTRA without BC -> gzip");
     /* Documented boundary: the BGZF-vs-gzip distinction needs the full 18 bytes,
      * so a short buffer that starts with the gzip magic still classifies GZIP;
      * a lone 0x1f (1 byte, below the n>=2 magic check) is PLAIN. */
     unsigned char gz2[2] = {0x1f,0x8b};
     unsigned char one[1] = {0x1f};
     CHECK(fr_detect(gz2,2) == FR_GZIP,                        "fr_detect: 2-byte gzip magic -> gzip");
+    CHECK(fr_detect(bg,17) == FR_GZIP,                        "fr_detect: BGZF header 1 byte short -> gzip");
     CHECK(fr_detect(one,1) == FR_PLAIN,                       "fr_detect: 1-byte 0x1f -> plain");
 
     if (bwa_test_mkdtemp(g_dir, sizeof g_dir, "fast_reader_selftest") != 0) return 1;
