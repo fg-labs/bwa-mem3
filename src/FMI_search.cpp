@@ -2038,7 +2038,7 @@ DONE:
 // ===== Lockstep bwtSeed batching =====
 // Per-slot state for the forward-only bwtSeed walk. Mirrors the locals of
 // the scalar bwtSeedStrategyAllPosOneThread inner-j loop, plus an outer-x
-// cursor. Each slot owns the entire scalar `while (x < readlength)` outer
+// cursor. Each slot owns the entire scalar `while (x < x_end)` outer
 // loop — outer transitions are handled inline in bsd_advance_step (Heng
 // review action: don't burn a stepping-pass on outer-only housekeeping
 // when the inner-j loop is shallow, which is exactly bwtSeed's regime).
@@ -2074,6 +2074,7 @@ struct FMI_search::BwtSeedSlot {
     SMEM    smem;          // current SA interval; rid/m fixed at outer-x init
     int32_t x;             // outer cursor: position of current smem's seed base
     int32_t j;             // inner cursor: next j to step; j < 0 = need outer seek
+    int32_t x_end;         // first x from which no walk can emit (bsd_init_slot)
 
     BwtSeedPhase phase;
     int32_t match_count;
@@ -2085,6 +2086,17 @@ struct FMI_search::BwtSeedSlot {
     // walk started at x and taken on the slot's next visit; NULL = step.
     const SeedJumpEntry *jump;
 };
+
+// First x from which no bwtSeed walk can emit. A walk from x emits only at a
+// step whose length n - m + 1 is at least minSeedLen, and its last possible
+// step ends at the read's last base, so a walk starting at
+// x >= readlength - minSeedLen + 1 never emits, nor does any walk after it.
+// minSeedLen <= 1 (-k 0 or below) keeps the read end as the bound, so no walk
+// starts past the read. Shared by the scalar and lockstep drivers.
+static inline int32_t bwtseed_x_end(int32_t readlength, int32_t minSeedLen)
+{
+    return minSeedLen > 1 ? readlength - minSeedLen + 1 : readlength;
+}
 
 // Same-slot T0 prefetch for the next inner-j step. The bwtSeed walk is
 // forward-only: bsd_advance_step swaps k<->l and calls backwardExt on the
@@ -2122,6 +2134,9 @@ void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
 // at that string's entry in the level-jd table jlev and prefetch it; the next
 // visit (bsd_advance_step) takes it. Otherwise s->jump stays NULL and the walk
 // steps from x as before, reaching the N or the read end exactly as it did.
+// The read-end check cannot fire for a walk that starts before x_end
+// (bsd_init_slot), since jd <= minSeedLen - 1 (clamped in
+// bwtSeedStrategyAllPosOneThread_lockstep); it keeps the read in bounds anyway.
 void FMI_search::bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
                                const SeedJumpEntry *jlev, int32_t jd)
 {
@@ -2137,15 +2152,21 @@ void FMI_search::bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
 // Initialize a fresh slot for the given input read. Scans forward from
 // x=0 for the first ACGT base (matching the scalar's outer while-loop
 // skipping non-ACGT) and either enters BSD_FWD with smem seeded (and its
-// jump planned, bsd_plan_jump), or jumps straight to BSD_DONE when the read
-// is entirely non-ACGT.
+// jump planned, bsd_plan_jump), or goes straight to BSD_DONE when no walk left
+// in the read can emit.
+//
+// No walk from x_end on can emit (bwtseed_x_end): it would only step to an N
+// or the read end. The slot retires as soon as its cursor reaches x_end (here,
+// at the outer seek, or where a walk ends in bsd_advance_step) instead of
+// walking there.
 void FMI_search::bsd_init_slot(BwtSeedSlot *s,
                                int32_t input_idx,
                                const int32_t *max_intv_array,
                                const bseq1_t *seq_,
                                const int32_t *query_cum_len_ar,
                                const uint8_t *enc_qdb,
-                               const SeedJumpEntry *jlev, int32_t jd)
+                               const SeedJumpEntry *jlev, int32_t jd,
+                               int32_t minSeedLen)
 {
     s->input_idx   = input_idx;
     s->max_intv    = max_intv_array[input_idx];
@@ -2154,11 +2175,12 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
     s->match_count = 0;
     s->ready       = false;
     s->jump        = nullptr;
+    s->x_end       = bwtseed_x_end(s->readlength, minSeedLen);
 
     int32_t x = 0;
-    while (x < s->readlength && enc_qdb[s->offset + x] >= 4) x++;
+    while (x < s->x_end && enc_qdb[s->offset + x] >= 4) x++;
     s->x = x;
-    if (x >= s->readlength) {
+    if (x >= s->x_end) {
         s->phase = BSD_DONE;
         s->ready = true;
         return;
@@ -2221,10 +2243,11 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
     // Outer seek: if j < 0 the slot just broke out of an inner-j extension
     // and needs to (re-)init smem at the next ACGT x. Spin through non-ACGT
     // bases inline (scalar does the same — at most O(N_run) here, and N runs
-    // are rare in Illumina data). Falls through to one inner-j step.
+    // are rare in Illumina data). Falls through to one inner-j step. From
+    // x_end on no walk can emit (bsd_init_slot), so the slot retires there.
     if (s->j < 0) {
-        while (s->x < s->readlength && enc_qdb[s->offset + s->x] >= 4) s->x++;
-        if (s->x >= s->readlength) {
+        while (s->x < s->x_end && enc_qdb[s->offset + s->x] >= 4) s->x++;
+        if (s->x >= s->x_end) {
             s->phase = BSD_DONE;
             s->ready = true;
             return;
@@ -2247,18 +2270,24 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
     // Inner-j step.
     if (s->j >= s->readlength) {
         // Scalar: inner for-loop exhausted; next_x stays at last iteration's
-        // j+1 = readlength. Setting x = readlength and j = -1 signals the
-        // next stepping pass to retire (the seek above will hit x >= L).
+        // j+1 = readlength, at or past x_end, so the slot retires now.
         s->x = s->readlength;
         s->j = -1;
+        s->phase = BSD_DONE;
+        s->ready = true;
         return;
     }
 
     uint8_t a = enc_qdb[s->offset + s->j];
     if (a >= 4) {
-        // Scalar: non-ACGT in inner-j sets next_x = j+1 and breaks.
+        // Scalar: non-ACGT in inner-j sets next_x = j+1 and breaks. A walk
+        // ending at x_end or past it is the read's last (bsd_init_slot).
         s->x = s->j + 1;
         s->j = -1;
+        if (s->x >= s->x_end) {
+            s->phase = BSD_DONE;
+            s->ready = true;
+        }
         return;
     }
 
@@ -2279,6 +2308,10 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         }
         s->x = s->j + 1;
         s->j = -1;
+        if (s->x >= s->x_end) {
+            s->phase = BSD_DONE;
+            s->ready = true;
+        }
         return;
     }
 
@@ -2571,8 +2604,10 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
     for(i = 0; i < numReads; i++)
     {
         int readlength = seq_[i].l_seq;
+        // No walk from x_end on can emit (bwtseed_x_end), so the read ends there.
+        const int x_end = bwtseed_x_end(readlength, minSeedLen);
         int32_t x = 0;
-        while(x < readlength)
+        while(x < x_end)
         {
             int next_x = x + 1;
 
@@ -2723,7 +2758,8 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
     // Seed the first min(N, numReads) slots.
     const int32_t initial = (numReads < N) ? numReads : N;
     for (int32_t s = 0; s < initial; s++) {
-        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd);
+        bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd,
+                      minSeedLen);
         if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr) bsd_prefetch_cp_occ(&slots[s]);
     }
     // Unused slots get input_idx = -1 so the flush pass skips them.
@@ -2768,7 +2804,8 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
 
             if (next_input < numReads) {
                 bsd_init_slot(&slots[s], next_input,
-                              max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd);
+                              max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd,
+                              minSeedLen);
                 if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr)
                     bsd_prefetch_cp_occ(&slots[s]);
                 next_input++;
