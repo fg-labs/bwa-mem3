@@ -6,7 +6,7 @@ bwa-mem3 tests are organized into three categories — **unit**, **integration**
 |----------------|------------------------------------|----------------------------------------------|--------------------------------------|
 | **unit**       | `test/bwa_mem3_tests_unit`         | None. All inputs synthetic (scratch files a case generates itself are allowed). | Every matrix row                     |
 | **integration**| `test/bwa_mem3_tests_integration`  | Small committed FASTAs / FMI under `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
-| **regression** | `test/regression/*.sh`             | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row), `mem_cli_basics.sh` (also Linux ARM64) and the source-only lints (own jobs) |
+| **regression** | `test/regression/*.sh`             | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row), `mem_cli_basics.sh` and `mem_pair_cli.sh` (also Linux ARM64) and the source-only lints (own jobs) |
 
 Design rationale: see the internal test framework design spec (not committed).
 
