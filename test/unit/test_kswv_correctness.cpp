@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
@@ -1499,6 +1500,66 @@ TEST_CASE("kswv FSCAN: equal gap-open totals with different extension costs"
         for (bool use16 : {false, true})
             check_fscan_off_on(c.name, pairs, mat, c.gaps, use16);
     }
+}
+
+
+// A batch whose size is not a multiple of the SIMD width ends in a partial
+// group, padded with dummy lanes. jsplit/jdummy are taken over the real lanes
+// only (kswv_real_lanes), so the partial group runs the mask-free column range
+// below the real lanes' minimum quantum. Drive every batch size around the
+// widths of each tier (16 NEON, 32 AVX2, 64 AVX-512BW) with ragged query
+// lengths, under every u8 body, and require scalar parity for each real pair.
+TEST_CASE("kswv u8 rescue: partial final groups match scalar at every batch size and body"
+          * doctest::test_suite("unit/kswv")) {
+    auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
+    const int sizes[] = {1, 2, 3, 5, 8, 15, 17, 23, 31, 33, 47, 63, 65, 79, 97, 127, 129};
+    struct Body { const char *name, *var, *val, *var2, *val2; };
+    const Body bodies[] = {
+        {"default", nullptr, nullptr, nullptr, nullptr},
+        {"FSCAN=0", "BWA3_RESCUE_FSCAN", "0", nullptr, nullptr},
+        {"USQADD=0", "BWA3_RESCUE_USQADD", "0", nullptr, nullptr},
+        {"FSCAN=0 USQADD=0", "BWA3_RESCUE_FSCAN", "0", "BWA3_RESCUE_USQADD", "0"},
+        {"ROWPAIR=0", "BWA3_RESCUE_ROWPAIR", "0", nullptr, nullptr},
+    };
+
+    std::mt19937 rng(20261020);
+    std::uniform_int_distribution<int> qlen_d(30, 150);
+    std::uniform_int_distribution<int> rlen_d(80, 260);
+    int checked = 0;
+    for (const int n : sizes) {
+        std::vector<bwa_tests::TestPair> pairs;
+        for (int i = 0; i < n; i++) {
+            // Mix in pairs that align well, so gmax/te/qe move on many rows.
+            const int q = qlen_d(rng), r = rlen_d(rng);
+            if (i % 4 == 0) pairs.push_back(bwa_tests::gen_tandem_repeat_pair(rng, q, q + r / 2));
+            else            pairs.push_back(bwa_tests::gen_random_pair(rng, q, r));
+        }
+        std::vector<kswr_t> scalar;
+        for (const auto &p : pairs) scalar.push_back(bwa_tests::run_scalar_ksw(p, mat));
+
+        for (const Body &b : bodies) {
+            std::unique_ptr<ScopedEnv> env;
+            if (b.var) env.reset(new ScopedEnv(b.var, b.val));
+            std::unique_ptr<ScopedEnv> env2;
+            if (b.var2) env2.reset(new ScopedEnv(b.var2, b.val2));
+            auto batched = bwa_tests::run_kswv_batch(pairs, mat);
+            REQUIRE(batched.size() == pairs.size());
+            for (int i = 0; i < n; i++) {
+                const std::string tier(kKswvTier);
+                CAPTURE(tier);
+                const std::string body(b.name);
+                CAPTURE(body);
+                CAPTURE(n);
+                CAPTURE(i);
+                CHECK(bwa_tests::kswr_score_eq(scalar[i], batched[i]));
+                CHECK(bwa_tests::kswr_ends_eq(scalar[i], batched[i]));
+                CHECK(bwa_tests::kswr_coords_eq(scalar[i], batched[i]));
+                CHECK(bwa_tests::kswr_score2_eq(scalar[i], batched[i]));
+                ++checked;
+            }
+        }
+    }
+    MESSAGE("partial-group parity: " << checked << " pair results on tier " << std::string(kKswvTier));
 }
 
 #endif // BWA_TESTS_HAVE_KSWV

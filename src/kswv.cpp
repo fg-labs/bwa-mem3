@@ -214,6 +214,30 @@ static inline int compute_jsplit(const SeqPair *p, int width, int ncol, bool i16
     return jsplit;
 }
 
+/* Real (non-dummy) lanes of the group starting at po_ind. The batch drivers pad
+ * the last group out to the SIMD width with dummy lanes (len1 == len2 == 0,
+ * h0 == 0) whose results are never read back. Taking jsplit and jdummy over the
+ * real lanes only lets a partial group run the mask-free column range like a
+ * full one: below the real lanes' minimum quantum only a dummy lane can carry
+ * the query pad, so the query half of the mask there changes dummy cells only.
+ * Those cells are no longer zeroed, though -- a dummy lane's reference and query
+ * are both 0xFF, which the score table reads as a match -- so each u8 kernel
+ * also excludes the dummy lanes from its gmax/te/qe update (frozen from row 0,
+ * see kswv_dummy_lane_bytes). Their gmax then stays 0, as it did when every
+ * cell was masked, so they still never end the batch early (no KSW_XSTOP
+ * target, no saturation) and never trigger a query-end rescan. */
+static inline int kswv_real_lanes(int po_ind, int32_t numPairs, int width)
+{
+    const int n = numPairs - po_ind;
+    return n < width ? n : width;
+}
+
+/* 0xFF for each dummy lane (l >= nreal), 0x00 for each real one. */
+static inline void kswv_dummy_lane_bytes(uint8_t *out, int width, int nreal)
+{
+    for (int l = 0; l < width; l++) out[l] = l >= nreal ? 0xFF : 0x00;
+}
+
 /* "No freed cell active on this lane" markers for the freed-cell (--meth)
  * blend, one per kernel width. Each must be a value a query byte can never
  * take, so the blend provably never fires on a lane with no active freed cell:
@@ -1175,7 +1199,11 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
     // the caller only partially reversed the buffer) can add spurious
     // matches, pushing phase-1's score above phase-0's and breaking the
     // write-back gate `aln[ind].score == score[l]` at line ~538.
-    uint8x16_t frozen_vec = zero_vec;
+    // A partial group's dummy lanes start frozen; see kswv_real_lanes.
+    const int nreal = kswv_real_lanes(po_ind, numPairs, SIMD_WIDTH8);
+    uint8_t _dummy_bytes[SIMD_WIDTH8];
+    kswv_dummy_lane_bytes(_dummy_bytes, SIMD_WIDTH8, nreal);
+    uint8x16_t frozen_vec = vld1q_u8(_dummy_bytes);
 
     /* Per-lane mask of "this lane has a real KSW_XSTOP target set" (derived
      * from endsc_msk_a). endsc[i] defaults to 0 for lanes without a target,
@@ -1264,12 +1292,14 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * projected below the +/-0.5% noise floor: kswv is ~31% of mem CPU and phase 1
      * is a fraction of that, and EXT-13 -- the same technique -- was predicted at
      * 1-3% and measured -0.19%.
-     * Dummy tail lanes carry len1 == len2 == 0, pinning both to 0 for
-     * a partial final group: no fast path, still correct. */
+     * jsplit is taken over the real lanes only (kswv_real_lanes), so a
+     * partial final group gets the same column split as a full one. minLen1
+     * still spans the dummy lanes (len1 == 0 pins it to 0): it gates only the
+     * reference half of the mask, which the default FScan body drops anyway. */
     int minLen1 = p[0].len1;
     for (int l = 0; l < SIMD_WIDTH8; l++)
         if (p[l].len1 < minLen1) minLen1 = p[l].len1;
-    const int jsplit = compute_jsplit(p, SIMD_WIDTH8, ncol, false);
+    const int jsplit = compute_jsplit(p, nreal, ncol, false);
 
     /* Query-tail padding, [len2, quantum) per lane. The NEON wrapper fills it
      * with NEON_QPAD8 (16), chosen so that the score gather handles it for free
@@ -1287,7 +1317,7 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * the pad there; see compute_jdummy). Production pays that only on the
      * legacy toggle path. The AVX2/AVX-512 kernels pad with X86_QPAD8 = 6: pshufb
      * masks its index to four bits, so an index of 16 would read entry 0 there. */
-    const int jdummy = USQADD ? jsplit : compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+    const int jdummy = USQADD ? jsplit : compute_jdummy(p, nreal, ncol, jsplit);
 
     /* All-pad columns (BWA3_RESCUE_PADCOLS, USQADD FScan bodies only). From the
      * group's longest query up to jsplit, every lane's query byte is NEON_QPAD8:
@@ -1298,9 +1328,10 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
      * USQADD: 8 vector ALU ops per cell instead of 11 (the last 10 of 160 columns
      * for 150 bp mates). The freed-cell override never fires there either: it
      * compares s2 with a base code or FREED_INACTIVE8, never 16. The FScan bodies
-     * apply no boundary mask below jsplit, so nothing else differs. A dummy tail
-     * lane (len2 = 0) pins jsplit to 0, and a lane whose len2 is a multiple of 16
-     * pins it to at most that len2, so the range is empty in both cases. The
+     * apply no boundary mask below jsplit, so nothing else differs. jsplit is
+     * taken over the real lanes, and a dummy tail lane is frozen from the start,
+     * so its cells in the range do not matter. A lane whose len2 is a multiple of
+     * 16 pins jsplit to at most that len2, so the range is empty then. The
      * biased (!USQADD) body is excluded: its pad cell is vqsubq(vqaddq(h, shift),
      * shift), which is not h when h + shift saturates. Default ON; 0 leaves the
      * range empty. */
@@ -3443,17 +3474,22 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
      * mask -- the only half FScan keeps -- is dead, and jdummy_fs subdivides
      * [0, jsplit) for the X86_QPAD8 test exactly as jdummy_a2 does [0, ncol).
      * Splitting the column range pins no vector, unlike the hoisted mask the
-     * register-pressure note in the cell below rules out. */
-    const int jsplit = compute_jsplit(p, SIMD_WIDTH8, ncol, false);
-    const int jdummy_fs = compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+     * register-pressure note in the cell below rules out. Both are taken over
+     * the real lanes only, as in the NEON kernel (kswv_real_lanes). */
+    const int nreal = kswv_real_lanes(po_ind, numPairs, SIMD_WIDTH8);
+    const int jsplit = compute_jsplit(p, nreal, ncol, false);
+    const int jdummy_fs = compute_jdummy(p, nreal, ncol, jsplit);
     const __m256i cmax_vec   = _mm256_set1_epi8((char)255);
 
     __m256i gmax_vec   = zero_vec;
     /* Fix 1: split te into two int16 vectors covering 32 pairs. */
     __m256i te_vec_lo  = _mm256_set1_epi16(-1);  /* pairs 0..15 */
     __m256i te_vec_hi  = _mm256_set1_epi16(-1);  /* pairs 16..31 */
-    /* Fix 2: per-lane freeze once pair hits KSW_XSTOP. */
-    __m256i frozen_vec = zero_vec;
+    /* Fix 2: per-lane freeze once pair hits KSW_XSTOP. A partial group's
+     * dummy lanes start frozen; see kswv_real_lanes. */
+    uint8_t _dummy_bytes[SIMD_WIDTH8];
+    kswv_dummy_lane_bytes(_dummy_bytes, SIMD_WIDTH8, nreal);
+    __m256i frozen_vec = _mm256_loadu_si256((const __m256i *)_dummy_bytes);
 
     /* Fix 2 helper: only freeze lanes that actually set an endsc target.
      * endsc_vec defaults to 0 for lanes without a target (compares
@@ -4869,14 +4905,18 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * lengths, so they do run it. (No minLen1 range here: unlike NEON's vbsl,
      * the AVX-512 blend is a masked move that costs the same whether or not the
      * mask is empty, so splitting the reference half out as well buys
-     * nothing.) */
-    const int jsplit = compute_jsplit(p, SIMD_WIDTH8, ncol, false);
+     * nothing.) Taken over the real lanes only; real_msk keeps the dummy lanes
+     * out of the gmax/te/qe update (see kswv_real_lanes). */
+    const int nreal = kswv_real_lanes(po_ind, numPairs, SIMD_WIDTH8);
+    const __mmask64 real_msk = nreal >= SIMD_WIDTH8 ? ~(__mmask64)0
+                                                   : (((__mmask64)1 << nreal) - 1);
+    const int jsplit = compute_jsplit(p, nreal, ncol, false);
 
     /* First column any lane can hold the X86_QPAD8 query pad, so the cmp+blend
      * for it can be elided below this. Same derivation and same byte-identity
      * argument as the NEON kernel above; clamped to jsplit because it only
      * subdivides the [0, jsplit) range. */
-    const int jdummy = compute_jdummy(p, SIMD_WIDTH8, ncol, jsplit);
+    const int jdummy = compute_jdummy(p, nreal, ncol, jsplit);
 
     /* Per-row epilogue, shared by the one-row and two-row sweeps: close the
      * final checkpoint block, Block I (the lagged rowMax store), Block II (gmax,
@@ -4889,7 +4929,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * holds the row's H at column j (H1 + SIMD_WIDTH8 for the one-row sweep and
      * a pair's row i+1, H0 for a pair's row i). The caller tests exit0. Besides its
  * arguments it reads and writes the enclosing kernel's per-batch state by name
- * (ncol, nblocks, h_zero, pimax512, mask512, minsc_msk, minsc512, gmax512,
+ * (ncol, nblocks, h_zero, pimax512, mask512, minsc_msk, minsc512, gmax512, real_msk,
  * te512, te512_, qe512, exit0, rowMax, colIdx8, endsc512, cmax512, sft512,
  * zero512 and the Sgn template parameter). */
 #define KSWV512_U8_EPILOGUE(EPI_ROW, EPI_IMAX, EPI_BLOCKMAX, EPI_HBASE)         \
@@ -4925,7 +4965,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
                                                                                 \
         /* Block II: gmax, te */                                                \
         __mmask64 cmp0 = _mm512_cmpgt_epu8_mask(__imax, gmax512);               \
-        cmp0 &= exit0;                                                          \
+        cmp0 &= exit0 & real_msk;                                               \
         gmax512 = _mm512_mask_blend_epi8(cmp0, gmax512, __imax);                \
         te512 = _mm512_mask_blend_epi16((__mmask32)cmp0, te512, __i512);        \
         te512_ = _mm512_mask_blend_epi16((__mmask32) (cmp0 >> SIMD_WIDTH16), te512_, __i512); \
