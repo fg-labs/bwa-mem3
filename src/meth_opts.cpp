@@ -82,7 +82,10 @@ int meth_opts_parse(int opt_id, const char *optarg, mem_opt_t *opt, meth_cli_t *
          * unreachable under --meth — there was no flag that undid it.) */
         /* Optional chemistry argument. getopt_long's optional_argument only
          * accepts the `--meth=taps` form (a separate word is treated as a
-         * positional), so a bare `--meth` leaves optarg NULL => em-seq. */
+         * positional), so a bare `--meth` leaves optarg NULL => em-seq.
+         * Set em-seq first so the last --meth wins: a bare --meth after
+         * --meth=taps is em-seq, not a leftover taps. */
+        opt->meth_chem = METH_CHEM_EMSEQ;
         if (optarg != NULL) {
             size_t k = 0;
             while (k < N_CHEM && strcmp(optarg, meth_chem_names[k].name) != 0) ++k;

@@ -10,7 +10,8 @@ strand-filtering logic inside `meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
 ## `--meth[={emseq|taps|5base}]`
 
 Selects the **methylation chemistry**. Defaults to `emseq`, so a bare `--meth`
-behaves exactly as it always has.
+behaves exactly as it always has. When `--meth` is given more than once, the last
+one wins: `--meth=taps --meth` is EM-seq, and `--meth --meth=taps` is TAPS.
 
 | Value | Chemistry | Which cytosines convert to T |
 |-------|-----------|------------------------------|

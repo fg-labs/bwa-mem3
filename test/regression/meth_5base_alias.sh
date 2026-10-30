@@ -17,6 +17,10 @@
 # `--meth=taps --meth-scoring neutral` must equal plain --meth=taps, so a change
 # to TAPS's default scoring (which 5base inherits) fails here.
 #
+# The last --meth on the command line wins, as for any option: a bare --meth
+# after --meth=5base is em-seq (it used to keep 5base), and --meth=5base after a
+# bare --meth is 5base. Both orders are checked record for record.
+#
 # Also asserted: an unknown chemistry is rejected with a message naming 5base,
 # and so is `--meth=illumina` (Illumina also sells bisulfite kits, whose calls
 # 5base would invert). The advice for `--meth 5base` (no '=') is checked with
@@ -95,12 +99,21 @@ align taps-neutral.sam --meth=taps --meth-scoring neutral
 diff <(records taps.sam) <(records taps-neutral.sam) > taps-neutral.diff \
     || fail "--meth=taps does not default to --meth-scoring neutral: $(head -4 taps-neutral.diff | cut -c1-200 | tr '\n' ' ')"
 
+align emseq.sam --meth
+
+# --- 1b. the last --meth wins -----------------------------------------------
+align last-bare.sam --meth=5base --meth
+diff <(records emseq.sam) <(records last-bare.sam) > last-bare.diff \
+    || fail "--meth=5base --meth: a later bare --meth must select em-seq, but records differ from --meth: $(head -4 last-bare.diff | cut -c1-200 | tr '\n' ' ')"
+align last-chem.sam --meth --meth=5base
+diff <(records 5base.sam) <(records last-chem.sam) > last-chem.diff \
+    || fail "--meth --meth=5base: records differ from --meth=5base: $(head -4 last-chem.diff | cut -c1-200 | tr '\n' ' ')"
+
 # --- 2. polarity: the converted CpG is the methylated call -----------------
 polarity=checked
 if command -v mawk > /dev/null 2>&1; then
     [ "$(cpg_calls 5base.sam Z)" = "$ONE_EACH" ] \
         || fail "--meth=5base: want exactly one methylated CpG call (Z) per mate, got '$(cpg_calls 5base.sam Z)'"
-    align emseq.sam --meth
     [ "$(cpg_calls emseq.sam z)" = "$ONE_EACH" ] \
         || fail "--meth (em-seq control): want exactly one unmethylated CpG call (z) per mate, got '$(cpg_calls emseq.sam z)'"
     # The retained CpGs: unmethylated under 5base, methylated under em-seq.
@@ -120,4 +133,4 @@ if "$BWA_MEM3" mem --meth=illumina ref.fa r1.fq > /dev/null 2> err.txt; then
     fail "--meth=illumina exited 0; it must not alias 5base"
 fi
 grep -q "got 'illumina'" err.txt || fail "--meth=illumina: not rejected as an unknown chemistry; got: $(head -1 err.txt)"
-echo "PASS: meth_5base_alias (5base/5-base == taps record for record; taps defaults to neutral; 5mC->T read as methylated and retained C as unmethylated: $polarity; illumina and unknown chemistries rejected)"
+echo "PASS: meth_5base_alias (5base/5-base == taps record for record; taps defaults to neutral; the last --meth wins; 5mC->T read as methylated and retained C as unmethylated: $polarity; illumina and unknown chemistries rejected)"
