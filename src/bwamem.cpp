@@ -3198,6 +3198,17 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
      * included) as sortSMEMs followed by a per-rid ks_introsort(mem_intv1). */
     smem_sort_rid_mn(matchArray, tot_smem, mmc->smem_sort_scratch[tid]);
 
+    /* An s == 1 SMEM inside a tagged one takes its tag (SA resolution then
+     * writes its coordinate without an LF walk; FMI_search.cpp,
+     * s1_tag_contained). Per read: each rid's run, in the (m, n) order just
+     * made. Skipped when seeding cannot tag (no pac, e.g. --meth): there is
+     * nothing to pass on. Skipped too under a dropped sentinel offset
+     * (--compat=bwa-mem2), where SA resolution ignores the tags; this is the
+     * same condition mem_chain_seeds computes as sa_drop_sentinel_offset. */
+    if (fmi->s1_text_available() &&
+        !(opt->compat != NULL && opt->compat->sa_sentinel_drop_offset))
+        FMI_search::s1_tag_contained_reads(matchArray, tot_smem);
+
     if (opt->smem_dedup)
         tot_smem = smem_dedup_inplace(matchArray, tot_smem);
 
@@ -3915,7 +3926,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
                 uint64_t tim_sa = __rdtsc();
                 fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
                                              chunk_end - smem_ptr, opt->max_occ, tid, id,
-                                             sa_drop_sentinel_offset);
+                                             sa_drop_sentinel_offset, /*trust_s1_tag=*/true);
                 tprof[MEM_SA][tid] += __rdtsc() - tim_sa;
                 mypos = 0;
                 sa_n = cnt_;
@@ -3927,7 +3938,8 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
             uint64_t tim = __rdtsc();
             fmi->get_sa_entries_prefetch(&matchArray[smem_ptr], sa_coord, &cnt_,
                                          pos - smem_ptr + 1, opt->max_occ, tid, id,
-                                         sa_drop_sentinel_offset);  // sa compressed prefetch
+                                         sa_drop_sentinel_offset,
+                                         /*trust_s1_tag=*/true);  // sa compressed prefetch
             tprof[MEM_SA][tid] += __rdtsc() - tim;
             sa_n = cnt_;
         }
