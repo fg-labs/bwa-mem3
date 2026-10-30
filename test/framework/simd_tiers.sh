@@ -7,7 +7,8 @@
 # script parses the dispatcher, ranks tiers and sweeps them the same way. Used
 # by all_tiers_parity.sh, band_cert_identity.sh, dash_read_as_n.sh,
 # meth_context_identity.sh, rescue_prune_identity.sh and, through
-# test/framework/mem_cli.sh, mem_cli_basics.sh. Keeps to bash 3.2 (macOS /bin/bash).
+# test/framework/mem_cli.sh, every script that sources that (mem_cli_basics.sh
+# and the mem_*_cli.sh scripts). Keeps to bash 3.2 (macOS /bin/bash).
 #
 #     source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/simd_tiers.sh"
 #     simd_sweep_tiers "$BWA_MEM3" || exit $?
