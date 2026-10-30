@@ -110,9 +110,10 @@ mem_cli_cleanup() {
 
 # mem_cli_verdict
 #   Sets MEM_CLI_VERDICT to a one-line summary and returns 1 if any check
-#   failed or none ran at all, else 0. The summary counts skipped checks
-#   separately, so a run that skipped part of its work does not read as a
-#   full pass.
+#   failed, a mem_cli_seq slice failed (even inside a command substitution,
+#   where its status is lost) or no check ran at all, else 0. The summary
+#   counts skipped checks separately, so a run that skipped part of its work
+#   does not read as a full pass.
 # MEM_CLI_VERDICT is read by the calling script, which shellcheck sees separately.
 # shellcheck disable=SC2034
 mem_cli_verdict() {
@@ -120,6 +121,10 @@ mem_cli_verdict() {
     tiers="$(mem_cli_tiers | tr '\n' ' ')"
     if ((MEM_CLI_FAILS > 0)); then
         MEM_CLI_VERDICT="$MEM_CLI_NAME: $MEM_CLI_FAILS of $MEM_CLI_CHECKS checks failed (tiers: $tiers)"
+        return 1
+    fi
+    if [[ -s $MEM_CLI_WORK/mem_cli_seq.failed ]]; then
+        MEM_CLI_VERDICT="$MEM_CLI_NAME: $(wc -l < "$MEM_CLI_WORK/mem_cli_seq.failed" | tr -d ' ') mem_cli_seq slice(s) fell outside the reference (tiers: $tiers)"
         return 1
     fi
     if ((MEM_CLI_CHECKS == 0)); then
@@ -133,13 +138,15 @@ mem_cli_verdict() {
 # References and indexes
 # ---------------------------------------------------------------------------
 
-# mem_cli_index <ref.fa>
-#   `bwa-mem3 index` with its log beside the reference; a failure ends the
-#   script with the log's tail.
+# mem_cli_index <ref.fa> [index options...]
+#   `bwa-mem3 index [options] <ref.fa>` with its log beside the reference; a
+#   failure ends the script with the log's tail.
 mem_cli_index() {
-    if ! "$BWA_MEM3" index "$1" > "$1.index.log" 2>&1; then
-        echo "FAIL: $MEM_CLI_NAME: bwa-mem3 index $1 failed:" >&2
-        tail -n 20 "$1.index.log" >&2
+    local fa="$1"
+    shift
+    if ! "$BWA_MEM3" index "$@" "$fa" > "$fa.index.log" 2>&1; then
+        echo "FAIL: $MEM_CLI_NAME: bwa-mem3 index $* $fa failed:" >&2
+        tail -n 20 "$fa.index.log" >&2
         exit 1
     fi
 }
@@ -147,18 +154,25 @@ mem_cli_index() {
 # mem_cli_setup_synth
 #   Copies the committed synthetic reference (test/fixtures/mem_synth.fa; the
 #   header of test/tools/mem_synth_ref.c lists its contigs and planted
-#   repeats) into the work directory and indexes it, at MEM_CLI_SYNTH. The
-#   copy's basename carries the script name and pid: `mem` first tries to
-#   attach an index staged in shared memory (`bwa-mem3 shm`), matched by
-#   basename alone, so a fixed name could pick up a staged index instead.
+#   repeats) into the work directory and indexes it, at MEM_CLI_SYNTH, under a
+#   name unique to the run (mem_cli_ref_name).
 mem_cli_setup_synth() {
-    MEM_CLI_SYNTH="$MEM_CLI_WORK/synth/$MEM_CLI_NAME.$$.fa"
+    MEM_CLI_SYNTH="$MEM_CLI_WORK/synth/$(mem_cli_ref_name synth)"
     mkdir -p "$MEM_CLI_WORK/synth"
     if ! cp "$MEM_CLI_REPO/test/fixtures/mem_synth.fa" "$MEM_CLI_SYNTH"; then
         echo "FAIL: $MEM_CLI_NAME: cannot copy test/fixtures/mem_synth.fa to $MEM_CLI_SYNTH" >&2
         exit 1
     fi
     mem_cli_index "$MEM_CLI_SYNTH"
+}
+
+# mem_cli_ref_name <stem>
+#   A basename for a reference the script indexes: <script>.<stem>.<pid>.fa.
+#   `mem` first tries to attach an index staged in shared memory (`bwa-mem3
+#   shm`), matched by basename alone, so a fixed name such as ref.fa could
+#   pick up a staged index instead of the one just built.
+mem_cli_ref_name() {
+    printf '%s.%s.%s.fa\n' "$MEM_CLI_NAME" "$1" "$$"
 }
 
 # ---------------------------------------------------------------------------
@@ -170,7 +184,10 @@ mem_cli_setup_synth() {
 #   range outside the contig (or an unknown contig) prints a FAIL line and
 #   returns 1. Assign the result to a variable on its own
 #   (`s="$(mem_cli_seq ...)"`), which ends a `set -e` caller; inside a larger
-#   expression or as a command's argument the status is lost.
+#   expression or as a command's argument the status is lost, so the failure
+#   also leaves a marker in MEM_CLI_WORK that fails mem_cli_verdict: a slice
+#   outside the reference always fails the run, even when the caller handles
+#   the return status.
 mem_cli_seq() {
     if ! awk -v c="$2" -v p="$3" -v l="$4" '
         /^>/ { on = (substr($1, 2) == c); found = found || on; next }
@@ -180,6 +197,9 @@ mem_cli_seq() {
             print substr(s, p, l)
         }' "$1"; then
         echo "FAIL: ${MEM_CLI_NAME:-mem_cli}: mem_cli_seq $2:$3+$4 is outside the reference $1" >&2
+        if [[ -n ${MEM_CLI_WORK:-} ]]; then
+            echo "$2:$3+$4" >> "$MEM_CLI_WORK/mem_cli_seq.failed"
+        fi
         return 1
     fi
 }
@@ -222,16 +242,57 @@ mem_cli_tiers() {
 mem_cli_mem() {
     local tier="$1" out="$2"
     shift 2
-    if ! BWAMEM3_FORCE_TIER="$tier" "$BWA_MEM3" mem "$@" > "$out" 2> "$out.err"; then
+    mem_cli_mem_status "$tier" "$out" "$@"
+    if ((MEM_CLI_STATUS != 0)); then
         echo "FAIL: $MEM_CLI_NAME: bwa-mem3 mem $* (tier $tier) exited nonzero:" >&2
         tail -n 20 "$out.err" >&2
         exit 1
     fi
-    if ! grep -q "^Executing in $tier mode" "$out.err"; then
+}
+
+# mem_cli_mem_status <tier> <out> [mem args...]
+#   As mem_cli_mem, but for a run that is expected to fail: sets
+#   MEM_CLI_STATUS to mem's exit status instead of ending the script. A run
+#   killed by a signal (status above 128) still ends the script, so a crash
+#   cannot pass for the error exit a check expects; a run that succeeds must
+#   report the forced tier, as under mem_cli_mem.
+# MEM_CLI_STATUS is read by the calling script, which shellcheck sees separately.
+# shellcheck disable=SC2034
+mem_cli_mem_status() {
+    local tier="$1" out="$2"
+    shift 2
+    MEM_CLI_STATUS=0
+    BWAMEM3_FORCE_TIER="$tier" "$BWA_MEM3" mem "$@" > "$out" 2> "$out.err" || MEM_CLI_STATUS=$?
+    if ((MEM_CLI_STATUS > 128)); then
+        echo "FAIL: $MEM_CLI_NAME: bwa-mem3 mem $* (tier $tier) was killed by signal $((MEM_CLI_STATUS - 128)):" >&2
+        tail -n 20 "$out.err" >&2
+        exit 1
+    fi
+    if ((MEM_CLI_STATUS == 0)) && ! grep -q "^Executing in $tier mode" "$out.err"; then
         echo "FAIL: $MEM_CLI_NAME: BWAMEM3_FORCE_TIER=$tier was not honoured:" >&2
         head -n 5 "$out.err" >&2
         exit 1
     fi
+}
+
+# mem_cli_expect_fail <label> <stderr-ERE> <tier> <out> [mem args...]
+#   One check: `mem <args>` (run as mem_cli_mem_status runs it) exits nonzero
+#   and its stderr matches the extended regular expression, so a run that
+#   fails for some other reason (a different error, a sanitizer report) does
+#   not pass for the failure the check expects.
+mem_cli_expect_fail() {
+    local label="$1" pattern="$2"
+    shift 2
+    mem_cli_mem_status "$@"
+    local got="exit 0"
+    if ((MEM_CLI_STATUS != 0)); then
+        if grep -Eq -- "$pattern" "$2.err"; then
+            got="nonzero, stderr matches"
+        else
+            got="exit $MEM_CLI_STATUS, stderr: $(head -n 3 "$2.err" | tr '\n' ' ')"
+        fi
+    fi
+    mem_cli_expect "$label" "nonzero, stderr matches" "$got"
 }
 
 # ---------------------------------------------------------------------------
@@ -279,6 +340,19 @@ mem_cli_tag() {
         for (i = 12; i <= NF; i++)
             if (substr($i, 1, length(t) + 1) == t ":") { print substr($i, length(t) + 4); exit }
     }'
+}
+
+# mem_cli_tags <record>
+#   The optional fields of a SAM record (column 12 on), TAB-joined.
+mem_cli_tags() {
+    printf '%s\n' "$1" | awk -F '\t' '{ s = $12; for (i = 13; i <= NF; i++) s = s "\t" $i; print s }'
+}
+
+# mem_cli_count <sam> <awk-condition>
+#   The number of alignment records (header lines skipped) for which the awk
+#   condition holds, with fields split on TAB ($2 is FLAG, $NF the last tag).
+mem_cli_count() {
+    awk -F '\t' '!/^@/ && ('"$2"') { n++ } END { print n + 0 }' "$1"
 }
 
 # ---------------------------------------------------------------------------
