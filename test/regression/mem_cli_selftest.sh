@@ -23,12 +23,23 @@
 #                      unknown tier or names a tier twice ends the script
 #                      with FAIL; an empty one counts as unset; a host below
 #                      the floor reports SKIP and exits 0.
-#   mem_cli_verdict    zero checks is a failure, a failed check is a failure.
+#   mem_cli_verdict    zero checks is a failure, a failed check is a failure,
+#                      and so is a mem_cli_seq slice that failed inside a
+#                      command substitution, where its status is lost.
 #   mem_cli_expect     a mismatch is counted as a failure.
 #   mem_cli_same_file  differing, missing and header-only files all fail;
 #                      equal files that differ only in @PG pass.
 #   mem_cli_primary    a read with two primary records yields nothing.
 #   mem_cli_tag        a present tag's value, nothing for an absent one.
+#   mem_cli_ref_name   names the script, the stem and the pid.
+#   mem_cli_tags       the optional fields of a record, TAB-joined.
+#   mem_cli_expect_fail a nonzero exit with the expected stderr passes; exit
+#                      0, or a nonzero exit with other stderr, fails.
+#   mem_cli_count      counts the records an awk condition selects, never a
+#                      header line, and 0 when none match.
+#   mem_cli_mem_status an error exit is recorded, not fatal; a signal death
+#                      and a successful run in the wrong tier end the
+#                      script with FAIL.
 #   mem_cli_seq        an out-of-range slice, or an unknown contig even for
 #                      an empty slice, returns 1 with a FAIL line.
 #
@@ -176,6 +187,11 @@ out="$(run_script none BWA_MEM3="$neon" -- "mem_cli_init none; $verdict")"
 check "mem_cli_verdict: zero checks is a FAIL" "1|FAIL: none: no check ran (tiers: neon )" "$out"
 out="$(run_script bad BWA_MEM3="$neon" -- "mem_cli_init bad; mem_cli_expect x a b; $verdict")"
 check "mem_cli_verdict: a failed check is a FAIL" "1|FAIL: bad: 1 of 1 checks failed (tiers: neon )" "$out"
+# The generated script expands MEM_CLI_WORK itself.
+# shellcheck disable=SC2016
+out="$(run_script lostseq BWA_MEM3="$neon" -- 'mem_cli_init lostseq; printf ">c\nACGT\n" > "$MEM_CLI_WORK/r.fa"; x="$(echo "$(mem_cli_seq "$MEM_CLI_WORK/r.fa" c 3 9)")"; mem_cli_expect x a a; '"$verdict")"
+check "mem_cli_verdict: a slice that failed inside \$(...) is a FAIL" \
+    "1|FAIL: lostseq: 1 mem_cli_seq slice(s) fell outside the reference (tiers: neon )" "$out"
 out="$(run_script good BWA_MEM3="$neon" -- "mem_cli_init good; mem_cli_expect x a a; mem_cli_skip y z; $verdict")"
 check "mem_cli_verdict: passing checks are a PASS with skips counted" \
     "0|PASS: good: 1 checks on tiers: neon (1 skipped)" "$out"
@@ -210,6 +226,61 @@ check "mem_cli_primary: the one primary of a read" "r1${tab}0${tab}ctg1" \
 rec="$(mem_cli_primary "$work/a.sam" r1)"
 check "mem_cli_tag: a present tag" 4 "$(mem_cli_tag "$rec" AS)"
 check "mem_cli_tag: an absent tag" "" "$(mem_cli_tag "$rec" XS)"
+check "mem_cli_tags: every optional field" "NM:i:0${tab}AS:i:4" "$(mem_cli_tags "$rec")"
+
+check "mem_cli_ref_name: script, stem and pid" "selftest.u3.$$.fa" "$(mem_cli_ref_name u3)"
+
+# Expanded by awk, not here.
+# shellcheck disable=SC2016
+check "mem_cli_count: records matching a condition" 2 "$(mem_cli_count "$work/two.sam" '$1 == "r1" && $5 == 60')"
+# shellcheck disable=SC2016
+check "mem_cli_count: header lines never count" 0 "$(mem_cli_count "$work/a.sam" '$1 ~ /^@/')"
+# shellcheck disable=SC2016
+check "mem_cli_count: no match is 0" 0 "$(mem_cli_count "$work/two.sam" '$3 == "ctg9"')"
+
+# A stub `mem` that exits with <status>, after printing the banner of <tier>.
+status_stub() {
+    local path="$work/status-stub-$1-$2"
+    printf '#!/bin/sh
+echo "Executing in %s mode" >&2
+%s
+' "$2" "$3" > "$path"
+    chmod +x "$path"
+    printf '%s\n' "$path"
+}
+# run_status <stub-args...>: "<script status>|<MEM_CLI_STATUS>|<first FAIL: line>"
+# (bash itself reports a killed job on stderr first)
+# for mem_cli_mem_status at tier avx2 in a subshell.
+run_status() {
+    local bin rc=0
+    bin="$(status_stub "$@")"
+    (
+        BWA_MEM3="$bin"
+        mem_cli_mem_status avx2 "$work/status.out"
+        echo "$MEM_CLI_STATUS" > "$work/status.code"
+    ) 2> "$work/status.err" || rc=$?
+    printf '%s|%s|%s\n' "$rc" "$(cat "$work/status.code" 2> /dev/null)" "$(grep -m 1 '^FAIL:' "$work/status.err" || true)"
+    rm -f "$work/status.code"
+}
+check "mem_cli_mem_status: an error exit is recorded" "0|1|" "$(run_status exit1 avx2 'exit 1')"
+check "mem_cli_mem_status: success in the forced tier" "0|0|" "$(run_status ok avx2 'exit 0')"
+check "mem_cli_mem_status: a signal death ends the script" \
+    "1||FAIL: selftest: bwa-mem3 mem  (tier avx2) was killed by signal 9:" \
+    "$(run_status kill avx2 'kill -9 $$')"
+# run_fail <stub-args...> <pattern>: the failures mem_cli_expect_fail counted.
+run_fail() {
+    local bin pattern="${*: -1}" before=$MEM_CLI_FAILS
+    bin="$(status_stub "${@:1:3}")"
+    BWA_MEM3="$bin" mem_cli_expect_fail "x" "$pattern" avx2 "$work/fail.out" > /dev/null 2>&1
+    echo $((MEM_CLI_FAILS - before))
+}
+check "mem_cli_expect_fail: nonzero with the expected stderr passes" 0 \
+    "$(run_fail fmsg avx2 'echo "[E::x] bad thing" >&2; exit 1' 'bad thing')"
+check "mem_cli_expect_fail: nonzero with other stderr fails" 1 \
+    "$(run_fail fother avx2 'echo "[E::x] other" >&2; exit 1' 'bad thing')"
+check "mem_cli_expect_fail: exit 0 fails" 1 "$(run_fail fzero avx2 'exit 0' 'bad thing')"
+check "mem_cli_mem_status: success in another tier ends the script" \
+    "1||FAIL: selftest: BWAMEM3_FORCE_TIER=avx2 was not honoured:" "$(run_status wrong neon 'exit 0')"
 
 check "dna_revcomp: reverses, complements, keeps case, N and '-'" "-nacgtNACGT" "$(dna_revcomp "ACGTNacgtn-")"
 
