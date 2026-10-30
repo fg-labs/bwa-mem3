@@ -185,6 +185,13 @@ public:
     const bntseq_t *bns() const { return fmi_->idx->bns; }
     const uint8_t *pac() const { return fmi_->idx->pac; }
     const std::string &prefix() const { return prefix_; }
+
+    // Deletes the index files and their directory now. fmi(), bns() and pac()
+    // keep working, as load_index has read the whole index into memory;
+    // prefix() then names files that are gone. For an index a fixture shares
+    // across cases: the case that builds it calls this, so its scratch files
+    // are removed when that case ends rather than when the process exits.
+    void drop_files() { dir_.remove(); }
 private:
     static std::string read_file(const std::string &path) {
         std::string out;

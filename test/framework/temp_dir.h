@@ -60,10 +60,16 @@ public:
             throw std::runtime_error("cannot create a scratch directory under " + temp_root());
         path_ = buf.data();
     }
-    ~TempDir() {
-        if (getpid() != owner_) return;
+    ~TempDir() { remove(); }
+
+    // Removes the directory and its files now rather than on destruction; a
+    // second call, and the destructor after it, do nothing. path() is then
+    // empty and file() names nothing.
+    void remove() {
+        if (path_.empty() || getpid() != owner_) return;
         if (bwa_test_remove_flat_dir(path_.c_str()) != 0)
             fprintf(stderr, "warning: TempDir could not remove %s: %s\n", path_.c_str(), strerror(errno));
+        path_.clear();
     }
     TempDir(const TempDir &) = delete;
     TempDir &operator=(const TempDir &) = delete;
