@@ -23,6 +23,7 @@ tag. Each file keeps its upstream copyright block.
 | `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack) |
 | `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out |
 | `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_get_seq` and `bns_cnt_ambi` from `bntseq.c` |
+| `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, `bwa_paired_sw`) |
 | `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code: the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
 | `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
 
@@ -90,3 +91,29 @@ Each task that changes or adds upstream-derived code appends a line here.
 - `srand48(bns->seed)` is called once per run, before the first batch, and `bwa_aln2seq_core` runs
   serially in read order, so the random choice among equally good hits is the same as stock's
   and does not depend on `-t`.
+- `bwape.cpp`/`bwape.h`: `bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_sw_core` and `bwa_paired_sw` are
+  upstream's bodies in `namespace bwa_aln`; `bwa_cal_pac_pos_pe` is upstream's with these changes. Each read's
+  alignments come from its own `aln` / `n_aln` (upstream reads them from the `.sai` and keeps a backup copy per
+  read, which is not needed here); the BWT is a parameter; `infer_isize` is exported (the unit tests call it).
+  Dropped: the dead `if (0 && ...)` hash-table branch and `g_hash` (so `-P` has no effect), the `.sai` reading
+  and the sampe command line, the per-step timing lines on stderr, and the branch that loads the reference when
+  the caller gives none (it is always the in-memory packed copy). `g_log_n` (bwase.cpp) is now shared with it. The
+  mate alignment in `bwa_sw_core` calls bwa-mem3's `ksw_align` and `ksw_global`, which match stock's up to cosmetics;
+  `aln_parity.sh` is the check. `infer_isize`'s `erfc`/`sqrt` loop, the pairing score's `log`/`erfc` and the
+  `int += double` arithmetic in `bwa_paired_sw` are kept verbatim; the objects are built with `-ffp-contract=off`.
+- Paired-end driver (`aln_run_pe`, new code). `bwa-mem3 aln [options] <prefix> <R1.fq> <R2.fq>` is `aln` on each
+  file followed by `sampe`. Per batch of 0x40000 reads from each file: R1's reads are read, then R2's (stock
+  order); each file is searched as its own batch, because stock runs `aln` on each file separately and the
+  batch-wide gap-open cap depends on the longest read of the batch; pairing runs serially in read order (it
+  draws from `drand48`), with the previous batch's insert-size estimate carried over; the mate Smith-Waterman, the
+  gapped refinement and the output follow, each pair printed as read 1 then read 2. sampe's options are `-a`, `-s`,
+  `-A`, `-c` and `-P` (as stock), `--max-occ` (sampe `-o`), `--max-xa-hits` (sampe `-n`, shared with the
+  single-end XA limit) and `--max-xa-hits-discordant` (sampe `-N`). Where stock sampe takes the options saved in
+  R2's `.sai` for both ends, one option set serves both files here. When the two files give different read
+  counts in a batch, sampe's rule is kept (the count of R2) and a warning is written to stderr; if R2 has more
+  reads than R1 the count of R1 is used, where sampe would read past R1's reads. A pair whose names differ after
+  the `/1` and `/2` trim stops the run with an error after that pair is written, as sampe does.
+- The batch-wide `max_gapo` cap does not change any output, so searching the two files of a pair separately or
+  together gives the same hits and the same `-m` behaviour. A gap open is tried only from an entry with at least one
+  difference still allowed, so its gap opens stay below `min(-o, differences allowed for the file's longest read)`,
+  and a larger cap never lets a further entry in. The driver still searches each file as its own batch, as stock does.

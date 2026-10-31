@@ -14,6 +14,8 @@
 
 namespace bwa_aln {
 
+/* log table (4.343 * ln n, rounded) that bwa_approx_mapQ and sampe's pairing read; filled by bwase_initialize. */
+extern int g_log_n[256];
 /* Fills the table bwa_approx_mapQ reads. */
 void bwase_initialize(void);
 /* Collapses a read's .sai alignments into its best hit (set_main) and up to n_multi
