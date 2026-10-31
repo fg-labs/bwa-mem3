@@ -669,9 +669,10 @@ int meth_mem_aln_to_bam(bam1_t *b,
     }
     /* XA:Z — D3 (PR-5): p.XA is produced by mem_gen_alt against the ORIGINAL
      * bns, so its `name,+/-pos,cigar,NM;` entries already carry original contig
-     * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim. */
+     * names. No f/r prefix stripping or chrom rewrite is needed; emit verbatim.
+     * Named XB under -u, as in the other writers. */
     if (p.XA != NULL) {
-        if (bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
+        if (bam_aux_append(b, (opt->flag & MEM_F_XB) ? "XB" : "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
     }
     /* HN:i — the same mem_gen_alt call that fills p.XA fills p.HN, so this
      * counts the hits XA enumerates. Like XA above it is already stated against

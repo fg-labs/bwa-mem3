@@ -75,8 +75,9 @@ Options:
                   (run-specific); exclude it when comparing.
                   To stay byte-identical, --compat refuses bwa-mem3-only levers that
                   change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,
-                  --min-ext-len, --rescue-kmer, --seed-order); --fast and --meth are
-                  always refused. Override the forceable ones with --compat-allow-divergent.
+                  --min-ext-len, --rescue-kmer, --seed-order), and -u under bwa-mem2
+                  (no XB:Z before bwa 0.7.18); --fast and --meth are always refused.
+                  Override the forceable ones with --compat-allow-divergent.
                   Keeps every byte-identical optimization, the default contained-seed
                   extension skip included (--keep-contained-ext still opts out of it).
                   [off]
