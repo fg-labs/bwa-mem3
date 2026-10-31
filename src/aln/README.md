@@ -150,3 +150,13 @@ Each task that changes or adds upstream-derived code appends a line here.
   what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the check. Reads are still dealt to
   threads round-robin. A slot whose stack grew past 65,536 entries frees its stack buffers after that
   read, so each thread keeps at most 8 x 65,536 (`ALN_STACK_KEEP`) stack entries across its slots.
+- Interleaved exact-match walks (new code). When an entry has no differences left, `gap_job_run` runs
+  `bwt_match_exact_alt`'s loop itself, one base per call: it prefetches the two Occ blocks of the
+  next `bwt_2occ` and yields, and the next call does that lookup and updates `k`/`l` as
+  `bwt_match_exact_alt` does, with its early exits (an N, or `k > l`). The hit, if any, is then
+  handled by the same code as before (moved into `gap_job_hit`). `bwt_match_exact_alt` and
+  `bwt_match_gap` themselves are unchanged. Likewise, `bwa_cal_sa_reg_gap_group` computes a read's
+  two widths (whole read and seed) with `width_walk_run`, `bwt_cal_width`'s loop as a resumable walk
+  that yields before each `bwt_2occ`, so they overlap the other slots' lookups; `bwt_cal_width` is
+  unchanged and still used by the unit tests as the reference. Per read, the lookups and their order
+  are the same as before; only their interleaving with other reads' changes.

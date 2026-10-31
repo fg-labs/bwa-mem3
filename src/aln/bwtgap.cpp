@@ -5,7 +5,8 @@
  * MODIFIED from the original: the code is moved into namespace bwa_aln, the
  * extern "C" block and the malloc wrappers are dropped, and the bwa_aln2seq
  * declaration is left out (it is ported with the SAM code). gap_job_start/gap_job_run at the
- * end of the file are new: bwt_match_gap's loop as a resumable job, for interleaved search. */
+ * end of the file are new: bwt_match_gap's loop as a resumable job, for interleaved search,
+ * with bwt_match_exact_alt's loop (aln_bwt.cpp) run inside the job one base at a time. */
 #include "bwtgap.h"
 
 #include <stdio.h>
@@ -273,13 +274,26 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 /* ---------------------------------------------------------------------------------------
  * Interleaved search (new code in bwa-mem3, derived from bwt_match_gap above).
  *
- * gap_job_* runs bwt_match_gap's loop for one read as a resumable job: gap_job_run stops just
- * before each Occ lookup (the bwt_2occ4 call), after prefetching the two Occ blocks that
- * lookup reads, and the next call does the lookup and carries on. A driver that rotates
- * among several reads' jobs then has several reads' cache misses in flight at once. Each job
- * owns its stack, widths and options, and its steps are bwt_match_gap's steps in the same
- * order, so a job's hits are exactly bwt_match_gap's for the same read.
+ * gap_job_* runs bwt_match_gap's loop for one read as a resumable job. gap_job_run stops
+ * before each Occ lookup, after prefetching the Occ blocks that lookup reads, and the next
+ * call does the lookup and carries on. There are two kinds of lookup:
+ *
+ *   JOB_OCC4   the bwt_2occ4 call that expands an entry (pending = JOB_OCC4);
+ *   JOB_EXACT  one step of bwt_match_exact_alt, for an entry with no differences left
+ *              (pending = JOB_EXACT). The exact-match tail is run here one base per call:
+ *              each call does the bwt_2occ pair for base i-1 and updates (k, l) as
+ *              bwt_match_exact_alt does, with its early exits (an N, or k > l: no hit), and
+ *              stops again before the next base. When the last base is done, the hit is
+ *              handled as bwt_match_gap handles bwt_match_exact_alt's nonzero return.
+ *
+ * A driver that rotates among several reads' jobs then has several reads' cache misses in
+ * flight at once. Each job owns its stack, widths and options, and its steps are
+ * bwt_match_gap's steps in the same order, so a job's hits are exactly bwt_match_gap's for
+ * the same read.
  * --------------------------------------------------------------------------------------- */
+
+#define JOB_OCC4  1
+#define JOB_EXACT 2
 
 int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 {
@@ -303,6 +317,61 @@ int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 	return 0;
 }
 
+/* bwt_match_gap's action for a found hit (entry e, SA interval [k, l]). Returns 1 where
+ * bwt_match_gap breaks out of its loop (top2b behaviour). */
+static inline int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_t *e, bwtint_t k, bwtint_t l)
+{
+	const gap_opt_t *opt = &J->opt;
+	int score = aln_score(e->n_mm, e->n_gapo, e->n_gape, opt);
+	int do_add = 1, j;
+	if (J->n_aln == 0) {
+		J->best_score = score;
+		J->best_diff = e->n_mm + e->n_gapo;
+		if (opt->mode & BWA_MODE_GAPE) J->best_diff += e->n_gape;
+		if (!(opt->mode & BWA_MODE_NONSTOP))
+			J->max_diff = (J->best_diff + 1 > opt->max_diff)? opt->max_diff : J->best_diff + 1; // top2 behaviour
+	}
+	if (score == J->best_score) J->best_cnt += l - k + 1;
+	else if (J->best_cnt > opt->max_top2) return 1; // top2b behaviour
+	if (e->n_gapo) { // check whether the hit has been found. this may happen when a gap occurs in a tandem repeat
+		for (j = 0; j != J->n_aln; ++j)
+			if (J->aln[j].k == k && J->aln[j].l == l) break;
+		if (j < J->n_aln) do_add = 0;
+	}
+	if (do_add) { // append
+		bwt_aln1_t *p;
+		gap_shadow(l - k + 1, J->len, bwt->seq_len, e->last_diff_pos, J->width);
+		if (J->n_aln == J->m_aln) {
+			J->m_aln <<= 1;
+			J->aln = (bwt_aln1_t*)realloc(J->aln, J->m_aln * sizeof(bwt_aln1_t));
+			memset(J->aln + J->m_aln/2, 0, J->m_aln/2*sizeof(bwt_aln1_t));
+		}
+		p = J->aln + J->n_aln;
+		p->n_mm = e->n_mm; p->n_gapo = e->n_gapo; p->n_gape = e->n_gape;
+		p->n_ins = e->n_ins; p->n_del = e->n_del;
+		p->k = k; p->l = l;
+		p->score = score;
+		++J->n_aln;
+	}
+	return 0;
+}
+
+/* bwt_match_exact_alt's next base, seq[i-1], for the entry in J->e: returns 0 if that base is
+ * an N (no match), else saves (i, k, l), prefetches the two Occ blocks that
+ * bwt_2occ(k - 1, l) reads (those of rows k and l + 1) and returns 1 (yield). */
+static inline int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bwtint_t k, bwtint_t l)
+{
+	// Kept to mirror bwt_match_exact_alt. Unreachable from this call site: an N in the read
+	// forces a width restart, so an entry that reaches the tail with no differences left has
+	// no N ahead of it.
+	if (J->seq[i - 1] > 3) return 0; // there is an N here. no match
+	J->pending = JOB_EXACT;
+	J->i = i; J->k = k; J->l = l;
+	bwt_prefetch_occ(bwt, k);
+	bwt_prefetch_occ(bwt, l + 1);
+	return 1;
+}
+
 int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 {
 	const gap_opt_t *opt = &J->opt;
@@ -317,11 +386,28 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 		int i, m, m_seed, allow_diff, allow_M, tmp;
 		bwtint_t k, l, cnt_k[4], cnt_l[4], occ;
 
-		if (J->pending) { // resume at the Occ lookup
+		if (J->pending == JOB_OCC4) { // resume at the Occ lookup
 			J->pending = 0;
 			e = J->e; i = J->i; m = J->m; m_seed = J->m_seed; k = J->k; l = J->l;
+		} else if (J->pending == JOB_EXACT) { // resume at one step of bwt_match_exact_alt
+			bwtint_t ok, ol;
+			ubyte_t c;
+			J->pending = 0;
+			i = J->i; k = J->k; l = J->l;
+			c = seq[i - 1];
+			bwt_2occ(bwt, k - 1, l, c, &ok, &ol);
+			k = bwt->L2[c] + ok + 1;
+			l = bwt->L2[c] + ol;
+			if (k > l) continue; // no match
+			if (--i > 0) {
+				if (gap_job_exact_yield(J, bwt, i, k, l)) return 0;
+				continue; // an N: no match
+			}
+			// bwt_match_exact_alt returns l - k + 1 as an int; bwt_match_gap tests it for nonzero
+			if ((uint32_t)(l - k + 1) == 0) continue;
+			if (gap_job_hit(J, bwt, &J->e, k, l)) break;
+			continue;
 		} else {
-			int hit_found;
 			if (!stack->n_entries) break;
 			m_seed = 0;
 			if (J->max_entries < stack->n_entries) J->max_entries = stack->n_entries;
@@ -341,51 +427,19 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 			if (i > 0 && m < width[i-1].bid) continue;
 
 			// check whether a hit is found
-			hit_found = 0;
-			if (i == 0) hit_found = 1;
-			else if (m == 0 && (e.state == STATE_M || (opt->mode&BWA_MODE_GAPE) || e.n_gape == opt->max_gape)) { // no diff allowed
-				if (bwt_match_exact_alt(bwt, i, seq, &k, &l)) hit_found = 1;
-				else continue; // no hit, skip
-			}
-
-			if (hit_found) { // action for found hits
-				int score = aln_score(e.n_mm, e.n_gapo, e.n_gape, opt);
-				int do_add = 1;
-				if (J->n_aln == 0) {
-					J->best_score = score;
-					J->best_diff = e.n_mm + e.n_gapo;
-					if (opt->mode & BWA_MODE_GAPE) J->best_diff += e.n_gape;
-					if (!(opt->mode & BWA_MODE_NONSTOP))
-						J->max_diff = (J->best_diff + 1 > opt->max_diff)? opt->max_diff : J->best_diff + 1; // top2 behaviour
-				}
-				if (score == J->best_score) J->best_cnt += l - k + 1;
-				else if (J->best_cnt > opt->max_top2) break; // top2b behaviour
-				if (e.n_gapo) { // check whether the hit has been found. this may happen when a gap occurs in a tandem repeat
-					for (j = 0; j != J->n_aln; ++j)
-						if (J->aln[j].k == k && J->aln[j].l == l) break;
-					if (j < J->n_aln) do_add = 0;
-				}
-				if (do_add) { // append
-					bwt_aln1_t *p;
-					gap_shadow(l - k + 1, len, bwt->seq_len, e.last_diff_pos, width);
-					if (J->n_aln == J->m_aln) {
-						J->m_aln <<= 1;
-						J->aln = (bwt_aln1_t*)realloc(J->aln, J->m_aln * sizeof(bwt_aln1_t));
-						memset(J->aln + J->m_aln/2, 0, J->m_aln/2*sizeof(bwt_aln1_t));
-					}
-					p = J->aln + J->n_aln;
-					p->n_mm = e.n_mm; p->n_gapo = e.n_gapo; p->n_gape = e.n_gape;
-					p->n_ins = e.n_ins; p->n_del = e.n_del;
-					p->k = k; p->l = l;
-					p->score = score;
-					++J->n_aln;
-				}
+			if (i == 0) { // hit found
+				if (gap_job_hit(J, bwt, &e, k, l)) break;
 				continue;
+			} else if (m == 0 && (e.state == STATE_M || (opt->mode&BWA_MODE_GAPE) || e.n_gape == opt->max_gape)) { // no diff allowed
+				// bwt_match_exact_alt(bwt, i, seq, &k, &l), one base per call (JOB_EXACT above)
+				J->e = e;
+				if (gap_job_exact_yield(J, bwt, i, k, l)) return 0;
+				continue; // an N: no hit, skip
 			}
 
 			--i;
 			// yield before the Occ lookup; bwt_2occ4(k - 1, l) reads the blocks of rows k and l + 1
-			J->pending = 1;
+			J->pending = JOB_OCC4;
 			J->e = e; J->i = i; J->m = m; J->m_seed = m_seed; J->k = k; J->l = l;
 			bwt_prefetch_occ(bwt, k);
 			bwt_prefetch_occ(bwt, l + 1);
