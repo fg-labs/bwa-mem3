@@ -370,6 +370,7 @@ int main(int argc, char* argv[])
         ret = main_aln(argc-1, argv+1);
         free(bwa_pg);
         bwa_pg = NULL;
+        return ret; // skip the parameter banner below: it describes mem, not aln
     }
     else if (strcmp(argv[1], "version") == 0)
     {

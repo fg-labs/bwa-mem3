@@ -1,12 +1,4 @@
 
-Important parameter settings:
-	BATCH_SIZE: 1024
-	MAX_SEQ_LEN_REF: 256
-	MAX_SEQ_LEN_QER: 128
-	MAX_SEQ_LEN8: 1088
-	SEEDS_PER_READ: 500
-	AVG_SEEDS_PER_READ: 64
-
 Usage:   bwa-mem3 aln [options] <prefix> <in.fq> [<in2.fq>]
 
 Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one
