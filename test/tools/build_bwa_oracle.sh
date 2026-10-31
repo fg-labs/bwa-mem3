@@ -40,7 +40,7 @@ sha256_of() {
 }
 
 tarball="$out/v$VERSION.tar.gz"
-curl -sSfL -o "$tarball" "$URL" >&2
+curl -sSfL --retry 3 --retry-delay 5 -o "$tarball" "$URL" >&2
 if [[ "$(sha256_of "$tarball")" != "$SHA256" ]]; then
     echo "FAIL: bwa-$VERSION tarball sha256 mismatch" >&2
     exit 1
