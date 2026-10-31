@@ -59,17 +59,18 @@ int main(int argc, char *argv[]) {
     if (ref_len <= 0) { fprintf(stderr, "FAIL: empty index\n"); return 1; }
 
     // Witness 1 (implementation-independent, fixture-robust): drive the fixed branch
-    // directly. At the sentinel ($) row call_one_step hits its b == 4 branch; with a
-    // nonzero accumulated offset it must return that offset (the fix), not 0 (the bug).
+    // directly. At the sentinel ($) row (no bit-plane set) call_one_step takes its
+    // sentinel branch; with a nonzero accumulated offset it must return that offset
+    // (the fix), not 0 (the bug).
     // The branch is only reachable when the sentinel row is not itself SA-sampled
-    // (otherwise call_one_step takes the direct-read fast path and never sees b == 4),
+    // (otherwise call_one_step takes the direct-read fast path and never sees it),
     // so a sampled sentinel is a loud failure -- pick a fixture whose sentinel row is
     // non-sampled -- never a silent skip that would let the whole gate go vacuous.
     // Classify with the loaded index's mask (fmi->sa_compx_mask), not the compile-time
     // default SA_COMPX_MASK: an index built with a non-default -u samples at another rate.
     if ((fmi->sentinel_index & fmi->sa_compx_mask) == 0) {
         fprintf(stderr, "FAIL: sentinel_index %lld is SA-sampled, so call_one_step's "
-                "b==4 offset branch is unreachable here; use a fixture whose sentinel row "
+                "sentinel offset branch is unreachable here; use a fixture whose sentinel row "
                 "is non-sampled\n", (long long)fmi->sentinel_index);
         return 1;
     }

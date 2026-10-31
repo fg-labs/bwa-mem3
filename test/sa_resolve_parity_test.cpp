@@ -1,6 +1,10 @@
 /* Isolated parity gate for the pipelined compressed-SA resolver
  * (FMI_search::get_sa_entries_prefetch, stepping each lane with call_one_step)
  * against a scalar LF walk computed straight from the checkpoint blocks.
+ * call_one_step selects the BWT symbol from all four plane bits at once on
+ * both arms (NEON: a ternary over them; x86: the lowest set bit of a 4-bit
+ * plane mask), and the reference below tests the planes one at a time, so it is an
+ * independent oracle on every architecture and the gate runs everywhere.
  *
  * Every SA row that is not a sampled row (row & SA_COMPX_MASK != 0) is
  * resolved by walking LF until a sampled row is reached:
@@ -35,7 +39,8 @@
 /* Scalar LF walk with the pipeline's contract. Returns the resolved text
  * position; at the sentinel row that is the accumulated LF `offset` (sa value 0
  * plus the walk), matching call_one_step's default branch (sets *hit_sentinel). */
-static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel) {
+static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel,
+                           int64_t sym_steps[4]) {
     int64_t sp = pos, offset = 0;
     *hit_sentinel = 0;
     while ((sp & fmi->sa_compx_mask) != 0) {
@@ -45,6 +50,7 @@ static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel
         for (int c = 0; c < 4; c++)
             if ((blk.one_hot_bwt_str[c] >> y) & 1ULL) { b = c; break; }
         if (b == 4) { *hit_sentinel = 1; return offset; }
+        sym_steps[b]++;
         const int64_t occ = blk.cp_count[b] +
             (int64_t) __builtin_popcountll(blk.one_hot_bwt_str[b] & one_hot_mask_array[sp & CP_MASK]);
         sp = fmi->count[b] + occ;
@@ -59,7 +65,8 @@ static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel
  * against the scalar walk, mirroring the staging rule (stride s / max_occ,
  * at most max_occ entries per interval). */
 static void check_batch(FMI_search *fmi, std::vector<SMEM> &smems, int32_t max_occ,
-                        int64_t &checked, int64_t &mismatches, int64_t &sentinel_walks) {
+                        int64_t &checked, int64_t &mismatches, int64_t &sentinel_walks,
+                        int64_t sym_steps[4]) {
     int64_t total = 0;
     for (size_t i = 0; i < smems.size(); i++)
         total += smems[i].s > max_occ ? max_occ : smems[i].s;
@@ -80,7 +87,7 @@ static void check_batch(FMI_search *fmi, std::vector<SMEM> &smems, int32_t max_o
         int32_t n = 0;
         for (int64_t j = m.k; j < m.k + m.s && n < max_occ; j += step, n++, c++) {
             int hit = 0;
-            const int64_t expect = ref_resolve(fmi, j, &hit);
+            const int64_t expect = ref_resolve(fmi, j, &hit, sym_steps);
             sentinel_walks += hit;
             checked++;
             if (coords[(size_t) c] != expect) {
@@ -98,15 +105,6 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <bwa-mem3 index prefix>\n", argv[0]);
         return 2;
     }
-#if !defined(__aarch64__)
-    /* The pipelined resolver under test (get_sa_entries_prefetch / call_one_step)
-     * has a NEON implementation and a scalar fallback; off AArch64 this gate would
-     * exercise the fallback and pass vacuously (the scalar resolver against the
-     * scalar reference). Report an explicit skip so a non-NEON run is never
-     * mistaken for NEON parity coverage. */
-    printf("SA resolve PARITY SKIP (not an AArch64/NEON target)\n");
-    return 0;
-#endif
     /* Force the cross-read (k,s) dedup path ON for the whole sweep so the
      * duplicate-interval scatter (memcpy of a rep's resolved slot-run into a
      * duplicate's) is deterministically exercised and validated against the
@@ -128,6 +126,9 @@ int main(int argc, char *argv[]) {
             (long long) ref_len, (long long) fmi->sentinel_index, (int) SA_COMPX);
 
     int64_t checked = 0, mismatches = 0, sentinel_walks = 0;
+    /* LF steps the reference walk took per symbol (A, C, G, T): every arm of
+     * the symbol select must be reached, not only the sentinel branch. */
+    int64_t sym_steps[4] = {0, 0, 0, 0};
 
     /* 1. Every row as its own s = 1 interval: exercises every residue mod the
      * SA sampling, every in-block offset, and every walk length. */
@@ -136,7 +137,7 @@ int main(int argc, char *argv[]) {
         for (int64_t k = 0; k < ref_len; k++) {
             SMEM m = {}; m.k = k; m.l = 0; m.s = 1; smems[(size_t) k] = m;
         }
-        check_batch(fmi, smems, 500, checked, mismatches, sentinel_walks);
+        check_batch(fmi, smems, 500, checked, mismatches, sentinel_walks, sym_steps);
     }
 
     /* 2. Strided multi-occurrence intervals (s > max_occ): the staging loop's
@@ -153,7 +154,7 @@ int main(int argc, char *argv[]) {
                 }
                 SMEM tail = {}; tail.k = ref_len - sizes[si]; tail.s = sizes[si]; smems.push_back(tail);
             }
-            check_batch(fmi, smems, caps[ci], checked, mismatches, sentinel_walks);
+            check_batch(fmi, smems, caps[ci], checked, mismatches, sentinel_walks, sym_steps);
         }
     }
 
@@ -162,9 +163,9 @@ int main(int argc, char *argv[]) {
     {
         std::vector<SMEM> smems;
         SMEM m = {}; m.k = ref_len / 2 + 1; m.s = 3; smems.push_back(m);
-        check_batch(fmi, smems, 500, checked, mismatches, sentinel_walks);
+        check_batch(fmi, smems, 500, checked, mismatches, sentinel_walks, sym_steps);
         std::vector<SMEM> none;
-        check_batch(fmi, none, 500, checked, mismatches, sentinel_walks);
+        check_batch(fmi, none, 500, checked, mismatches, sentinel_walks, sym_steps);
     }
 
     /* 4. Cross-read (k,s) duplicates: the same interval appears several times in
@@ -188,7 +189,7 @@ int main(int argc, char *argv[]) {
         push(kB, 100);    /* dup of B -> memcpy, length 7    */
         push(kA, 3);      /* 2nd dup of A                    */
         push(kB, 100);    /* 2nd dup of B                    */
-        check_batch(fmi, smems, max_occ, checked, mismatches, sentinel_walks);
+        check_batch(fmi, smems, max_occ, checked, mismatches, sentinel_walks, sym_steps);
 
         /* Prove the dedup staging path actually ran and collapsed the duplicates
          * above -- the coordinate oracle can't, since the plain path returns the
@@ -205,19 +206,29 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    fprintf(stderr, "sa_resolve_parity_test: checked=%lld mismatches=%lld sentinel_walks=%lld\n",
-            (long long) checked, (long long) mismatches, (long long) sentinel_walks);
+    fprintf(stderr, "sa_resolve_parity_test: checked=%lld mismatches=%lld sentinel_walks=%lld "
+            "sym_steps=%lld/%lld/%lld/%lld\n",
+            (long long) checked, (long long) mismatches, (long long) sentinel_walks,
+            (long long) sym_steps[0], (long long) sym_steps[1], (long long) sym_steps[2],
+            (long long) sym_steps[3]);
     delete fmi;
     if (mismatches != 0) {
         printf("SA resolve PARITY FAIL (%lld mismatches)\n", (long long) mismatches);
         return 1;
     }
-    /* The sentinel-row branch is the one real branch left in the arm64 step;
-     * the fixture must reach it (phix does, from three rows) or the sweep is
-     * not covering it. */
+    /* The sentinel-row branch is the one real branch left in the step on
+     * either arm; the fixture must reach it (phix does, from three rows) or
+     * the sweep is not covering it. Likewise every symbol the select can
+     * return must be taken at least once. */
     if (sentinel_walks == 0) {
         printf("SA resolve PARITY FAIL (sentinel branch never exercised)\n");
         return 1;
+    }
+    for (int b = 0; b < 4; b++) {
+        if (sym_steps[b] == 0) {
+            printf("SA resolve PARITY FAIL (symbol %d never exercised)\n", b);
+            return 1;
+        }
     }
     printf("SA resolve PARITY PASS (%lld coordinates)\n", (long long) checked);
     return 0;
