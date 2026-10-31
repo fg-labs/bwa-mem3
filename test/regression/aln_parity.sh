@@ -2,7 +2,7 @@
 # test/regression/aln_parity.sh
 #
 # Regression: `bwa-mem3 aln` writes the same SAM as stock bwa 0.7.19's `aln` followed by
-# `samse` (single-end) -- every record, byte for byte; only the @PG line differs (it names
+# `samse` (single-end) or `sampe` (paired-end) -- every record, byte for byte; only the @PG line differs (it names
 # the program that ran) and is dropped from both sides before the diff.
 #
 # The reference is phiX plus the synthetic contigs the unit tests use (an N run, a
@@ -14,6 +14,9 @@
 #
 # (A read with a '-' makes stock write a NUL byte into the SAM -- its base table maps '-' to
 # 5 and "ACGTN"[5] is the string's terminator -- so every grep and diff here is binary-safe.)
+#
+# The paired-end section does the same with `aln` on each file and `sampe` (pairs come from
+# test/regression/aln_pairs.awk), against `bwa-mem3 aln <opts> [sampe options] ref r1.fq r2.fq`.
 #
 # Each case runs with -t 1 and -t 4. Stock is `aln <opts> ref r.fq > r.sai` then
 # `samse [-n K] [-r RG] ref r.sai r.fq`; ours is `aln <opts> [--max-xa-hits K] [-r RG] ref r.fq`.
@@ -211,3 +214,136 @@ if [ "$mapped_total" -le 0 ] || [ "$xa_total" -le 0 ] || [ "$ah_total" -le 0 ]; 
     exit 1
 fi
 echo "PASS: aln_parity SE ($((n_cfg / 2)) cases x 2 thread counts)"
+
+# ---- paired end: aln R1, aln R2, sampe ------------------------------------------------
+# Reads come from aln_pairs.awk (fragments of 250-349 bp, so most pairs are concordant; a few
+# have a far second mate or a random one; "rescue" gives some second mates too many scattered
+# mismatches for the search, so only the mate Smith-Waterman can place them).
+pe_cfg=0
+pe_xt_m=0
+pe_ref=plain
+
+gen_pairs() { # seed n lens rescue names out1 out2 [lens2 heavy1]
+    awk -v seed="$1" -v n="$2" -v lens="$3" -v rescue="$4" -v names="$5" -v out1="$6" -v out2="$7" \
+        -v lens2="${8:-}" -v heavy1="${9:-}" \
+        -f "$repo_root/test/regression/aln_pairs.awk" "$work/ref.fa"
+}
+
+# compare_pe <tag> <fq1> <fq2> <sampe args> <ours args> [aln options...]
+# The two argument strings are split on spaces (-r values with spaces are not used here).
+compare_pe() {
+    local tag="$1" fq1="$2" fq2="$3" sampe_s="$4" ours_s="$5"
+    shift 5
+    local t sampe_args=() ours_args=()
+    read -r -a sampe_args <<< "$sampe_s" || true
+    read -r -a ours_args <<< "$ours_s" || true
+    for t in 1 4; do
+        pe_cfg=$((pe_cfg + 1))
+        "$BWA_ORACLE" aln "$@" -t "$t" "$work/$pe_ref/stock/ref.fa" "$fq1" > "$work/stock.1.sai" 2> "$work/stock.aln1.log"
+        "$BWA_ORACLE" aln "$@" -t "$t" "$work/$pe_ref/stock/ref.fa" "$fq2" > "$work/stock.2.sai" 2> "$work/stock.aln2.log"
+        "$BWA_ORACLE" sampe ${sampe_args[@]+"${sampe_args[@]}"} "$work/$pe_ref/stock/ref.fa" "$work/stock.1.sai" "$work/stock.2.sai" "$fq1" "$fq2" \
+            > "$work/stock.sam" 2> "$work/stock.sampe.log"
+        "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$work/$pe_ref/mem3/ref.fa" "$fq1" "$fq2" \
+            > "$work/mem3.sam" 2> "$work/mem3.aln.log"
+        grep -av '^@PG' "$work/stock.sam" > "$work/stock.nopg" || true
+        grep -av '^@PG' "$work/mem3.sam" > "$work/mem3.nopg" || true
+        if ! diff -a "$work/stock.nopg" "$work/mem3.nopg" > "$work/sam.diff"; then
+            echo "FAIL: aln_parity: PE $tag -t $t $* differs from stock sampe; first lines of diff (< stock, > ours):" >&2
+            head -n 10 "$work/sam.diff" >&2
+            exit 1
+        fi
+        if ! grep -q '^@PG' "$work/mem3.sam"; then
+            echo "FAIL: aln_parity: PE $tag -t $t has no @PG line" >&2
+            exit 1
+        fi
+        pe_xt_m=$((pe_xt_m + $(grep -ac 'XT:A:M' "$work/mem3.nopg" || true)))
+        echo "aln_parity: ok PE $tag -t $t $* ($(grep -avc '^@' "$work/mem3.nopg" || true) records)"
+    done
+}
+
+# run_pe <name> <seed> <n> <lens> <rescue> <names> <sampe args> <ours args> [aln options...]
+run_pe() {
+    local name="$1" seed="$2" n="$3" lens="$4" rescue="$5" names="$6" sampe_s="$7" ours_s="$8"
+    shift 8
+    gen_pairs "$seed" "$n" "$lens" "$rescue" "$names" "$work/$name.1.fq" "$work/$name.2.fq"
+    compare_pe "$name" "$work/$name.1.fq" "$work/$name.2.fq" "$sampe_s" "$ours_s" "$@"
+}
+
+# need_pe <tag> <pattern>: as need_tag, on the last PE case.
+need_pe() { need_tag "PE $1" "$2"; }
+
+run_pe pe36 501 2000 36 0 plain "" ""
+need_pe pe36 'XT:A:U'
+run_pe pe150 502 800 150 0 plain "" ""
+run_pe pe_adna 503 1500 20-40 0 plain "" "" -l 1024 -n 0.04 -o 2
+# Files of different read lengths (R1 36 bp, R2 150 bp) under fractional -n with a large -o and a
+# small -m: each file is searched as its own batch, as stock's separate aln runs do. (The
+# batch-wide gap-open cap turned out not to change any output -- see the aln README -- so this
+# case guards the mixed-length path, it does not tell a per-file search from a combined one.)
+gen_pairs 521 1500 36 0 plain "$work/pe_mixlen.1.fq" "$work/pe_mixlen.2.fq" 150 30
+compare_pe pe_mixlen "$work/pe_mixlen.1.fq" "$work/pe_mixlen.2.fq" "" "" -n 0.04 -o 5 -m 100
+run_pe pe_rescue 504 1500 100 30 plain "" ""
+need_pe pe_rescue 'XT:A:M'
+run_pe pe_rescue150 505 600 150 30 plain "" ""
+run_pe pe_maxocc 506 1500 36 0 plain "-o 3" "--max-occ 3"
+run_pe pe_xa 507 1500 36 0 plain "-n 5 -N 20" "--max-xa-hits 5 --max-xa-hits-discordant 20"
+run_pe pe_a300 508 1500 36 0 plain "-a 300" "-a 300"
+run_pe pe_a300_A 520 1500 36 0 plain "-A -a 300" "-A -a 300"
+run_pe pe_s 509 1500 100 30 plain "-s" "-s"
+run_pe pe_A 510 1500 100 30 plain "-A" "-A"
+run_pe pe_c 511 1500 36 0 plain "-c 0.1" "-c 0.1"
+run_pe pe_slash 512 800 36 0 slash "" ""
+run_pe pe_comment 513 800 36 0 comment "" ""
+run_pe pe_rg 514 500 36 0 plain "-r @RG\\tID:x\\tSM:y" "-r @RG\\tID:x\\tSM:y"
+need_pe pe_rg 'RG:Z:x'
+
+# Repeats: contigs of five and of twelve exact copies of a 200 bp unit, 40 bp apart, so each end
+# has five (twelve) equally good places and XA lists depend on --max-xa-hits and
+# --max-xa-hits-discordant. Reads come from those contigs only; the reference is phiX plus them.
+awk 'BEGIN {
+    srand(7)
+    split("5 12", ncopy, " ")
+    for (m = 1; m <= 2; m++) {
+        unit = ""
+        for (i = 0; i < 200; i++) unit = unit substr("ACGT", int(rand() * 4) + 1, 1)
+        s = ""
+        for (c = 0; c < ncopy[m]; c++) {
+            s = s unit
+            for (i = 0; i < 40; i++) s = s substr("ACGT", int(rand() * 4) + 1, 1)
+        }
+        printf ">m%d\n", ncopy[m]
+        for (i = 1; i <= length(s); i += 60) print substr(s, i, 60)
+    }
+}' > "$work/multi.fa"
+for tool in stock mem3; do
+    mkdir -p "$work/multi/$tool"
+    cat "$fixtures/phix.fa" "$work/multi.fa" > "$work/multi/$tool/ref.fa"
+done
+"$BWA_ORACLE" index "$work/multi/stock/ref.fa" > "$work/multi.stock.index.log" 2>&1
+"$BWA_MEM3" index "$work/multi/mem3/ref.fa" > "$work/multi.mem3.index.log" 2>&1
+pe_ref=multi
+for spec in "multi_default||" "multi_xa5|-n 5|--max-xa-hits 5" "multi_xa20|-N 20|--max-xa-hits-discordant 20" "multi_occ|-o 3|--max-occ 3"; do
+    IFS='|' read -r name sampe_s ours_s <<< "$spec"
+    awk -v seed=517 -v n=800 -v lens=36 -v rescue=0 -v uniform=1 -v names=plain -v out1="$work/$name.1.fq" -v out2="$work/$name.2.fq" \
+        -f "$repo_root/test/regression/aln_pairs.awk" "$work/multi.fa"
+    compare_pe "$name" "$work/$name.1.fq" "$work/$name.2.fq" "$sampe_s" "$ours_s"
+    if [ "$name" = multi_xa5 ]; then need_pe multi_xa5 'XA:Z:'; fi
+done
+pe_ref=plain
+
+# R1 holds three reads more than R2: sampe pairs the first R2-count reads and stops; we do
+# the same and say so on stderr.
+gen_pairs 515 600 36 0 plain "$work/pe_extra.1.fq" "$work/pe_extra.2.fq"
+gen_pairs 516 3 36 0 plain "$work/pe_extra_tail.1.fq" "$work/pe_extra_tail.2.fq"
+sed 's/^@r/@x/' "$work/pe_extra_tail.1.fq" >> "$work/pe_extra.1.fq"
+compare_pe pe_extra "$work/pe_extra.1.fq" "$work/pe_extra.2.fq" "" ""
+if ! grep -q 'read counts differ' "$work/mem3.aln.log"; then
+    echo "FAIL: aln_parity: PE pe_extra printed no warning about the unequal read counts" >&2
+    exit 1
+fi
+
+if [ "$pe_xt_m" -le 0 ]; then
+    echo "FAIL: aln_parity: no PE case produced a mate-rescued record (XT:A:M)" >&2
+    exit 1
+fi
+echo "PASS: aln_parity PE ($((pe_cfg / 2)) cases x 2 thread counts, $pe_xt_m rescued mates)"
