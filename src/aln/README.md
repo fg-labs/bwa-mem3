@@ -136,3 +136,14 @@ Each task that changes or adds upstream-derived code appends a line here.
   `bwa_pe_isize` as a barrier, then pairing, mate Smith-Waterman, refinement and each pair's records in
   parallel. Each slice's text goes to its thread's buffer, and the slices are written in read order; a
   pair with mismatched names still ends the output after that pair.
+- Interleaved search. `bwtgap.cpp` gains `gap_job_start` and `gap_job_run` (new code, appended; the
+  upstream functions above them are unchanged): `bwt_match_gap`'s loop for one read as a resumable job,
+  which stops just before each `bwt_2occ4` lookup after prefetching the two Occ blocks the lookup
+  reads (`bwt_prefetch_occ`, new in `aln_bwt.cpp`). The loop body is upstream's, statement for
+  statement, with its locals moved into the job. In `bwtaln.cpp`, `bwa_cal_sa_reg_gap` is replaced by
+  `bwa_cal_sa_reg_gap_group`, which prepares each read as upstream does (widths, per-read `max_diff`
+  and `seed_len`, complemented copy) and keeps 8 of the thread's reads in flight, each with its own
+  stack and widths, stepping them in turn so several Occ misses overlap. Each read's hits are exactly
+  what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the check. Reads are still dealt to
+  threads round-robin. A slot whose stack grew past 65,536 entries frees its stack buffers after that
+  read, so eight stacks per thread hold about as much memory as upstream's one.
