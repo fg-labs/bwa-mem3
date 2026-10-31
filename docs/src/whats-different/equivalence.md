@@ -565,7 +565,8 @@ default used (`chain_flat_parse_cap`).
 
 The output is the same at every cap by construction, clamped or not, because a read that reaches
 the cap takes the B-tree replay. `test/regression/chain_flat_replay_identity.sh` checks this on
-its generated 300 kb fixture at caps 0, 3 and 2000000 (clamped, with the warning). At the default
+its generated 300 kb fixture at caps 0, 1, 3, 1048576 (the ceiling, unclamped) and 2000000
+(clamped, with the warning). At the default
 cap, SAM output was md5-identical to the base on a 5M-pair WGS slice (HG00096, hg38) on
 Graviton4 (NEON) and Zen 4 (AVX-512BW, and AVX2 forced), clang 19.1.7, in the default mode and
 with `--compat=bwa-mem2` and `--compat=bwa-mem`
