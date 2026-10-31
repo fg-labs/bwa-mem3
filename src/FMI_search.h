@@ -627,13 +627,23 @@ private:
         __attribute__((always_inline)) inline
         SMEM backwardExt_konly(SMEM smem, uint8_t a) const
         {
+            return backwardExt_konly_cp(cp_occ, count[a], smem, a);
+        }
+
+        /* backwardExt_konly on a caller-held cp_occ pointer and count[a], so the
+         * general loops of ls_advance_backward_step keep both in registers across
+         * their prev[] stores. Same arithmetic and same contract: k is left stale
+         * on the s'->0 exit, so the caller must discard any s' < min_intv. */
+        __attribute__((always_inline)) static inline
+        SMEM backwardExt_konly_cp(const CP_OCC *cpo, int64_t count_a, SMEM smem, uint8_t a)
+        {
             const int64_t sp = (int64_t)smem.k;
             if (smem.s == 1) {
-                const CP_OCC &blk = cp_occ[sp >> CP_SHIFT];
+                const CP_OCC &blk = cpo[sp >> CP_SHIFT];
                 const int pos = (int)(sp & CP_MASK);
                 const uint64_t oh = blk.one_hot_bwt_str[a];
                 if ((oh >> (CP_MASK - pos)) & 1ULL) {  /* BWT[sp] == a  => s' = 1 */
-                    smem.k = count[a] + blk.cp_count[a] +
+                    smem.k = count_a + blk.cp_count[a] +
                              occ_popcount64(&blk.one_hot_bwt_str[a], &one_hot_mask_array[pos]);
                     smem.s = 1;
                 } else {                               /* s' = 0; new k is dead */
@@ -642,13 +652,13 @@ private:
                 return smem;
             }
             const int64_t ep = sp + (int64_t)smem.s;
-            const CP_OCC &blk_sp = cp_occ[sp >> CP_SHIFT];
-            const CP_OCC &blk_ep = cp_occ[ep >> CP_SHIFT];
+            const CP_OCC &blk_sp = cpo[sp >> CP_SHIFT];
+            const CP_OCC &blk_ep = cpo[ep >> CP_SHIFT];
             const int64_t occ_s = blk_sp.cp_count[a] +
                 occ_popcount64(&blk_sp.one_hot_bwt_str[a], &one_hot_mask_array[(sp & CP_MASK)]);
             const int64_t occ_e = blk_ep.cp_count[a] +
                 occ_popcount64(&blk_ep.one_hot_bwt_str[a], &one_hot_mask_array[(ep & CP_MASK)]);
-            smem.k = count[a] + occ_s;
+            smem.k = count_a + occ_s;
             smem.s = occ_e - occ_s;
             return smem;
         }
