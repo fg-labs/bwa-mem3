@@ -211,12 +211,17 @@ class FMI_search: public indexEle
      * (for the seed->original remap) but never the seed pac — extension/scoring
      * runs against the ORIGINAL pac (meth_orig_pac). Saves ~1.6 GB on hg38. */
     /* n_threads: worker count for the big-array disk reads (capped internally,
-     * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior. */
-    void load_index(bool load_pac = true, int n_threads = 1);
+     * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior.
+     * build_seed_jump=false skips the seed jump table (seed_jump stays NULL,
+     * seed_jump_depth 0, as under BWA3_BWTSEED_JUMP=0): for a loader that never
+     * runs the lockstep seeding drivers, such as the fmi_seed_api facade. The
+     * table is built on both the disk and the shm-attach path. */
+    void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
-     * destructor munmaps `base` and leaves the aliased buffers untouched. */
+     * destructor munmaps `base` and leaves the aliased buffers untouched.
+     * Builds no seed jump table: load_index builds it after the attach. */
     void load_index_from_shm(uint8_t *base, size_t len);
 
     /* Densify the SA sample table on the fly: given an existing FM-index's
@@ -427,6 +432,35 @@ private:
         uint8_t *shm_base;
         size_t   shm_len;
 
+        /* Seed jump table: the bidirectional interval (k, l, s) of every
+         * string of length 1..seed_jump_depth, level L at offset
+         * seed_jump_level_off(L), indexed within a level by the string's
+         * 2-bit code, first base most significant. Built once per index load by
+         * build_seed_jump_table after cp_occ, count[] and sentinel_index are in
+         * (load_index, after the disk load or the shm attach); NULL (seed_jump_depth 0) when
+         * BWA3_BWTSEED_JUMP=0, the loader passed build_seed_jump=false, or
+         * the table could not be allocated.
+         * Level 1 is bsd_init_slot's 1-base interval and every child is the
+         * walk's own forward step (backwardExt on the k<->l-swapped parent with
+         * 3 - c, swapped back), so an entry is exactly the interval a bwtSeed
+         * walk reaches by stepping, s == 0 strings included. A walk cannot
+         * leave before length minSeedLen except at an N or the read end, so
+         * bwtSeedStrategyAllPosOneThread_lockstep jumps from its first base
+         * straight to length min(depth, minSeedLen - 1) when the read has
+         * that many ACGT bases there. The SMEM lockstep driver's forward walks
+         * step the same way, so a walk's first visit takes its steps to depths
+         * 2..min(depth, ACGT bases left) from the table, each with the forward
+         * step's own s < min_intv exit (ls_advance_forward_table). Owned
+         * (_mm_malloc), also on the shm path. */
+        struct SeedJumpEntry { int64_t k, l, s; };
+        SeedJumpEntry *seed_jump;
+        int32_t        seed_jump_depth;
+        static int64_t seed_jump_level_off(int L) { return (((int64_t)1 << (2 * L)) - 4) / 3; }
+        static inline void seed_jump_prefetch(const SeedJumpEntry *e);
+        void build_seed_jump_table(int n_threads);
+        void seed_jump_children(int L, int64_t first, int64_t n);
+        static void *seed_jump_worker(void *arg);
+
         /* Defined inline so all hot callers (getSMEMs* and ls_advance_*)
          * fully absorb the body and pay no struct-by-value pass / return
          * cost. backwardExt is called ~10^10 times per 5M-pair WGS run, so
@@ -593,6 +627,7 @@ private:
     void ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac);
     void ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
                        const uint8_t *pac, int64_t l_pac);
+    void ls_advance_forward_table(BatchSlot *s, bool s1_text);
     void ls_prepare_backward(BatchSlot *s);
     void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,
@@ -605,12 +640,17 @@ private:
                        const int32_t *max_intv_array,
                        const bseq1_t *seq_,
                        const int32_t *query_cum_len_ar,
-                       const uint8_t *enc_qdb);
+                       const uint8_t *enc_qdb,
+                       const SeedJumpEntry *jlev, int32_t jd,
+                       int32_t minSeedLen);
     void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
     void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
+    void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
+                       const SeedJumpEntry *jlev, int32_t jd);
     void bsd_advance_step(BwtSeedSlot *s,
                           const uint8_t *enc_qdb,
-                          int32_t minSeedLen);
+                          int32_t minSeedLen,
+                          const SeedJumpEntry *jlev, int32_t jd);
 };
 
 #endif

@@ -2260,6 +2260,19 @@ jobs:
           # fails the job on the leak.
           make -j"$(nproc)" ASAN=1 arch=avx2 CXX=clang++-19 test-binaries
           ./test/bwa_mem3_tests_unit --test-suite=unit/chain_flt
+          # The bwtSeed parity test checks output only, and a seeding walk that
+          # reads one base past the end of its read changes no output (a walk
+          # from there cannot step), so only asan sees the drivers' read-end
+          # bound go wrong, for example at minSeedLen 0 or 1. Build it against
+          # the asan libbwa.a above and run it on the phiX fixture, indexed
+          # here. test/Makefile has no ASAN switch: the flags come in through
+          # the environment, which its `CXXFLAGS ?=` default yields to and its
+          # `LDFLAGS +=` appends the htslib link flags to.
+          "$GITHUB_WORKSPACE/bwa-mem3" index test/fixtures/phix.fa
+          CXXFLAGS="-std=c++11 -O1 -g -fopenmp -mavx2 -fsanitize=address -fno-omit-frame-pointer" \
+          LDFLAGS="-fsanitize=address" \
+            make -C test CXX=clang++-19 bwtseed_lockstep_parity_test
+          (cd test && ./bwtseed_lockstep_parity_test fixtures/phix.fa)
           # The pre-load input check returns early from mem; run its
           # regression against the asan binary so a memory error on that
           # return, or in the -p / URL / `<cmd` legs, fails the job.
@@ -2743,6 +2756,9 @@ jobs:
           make -j"$(nproc)" arch=avx2 CXX=clang++-19 ASAN=1
           make ASAN=1 arch=avx2 CXX=clang++-19 cli_arg_safety_test
           make -j"$(nproc)" ASAN=1 arch=avx2 CXX=clang++-19 test-binaries
+          CXXFLAGS="-std=c++11 -O1 -g -fopenmp -mavx2 -fsanitize=address -fno-omit-frame-pointer" \
+          LDFLAGS="-fsanitize=address" \
+            make -C test CXX=clang++-19 bwtseed_lockstep_parity_test
 
       - name: Build (MSan padded-lane gate)
         if: matrix.kind == 'msan'
