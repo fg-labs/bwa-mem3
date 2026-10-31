@@ -1119,7 +1119,8 @@ jobs:
 
       - name: aln SE/PE parity vs bwa 0.7.19
         # `bwa-mem3 aln` must write the same SAM as stock `bwa aln` followed by
-        # `bwa samse` (single-end; the @PG line is the one difference). aln_sai_dump
+        # `bwa samse` (single end) or `bwa sampe` (paired end); the @PG line is the
+        # one difference. aln_sai_dump
         # is built only because the script takes the synthetic reference from it, with
         # the row's arch/CXX/USE_MIMALLOC for the same build-flags-stamp reason as the
         # aln search parity step above; the oracle comes from the same cache.

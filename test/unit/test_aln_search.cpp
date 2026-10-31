@@ -86,12 +86,6 @@ struct Batch {
     Batch &operator=(const Batch &) = delete;
 };
 
-// Frees the aln arrays the search allocated (bwa_free_read_seq does not).
-void free_alns(ba::bwa_seq_t *seqs, int n)
-{
-    for (int i = 0; i < n; ++i) { free(seqs[i].aln); seqs[i].aln = nullptr; }
-}
-
 ba::gap_opt_t make_opt(int max_diff, int max_gapo)
 {
     ba::gap_opt_t *o = ba::gap_init_opt();
@@ -135,7 +129,6 @@ TEST_CASE("aln_search: exact 32-mer from c1 gives one hit, score 0, n_mm 0"
     CHECK(b.seqs[0].sa == 0);
     CHECK((uint64_t)b.seqs[0].c1 == 0);
     CHECK((uint64_t)b.seqs[0].c2 == 0);
-    free_alns(b.seqs, b.n);
 }
 
 TEST_CASE("aln_search: one planted mismatch gives n_mm 1 at -n 2"
@@ -150,7 +143,6 @@ TEST_CASE("aln_search: one planted mismatch gives n_mm 1 at -n 2"
     CHECK((int)b.seqs[0].aln[0].n_mm == 1);
     CHECK((int)b.seqs[0].aln[0].n_gapo == 0);
     CHECK((int)b.seqs[0].aln[0].score == opt.s_mm);
-    free_alns(b.seqs, b.n);
 }
 
 TEST_CASE("aln_search: one planted 1-bp deletion found with -o 1, not with -o 0"
@@ -163,16 +155,14 @@ TEST_CASE("aln_search: one planted 1-bp deletion found with -o 1, not with -o 0"
     CHECK((int)with_gap.seqs[0].aln[0].n_gapo == 1);
     CHECK((int)with_gap.seqs[0].aln[0].n_del == 1);
     CHECK((int)with_gap.seqs[0].aln[0].n_mm == 0);
-    free_alns(with_gap.seqs, with_gap.n);
 
     Batch no_gap({deletion40()});
     ba::gap_opt_t o0 = make_opt(2, 0);
     ba::aln_search_batch(ix.bwt, no_gap.n, no_gap.seqs, &o0, 1);
     CHECK(no_gap.seqs[0].n_aln == 0);
-    free_alns(no_gap.seqs, no_gap.n);
 }
 
-TEST_CASE("aln_search: AC-repeat read gives c1 > 1 (repeat type after aln2seq is Task 4)"
+TEST_CASE("aln_search: AC-repeat read gives c1 > 1 (the repeat type is set later, in aln2seq)"
           * doctest::test_suite("unit/aln_search")) {
     SearchIndex &ix = index_fixture();
     std::string r;
@@ -188,7 +178,6 @@ TEST_CASE("aln_search: AC-repeat read gives c1 > 1 (repeat type after aln2seq is
         if (b.seqs[0].aln[i].score == b.seqs[0].aln[0].score)
             top += b.seqs[0].aln[i].l - b.seqs[0].aln[i].k + 1;
     CHECK(top > 1);
-    free_alns(b.seqs, b.n);
 }
 
 TEST_CASE("aln_search: max_gapo cap uses the batch's longest read"
@@ -235,8 +224,6 @@ TEST_CASE("aln_search: max_gapo cap uses the batch's longest read"
     CHECK(a2.seqs[0].n_aln >= 1); // found (with two gap opens) in both
     REQUIRE(a2.seqs[0].n_aln == m2.seqs[0].n_aln);
     for (int i = 0; i < a2.seqs[0].n_aln; ++i) CHECK(same_aln(a2.seqs[0].aln[i], m2.seqs[0].aln[i]));
-    free_alns(a2.seqs, a2.n);
-    free_alns(m2.seqs, m2.n);
 }
 
 TEST_CASE("aln_search: name/seq/rseq/qual survive the search unchanged"
@@ -266,7 +253,6 @@ TEST_CASE("aln_search: name/seq/rseq/qual survive the search unchanged"
         CHECK(before[i].rseq == std::string((const char *)s.rseq, s.len));
         CHECK(before[i].qual == std::string((const char *)s.qual, s.len));
     }
-    free_alns(b.seqs, b.n);
 }
 
 TEST_CASE("aln_search: n_threads 1 and 4 give identical aln arrays"
@@ -291,6 +277,4 @@ TEST_CASE("aln_search: n_threads 1 and 4 give identical aln arrays"
         for (int j = 0; j < one.seqs[i].n_aln; ++j) CHECK(same_aln(one.seqs[i].aln[j], four.seqs[i].aln[j]));
     }
     CHECK(found > 20); // the comparison is not vacuous
-    free_alns(one.seqs, one.n);
-    free_alns(four.seqs, four.n);
 }

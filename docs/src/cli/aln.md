@@ -31,7 +31,7 @@ bwa-mem3 aln ref.fa r.fq > out.sam            # bwa aln + samse
 bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 ```
 
-**Byte-identity.** Without `--meth`, the SAM records are byte-identical to the
+**Byte-identity.** The SAM records are byte-identical to the
 output of stock bwa 0.7.19 `aln` + `samse`/`sampe` (the header is too, except
 the `@PG` line, which names the program that ran). This is checked against a
 stock bwa 0.7.19 binary on generated single-end and paired-end reads with every
@@ -68,7 +68,7 @@ and the name it has there when it differs.
 | `-M`, `-O`, `-E INT` | aln | 3, 11, 4 | Mismatch, gap-open and gap-extension penalties |
 | `-R INT` | aln | 30 | Stop searching when there are more than INT equally best hits |
 | `-q INT` | aln | 0 | Quality threshold for trimming reads down to 35 bp |
-| `-B INT` | aln | 0 | Barcode length |
+| `-B INT` | aln | 0 | Barcode length (at most 63, or 31 with two read files) |
 | `-L`, `-N`, `-I`, `-Y` | aln | off | Log-scaled gap penalty; non-iterative search; Illumina 1.3+ qualities; drop Casava-filtered reads |
 | `--max-xa-hits INT` | samse `-n` | 3 | Maximum alternative hits in the `XA` tag |
 | `-r STR` | samse, sampe | none | Read-group header line |
@@ -116,6 +116,13 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   is loaded, so a typo costs no index load and leaves no partial output.
 - Output goes to standard output or `-f`. With `--bam`, `samtools view` of the
   result gives the SAM records.
+- A read that contains `-` cannot be written as BAM: `--bam` stops with an error
+  naming the read (SAM output is fine, and matches stock).
+- Standard input (`-`) can stand for only one input. `aln ref - -` is not
+  supported: the first `-` takes all of standard input, the second file is then
+  empty, and the run writes the header only, warns that read 2 ended before read
+  1, and exits 1. For paired reads from pipes, use two named files or
+  process substitution (`<(zcat r1.fq.gz) <(zcat r2.fq.gz)`).
 
 ## Notes
 
@@ -124,6 +131,8 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   error, as `bwa sampe` does. If the first file has fewer, it pairs only the
   reads that both have (stock `sampe` would read past the end of the first
   file). Check the warning when the counts should be equal.
+- **Read 1 shorter than read 2.** If the first file runs out first, the extra
+  reads of the second are ignored, with a warning.
 - **No `.sai` files.** Nothing is written between the search and the SAM stage.
 - **Header.** `@HD` (unless the `-r` text has an `@HD` line), `@SQ`, the `-r`
   line, then `@PG`.

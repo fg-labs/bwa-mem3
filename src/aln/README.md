@@ -14,7 +14,10 @@ stock bwa 0.7.19.
 | License | Apache License 2.0 (`LICENSE` in this directory); relicensing statement at https://github.com/lh3/bwa/issues/389 |
 
 Code is copied only from the `Apache2` branch, never from `master` or a release
-tag. Each file keeps its upstream copyright block.
+tag. Upstream's `bwt.c` (in `aln_bwt.*`) and `bntseq.c` (in `bwase.cpp`) carry an MIT
+notice, and those files keep it verbatim. Upstream's `bwtaln.c`, `bwtgap.c`, `bwase.c`,
+`bwape.c` and `bwaseqio.c` carry no copyright block; the "Heng Li and the bwa
+contributors" line in the headers of the files derived from them was added here.
 
 ## Files
 
@@ -128,7 +131,7 @@ Each task that changes or adds upstream-derived code appends a line here.
   `bwa_paired_sw_report` (the two stderr lines). The `bwa_aln2seq_core` calls in `bwa_pe_pair` use
   `set_main = 0` and never reach the sampling branch (`rest` there equals the hits still to place, so
   no interval exceeds it), so that stage draws nothing.
-- The driver runs the stages after the search on `kt_for` (design §6.2). Single end: the `drand48`
+- The driver runs the stages after the search on `kt_for` (stage order below). Single end: the `drand48`
   pass (`bwa_aln2seq_core`) runs serially over the batch in read order, then position, refinement, MD,
   trim correction and SAM text run in parallel on slices of the batch (`bwa_cal_pac_pos`,
   `bwa_refine_gapped` and `bwa_print_sam1` unchanged, on each slice). Paired end: `bwa_pe_aln2seq`
@@ -146,4 +149,4 @@ Each task that changes or adds upstream-derived code appends a line here.
   stack and widths, stepping them in turn so several Occ misses overlap. Each read's hits are exactly
   what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the check. Reads are still dealt to
   threads round-robin. A slot whose stack grew past 65,536 entries frees its stack buffers after that
-  read, so eight stacks per thread hold about as much memory as upstream's one.
+  read, so each thread keeps at most 8 x 65,536 (`ALN_STACK_KEEP`) stack entries across its slots.

@@ -542,6 +542,55 @@ if ! grep -q 'read 2 file ended before read 1' "$work/mem3.aln.log"; then
     exit 1
 fi
 
+# R1 ends before R2. R1 empty: no pairs, the header only, and R2's reads are reported as ignored.
+# R1 a few reads short of R2 inside one batch: stock sampe reads past R1's reads (undefined), so
+# the expected output is stock's on both files cut to the common count; ours, given the longer
+# R2, must write the same records and warn.
+compare_pe pe_r1_empty "$work/pe_empty.1.fq" "$work/pe36.2.fq" "" ""
+if ! grep -q 'read 1 file ended before read 2' "$work/mem3.aln.log"; then
+    echo "FAIL: aln_parity: an empty R1 with a non-empty R2 printed no warning" >&2
+    exit 1
+fi
+head -n $((4 * 1997)) "$work/pe36.1.fq" > "$work/pe_r1_short.1.fq"
+head -n $((4 * 1997)) "$work/pe36.2.fq" > "$work/pe_r1_short.2.fq"
+compare_pe pe_r1_short "$work/pe_r1_short.1.fq" "$work/pe_r1_short.2.fq" "" ""
+cp "$work/stock.nopg" "$work/pe_r1_short.expected"
+for t in 1 4; do
+    "$BWA_MEM3" aln -t "$t" "$ref_mem3" "$work/pe_r1_short.1.fq" "$work/pe36.2.fq" > "$work/mem3.sam" 2> "$work/mem3.aln.log"
+    grep -av '^@PG' "$work/mem3.sam" > "$work/mem3.nopg" || true
+    if ! diff -a "$work/pe_r1_short.expected" "$work/mem3.nopg" > /dev/null; then
+        echo "FAIL: aln_parity: R1 a few reads shorter than R2 (-t $t) differs from stock on the common pairs" >&2
+        exit 1
+    fi
+    if ! grep -q 'read counts differ' "$work/mem3.aln.log"; then
+        echo "FAIL: aln_parity: R1 a few reads shorter than R2 printed no warning" >&2
+        exit 1
+    fi
+done
+echo "aln_parity: ok PE R1 shorter than R2 (-t 1, -t 4)"
+
+# -B: a barcode longer than the buffer allows is refused before the index loads (stock overruns
+# the buffer with two read files and writes a header only with one)
+rc=0
+"$BWA_MEM3" aln -B 40 "$ref_mem3" "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q 'too long: the maximum barcode length is 31' "$work/none.err" \
+    || grep -q 'Index file found' "$work/none.err"; then
+    echo "FAIL: aln_parity: PE -B 40 must exit 1 with the barcode-length error (exit $rc)" >&2
+    exit 1
+fi
+rc=0
+"$BWA_MEM3" aln -B 64 "$ref_mem3" "$work/pe36.1.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q 'too long: the maximum barcode length is 63' "$work/none.err"; then
+    echo "FAIL: aln_parity: SE -B 64 must exit 1 with the barcode-length error (exit $rc)" >&2
+    exit 1
+fi
+rc=0
+"$BWA_MEM3" aln -B 31 "$ref_mem3" "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 0 ]; then
+    echo "FAIL: aln_parity: PE -B 31 is within the limit and must run (exit $rc)" >&2
+    exit 1
+fi
+
 if [ "$pe_xt_m" -le 0 ]; then
     echo "FAIL: aln_parity: no PE case produced a mate-rescued record (XT:A:M)" >&2
     exit 1
