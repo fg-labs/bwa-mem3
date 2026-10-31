@@ -6,9 +6,12 @@
  * extern "C" block and the malloc wrappers are dropped, and the bwa_aln2seq
  * declaration is left out (it is ported with the SAM code). gap_job_start/gap_job_run at the
  * end of the file are new: bwt_match_gap's loop as a resumable job, for interleaved search,
- * with bwt_match_exact_alt's loop (aln_bwt.cpp) run inside the job one base at a time. */
+ * with bwt_match_exact_alt's loop (aln_bwt.cpp) run inside the job one base at a time. The job
+ * uses a new stack, gap_cstack_t (after gap_pop), whose buckets are chains of pooled chunks;
+ * bwt_match_gap keeps upstream's gap_stack_t. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
+#include "../utils.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -90,6 +93,170 @@ static inline void gap_pop(gap_stack_t *stack, gap_entry_t *e)
 		stack->best = i;
 	} else if (stack->n_entries == 0) stack->best = stack->n_stacks;
 }
+
+/* ---------------------------------------------------------------------------------------
+ * Chunked stack for the interleaved search (new code in bwa-mem3).
+ *
+ * gap_cstack_t is gap_stack_t with each bucket's array replaced by a chain of chunks of
+ * GAP_CHUNK_ENTRIES entries: the bucket's last entries are in `top`, the ones below them in
+ * top->prev, and so on, every chunk but `top` full. A push that finds `top` full (or none) takes
+ * a chunk from the pool; a pop that empties `top` gives it back. So a stack holds at most one
+ * part-full chunk per non-empty bucket on top of the entries in use, and a bucket that drains
+ * frees its chunks for the other buckets, the other reads of the thread and later reads. The
+ * pool is a per-thread free list rather than a malloc/free per chunk: it takes no lock, and the
+ * memory a thread keeps is bounded by max_free whichever allocator the build uses (mimalloc or
+ * the system's).
+ *
+ * Pop order: gap_cpush and gap_cpop are gap_push and gap_pop with q->stack[q->n_entries] read
+ * and written through the chunk chain. The bucket chosen (stack->best), the per-bucket and
+ * total entry counts and the rescan for the next non-empty bucket are the same statements on
+ * the same counts, and within a bucket the entry popped is the last one pushed, as in the
+ * array. So the two stacks pop the same entries in the same order.
+ * --------------------------------------------------------------------------------------- */
+
+void gap_init_pool(gap_pool_t *pool, int max_free)
+{
+	pool->free_list = 0;
+	pool->n_free = 0;
+	pool->max_free = max_free;
+	pool->n_alloc = 0;
+}
+
+void gap_destroy_pool(gap_pool_t *pool)
+{
+	while (pool->free_list) {
+		gap_chunk_t *c = pool->free_list;
+		pool->free_list = c->prev;
+		free(c);
+		--pool->n_alloc;
+	}
+	pool->n_free = 0;
+	xassert(pool->n_alloc == 0, "a stack still holds chunks from this pool");
+}
+
+static inline gap_chunk_t *gap_pool_get(gap_pool_t *pool)
+{
+	gap_chunk_t *c = pool->free_list;
+	if (c) {
+		pool->free_list = c->prev;
+		--pool->n_free;
+	} else {
+		c = (gap_chunk_t*)aln_malloc(sizeof(gap_chunk_t)); // exits on failure
+		++pool->n_alloc;
+	}
+	return c;
+}
+
+static inline void gap_pool_put(gap_pool_t *pool, gap_chunk_t *c)
+{
+	if (pool->n_free < pool->max_free) {
+		c->prev = pool->free_list;
+		pool->free_list = c;
+		++pool->n_free;
+	} else {
+		free(c);
+		--pool->n_alloc;
+	}
+}
+
+gap_cstack_t *gap_init_cstack(int max_mm, int max_gapo, int max_gape, const gap_opt_t *opt, gap_pool_t *pool)
+{
+	gap_cstack_t *stack;
+	stack = (gap_cstack_t*)aln_calloc(1, sizeof(gap_cstack_t));
+	stack->n_stacks = aln_score(max_mm+1, max_gapo+1, max_gape+1, opt);
+	stack->stacks = (gap_bucket_t*)aln_calloc(stack->n_stacks, sizeof(gap_bucket_t));
+	stack->best = stack->n_stacks;
+	stack->pool = pool;
+	return stack;
+}
+
+void gap_release_cstack(gap_cstack_t *stack)
+{
+	int i;
+	for (i = stack->best; i < stack->n_stacks; ++i) { // the buckets below best are empty and hold no chunk
+		gap_bucket_t *q = stack->stacks + i;
+		while (q->top) {
+			gap_chunk_t *c = q->top;
+			q->top = c->prev;
+			gap_pool_put(stack->pool, c);
+		}
+		q->top_n = q->n_entries = 0;
+	}
+	stack->best = stack->n_stacks;
+	stack->n_entries = 0;
+}
+
+void gap_destroy_cstack(gap_cstack_t *stack)
+{
+	gap_release_cstack(stack);
+	free(stack->stacks);
+	free(stack);
+}
+
+static inline void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
+							 int state, int is_diff, const gap_opt_t *opt)
+{
+	int score;
+	gap_entry_t *p;
+	gap_bucket_t *q;
+	score = aln_score(n_mm, n_gapo, n_gape, opt);
+	q = stack->stacks + score;
+	if (q->top == 0 || q->top_n == GAP_CHUNK_ENTRIES) { // start a new chunk
+		gap_chunk_t *c = gap_pool_get(stack->pool);
+		c->prev = q->top;
+		q->top = c;
+		q->top_n = 0;
+	}
+	p = q->top->e + q->top_n;
+	p->info = (uint32_t)score<<21 | i; p->k = k; p->l = l;
+	p->n_mm = n_mm; p->n_gapo = n_gapo; p->n_gape = n_gape;
+	p->n_ins = n_ins; p->n_del = n_del;
+	p->state = state;
+	p->last_diff_pos = is_diff? i : 0;
+	++(q->top_n);
+	++(q->n_entries);
+	++(stack->n_entries);
+	if (stack->best > score) stack->best = score;
+}
+
+static inline void gap_cpop(gap_cstack_t *stack, gap_entry_t *e)
+{
+	gap_bucket_t *q;
+	q = stack->stacks + stack->best;
+	*e = q->top->e[q->top_n - 1];
+	if (--(q->top_n) == 0) { // the top chunk is empty: give it back
+		gap_chunk_t *c = q->top;
+		q->top = c->prev;
+		q->top_n = q->top? GAP_CHUNK_ENTRIES : 0;
+		gap_pool_put(stack->pool, c);
+	}
+	--(q->n_entries);
+	--(stack->n_entries);
+	if (q->n_entries == 0 && stack->n_entries) { // reset best
+		int i;
+		for (i = stack->best + 1; i < stack->n_stacks; ++i)
+			if (stack->stacks[i].n_entries != 0) break;
+		stack->best = i;
+	} else if (stack->n_entries == 0) stack->best = stack->n_stacks;
+}
+
+void gap_stack_push_ext(gap_stack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
+						int n_ins, int n_del, int state, int is_diff, const gap_opt_t *opt)
+{
+	gap_push(stack, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff, opt);
+}
+
+void gap_stack_pop_ext(gap_stack_t *stack, gap_entry_t *e) { gap_pop(stack, e); }
+
+void gap_stack_reset_ext(gap_stack_t *stack) { gap_reset_stack(stack); }
+
+void gap_cstack_push_ext(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
+						 int n_ins, int n_del, int state, int is_diff, const gap_opt_t *opt)
+{
+	gap_cpush(stack, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff, opt);
+}
+
+void gap_cstack_pop_ext(gap_cstack_t *stack, gap_entry_t *e) { gap_cpop(stack, e); }
 
 static inline void gap_shadow(int x, int len, bwtint_t max, int last_diff_pos, bwt_width_t *w)
 {
@@ -311,8 +478,9 @@ int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 		if (j->seq[jj] > 3) ++_j;
 	if (_j > j->max_diff) return 1;
 
-	gap_reset_stack(j->stack); // reset stack
-	gap_push(j->stack, j->len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
+	// reset stack: a no-op after a finished job, which released it; kept as upstream's gap_reset_stack
+	gap_release_cstack(j->stack);
+	gap_cpush(j->stack, j->len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
 	return 0;
 }
 
@@ -373,7 +541,7 @@ static inline int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bwt
 int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 {
 	const gap_opt_t *opt = &J->opt;
-	gap_stack_t *stack = J->stack;
+	gap_cstack_t *stack = J->stack;
 	const ubyte_t *seq = J->seq;
 	bwt_width_t *width = J->width, *seed_width = J->seed_width;
 	const int len = J->len;
@@ -410,7 +578,7 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 			m_seed = 0;
 			if (J->max_entries < stack->n_entries) J->max_entries = stack->n_entries;
 			if (stack->n_entries > opt->max_entries) break;
-			gap_pop(stack, &e); // get the best entry
+			gap_cpop(stack, &e); // get the best entry
 			k = e.k; l = e.l; // SA interval
 			i = e.info&0xffff; // length
 			if (!(opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > J->best_score + opt->s_mm) break; // no need to proceed
@@ -463,24 +631,24 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 			if (e.state == STATE_M) { // gap open
 				if (e.n_gapo < opt->max_gapo) { // gap open is allowed
 					// insertion
-					gap_push(stack, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					gap_cpush(stack, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
 					// deletion
 					for (j = 0; j != 4; ++j) {
 						k = bwt->L2[j] + cnt_k[j] + 1;
 						l = bwt->L2[j] + cnt_l[j];
-						if (k <= l) gap_push(stack, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+						if (k <= l) gap_cpush(stack, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
 					}
 				}
 			} else if (e.state == STATE_I) { // extention of an insertion
 				if (e.n_gape < opt->max_gape) // gap extention is allowed
-					gap_push(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					gap_cpush(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
 			} else if (e.state == STATE_D) { // extention of a deletion
 				if (e.n_gape < opt->max_gape) { // gap extention is allowed
 					if (e.n_gape + e.n_gapo < J->max_diff || occ < opt->max_del_occ) {
 						for (j = 0; j != 4; ++j) {
 							k = bwt->L2[j] + cnt_k[j] + 1;
 							l = bwt->L2[j] + cnt_l[j];
-							if (k <= l) gap_push(stack, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+							if (k <= l) gap_cpush(stack, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
 						}
 					}
 				}
@@ -493,15 +661,16 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 				int is_mm = (j != 4 || seq[i] > 3);
 				k = bwt->L2[c] + cnt_k[c] + 1;
 				l = bwt->L2[c] + cnt_l[c];
-				if (k <= l) gap_push(stack, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
+				if (k <= l) gap_cpush(stack, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
 			}
 		} else if (seq[i] < 4) { // try exact match only
 			int c = seq[i] & 3;
 			k = bwt->L2[c] + cnt_k[c] + 1;
 			l = bwt->L2[c] + cnt_l[c];
-			if (k <= l) gap_push(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
+			if (k <= l) gap_cpush(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
 		}
 	}
+	gap_release_cstack(stack); // the read is done: its stack's chunks go back to the pool
 	return 1;
 }
 

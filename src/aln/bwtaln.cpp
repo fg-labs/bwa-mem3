@@ -11,7 +11,8 @@
  * and passed down. bwa_cal_sa_reg_gap's one-read-at-a-time loop is replaced by
  * bwa_cal_sa_reg_gap_group, which prepares each read the same way and interleaves several
  * reads' searches (gap_job_t in bwtgap.cpp); its widths are computed by width_walk_run, which
- * is bwt_cal_width's loop as a resumable walk. The BAM input, .sai writer and command-line
+ * is bwt_cal_width's loop as a resumable walk, and each slot's search stack is a gap_cstack_t
+ * drawing chunks from a per-thread pool. The BAM input, .sai writer and command-line
  * parser are not ported. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
@@ -148,10 +149,10 @@ int width_walk_run(width_walk_t *w, const bwt_t *bwt)
 /* New code: upstream's bwa_cal_sa_reg_gap with several of the thread's reads searched at once
  * (gap_job_*, bwtgap.cpp). Per read, everything bwa_cal_sa_reg_gap does is done in the same
  * way: the same widths, the same per-read max_diff and seed_len, the same complemented read
- * and a stack of its own; only the reads' steps are interleaved, so each read gets the hits
- * bwt_match_gap gives it. A read's two width computations (whole read and seed) are run as
- * width walks, interleaved with the other slots' work, before its search starts. `opt` is
- * batch_opt()'s result: max_diff and max_gapo are the batch-wide values. */
+ * and a stack of its own (chunks from the thread's pool); only the reads' steps are interleaved,
+ * so each read gets the hits bwt_match_gap gives it. A read's two width computations (whole read
+ * and seed) are run as width walks, interleaved with the other slots' work, before its search
+ * starts. `opt` is batch_opt()'s result: max_diff and max_gapo are the batch-wide values. */
 namespace {
 struct gap_slot_t {
 	gap_job_t job;
@@ -163,43 +164,30 @@ struct gap_slot_t {
 };
 }
 
-/* Reads searched at once per thread. Measured on Apple M2 Max (hg38, 262,144 aDNA reads,
- * -t 1, default options): 4 reads -36% wall against one at a time, 8 -43%, 12 -43%, 16 -41%,
- * 32 -40%; 8 was also the best at -t 12. Only that host was swept; x86-64 and Linux arm64 have
- * not been measured at other depths. The search is scalar (no SIMD tier is involved) and the
- * hits do not depend on the depth, so the value is a tuning choice only. */
+/* Reads searched at once per thread. Only the scheduling depends on it; each read's hits do not.
+ * Measured at -t 16 on hg38 (1M aDNA reads at default options and at -l 1024 -n 0.04 -o 2, 1M
+ * merged reads, 2M 20-40 bp reads, 2M 2x36 bp pairs, 1.09M real pairs) with the chunked stacks:
+ * - Apple M3 Ultra: 12 was 4-11% faster in wall time than 8; 16 was faster than 12 only on the
+ *   20-40 bp reads and the pairs (1.5-3.6%) and slower on the other three.
+ * - Intel Sapphire Rapids (16 vCPU, 8 cores with SMT, AVX-512 and AVX2 tiers): 8 was 2.5-3.5%
+ *   faster than 12 on four of the six workloads and within 2.1% on the other two.
+ * No other host was swept. So 12 is used only on Apple arm64, and every other target, Linux
+ * arm64 included, keeps 8, the depth before the chunked stacks. */
+#if defined(__APPLE__) && defined(__aarch64__)
+#define ALN_GROUP 12
+#else
 #define ALN_GROUP 8
-
-/* A slot's stack keeps the capacity its largest read needed; with ALN_GROUP stacks per thread
- * instead of one, that would multiply the stacks' peak memory. After a read whose stack grew
- * past this many entries, the slot's stack buffers are freed (they regrow on demand), so the
- * memory held is close to the one-stack-per-thread search's. Output does not depend on it. */
-#define ALN_STACK_KEEP 65536
-
-/* O(n_stacks) per read, the same walk gap_reset_stack already does for every read, and n_stacks
- * is small (score(max_diff + 1, ...), tens to a few hundred), so it is not tracked incrementally
- * in gap_push. */
-static void gap_stack_trim(gap_stack_t *stack)
-{
-	long cap = 0;
-	for (int i = 0; i < stack->n_stacks; ++i) cap += stack->stacks[i].m_entries;
-	if (cap <= ALN_STACK_KEEP) return;
-	for (int i = 0; i < stack->n_stacks; ++i) {
-		free(stack->stacks[i].stack);
-		stack->stacks[i].stack = 0;
-		stack->stacks[i].n_entries = stack->stacks[i].m_entries = 0;
-	}
-	stack->n_entries = 0;
-	stack->best = stack->n_stacks;
-}
+#endif
 
 static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs,
 									 const gap_opt_t *opt)
 {
 	const int G = ALN_GROUP;
 	std::vector<gap_slot_t> slots(G);
+	gap_pool_t pool;
+	gap_init_pool(&pool, ALN_POOL_KEEP);
 	for (gap_slot_t &s : slots) {
-		s.job.stack = gap_init_stack(opt->max_diff, opt->max_gapo, opt->max_gape, opt);
+		s.job.stack = gap_init_cstack(opt->max_diff, opt->max_gapo, opt->max_gape, opt, &pool);
 		s.p = 0; // seed_w is sized on first use: only reads longer than -l use it
 	}
 	int next = tid, n_active = 0;
@@ -251,7 +239,6 @@ static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, const bwt_t *bwt, i
 			return 0;
 		}
 		s.p->aln = s.job.aln; s.p->n_aln = s.job.n_aln;
-		gap_stack_trim(s.job.stack);
 		return 1;
 	};
 	for (gap_slot_t &s : slots)
@@ -262,7 +249,8 @@ static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, const bwt_t *bwt, i
 			if (step(s) && !fill(s)) --n_active;
 		}
 	}
-	for (gap_slot_t &s : slots) gap_destroy_stack(s.job.stack);
+	for (gap_slot_t &s : slots) gap_destroy_cstack(s.job.stack);
+	gap_destroy_pool(&pool);
 }
 
 typedef struct {

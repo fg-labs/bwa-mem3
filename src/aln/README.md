@@ -23,7 +23,7 @@ contributors" line in the headers of the files derived from them was added here.
 
 | File | Origin |
 | --- | --- |
-| `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack) |
+| `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack), plus the chunked stack `gap_cstack_t`/`gap_pool_t` (new) |
 | `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out, plus `width_walk_init`/`width_walk_run` (new) |
 | `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_cnt_ambi` from `bntseq.c` |
 | `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, and `bwa_paired_sw`'s body as `bwa_paired_sw_core`/`bwa_paired_sw_report`) |
@@ -62,7 +62,11 @@ Each change to upstream-derived code adds a line here.
   block, the malloc wrappers and the `bwa_aln2seq` declaration (ported with the SAM
   code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
   `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch`,
-  `aln_batch_max_gapo` and `width_walk_t`/`width_walk_init`/`width_walk_run`, which are new.
+  `aln_batch_max_gapo`, `width_walk_t`/`width_walk_init`/`width_walk_run`, the chunked stack
+  (`gap_chunk_t`, `gap_pool_t`, `gap_bucket_t`, `gap_cstack_t` and their init, release and destroy
+  functions, `ALN_POOL_KEEP`) and the out-of-line push, pop and reset wrappers the unit tests use
+  (`gap_stack_push_ext`, `gap_stack_pop_ext`, `gap_stack_reset_ext`, `gap_cstack_push_ext`,
+  `gap_cstack_pop_ext`), which are new.
 - `bwtaln.cpp`: `gap_init_opt`, `bwa_cal_maxdiff` and `bwt_cal_width` are upstream's
   bodies. `bwa_cal_sa_reg_gap` differs in three ways. (1) The read is complemented into
   a per-thread scratch buffer instead of in place, and `name`, `seq`, `rseq` and `qual`
@@ -165,18 +169,18 @@ Each change to upstream-derived code adds a line here.
   which stops just before each `bwt_2occ4` lookup after prefetching the two Occ blocks the lookup
   reads (`bwt_prefetch_occ`, new in `aln_bwt.cpp`). The loop body is upstream's, statement for
   statement, with its locals moved into the job. In `bwtaln.cpp`, `bwa_cal_sa_reg_gap` is replaced by
-  `bwa_cal_sa_reg_gap_group`, which prepares each read as upstream does (widths, per-read `max_diff`
-  and `seed_len`, complemented copy) and keeps 8 of the thread's reads in flight, each with its own
-  stack and widths, stepping them in turn so several Occ misses overlap. Each read's hits are exactly
-  what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the check. Reads are still dealt to
-  threads round-robin, on fresh pthreads per batch as upstream does (moving the search onto `kt_for_nt`
-  would need per-thread slot state and a fresh throughput A/B; see the comment on `aln_search_batch`). A
-  slot whose stack grew past 65,536 entries frees its stack buffers after that read, so each thread keeps
-  at most 8 x 65,536 (`ALN_STACK_KEEP`) stack entries across its slots. A slot's seed-width buffer is
-  sized on the first read longer than `-l` (upstream's single per-thread `calloc` of `-l` + 1 entries
-  is never touched for shorter reads; zero-filling one per slot up front cost 8 x 16 bytes x `-l` per
-  thread, gigabytes for the large `-l` used to turn seeding off). The group depth of 8 was measured on
-  one host (Apple M2 Max); the hits do not depend on it.
+  `bwa_cal_sa_reg_gap_group`, which prepares each read as upstream does (widths, per-read
+  `max_diff` and `seed_len`, complemented copy) and keeps `ALN_GROUP` of the thread's reads in
+  flight, each with its own stack and widths, stepping them in turn so several Occ misses overlap.
+  Each read's hits are exactly what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the
+  check. Reads are still dealt to threads round-robin, on fresh pthreads per batch as upstream does
+  (moving the search onto `kt_for_nt` would need per-thread slot state and a fresh throughput A/B;
+  see the comment on `aln_search_batch`). Each slot's stack is the chunked stack described below. A
+  slot's seed-width buffer is sized on the first read longer than `-l` (upstream's single per-thread
+  `calloc` of `-l` + 1 entries is never touched for shorter reads; zero-filling one per slot up
+  front cost `ALN_GROUP` x 16 bytes x `-l` per thread, gigabytes for the large `-l` used to turn
+  seeding off). The hits do not depend on the group depth (`ALN_GROUP`, see the chunked stack
+  below).
 - Failure handling (new code, no output change). Allocations go through `aln_alloc.h` instead of the
   bare libc calls. The three `assert`s in `bwa_refine_gapped_core` (window inside the packed reference,
   window length, a CIGAR was produced) are `xassert`, so they hold in a build with `NDEBUG` defined too.
@@ -194,3 +198,18 @@ Each change to upstream-derived code adds a line here.
   unchanged and still used by the unit tests as the reference. Per read, the same lookups are done:
   the search's in the same order as before, while the whole-read and seed width walks, which share
   no state, now take turns. Only the interleaving changes; the output does not.
+- Chunked search stack (new code). The interleaved search no longer uses upstream's `gap_stack_t`:
+  `gap_cstack_t` (`bwtgap.cpp`) has the same score buckets, the same `best` and entry counts and the
+  same push and pop statements, but each bucket is a chain of fixed-size chunks (`GAP_CHUNK_BYTES`,
+  16 KiB, 511 entries) rather than an array that doubles on its own. A push that finds its bucket's top
+  chunk full (or no chunk) takes one from a per-thread pool; a pop that empties one gives it back; a finished read gives
+  back all of its stack's chunks. So the memory the stacks hold follows the entries in use rather
+  than every bucket's high-water mark, which lets `bwa_cal_sa_reg_gap_group` keep more reads in
+  flight per thread for less peak memory than 8 took before (`ALN_GROUP`: 12 on Apple arm64, where
+  it measured 4-11% faster than 8; 8 on every other target, including x86-64, where 12 measured
+  slower, and Linux arm64, which was not measured). The pool keeps at most 256 free chunks
+  (`ALN_POOL_KEEP`, 4 MiB) per thread and frees the rest; a 1,024-chunk pool measured no faster and
+  held about 0.2 GiB more at peak. Within a bucket the last entry pushed is popped first,
+  as in the array, and the bucket popped is chosen by the same code, so entries come off in the same
+  order and each read's hits are unchanged. `bwt_match_gap` keeps upstream's `gap_stack_t` and is the
+  unit tests' reference.
