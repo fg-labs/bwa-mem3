@@ -506,7 +506,7 @@ LIBS    += $(HTSLIB_static_LIBS)
 LDFLAGS += $(HTSLIB_static_LDFLAGS)
 # Non-kernel objects: always compiled once at the baseline ISA and linked into
 # libbwa.a on every build (arm64 and x86 alike).
-OBJS=		src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
+OBJS=		src/aln/aln_bwt.o src/aln/bwaseqio.o src/aln/bwtgap.o src/aln/bwtaln.o src/aln/bwase.o src/aln/bwape.o src/aln/aln_out.o src/aln/aln_main.o src/fastmap.o src/bwtindex.o src/utils.o src/kthread.o \
 			src/kstring.o src/bntseq.o src/bwamem.o src/seed_order.o src/profiling.o \
 			src/compat_target.o \
 			src/FMI_search.o src/fmi_seed_api.o src/read_index_ele.o src/bwamem_pair.o src/bwa.o \
@@ -549,13 +549,16 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    packed_text_overflow_nbases_test \
                    mem_gen_alt_zero_calloc_test srtgg_grow_multi_test \
                    kopen_pipe_status_test cli_arg_safety_test \
-                   pwrite_all_status_test x86_soa_pack_test
+                   pwrite_all_status_test x86_soa_pack_test \
+                   aln_index_parity_test aln_sai_dump
 STANDALONE_TEST_OBJS = $(STANDALONE_TESTS:%=test/%.o)
 
 # shm_pack_round_trip_test and shm_thp_advise_test are excluded from `test:`
 # because they need a phiX index: test/run_unit_tests.sh runs them after
-# test/shm_pack_round_trip_test.sh has built it.
-STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test shm_thp_advise_test,$(STANDALONE_TESTS))
+# test/shm_pack_round_trip_test.sh has built it. aln_index_parity_test is excluded
+# because it needs both a stock bwa index and a bwa-mem3 index as arguments, and
+# aln_sai_dump because it needs an index and a FASTQ (test/regression/aln_sai_parity.sh).
+STANDALONE_TESTS_IN_TEST_TARGET = $(filter-out shm_pack_round_trip_test shm_thp_advise_test aln_index_parity_test aln_sai_dump,$(STANDALONE_TESTS))
 
 # Architecture-specific builds (x86 only, ARM uses default from above)
 ifeq ($(IS_ARM),)
@@ -659,6 +662,10 @@ DEFAULT_BUILD_GOAL ?= all
 .DEFAULT_GOAL := $(DEFAULT_BUILD_GOAL)
 
 CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
+
+# The aln port's floating-point code (bwa_cal_maxdiff) must round exactly as stock bwa's
+# does, which is compiled without fused multiply-add. Applies to every src/aln object.
+src/aln/%.o: CXXFLAGS += -ffp-contract=off
 
 # The C TUs in $(OBJS) (src/fast_reader*.c, src/fr_fastq.c: the FASTQ reader)
 # get the C++ TUs' -g -O3 and $(ARCH_FLAGS). Outside sanitizer builds nothing
@@ -1138,6 +1145,16 @@ test-binaries: $(BWA_LIB) $(HTS_LIB) $(ROWALT_KERNEL_OBJ)
 shm_section_find_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_section_find_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_section_find_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+# aln_index_parity_test: needs a stock `bwa index` and a bwa-mem3 index of the same
+# FASTA, so it is excluded from `test:` and run by test/regression/aln_index_parity.sh.
+aln_index_parity_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/aln_index_parity_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/aln_index_parity_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+# aln_sai_dump: the ported search's .sai body, compared with stock bwa aln by
+# test/regression/aln_sai_parity.sh; takes arguments, so it is excluded from `test:`.
+aln_sai_dump: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/aln_sai_dump.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/aln_sai_dump.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
 detect_sa_compx_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/detect_sa_compx_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/detect_sa_compx_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
@@ -1495,6 +1512,12 @@ test/kernel_padded_lane_uninit_test.o: test/kernel_padded_lane_uninit_test.cpp
 test/shm_section_find_test.o: test/shm_section_find_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
+test/aln_index_parity_test.o: test/aln_index_parity_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/aln_sai_dump.o: test/aln_sai_dump.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 test/detect_sa_compx_test.o: test/detect_sa_compx_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
@@ -1659,7 +1682,7 @@ $(ZLIBNG_LIB):
 	cd $(ZLIBNG_BUILD) && cmake $(ZLIBNG_CMAKE_FLAGS) .. && $(MAKE)
 
 clean: pgo-clean profile-clean lto-clean
-	rm -fr src/*.o src/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness rescue_band_kernel_eq rescue_prune_eq bwa-mem3.arm64
+	rm -fr src/*.o src/*.d src/aln/*.o src/aln/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness rescue_band_kernel_eq rescue_prune_eq bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
 	rm -f src/*.gcno src/*.gcda
 	$(MAKE) -C test clean
@@ -1687,7 +1710,7 @@ clean: pgo-clean profile-clean lto-clean
 #   - the `SIMD floor:` / `SIMD runtime:` lines (vary by build arch and host
 #     CPU: avx2/avx512bw on x86, neon on arm64).
 # Any future host-dependent line must be added here too.
-DOCS_CLI_SUBCMDS := index mem shm re-sa version
+DOCS_CLI_SUBCMDS := index mem aln shm re-sa version
 
 docs:
 	cd docs && mdbook build
@@ -1907,4 +1930,4 @@ print-%:
 # (src/%.avx2.o), native and standalone-test objects are all picked up.
 # `-include` (not `include`) makes a glob that matches nothing — a clean tree —
 # silently fine rather than a hard error.
--include src/*.d test/*.d $(LIBSAIS_OBJS:.o=.d)
+-include src/*.d src/aln/*.d test/*.d $(LIBSAIS_OBJS:.o=.d)

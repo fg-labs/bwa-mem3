@@ -124,6 +124,10 @@ make
 
 See the [installation guide](https://bwa-mem3.readthedocs.io/en/latest/getting-started/installation.html) for prerequisites and architecture-specific notes.
 
+## Other subcommands
+
+`bwa-mem3 aln` aligns ultrashort, ancient or degraded DNA with bwa's backtracking algorithm. It fuses `bwa aln` and `bwa samse`/`bwa sampe` into one command and writes SAM that is byte-identical to bwa 0.7.19's (see [aln](https://bwa-mem3.readthedocs.io/en/latest/cli/aln.html)). `index`, `mem`, `shm`, `re-sa` and `version` are the others.
+
 ## Quick links
 
 - [Benchmarks](https://bwa-mem3.readthedocs.io/en/latest/performance/benchmarks.html) — published results for every release, and how they are measured
