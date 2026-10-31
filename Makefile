@@ -1785,7 +1785,7 @@ clean: pgo-clean profile-clean lto-clean
 #   - the `SIMD floor:` / `SIMD runtime:` lines (vary by build arch and host
 #     CPU: avx2/avx512bw on x86, neon on arm64).
 # Any future host-dependent line must be added here too.
-DOCS_CLI_SUBCMDS := index mem shm re-sa version
+DOCS_CLI_SUBCMDS := index mem aln shm re-sa version
 
 docs:
 	cd docs && mdbook build
@@ -1795,10 +1795,14 @@ docs-serve:
 
 docs-cli: $(EXE)
 	@mkdir -p docs/_generated/cli
-	@for sub in $(DOCS_CLI_SUBCMDS); do \
+	@raw=$$(mktemp) || exit 1; \
+	for sub in $(DOCS_CLI_SUBCMDS); do \
 		echo "  CAPTURE  docs/_generated/cli/$$sub.txt"; \
-		./$(EXE) $$sub --help 2>&1 \
-			| sed -e 's/[[:space:]]*$$//' \
+		if ! ./$(EXE) $$sub --help > "$$raw" 2>&1 || ! grep -q '[[:alnum:]]' "$$raw"; then \
+			echo "docs-cli: './$(EXE) $$sub --help' failed or printed nothing; docs/_generated/cli/$$sub.txt is left unchanged" >&2; \
+			cat "$$raw" >&2; rm -f "$$raw"; exit 1; \
+		fi; \
+		sed -e 's/[[:space:]]*$$//' "$$raw" \
 			| grep -v '^Total time taken:' \
 			| grep -v '^Looking to launch ' \
 			| grep -v '^Launching executable ' \
@@ -1808,7 +1812,8 @@ docs-cli: $(EXE)
 			       /^SIMD floor: / {print "SIMD floor: <FLOOR-TIER> (<HOST-CLASS>); kernels: <KERNEL-LIST>"; next} \
 			       /^SIMD runtime: / {print "SIMD runtime: <RUNTIME-TIER> (<FORCE-TIER-STATE>)"; next} {print}' \
 			> docs/_generated/cli/$$sub.txt; \
-	done
+	done; \
+	rm -f "$$raw"
 
 # The BWA3_RESCUE_* knob table of the rescue developer-guide page, rendered from the knob list in
 # src/rescue_env.h; test/regression/rescue_docs_lint.sh fails when the committed copy is stale.
