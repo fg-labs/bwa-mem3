@@ -8,7 +8,8 @@
  * end of the file are new: bwt_match_gap's loop as a resumable job, for interleaved search,
  * with bwt_match_exact_alt's loop (aln_bwt.cpp) run inside the job one base at a time. The job
  * uses a new stack, gap_cstack_t (after gap_pop), whose buckets are chains of pooled chunks;
- * bwt_match_gap keeps upstream's gap_stack_t. */
+ * bwt_match_gap keeps upstream's gap_stack_t. gap_cpush builds each entry in a local and stores
+ * it whole, where gap_push assigns the slot's fields one by one. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
 #include "../utils.h"
@@ -108,7 +109,8 @@ static inline void gap_pop(gap_stack_t *stack, gap_entry_t *e)
  * the system's).
  *
  * Pop order: gap_cpush and gap_cpop are gap_push and gap_pop with q->stack[q->n_entries] read
- * and written through the chunk chain. The bucket chosen (stack->best), the per-bucket and
+ * and written through the chunk chain (and gap_cpush stores the entry whole, with n_seed_mm,
+ * which nothing reads, set to 0; see gap_cpush). The bucket chosen (stack->best), the per-bucket and
  * total entry counts and the rescan for the next non-empty bucket are the same statements on
  * the same counts, and within a bucket the entry popped is the last one pushed, as in the
  * array. So the two stacks pop the same entries in the same order.
@@ -197,7 +199,7 @@ static inline void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l,
 							 int state, int is_diff, const gap_opt_t *opt)
 {
 	int score;
-	gap_entry_t *p;
+	gap_entry_t t;
 	gap_bucket_t *q;
 	score = aln_score(n_mm, n_gapo, n_gape, opt);
 	q = stack->stacks + score;
@@ -207,12 +209,15 @@ static inline void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l,
 		q->top = c;
 		q->top_n = 0;
 	}
-	p = q->top->e + q->top_n;
-	p->info = (uint32_t)score<<21 | i; p->k = k; p->l = l;
-	p->n_mm = n_mm; p->n_gapo = n_gapo; p->n_gape = n_gape;
-	p->n_ins = n_ins; p->n_del = n_del;
-	p->state = state;
-	p->last_diff_pos = is_diff? i : 0;
+	// Build the entry here and store it whole. Assigning n_mm, n_gapo, n_gape and state to the
+	// slot's bitfield word one by one makes the compiler load the word to keep its other bits
+	// (n_seed_mm, which nothing reads), and that load of a slot not yet in cache stalls.
+	t.info = (uint32_t)score<<21 | i;
+	t.n_mm = n_mm; t.n_gapo = n_gapo; t.n_gape = n_gape; t.state = state; t.n_seed_mm = 0;
+	t.n_ins = n_ins; t.n_del = n_del;
+	t.last_diff_pos = is_diff? i : 0;
+	t.k = k; t.l = l;
+	q->top->e[q->top_n] = t;
 	++(q->top_n);
 	++(q->n_entries);
 	++(stack->n_entries);

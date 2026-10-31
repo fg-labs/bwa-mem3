@@ -202,10 +202,11 @@ Each change to upstream-derived code adds a line here.
   no state, now take turns. Only the interleaving changes; the output does not.
 - Chunked search stack (new code). The interleaved search no longer uses upstream's `gap_stack_t`:
   `gap_cstack_t` (`bwtgap.cpp`) has the same score buckets, the same `best` and entry counts and the
-  same push and pop statements, but each bucket is a chain of fixed-size chunks (`GAP_CHUNK_BYTES`,
-  16 KiB, 511 entries) rather than an array that doubles on its own. A push that finds its bucket's top
-  chunk full (or no chunk) takes one from a per-thread pool; a pop that empties one gives it back; a finished read gives
-  back all of its stack's chunks. So the memory the stacks hold follows the entries in use rather
+  same push and pop statements (apart from the whole-entry store below), but each bucket is a chain
+  of fixed-size chunks (`GAP_CHUNK_BYTES`, 16 KiB, 511 entries) rather than an array that doubles on
+  its own. A push that finds its bucket's top chunk full (or no chunk) takes one from a per-thread
+  pool; a pop that empties one gives it back; a finished read gives back all of its stack's chunks.
+  So the memory the stacks hold follows the entries in use rather
   than every bucket's high-water mark, which lets `bwa_cal_sa_reg_gap_group` keep more reads in
   flight per thread for less peak memory than 8 took before (`ALN_GROUP`: 12 on Apple arm64, where
   it measured 4-11% faster than 8; 8 on every other target, including x86-64, where 12 measured
@@ -215,6 +216,12 @@ Each change to upstream-derived code adds a line here.
   as in the array, and the bucket popped is chosen by the same code, so entries come off in the same
   order and each read's hits are unchanged. `bwt_match_gap` keeps upstream's `gap_stack_t` and is the
   unit tests' reference.
+- Whole-entry push (new code). `gap_cpush` builds the entry in a local `gap_entry_t`, sets every field
+  (`n_seed_mm` to 0) and stores it in one piece. Upstream's `gap_push` assigns `n_mm`, `n_gapo`,
+  `n_gape` and `state` into the slot's bitfield word, which the compiler turns into a load of that
+  word to keep `n_seed_mm`; the slot is often a line not yet in cache, so the load stalled. Nothing
+  reads `n_seed_mm`, so the entries popped are the same. `gap_push` is unchanged and still used by
+  `bwt_match_gap`.
 - Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
   walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
   block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone
