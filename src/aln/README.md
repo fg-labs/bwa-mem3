@@ -121,3 +121,18 @@ Each task that changes or adds upstream-derived code appends a line here.
   order; its line-start counting is a small helper (`count_line_start`).
 - `aln_main.cpp`: new code. Inputs and `-f` are checked before the index loads, so a failed
   run leaves no output; help text lists each option with its stock default and source command.
+- `bwape.cpp`/`bwape.h`: `bwa_cal_pac_pos_pe` is cut into its four stages, `bwa_pe_aln2seq` (the
+  `drand48` draws), `bwa_pe_se_pos`, `bwa_pe_isize` (`infer_isize` and the `last_ii` fallback) and
+  `bwa_pe_pair`, each holding upstream's loop body unchanged; `bwa_cal_pac_pos_pe` calls them in turn.
+  `bwa_paired_sw` is likewise split into `bwa_paired_sw_core` (the loop, adding to the counts) and
+  `bwa_paired_sw_report` (the two stderr lines). The `bwa_aln2seq_core` calls in `bwa_pe_pair` use
+  `set_main = 0` and never reach the sampling branch (`rest` there equals the hits still to place, so
+  no interval exceeds it), so that stage draws nothing.
+- The driver runs the stages after the search on `kt_for` (design §6.2). Single end: the `drand48`
+  pass (`bwa_aln2seq_core`) runs serially over the batch in read order, then position, refinement, MD,
+  trim correction and SAM text run in parallel on slices of the batch (`bwa_cal_pac_pos`,
+  `bwa_refine_gapped` and `bwa_print_sam1` unchanged, on each slice). Paired end: `bwa_pe_aln2seq`
+  serially in stock order (pair by pair, read 1 then read 2), `bwa_pe_se_pos` in parallel,
+  `bwa_pe_isize` as a barrier, then pairing, mate Smith-Waterman, refinement and each pair's records in
+  parallel. Each slice's text goes to its thread's buffer, and the slices are written in read order; a
+  pair with mismatched names still ends the output after that pair.
