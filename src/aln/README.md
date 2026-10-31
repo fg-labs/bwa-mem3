@@ -77,7 +77,7 @@ Each task that changes or adds upstream-derived code appends a line here.
   `bwa_refine_gapped` always receives the packed reference (upstream's `NULL` branch that
   reads `.pac` is dropped); the `.sai` reading, `bwa_sai2sam_se_core` and the samse command
   line are not ported (alignments come from the search's `aln` arrays, and the driver is
-  `aln_main.cpp`); and `bwa_print_sam1` / `bwa_refine_gapped_core` have C++ casts. Output
+  `aln_main.cpp`); `bwa_print_sam1`, `bwa_cal_md1` and the header writer format numbers and strings with `kputs`/`kputc`/`kputl` instead of `ksprintf` (same text; libc's `vfprintf` takes a process-wide locale lock that serialises the formatting threads on macOS); and `bwa_print_sam1` / `bwa_refine_gapped_core` have C++ casts. Output
   goes to a sink that writes per batch, in read order.
 - `bwase.cpp`: `bns_get_seq` and `bns_cnt_ambi` are upstream `bntseq.c`'s bodies, kept as
   file-local `aln_bns_get_seq` / `aln_bns_cnt_ambi`. bwa-mem3's own `bns_cnt_ambi` counts every
