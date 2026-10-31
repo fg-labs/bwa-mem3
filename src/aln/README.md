@@ -117,3 +117,7 @@ Each task that changes or adds upstream-derived code appends a line here.
   together gives the same hits and the same `-m` behaviour. A gap open is tried only from an entry with at least one
   difference still allowed, so its gap opens stay below `min(-o, differences allowed for the file's longest read)`,
   and a larger cap never lets a further entry in. The driver still searches each file as its own batch, as stock does.
+- `bwase.cpp`: `aln_print_sam_hdr` is new code that follows the 0.7.19 release's header
+  order; its line-start counting is a small helper (`count_line_start`).
+- `aln_main.cpp`: new code. Inputs and `-f` are checked before the index loads, so a failed
+  run leaves no output; help text lists each option with its stock default and source command.

@@ -1,0 +1,60 @@
+
+Important parameter settings:
+	BATCH_SIZE: 1024
+	MAX_SEQ_LEN_REF: 256
+	MAX_SEQ_LEN_QER: 128
+	MAX_SEQ_LEN8: 1088
+	SEEDS_PER_READ: 500
+	AVG_SEEDS_PER_READ: 64
+
+Usage:   bwa-mem3 aln [options] <prefix> <in.fq> [<in2.fq>]
+
+Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one
+step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe
+(two files), with no .sai files. Output matches bwa 0.7.19. <prefix> is an index made
+by `bwa-mem3 index` (also one made with --meth, or one staged by `bwa-mem3 shm`).
+Each option shows its default and the stock command it comes from.
+
+Search options (from bwa aln):
+  -n NUM    max #diff (int) or missing prob under 0.02 err rate (float) [0.04]
+  -o INT    maximum number or fraction of gap opens [1]
+  -e INT    maximum number of gap extensions, -1 for disabling long gaps [-1]
+  -i INT    do not put an indel within INT bp towards the ends [5]
+  -d INT    maximum occurrences for extending a long deletion [10]
+  -l INT    seed length [32]
+  -k INT    maximum differences in the seed [2]
+  -m INT    maximum entries in the queue [2000000]
+  -t INT    number of threads [1]
+  -M INT    mismatch penalty [3]
+  -O INT    gap open penalty [11]
+  -E INT    gap extension penalty [4]
+  -R INT    stop searching when there are >INT equally best hits [30]
+  -q INT    quality threshold for read trimming down to 35bp [0]
+  -B INT    length of barcode [0]
+  -L        log-scaled gap penalty for long deletions
+  -N        non-iterative mode: search for all n-difference hits (slooow)
+  -I        the input is in the Illumina 1.3+ FASTQ-like format
+  -Y        filter Casava-filtered sequences
+
+Single-end output options (from bwa samse):
+  --max-xa-hits INT   maximum number of alternative hits in the XA tag [3] (samse -n)
+  -r STR    read group header line such as '@RG\tID:foo\tSM:bar' [null] (samse and sampe -r)
+  -f FILE   file to write output to instead of stdout (samse and sampe -f)
+
+Paired-end options (two input files; from bwa sampe):
+  -a INT    maximum insert size [500]
+  --max-occ INT   maximum occurrences for one end [100000] (sampe -o)
+  --max-xa-hits-discordant INT   maximum hits to output for discordant pairs [10] (sampe -N)
+  -c FLOAT  prior of chimeric rate (lower bound) [1.0e-05]
+  -s        disable Smith-Waterman for the unmapped mate
+  -A        disable insert size estimate (force -s)
+  -P        accepted and ignored (sampe -P loads the index into memory; always so here)
+
+New in bwa-mem3 aln:
+  --bam     write BAM instead of SAM
+  --bam-level INT     BAM compression level 0-9 [1]
+  --help    show this message
+
+The long names stand in for stock samse/sampe -n and -o and sampe -N, whose letters
+are taken by the search options above.
+
