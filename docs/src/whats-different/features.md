@@ -262,6 +262,9 @@ This makes it possible to distinguish:
 - `HN:i:N` + no `XA:Z:` (N > `-h`) — multi-mapper whose alternates were
   suppressed by the cap.
 
+Under `-u` the alternate list is written as `XB:Z:` instead of `XA:Z:`, so read
+`XB:Z:` for `XA:Z:` above ([#690](https://github.com/fg-labs/bwa-mem3/pull/690)).
+
 Motivated by [lh3/bwa#438](https://github.com/lh3/bwa/pull/438), which adds
 HN to `bwa aln`. HN is emitted in both SAM (`mem_aln2sam`) and BAM
 (`mem_aln_to_bam`) paths and is absent when `-a` (`MEM_F_ALL`) is active or

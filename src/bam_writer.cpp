@@ -473,8 +473,8 @@ int mem_aln_to_bam(struct bam1_t *b,
             if (bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f) < 0) return -1;
         }
     }
-    if (p.XA != NULL) {
-        if (bam_aux_append(b, "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
+    if (p.XA != NULL) {   /* XB under -u, as in the SAM writer */
+        if (bam_aux_append(b, (opt->flag & MEM_F_XB) ? "XB" : "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
     }
     if (p.HN >= 0 && opt->compat->emit_hn) {
         int32_t hn = (int32_t)p.HN;
