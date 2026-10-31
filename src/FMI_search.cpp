@@ -1380,12 +1380,12 @@ struct LockstepSmemCache {
 };
 
 // LISA trick #4: hybrid SoA. The per-slot "hot" state stays compact
-// (160 bytes) so cross-slot access (e.g. T1 prefetch lookahead against
-// slots[(s+N/2)%N]) hits a tight L1-resident array instead of jumping
-// 32KB strides across embedded buffers. The bulk arrays (prev[],
-// match_buf[]; ~32 KB each) live in separate per-slot allocations,
-// referenced by pointer. Accessor syntax (s->prev[i], s->match_buf[i])
-// is unchanged from the embedded-array version.
+// (160 bytes) so the driver's pass over slots[0..N) hits a tight
+// L1-resident array instead of jumping 32KB strides across embedded
+// buffers. The bulk arrays (prev[], match_buf[]; ~32 KB each) live in
+// separate per-slot allocations, referenced by pointer. Accessor syntax
+// (s->prev[i], s->match_buf[i]) is unchanged from the embedded-array
+// version.
 struct FMI_search::BatchSlot {
     // Input identity — copied at init, never mutated thereafter.
     int32_t input_idx;           // index into the caller's input arrays
@@ -1442,50 +1442,6 @@ void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
     _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
-#else
-    (void)s;
-#endif
-}
-
-/* T1 (L2) variant — used for cross-slot N/2-step lookahead. The T0 prefetch
- * above lands at "this slot's next step" granularity; T1 here lands at
- * "this slot's step ~N/2 from now". For N=8 that's 4 stepping-passes ahead,
- * giving DRAM-latency-class lookahead when the cp_occ working set spills
- * out of L2/L3.
- *
- * Target the interval the lookahead slot will actually read next, which
- * differs by phase:
- *
- *   PH_BWD: ls_advance_backward_step runs entirely out of prev[] and NEVER
- *           rewrites smem, so smem here is the STALE leftover from the end of
- *           the forward phase. The next backward step calls backwardExt on
- *           prev[0] first, reading cp_occ[prev[0].k] and
- *           cp_occ[prev[0].k + prev[0].s]; warm those two blocks.
- *   otherwise: warm smem.l and smem.l + smem.s, the blocks the next forward
- *           step reads for its sp/ep.
- *
- * The lookahead slot's phase is effectively random from step to step, so a
- * phase test (and a loop over prev[]) mispredicts heavily. Instead the two
- * prefetches are always issued, with the interval chosen by mask selects. Only
- * the two blocks the next step reads first are warmed; warming more (all of
- * smem's blocks, or every live prev[p]) needs the branches back and measured
- * slower.
- * For PH_DONE / PH_BWD_INIT slots smem holds a stale but in-range interval
- * (zeros for a never-used slot), so the prefetch is merely wasted. prev[0] is
- * only dereferenced when phase == PH_BWD, where numPrev >= 1 holds. Pure hint,
- * so output is unchanged. */
-void FMI_search::ls_prefetch_cp_occ_t1(const BatchSlot *s)
-{
-#ifdef ENABLE_PREFETCH
-    /* Written as ?: (even with BWA_UNPREDICTABLE) clang still emitted a branch
-     * on the phase test, so the select is mask arithmetic behind BWA_OPAQUE
-     * (macro.h). Checked branch-free with clang 19 on x86-64 and arm64. */
-    uint64_t mask = (uint64_t)0 - (uint64_t)(s->phase == PH_BWD);
-    BWA_OPAQUE(mask);
-    const SMEM *m = (const SMEM *)(((uintptr_t)s->prev & mask) | ((uintptr_t)&s->smem & ~mask));
-    const int64_t lo = (int64_t)(((uint64_t)m->k & mask) | ((uint64_t)m->l & ~mask));
-    _mm_prefetch((const char *)(&cp_occ[(lo) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(lo + m->s) >> CP_SHIFT]), _MM_HINT_T1);
 #else
     (void)s;
 #endif
@@ -1999,11 +1955,10 @@ void FMI_search::ls_prepare_backward(BatchSlot *s)
     }
 #ifdef ENABLE_PREFETCH
     // The first backward step extends every prev entry from its k and k + s
-    // checkpoint blocks. The forward step prefetched only the l side, and the
-    // half-batch look-ahead (ls_prefetch_cp_occ_t1) warms only prev[0]'s two
-    // blocks, into L2, once it sees this slot in PH_BWD; prev[1..] get no hint
-    // at all. Hint every entry into L1 now, a full pass of the other slots
-    // ahead of that step. A hint only; nothing reads its result.
+    // checkpoint blocks. The forward step prefetched only the l side, so
+    // without this no prev entry's k-side blocks get a hint. Hint every entry
+    // into L1 now, a full pass of the other slots ahead of that step. A hint
+    // only; nothing reads its result.
     for (int p = 0; p < s->numPrev; p++) {
         _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k) >> CP_SHIFT]), _MM_HINT_T0);
         _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k + s->prev[p].s) >> CP_SHIFT]), _MM_HINT_T0);
@@ -2190,20 +2145,6 @@ void FMI_search::bsd_prefetch_cp_occ(const BwtSeedSlot *s)
 #ifdef ENABLE_PREFETCH
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
     _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
-#else
-    (void)s;
-#endif
-}
-
-// Cross-slot T1 (L2) prefetch — same two-line target as T0 (the swapped
-// interval at smem.l; see bsd_prefetch_cp_occ) but at L2 hint, used in the
-// driver's (s + N/2) % N lookahead to cover DRAM-class latency when cp_occ
-// spills out of L3.
-void FMI_search::bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s)
-{
-#ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T1);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T1);
 #else
     (void)s;
 #endif
@@ -2527,7 +2468,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     xassert(N >= 1 && N <= SMEM_LOCKSTEP_N_MAX,
             "g_smem_lockstep_n out of range [1, SMEM_LOCKSTEP_N_MAX]");
     // LISA trick #4: hybrid SoA layout. `slots[]` holds only the small hot
-    // state (~80 B per slot, full array fits in 1-2 cache lines for N=8).
+    // state (160 B per slot: 2.5 KB at N=16, 5 KB at N=32; see BatchSlot).
     // Bulk per-slot buffers (prev/match_buf) live separately and are reused
     // across calls via thread_local caches sized from the batch's
     // max_readlength so reads of any length fit (see issue #44 / PR #55).
@@ -2665,17 +2606,11 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                     idle++;
                 }
             }
-            // LISA trick #5: cross-slot T1 (L2) prefetch with N/2-step lookahead.
-            // The same-slot T0 prefetch issued inside ls_advance_*_step covers
-            // the next single-step access; this T1 prefetch on slot[s+N/2] keeps
-            // a copy in L2 for that slot's access ~N/2 stepping-passes from now,
-            // hiding DRAM-class latency when cp_occ entries spill out of L3.
-            // N is runtime (g_smem_lockstep_n), so `% N` is a real idiv every
-            // step. s < N and N/2 < N => s + N/2 < 2N, so one compare + subtract
-            // replaces the division. Byte-identical.
-            int32_t s_la = s + (N >> 1);
-            if (s_la >= N) s_la -= N;
-            ls_prefetch_cp_occ_t1(&slots[s_la]);
+            /* No cross-slot prefetch for another slot's next visit: each slot
+             * already hints what its next step reads, at the end of its last one
+             * (ls_advance_forward_step, ls_advance_forward_table,
+             * ls_advance_backward_step, ls_prepare_backward, ls_s1_lf_step) or when
+             * filled (ls_init_slot's jump-table entry, ls_prefetch_cp_occ). */
         }
 
         // --- Refill the slots the window turned away, now that it may admit
@@ -2803,9 +2738,10 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
 // load queue rather than serializing on per-read load latency.
 //
 // Structurally parallel to getSMEMsOnePosOneThread_lockstep above; see that
-// function's comments for the prefetch model (same-slot T0 inside the step
-// function + cross-slot T1 at (s + N/2) % N in the driver) and the hybrid
-// SoA per-slot/bulk-buffer layout rationale.
+// function's comments for the hybrid SoA per-slot/bulk-buffer layout
+// rationale. Prefetch model: same-slot T0 only, at the end of each step
+// (bsd_advance_step) and at slot init; as in the SMEM driver, there is no
+// cross-slot T1 lookahead (see the stepping pass below).
 int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
                                                             int32_t *max_intv_array,
                                                             int32_t numReads,
@@ -2893,12 +2829,13 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
             if (slots[s].phase == BSD_FWD) {
                 bsd_advance_step(&slots[s], enc_qdb, minSeedLen, jlev, jd);
             }
-            // Cross-slot T1 lookahead — same pattern as the SMEM lockstep's
-            // (s + N/2) % N L2 prefetch.
-            const int32_t s_la = (s + (N / 2)) % N;
-            if (slots[s_la].phase == BSD_FWD && slots[s_la].j >= 0) {
-                bsd_prefetch_cp_occ_t1(&slots[s_la]);
-            }
+            // No cross-slot prefetch for another slot's next visit: a slot that
+            // steps next already hinted its two cp_occ lines (smem.l and
+            // smem.l + smem.s) at the end of its last step (bsd_advance_step) or
+            // at init; a slot with a planned jump next reads only its jump-table
+            // entry, which bsd_plan_jump prefetched; and a fresh seed (j < 0)
+            // reads lines that are not known until its next start x is found.
+            // A second hint would only repeat the first or miss.
         }
 
         // Flush pass: emit retired slots in input order; recycle into the
