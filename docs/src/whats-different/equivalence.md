@@ -111,6 +111,7 @@ bwa-mem3 mem --compat=bwa-mem2 -t <N> ref.fa R1.fq R2.fq > out.sam
 | default `@HD` | emitted | suppressed | **none emitted** | emitted | **present** |
 | `.hdr`/`.dict` sidecar `@SQ` | honored (`M5`/`AS`/`UR`/`SP`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) |
 | `@PG` | `ID:bwa-mem3` | `ID:bwa-mem3` | `ID:bwa-mem2` | `ID:bwa-mem3` | `ID:bwa` |
+| `-u` hit list | `XB:Z` | `-u` refused | no `-u` | `XB:Z` | `XB:Z` |
 
 **The two upstreams disagree with each other on half of this table, which is why `--compat`
 takes a *target* rather than being a boolean.** `MQ:i` is not a bwa-mem3 invention — bwa
@@ -119,7 +120,9 @@ bwa-mem2 lacks it only because it forked at 0.7.17, before that landed. Likewise
 a default `@HD`** ([lh3/bwa#336](https://github.com/lh3/bwa/pull/336), merged 2022-03-06,
 shipped in 0.7.18 as `6b18630`) and bwa-mem2 does not, for the same reason. Only `HN:i`
 and the sidecar are genuinely bwa-mem3-only, and both targets drop them; every other row is
-the fork point showing through. `bwa-mem` is pinned at **0.7.19** for exactly this reason — a
+the fork point showing through, `-u` included: bwa added it in 0.7.18, so `--compat=bwa-mem2`
+refuses it unless `--compat-allow-divergent` is passed
+([#690](https://github.com/fg-labs/bwa-mem3/pull/690)). `bwa-mem` is pinned at **0.7.19** for exactly this reason — a
 0.7.17 target would be the `bwa-mem2` column with a different `@PG`.
 
 **Why a bwa target needs no alignment work.** bwa-mem2 v2.2.1 advertises output identical to

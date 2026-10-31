@@ -41,6 +41,7 @@ TEST_CASE("compat target `off` is bwa-mem3's native output") {
     // #469: `off` reports the correct sentinel-row coordinate; only the
     // bwa-mem2 target keeps bwa-mem2's dropped walk offset.
     CHECK(t->sa_sentinel_drop_offset == 0);
+    CHECK(t->has_xb == 1);   // -u writes XB:Z, as bwa does
     // `off` pins the one canonical default. It used to be NULL, meaning "each
     // path keeps whatever it emits" -- which was a different string on the SAM
     // text and BAM paths until #288 unified them.
@@ -68,6 +69,9 @@ TEST_CASE("compat target `bwa-mem2` matches bwa-mem2 v2.2.1") {
     // #310: bwa-mem2 resurrects the rejected slot-0 chain; that IS the target.
     CHECK(t->chain_flt_resurrect_empty == 1);
     CHECK(t->sa_sentinel_drop_offset == 1);   // #469: bwa-mem2 drops the walk offset
+    // bwa added -u (XB:Z) in 0.7.18, after the fork, so -u has no bwa-mem2
+    // counterpart and the --compat divergence guard refuses it.
+    CHECK(t->has_xb == 0);
 }
 
 TEST_CASE("compat target `bwa-mem` matches bwa 0.7.19") {
@@ -96,6 +100,7 @@ TEST_CASE("compat target `bwa-mem` matches bwa 0.7.19") {
     // leaves the read unmapped; modelling that is the whole point of the row.
     CHECK(t->chain_flt_resurrect_empty == 0);
     CHECK(t->sa_sentinel_drop_offset == 0);   // #469: bwa's bwt_sa keeps it
+    CHECK(t->has_xb == 1);   // bwa 0.7.18+ has -u (bwamem.c:963)
 }
 
 TEST_CASE("bwa and bwa-mem2 rows differ exactly where the upstreams do") {

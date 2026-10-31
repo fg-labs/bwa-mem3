@@ -335,6 +335,14 @@ compat_ok --compat=bwa-mem2 --skip-contained-ext
 compat_ok --compat=bwa-mem2 --keep-contained-ext
 compat_ok --compat=bwa-mem --keep-contained-ext
 compat_err "mutually exclusive" --compat=bwa-mem2 --chunk-cap 1000
+# -u is the per-target row: its XB:Z exists only in bwa 0.7.18+, so bwa-mem2
+# (forked at 0.7.17, no -u) refuses it and bwa-mem, whose own -u writes the same
+# XB:Z, accepts it. The error names -u, under either spelling of the target.
+compat_err "mutually exclusive: -u" --compat=bwa-mem2 -u
+compat_err "mutually exclusive: -u" --compat=mem2 -u
+compat_err "mutually exclusive: -u" -u --compat=bwa-mem2
+compat_ok --compat=bwa-mem -u
+compat_ok --compat=off -u
 # The error must NAME the offending flag(s) (the guard builds the list at runtime),
 # so assert on the flag name, not just the boilerplate. A two-lever case pins that
 # the accumulation lists more than one.
@@ -365,6 +373,7 @@ compat_warn "NOT byte-identical" --compat=bwa-mem2 --max-extend-chains=5 --compa
 compat_warn "NOT byte-identical" --compat=bwa-mem2 --proper-pair-from-emitted --compat-allow-divergent
 # The warning, like the error, must NAME the forced lever (same runtime-built list).
 compat_warn "smem-dedup" --compat=bwa-mem2 --smem-dedup --compat-allow-divergent
+compat_warn "proceeding with -u" --compat=bwa-mem2 -u --compat-allow-divergent
 # Hatch does not rescue the category errors.
 compat_err "mutually exclusive" --compat=bwa-mem2 --fast --compat-allow-divergent
 compat_err "no methylation mode" --compat=bwa-mem2 --meth --compat-allow-divergent
