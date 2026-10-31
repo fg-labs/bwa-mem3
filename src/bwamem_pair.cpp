@@ -1200,9 +1200,12 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
      * unique and pdqsort gives the same array as the klib introsort it
      * replaces (faster on the sort microbench's 9-32 element bucket; measured
      * whole-aligner in the PR). Tested against ks_introsort_128 in
-     * test/unit/test_pair64_sort.cpp. The strict-order check after each sort
-     * turns a future key change that breaks distinctness into a hard failure
-     * instead of a silently different pairing on ties. */
+     * test/unit/test_pair64_sort.cpp. (Equal pair64_t are the same bytes, so
+     * the sorted array is unique even with duplicates.) The strict-order check
+     * after each sort guards the key construction itself: the loops below read
+     * i, k, strand and r back out of y and count each u entry toward *n_sub, so
+     * a future key change that let two elements collide would lose candidates
+     * or double-count; the check makes that a hard failure. */
     if (v.n > 1) pdqsort_128(v.n, v.a);  // v.a is null when no candidates were pushed; pdqsort_128 forms a + n, UB on a null pointer
     xassert(pair64_strictly_sorted(v.n, v.a), "mem_pair: candidate keys must be pairwise distinct");
     y[0] = y[1] = y[2] = y[3] = -1;

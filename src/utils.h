@@ -118,10 +118,13 @@ extern "C" {
 
 	void ks_introsort_64 (size_t n, uint64_t *a);
 	void ks_introsort_128(size_t n, pair64_t *a);
-	/* pdqsort on the same (x, y) order as ks_introsort_128. Only for arrays
-	 * whose (x, y) keys are pairwise distinct: the sorted order is then unique
-	 * and the two produce the same array (see mem_pair, which guards the
-	 * distinctness with pair64_strictly_sorted after each sort). */
+	/* pdqsort on the same (x, y) order as ks_introsort_128, and it produces the
+	 * same array for any input, duplicates included: the order compares the whole
+	 * element, so equal pair64_t are the same bytes and the sorted array is unique
+	 * (test/unit/test_pair64_sort.cpp checks it against ks_introsort_128 on
+	 * distinct and on duplicate-heavy keys; `aln`'s pairing sort has duplicates).
+	 * mem_pair separately asserts its keys are pairwise distinct, a property of
+	 * its key construction (see there). */
 	void pdqsort_128(size_t n, pair64_t *a);
 	/* The (x, y) order both sorts use, and the same order without
 	 * short-circuits for pdqsort_128's branchless partition (keep the two in

@@ -11,7 +11,8 @@
  * except that bwa_pe_se_pos and bwa_pe_pair make their SA lookups in batches (bwt_sa_batch) ahead
  * of the code that uses them, and bwa_pe_pair is restructured into per-group phases for that.
  * The bwa_paired_sw wrapper itself is not kept (nothing calls it). bwa_pe_pairing and
- * bwa_pe_pair_grouped expose pairing and the grouping to the unit tests. See README.md. */
+ * bwa_pe_pair_grouped expose pairing and the grouping to the unit tests. Pairing sorts its rows
+ * with pdqsort_128 in place of ks_introsort_128; the sorted array is the same. See README.md. */
 #include "bwape.h"
 #include "aln_alloc.h"
 
@@ -170,7 +171,10 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 
 	o_score = subo_score = (uint64_t)-1;
 	o_n = subo_n = 0;
-	ks_introsort_128(d->arr.n, d->arr.a);
+	/* pdqsort_128 in place of upstream's ks_introsort_128: both order rows by the whole
+	 * (x, y), so rows equal under it are identical bytes and the sorted array is the same
+	 * (utils.h). The guard keeps pdqsort_128 from forming a + n on an empty, null array. */
+	if (d->arr.n > 1) pdqsort_128(d->arr.n, d->arr.a);
 	for (j = 0; j < 2; ++j) last_pos[j][0].x = last_pos[j][0].y = last_pos[j][1].x = last_pos[j][1].y = (uint64_t)-1;
 	if (opt->type == BWA_PET_STD) {
 		for (i = 0; i < d->arr.n; ++i) {
