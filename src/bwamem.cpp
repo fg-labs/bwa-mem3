@@ -3045,9 +3045,38 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
             max_readlength = seq_[i].l_seq;
     }
 
+    /* The bwtSeed pass's first walk on each read (from x = 0) repeats the
+     * first steps of the SMEM pass's first forward walk on it, so that walk
+     * records where the bwtSeed walk stops and the bwtSeed pass starts each
+     * read there (BsdFirstWalk, FMI_search.h). Lockstep drivers only. */
+    BsdFirstWalkHint bsd_hint_v;
+    BsdFirstWalkHint *bsd_hint = nullptr;
+#if SMEM_LOCKSTEP_N > 1 && BWTSEED_LOCKSTEP_N > 1
+    if (opt->max_mem_intv > 0 && g_bwtseed_lockstep) {
+        struct BsdFirstWalkCache {
+            BsdFirstWalk *rec = nullptr;
+            int64_t cap = 0;
+            ~BsdFirstWalkCache() { if (rec != nullptr) _mm_free(rec); }
+        };
+        static thread_local BsdFirstWalkCache bsd_cache;
+        if (bsd_cache.cap < nseq) {
+            if (bsd_cache.rec != nullptr) _mm_free(bsd_cache.rec);
+            const size_t bytes = (size_t)nseq * sizeof(BsdFirstWalk);
+            bsd_cache.rec = (BsdFirstWalk *)_mm_malloc(bytes, 64);
+            assert_not_null(bsd_cache.rec, bytes, bytes);
+            bsd_cache.cap = nseq;
+        }
+        // getSMEMsAllPosOneThread marks each rid's record unrecorded (x = -1).
+        bsd_hint_v.rec      = bsd_cache.rec;
+        bsd_hint_v.max_intv = (int32_t)opt->max_mem_intv;   // as min_intv_ar below
+        bsd_hint_v.min_len  = opt->min_seed_len + 1;
+        bsd_hint = &bsd_hint_v;
+    }
+#endif
+
     fmi->getSMEMsAllPosOneThread(enc_qdb, min_intv_ar, rid, nseq, nseq,
                                  seq_, query_cum_len_ar, max_readlength, opt->min_seed_len,
-                                 matchArray, &num_smem1);
+                                 matchArray, &num_smem1, bsd_hint);
 
     for (int64_t i=0; i<num_smem1; i++)
     {
@@ -3173,15 +3202,15 @@ SMEM *mem_collect_smem(FMI_search *fmi, const mem_opt_t *opt,
 // Third-pass re-seeding: the lockstep driver overlaps N reads' cp_occ misses
 // (on by default; g_bwtseed_lockstep is resolved once per run at startup, where
 // BWA3_BWTSEED_LOCKSTEP can pin it -- policy and measurements in
-// lockstep_width.h). Byte-identical either way: same SMEM emission order (the
-// bwtseed lockstep parity harness pins it).
+// lockstep_width.h). Either way: same (rid, m, n, k, s) seeds, same order, same SAM
+// (the parity harness pins it); a seed from a BsdFirstWalk record may keep a stale l.
 #if BWTSEED_LOCKSTEP_N > 1
         if (g_bwtseed_lockstep) {
             num_smem3 = fmi->bwtSeedStrategyAllPosOneThread_lockstep(enc_qdb, min_intv_ar,
                                                                      nseq, seq_, query_cum_len_ar,
                                                                      opt->min_seed_len + 1,
                                                                      matchArray + num_smem1 + num_smem2,
-                                                                     max_readlength);
+                                                                     max_readlength, bsd_hint);
         } else
 #endif
         {

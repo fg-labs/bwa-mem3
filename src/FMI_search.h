@@ -102,6 +102,34 @@ typedef struct smem_sort_scratch
  * caller-owned, grown on demand. */
 void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch);
 
+/* The bwtSeed pass's first walk on a read (from x = 0), recorded by the SMEM
+ * pass's first forward walk on it. Both start at read base 0 and step every
+ * base with the same forward extension, so the bwtSeed walk is a prefix of the
+ * SMEM walk (min_intv 1), which goes on while s >= 1: the SMEM walk notes the
+ * step at which the bwtSeed walk stops (s < max_intv and n + 1 >= min_len), or
+ * where it would end when the SMEM walk stops first, and the bwtSeed pass
+ * emits that seed and starts the read at x instead of walking it again.
+ * mem_collect_smem fills `rec` (one entry per read, indexed by rid) through
+ * getSMEMsAllPosOneThread, which first sets x = -1 for every rid it is given,
+ * and reads it back in bwtSeedStrategyAllPosOneThread_lockstep, whose read i
+ * must be rid i. A direct getSMEMsOnePosOneThread_lockstep caller must set
+ * those x to -1 itself. */
+typedef struct bsd_first_walk
+{
+    int64_t k, l, s;  /* the walk's last interval, emitted as its seed when s > 0;
+                       * l is stale (frozen at the unique-match step) when the
+                       * SMEM walk ended in its text compare (ls_s1_compare) */
+    int32_t n;        /* the seed's last base (m = 0)                          */
+    int32_t x;        /* where the bwtSeed pass goes on; < 0: not recorded     */
+}BsdFirstWalk;
+
+typedef struct bsd_first_walk_hint
+{
+    BsdFirstWalk *rec;     /* one per read, indexed by rid                     */
+    int32_t       max_intv;/* the bwtSeed pass's max_intv (>= 1, every read)    */
+    int32_t       min_len; /* the bwtSeed pass's minSeedLen                     */
+}BsdFirstWalkHint;
+
 #define SAL_PFD 16
 
 /* SMEM_LOCKSTEP_N (phase-2 SMEM lockstep width, the compile-time floor/default
@@ -285,7 +313,12 @@ class FMI_search: public indexEle
      * read finishes; finished reads are emitted in input order through a
      * per-thread parked list (smem_parked.h), so matchArray is written in the
      * same (read, smem) order as the scalar path.
-     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
+     * matchArray must hold at least numReads * max_readlength SMEMs (caller-sized).
+     * With bsd_hint, a walk from query position 0 at min_intv 1 records the
+     * bwtSeed pass's first walk on its read (BsdFirstWalk). The caller must
+     * first set bsd_hint->rec[rid].x = -1 for every rid it passes, as
+     * getSMEMsAllPosOneThread does; a read whose walk records nothing keeps
+     * that mark. */
     void getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                                           int32_t *query_pos_array,
                                           int32_t *min_intv_array,
@@ -297,9 +330,13 @@ class FMI_search: public indexEle
                                           int32_t  max_readlength,
                                           int32_t minSeedLen,
                                           SMEM *matchArray,
-                                          int64_t *__numTotalSmem);
+                                          int64_t *__numTotalSmem,
+                                          BsdFirstWalkHint *bsd_hint = nullptr);
 
-    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized). */
+    /* matchArray must hold at least numReads * max_readlength SMEMs (caller-sized).
+     * bsd_hint (first round only, lockstep build) as in
+     * getSMEMsOnePosOneThread_lockstep; this call sets x = -1 in every rid's
+     * record itself. */
     void getSMEMsAllPosOneThread(uint8_t *enc_qdb,
                                  int32_t *min_intv_array,
                                  int32_t *rid_array,
@@ -310,7 +347,8 @@ class FMI_search: public indexEle
                                  int32_t max_readlength,
                                  int32_t minSeedLen,
                                  SMEM *matchArray,
-                                 int64_t *__numTotalSmem);
+                                 int64_t *__numTotalSmem,
+                                 BsdFirstWalkHint *bsd_hint = nullptr);
 
 
     /* matchArray must hold at least numReads * (longest l_seq in seq_) SMEMs;
@@ -328,7 +366,14 @@ class FMI_search: public indexEle
      * order so the CP_OCC cache-line misses from independent reads issue
      * concurrently. Same SMEM emission order as the scalar (reads in input
      * order; within a read, outer-x ascending). matchArray must hold at
-     * least numReads * max_readlength SMEMs. */
+     * least numReads * max_readlength SMEMs. With bsd_hint (filled by the
+     * SMEM pass, BsdFirstWalk), a read whose first walk was recorded emits
+     * that walk's seed and starts at its x; a hint whose min_len or max_intv
+     * differs from this call's is not used. rec is indexed by read index,
+     * which must equal the rid the SMEM pass recorded it under, and any
+     * record with x > 0 is trusted as this batch's. A seed taken from a
+     * record may carry a stale l (frozen at the SMEM walk's unique-match
+     * step), so it matches the scalar driver's seed in (rid, m, n, k, s). */
     int64_t bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
                                                     int32_t *max_intv_array,
                                                     int32_t numReads,
@@ -336,7 +381,8 @@ class FMI_search: public indexEle
                                                     int32_t *query_cum_len_ar,
                                                     int32_t minSeedLen,
                                                     SMEM *matchArray,
-                                                    int32_t max_readlength);
+                                                    int32_t max_readlength,
+                                                    const BsdFirstWalkHint *bsd_hint = nullptr);
 
     /* No production caller: mem_collect_smem uses smem_sort_rid_mn. Kept for the
      * integration tests (smem2_test, bwt_seed_strategy_test, fmi_test); the
@@ -618,16 +664,20 @@ private:
                       const int32_t *rid_array,
                       const bseq1_t *seq_,
                       const int32_t *query_cum_len_ar,
-                      const uint8_t *enc_qdb);
+                      const uint8_t *enc_qdb,
+                      BsdFirstWalkHint *bsd_hint);
     void ls_prefetch_cp_occ(const BatchSlot *s);
     void ls_prefetch_cp_occ_t1(const BatchSlot *s);
+    inline void ls_bsd_note(BatchSlot *s, int64_t k, int64_t l, int64_t sz);
+    void ls_bsd_resolve(BatchSlot *s, const uint8_t *enc_qdb, int32_t p);
     void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
                                  bool s1_text);
     inline void ls_prefetch_sa_row(int64_t p) const;
     void ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac);
     void ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
                        const uint8_t *pac, int64_t l_pac);
-    void ls_advance_forward_table(BatchSlot *s, bool s1_text);
+    void ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
+                                  bool s1_text);
     void ls_prepare_backward(BatchSlot *s);
     void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,
@@ -642,7 +692,8 @@ private:
                        const int32_t *query_cum_len_ar,
                        const uint8_t *enc_qdb,
                        const SeedJumpEntry *jlev, int32_t jd,
-                       int32_t minSeedLen);
+                       int32_t minSeedLen,
+                       const BsdFirstWalkHint *bsd_hint);
     void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
     void bsd_prefetch_cp_occ_t1(const BwtSeedSlot *s);
     void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,

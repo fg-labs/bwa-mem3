@@ -422,8 +422,8 @@ integration/main_banded.o: ../src/bandedSWA.h ../src/macro.h
 integration/bandedswa_zdrop_eweight_test.o: ../src/bandedSWA.h ../src/macro.h framework/ext_result.h
 integration/sa2ref_test.o: $(FMI_TEST_HEADERS)
 integration/smem2_test.o: $(FMI_TEST_HEADERS)
-smem_lockstep_parity_test.o: $(FMI_TEST_HEADERS) ../src/smem_parked.h seed_jump_test_util.h
-bwtseed_lockstep_parity_test.o: $(FMI_TEST_HEADERS) seed_jump_test_util.h
+smem_lockstep_parity_test.o: $(FMI_TEST_HEADERS) ../src/smem_parked.h seed_jump_test_util.h lockstep_parity_test_util.h
+bwtseed_lockstep_parity_test.o: $(FMI_TEST_HEADERS) seed_jump_test_util.h lockstep_parity_test_util.h
 backwardext_konly_parity_test.o: $(FMI_TEST_HEADERS)
 sa_lookup_sentinel_parity_test.o: $(FMI_TEST_HEADERS)
 backwardext_parity_test.o: $(FMI_TEST_HEADERS)

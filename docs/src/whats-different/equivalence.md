@@ -571,6 +571,29 @@ Graviton4 (NEON) and Zen 4 (AVX-512BW, and AVX2 forced), clang 19.1.7, in the de
 with `--compat=bwa-mem2` and `--compat=bwa-mem`
 ([#642](https://github.com/fg-labs/bwa-mem3/pull/642)).
 
+### Third-pass seeding from the first SMEM walk (default, byte-identical)
+
+The third seeding pass (bwtSeed) walks each read forward from base 0, and the first SMEM pass
+has already taken that walk. With the lockstep bwtSeed driver (the default), the SMEM pass
+records where the bwtSeed walk would stop (`BsdFirstWalk`), and the bwtSeed pass emits that
+seed and starts the read there. It does this only when the third pass runs (`max_mem_intv > 0`)
+and only when the record's `min_len` and `max_intv` match the call's. With
+`BWA3_BWTSEED_LOCKSTEP=0` nothing is recorded and the scalar driver emits the same seeds as before.
+
+Every emitted seed has the same `(rid, m, n, k, s)` as the scalar driver's, in the same order.
+A seed taken from a record whose SMEM walk ended in the unique-match text compare can keep a
+stale `l` (the walk's last forward-step `l`). Nothing reads `l` after seeding: SA lookup uses
+`k` and `s`, the per-read sort keys on `(m, n)`, and the opt-in SMEM dedup compares
+`(rid, m, n, k, s)`. `test/bwtseed_lockstep_parity_test` checks this field by field on phiX
+windows. SAM output (excluding `@PG`) was identical to the base on an arm64 build (NEON tier) and
+an x86-64 build at the AVX2 tier, clang 21, with the lockstep and the scalar driver, on a 10.6 Mb
+reference (E. coli K-12 MG1655 plus a 6 Mb chr22 slice) with 40,000 151 bp read pairs and 8,000
+long reads: SE, PE and long-read runs at default options and
+under `-d 70`, `-w 30` and `--compat=bwa-mem2`, and PE runs under `-k 10`, `-k 30`, `-y 1`,
+`-y 5` and `--ks-dedup=on`/`off`. It was also identical on a 5M-pair WGS slice (HG00096,
+hg38) on Sapphire Rapids (AVX-512BW), Zen 3 (AVX2) and Graviton4 (NEON), clang 19.1.7
+([#674](https://github.com/fg-labs/bwa-mem3/pull/674)).
+
 ## What differs
 
 ### Additive SAM tags

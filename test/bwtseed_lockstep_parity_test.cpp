@@ -1,6 +1,9 @@
 /* Parity harness: scalar bwtSeedStrategyAllPosOneThread vs the lockstep
- * variant. Both functions are given identical inputs; outputs (matchArray
- * bytes, returned numSeed) must be byte-identical.
+ * variant. Both functions are given identical inputs; outputs (returned
+ * numSeed, then every SMEM field but the padding) must be identical. The one
+ * exception is a lockstep seed taken from a BsdFirstWalk record that the SMEM
+ * walk's unique-match text compare wrote (Case 13h), whose `l` may be stale and
+ * is not compared (see l_may_be_stale).
  *
  * Both drivers end a read once no later walk can emit (x_end), so a wrong
  * bound shared by the two would pass the scalar-vs-lockstep compare. Every
@@ -21,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <map>
 #include <string>
 #include <vector>
 /* reference_bwtseed needs count[] and backwardExt. */
@@ -28,6 +32,7 @@
 #include "FMI_search.h"
 #undef private
 #include "seed_jump_test_util.h"
+#include "lockstep_parity_test_util.h"
 #include "bwa.h"
 
 /* A degenerate N=1 build would invoke bwtSeedStrategyAllPosOneThread_lockstep
@@ -37,24 +42,40 @@
 #error "bwtseed_lockstep_parity_test requires BWTSEED_LOCKSTEP_N > 1 to exercise the lockstep path"
 #endif
 
+/* Whether lockstep seed b, compared with the scalar or reference seed a, may
+ * carry a stale `l`: l_hint is the hint the lockstep call used (nullptr when it
+ * had none or rejected it), and b is that read's first seed (m = 0) taken from
+ * a record with s = 1. Such a record may have been written by the SMEM walk's
+ * unique-match text compare (ls_s1_compare), which never steps l, so the seed
+ * keeps the l of the step that handed off to it. A record from an ordinary
+ * forward step with s = 1 cannot be told apart here and is skipped too; every
+ * other seed compares l. */
+static bool l_may_be_stale(const SMEM &a, const SMEM &b, const BsdFirstWalkHint *l_hint) {
+    if (l_hint == nullptr || a.rid != b.rid || a.m != 0 || b.m != 0) return false;
+    const BsdFirstWalk &r = l_hint->rec[a.rid];
+    return r.x > 0 && r.s == 1;
+}
+
 /* Field-by-field SMEM equality. memcmp is unsuitable because the SMEM struct
  * has implicit padding between `n` and `k` that upstream leaves
  * uninitialized — the padding bytes are not part of the semantic contract.
  * Neither driver tags its seeds, so both must leave info 0: SA resolution
- * trusts a tag in info (get_sa_entries_prefetch's trust_s1_tag). */
-static bool smem_fields_equal(const SMEM &a, const SMEM &b) {
+ * trusts a tag in info (get_sa_entries_prefetch's trust_s1_tag).
+ * `l` is skipped only where l_may_be_stale. */
+static bool smem_fields_equal(const SMEM &a, const SMEM &b, const BsdFirstWalkHint *l_hint) {
     return a.rid == b.rid &&
            a.m   == b.m   &&
            a.n   == b.n   &&
            a.k   == b.k   &&
-           a.l   == b.l   &&
+           (a.l == b.l || l_may_be_stale(a, b, l_hint)) &&
            a.s   == b.s   &&
            a.info == 0 && b.info == 0;
 }
 
-static int64_t smem_array_first_mismatch(const SMEM *a, const SMEM *b, int64_t n) {
+static int64_t smem_array_first_mismatch(const SMEM *a, const SMEM *b, int64_t n,
+                                         const BsdFirstWalkHint *l_hint) {
     for (int64_t i = 0; i < n; i++) {
-        if (!smem_fields_equal(a[i], b[i])) return i;
+        if (!smem_fields_equal(a[i], b[i], l_hint)) return i;
     }
     return -1;
 }
@@ -113,18 +134,32 @@ static int64_t reference_bwtseed(const FMI_search *fmi, const uint8_t *enc_qdb,
     return numTotalSeed;
 }
 
-/* Compare two drivers' outputs (count, then every SMEM's fields); prints and
- * returns false on the first difference. */
+/* Every field (rid, m, n, k, l, s, info) of two SMEM streams of length n, for
+ * the SMEM pass (Case 13h), which tags info; returns the first differing index
+ * or -1. */
+static int64_t smem_all_fields_first_mismatch(const SMEM *a, const SMEM *b, int64_t n) {
+    for (int64_t i = 0; i < n; i++) {
+        if (a[i].rid != b[i].rid || a[i].m != b[i].m || a[i].n != b[i].n || a[i].k != b[i].k ||
+            a[i].l != b[i].l || a[i].s != b[i].s || a[i].info != b[i].info)
+            return i;
+    }
+    return -1;
+}
+
+/* Compare two drivers' outputs (count, then every SMEM's fields, `l` skipped
+ * only where l_may_be_stale(a, b, l_hint)); prints and returns false on the
+ * first difference. */
 static bool check_same(const char *case_name,
                        const char *name_a, const SMEM *a_out, int64_t n_a,
-                       const char *name_b, const SMEM *b_out, int64_t n_b)
+                       const char *name_b, const SMEM *b_out, int64_t n_b,
+                       const BsdFirstWalkHint *l_hint)
 {
     if (n_a != n_b) {
         fprintf(stderr, "[FAIL] %s: numSeed mismatch: %s=%lld %s=%lld\n",
                 case_name, name_a, (long long)n_a, name_b, (long long)n_b);
         return false;
     }
-    const int64_t mism = smem_array_first_mismatch(a_out, b_out, n_a);
+    const int64_t mism = smem_array_first_mismatch(a_out, b_out, n_a, l_hint);
     if (mism >= 0) {
         const SMEM &a = a_out[mism];
         const SMEM &b = b_out[mism];
@@ -163,7 +198,8 @@ static bool run_case(FMI_search *fmi,
                      int32_t *query_cum_len_ar,
                      int32_t expect_min_seeds = 0,
                      bool expect_seed_per_read = false,
-                     bool expect_end_seed = false)
+                     bool expect_end_seed = false,
+                     const BsdFirstWalkHint *bsd_hint = nullptr)
 {
     /* Scalar emits at most one SMEM per outer-x ∈ [0, l_seq), so
      * numReads * max_readlength is a tight upper bound for both paths. */
@@ -185,19 +221,32 @@ static bool run_case(FMI_search *fmi,
             minSeedLen, scalar_out);
     int64_t n_lockstep = fmi->bwtSeedStrategyAllPosOneThread_lockstep(
             enc_qdb, mia_l, numReads, seq_, query_cum_len_ar,
-            minSeedLen, lockstep_out, max_readlength);
+            minSeedLen, lockstep_out, max_readlength, bsd_hint);
     const int64_t n_ref = reference_bwtseed(fmi, enc_qdb, mia_r, numReads, seq_,
                                             query_cum_len_ar, minSeedLen, ref_out);
 
     total_cases++;
+    /* A lockstep seed taken from a BsdFirstWalk record (always the read's
+     * first walk, m = 0) carries the SMEM walk's l, which is stale when that
+     * walk ended in its text compare (ls_s1_compare, a record with s = 1). No
+     * consumer of a seed reads l (SA resolution uses k and s, the sorts key on
+     * rid, m, n, the opt-in dedup compares rid, m, n, k, s), so
+     * (rid, m, n, k, s) is the output contract for that seed, and l is skipped
+     * there (l_may_be_stale). The lockstep driver uses the hint only when its
+     * max_intv and min_len match this call's; a rejected hint skips nothing.
+     * The scalar driver takes no hint, so reference-vs-scalar compares l in
+     * full. */
+    const BsdFirstWalkHint *l_hint =
+        bsd_hint != nullptr && bsd_hint->max_intv == max_intv && bsd_hint->min_len == minSeedLen
+            ? bsd_hint : nullptr;
     /* All three comparisons run, so a failure names the driver that left the
      * reference rather than only reporting that the two drivers differ. */
     const bool same_sl = check_same(case_name, "scalar", scalar_out, n_scalar,
-                                    "lockstep", lockstep_out, n_lockstep);
+                                    "lockstep", lockstep_out, n_lockstep, l_hint);
     const bool same_rs = check_same(case_name, "reference", ref_out, n_ref,
-                                    "scalar", scalar_out, n_scalar);
+                                    "scalar", scalar_out, n_scalar, /*l_hint=*/nullptr);
     const bool same_rl = check_same(case_name, "reference", ref_out, n_ref,
-                                    "lockstep", lockstep_out, n_lockstep);
+                                    "lockstep", lockstep_out, n_lockstep, l_hint);
     bool ok = same_sl && same_rs && same_rl;
 
     /* Emission-path cases must actually emit seeds. Byte-identity between two
@@ -263,40 +312,6 @@ static bool run_case(FMI_search *fmi,
     _mm_free(ref_out);
     free(mia_s); free(mia_l); free(mia_r);
     return ok;
-}
-
-/* Encode a vector of read strings (ACGT->0123, N->4) into the flat enc_qdb
- * + bseq1_t[] + query_cum_len_ar[] layout the scalar expects. */
-static void encode_reads(const char * const *reads, int32_t numReads,
-                         uint8_t **out_enc_qdb,
-                         bseq1_t **out_seq,
-                         int32_t **out_cum_len)
-{
-    int32_t total_len = 0;
-    for (int i = 0; i < numReads; i++) total_len += (int32_t)strlen(reads[i]);
-    uint8_t *enc = (uint8_t *)calloc(total_len > 0 ? total_len : 1, 1);
-    bseq1_t *seq = (bseq1_t *)calloc(numReads, sizeof(bseq1_t));
-    int32_t *cum = (int32_t *)calloc(numReads + 1, sizeof(int32_t));
-    int32_t off = 0;
-    for (int i = 0; i < numReads; i++) {
-        int32_t l = (int32_t)strlen(reads[i]);
-        cum[i] = off;
-        for (int j = 0; j < l; j++) {
-            char c = reads[i][j];
-            uint8_t e = 4;
-            if (c == 'A' || c == 'a') e = 0;
-            else if (c == 'C' || c == 'c') e = 1;
-            else if (c == 'G' || c == 'g') e = 2;
-            else if (c == 'T' || c == 't') e = 3;
-            enc[off + j] = e;
-        }
-        seq[i].l_seq = l;
-        off += l;
-    }
-    cum[numReads] = off;
-    *out_enc_qdb = enc;
-    *out_seq = seq;
-    *out_cum_len = cum;
 }
 
 int main(int argc, char *argv[]) {
@@ -820,6 +835,351 @@ int main(int argc, char *argv[]) {
                  enc_qdb, seq_, cum_len);
         free(enc_qdb); free(seq_); free(cum_len);
     }
+
+    /* Case 13h: the BsdFirstWalk hand-off. mem_collect_smem runs the SMEM pass
+     * (getSMEMsAllPosOneThread, min_intv 1) with a BsdFirstWalkHint, whose first
+     * forward walk on each read records where the bwtSeed pass's first walk on
+     * it stops; the lockstep bwtSeed pass then emits that walk's seed and starts
+     * the read there. The scalar bwtSeedStrategyAllPosOneThread walks every read
+     * from x = 0, so it is the oracle: the hinted lockstep stream must equal it
+     * field by field and in count, with l skipped only for a read's first seed
+     * taken from a record with s = 1 (l_may_be_stale).
+     *
+     * The records start as garbage with x > 0, so a record the SMEM pass did
+     * not write (a read starting with N) would be used if
+     * getSMEMsAllPosOneThread did not mark every read unrecorded first; every
+     * read whose base 0 is ACGT must then be recorded, and no other. The
+     * hinted SMEM pass's own output must equal an unhinted run's, every field
+     * (info and l included). Reads:
+     * phiX windows of 30-151 bases, forward and reverse-complemented (unique
+     * matches with many bases left, so the SMEM walk takes its text compare),
+     * windows with an N first, early, mid-read and last (the SMEM walk stops
+     * before the bwtSeed walk does), a substituted base, reads at and below the
+     * seed length, substitutions and N's around base min_len - 1, palindromes
+     * whose walk falls to s = 0 at base min_len - 1 without a unique match,
+     * windows whose first 11 bases occur twice in the text (a record with
+     * s = 2 at seed length 11, whose l is compared), and non-matching
+     * synthetic reads (s = 0). Run at max_intv 1 (no seed: the walk stops only
+     * at s = 0), 5 and 20, at seed lengths 20 and 11; then with a hint whose
+     * min_len or max_intv differs from the call's, which must be ignored (at
+     * max_intv 1 with a hint recorded at 20, using it would emit seeds the
+     * scalar does not); with the SMEM pass at min_intv 2, whose walk stops at
+     * s = 1 and so must record nothing (a record there would end the bwtSeed
+     * walk early); and with a hint max_intv of 0, which must record nothing
+     * (at max_intv 0 no walk emits, so only the record count can show it).
+     * Each matched run that emits seeds also runs a canary that shifts k in one
+     * recorded seed at a time and requires that read's output to change, so a
+     * bwtSeed pass that ignored any read's record with s > 0 would fail (a
+     * record with s = 0 emits no seed). Every run repeats on the index loaded
+     * without its pac, where no record comes from the text compare. */
+#if SMEM_LOCKSTEP_N > 1
+    {
+        /* The last base the windows below take: R.substr(2500 + 97 * 27, 60). */
+        const int32_t min_ref_len = 2500 + 97 * 27 + 60;
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        if (!ref || ref_len < min_ref_len || !fmi->s1_text_available()) {
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 13h: needs a reference FASTA of at least %d bases "
+                    "at '%s' and its pac loaded (s1_text_available), so the SMEM walk's "
+                    "text compare records walks too\n", (int)min_ref_len, argv[1]);
+        } else {
+            const std::string R(ref, (size_t)ref_len);
+            std::vector<std::string> rv;
+            for (int i = 0; i < 48; i++) {
+                const int len = 30 + (i * 13) % 122;                       /* 30..151 */
+                const int off = (int)(((int64_t)i * 389) % (ref_len - 160));
+                std::string w = R.substr((size_t)off, (size_t)len);
+                if (i & 1) w = revcomp(w);
+                switch (i % 8) {
+                case 2: w[0] = 'N'; break;                                 /* no first walk */
+                case 3: w[3] = 'N'; break;                                 /* SMEM walk stops at 3 */
+                case 4: w[w.size() / 2] = 'N'; break;
+                case 5: w[w.size() - 1] = 'N'; break;
+                case 6: w[22] = (w[22] == 'A') ? 'C' : 'A'; break;         /* a mismatch */
+                default: break;
+                }
+                rv.push_back(w);
+            }
+            for (int len : {11, 12, 19, 20, 21})                           /* around min_len */
+                rv.push_back(R.substr(2000, (size_t)len));
+            /* A substitution or an N at, just before and just after base
+             * min_len - 1 (10 and 19 for the seed lengths below): the SMEM
+             * walk's text compare ends on the step at which the bwtSeed walk
+             * could first stop, where an s = 0 step or an N ends that walk
+             * without a seed. */
+            for (int p : {9, 10, 11, 18, 19, 20})
+                for (int kind = 0; kind < 2; kind++) {
+                    std::string w = R.substr((size_t)(3000 + 61 * p + 7 * kind), 70);
+                    w[(size_t)p] = kind ? 'N' : (w[(size_t)p] == 'A' ? 'C' : 'A');
+                    rv.push_back(w);
+                }
+            /* A 10-base reverse palindrome occurs twice in the doubled text (on
+             * both strands), so its walk keeps s >= 2 through base 9 and takes no
+             * unique-match hand-off; a next base that neither occurrence
+             * continues with then gives s = 0 at base 10, min_len - 1 at seed
+             * length 11: at jump depth 12 inside the jump-table steps, else in a
+             * forward step. */
+            int32_t n_pal = 0;
+            for (int32_t a = 1; a + 70 < ref_len && n_pal < 2; a++) {
+                const std::string w10 = R.substr((size_t)a, 10);
+                if (w10.find_first_not_of("ACGT") != std::string::npos || w10 != revcomp(w10))
+                    continue;
+                const char f = R[(size_t)a + 10];
+                const char r = revcomp(R.substr((size_t)a - 1, 1))[0];
+                char c = 'A';
+                while (c == f || c == r) c = c == 'A' ? 'C' : c == 'C' ? 'G' : 'T';
+                rv.push_back(w10 + c + R.substr((size_t)a + 11, 49));
+                n_pal++;
+            }
+            if (n_pal < 2) {
+                total_cases++;
+                fprintf(stderr, "[FAIL] Case 13h: found %d of 2 10-base reverse palindromes "
+                        "in '%s'\n", (int)n_pal, argv[1]);
+            }
+            rv.push_back("ACGTACGTACGTACGTACGTACGTACGTACGTACGTACGT");       /* s = 0 early */
+            rv.push_back("TTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTTT");
+            /* A non-matching prefix (s = 0 within a few bases) ahead of a phiX
+             * window: the SMEM walk stops in the prefix, before the bwtSeed walk
+             * can, and the bwtSeed walk's next start (just past its minimum
+             * length, or past an N) decides which phiX seed comes next. */
+            for (int pl : {9, 13, 19, 20, 21, 27}) {
+                std::string w;
+                for (int j = 0; j < pl; j++) w += "CGCGATATCG"[j % 10];
+                if (pl == 13) w[11] = 'N';
+                rv.push_back(w + R.substr((size_t)(2500 + 97 * pl), 60));
+            }
+            rv.push_back(R.substr(0, 60));                                 /* the text's first bases */
+            rv.push_back(revcomp(R.substr(0, 60)) + "ACGTTGCA");           /* runs past the text end */
+            /* Windows whose first 11 bases occur at least twice in the doubled
+             * text (no 11-mer is its own reverse complement, so these are
+             * true repeats): at seed length 11 their first walk has s >= 2 on
+             * every step through base 10 and no unique-match hand-off, so the
+             * record (s >= 2) comes from a forward step and its l is exact. */
+            {
+                std::map<std::string, int32_t> kc;
+                const std::string Rrc = revcomp(R);
+                for (const std::string *t : {&R, &Rrc})
+                    for (size_t a = 0; a + 11 <= t->size(); a++) kc[t->substr(a, 11)]++;
+                int32_t n_rep = 0;
+                for (int32_t a = 0; a + 70 < ref_len && n_rep < 2; a++) {
+                    const std::string w11 = R.substr((size_t)a, 11);
+                    if (w11.find_first_not_of("ACGT") != std::string::npos || kc[w11] < 2)
+                        continue;
+                    rv.push_back(R.substr((size_t)a, 60));
+                    n_rep++;
+                    a += 60;                                               /* a different repeat */
+                }
+                if (n_rep < 2) {
+                    total_cases++;
+                    fprintf(stderr, "[FAIL] Case 13h: found %d of 2 repeated 11-base windows "
+                            "in '%s'\n", (int)n_rep, argv[1]);
+                }
+            }
+
+            const int32_t numReads = (int32_t)rv.size();
+            int32_t max_readlength = 0;
+            int32_t n_acgt_first = 0;   /* reads the SMEM pass's round 1 walks from base 0 */
+            std::vector<bool> acgt_first((size_t)numReads, false);
+            std::vector<const char *> reads((size_t)numReads);
+            for (int32_t i = 0; i < numReads; i++) {
+                const std::string &r = rv[(size_t)i];
+                reads[(size_t)i] = r.c_str();
+                if ((int32_t)r.size() > max_readlength) max_readlength = (int32_t)r.size();
+                if (!r.empty() && strchr("ACGT", r[0]) != NULL) {
+                    acgt_first[(size_t)i] = true;
+                    n_acgt_first++;
+                }
+            }
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads.data(), numReads, &enc_qdb, &seq_, &cum_len);
+
+            /* need_multi: some record must have s >= 2, so a record whose l is
+             * compared is exercised (the repeated 11-base windows above). */
+            struct HintRun {
+                int32_t min_seed, max_intv, rec_intv, rec_min_len_delta, smem_min_intv;
+                int32_t floor;
+                bool need_multi;
+            };
+            const HintRun runs[] = {
+                {20,  1,  1, 0, 1,  0, false},
+                {20,  5,  5, 0, 1, 20, false},
+                {20, 20, 20, 0, 1, 20, false},
+                {11,  5,  5, 0, 1, 20, true},
+                {11, 20, 20, 0, 1, 20, true},
+                {20, 20,  5, 0, 1, 20, false},   /* hint max_intv differs: not used */
+                {20,  1, 20, 0, 1,  0, false},   /* hint max_intv differs, would emit: not used */
+                {20, 20, 20, 1, 1, 20, false},   /* hint min_len differs: not used */
+                {20, 20, 20, 0, 2, 20, false},   /* SMEM pass at min_intv 2: no records */
+                {20,  0,  0, 0, 1,  0, false},   /* hint max_intv 0: no records */
+            };
+            const size_t smem_cap = (size_t)numReads * (size_t)max_readlength;
+            std::vector<BsdFirstWalk> rec((size_t)numReads);
+            std::vector<SMEM> smem_out(smem_cap), smem_plain(smem_cap);
+            std::vector<int32_t> mia((size_t)numReads), rid((size_t)numReads);
+            std::vector<int32_t> mia_p((size_t)numReads), rid_p((size_t)numReads);
+            /* The runs go first on the index with its pac loaded, where the
+             * SMEM walk's unique-match text compare writes records, then on the
+             * same index loaded without its pac (as the --meth seed index is),
+             * where every record comes from a forward step. Each index gets its
+             * own record-count and canary checks. */
+            FMI_search *fmi_np = new FMI_search(argv[1]);
+            fmi_np->load_index(/*load_pac=*/false);
+            if (fmi_np->s1_text_available()) {
+                total_cases++;
+                fprintf(stderr, "[FAIL] Case 13h: the index loaded without its pac still "
+                        "reports s1_text_available, so the textless runs would not be textless\n");
+            }
+            for (FMI_search *idx : {fmi, fmi_np})
+            for (const HintRun &hr : runs) {
+                const bool textless = idx == fmi_np;
+                for (int32_t i = 0; i < numReads; i++) {
+                    /* Garbage a correct producer overwrites or marks unrecorded. */
+                    rec[(size_t)i].k = 1; rec[(size_t)i].l = 2; rec[(size_t)i].s = 1;
+                    rec[(size_t)i].n = 5; rec[(size_t)i].x = 7;
+                    mia[(size_t)i] = mia_p[(size_t)i] = hr.smem_min_intv;
+                    rid[(size_t)i] = rid_p[(size_t)i] = i;
+                }
+                BsdFirstWalkHint hint;
+                hint.rec      = rec.data();
+                hint.max_intv = hr.rec_intv;
+                hint.min_len  = hr.min_seed + hr.rec_min_len_delta;
+                int64_t n_smem = 0, n_plain = 0;
+                /* As mem_collect_smem: the SMEM pass's minSeedLen is one less
+                 * than the bwtSeed pass's. The unhinted run gets its own
+                 * min_intv and rid arrays, which the driver compacts in place. */
+                idx->getSMEMsAllPosOneThread(enc_qdb, mia.data(), rid.data(), numReads, numReads,
+                                             seq_, cum_len, max_readlength, hr.min_seed - 1,
+                                             smem_out.data(), &n_smem, &hint);
+                idx->getSMEMsAllPosOneThread(enc_qdb, mia_p.data(), rid_p.data(), numReads, numReads,
+                                             seq_, cum_len, max_readlength, hr.min_seed - 1,
+                                             smem_plain.data(), &n_plain, nullptr);
+                const bool expect_any = hr.smem_min_intv == 1 && hr.rec_intv >= 1;
+                const int32_t expect_rec = expect_any ? n_acgt_first : 0;
+                /* wrong_owner counts reads whose recorded state is not the
+                 * expected one, so a record written for an N-first read cannot
+                 * stand in for a missing one on an ACGT-first read. */
+                int32_t recorded = 0, multi = 0, wrong_owner = 0, first_wrong = -1;
+                for (int32_t i = 0; i < numReads; i++) {
+                    const bool is_rec = rec[(size_t)i].x > 0;
+                    recorded += is_rec;
+                    multi += is_rec && rec[(size_t)i].s >= 2;
+                    if (is_rec != (expect_any && acgt_first[(size_t)i])) {
+                        wrong_owner++;
+                        if (first_wrong < 0) first_wrong = i;
+                    }
+                }
+                char name[224];
+                snprintf(name, sizeof name,
+                         "Case 13h%s: BsdFirstWalk hint, minSeed=%d max_intv=%d (hint max_intv=%d "
+                         "min_len=%d, SMEM min_intv=%d, %d/%d recorded, %d with s >= 2)",
+                         textless ? " (no pac)" : "",
+                         (int)hr.min_seed, (int)hr.max_intv, (int)hint.max_intv, (int)hint.min_len,
+                         (int)hr.smem_min_intv, (int)recorded, (int)numReads, (int)multi);
+
+                /* The hint must leave the SMEM pass's own output alone. */
+                total_cases++;
+                const int64_t smism = n_smem != n_plain ? 0
+                                    : smem_all_fields_first_mismatch(smem_out.data(),
+                                                                     smem_plain.data(), n_smem);
+                if (smism >= 0) {
+                    fprintf(stderr, "[FAIL] %s: hinted SMEM pass differs from the unhinted one "
+                            "(n_smem %lld vs %lld, first difference at %lld)\n", name,
+                            (long long)n_smem, (long long)n_plain, (long long)smism);
+                } else {
+                    fprintf(stderr, "[PASS] %s: SMEM pass unchanged by the hint (n_smem=%lld)\n",
+                            name, (long long)n_smem);
+                    passed_cases++;
+                }
+
+                /* Every read the SMEM pass walks from base 0 at min_intv 1 is
+                 * recorded (each exit of that walk writes its record), and no
+                 * other read is: checked read by read and in total. The parity
+                 * run below goes ahead either way. */
+                if (recorded != expect_rec || wrong_owner > 0 || (hr.need_multi && multi == 0)) {
+                    total_cases++;
+                    fprintf(stderr, "[FAIL] %s: expected %d recorded%s", name, (int)expect_rec,
+                            hr.need_multi && multi == 0 ? ", some with s >= 2" : "");
+                    if (wrong_owner > 0)
+                        fprintf(stderr, "; %d reads have the wrong recorded state (first: read %d, "
+                                "%s)", (int)wrong_owner, (int)first_wrong,
+                                rec[(size_t)first_wrong].x > 0 ? "recorded but should not be"
+                                                               : "not recorded but should be");
+                    fprintf(stderr, "\n");
+                }
+                run_case(idx, name, numReads, max_readlength, hr.min_seed, hr.max_intv,
+                         enc_qdb, seq_, cum_len, /*expect_min_seeds=*/hr.floor,
+                         /*expect_seed_per_read=*/false, /*expect_end_seed=*/false,
+                         &hint);
+
+                /* Canary: parity alone also passes if the bwtSeed pass ignores
+                 * the hint and walks every read from x = 0, or uses only some
+                 * reads' records. Where the hint matches the call and seeds are
+                 * expected, shift k of one recorded seed at a time: that read's
+                 * lockstep output must then leave the scalar's, which it can
+                 * only do by emitting that read's record. Records with s = 0
+                 * emit no seed, so this check does not cover them. */
+                if (hr.rec_intv != hr.max_intv || hr.rec_min_len_delta != 0 || hr.floor == 0 ||
+                    expect_rec == 0)
+                    continue;
+                total_cases++;
+                std::vector<SMEM> c_scalar(smem_cap), c_lockstep(smem_cap);
+                std::vector<int32_t> mia_s((size_t)numReads, hr.max_intv);
+                const int64_t c_ns = idx->bwtSeedStrategyAllPosOneThread(
+                        enc_qdb, mia_s.data(), numReads, seq_, cum_len, hr.min_seed,
+                        c_scalar.data());
+                /* The scalar seeds of read r, which the driver emits in read order. */
+                auto read_seeds = [](const std::vector<SMEM> &a, int64_t n, int32_t r) {
+                    std::vector<SMEM> o;
+                    for (int64_t i = 0; i < n; i++)
+                        if ((int32_t)a[(size_t)i].rid == r) o.push_back(a[(size_t)i]);
+                    return o;
+                };
+                int32_t tampered = 0, unchanged = 0, first_unchanged = -1;
+                for (int32_t r = 0; r < numReads; r++) {
+                    if (!(rec[(size_t)r].x > 0 && rec[(size_t)r].s > 0)) continue;
+                    std::vector<BsdFirstWalk> bad(rec);
+                    bad[(size_t)r].k += 1;
+                    tampered++;
+                    BsdFirstWalkHint bad_hint = hint;
+                    bad_hint.rec = bad.data();
+                    std::vector<int32_t> mia_l((size_t)numReads, hr.max_intv);
+                    const int64_t c_nl = idx->bwtSeedStrategyAllPosOneThread_lockstep(
+                            enc_qdb, mia_l.data(), numReads, seq_, cum_len, hr.min_seed,
+                            c_lockstep.data(), max_readlength, &bad_hint);
+                    const std::vector<SMEM> s_r = read_seeds(c_scalar, c_ns, r);
+                    const std::vector<SMEM> l_r = read_seeds(c_lockstep, c_nl, r);
+                    bool differs = s_r.size() != l_r.size();
+                    for (size_t i = 0; !differs && i < s_r.size(); i++)
+                        differs = !smem_fields_equal(s_r[i], l_r[i], &bad_hint);
+                    if (!differs) {
+                        unchanged++;
+                        if (first_unchanged < 0) first_unchanged = r;
+                    }
+                }
+                if (tampered == 0 || unchanged > 0) {
+                    if (tampered == 0)
+                        fprintf(stderr, "[FAIL] %s: canary: no recorded seed to tamper with\n", name);
+                    else
+                        fprintf(stderr, "[FAIL] %s: canary: %d of %d tampered records left their "
+                                "read's output unchanged (first: read %d), so the hint is not "
+                                "used for every recorded read\n",
+                                name, (int)unchanged, (int)tampered, (int)first_unchanged);
+                } else {
+                    fprintf(stderr, "[PASS] %s: canary (each of %d tampered records changes "
+                            "its read's output)\n", name, (int)tampered);
+                    passed_cases++;
+                }
+            }
+            delete fmi_np;
+            free(enc_qdb); free(seq_); free(cum_len);
+        }
+        free(ref);
+    }
+#else
+    fprintf(stderr, "[SKIP] Case 13h: needs the lockstep SMEM driver (SMEM_LOCKSTEP_N > 1)\n");
+#endif
+
 
     fprintf(stderr, "%d / %d cases passed\n", passed_cases, total_cases);
     delete fmi;
