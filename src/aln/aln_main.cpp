@@ -8,6 +8,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/stat.h>
 
 #include "../FMI_search.h"
 #include "../bwa.h"
@@ -152,41 +154,89 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	const gap_opt_t *g = &o->gap;
 	fprintf(fp, "\n");
 	fprintf(fp, "Usage:   bwa-mem3 aln [options] <prefix> <in.fq> [<in2.fq>]\n\n");
-	fprintf(fp, "Options: -n NUM    max #diff (int) or missing prob under %.2f err rate (float) [%.2f]\n", BWA_AVG_ERR, g->fnr);
-	fprintf(fp, "         -o INT    maximum number or fraction of gap opens [%d]\n", g->max_gapo);
-	fprintf(fp, "         -e INT    maximum number of gap extensions, -1 for disabling long gaps [-1]\n");
-	fprintf(fp, "         -i INT    do not put an indel within INT bp towards the ends [%d]\n", g->indel_end_skip);
-	fprintf(fp, "         -d INT    maximum occurrences for extending a long deletion [%d]\n", g->max_del_occ);
-	fprintf(fp, "         -l INT    seed length [%d]\n", g->seed_len);
-	fprintf(fp, "         -k INT    maximum differences in the seed [%d]\n", g->max_seed_diff);
-	fprintf(fp, "         -m INT    maximum entries in the queue [%d]\n", g->max_entries);
-	fprintf(fp, "         -t INT    number of threads [%d]\n", g->n_threads);
-	fprintf(fp, "         -M INT    mismatch penalty [%d]\n", g->s_mm);
-	fprintf(fp, "         -O INT    gap open penalty [%d]\n", g->s_gapo);
-	fprintf(fp, "         -E INT    gap extension penalty [%d]\n", g->s_gape);
-	fprintf(fp, "         -R INT    stop searching when there are >INT equally best hits [%d]\n", g->max_top2);
-	fprintf(fp, "         -q INT    quality threshold for read trimming down to %dbp [%d]\n", BWA_MIN_RDLEN, g->trim_qual);
-	fprintf(fp, "         -f FILE   file to write output to instead of stdout\n");
-	fprintf(fp, "         -r STR    read group header line such as '@RG\\tID:foo\\tSM:bar' [null]\n");
-	fprintf(fp, "         -B INT    length of barcode\n");
-	fprintf(fp, "         -L        log-scaled gap penalty for long deletions\n");
-	fprintf(fp, "         -N        non-iterative mode: search for all n-difference hits (slooow)\n");
-	fprintf(fp, "         -I        the input is in the Illumina 1.3+ FASTQ-like format\n");
-	fprintf(fp, "         -Y        filter Casava-filtered sequences\n");
-	fprintf(fp, "         --max-xa-hits INT   maximum number of alternative hits in the XA tag [%d]\n", o->max_xa_hits);
-	fprintf(fp, "\nPaired-end options (two FASTQ files; as bwa sampe):\n");
-	fprintf(fp, "         -a INT    maximum insert size [%d]\n", o->pe.max_isize);
-	fprintf(fp, "         --max-occ INT   maximum occurrences for one end [%d]\n", o->pe.max_occ);
-	fprintf(fp, "         --max-xa-hits-discordant INT   maximum hits to output for discordant pairs [%d]\n", o->pe.N_multi);
-	fprintf(fp, "         -c FLOAT  prior of chimeric rate (lower bound) [%.1le]\n", o->pe.ap_prior);
-	fprintf(fp, "         -s        disable Smith-Waterman for the unmapped mate\n");
-	fprintf(fp, "         -A        disable insert size estimate (force -s)\n");
-	fprintf(fp, "         -P        accepted and ignored (the index is always in memory)\n");
-	fprintf(fp, "\nOutput:\n");
-	fprintf(fp, "         --bam     write BAM instead of SAM\n");
-	fprintf(fp, "         --bam-level INT     BAM compression level 0-9 [1]\n");
+	fprintf(fp, "Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one\n");
+	fprintf(fp, "step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe\n");
+	fprintf(fp, "(two files), with no .sai files. Output matches bwa 0.7.19. <prefix> is an index made\n");
+	fprintf(fp, "by `bwa-mem3 index` (also one made with --meth, or one staged by `bwa-mem3 shm`).\n");
+	fprintf(fp, "Each option shows its default and the stock command it comes from.\n\n");
+	fprintf(fp, "Search options (from bwa aln):\n");
+	fprintf(fp, "  -n NUM    max #diff (int) or missing prob under %.2f err rate (float) [%.2f]\n", BWA_AVG_ERR, g->fnr);
+	fprintf(fp, "  -o INT    maximum number or fraction of gap opens [%d]\n", g->max_gapo);
+	fprintf(fp, "  -e INT    maximum number of gap extensions, -1 for disabling long gaps [-1]\n");
+	fprintf(fp, "  -i INT    do not put an indel within INT bp towards the ends [%d]\n", g->indel_end_skip);
+	fprintf(fp, "  -d INT    maximum occurrences for extending a long deletion [%d]\n", g->max_del_occ);
+	fprintf(fp, "  -l INT    seed length [%d]\n", g->seed_len);
+	fprintf(fp, "  -k INT    maximum differences in the seed [%d]\n", g->max_seed_diff);
+	fprintf(fp, "  -m INT    maximum entries in the queue [%d]\n", g->max_entries);
+	fprintf(fp, "  -t INT    number of threads [%d]\n", g->n_threads);
+	fprintf(fp, "  -M INT    mismatch penalty [%d]\n", g->s_mm);
+	fprintf(fp, "  -O INT    gap open penalty [%d]\n", g->s_gapo);
+	fprintf(fp, "  -E INT    gap extension penalty [%d]\n", g->s_gape);
+	fprintf(fp, "  -R INT    stop searching when there are >INT equally best hits [%d]\n", g->max_top2);
+	fprintf(fp, "  -q INT    quality threshold for read trimming down to %dbp [%d]\n", BWA_MIN_RDLEN, g->trim_qual);
+	fprintf(fp, "  -B INT    length of barcode [0]\n");
+	fprintf(fp, "  -L        log-scaled gap penalty for long deletions\n");
+	fprintf(fp, "  -N        non-iterative mode: search for all n-difference hits (slooow)\n");
+	fprintf(fp, "  -I        the input is in the Illumina 1.3+ FASTQ-like format\n");
+	fprintf(fp, "  -Y        filter Casava-filtered sequences\n");
+	fprintf(fp, "\nSingle-end output options (from bwa samse):\n");
+	fprintf(fp, "  --max-xa-hits INT   maximum number of alternative hits in the XA tag [%d] (samse -n)\n", o->max_xa_hits);
+	fprintf(fp, "  -r STR    read group header line such as '@RG\\tID:foo\\tSM:bar' [null] (samse and sampe -r)\n");
+	fprintf(fp, "  -f FILE   file to write output to instead of stdout (samse and sampe -f)\n");
+	fprintf(fp, "\nPaired-end options (two input files; from bwa sampe):\n");
+	fprintf(fp, "  -a INT    maximum insert size [%d]\n", o->pe.max_isize);
+	fprintf(fp, "  --max-occ INT   maximum occurrences for one end [%d] (sampe -o)\n", o->pe.max_occ);
+	fprintf(fp, "  --max-xa-hits-discordant INT   maximum hits to output for discordant pairs [%d] (sampe -N)\n", o->pe.N_multi);
+	fprintf(fp, "  -c FLOAT  prior of chimeric rate (lower bound) [%.1le]\n", o->pe.ap_prior);
+	fprintf(fp, "  -s        disable Smith-Waterman for the unmapped mate\n");
+	fprintf(fp, "  -A        disable insert size estimate (force -s)\n");
+	fprintf(fp, "  -P        accepted and ignored (sampe -P loads the index into memory; always so here)\n");
+	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
+	fprintf(fp, "  --bam     write BAM instead of SAM\n");
+	fprintf(fp, "  --bam-level INT     BAM compression level 0-9 [1]\n");
+	fprintf(fp, "  --help    show this message\n");
+	fprintf(fp, "\nThe long names stand in for stock samse/sampe -n and -o and sampe -N, whose letters\n");
+	fprintf(fp, "are taken by the search options above.\n");
 	fprintf(fp, "\n");
 	return fp == stdout ? 0 : 1;
+}
+
+/* An input that stock would fail to open must fail before any output is created or the index
+ * is loaded. "-" is standard input. */
+static int aln_input_ok(const char *fn)
+{
+	struct stat st;
+	memset(&st, 0, sizeof st);
+	if (strcmp(fn, "-") == 0) return 1;
+	if (stat(fn, &st) != 0) {
+		fprintf(stderr, "[E::aln] cannot open the input '%s': %s\n", fn, strerror(errno));
+		return 0;
+	}
+	if (S_ISDIR(st.st_mode)) {
+		fprintf(stderr, "[E::aln] cannot open the input '%s': is a directory\n", fn);
+		return 0;
+	}
+	if (access(fn, R_OK) != 0) {
+		fprintf(stderr, "[E::aln] cannot open the input '%s': %s\n", fn, strerror(errno));
+		return 0;
+	}
+	return 1;
+}
+
+/* Checks that -f can be written without leaving a file behind (a file created for the check
+ * is removed again). Standard output needs no check. */
+static int aln_output_ok(const char *path)
+{
+	if (!path || strcmp(path, "-") == 0) return 1;
+	int existed = access(path, F_OK) == 0;
+	FILE *fp = fopen(path, "a");
+	if (!fp) {
+		fprintf(stderr, "[E::aln] cannot open '%s' for writing: %s\n", path, strerror(errno));
+		return 0;
+	}
+	fclose(fp);
+	if (!existed) unlink(path);
+	return 1;
 }
 
 enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP };
@@ -279,6 +329,8 @@ int main_aln(int argc, char *argv[])
 			return 1;
 		}
 	}
+	if (!aln_input_ok(fn_fq) || (paired && !aln_input_ok(argv[optind + 2])) || !aln_output_ok(out_path))
+		return 1;
 	FMI_search *fmi = new FMI_search(prefix);
 	fmi->load_index(/*load_pac=*/true, opt->n_threads);
 	const bntseq_t *bns = fmi->idx->bns;

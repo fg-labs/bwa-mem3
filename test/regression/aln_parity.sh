@@ -10,13 +10,18 @@
 # bwa-mem3, and a second copy of both indices with an .alt file naming one contig. Reads
 # come from test/regression/aln_reads.awk (exact copies, substitutions, 1-bp indels,
 # ambiguous bases, reads from the repeat and the reverse-complement copy, both strands),
-# plus hand-made reads: lower case, IUPAC codes R and Y, a '-', an all-N read.
+# plus hand-made reads: lower case, IUPAC codes R and Y, a '-' (in the `ambig` set), an all-N
+# read (in the long-read set).
 #
 # (A read with a '-' makes stock write a NUL byte into the SAM -- its base table maps '-' to
 # 5 and "ACGTN"[5] is the string's terminator -- so every grep and diff here is binary-safe.)
 #
 # The paired-end section does the same with `aln` on each file and `sampe` (pairs come from
 # test/regression/aln_pairs.awk), against `bwa-mem3 aln <opts> [sampe options] ref r1.fq r2.fq`.
+#
+# After the single-end cases come an option sweep (each option alone), the input forms (gz,
+# FASTA, stdin), the output forms (-f, --bam), the index forms (an index built with --meth,
+# shared memory on Linux) and the fail-before-side-effects checks.
 #
 # Each case runs with -t 1 and -t 4. Stock is `aln <opts> ref r.fq > r.sai` then
 # `samse [-n K] [-r RG] ref r.sai r.fq`; ours is `aln <opts> [--max-xa-hits K] [-r RG] ref r.fq`.
@@ -187,8 +192,33 @@ run_case readgroup 208 800 36 0 "" '@RG\tID:x\tSM:y'
 need_tag readgroup 'RG:Z:x'
 run_case nonstop 209 600 36 0 "" "" -N
 
+# ---- option sweep: each stock option alone, against stock aln + samse ----------------------
+run_case sw_n3 221 1000 36 0 "" "" -n 3
+run_case sw_n001 222 1000 36 0 "" "" -n 0.01
+run_case sw_o0 223 1000 100 0 "" "" -o 0
+run_case sw_e2 224 1000 100 0 "" "" -e 2
+run_case sw_i10 225 1000 100 0 "" "" -i 10
+run_case sw_d5 226 1000 100 0 "" "" -d 5
+run_case sw_l20k1 227 1000 36 0 "" "" -l 20 -k 1
+run_case sw_q20 228 600 100 1 "" "" -q 20
+need_tag sw_q20 'XC:i:'
+run_case sw_B4 229 800 36 0 "" "" -B 4
+need_tag sw_B4 'BC:Z:'
+run_case sw_L 230 1000 100 0 "" "" -L -n 0.04 -o 2
+run_case sw_R10 231 1000 36 0 "" "" -R 10
+run_case sw_MOE 232 1000 100 0 "" "" -M 2 -O 9 -E 3 -n 0.04 -o 2
+# mixed 20 and 100 bp reads under a small queue: -m 50 makes the search give up on some reads
+run_case sw_m50 233 1500 20,100 0 "" "" -m 50
+# Illumina 1.3+ qualities (phred+64): the generator's I and # become h and D
+gen_reads 234 800 36 1 | mawk_or_awk 'NR % 4 == 0 { gsub(/I/, "h"); gsub(/#/, "D") } 1' > "$work/sw_I.fq"
+compare sw_I plain "$work/sw_I.fq" "" "" -I -q 20
+# Casava comments: every other read carries " 1:Y:0:ACGT" (filtered) or " 1:N:0:ACGT"
+gen_reads 235 800 36 0 | mawk_or_awk 'NR % 4 == 1 { $0 = $0 " 1:" ((NR % 8 == 1) ? "Y" : "N") ":0:ACGT" } 1' > "$work/sw_Y.fq"
+compare sw_Y plain "$work/sw_Y.fq" "" "" -Y
+need_tag sw_Y 'XT:A:'
+
 # One 1,000 bp read and twenty 250 bp reads in a single batch (the batch-wide gap-open cap
-# follows the longest read), plus an all-N read and a read with a '-'.
+# follows the longest read), plus an all-N read (the '-' reads are in the `ambig` set).
 {
     gen_reads 301 1 1000 0
     gen_reads 302 20 250 0
@@ -214,6 +244,153 @@ if [ "$mapped_total" -le 0 ] || [ "$xa_total" -le 0 ] || [ "$ah_total" -le 0 ]; 
     exit 1
 fi
 echo "PASS: aln_parity SE ($((n_cfg / 2)) cases x 2 thread counts)"
+
+# ---- input, output and index forms; fail before side effects -----------------------------
+ref_stock="$work/plain/stock/ref.fa"
+ref_mem3="$work/plain/mem3/ref.fa"
+form_fq="$work/default36.fq"
+
+# stock_se <out.sam> <fq> [aln options]: stock aln + samse, single thread.
+stock_se() {
+    local out="$1" fq="$2"
+    shift 2
+    "$BWA_ORACLE" aln "$@" "$ref_stock" "$fq" > "$work/form.sai" 2> /dev/null
+    "$BWA_ORACLE" samse "$ref_stock" "$work/form.sai" "$fq" > "$out" 2> /dev/null
+}
+# same_records <tag> <a> <b>: equal apart from the @PG line.
+same_records() {
+    grep -av '^@PG' "$2" > "$work/same.a" || true
+    grep -av '^@PG' "$3" > "$work/same.b" || true
+    if ! diff -a "$work/same.a" "$work/same.b" > "$work/same.diff"; then
+        echo "FAIL: aln_parity: $1 differs; first lines of diff (< expected, > ours):" >&2
+        head -n 10 "$work/same.diff" >&2
+        exit 1
+    fi
+    echo "aln_parity: ok $1"
+}
+
+# gz input and FASTA input, against stock on the same files
+gzip -c "$form_fq" > "$work/default36.fq.gz"
+compare gz plain "$work/default36.fq.gz" "" ""
+mawk_or_awk 'NR % 4 == 1 { print ">" substr($0, 2) } NR % 4 == 2 { print }' "$form_fq" > "$work/default36.fa"
+compare fasta plain "$work/default36.fa" "" ""
+need_tag fasta 'XT:A:'
+
+# stdin: `aln ref -` equals stock on the file
+stock_se "$work/form.stock.sam" "$form_fq" -t 1
+"$BWA_MEM3" aln -t 1 "$ref_mem3" - < "$form_fq" > "$work/form.stdin.sam" 2> /dev/null
+same_records "stdin '-'" "$work/form.stock.sam" "$work/form.stdin.sam"
+
+# an -r whose text has "@HD<tab>" in the middle of a line must not suppress the default @HD
+compare rg_mid_hd plain "$form_fq" "" '@RG\tID:x\tDS:@HD\tz'
+if ! grep -aq '^@HD' "$work/mem3.nopg"; then
+    echo "FAIL: aln_parity: a mid-line @HD<tab> in -r suppressed the default @HD" >&2
+    exit 1
+fi
+
+# -f equals standard output (and nothing goes to standard output with -f)
+"$BWA_MEM3" aln -t 1 "$ref_mem3" "$form_fq" > "$work/form.stdout.sam" 2> /dev/null
+"$BWA_MEM3" aln -t 1 -f "$work/form.f.sam" "$ref_mem3" "$form_fq" > "$work/form.f.stdout" 2> /dev/null
+same_records "-f equals stdout" "$work/form.stdout.sam" "$work/form.f.sam"
+if [ -s "$work/form.f.stdout" ]; then
+    echo "FAIL: aln_parity: -f still wrote to standard output" >&2
+    exit 1
+fi
+
+# --bam through samtools view equals the SAM records (SE here, PE below)
+have_samtools=1
+command -v samtools > /dev/null 2>&1 || have_samtools=0
+bam_vs_sam() { # tag sam bam
+    if [ "$have_samtools" = 0 ]; then
+        echo "SKIP: $1: samtools not found"
+        return
+    fi
+    grep -av '^@' "$2" > "$work/bam.expect" || true
+    samtools view "$3" > "$work/bam.got"
+    if ! cmp -s "$work/bam.expect" "$work/bam.got"; then
+        diff -a "$work/bam.expect" "$work/bam.got" | head -n 10 >&2 || true
+        echo "FAIL: aln_parity: $1: --bam records differ from the SAM records" >&2
+        exit 1
+    fi
+    if [ ! -s "$work/bam.got" ]; then
+        echo "FAIL: aln_parity: $1: no records to compare" >&2
+        exit 1
+    fi
+    echo "aln_parity: ok $1"
+}
+"$BWA_MEM3" aln -t 1 --bam "$ref_mem3" "$form_fq" > "$work/form.bam" 2> /dev/null
+bam_vs_sam "--bam SE" "$work/form.stdout.sam" "$work/form.bam"
+
+# index forms: an index built with --meth (the normal index plus a .meth seed index) gives the
+# same output as the plain index of the same FASTA
+mkdir -p "$work/methidx"
+cp "$work/ref.fa" "$work/methidx/ref.fa"
+"$BWA_MEM3" index --meth "$work/methidx/ref.fa" > "$work/methidx.index.log" 2>&1
+"$BWA_MEM3" aln -t 1 "$work/methidx/ref.fa" "$form_fq" > "$work/form.meth.sam" 2> /dev/null
+same_records "--meth index equals plain index" "$work/form.stdout.sam" "$work/form.meth.sam"
+
+# shared memory (Linux only: macOS POSIX shm cannot hold an index and limits names to ~31 chars)
+if [ "$(uname -s)" = Linux ]; then
+    shm_cleanup() {
+        "$BWA_MEM3" shm -d > /dev/null 2>&1 || true
+        cleanup
+    }
+    trap shm_cleanup EXIT
+    "$BWA_MEM3" shm -d > /dev/null 2>&1 || true
+    "$BWA_MEM3" shm "$ref_mem3" > "$work/shm.stage.log" 2>&1
+    "$BWA_MEM3" aln -t 1 "$ref_mem3" "$form_fq" > "$work/form.shm.sam" 2> "$work/form.shm.err"
+    if ! grep -q 'attached from shm' "$work/form.shm.err"; then
+        echo "FAIL: aln_parity: aln did not attach to the staged shared-memory index" >&2
+        exit 1
+    fi
+    same_records "shm index equals disk index" "$work/form.stdout.sam" "$work/form.shm.sam"
+    "$BWA_MEM3" shm -d > /dev/null 2>&1
+else
+    echo "SKIP: aln_parity: shared-memory index (macOS POSIX shm cannot hold an index)"
+fi
+
+# fail before side effects: a missing input or an unwritable -f stops before the index loads and
+# before any output exists
+rm -f "$work/none.sam"
+rc=0
+"$BWA_MEM3" aln "$ref_mem3" "$work/missing.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q "missing.fq" "$work/none.err" || grep -q 'Index file found' "$work/none.err"; then
+    echo "FAIL: aln_parity: a missing FASTQ must exit 1 with no output and no index load (exit $rc)" >&2
+    exit 1
+fi
+rc=0
+"$BWA_MEM3" aln -f "$work/none.sam" "$ref_mem3" "$work/missing.fq" > /dev/null 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || [ -e "$work/none.sam" ]; then
+    echo "FAIL: aln_parity: a missing FASTQ with -f must exit 1 and create no file (exit $rc)" >&2
+    exit 1
+fi
+rc=0
+"$BWA_MEM3" aln "$ref_mem3" "$form_fq" "$work/missing.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || grep -q 'Index file found' "$work/none.err"; then
+    echo "FAIL: aln_parity: a missing second FASTQ must exit 1 with no output and no index load (exit $rc)" >&2
+    exit 1
+fi
+rc=0
+"$BWA_MEM3" aln -f "$work/no_such_dir/out.sam" "$ref_mem3" "$form_fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q "cannot open '.*out.sam' for writing" "$work/none.err" \
+    || grep -q 'Index file found' "$work/none.err"; then
+    echo "FAIL: aln_parity: an unwritable -f must exit 1 before the index loads (exit $rc)" >&2
+    exit 1
+fi
+rc=0
+"$BWA_MEM3" aln "$ref_mem3" "$work/missing.fq" > /dev/null 2> "$work/none.err" || rc=$?
+if grep -q 'is a directory' "$work/none.err"; then
+    echo "FAIL: aln_parity: a missing input was reported as a directory" >&2
+    exit 1
+fi
+mkdir -p "$work/adir"
+rc=0
+"$BWA_MEM3" aln "$ref_mem3" "$work/adir" > /dev/null 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || ! grep -q 'is a directory' "$work/none.err" || grep -q 'Index file found' "$work/none.err"; then
+    echo "FAIL: aln_parity: a directory input must exit 1 and be reported as a directory (exit $rc)" >&2
+    exit 1
+fi
+echo "aln_parity: ok fail-before-side-effects (missing FASTQ, missing R2, unwritable -f)"
 
 # ---- paired end: aln R1, aln R2, sampe ------------------------------------------------
 # Reads come from aln_pairs.awk (fragments of 250-349 bp, so most pairs are concordant; a few
@@ -339,6 +516,29 @@ sed 's/^@r/@x/' "$work/pe_extra_tail.1.fq" >> "$work/pe_extra.1.fq"
 compare_pe pe_extra "$work/pe_extra.1.fq" "$work/pe_extra.2.fq" "" ""
 if ! grep -q 'read counts differ' "$work/mem3.aln.log"; then
     echo "FAIL: aln_parity: PE pe_extra printed no warning about the unequal read counts" >&2
+    exit 1
+fi
+
+# --bam through samtools view equals the SAM records, paired end
+"$BWA_MEM3" aln -t 1 "$ref_mem3" "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/form.pe.sam" 2> /dev/null
+"$BWA_MEM3" aln -t 1 --bam "$ref_mem3" "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/form.pe.bam" 2> /dev/null
+bam_vs_sam "--bam PE" "$work/form.pe.sam" "$work/form.pe.bam"
+
+# Empty FASTQs: a header and nothing else, exit 0, same as stock sampe
+: > "$work/pe_empty.1.fq"
+: > "$work/pe_empty.2.fq"
+compare_pe pe_empty "$work/pe_empty.1.fq" "$work/pe_empty.2.fq" "" ""
+if grep -aqv '^@' "$work/mem3.nopg"; then
+    echo "FAIL: aln_parity: the empty paired FASTQs produced records" >&2
+    exit 1
+fi
+
+# R2 ends before R1. pe_extra above has R2 end three reads early inside a batch; here R2 is
+# empty, so the first R2 batch is already missing while R1 still has reads. Both are compared
+# with stock sampe, and the warning is required on stderr.
+compare_pe pe_r2_empty "$work/pe36.1.fq" "$work/pe_empty.2.fq" "" ""
+if ! grep -q 'read 2 file ended before read 1' "$work/mem3.aln.log"; then
+    echo "FAIL: aln_parity: R2 ending before R1 printed no warning" >&2
     exit 1
 fi
 
