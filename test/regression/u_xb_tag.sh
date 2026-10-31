@@ -14,6 +14,9 @@
 #   -u --bam           the same records as -u's SAM text
 #   --meth -u          XB:Z, six fields per hit, no XA
 #   --meth -u --bam    the same records as --meth -u's SAM text
+#   --compat=bwa-mem -u  XB:Z as -u writes it (bwa 0.7.18+ has -u), no HN:i
+#   --compat=bwa-mem2 -u refused, naming -u (bwa-mem2 has no -u); with
+#                      --compat-allow-divergent it warns and writes -u's XB:Z
 #
 # The fixture is a reference whose second contig is a 2%-diverged copy of a
 # window of the first, so reads from that window carry an alternative hit.
@@ -87,6 +90,22 @@ run u.sam -u ref.fa reads.fq
 run u.bam -u --bam=0 ref.fa reads.fq
 run meth_u.sam --meth -u ref.fa reads_ct.fq
 run meth_u.bam --meth -u --bam=0 ref.fa reads_ct.fq
+run compat_mem_u.sam --compat=bwa-mem -u ref.fa reads.fq
+run compat_mem2_u_div.sam --compat=bwa-mem2 -u --compat-allow-divergent ref.fa reads.fq
+grep -q 'proceeding with -u under --compat=bwa-mem2' compat_mem2_u_div.sam.err || {
+    echo "FAIL: --compat=bwa-mem2 -u --compat-allow-divergent did not warn about -u" >&2
+    exit 1
+}
+if "$BWA_MEM3" mem -t 1 --compat=bwa-mem2 -u ref.fa reads.fq > compat_mem2_u.sam 2> compat_mem2_u.err; then
+    echo "FAIL: --compat=bwa-mem2 -u was accepted; bwa-mem2 has no -u" >&2
+    exit 1
+fi
+grep -q 'mutually exclusive: -u' compat_mem2_u.err || {
+    echo "FAIL: --compat=bwa-mem2 -u was refused without naming -u" >&2
+    cat compat_mem2_u.err >&2
+    exit 1
+}
+echo "ok: --compat=bwa-mem2 -u: refused, naming -u"
 samtools view u.bam > u.bam.sam
 samtools view meth_u.bam > meth_u.bam.sam
 
@@ -152,6 +171,22 @@ if len(fails) == before:
 meth = records("meth_u.sam")
 check_lists("--meth -u", meth, "XB", "XA", 6, 100)
 
+# --compat only drops HN:i here (no MQ:i on single-end reads, no sidecar), so
+# its records are -u's minus HN, with the same XB lists.
+def no_hn(recs):
+    return [(k, {t: v for t, v in tags.items() if t != "HN"}) for k, tags in recs]
+
+
+for name, path in (("--compat=bwa-mem -u", "compat_mem_u.sam"),
+                   ("--compat=bwa-mem2 -u --compat-allow-divergent", "compat_mem2_u_div.sam")):
+    c = records(path)
+    if any("HN" in tags for _, tags in c):
+        fails.append("%s: HN:i present" % name)
+    elif c != no_hn(u):
+        fails.append("%s: records differ from -u's minus HN:i" % name)
+    else:
+        print("ok: %s: %d records equal -u's minus HN:i (XB:Z kept)" % (name, len(c)))
+
 for name, a, b in (("-u --bam", u, records("u.bam.sam")),
                    ("--meth -u --bam", meth, records("meth_u.bam.sam"))):
     if a != b:
@@ -164,4 +199,4 @@ for f in fails:
 sys.exit(1 if fails else 0)
 PY
 
-echo "PASS: u_xb_tag (XB:Z under -u from the SAM, --bam and --meth writers; XA:Z otherwise)"
+echo "PASS: u_xb_tag (XB:Z under -u from the SAM, --bam and --meth writers and --compat=bwa-mem; XA:Z otherwise; -u refused under --compat=bwa-mem2)"

@@ -239,14 +239,20 @@ Notes and caveats:
   `--min-ext-len`, `--extend-tie-frac`, `--rescue-kmer`, `--supp-rep-hard-cap`,
   `--seed-order`, `--chunk-cap`, and
   [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment).
-  The error names the offending flags (`--compat and these bwa-mem3-only levers
-  are mutually exclusive: ...`). Pass **`--compat-allow-divergent`** to downgrade
+  The error names the offending flags (`--compat and these levers are mutually
+  exclusive: ...`). Pass **`--compat-allow-divergent`** to downgrade
   the refusal to a warning and proceed: you keep the target's *output
   conventions* (tag/header shaping) while a bwa-mem3 lever is engaged, but the
   output is then **not** byte-identical to the target (the `@PG` `CL:` record
   already documents which flags ran). Shared knobs the upstream also has (scoring
   `-A`/`-B`, `-k`/`-w`/`-r`, `-T`, …) are *not* guarded — changing one just moves
   both sides to the same operating point, so byte-identity still holds.
+- **`-u` is rejected under `--compat=bwa-mem2` (same override), accepted under `--compat=bwa-mem`.**
+  `-u` changes no alignment, but its `XB:Z` tag exists only in bwa 0.7.18 and
+  later: bwa-mem2 v2.2.1 forked at 0.7.17 and has no `-u`, so no bwa-mem2 output
+  can match. bwa's `-u` writes the same `XB:Z` as bwa-mem3, so
+  `--compat=bwa-mem -u` is accepted. `--compat-allow-divergent` downgrades the
+  bwa-mem2 refusal to a warning and writes `XB:Z`.
 - **`--compat` keeps the default contained-seed extension skip.** The compat
   policy is proof-based: a target keeps every optimization that is byte-identical
   by construction or proven inside a code-enforced envelope, and drops only
