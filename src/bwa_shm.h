@@ -47,6 +47,12 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * changes. */
 #define BWA_SHM_VERSION        2u
 #define BWA_SHM_CTL_NAME       "/bwactl"
+/* Named POSIX semaphore guarding read-modify-write sequences against
+ * /bwactl. Created on first use and unlinked by bwa_shm_destroy alongside
+ * the registry, so `bwa-mem3 shm -d` is the recovery path if a stager
+ * crashes while holding the lock (POSIX semaphores have no SEM_UNDO).
+ * Public so a test that cleans up its own staged index takes the same lock. */
+#define BWA_SHM_LOCK_NAME      "/bwactl_lock"
 #define BWA_SHM_IDX_PREFIX     "/bwaidx-"
 #define BWA_SHM_CTL_SIZE       0x10000   /* 64 KiB. Must equal bwa.h::BWA_CTL_SIZE
                                           * (the legacy v1 stub); a static_assert in

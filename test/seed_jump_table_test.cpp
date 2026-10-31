@@ -43,8 +43,11 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <semaphore.h>
 
 static int32_t total_cases = 0;
 static int32_t passed_cases = 0;
@@ -61,6 +64,108 @@ static void set_jump_env(const char *v)
 {
     if (v == NULL) unsetenv("BWA3_BWTSEED_JUMP");
     else setenv("BWA3_BWTSEED_JUMP", v, 1);
+}
+
+/* The basenames in the shm registry (BWA_SHM_CTL_NAME), parsed as
+ * bwa_shm.cpp's ctl_walk does: uint16 n_entries, uint16 next_write, then
+ * packed {int64 l_mem, NUL-terminated basename} entries. Returns false when
+ * there is no registry. A registry smaller than BWA_SHM_CTL_SIZE (left by a
+ * stage that failed before sizing it) reads as empty, as ctl_walk reads it. */
+static bool read_shm_registry(std::vector<std::string> *names)
+{
+    names->clear();
+    const int fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
+    if (fd < 0) return false;
+    struct stat st;
+    if (fstat(fd, &st) < 0 || (size_t)st.st_size < BWA_SHM_CTL_SIZE) {
+        close(fd);
+        return true;
+    }
+    void *m = mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return true;
+    const uint8_t *base = (const uint8_t *)m;
+    const uint8_t *end = base + BWA_SHM_CTL_SIZE;
+    uint16_t n_entries = 0;
+    memcpy(&n_entries, base, sizeof(uint16_t));
+    const uint8_t *p = base + 4;   /* past n_entries and next_write */
+    for (uint16_t i = 0; i < n_entries; i++) {
+        if (p + sizeof(int64_t) >= end) break;
+        const char *name = (const char *)(p + sizeof(int64_t));
+        const size_t name_max = (size_t)(end - (const uint8_t *)name);
+        const size_t len = strnlen(name, name_max);
+        if (len == name_max) break;
+        names->push_back(std::string(name, len));
+        p = (const uint8_t *)name + len + 1;
+    }
+    munmap(m, BWA_SHM_CTL_SIZE);
+    return true;
+}
+
+/* Undo this test's staging of `prefix` without touching any other index.
+ * Unlike bwa_shm_destroy, which unlinks every staged index, the registry and
+ * its lock, this holds the lock the stager takes (BWA_SHM_LOCK_NAME), so no
+ * stage can run while it reads the registry, and drops anything only when the
+ * registry holds nothing but the fixture: exactly one entry with the
+ * fixture's basename, or no entry at all (an aborted stage's leftover, which
+ * stages nothing). Then it unlinks the fixture's segment, the registry and
+ * the lock, in bwa_shm_destroy's order. If another index is registered it
+ * drops nothing and warns. With no registry (a stage that failed before
+ * creating one) it does nothing. */
+static void drop_fixture_shm(const char *prefix)
+{
+    const char *slash = strrchr(prefix, '/');
+    const char *fixture = slash != NULL ? slash + 1 : prefix;
+    std::vector<std::string> names;
+
+    sem_t *lock = sem_open(BWA_SHM_LOCK_NAME, 0);
+    if (lock == SEM_FAILED) {
+        /* Every stager creates the lock before the registry. */
+        if (read_shm_registry(&names))
+            fprintf(stderr, "[WARN] shm registry %s exists but its lock %s does not; "
+                    "left it staged (`bwa-mem3 shm -d` removes it)\n",
+                    BWA_SHM_CTL_NAME, BWA_SHM_LOCK_NAME);
+        return;
+    }
+    /* Up to 10 s, polled, rather than sem_wait: a stager that crashed holding
+     * the lock leaves it taken until `bwa-mem3 shm -d`, and the test must not
+     * hang on it. */
+    bool locked = false;
+    int err = 0;
+    for (int tries = 0; tries < 1000 && !locked; tries++) {
+        locked = sem_trywait(lock) == 0;
+        err = locked ? 0 : errno;
+        if (!locked && err != EAGAIN && err != EINTR) break;
+        if (!locked) usleep(10000);
+    }
+    if (!locked) {
+        fprintf(stderr, "[WARN] could not take the shm lock %s (%s); left %s staged "
+                "(`bwa-mem3 shm -d` removes it)\n", BWA_SHM_LOCK_NAME,
+                err == EAGAIN || err == EINTR ? "still held after 10 s" : strerror(err), fixture);
+        sem_close(lock);
+        return;
+    }
+    if (!read_shm_registry(&names)) {
+        sem_post(lock);
+        sem_close(lock);
+        return;
+    }
+    if (names.empty() || (names.size() == 1 && names[0] == fixture)) {
+        const std::string idx = std::string(BWA_SHM_IDX_PREFIX) + fixture;
+        shm_unlink(idx.c_str());   /* absent after an aborted stage */
+        shm_unlink(BWA_SHM_CTL_NAME);
+        sem_post(lock);
+        sem_close(lock);
+        sem_unlink(BWA_SHM_LOCK_NAME);
+        return;
+    }
+    sem_post(lock);
+    sem_close(lock);
+    std::string staged;
+    for (const std::string &n : names) staged += (staged.empty() ? "" : ", ") + n;
+    fprintf(stderr, "[WARN] another index was staged in shm while this test ran; dropped "
+            "nothing, so %s may still be staged (registry: %s). `bwa-mem3 shm -d` removes "
+            "every staged index\n", fixture, staged.c_str());
 }
 
 struct Walk { int64_t k, l, s; };
@@ -439,10 +544,16 @@ int main(int argc, char *argv[])
 
     /* load_index's shm-attach path, which builds the table itself after the
      * attach and carries the opt-out. Staging needs POSIX shm for the phiX
-     * segment. bwa_shm_destroy drops every index staged on the host, so the
-     * case runs only when no registry exists yet: then every segment it finds
-     * at cleanup is the fixture's own, including after a failed stage. A host
-     * with an index already staged skips the case rather than drop it. */
+     * segment. The case runs only when no registry exists yet, so a host with
+     * an index already staged skips it rather than share the registry. Another
+     * process may still stage between that check and the cleanup, so the
+     * cleanup (drop_fixture_shm, after a stage or a failed stage) takes the
+     * stager's lock and drops the fixture's segment, the registry and the lock
+     * only when the registry names the fixture alone; otherwise it drops
+     * nothing and warns. The one case it cannot tell apart is another process
+     * staging an index with the fixture's basename (phix.fa) in that window:
+     * the stage below then finds it already staged, and the cleanup drops it
+     * as the fixture's. */
     int ctl_fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
     if (ctl_fd >= 0) {
         close(ctl_fd);
@@ -464,9 +575,9 @@ int main(int argc, char *argv[])
                    && h->fmi->seed_jump_depth == 0,
                "fmi_seed_open (shm attach): no table");
         fmi_seed_close(h);
-        bwa_shm_destroy();
+        drop_fixture_shm(prefix);
     } else {
-        bwa_shm_destroy();   /* the registry, if the failed stage made one, is the fixture's */
+        drop_fixture_shm(prefix);   /* a no-op if the failed stage made no registry */
         fprintf(stderr, "[SKIP] load_index's shm-attach path: could not stage %s on this host\n", prefix);
     }
 

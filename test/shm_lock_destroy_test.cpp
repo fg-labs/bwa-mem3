@@ -20,8 +20,6 @@
 #include <cstdlib>
 #include <cstring>
 
-#define BWA_SHM_LOCK_NAME "/bwactl_lock"
-
 #define CHECK(cond) do { \
     if (!(cond)) { \
         std::fprintf(stderr, "CHECK failed at %s:%d: %s (errno=%d %s)\n", \
