@@ -16,6 +16,7 @@
 
 #include "FMI_search.h"
 #include "bwa.h"          // bwa_idx_build(): the real `index -u` build entry point
+#include "framework/temp_dir.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -47,15 +48,11 @@ static int64_t off_sent_for(int64_t ref_seq_len, int64_t compx)
 }
 
 // Create a file of exactly `size` bytes with its trailing 8 bytes set to
-// `tail`. Returns an open fd (caller closes) via the path in `path_out`.
-static int make_file(const char *tmpl_in, int64_t size, int64_t tail,
-                     std::string &path_out)
+// `tail`. Returns an open, already-unlinked fd (caller closes).
+static int make_file(const char *prefix, int64_t size, int64_t tail)
 {
-    char tmpl[64];
-    std::snprintf(tmpl, sizeof(tmpl), "%s", tmpl_in);
-    int fd = mkstemp(tmpl);
+    int fd = bwa_tests::anon_temp_fd(prefix);
     CHECK(fd >= 0);
-    path_out = tmpl;
     CHECK(ftruncate(fd, (off_t)size) == 0);
     if (size >= (int64_t)sizeof(int64_t)) {
         ssize_t w = pwrite(fd, &tail, sizeof(int64_t),
@@ -81,10 +78,9 @@ int main()
     {
         const int chosen_c = 4;  // non-default rate (compile-time default is 3); in [0, 6]
 
-        char dir[] = "/tmp/detect_sa_compx_real_XXXXXX";
-        CHECK(mkdtemp(dir) != nullptr);
-        const std::string fa_path = std::string(dir) + "/ref.fa";
-        const std::string prefix  = std::string(dir) + "/idx";
+        bwa_tests::TempDir dir("detect_sa_compx_real");
+        const std::string fa_path = dir.file("ref.fa");
+        const std::string prefix  = dir.file("idx");
 
         // A deterministic ~1 kbp reference (fixed-seed LCG over ACGT) so the
         // build is reproducible and large enough for a well-formed layout.
@@ -122,14 +118,6 @@ int main()
         int64_t got = detect_sa_compx(fd, (int64_t)st.st_size, file_ref_seq_len, SA_COMPX);
         close(fd);
         CHECK(got == chosen_c);
-
-        // Remove every sidecar the writer may have produced, then the tempdir.
-        for (const char *ext : {".pac", ".ann", ".amb", ".bwt.2bit.64", ".0123", ".sa"}) {
-            const std::string p = prefix + ext;
-            unlink(p.c_str());
-        }
-        unlink(fa_path.c_str());
-        rmdir(dir);
     }
 
     // Case 2a: a legacy-shaped index (no tag: size == off_sent_for(default) +
@@ -137,23 +125,19 @@ int main()
     // to the default rate.
     {
         const int64_t size = off_sent_for(ref_seq_len, SA_COMPX) + (int64_t)sizeof(int64_t);
-        std::string path;
         // Trailing value is a sentinel index, not a valid rate/layout match.
-        int fd = make_file("/tmp/detect_sa_compx_legacy_XXXXXX", size, 123456, path);
+        int fd = make_file("detect_sa_compx_legacy", size, 123456);
         int64_t got = detect_sa_compx(fd, size, ref_seq_len, SA_COMPX);
         close(fd);
-        unlink(path.c_str());
         CHECK(got == SA_COMPX);
     }
 
     // Case 2b: a file too small to carry a tail (< 2*int64) falls back to the
     // default without attempting a read.
     {
-        std::string path;
-        int fd = make_file("/tmp/detect_sa_compx_tiny_XXXXXX", 8, 0, path);
+        int fd = make_file("detect_sa_compx_tiny", 8, 0);
         int64_t got = detect_sa_compx(fd, 8, ref_seq_len, SA_COMPX);
         close(fd);
-        unlink(path.c_str());
         CHECK(got == SA_COMPX);
     }
 

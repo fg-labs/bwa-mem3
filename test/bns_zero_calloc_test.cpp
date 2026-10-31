@@ -30,7 +30,6 @@
 // The .ann/.amb/.pac fixture is generated at run time -- no test data files.
 
 #include <errno.h>
-#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +37,7 @@
 #include <unistd.h>
 
 #include "bntseq.h"
+#include "framework/temp_dir.h"
 
 /* Armed only around the call under test, so fixture setup and every startup
  * allocation take the ordinary path. Not thread-safe and does not need to be:
@@ -89,27 +89,9 @@ void write_file(const char *path, const char *contents)
 
 int main(void)
 {
-    /* Honour TMPDIR, as test/unit/test_fmi_pread_from_stream.cpp does: CI
-     * runners and sandboxes often point it somewhere with room, and /tmp is
-     * RAM-backed tmpfs on several modern distributions. */
-    const char *tmpdir = getenv("TMPDIR");
-    if (tmpdir == NULL || tmpdir[0] == '\0') tmpdir = "/tmp";
-    char dir[PATH_MAX];
-    const int dir_len = snprintf(dir, sizeof(dir), "%s%sbns_zero_calloc_XXXXXX",
-                                 tmpdir, tmpdir[strlen(tmpdir) - 1] == '/' ? "" : "/");
-    if (dir_len < 0 || (size_t)dir_len >= sizeof(dir)) {
-        fprintf(stderr, "FAIL: TMPDIR path too long: %s\n", tmpdir);
-        return 1;
-    }
-    if (mkdtemp(dir) == NULL) {
-        fprintf(stderr, "FAIL: mkdtemp(%s): %s\n", dir, strerror(errno));
-        return 1;
-    }
-
-    char ann[PATH_MAX], amb[PATH_MAX], pac[PATH_MAX];
-    snprintf(ann, sizeof(ann), "%s/ref.ann", dir);
-    snprintf(amb, sizeof(amb), "%s/ref.amb", dir);
-    snprintf(pac, sizeof(pac), "%s/ref.pac", dir);
+    bwa_tests::TempDir dir("bns_zero_calloc");
+    const std::string ann_s = dir.file("ref.ann"), amb_s = dir.file("ref.amb"), pac_s = dir.file("ref.pac");
+    const char *ann = ann_s.c_str(), *amb = amb_s.c_str(), *pac = pac_s.c_str();
 
     /* .ann header is "l_pac n_seqs seed"; .amb is "l_pac n_seqs n_holes". The
      * two must agree on l_pac and n_seqs or bns_restore_core rejects the pair.
@@ -153,11 +135,6 @@ int main(void)
         }
         bns_destroy(bns);   /* must also survive anns == NULL */
     }
-
-    unlink(ann);
-    unlink(amb);
-    unlink(pac);
-    rmdir(dir);
 
     if (rc == 0)
         printf("PASS: a zero-sequence index loads when calloc(0, ...) is NULL\n");

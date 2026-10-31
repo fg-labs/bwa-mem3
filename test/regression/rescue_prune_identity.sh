@@ -127,6 +127,9 @@ esac
     exit 1
 }
 
+# shellcheck source=test/framework/simd_tiers.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/simd_tiers.sh"
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 cd "$WORK"
@@ -281,7 +284,9 @@ case "$floor" in
     *) has_simd=1 ;;
 esac
 # The tier kswv runs at on this host (the dispatcher's choice, which the x86 cost gate keys on).
-host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BIN" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
+# Left empty if it cannot be read; only the checks below that need it fail on that.
+host_tier=""
+if simd_detect_tier "$BIN" 2> simd_tier.err; then host_tier="$SIMD_HOST_TIER"; fi
 
 # The reference: every shortcut and alternative kernel form off. Defined once so
 # the unforced and forced-tier references cannot drift apart. Some kernel forms
@@ -338,7 +343,7 @@ kp1=$(printf '%s\n' "$kbstats" | tr ' ' '\n' | sed -n 's/^pass1_banded=//p')
 k25_note="; -k 25: jobs=${kjobs:-0} pass1_banded=${kp1:-0}"
 if [ "$has_simd" = 1 ]; then
     [ "${kp1:-0}" -gt 0 ] || fail "no banded pass-1 job at -k 25 (SIMD floor '$floor'): $kstats $kbstats"
-    [ -n "$host_tier" ] || fail "could not detect the kswv SIMD tier from BWAMEM3_DEBUG_SIMD output"
+    [ -n "$host_tier" ] || fail "could not detect the kswv SIMD tier: $(cat simd_tier.err)"
     case "$host_tier" in
         avx512bw) [ "${kjobs:-0}" -eq 0 ] || fail "x86 pruned at -k 25 at the AVX-512BW tier, past its cost gate: $kstats" ;;
         *) [ "${kjobs:-0}" -gt 0 ] || fail "pruning filtered no rescue job at -k 25 (kswv tier '$host_tier'): $kstats" ;;
@@ -561,10 +566,11 @@ sc_note="$sc_note$lever_note"
 # tier names (as in all_tiers_parity.sh): BWAMEM3_FORCE_TIER only downgrades.
 tier_note=""
 if [ -n "${RESCUE_TIERS:-}" ]; then
-    [ -n "$host_tier" ] || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
-    rank() { # tier -> rank among the x86 tiers, or -1
+    [ -n "$host_tier" ] || fail "could not detect the host SIMD tier: $(cat simd_tier.err)"
+    rank() { # tier -> rank among the x86 SIMD tiers (simd_tier_rank without neon and scalar), or -1
         case "$1" in
-            sse41) echo 0 ;; sse42) echo 1 ;; avx) echo 2 ;; avx2) echo 3 ;; avx512bw) echo 4 ;; *) echo -1 ;;
+            neon | scalar) echo -1 ;;
+            *) simd_tier_rank "$1" ;;
         esac
     }
     host_rank="$(rank "$host_tier")"

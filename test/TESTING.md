@@ -4,9 +4,9 @@ bwa-mem3 tests are organized into three categories — **unit**, **integration**
 
 | Category       | Binary / runner                    | Fixtures                                     | CI scope                             |
 |----------------|------------------------------------|----------------------------------------------|--------------------------------------|
-| **unit**       | `test/bwa_mem3_tests_unit`         | None. All inputs synthetic.                  | Every matrix row                     |
+| **unit**       | `test/bwa_mem3_tests_unit`         | None. All inputs synthetic (scratch files a case generates itself are allowed). | Every matrix row                     |
 | **integration**| `test/bwa_mem3_tests_integration`  | Small committed FASTAs / FMI under `test/fixtures/` | SSE4.1, AVX2, ARM64 Linux, macOS ARM |
-| **regression** | `test/regression/*.sh`             | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row) and the source-only lints (own jobs) |
+| **regression** | `test/regression/*.sh`             | Committed phiX in `test/fixtures/`; chr22 downloaded by CI, reads simulated by holodeck; bwa for the parity diffs | Canonical AVX2 row, except `chr22_parity.sh` (every row), `mem_cli_basics.sh` (also Linux ARM64) and the source-only lints (own jobs) |
 
 Design rationale: see the internal test framework design spec (not committed).
 
@@ -34,6 +34,17 @@ make -C test -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)   # builds framework + 
 ./test/bwa_mem3_tests_unit --help         # full doctest flag list
 bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit   # run as one concurrent shard per CPU (what CI does)
 ```
+
+### Run unit tests under AddressSanitizer
+
+`ASAN=1` builds `libbwa.a` with AddressSanitizer, and the doctest binaries are then compiled and linked with `-fsanitize=address` too:
+
+```bash
+make ASAN=1 test-binaries                 # add the row's arch= (e.g. arch=avx2) to match a CI build
+ASAN_OPTIONS=allocator_may_return_null=1:detect_leaks=0 ./test/bwa_mem3_tests_unit
+```
+
+A run of the whole unit binary needs both options for now, because of two existing tests: `test_bam_rec_scratch.cpp` requests a `SIZE_MAX` allocation on purpose to check the overflow guard, which AddressSanitizer aborts on unless `allocator_may_return_null=1`; and LeakSanitizer reports 25 KB that `read_memo_prepass` (`src/read_memo.cpp`) allocates for the `read_memo_state` buffers in `test_read_memo.cpp`, whose cases do not release them with `read_memo_state_free`. A run filtered to other files (`-sf`, `-ts`) needs neither option.
 
 ### Run integration tests
 
@@ -80,9 +91,9 @@ The chr22 scripts are the expensive end: they want a chr22 reference indexed for
 
 Unit tests are doctest `TEST_CASE`s in `test/unit/test_*.cpp`. They must:
 
-1. Use only synthetic inputs (no files on disk).
+1. Use only synthetic inputs: read no committed fixture (a test that does is an integration test). A case may write scratch files it generates itself, inside a `bwa_tests::TempDir` (`temp_dir.h`), so long as they are removed when it ends: a corrupt index header, captured stderr, or a real index of a few kilobases of synthetic contigs built and loaded with `bwa_tests::TempIndex` (`temp_index.h`).
 2. Complete in <100 ms each.
-3. Be tagged with `doctest::test_suite("unit/<module>")` (or wrapped in a `TEST_SUITE("unit/<module>") { ... }` block), where `<module>` names the code under test. Reuse an existing module where one fits; add a new one when none does. The modules in use in `test/unit/` are: `alnreg_sort_dedup`, `bam_aux_append_propagation`, `bam_pa_tag_parity`, `bandedswa`, `bandedswa-asym`, `bandedswa-zdrop`, `bns_get_seq`, `bns_pos2rid`, `bns_restore`, `bwa_thp`, `chain`, `chain_cap`, `chain_weight_clamp`, `cigar`, `extend_csub`, `extension`, `flt_chained_seeds`, `gen_cigar`, `huge_pages`, `index_load_threads`, `ksort_permutation`, `ksw_global2`, `kswv`, `kt_for`, `madvise`, `meth-asym-directed`, `meth_nm_md`, `meth_scoring`, `min_ext_len`, `neon_movemask`, `neon_soa_pack`, `pac_slurp_and_close`, `pair`, `pair64_sort`, `proc_freq`, `pwrite_request_size`, `read_memo`, `rescue_band`, `sam_encode`, `smem`, `smem_dedup`, `ungapped_fastpath`, `util` (regenerate from the repo root with `grep -rhoE '(test_suite|TEST_SUITE)\("unit/[^"]+"' test/unit/*.cpp | sed -E 's/.*unit\///; s/"$//' | LC_ALL=C sort -u`). Some older files in `test/unit/` carry no suite tag; doctest runs them in its default suite, so `--test-suite` filters skip them and they are selected by name (`-tc`) instead. Tag new tests. doctest's `test_suite` decorator is overriding (not additive) — chaining `* doctest::test_suite("a") * doctest::test_suite("b")` keeps only the last one — so encode the category and module as a single slash-separated string.
+3. Be tagged with `doctest::test_suite("unit/<module>")` (or wrapped in a `TEST_SUITE("unit/<module>") { ... }` block), where `<module>` names the code under test. Reuse an existing module where one fits; add a new one when none does. The modules in use in `test/unit/` are: `alnreg_sort_dedup`, `bam_aux_append_propagation`, `bam_pa_tag_parity`, `bandedswa`, `bandedswa-asym`, `bandedswa-signed8`, `bandedswa-zdrop`, `bandedswa_cpg`, `bns_get_seq`, `bns_pos2rid`, `bns_restore`, `bwa_thp`, `chain`, `chain_cap`, `chain_flat_key`, `chain_flt`, `chain_weight_clamp`, `cigar`, `extend_csub`, `extension`, `flt_chained_seeds`, `gen_cigar`, `huge_pages`, `index_load_threads`, `ksort_permutation`, `ksw_global2`, `kswv`, `kswv_cpg`, `kt_for`, `madvise`, `meth-asym-directed`, `meth_model`, `meth_nm_md`, `meth_scoring`, `min_ext_len`, `neon_movemask`, `neon_soa_pack`, `pac_slurp_and_close`, `pair`, `pair64_sort`, `proc_freq`, `pwrite_request_size`, `read_memo`, `rescue_band`, `rescue_rb_index`, `sam_encode`, `seq_reverse`, `smem`, `smem_dedup`, `test_framework`, `ungapped_fastpath`, `util`, `xa_regen` (regenerate from the repo root with `grep -rhoE '(test_suite|TEST_SUITE)\("unit/[^"]+"' test/unit/*.cpp | sed -E 's/.*unit\///; s/"$//' | LC_ALL=C sort -u`). Some older files in `test/unit/` carry no suite tag; doctest runs them in its default suite, so `--test-suite` filters skip them and they are selected by name (`-tc`) instead. Tag new tests. doctest's `test_suite` decorator is overriding (not additive) — chaining `* doctest::test_suite("a") * doctest::test_suite("b")` keeps only the last one — so encode the category and module as a single slash-separated string.
 4. Stand alone. CI runs the binary as concurrent shards (`test/run_unit_shards.sh`), each a separate process running a contiguous slice of the cases, so a case cannot rely on an earlier case having run in the same process, and any scratch file must get a unique name (`mkstemp(3)`, or the pid in the name) rather than a fixed path.
 
 Template:
@@ -122,6 +133,9 @@ Framework helpers available in `test/framework/`:
 - `bwa_tests::run_scalar_ksw` (ksw_runner.h)
 - `bwa_tests::run_kswv_batch` (kswv_runner.h)
 - `bwa_tests::kswr_{score,coords,score2}_eq` (kswr_cmp.h)
+- `bwa_tests::TempDir` (temp_dir.h)
+- `bwa_tests::StderrCapture`, `QuietStderr` (stderr_capture.h)
+- `bwa_tests::TempIndex`, `Contig`, `nt4`, `revcomp` (temp_index.h)
 
 The file is picked up automatically by the wildcard rule in `test/Makefile` — no Makefile edits needed when adding a new `test_*.cpp`.
 
@@ -141,6 +155,10 @@ Write a standalone bash script in `test/regression/<name>.sh`:
 - Emit `PASS:` / `FAIL:` lines; exit nonzero on failure.
 - Add a row to `test/regression/README.md`.
 - Wire it into `.github/workflows/ci.yml`: a script that needs only the built `bwa-mem3` and fixtures goes in the `canonical-regressions` job; one that needs the canonical row's built tree goes in `build-and-test` with the `if: matrix.canonical == true` gate.
+
+A script that runs the binary under each SIMD tier with a batched kswv kernel that the host has sources `test/framework/simd_tiers.sh`, whose `simd_sweep_tiers` lists them (avx2 and, where the runner has it, avx512bw on x86; neon on arm64), as `all_tiers_parity.sh`, `band_cert_identity.sh`, `dash_read_as_n.sh` and `meth_context_identity.sh` do; a script that needs only the tier the binary dispatches to calls its `simd_detect_tier` (`rescue_prune_identity.sh`). `all_tiers_parity.sh` and `band_cert_identity.sh` run only in `canonical-regressions`, so on x86 alone; `mem_cli_basics.sh` also runs on the Linux ARM64 row, gated on `matrix.os == 'ubuntu-24.04-arm'` in `build-and-test`, to cover neon.
+
+Scripts that check `bwa-mem3 mem` output field by field can source the shared helpers in `test/framework/mem_cli.sh` (see `test/regression/mem_cli_basics.sh` for a complete example): `mem_cli_setup_synth` copies and indexes the committed synthetic reference `test/fixtures/mem_synth.fa` (the header of its generator, `test/tools/mem_synth_ref.c`, lists the contigs and planted repeats, so expected coordinates can be worked out by hand), `mem_cli_mem` runs `mem` under one tier (`BWAMEM3_FORCE_TIER`) for each of `mem_cli_tiers`, and `mem_cli_primary`, `mem_cli_col` and `mem_cli_tag` read records back, and `mem_cli_verdict` decides the verdict the script prints (a run with no check, or a failed one, is a failure). `test/regression/mem_cli_selftest.sh` checks the helpers themselves. The helpers are written for bash 3.2 and POSIX awk so the scripts also run on a macOS checkout, but CI runs them only on Linux (`canonical-regressions` and the ARM64 row), so that portability is not checked there.
 
 Choose regression over integration when:
 - The test shells out to bwa-mem3 (or any other binary) as a process.
@@ -191,3 +209,10 @@ For a test using `std::mt19937(seed)`, reproduce locally by editing the seed and
 | `framework/ext_result.h`         | `ExtResult`: one extension's six result fields |
 | `framework/junit_reporter.h`     | CI matrix-row banner                           |
 | `framework/test_main.cpp`        | Shared `main()` (single doctest IMPL TU)       |
+| `framework/temp_dir.h`           | `TempDir`: scratch directory, removed on destruction; `anon_temp_fd`: an already-unlinked scratch file |
+| `framework/temp_path.h`          | C99 scratch files and directories under `$TMPDIR` (`bwa_test_mkstemp`, `bwa_test_mkdtemp`, `bwa_test_temp_template`), for the standalone C tests and any test that wants a plain path in a buffer; `temp_dir.h` builds on it |
+| `framework/stderr_capture.h`     | `StderrCapture`, `QuietStderr`: scoped stderr redirection |
+| `framework/temp_index.h`         | `TempIndex`: a real index of test contigs, built and loaded in a `TempDir`; `nt4`, `revcomp` |
+| `framework/simd_tiers.sh`        | `simd_sweep_tiers`: the SIMD tiers a regression script sweeps; `simd_detect_tier`, `simd_tier_rank`: the tier a binary dispatches to, and tier order |
+| `framework/dna.sh`               | `dna_revcomp`: the reverse complement regression scripts build reads with |
+| `framework/mem_cli.sh`           | Source-only shell helpers for the `mem` CLI regression scripts |

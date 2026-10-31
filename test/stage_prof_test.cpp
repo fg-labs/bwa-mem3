@@ -1,6 +1,7 @@
 /* Unit test for the pure helpers of stage_prof (stats + clocks + NaN init).
  * Builds standalone: no htslib, no index, no pipeline. */
 #include "../src/stage_prof.h"
+#include "framework/temp_dir.h"
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
@@ -129,6 +130,7 @@ static void force_one_drop(void) {
 }
 
 int main(void) {
+    bwa_tests::TempDir dir("stage_prof_test");
     /* sp_chunk_init sets the maybe-N/A doubles to NaN */
     prof_chunk_t c;
     sp_chunk_init(&c);
@@ -164,8 +166,8 @@ int main(void) {
 
     /* Aggregate N/A semantics: when every chunk reports read_bytes_in/bgzf_blocks
      * as N/A (-1), the aggregate row must stay blank, not collapse to a false 0. */
-    const char *tsv = "/tmp/stage_prof_test.tsv";
-    remove(tsv);
+    const std::string tsv_path = dir.file("stage_prof_test.tsv");
+    const char *tsv = tsv_path.c_str();
     sp_init(tsv, "t", "v", "x86_64", 4, "sam", -1, "in");
     assert(sp_enabled() == 1);
     prof_chunk_t a; sp_chunk_init(&a); a.chunk = 0; a.n_reads = 10; a.n_bp = 1500;
@@ -178,7 +180,6 @@ int main(void) {
     assert(agg_field(tsv, 10, field, sizeof field) && strcmp(field, "30") == 0);  /* n_reads sums */
     assert(agg_field(tsv, 16, field, sizeof field) && field[0] == '\0');           /* read_bytes_in blank */
     assert(agg_field(tsv, 17, field, sizeof field) && field[0] == '\0');           /* bgzf_blocks blank */
-    remove(tsv);
 
     /* sp_init must reset run-scoped accumulators so a second run started in
      * the same process (a host embedding bwa-mem3 as a library, or -- as here
@@ -187,14 +188,15 @@ int main(void) {
      * the chunk count and idle time directly; the OOM-drop counter resets via
      * the same statement (see sp_init) and is forced nonzero deterministically
      * in the dedicated OOM-drop block below. */
-    const char *tsv2 = "/tmp/stage_prof_test2.tsv";
-    const char *err1 = "/tmp/stage_prof_test1.err";
-    const char *err2 = "/tmp/stage_prof_test2.err";
-    char errbuf[1024];
-    remove(tsv);
-    remove(tsv2);
-    remove(err1);
-    remove(err2);
+    const std::string tsv2_path = dir.file("stage_prof_test2.tsv");
+    const char *tsv2 = tsv2_path.c_str();
+    const std::string err1_path = dir.file("stage_prof_test1.err");
+    const char *err1 = err1_path.c_str();
+    const std::string err2_path = dir.file("stage_prof_test2.err");
+    const char *err2 = err2_path.c_str();
+    /* Room for the TMPDIR-derived paths the diagnostics name, plus the text. */
+    char errbuf[8192];
+    remove(tsv);   /* run 1 reuses the first block's report path */
 
     /* Run 1: accrue idle time AND force a dropped chunk, so this run ends with
      * g_n_dropped > 0 and its sp_finish flags the report incomplete. Capturing
@@ -204,7 +206,7 @@ int main(void) {
     sp_add_idle(0, 5.0);   /* run 1 accrues idle time */
     finish_capturing(err1, 1.0, 0.0, 0.0);
     slurp(err1, errbuf, sizeof errbuf);
-    assert(strstr(errbuf, "incomplete") != NULL);   /* run 1 dropped a chunk */
+    assert(strstr(errbuf, "report is incomplete") != NULL);   /* run 1 dropped a chunk */
 
     /* Run 2: a fresh run in the same process adds one small chunk and neither
      * drops nor accrues idle. sp_init must reset the run-scoped accumulators
@@ -218,27 +220,23 @@ int main(void) {
 
     /* g_n_dropped is reset by sp_init, so run 2 must NOT inherit run 1's drop:
      * its report is complete and its diagnostic mentions no dropped chunk. */
-    assert(strstr(errbuf, "incomplete") == NULL);
-    assert(strstr(errbuf, "dropped") == NULL);
+    assert(strstr(errbuf, "report is incomplete") == NULL);
+    assert(strstr(errbuf, "chunk(s) dropped") == NULL);
     /* run 2's aggregate must reflect only its own chunk (7), not the 64 rows
      * that landed in run 1, inherited via an un-reset chunk count. */
     assert(agg_field(tsv2, 10, field, sizeof field) && strcmp(field, "7") == 0);
     /* run 2's idle-time column must be 0, not run 1's leftover 5.0. */
     assert(agg_field(tsv2, 31, field, sizeof field) && strcmp(field, "0.0000") == 0);
-    remove(tsv);
-    remove(tsv2);
-    remove(err1);
-    remove(err2);
 
     /* Deterministic OOM-drop coverage: force the buffer past capacity with one
      * armed realloc failure so the next add takes the drop path. The dropped
      * chunk must NOT appear in the report, the already-stored rows must remain
      * valid, and sp_finish must emit the "incomplete" diagnostic naming the
      * exact dropped count -- all without relying on host OOM. */
-    const char *tsv3 = "/tmp/stage_prof_test3.tsv";
-    const char *err3 = "/tmp/stage_prof_test3.err";
-    remove(tsv3);
-    remove(err3);
+    const std::string tsv3_path = dir.file("stage_prof_test3.tsv");
+    const char *tsv3 = tsv3_path.c_str();
+    const std::string err3_path = dir.file("stage_prof_test3.err");
+    const char *err3 = err3_path.c_str();
     sp_init(tsv3, "t", "v", "x86_64", 4, "sam", -1, "in");
     force_one_drop();   /* fills to capacity, then drops exactly one chunk */
 
@@ -259,9 +257,7 @@ int main(void) {
      * keyword -- catches a miscount a substring check would let pass. */
     slurp(err3, errbuf, sizeof errbuf);
     assert(strstr(errbuf, "1 chunk(s) dropped") != NULL);
-    assert(strstr(errbuf, "incomplete") != NULL);
-    remove(tsv3);
-    remove(err3);
+    assert(strstr(errbuf, "report is incomplete") != NULL);
 
     printf("stage_prof_test OK\n");
     return 0;

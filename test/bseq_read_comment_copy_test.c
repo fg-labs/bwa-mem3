@@ -16,6 +16,7 @@
 #include "bwa.h"
 #include "fast_reader.h"
 #include "fast_reader_bseq.h"
+#include "framework/temp_path.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -43,7 +44,7 @@ static const char *PAYLOAD =
 
 static char *write_payload(void)
 {
-    char *path = strdup("/tmp/bseq_comment_XXXXXX");
+    char *path = bwa_test_temp_alloc("bseq_comment");
     int fd = mkstemp(path);
     assert(fd >= 0);
     size_t len = strlen(PAYLOAD), off = 0;
@@ -118,7 +119,7 @@ static void check_trim(void)
         "@r/x\nTT\n+\nGG\n";
     static const char *EXPECT[3] = { "a", "/1", "r/x" };
 
-    char *path = strdup("/tmp/bseq_trim_XXXXXX");
+    char *path = bwa_test_temp_alloc("bseq_trim");
     int fd = mkstemp(path); assert(fd >= 0);
     size_t len = strlen(P), off = 0;
     while (off < len) { ssize_t w = write(fd, P + off, len - off); assert(w > 0); off += (size_t)w; }

@@ -21,13 +21,13 @@
 
 #include "doctest/doctest.h"
 #include "../../src/FMI_search.h"
+#include "temp_dir.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <unistd.h>   /* getpid -- per-process temp path */
 #include <vector>
 
 namespace {
@@ -51,10 +51,11 @@ size_t first_pattern_mismatch(const uint8_t *buf, size_t len, size_t file_off)
     return len;
 }
 
-// A temp file holding `nbytes` of pattern_byte(), removed on destruction.
+// A temp file holding `nbytes` of pattern_byte(), in its own TempDir (removed
+// on destruction).
 class PatternFile {
   public:
-    explicit PatternFile(size_t nbytes) : path_(make_path())
+    explicit PatternFile(size_t nbytes) : path_(dir_.file("pattern"))
     {
         FILE *fp = fopen(path_.c_str(), "wb");
         REQUIRE(fp != NULL);
@@ -64,22 +65,10 @@ class PatternFile {
         REQUIRE(fclose(fp) == 0);
     }
 
-    ~PatternFile() { remove(path_.c_str()); }
-
     const char *path() const { return path_.c_str(); }
 
   private:
-    static std::string make_path()
-    {
-        const char *dir = getenv("TMPDIR");
-        std::string p = std::string(dir != NULL ? dir : "/tmp");
-        if (!p.empty() && p[p.size() - 1] != '/') p += '/';
-        // Distinct per process so concurrent test runs don't collide.
-        char suffix[64];
-        snprintf(suffix, sizeof(suffix), "bwa3_pread_test_%ld", (long)getpid());
-        return p + suffix;
-    }
-
+    bwa_tests::TempDir dir_{"bwa3_pread_test"};
     std::string path_;
 };
 

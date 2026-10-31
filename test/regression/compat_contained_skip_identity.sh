@@ -54,6 +54,8 @@
 #   COMPAT_CONTAINED_WORK_DIR — private scratch directory for this script
 
 set -euo pipefail
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 : "${COMPAT_CONTAINED_PHIX_FA:?COMPAT_CONTAINED_PHIX_FA must be set}"
 : "${COMPAT_CONTAINED_WORK_DIR:?COMPAT_CONTAINED_WORK_DIR must be set}"
@@ -105,7 +107,6 @@ done
 "$BWA_MEM3" index "$W/ref.fa" > /dev/null 2>&1 || fail "index"
 
 # --- Reads (deterministic slices). --------------------------------------------
-revcomp() { printf '%s' "$1" | rev | tr ACGTacgt TGCAtgca; }
 QUAL150=$(printf 'I%.0s' $(seq 150))
 QUAL250=$(printf 'I%.0s' $(seq 250))
 
@@ -131,7 +132,7 @@ for ((off = 5; off + 153 <= ${#REP}; off += 41)); do
     n=$((n + 1))
     r=${REP:$off:153}
     r="${r:0:70}${r:73}"
-    printf '@repdel_%04d\n%s\n+\n%s\n' "$n" "$(revcomp "$r")" "$QUAL150" >> "$se"
+    printf '@repdel_%04d\n%s\n+\n%s\n' "$n" "$(dna_revcomp "$r")" "$QUAL150" >> "$se"
 done
 # Openers of contig 0 (SA sentinel walk) at three offsets and lengths.
 for off in 0 1 2; do
@@ -156,12 +157,12 @@ m=0
 for ((off = 0; off + 300 <= ${#REP}; off += 29)); do
     m=$((m + 1))
     printf '@pe_%04d/1\n%s\n+\n%s\n' "$m" "${REP:$off:150}" "$QUAL150" >> "$r1"
-    printf '@pe_%04d/2\n%s\n+\n%s\n' "$m" "$(revcomp "${REP:$((off + 150)):150}")" "$QUAL150" >> "$r2"
+    printf '@pe_%04d/2\n%s\n+\n%s\n' "$m" "$(dna_revcomp "${REP:$((off + 150)):150}")" "$QUAL150" >> "$r2"
 done
 for ((off = 0; off + 300 <= ${#SEQ}; off += 61)); do
     m=$((m + 1))
     printf '@pephix_%04d/1\n%s\n+\n%s\n' "$m" "${SEQ:$off:150}" "$QUAL150" >> "$r1"
-    printf '@pephix_%04d/2\n%s\n+\n%s\n' "$m" "$(revcomp "${SEQ:$((off + 150)):150}")" "$QUAL150" >> "$r2"
+    printf '@pephix_%04d/2\n%s\n+\n%s\n' "$m" "$(dna_revcomp "${SEQ:$((off + 150)):150}")" "$QUAL150" >> "$r2"
 done
 [[ $n -ge 200 && $m -ge 100 ]] || fail "fixture too small (se=$n pe=$m)"
 

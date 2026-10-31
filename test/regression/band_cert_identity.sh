@@ -43,6 +43,8 @@
 #   BAND_CERT_WORK_DIR — directory for fixture-private intermediates
 
 set -euo pipefail
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 # Any command that fails unexpectedly (index/aligner/diff/conversion) exits via
 # set -e; surface it as a FAIL: record with the failing line and status rather
 # than dying silently.
@@ -77,7 +79,7 @@ n_pairs=0
 for off in 200 900 1600 2300 3000 3700; do
     s1="${seq:$off:$L}"
     s2fwd="${seq:$((off + G)):$L}"
-    s2="$(printf '%s' "$s2fwd" | rev | tr 'ACGT' 'TGCA')"
+    s2="$(dna_revcomp "$s2fwd")"
     [ "${#s1}" -eq "$L" ] && [ "${#s2}" -eq "$L" ] || continue
     q="$(printf 'I%.0s' $(seq 1 "$L"))"
     printf '@pair%d/1\n%s\n+\n%s\n' "$n_pairs" "$s1" "$q" >> "$r1"
@@ -108,7 +110,7 @@ n_del=0
 for off in 500 1500 2500 3500; do
     d1="${seq:$off:$L1}${seq:$((off + L1 + DEL)):$L2}"
     d2fwd="${seq:$((off + 700)):120}"
-    d2="$(printf '%s' "$d2fwd" | rev | tr 'ACGT' 'TGCA')"
+    d2="$(dna_revcomp "$d2fwd")"
     [ "${#d1}" -eq "$((L1 + L2))" ] && [ "${#d2}" -eq 120 ] || continue
     q1="$(printf 'I%.0s' $(seq 1 "$((L1 + L2))"))"
     q2="$(printf 'I%.0s' $(seq 1 120))"
@@ -178,49 +180,29 @@ echo "  ok: default output exercises the certificate (widest deletion = ${widest
 # declined. That kernel must emit byte-identical SAM whichever SIMD tier the dispatcher
 # selects, so run the default path under each usable tier and assert one output.
 #
-# Scope mirrors all_tiers_parity.sh: only tiers with a batched kswv kernel are
-# sweepable -- avx2/avx512bw on x86, neon on arm64. sse41/sse42/avx have no batched
+# Scope is simd_sweep_tiers' (test/framework/simd_tiers.sh), shared with
+# all_tiers_parity.sh: only tiers with a batched kswv kernel are sweepable --
+# avx2/avx512bw on x86, neon on arm64. sse41/sse42/avx have no batched
 # kernel and forcing them aborts on PE input, so they are excluded. FORCE_TIER is
 # downgrade-only, so only tiers at or below the host are swept. A host with a single
 # sweepable tier (arm64, or x86 without AVX-512BW) has nothing to compare and reports
 # SKIP rather than a vacuous PASS; the real avx2-vs-avx512bw evidence is earned on an
 # AVX-512BW x86 runner.
-host_tier_raw="$(BWAMEM3_DEBUG_SIMD=1 "$BWA_MEM3" 2>&1 || true)"
-host_tier="$(printf '%s\n' "$host_tier_raw" | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1)"
-known_tiers="sse41 sse42 avx avx2 avx512bw neon"
-case " $known_tiers " in
-    *" $host_tier "*) ;;
-    *)
-        echo "SKIP: could not detect host SIMD tier (parsed '$host_tier') — cross-tier band_cert sweep skipped"
-        host_tier=""
-        ;;
-esac
+# shellcheck source=test/framework/simd_tiers.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/simd_tiers.sh"
+host_tier=""
+if simd_sweep_tiers "$BWA_MEM3" 2> /dev/null; then
+    host_tier="$SIMD_HOST_TIER"
+else
+    echo "SKIP: could not detect host SIMD tier (parsed '$SIMD_HOST_TIER') — cross-tier band_cert sweep skipped"
+fi
 if [ -n "$host_tier" ]; then
-    # Select the sweepable tiers, family-aware: neon is arm64-only and is NOT
-    # "above" the x86 tiers, so a flat rank across both families would wrongly
-    # force x86 tiers on arm64 (where FORCE_TIER silently ignores the cross-family
-    # request and re-runs neon -- a vacuous self-comparison). Mirror
-    # all_tiers_parity.sh: neon hosts sweep {neon} only; x86 hosts sweep the
-    # batched tiers (avx2, avx512bw) at or below the host (FORCE_TIER is
-    # downgrade-only; sse41/sse42/avx have no batched kswv kernel).
-    if [ "$host_tier" = "neon" ]; then
-        sweep_tiers="neon"
-    else
-        host_rank=-1
-        i=0
-        for t in $known_tiers; do
-            [ "$t" = "$host_tier" ] && host_rank="$i"
-            i=$((i + 1))
-        done
-        sweep_tiers=""
-        i=0
-        for t in $known_tiers; do
-            case "$t" in
-                avx2 | avx512bw) [ "$i" -le "$host_rank" ] && sweep_tiers="$sweep_tiers $t" ;;
-            esac
-            i=$((i + 1))
-        done
-    fi
+    # simd_sweep_tiers is family-aware: neon hosts sweep {neon} only, x86 hosts
+    # the batched tiers (avx2, avx512bw) at or below the host.
+    sweep_tiers=""
+    for t in ${SIMD_TIERS[@]+"${SIMD_TIERS[@]}"}; do
+        sweep_tiers="$sweep_tiers $t"
+    done
     n_sweep=0
     for t in $sweep_tiers; do n_sweep=$((n_sweep + 1)); done
     if [ "$n_sweep" -lt 2 ]; then
@@ -243,7 +225,7 @@ if [ -n "$host_tier" ]; then
             # the tier actually used, not the host's native tier.
             BWAMEM3_DEBUG_SIMD=1 BWAMEM3_FORCE_TIER="$t" "$BWA_MEM3" mem "$ref" "$r1" "$r2" 2> "$terr" \
                 | grep -v '^@PG' > "$tsam"
-            eff_tier="$(sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' "$terr" | head -1)"
+            eff_tier="$(simd_parse_tier "$terr")"
             if [ "$eff_tier" != "$t" ]; then
                 echo "FAIL: forced tier '$t' but dispatcher ran '${eff_tier:-<none>}' — cross-tier band_cert coverage would be vacuous" >&2
                 exit 1

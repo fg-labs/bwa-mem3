@@ -14,6 +14,7 @@
 #include "fast_reader.h"
 #include "fr_fastq.h"
 #include "kseq.h"
+#include "framework/temp_path.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -144,8 +145,8 @@ static void report_field(const char *which, int rec, const field_t *k, const fie
 
 static void run_case(const char *name, const char *payload, size_t len)
 {
-    char path[] = "/tmp/fr_fastq_diff_XXXXXX";
-    int fd = mkstemp(path);
+    char path[BWA_TEST_PATH_MAX];
+    int fd = bwa_test_mkstemp(path, sizeof path, "fr_fastq_diff");
     assert(fd >= 0);
     { size_t off = 0; while (off < len) { ssize_t w = write(fd, payload + off, len - off); assert(w > 0); off += (size_t)w; } }
     close(fd);

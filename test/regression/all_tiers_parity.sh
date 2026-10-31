@@ -6,8 +6,9 @@
 #
 # SCOPE: avx2 and avx512bw only (plus neon on arm64, where there is one tier).
 # sse41/sse42/avx are excluded because there is no batched kswv kernel below
-# AVX2 and forcing them kills the aligner — see the ALL_TIERS comment for the
-# full reasoning and the measurement behind it.
+# AVX2 and forcing them kills the aligner — see SIMD_SWEEP_TIERS in
+# test/framework/simd_tiers.sh for the full reasoning and the measurement
+# behind it.
 #
 # This script is therefore NOT the cross-build parity check, and should not be
 # mistaken for one. "Does a low-baseline build agree with an avx2 build?" is
@@ -35,104 +36,27 @@ set -euo pipefail
 OUT_DIR="$(mktemp -d -t bwamem3-parity-XXXXXX)"
 trap 'rm -rf "$OUT_DIR"' EXIT
 
-# Detect host max tier. The dispatcher's debug message goes to stderr.
-# bwa-mem3 with no args prints usage and exits non-zero; capture the output
-# under `|| true` so set -euo pipefail doesn't abort the whole script.
-HOST_TIER_RAW="$(BWAMEM3_DEBUG_SIMD=1 "$BWA_MEM3" 2>&1 || true)"
-HOST_TIER="$(printf '%s\n' "$HOST_TIER_RAW" | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1)"
-
-# Tiers in low-to-high order. Skip any tier above the host (BWAMEM3_FORCE_TIER
-# would refuse the request anyway).
-#
-# sse41/sse42/avx are DELIBERATELY ABSENT. There is no batched kswv kernel below
-# AVX2: src/kswv.cpp's SSE-only getScores8/getScores16 are stubs that
-# exit(EXIT_FAILURE). On a multi-tier build the main TUs are compiled at
-# BASELINE_ARCH (avx2 by default), and the batched mate-rescue path is the only
-# one there (the scalar pre-AVX2 fallback was removed), so mem_sam_pe_batch_run
-# calls those stubs the moment a pair needs mate rescue.
-# Forcing any of those three tiers on paired-end input therefore kills the
-# aligner: exit 1, one [E::getScores8] per thread, header-only SAM. Measured
-# 2026-07-26 on a c7i.4xlarge, all three tiers, hg38 + 32k pairs.
-#
-# This is not a user-facing gap. Pre-AVX2 x86 (sse41/sse42/avx) is no longer a
-# supported tier: the batched mate-rescue kernels require AVX2+, the scalar
-# (pre-AVX2) mate-rescue fallback was removed, and the Makefile now refuses
-# BASELINE_ARCH<avx2 at configure time (so no crashing binary can be built). A
-# default build also refuses to start below its floor (the simd_dispatch.cpp
-# host precheck, covered by host_floor_enforce.sh). The supported tiers
-# (avx2/avx512bw and arm64) are each run through chr22_parity.sh, asserting
-# byte-identity against bwa itself, so the builds agree transitively -- a
-# stronger oracle than this script's self-comparison, and where cross-build
-# parity actually lives. Caveat on scope: chr22_parity.sh strips MQ:i, HN:i,
-# and XS:i before its diff against bwa (see proto-neon-kswv.yml), so that
-# transitive cross-build claim does NOT cover those three emitted tags. This
-# script compares the FULL, unstripped SAM record, so it is what establishes
-# equality of MQ:i/HN:i/XS:i across a single build's reachable tiers.
+# The sweepable tiers (avx2/avx512bw on x86, neon on arm64) at or below the
+# host's. The helper's comment says why sse41/sse42/avx are excluded. The
+# supported tiers (avx2/avx512bw and arm64) are each run through
+# chr22_parity.sh, asserting byte-identity against bwa itself, so the builds
+# agree transitively -- a stronger oracle than this script's self-comparison,
+# and where cross-build parity actually lives. Caveat on scope: chr22_parity.sh
+# strips MQ:i, HN:i, and XS:i before its diff against bwa (see
+# proto-neon-kswv.yml), so that transitive cross-build claim does NOT cover
+# those three emitted tags. This script compares the FULL, unstripped SAM
+# record, so it is what establishes equality of MQ:i/HN:i/XS:i across a single
+# build's reachable tiers.
 #
 # What remains here is the reachable-tier question: one binary, on one host,
 # must produce the same SAM whichever of its usable kernels it dispatches.
-# Restore a tier below avx2 here only alongside a runtime scalar fallback for
-# tiers with no batched kernel.
-ALL_TIERS=(avx2 avx512bw neon)
-
-# Every tier name the dispatcher can report, batched or not. Kept separate from
-# ALL_TIERS so that narrowing the sweep does not turn a correctly-detected
-# low-tier host into a bogus "detection broke" failure: an sse41-baseline build
-# reports HOST_TIER=sse41, which is a perfectly good detection and simply has no
-# tiers to sweep.
-KNOWN_TIERS=(sse41 sse42 avx avx2 avx512bw neon)
-
-# Fail fast if HOST_TIER didn't parse, or names a tier we don't know about —
-# silent fallthrough below would then test every x86 tier on a non-AVX-512 host
-# and produce a confusing SIGILL rather than a clear "detection broke" message.
-detected_ok=0
-for t in "${KNOWN_TIERS[@]}"; do
-    if [[ "$t" == "$HOST_TIER" ]]; then
-        detected_ok=1
-        break
-    fi
-done
-if [[ "$detected_ok" -ne 1 ]]; then
-    echo "FAIL: could not detect host SIMD tier from BWAMEM3_DEBUG_SIMD output" >&2
-    echo "  parsed HOST_TIER='$HOST_TIER' (expected one of: ${KNOWN_TIERS[*]})" >&2
-    echo "  raw output was:" >&2
-    printf '%s\n' "$HOST_TIER_RAW" >&2
-    exit 2
-fi
+# shellcheck source=test/framework/simd_tiers.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/simd_tiers.sh"
+simd_sweep_tiers "$BWA_MEM3" || exit $?
+HOST_TIER="$SIMD_HOST_TIER"
+# ${a[@]+...}: an empty array is "unbound" under set -u in bash 3.2.
+TIERS=(${SIMD_TIERS[@]+"${SIMD_TIERS[@]}"})
 echo "Host tier: $HOST_TIER"
-
-# Select the sweepable tiers: those that both have a batched kswv kernel
-# (ALL_TIERS) and are at or below the host (BWAMEM3_FORCE_TIER is downgrade-only
-# and refuses up-tier requests).
-#
-# Rank against KNOWN_TIERS rather than walking ALL_TIERS until HOST_TIER matches.
-# The old walk relied on the host tier appearing in the list it was iterating;
-# once sub-AVX2 tiers were dropped from that list, an sse41 host would never
-# match, the loop would never break, and it would end up "testing" avx2 and
-# avx512bw -- tiers ABOVE the host, which the dispatcher refuses.
-host_rank=-1
-for i in "${!KNOWN_TIERS[@]}"; do
-    if [[ "${KNOWN_TIERS[$i]}" == "$HOST_TIER" ]]; then
-        host_rank=$i
-        break
-    fi
-done
-
-if [[ "$HOST_TIER" == "neon" ]]; then
-    # arm64 has exactly one tier; the dispatcher always picks NEON.
-    TIERS=("neon")
-else
-    TIERS=()
-    for t in "${ALL_TIERS[@]}"; do
-        if [[ "$t" == "neon" ]]; then continue; fi
-        for i in "${!KNOWN_TIERS[@]}"; do
-            if [[ "${KNOWN_TIERS[$i]}" == "$t" ]]; then
-                if [[ "$i" -le "$host_rank" ]]; then TIERS+=("$t"); fi
-                break
-            fi
-        done
-    done
-fi
 
 # A host below the batched floor (an sse41/sse42/avx baseline build) has nothing
 # to sweep. Say so plainly instead of reporting an empty pass.

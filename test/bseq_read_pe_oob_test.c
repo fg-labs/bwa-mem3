@@ -24,6 +24,7 @@
 #include "bwa.h"
 #include "fast_reader.h"
 #include "fast_reader_bseq.h"
+#include "framework/temp_path.h"
 
 #include <assert.h>
 #include <fcntl.h>
@@ -50,7 +51,7 @@ void   err_fatal(const char *header, const char *fmt, ...)
  * caller must unlink()+free(). */
 static char *write_fastq(int n_records, int first_len, int rest_len)
 {
-    char *path = strdup("/tmp/bseq_oob_XXXXXX");
+    char *path = bwa_test_temp_alloc("bseq_oob");
     int fd = mkstemp(path);
     assert(fd >= 0);
     FILE *f = fdopen(fd, "w");

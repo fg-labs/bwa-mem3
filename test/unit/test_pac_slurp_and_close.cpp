@@ -19,12 +19,12 @@
 #include "doctest/doctest.h"
 #include "../../src/read_index_ele.h"   /* pac_slurp_and_close */
 #include "../../src/FMI_search.h"       /* FMI_PREAD_MIN_CHUNK */
+#include "temp_dir.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-#include <unistd.h>   /* getpid -- per-process temp path */
 #include <vector>
 
 namespace {
@@ -36,10 +36,11 @@ uint8_t pattern_byte(size_t i)
     return (uint8_t)((i * 1103515245u + 12345u) >> 16);
 }
 
-// A temp file holding `nbytes` of pattern_byte(), removed on destruction.
+// A temp file holding `nbytes` of pattern_byte(), in its own TempDir (removed
+// on destruction).
 class PatternFile {
   public:
-    explicit PatternFile(size_t nbytes) : path_(make_path())
+    explicit PatternFile(size_t nbytes) : path_(dir_.file("pattern"))
     {
         FILE *fp = fopen(path_.c_str(), "wb");
         REQUIRE(fp != NULL);
@@ -48,16 +49,10 @@ class PatternFile {
         if (nbytes > 0) REQUIRE(fwrite(buf.data(), 1, nbytes, fp) == nbytes);
         REQUIRE(fclose(fp) == 0);
     }
-    ~PatternFile() { remove(path_.c_str()); }
     const std::string &path() const { return path_; }
 
   private:
-    static std::string make_path()
-    {
-        static unsigned seq = 0;   // unique per file within this process
-        return "/tmp/bwa_mem3_pac_slurp_test." + std::to_string(getpid()) + "." +
-               std::to_string(seq++);
-    }
+    bwa_tests::TempDir dir_{"bwa_mem3_pac_slurp_test"};
     std::string path_;
 };
 

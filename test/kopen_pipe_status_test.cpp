@@ -58,6 +58,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
+#include "framework/temp_path.h"
+
 /* Declared in src/fastmap.h; forward-declared here to keep the test lean and
  * free of the aligner headers. Signatures must match src/kopen.cpp. */
 void *kopen(const char *fn, int *_fd);
@@ -123,8 +125,8 @@ static int check_empty_cmd_rejected(const char *spec)
  * proving the descendant was terminated, not just that kclose returned. */
 static int check_process_group_cleanup(void)
 {
-    char pidfile[] = "/tmp/kopen_pgtest_XXXXXX";
-    int pf = mkstemp(pidfile);
+    char pidfile[BWA_TEST_PATH_MAX];
+    int pf = bwa_test_mkstemp(pidfile, sizeof pidfile, "kopen_pgtest");
     if (pf < 0) {
         fprintf(stderr, "FAIL: process_group_cleanup: mkstemp failed\n");
         return 1;
@@ -135,8 +137,27 @@ static int check_process_group_cleanup(void)
     // a background job keeps the parent shell's fds by default, so without
     // its own redirect it would hold the pipe open long after the shell
     // itself exits and drain_to_eof below would block on it, not on kclose.
-    char spec[256];
-    snprintf(spec, sizeof spec, "<sleep 30 >/dev/null 2>&1 & echo $! > '%s'", pidfile);
+    // The pidfile is single-quoted for sh -c, each quote in it written as
+    // '\'' (close, escaped quote, reopen); both buffers are sized for a path
+    // made of nothing but quotes.
+    char quoted[4 * sizeof pidfile];
+    size_t q = 0;
+    for (const char *c = pidfile; *c != '\0'; ++c) {
+        if (*c == '\'') {
+            memcpy(quoted + q, "'\\''", 4);
+            q += 4;
+        } else {
+            quoted[q++] = *c;
+        }
+    }
+    quoted[q] = '\0';
+    char spec[sizeof quoted + 64];
+    const int spec_len = snprintf(spec, sizeof spec, "<sleep 30 >/dev/null 2>&1 & echo $! > '%s'", quoted);
+    if (spec_len < 0 || (size_t)spec_len >= sizeof spec) {
+        fprintf(stderr, "FAIL: process_group_cleanup: kopen command does not fit\n");
+        unlink(pidfile);
+        return 1;
+    }
 
     int fd = -1;
     void *ko = kopen(spec, &fd);

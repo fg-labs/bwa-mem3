@@ -11,8 +11,8 @@
 # The oracle is exact and needs no golden file: a fixture with '-' bases must
 # give byte-identical SAM (records, @PG excluded) to the same fixture with
 # every '-' replaced by N, and the '-' fixture must give the same records at
-# every tier this host can run (the unforced host tier plus every x86 tier at or
-# below it, forced with BWAMEM3_FORCE_TIER). Checked paired-end and single-end,
+# every tier this host can run (the unforced host tier plus avx2 and avx512bw
+# where the host has them, forced with BWAMEM3_FORCE_TIER). Checked paired-end and single-end,
 # at -t 1 and -t 4, at the default scoring, with BWAMEM3_DISABLE_BSW8=1 (every
 # extension on the 16-bit kernels, where the tiers disagreed), at a scaled
 # scoring (-A 3 -B 12 -O 18 -E 3), and under both --compat targets (which also
@@ -59,15 +59,16 @@ done
 grep -q -- '-' "$W/dash_1.fq" || fail "the '-' fixture has no '-'"
 cmp -s "$W/dash_1.fq" "$W/n_1.fq" && fail "the '-' and N fixtures are identical"
 
-# Tiers: the host's own (unforced) and every x86 tier at or below it.
-host_tier="$(BWAMEM3_DEBUG_SIMD=1 "$BWA_MEM3" 2>&1 | sed -n 's/.*SIMD tier: \([a-z0-9]*\).*/\1/p' | head -1 || true)"
-[ -n "$host_tier" ] || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
-case "$host_tier" in
-    avx512bw) tiers=(host avx2 avx512bw) ;;
-    avx2) tiers=(host avx2) ;;
-    *) tiers=(host) ;;
-esac
-echo "Host tier: $host_tier; tiers checked: ${tiers[*]}"
+# Tiers: the host's own (unforced) and every x86 tier at or below it that
+# simd_sweep_tiers covers (none below avx2, which has no batched kswv kernel).
+# shellcheck source=test/framework/simd_tiers.sh
+source "$HERE/../framework/simd_tiers.sh"
+simd_sweep_tiers "$BWA_MEM3" || fail "could not detect the host SIMD tier from BWAMEM3_DEBUG_SIMD output"
+tiers=(host)
+for t in ${SIMD_TIERS[@]+"${SIMD_TIERS[@]}"}; do
+    [ "$t" = neon ] || tiers+=("$t")
+done
+echo "Host tier: $SIMD_HOST_TIER; tiers checked: ${tiers[*]}"
 
 # run <out> <tier> <threads> <mode: pe|se> <prefix> <env/flags...>
 run() {
@@ -83,7 +84,9 @@ run() {
     [ "$tier" = host ] || envs+=("BWAMEM3_FORCE_TIER=$tier")
     local reads=("$W/${p}_1.fq")
     [ "$mode" = pe ] && reads+=("$W/${p}_2.fq")
-    env ${envs[@]+"${envs[@]}"} "$BWA_MEM3" mem -t "$t" ${flags[@]+"${flags[@]}"} \
+    # The host leg runs with the caller's BWAMEM3_FORCE_TIER unset, at the tier
+    # simd_sweep_tiers read; a forced leg's own setting follows the -u.
+    env -u BWAMEM3_FORCE_TIER ${envs[@]+"${envs[@]}"} "$BWA_MEM3" mem -t "$t" ${flags[@]+"${flags[@]}"} \
         "$W/phix.fa" "${reads[@]}" 2> "$out.err" | grep -v '^@PG' > "$out.sam" \
         || fail "$out: $(tail -1 "$out.err")"
     if grep -q 'ignoring BWAMEM3_FORCE_TIER' "$out.err"; then

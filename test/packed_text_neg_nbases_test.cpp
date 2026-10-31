@@ -10,6 +10,7 @@
 // message -- which the parent detects as the failure.
 
 #include "packed_text.h"
+#include "framework/temp_path.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -18,8 +19,8 @@
 #include <unistd.h>
 
 int main() {
-    char path[] = "/tmp/pt_neg_nbases_XXXXXX";
-    int fd = mkstemp(path);
+    char path[BWA_TEST_PATH_MAX];
+    int fd = bwa_test_mkstemp(path, sizeof path, "pt_neg_nbases");
     if (fd < 0) { perror("mkstemp"); return 1; }
     const char pac[8] = {0};
     if (write(fd, pac, sizeof(pac)) != (ssize_t)sizeof(pac)) { perror("write"); return 1; }

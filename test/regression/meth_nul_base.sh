@@ -37,6 +37,8 @@
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
 set -euo pipefail
+# shellcheck source=test/framework/dna.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 : "${BWA_MEM3:?BWA_MEM3 must be set}"
 command -v samtools > /dev/null 2>&1 || {
     echo "SKIP: samtools not on PATH (needed to filter records by FLAG)"
@@ -150,7 +152,7 @@ check_read() {
     # SEQ is stored reverse-complemented for a reverse-strand hit; compare in
     # read order.
     if ((flag & 16)); then
-        seq=$(printf '%s\n' "$seq" | rev | tr ACGTN TGCAN)
+        seq=$(dna_revcomp "$seq")
     fi
     [ "$seq" = "$want" ] || fail "$name: SEQ differs from the input (control bytes as N): got $seq, want $want"
 
