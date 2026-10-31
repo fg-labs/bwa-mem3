@@ -222,24 +222,30 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	return cnt_chg;
 }
 
-int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-					   isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt,
-					   const isize_info_t *last_ii)
+/* bwa_cal_pac_pos_pe is upstream's single function cut into its stages, so that the driver can
+ * run the RNG-free stages in parallel (see bwape.h). Stage bodies are upstream's, in order. */
+
+void bwa_pe_aln2seq(int n_seqs, bwa_seq_t *seqs[2])
 {
-	int i, j, cnt_chg = 0;
-	pe_data_t *d;
+	int i, j;
+	for (i = 0; i != n_seqs; ++i) {
+		for (j = 0; j < 2; ++j) {
+			bwa_seq_t *p = seqs[j] + i;
+			p->n_multi = 0;
+			p->extra_flag |= SAM_FPD | (j == 0? SAM_FR1 : SAM_FR2);
+			// generate SE alignment and mapping quality
+			bwa_aln2seq(p->n_aln, p->aln, p);
+		}
+	}
+}
 
-	d = (pe_data_t*)calloc(1, sizeof(pe_data_t));
-
-	// SE
+void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], const gap_opt_t *gopt)
+{
+	int i, j;
 	for (i = 0; i != n_seqs; ++i) {
 		bwa_seq_t *p[2];
 		for (j = 0; j < 2; ++j) {
 			p[j] = seqs[j] + i;
-			p[j]->n_multi = 0;
-			p[j]->extra_flag |= SAM_FPD | (j == 0? SAM_FR1 : SAM_FR2);
-			// generate SE alignment and mapping quality
-			bwa_aln2seq(p[j]->n_aln, p[j]->aln, p[j]);
 			if (p[j]->type == BWA_TYPE_UNIQUE || p[j]->type == BWA_TYPE_REPEAT) {
 				int strand;
 				int max_diff = gopt->fnr > 0.0? bwa_cal_maxdiff(p[j]->len, BWA_AVG_ERR, gopt->fnr) : gopt->max_diff;
@@ -250,14 +256,27 @@ int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_se
 			}
 		}
 	}
+}
 
+void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, const pe_opt_t *opt,
+				  const isize_info_t *last_ii)
+{
 	// infer isize
 	infer_isize(n_seqs, seqs, ii, opt->ap_prior, bwt->seq_len/2);
 	if (ii->avg < 0.0 && last_ii->avg > 0.0) *ii = *last_ii;
 	if (opt->force_isize) {
-		fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", __func__);
+		fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");
 		ii->low = ii->high = 0; ii->avg = ii->std = -1.0;
 	}
+}
+
+int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
+				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt)
+{
+	int i, j, cnt_chg = 0;
+	pe_data_t *d;
+
+	d = (pe_data_t*)calloc(1, sizeof(pe_data_t));
 
 	// PE
 	for (i = 0; i != n_seqs; ++i) {
@@ -318,6 +337,17 @@ int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_se
 	kv_destroy(d->arr);
 	free(d);
 	return cnt_chg;
+}
+
+int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
+					   isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt,
+					   const isize_info_t *last_ii)
+{
+	// SE
+	bwa_pe_aln2seq(n_seqs, seqs);
+	bwa_pe_se_pos(bns, bwt, n_seqs, seqs, gopt);
+	bwa_pe_isize(bwt, n_seqs, seqs, ii, opt, last_ii);
+	return bwa_pe_pair(bns, bwt, n_seqs, seqs, ii, opt, gopt);
 }
 
 #define SW_MIN_MATCH_LEN 20
@@ -411,16 +441,15 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 	return cigar;
 }
 
-ubyte_t *bwa_paired_sw(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt, const isize_info_t *ii)
+void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,
+						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2])
 {
 	ubyte_t *pacseq = (ubyte_t*)_pacseq;
 	int i;
-	uint64_t n_tot[2], n_mapped[2];
 
-	if (!popt->is_sw || ii->avg < 0.0) return pacseq;
+	if (!popt->is_sw || ii->avg < 0.0) return;
 
 	// perform mate alignment
-	n_tot[0] = n_tot[1] = n_mapped[0] = n_mapped[1] = 0;
 	for (i = 0; i != n_seqs; ++i) {
 		bwa_seq_t *p[2];
 		p[0] = seqs[0] + i; p[1] = seqs[1] + i;
@@ -526,11 +555,26 @@ ubyte_t *bwa_paired_sw(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, 
 			free(cigar[0]); free(cigar[1]);
 		}
 	}
+}
+
+ubyte_t *bwa_paired_sw(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt, const isize_info_t *ii)
+{
+	ubyte_t *pacseq = (ubyte_t*)_pacseq;
+	uint64_t n_tot[2], n_mapped[2];
+
+	if (!popt->is_sw || ii->avg < 0.0) return pacseq;
+	n_tot[0] = n_tot[1] = n_mapped[0] = n_mapped[1] = 0;
+	bwa_paired_sw_core(bns, _pacseq, n_seqs, seqs, popt, ii, n_tot, n_mapped);
+	bwa_paired_sw_report(n_tot, n_mapped);
+	return pacseq;
+}
+
+void bwa_paired_sw_report(const uint64_t n_tot[2], const uint64_t n_mapped[2])
+{
 	fprintf(stderr, "[bwa_paired_sw] %lld out of %lld Q%d singletons are mated.\n",
 			(long long)n_mapped[1], (long long)n_tot[1], SW_MIN_MAPQ);
 	fprintf(stderr, "[bwa_paired_sw] %lld out of %lld Q%d discordant pairs are fixed.\n",
 			(long long)n_mapped[0], (long long)n_tot[0], SW_MIN_MAPQ);
-	return pacseq;
 }
 
 } // namespace bwa_aln

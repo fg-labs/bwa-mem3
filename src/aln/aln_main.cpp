@@ -11,8 +11,12 @@
 #include <errno.h>
 #include <sys/stat.h>
 
+#include <algorithm>
+#include <vector>
+
 #include "../FMI_search.h"
 #include "../bwa.h"
+#include "../kthread.h"
 #include "../read_index_ele.h"
 #include "aln_bwt.h"
 #include "bwape.h"
@@ -36,6 +40,135 @@ void aln_opt_init(aln_opt_t *o)
 	o->batch_size = 0x40000;
 }
 
+/* The stages after the search run in parallel on kt_for (design §6.2): every drand48() draw
+ * stays in one serial pass, in stock order, before them; infer_isize is a barrier between the
+ * paired-end passes; the records are formatted in parallel and written in read order. */
+
+namespace {
+
+/* One formatted run of consecutive reads (or pairs) [st, st + n): `len` bytes at `off` in
+ * thread `tid`'s buffer. `stop` >= 0: the pair at index `stop` has mismatched names, and the
+ * run ends with that pair's records. */
+struct fmt_seg_t {
+	int st, tid, stop;
+	size_t off, len;
+};
+
+/* Per-thread output buffers and segment lists for one pass, reused across batches. */
+struct fmt_bufs_t {
+	std::vector<kstring_t> buf;
+	std::vector<std::vector<fmt_seg_t>> segs;
+	explicit fmt_bufs_t(int n_threads) : buf(n_threads), segs(n_threads)
+	{
+		for (auto &k : buf) k.l = k.m = 0, k.s = 0;
+	}
+	~fmt_bufs_t()
+	{
+		for (auto &k : buf) free(k.s);
+	}
+	void reset()
+	{
+		for (auto &k : buf) k.l = 0;
+		for (auto &v : segs) v.clear();
+	}
+	/* Writes the segments in read order, up to and including the first stopped one. Sets
+	 * *stop to that segment's stopping index (or -1). Returns 0 or -1 on a write error. */
+	int write(aln_out_t *out, int *stop)
+	{
+		std::vector<fmt_seg_t> all;
+		for (auto &v : segs) all.insert(all.end(), v.begin(), v.end());
+		std::sort(all.begin(), all.end(), [](const fmt_seg_t &x, const fmt_seg_t &y) { return x.st < y.st; });
+		*stop = -1;
+		for (const fmt_seg_t &g : all) {
+			if (aln_out_write_buf(out, buf[g.tid].s + g.off, g.len) != 0) return -1;
+			if (g.stop >= 0) {
+				*stop = g.stop;
+				break;
+			}
+		}
+		return 0;
+	}
+};
+
+struct se_ctx_t {
+	const aln_opt_t *o;
+	const bwt_t *bwt;
+	const bntseq_t *bns;
+	ubyte_t *pac;
+	bwa_seq_t *seqs;
+	fmt_bufs_t *fb;
+};
+
+/* Single end, reads [st, st + n): SA to position, refinement, MD, trim correction and SAM text;
+ * bwa_cal_pac_pos and bwa_refine_gapped are upstream's batch loops run on the slice. */
+void se_post_worker(void *data, int st, int n, int tid)
+{
+	se_ctx_t *c = (se_ctx_t*)data;
+	bwa_seq_t *seqs = c->seqs + st;
+	bwa_cal_pac_pos(c->bns, c->bwt, n, seqs, c->o->gap.max_diff, c->o->gap.fnr);
+	bwa_refine_gapped(c->bns, n, seqs, c->pac);
+	kstring_t *k = &c->fb->buf[tid];
+	fmt_seg_t g;
+	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
+	for (int i = 0; i < n; ++i)
+		bwa_print_sam1(k, c->bns, seqs + i, 0, c->o->gap.mode, c->o->gap.max_top2);
+	g.len = k->l - g.off;
+	c->fb->segs[tid].push_back(g);
+}
+
+struct pe_ctx_t {
+	const aln_opt_t *o;
+	const bwt_t *bwt;
+	const bntseq_t *bns;
+	ubyte_t *pac;
+	bwa_seq_t *seqs[2];
+	const isize_info_t *ii;
+	fmt_bufs_t *fb;
+	std::vector<long long> cnt_chg;       // per thread
+	std::vector<uint64_t> sw_cnt;         // per thread: n_tot[0..1], n_mapped[0..1]
+};
+
+/* Paired end, pass 1 (pairs [st, st + n)): single-end mapQ and position. */
+void pe_pos_worker(void *data, int st, int n, int tid)
+{
+	(void)tid;
+	pe_ctx_t *c = (pe_ctx_t*)data;
+	bwa_seq_t *s[2] = {c->seqs[0] + st, c->seqs[1] + st};
+	bwa_pe_se_pos(c->bns, c->bwt, n, s, &c->o->gap);
+}
+
+/* Paired end, pass 2 (after infer_isize): pairing and extra hits, mate Smith-Waterman,
+ * refinement of both reads, then each pair's records, read 1 then read 2. */
+void pe_post_worker(void *data, int st, int n, int tid)
+{
+	pe_ctx_t *c = (pe_ctx_t*)data;
+	bwa_seq_t *s[2] = {c->seqs[0] + st, c->seqs[1] + st};
+	c->cnt_chg[tid] += bwa_pe_pair(c->bns, c->bwt, n, s, c->ii, &c->o->pe, &c->o->gap);
+	uint64_t *sw = &c->sw_cnt[4 * tid];
+	bwa_paired_sw_core(c->bns, c->pac, n, s, &c->o->pe, c->ii, sw, sw + 2);
+	for (int j = 0; j < 2; ++j) bwa_refine_gapped(c->bns, n, s[j], c->pac);
+	kstring_t *k = &c->fb->buf[tid];
+	fmt_seg_t g;
+	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
+	for (int i = 0; i < n; ++i) {
+		bwa_seq_t *p0 = s[0] + i, *p1 = s[1] + i;
+		if (p0->bc[0] || p1->bc[0]) {
+			strcat(p0->bc, p1->bc);
+			strcpy(p1->bc, p0->bc);
+		}
+		bwa_print_sam1(k, c->bns, p0, p1, c->o->gap.mode, c->o->gap.max_top2);
+		bwa_print_sam1(k, c->bns, p1, p0, c->o->gap.mode, c->o->gap.max_top2);
+		if (strcmp(p0->name, p1->name) != 0) { // as sampe: stop after this pair
+			g.stop = st + i;
+			break;
+		}
+	}
+	g.len = k->l - g.off;
+	c->fb->segs[tid].push_back(g);
+}
+
+} // namespace
+
 int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
 			   const char *fn_fq, aln_out_t *out)
 {
@@ -46,7 +179,8 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	}
 	bwase_initialize();
 	srand48(bns->seed); // once per run, never per batch
-	kstring_t sam = {0, 0, 0};
+	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	fmt_bufs_t fb(n_threads);
 	long long tot = 0;
 	int n_seqs, ret = 0;
 	bwa_seq_t *seqs;
@@ -56,17 +190,15 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		// serial and in read order: bwa_aln2seq_core draws from drand48
 		for (int i = 0; i < n_seqs; ++i)
 			bwa_aln2seq_core(seqs[i].n_aln, seqs[i].aln, &seqs[i], 1, o->max_xa_hits);
-		bwa_cal_pac_pos(bns, bwt, n_seqs, seqs, o->gap.max_diff, o->gap.fnr);
-		bwa_refine_gapped(bns, n_seqs, seqs, pac);
-		sam.l = 0;
-		for (int i = 0; i < n_seqs; ++i)
-			bwa_print_sam1(&sam, bns, seqs + i, 0, o->gap.mode, o->gap.max_top2);
-		if (aln_out_write(out, &sam) != 0) ret = 1;
+		se_ctx_t c = {o, bwt, bns, pac, seqs, &fb};
+		fb.reset();
+		kt_for_nt(se_post_worker, &c, n_seqs, n_threads);
+		int stop;
+		if (fb.write(out, &stop) != 0) ret = 1;
 		bwa_free_read_seq(n_seqs, seqs);
 		if (ret) break;
 		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld sequences have been processed.\n", tot);
 	}
-	free(sam.s);
 	bwa_seq_close(ks);
 	return ret;
 }
@@ -88,7 +220,8 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	}
 	bwase_initialize();
 	srand48(bns->seed); // once per run, never per batch
-	kstring_t sam = {0, 0, 0};
+	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	fmt_bufs_t fb(n_threads);
 	isize_info_t last_ii;
 	last_ii.avg = -1.0;
 	long long tot = 0;
@@ -112,34 +245,41 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		// each file is its own batch: the gap-open cap follows that file's longest read
 		aln_search_batch(bwt, n_in[0], seqs[0], &o->gap, o->gap.n_threads);
 		aln_search_batch(bwt, n_in[1], seqs[1], &o->gap, o->gap.n_threads);
+		// bwa_cal_pac_pos_pe, stage by stage: the drand48 pass serially in stock order, then
+		// positions in parallel, the insert-size barrier, then the per-pair work in parallel
+		bwa_pe_aln2seq(n_seqs, seqs);
+		pe_ctx_t c;
+		c.o = o, c.bwt = bwt, c.bns = bns, c.pac = pac, c.seqs[0] = seqs[0], c.seqs[1] = seqs[1];
+		c.fb = &fb;
+		c.cnt_chg.assign(n_threads, 0);
+		c.sw_cnt.assign(4 * n_threads, 0);
+		kt_for_nt(pe_pos_worker, &c, n_seqs, n_threads);
 		isize_info_t ii;
-		int cnt_chg = bwa_cal_pac_pos_pe(bns, bwt, n_seqs, seqs, &ii, &o->pe, &o->gap, &last_ii);
-		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] changed the coordinates of %d alignments.\n", cnt_chg);
-		ubyte_t *pacseq = bwa_paired_sw(bns, pac, n_seqs, seqs, &o->pe, &ii);
-		for (int j = 0; j < 2; ++j) bwa_refine_gapped(bns, n_seqs, seqs[j], pacseq);
-		sam.l = 0;
-		for (int i = 0; i < n_seqs; ++i) {
-			bwa_seq_t *p0 = seqs[0] + i, *p1 = seqs[1] + i;
-			if (p0->bc[0] || p1->bc[0]) {
-				strcat(p0->bc, p1->bc);
-				strcpy(p1->bc, p0->bc);
-			}
-			bwa_print_sam1(&sam, bns, p0, p1, o->gap.mode, o->gap.max_top2);
-			bwa_print_sam1(&sam, bns, p1, p0, o->gap.mode, o->gap.max_top2);
-			if (strcmp(p0->name, p1->name) != 0) {
-				fprintf(stderr, "[E::aln] paired reads have different names: \"%s\", \"%s\"\n", p0->name, p1->name);
-				ret = 1;
-				break;
-			}
+		bwa_pe_isize(bwt, n_seqs, seqs, &ii, &o->pe, &last_ii);
+		c.ii = &ii;
+		fb.reset();
+		kt_for_nt(pe_post_worker, &c, n_seqs, n_threads);
+		long long cnt_chg = 0;
+		uint64_t n_tot[2] = {0, 0}, n_mapped[2] = {0, 0};
+		for (int t = 0; t < n_threads; ++t) {
+			cnt_chg += c.cnt_chg[t];
+			n_tot[0] += c.sw_cnt[4 * t], n_tot[1] += c.sw_cnt[4 * t + 1];
+			n_mapped[0] += c.sw_cnt[4 * t + 2], n_mapped[1] += c.sw_cnt[4 * t + 3];
 		}
-		if (aln_out_write(out, &sam) != 0) ret = 1;
+		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] changed the coordinates of %lld alignments.\n", cnt_chg);
+		if (o->pe.is_sw && ii.avg >= 0.0) bwa_paired_sw_report(n_tot, n_mapped);
+		int stop;
+		if (fb.write(out, &stop) != 0) ret = 1;
+		if (stop >= 0) {
+			fprintf(stderr, "[E::aln] paired reads have different names: \"%s\", \"%s\"\n", seqs[0][stop].name, seqs[1][stop].name);
+			ret = 1;
+		}
 		bwa_free_read_seq(n_in[0], seqs[0]);
 		bwa_free_read_seq(n_in[1], seqs[1]);
 		if (ret) break;
 		last_ii = ii;
 		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld read pairs have been processed.\n", tot);
 	}
-	free(sam.s);
 	bwa_seq_close(ks[0]);
 	bwa_seq_close(ks[1]);
 	return ret;
