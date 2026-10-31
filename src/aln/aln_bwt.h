@@ -69,6 +69,9 @@ bwtint_t bwt_occ(const bwt_t *bwt, bwtint_t k, ubyte_t c);
 void bwt_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l, ubyte_t c, bwtint_t *ok, bwtint_t *ol);
 void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4]);
 
+/* Prefetches the Occ block that bwt_occ(bwt, p - 1, c) reads (any c). */
+void bwt_prefetch_occ(const bwt_t *bwt, bwtint_t p);
+
 /* SA[k] in bwa's row numbering (row 0 is the `$` suffix and returns (bwtint_t)-1). */
 bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k);
 
