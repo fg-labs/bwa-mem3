@@ -3,7 +3,8 @@
  * Version 2.0 (see LICENSE in this directory).
  *
  * MODIFIED from the original: moved into namespace bwa_aln; alignments come from each
- * read's own aln array instead of being read from a .sai file. See README.md. */
+ * read's own aln array instead of being read from a .sai file; bwa_cal_pac_pos_pe is cut into
+ * four stages and bwa_paired_sw into a counting core and a report. See README.md. */
 #ifndef BWA_MEM3_ALN_BWAPE_H
 #define BWA_MEM3_ALN_BWAPE_H
 
