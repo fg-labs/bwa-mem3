@@ -249,9 +249,9 @@ stride-8 index and is the recommended speed-per-GB operating point; `-u 1`
 
 ## `HN:i` hit count tag (PR #42)
 
-Every primary SAM/BAM record now carries an `HN:i:<n>` tag reporting the
-number of secondary alignment candidates clustered with this primary under
-`XA_drop_ratio`. This count is captured before the `-h`/`max_XA_hits` cap
+Every primary and supplementary SAM/BAM record now carries an `HN:i:<n>` tag
+reporting the number of secondary alignment candidates clustered with that
+record under `XA_drop_ratio`. This count is captured before the `-h`/`max_XA_hits` cap
 truncates the `XA:Z:` string, so `HN` reports the true number of alternate
 loci even when no `XA:Z:` field appears in the record.
 
@@ -264,7 +264,8 @@ This makes it possible to distinguish:
 
 Motivated by [lh3/bwa#438](https://github.com/lh3/bwa/pull/438), which adds
 HN to `bwa aln`. HN is emitted in both SAM (`mem_aln2sam`) and BAM
-(`mem_aln_to_bam`) paths and is absent when `-a` (`MEM_F_ALL`) is active.
+(`mem_aln_to_bam`) paths and is absent when `-a` (`MEM_F_ALL`) or `--compat`
+is active.
 
 ## `--bam=LEVEL` direct BAM output (PR #12)
 
