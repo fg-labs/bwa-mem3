@@ -7,9 +7,11 @@
  * its own aln array; the dead hash-table branch is dropped; the reference is always
  * the packed in-memory copy. The mate alignment uses bwa-mem3's ksw_align and ksw_global.
  * bwa_cal_pac_pos_pe is cut into four stages and bwa_paired_sw into a counting core and a report
- * (the two stderr lines), so the driver can run them in parallel; each holds upstream's loop body.
- * The bwa_paired_sw wrapper itself is not kept (nothing calls it).
- * See README.md. */
+ * (the two stderr lines), so the driver can run them in parallel; each holds upstream's loop body,
+ * except that bwa_pe_se_pos and bwa_pe_pair make their SA lookups in batches (bwt_sa_batch) ahead
+ * of the code that uses them, and bwa_pe_pair is restructured into per-group phases for that.
+ * The bwa_paired_sw wrapper itself is not kept (nothing calls it). bwa_pe_pairing and
+ * bwa_pe_pair_grouped expose pairing and the grouping to the unit tests. See README.md. */
 #include "bwape.h"
 #include "aln_alloc.h"
 
@@ -17,6 +19,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <vector>
 
 #include "../bwa.h"
 #include "../kvec.h"
@@ -226,8 +230,19 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	return cnt_chg;
 }
 
+int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm, const isize_info_t *ii)
+{
+	pe_data_t d;
+	d.arr = *arr;
+	d.aln[0] = p[0]->aln, d.aln[1] = p[1]->aln;
+	int ret = pairing(p, &d, opt, s_mm, ii);
+	*arr = d.arr;
+	return ret;
+}
+
 /* bwa_cal_pac_pos_pe is upstream's single function cut into its stages, so that the driver can
- * run the RNG-free stages in parallel (see bwape.h). Stage bodies are upstream's, in order. */
+ * run the RNG-free stages in parallel (see bwape.h). Stage bodies are upstream's, in order, apart
+ * from the batched SA lookups in bwa_pe_se_pos and bwa_pe_pair (README.md, "Batched SA lookups"). */
 
 void bwa_pe_aln2seq(int n_seqs, bwa_seq_t *seqs[2])
 {
@@ -246,6 +261,17 @@ void bwa_pe_aln2seq(int n_seqs, bwa_seq_t *seqs[2])
 void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], const gap_opt_t *gopt)
 {
 	int i, j;
+	// Pass 1: the SA row of every mapped read, in the loop's order, resolved in one batch.
+	std::vector<bwtint_t> sa;
+	sa.reserve((size_t)n_seqs * 2);
+	for (i = 0; i != n_seqs; ++i)
+		for (j = 0; j < 2; ++j) {
+			const bwa_seq_t *q = seqs[j] + i;
+			if (q->type == BWA_TYPE_UNIQUE || q->type == BWA_TYPE_REPEAT) sa.push_back(q->sa);
+		}
+	bwt_sa_batch(bwt, sa.data(), (int64_t)sa.size(), sa.data());
+	// Pass 2: upstream's loop, with bwa_sa2pos's lookup taken from the batch.
+	size_t c = 0;
 	for (i = 0; i != n_seqs; ++i) {
 		bwa_seq_t *p[2];
 		for (j = 0; j < 2; ++j) {
@@ -254,7 +280,7 @@ void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t 
 				int strand;
 				int max_diff = gopt->fnr > 0.0? bwa_cal_maxdiff(p[j]->len, BWA_AVG_ERR, gopt->fnr) : gopt->max_diff;
 				p[j]->seQ = p[j]->mapQ = bwa_approx_mapQ(p[j], max_diff);
-				p[j]->pos = bwa_sa2pos(bns, bwt, p[j]->sa, p[j]->len + p[j]->ref_shift, &strand);
+				p[j]->pos = bwa_pos_from_sa(bns, sa[c++], p[j]->len + p[j]->ref_shift, &strand);
 				p[j]->strand = strand;
 				if (p[j]->pos == (bwtint_t)-1) p[j]->type = BWA_TYPE_NO_MATCH;
 			}
@@ -274,73 +300,163 @@ void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t
 	}
 }
 
-int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt)
+/* Upstream's eligibility test for pairing: -1 unless both ends are mapped, -2 when an end has
+ * more than opt->max_occ hits (upstream's `continue`, which also skips the extra hits), else
+ * the number of SA rows the pairing looks up (every row of every alignment of both ends).
+ * *n_multi gets an upper bound on the extra hits the pair's body can generate: a read's extra
+ * hits are all its hits or none, and none when it has more than max(n_multi, N_multi) + 1. */
+static long long pe_pair_rows(bwa_seq_t *p[2], const pe_opt_t *opt, long long *n_multi)
 {
-	int i, j, cnt_chg = 0;
+	int j, k;
+	long long n_occ[2];
+	const long long max_multi = (opt->n_multi > opt->N_multi? opt->n_multi : opt->N_multi) + 1LL;
+	for (j = 0; j < 2; ++j) {
+		n_occ[j] = 0;
+		for (k = 0; k < p[j]->n_aln; ++k)
+			n_occ[j] += p[j]->aln[k].l - p[j]->aln[k].k + 1;
+	}
+	*n_multi = 0;
+	if (opt->N_multi || opt->n_multi)
+		for (j = 0; j < 2; ++j)
+			if (n_occ[j] <= max_multi) *n_multi += n_occ[j];
+	if (!((p[0]->type == BWA_TYPE_UNIQUE || p[0]->type == BWA_TYPE_REPEAT)
+		  && (p[1]->type == BWA_TYPE_UNIQUE || p[1]->type == BWA_TYPE_REPEAT)))
+		return -1;
+	if (n_occ[0] > opt->max_occ || n_occ[1] > opt->max_occ) {
+		*n_multi = 0;
+		return -2;
+	}
+	return n_occ[0] + n_occ[1];
+}
+
+/* Upstream's loop over the pairs, restructured so that its SA lookups are made in batches. The
+ * pairs are taken in groups of consecutive pairs whose weight (pairing rows + the bound on extra
+ * hits + 1 per pair) is at most group_rows; a heavier pair is a group alone, so the group's
+ * buffers hold at most group_rows entries, or one pair's (no more than upstream holds for that
+ * pair). Per group: (A) every pairing row, in upstream's push order, is resolved; (B) pair by
+ * pair, upstream's body runs up to the extra hits' lookups, building each pair's array from the
+ * resolved rows in the same order upstream pushes it, and pairing; (C) the extra hits' rows of
+ * the group are resolved and the rest of the body runs pair by pair. Each pair's state is
+ * touched only by its own body, and every value a stage reads is the value upstream's single
+ * pass would read there, so the output is the same. The buffers are std::vectors: an allocation
+ * failure ends the process with an uncaught std::bad_alloc rather than aln_alloc's message. */
+int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
+						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows)
+{
+	int i, j, g0, g1, cnt_chg = 0;
+	if (group_rows < 1) group_rows = 1;
+	const int do_multi = opt->N_multi || opt->n_multi;
 	pe_data_t *d;
+	std::vector<pair64_t> arr;      // per pairing row of the group: (pos, k<<2 | strand<<1 | j)
+	std::vector<bwtint_t> rows;     // the group's pairing rows, resolved in place to SA values
+	std::vector<long long> st;      // per pair of the group: its start in arr, or pe_pair_rows' -1 / -2
+	std::vector<long long> st_n;    // per pair of the group: its number of pairing rows
+	std::vector<bwtint_t> mrows;    // the group's extra hits' rows, resolved in place
+	std::vector<uint8_t> did;       // per read of the group: its extra hits were generated
 
 	d = (pe_data_t*)aln_calloc(1, sizeof(pe_data_t));
 
-	// PE
-	for (i = 0; i != n_seqs; ++i) {
-		bwa_seq_t *p[2];
-		for (j = 0; j < 2; ++j) {
-			p[j] = seqs[j] + i;
-			d->aln[j] = p[j]->aln;
+	for (g0 = 0; g0 < n_seqs; g0 = g1) {
+		long long n_rows = 0, weight = 0;
+		st.clear(), st_n.clear();
+		for (g1 = g0; g1 < n_seqs; ++g1) {
+			bwa_seq_t *p[2] = {seqs[0] + g1, seqs[1] + g1};
+			long long nm, r = pe_pair_rows(p, opt, &nm);
+			const long long w = (r > 0? r : 0) + nm + 1;
+			if (g1 > g0 && weight + w > group_rows) break;
+			weight += w;
+			st.push_back(r < 0? r : n_rows);
+			st_n.push_back(r < 0? 0 : r);
+			if (r > 0) n_rows += r;
 		}
-		if ((p[0]->type == BWA_TYPE_UNIQUE || p[0]->type == BWA_TYPE_REPEAT)
-			&& (p[1]->type == BWA_TYPE_UNIQUE || p[1]->type == BWA_TYPE_REPEAT))
-		{ // only when both ends mapped
-			pair64_t x;
-			int j, k;
-			long long n_occ[2];
+		// (A) the pairing rows, in upstream's order: end j, then alignment k, then row l
+		arr.resize((size_t)n_rows);
+		rows.resize((size_t)n_rows);
+		for (i = g0; i < g1; ++i) {
+			if (st[i - g0] < 0) continue;
+			pair64_t *x = arr.data() + st[i - g0];
+			bwtint_t *row = rows.data() + st[i - g0];
 			for (j = 0; j < 2; ++j) {
-				n_occ[j] = 0;
-				for (k = 0; k < p[j]->n_aln; ++k)
-					n_occ[j] += d->aln[j][k].l - d->aln[j][k].k + 1;
-			}
-			if (n_occ[0] > opt->max_occ || n_occ[1] > opt->max_occ) continue;
-			d->arr.n = 0;
-			for (j = 0; j < 2; ++j) {
-				for (k = 0; k < p[j]->n_aln; ++k) {
-					const bwt_aln1_t *r = d->aln[j] + k;
-					bwtint_t l;
-					for (l = r->k; l <= r->l; ++l) { // calculate on the fly
-						int strand;
-						x.x = bwa_sa2pos(bns, bwt, l, p[j]->len + p[j]->ref_shift, &strand);
-						x.y = k<<2 | strand<<1 | j;
-						kv_push(pair64_t, d->arr, x);
+				const bwa_seq_t *q = seqs[j] + i;
+				for (int k = 0; k < q->n_aln; ++k) {
+					const bwt_aln1_t *r = q->aln + k;
+					for (bwtint_t l = r->k; l <= r->l; ++l, ++x, ++row) {
+						*row = l;
+						x->y = k<<2 | j;
 					}
 				}
 			}
-			cnt_chg += pairing(p, d, opt, gopt->s_mm, ii);
+		}
+		bwt_sa_batch(bwt, rows.data(), (int64_t)rows.size(), rows.data());
+
+		// (B) upstream's body up to the extra hits' lookups
+		mrows.clear();
+		did.assign((size_t)(g1 - g0) * 2, 0);
+		for (i = g0; i < g1; ++i) {
+			bwa_seq_t *p[2];
+			for (j = 0; j < 2; ++j) {
+				p[j] = seqs[j] + i;
+				d->aln[j] = p[j]->aln;
+			}
+			const long long s0 = st[i - g0];
+			if (s0 == -2) continue;
+			if (s0 >= 0) { // only when both ends mapped
+				const long long nr = st_n[i - g0];
+				pair64_t *a = arr.data() + s0;
+				const bwtint_t *sa = rows.data() + s0;
+				for (long long c = 0; c < nr; ++c) {
+					int strand;
+					const int jj = (int)(a[c].y & 1);
+					a[c].x = bwa_pos_from_sa(bns, sa[c], p[jj]->len + p[jj]->ref_shift, &strand);
+					a[c].y |= (uint64_t)(strand<<1);
+				}
+				d->arr.a = a, d->arr.n = d->arr.m = (size_t)nr;
+				cnt_chg += pairing(p, d, opt, gopt->s_mm, ii);
+			}
+
+			if (do_multi) {
+				for (j = 0; j < 2; ++j) {
+					if (p[j]->type != BWA_TYPE_NO_MATCH) {
+						if (!(p[j]->extra_flag&SAM_FPP) && p[1-j]->type != BWA_TYPE_NO_MATCH) {
+							bwa_aln2seq_core(p[j]->n_aln, d->aln[j], p[j], 0, p[j]->c1+p[j]->c2-1 > opt->N_multi? opt->n_multi : opt->N_multi);
+						} else bwa_aln2seq_core(p[j]->n_aln, d->aln[j], p[j], 0, opt->n_multi);
+						did[(size_t)(i - g0) * 2 + j] = 1;
+						for (int k = 0; k < p[j]->n_multi; ++k) mrows.push_back(p[j]->multi[k].pos);
+					}
+				}
+			}
 		}
 
-		if (opt->N_multi || opt->n_multi) {
+		// (C) the extra hits' positions
+		bwt_sa_batch(bwt, mrows.data(), (int64_t)mrows.size(), mrows.data());
+		size_t c = 0;
+		for (i = g0; i < g1; ++i) {
 			for (j = 0; j < 2; ++j) {
-				if (p[j]->type != BWA_TYPE_NO_MATCH) {
-					int k, n_multi;
-					if (!(p[j]->extra_flag&SAM_FPP) && p[1-j]->type != BWA_TYPE_NO_MATCH) {
-						bwa_aln2seq_core(p[j]->n_aln, d->aln[j], p[j], 0, p[j]->c1+p[j]->c2-1 > opt->N_multi? opt->n_multi : opt->N_multi);
-					} else bwa_aln2seq_core(p[j]->n_aln, d->aln[j], p[j], 0, opt->n_multi);
-					for (k = 0, n_multi = 0; k < p[j]->n_multi; ++k) {
-						int strand;
-						bwt_multi1_t *q = p[j]->multi + k;
-						q->pos = bwa_sa2pos(bns, bwt, q->pos, p[j]->len + q->ref_shift, &strand);
-						q->strand = strand;
-						if (q->pos != p[j]->pos && q->pos != (bwtint_t)-1)
-							p[j]->multi[n_multi++] = *q;
-					}
-					p[j]->n_multi = n_multi;
+				if (!did[(size_t)(i - g0) * 2 + j]) continue;
+				bwa_seq_t *pj = seqs[j] + i;
+				int k, n_multi;
+				for (k = 0, n_multi = 0; k < pj->n_multi; ++k) {
+					int strand;
+					bwt_multi1_t *q = pj->multi + k;
+					q->pos = bwa_pos_from_sa(bns, mrows[c++], pj->len + q->ref_shift, &strand);
+					q->strand = strand;
+					if (q->pos != pj->pos && q->pos != (bwtint_t)-1)
+						pj->multi[n_multi++] = *q;
 				}
+				pj->n_multi = n_multi;
 			}
 		}
 	}
 
-	kv_destroy(d->arr);
+	d->arr.a = 0; // a view into arr
 	free(d);
 	return cnt_chg;
+}
+
+int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
+				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt)
+{
+	return bwa_pe_pair_grouped(bns, bwt, n_seqs, seqs, ii, opt, gopt, ALN_PE_GROUP_ROWS);
 }
 
 int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],

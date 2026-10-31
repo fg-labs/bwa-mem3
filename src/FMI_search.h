@@ -132,6 +132,15 @@ typedef struct bsd_first_walk_hint
 
 #define SAL_PFD 16
 
+/* Lane count of the pipelined compressed-SA resolver (get_sa_entries_prefetch), also used by
+ * aln's bwt_sa_batch; the measurements behind each value are in FMI_search.cpp. The count only
+ * sets how many fetches are in flight; results are byte-identical at every width. */
+#if defined(__x86_64__) || defined(_M_X64)
+#define SA_RESOLVE_LANES_DEFAULT 40
+#else
+#define SA_RESOLVE_LANES_DEFAULT 48
+#endif
+
 /* SMEM_LOCKSTEP_N (phase-2 SMEM lockstep width, the compile-time floor/default
  * and the enable guard) and SMEM_LOCKSTEP_N_MAX now live in lockstep_width.h,
  * included above, alongside the runtime width g_smem_lockstep_n and the startup

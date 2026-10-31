@@ -3379,12 +3379,10 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
  * rep-to-rep spread of 40 and 64). An A/B of 48 against 20 on the same slice,
  * 6 rotated pairs at -t 16: MEM_SA -13.3%, user CPU -0.59% and wall -0.84%
  * (user lower in 6/6). Only Graviton4 was measured; the value also applies to
- * every other non-x86 build, Apple Silicon included. */
-#if defined(__x86_64__) || defined(_M_X64)
-#define SA_RESOLVE_LANES_DEFAULT 40
-#else
-#define SA_RESOLVE_LANES_DEFAULT 48
-#endif
+ * every other non-x86 build, Apple Silicon included.
+ *
+ * SA_RESOLVE_LANES_DEFAULT itself is defined in FMI_search.h, so that aln's
+ * batched SA lookup (bwt_sa_batch, src/aln/aln_bwt.cpp) uses the same count. */
 #define SA_RESOLVE_LANES_MAX 64
 /* The resolver's lane arrays (working_set/map_pos/offset) are sized to
  * SA_RESOLVE_LANES_MAX and indexed by sa_batch_size, which is clamped into

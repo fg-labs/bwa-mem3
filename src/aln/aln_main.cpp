@@ -109,7 +109,8 @@ struct se_ctx_t {
 };
 
 /* Single end, reads [st, st + n): SA to position, refinement, MD, trim correction and SAM text;
- * bwa_cal_pac_pos and bwa_refine_gapped are upstream's batch loops run on the slice. */
+ * bwa_cal_pac_pos (with its SA lookups batched) and bwa_refine_gapped are upstream's batch loops
+ * run on the slice. */
 void se_post_worker(void *data, int st, int n, int tid)
 {
 	se_ctx_t *c = (se_ctx_t*)data;

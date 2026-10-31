@@ -25,11 +25,11 @@ contributors" line in the headers of the files derived from them was added here.
 | --- | --- |
 | `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack), plus the chunked stack `gap_cstack_t`/`gap_pool_t` (new) |
 | `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out, plus `width_walk_init`/`width_walk_run` (new) |
-| `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_cnt_ambi` from `bntseq.c` |
+| `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_cnt_ambi` from `bntseq.c`; `bwa_pos_from_sa` (new) is `bwa_sa2pos`'s tail, split out |
 | `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, and `bwa_paired_sw`'s body as `bwa_paired_sw_core`/`bwa_paired_sw_report`) |
 | `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code (MIT, as the rest of bwa-mem3; `SPDX-License-Identifier` line): the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
 | `aln_alloc.h` | new code (MIT): `aln_malloc`/`aln_calloc`/`aln_realloc`/`aln_strdup`, which exit with a message on allocation failure; every allocation in the files above goes through them (upstream dereferences the result unchecked) |
-| `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
+| `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`, plus the new `bwt_sa_batch`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
 
 ## Modifications
 
@@ -81,8 +81,8 @@ Each change to upstream-derived code adds a line here.
   are always used). Every object here is built with `-ffp-contract=off` (Makefile) so the
   floating-point code in `bwape.cpp` (named below) rounds as a stock build without FP
   contraction does; `bwa_cal_maxdiff` itself has no multiply-add to fuse.
-- `bwase.cpp`/`bwase.h`: `bwa_aln2seq_core`, `bwa_aln2seq`, `bwa_approx_mapQ`, `bwa_sa2pos`,
-  `bwa_cal_pac_pos_core`, `bwa_refine_gapped_core`, `bwa_cal_md1`, `bwa_correct_trimmed`,
+- `bwase.cpp`/`bwase.h`: `bwa_aln2seq_core`, `bwa_aln2seq`, `bwa_approx_mapQ`, `bwa_sa2pos` (now
+  `bwt_sa` plus its split-out tail `bwa_pos_from_sa`), `bwa_cal_pac_pos_core`, `bwa_refine_gapped_core`, `bwa_cal_md1`, `bwa_correct_trimmed`,
   `pos_end`, `bwa_print_sam1` and `bwase_initialize` are upstream's bodies, in
   `namespace bwa_aln`, with these changes: `bwa_print_sam1` and the header writer append to
   a `kstring_t` instead of writing to stdout (`bwa_print_seq` likewise); `bwa_cal_pac_pos`
@@ -150,7 +150,8 @@ Each change to upstream-derived code adds a line here.
   run leaves no output; help text lists each option with its stock default and source command.
 - `bwape.cpp`/`bwape.h`: `bwa_cal_pac_pos_pe` is cut into its four stages, `bwa_pe_aln2seq` (the
   `drand48` draws), `bwa_pe_se_pos`, `bwa_pe_isize` (`infer_isize` and the `last_ii` fallback) and
-  `bwa_pe_pair`, each holding upstream's loop body unchanged; `bwa_cal_pac_pos_pe` calls them in turn
+  `bwa_pe_pair`, each holding upstream's loop body unchanged apart from the batched SA lookups (see
+  "Batched SA lookups" below); `bwa_cal_pac_pos_pe` calls them in turn
   (the driver calls the stages itself; `bwa_cal_pac_pos_pe` is kept for the unit tests).
   `bwa_paired_sw` is likewise split into `bwa_paired_sw_core` (the loop, adding to the counts) and
   `bwa_paired_sw_report` (the two stderr lines); the wrapper itself is not kept. The `bwa_aln2seq_core` calls in `bwa_pe_pair` use
@@ -159,7 +160,8 @@ Each change to upstream-derived code adds a line here.
 - The driver runs the stages after the search on `kt_for` (stage order below). Single end: the `drand48`
   pass (`bwa_aln2seq_core`) runs serially over the batch in read order, then position, refinement, MD,
   trim correction and SAM text run in parallel on slices of the batch (`bwa_cal_pac_pos`,
-  `bwa_refine_gapped` and `bwa_print_sam1` unchanged, on each slice). Paired end: `bwa_pe_aln2seq`
+  `bwa_refine_gapped` and `bwa_print_sam1` unchanged apart from `bwa_cal_pac_pos`'s batched SA
+  lookups, on each slice). Paired end: `bwa_pe_aln2seq`
   serially in stock order (pair by pair, read 1 then read 2), `bwa_pe_se_pos` in parallel,
   `bwa_pe_isize` as a barrier, then pairing, mate Smith-Waterman, refinement and each pair's records in
   parallel. Each slice's text goes to its thread's buffer, and the slices are written in read order; a
@@ -213,3 +215,18 @@ Each change to upstream-derived code adds a line here.
   as in the array, and the bucket popped is chosen by the same code, so entries come off in the same
   order and each read's hits are unchanged. `bwt_match_gap` keeps upstream's `gap_stack_t` and is the
   unit tests' reference.
+- Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
+  walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
+  block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone
+  (row 0 gives `(bwtint_t)-1`, as `bwt_sa`). `bwa_sa2pos` is split into `bwt_sa` and its tail,
+  `bwa_pos_from_sa`, unchanged. `bwa_cal_pac_pos` and `bwa_pe_se_pos` collect the rows their loop
+  looks up, in the loop's order, resolve them in one call, then run upstream's loop taking each
+  result in turn. `bwa_pe_pair` takes the pairs in groups of consecutive pairs whose weight
+  (pairing rows, plus an upper bound on the extra hits their bodies can generate, plus one per
+  pair) is at most `ALN_PE_GROUP_ROWS` (8,192); a heavier pair is a group alone, so each group
+  buffer holds at most that many entries or one pair's rows, which upstream holds for that pair
+  too. Per group it resolves the group's pairing rows, runs upstream's body pair by pair up to the
+  extra hits' lookups (each pair's array is built in upstream's push order, so `pairing` sees the
+  same input), then resolves the group's extra-hit rows and finishes each pair. A pair over
+  `max_occ` still skips its extra hits. A pair's body reads and writes only that pair's reads, and
+  no stage here draws from `drand48`, so the output is the same as upstream's single pass.

@@ -4,12 +4,14 @@
  *
  * MODIFIED from the original: moved into namespace bwa_aln; alignments come from each
  * read's own aln array instead of being read from a .sai file; bwa_cal_pac_pos_pe is cut into
- * four stages and bwa_paired_sw into a counting core and a report. See README.md. */
+ * four stages and bwa_paired_sw into a counting core and a report; bwa_pe_pairing and
+ * bwa_pe_pair_grouped are new (for the unit tests). See README.md. */
 #ifndef BWA_MEM3_ALN_BWAPE_H
 #define BWA_MEM3_ALN_BWAPE_H
 
 #include "bwtaln.h"
 #include "../bntseq.h"
+#include "../utils.h"
 
 namespace bwa_aln {
 
@@ -51,6 +53,18 @@ void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t
 				  const isize_info_t *last_ii);
 int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
 				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt);
+/* sampe's pairing of one pair, for the unit tests' reference: `arr` holds upstream's
+ * (position, k<<2 | strand<<1 | end) array for the pair (sorted in place); the alignments are
+ * p[0]->aln and p[1]->aln. Returns the number of alignments whose position changed. */
+int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
+/* The largest weight of a group of pairs in bwa_pe_pair (see bwa_pe_pair_grouped). */
+constexpr long long ALN_PE_GROUP_ROWS = 8192;
+/* bwa_pe_pair with the group size as a parameter (bwa_pe_pair passes ALN_PE_GROUP_ROWS); the unit
+ * tests call it with other sizes. It makes its SA lookups in batches over groups of consecutive
+ * pairs of weight up to group_rows: pairing rows, plus a bound on extra hits, plus one per pair;
+ * a heavier pair is a group alone. The output does not depend on group_rows. */
+int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
+						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows);
 
 /* Mate Smith-Waterman for unpaired reads: upstream's bwa_paired_sw without its stderr report
  * (the driver calls these two directly; upstream's wrapper is not kept). Does nothing unless popt->is_sw and ii->avg >= 0;
