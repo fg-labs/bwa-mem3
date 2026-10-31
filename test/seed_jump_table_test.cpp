@@ -399,11 +399,19 @@ int main(int argc, char *argv[])
         report(np->seed_jump == NULL && np->seed_jump_depth == 0,
                "load_index(build_seed_jump=false): no table");
         delete np;
-        FmiSeed *h = fmi_seed_open(prefix);
-        report(h != NULL && h->fmi->shm_base == NULL && h->fmi->seed_jump == NULL
-                   && h->fmi->seed_jump_depth == 0,
-               "fmi_seed_open (disk load): no table");
-        fmi_seed_close(h);
+        /* fmi_seed_open attaches to a staged segment rather than load from
+         * disk, and nothing turns that off, so with the fixture already staged
+         * on this host (e.g. by `bwa-mem3 shm`) there is no disk load to test. */
+        if (bwa_shm_test(prefix) == 1) {
+            fprintf(stderr, "[SKIP] fmi_seed_open (disk load): no table: %s is staged in shm "
+                    "on this host, so it would attach instead of loading from disk\n", prefix);
+        } else {
+            FmiSeed *h = fmi_seed_open(prefix);
+            report(h != NULL && h->fmi->shm_base == NULL && h->fmi->seed_jump == NULL
+                       && h->fmi->seed_jump_depth == 0,
+                   "fmi_seed_open (disk load): no table");
+            fmi_seed_close(h);
+        }
     }
 
     /* An index attached from a packed segment: load_index_from_shm builds no
