@@ -152,3 +152,55 @@ TEST_CASE("aln_bwt: L2 is cumulative base counts of the fwd+revcomp text"
     for (int c = 0; c < 4; ++c)
         CHECK(ix.bwt->L2[c + 1] - ix.bwt->L2[c] == fwd[c] + fwd[3 - c]);
 }
+
+TEST_CASE("aln_bwt: bwt_sa_batch equals bwt_sa for every row, in any order, with repeats"
+          * doctest::test_suite("unit/aln_bwt")) {
+    AlnIndex &ix = index_fixture();
+    const ba::bwtint_t n = ix.bwt->seq_len; // rows 0..seq_len
+    std::vector<ba::bwtint_t> want(n + 1);
+    for (ba::bwtint_t k = 0; k <= n; ++k) want[k] = ba::bwt_sa(ix.bwt, k);
+    CHECK(want[0] == (ba::bwtint_t)(-1));
+
+    // every row in order, row 0 and the last row included; separate and in-place output
+    std::vector<ba::bwtint_t> rows(n + 1), out(n + 1);
+    for (ba::bwtint_t k = 0; k <= n; ++k) rows[k] = k;
+    ba::bwt_sa_batch(ix.bwt, rows.data(), (int64_t)rows.size(), out.data());
+    for (ba::bwtint_t k = 0; k <= n; ++k) REQUIRE_MESSAGE(out[k] == want[k], "row " << k);
+    ba::bwt_sa_batch(ix.bwt, rows.data(), (int64_t)rows.size(), rows.data());
+    for (ba::bwtint_t k = 0; k <= n; ++k) REQUIRE_MESSAGE(rows[k] == want[k], "row " << k << " (in place)");
+
+    // every row in reverse order
+    for (ba::bwtint_t k = 0; k <= n; ++k) rows[k] = n - k;
+    ba::bwt_sa_batch(ix.bwt, rows.data(), (int64_t)rows.size(), out.data());
+    for (ba::bwtint_t k = 0; k <= n; ++k) REQUIRE(out[k] == want[n - k]);
+
+    // empty batch
+    ba::bwt_sa_batch(ix.bwt, nullptr, 0, nullptr);
+
+    // random batches: sizes around the lane count, random order, duplicates, runs of row 0
+    uint32_t state = 17;
+    auto rnd = [&](uint32_t m) { state = state * 1103515245u + 12345u; return (state >> 8) % m; };
+    const int L = SA_RESOLVE_LANES_DEFAULT; // bwt_sa_batch's lane count
+    const int sizes[] = {1, 2, 7, L - 1, L, L + 1, 2 * L - 1, 2 * L, 2 * L + 1, 500, 3000};
+    for (int it = 0; it < 200; ++it) {
+        const int sz = sizes[it % (int)(sizeof(sizes) / sizeof(sizes[0]))];
+        std::vector<ba::bwtint_t> r((size_t)sz), o((size_t)sz, 12345);
+        for (int i = 0; i < sz; ++i) {
+            const uint32_t kind = rnd(10);
+            if (kind == 0) r[i] = 0;
+            else if (kind == 1) r[i] = n;
+            else if (kind == 2 && i > 0) r[i] = r[rnd((uint32_t)i)];
+            else r[i] = rnd((uint32_t)(n + 1));
+        }
+        ba::bwt_sa_batch(ix.bwt, r.data(), sz, o.data());
+        for (int i = 0; i < sz; ++i) REQUIRE_MESSAGE(o[i] == want[r[i]], "batch " << it << " index " << i);
+    }
+    for (int it = 0; it < 100; ++it) { // in place, checked against a copy of the rows
+        const int sz = sizes[it % (int)(sizeof(sizes) / sizeof(sizes[0]))];
+        std::vector<ba::bwtint_t> r((size_t)sz);
+        for (int i = 0; i < sz; ++i) r[i] = rnd(4) == 0 ? 0 : rnd((uint32_t)(n + 1));
+        const std::vector<ba::bwtint_t> r0 = r;
+        ba::bwt_sa_batch(ix.bwt, r.data(), sz, r.data());
+        for (int i = 0; i < sz; ++i) REQUIRE_MESSAGE(r[i] == want[r0[i]], "in-place batch " << it << " index " << i);
+    }
+}

@@ -82,6 +82,10 @@ inline void bwt_prefetch_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l)
 
 /* SA[k] in bwa's row numbering (row 0 is the `$` suffix and returns (bwtint_t)-1). */
 bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k);
+/* out[i] = bwt_sa(bwt, rows[i]) for i in [0, n), with up to SA_RESOLVE_LANES_DEFAULT
+ * (FMI_search.h) rows' LF walks interleaved so their cache misses overlap. Rows may repeat and come in any order;
+ * out may be rows itself. No allocation. */
+void bwt_sa_batch(const bwt_t *bwt, const bwtint_t *rows, int64_t n, bwtint_t *out);
 
 int bwt_match_exact_alt(const bwt_t *bwt, int len, const ubyte_t *str, bwtint_t *k0, bwtint_t *l0);
 

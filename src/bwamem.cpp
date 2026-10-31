@@ -3759,7 +3759,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
      * per-read call for A/B).
      *
      * get_sa_entries_prefetch is a multi-lane refill pipeline
-     * (SA_RESOLVE_LANES_DEFAULT lanes, FMI_search.cpp) over independent
+     * (SA_RESOLVE_LANES_DEFAULT lanes, FMI_search.h) over independent
      * compressed-SA walks. Calling it once per read starves it: the median read
      * supplies ~13 positions, so when the pipeline was 20 lanes wide mean lane
      * occupancy was only 10.5/20 and ~20% of all walk rounds ran with a SINGLE
