@@ -64,6 +64,33 @@ endif
 LIBS    += $(HTSLIB_static_LIBS)
 LDFLAGS += $(HTSLIB_static_LDFLAGS)
 
+# The default FASTQ reader in libbwa.a (src/fast_reader.c, reached through
+# bseq_read_fast and fr_fastq_next) inflates plain gzip with zlib-ng's native
+# zng_* API and decodes BGZF blocks with libdeflate. Link both, resolved as the
+# parent Makefile resolves them, so a test can call the reader: the vendored
+# static zlib-ng archive by default (built before libbwa.a, whose
+# src/fast_reader.o depends on it), a host zlib-ng with ZLIBNG_USE_VENDORED=0,
+# and libdeflate from Homebrew on macOS. On Linux htslib's static deps usually
+# carry -ldeflate already; naming it again is harmless. Each library comes
+# after -lbwa in $(LIBS), as a static link needs. A ZLIBNG_USE_VENDORED given
+# to the parent's command line reaches this sub-make; a standalone `make -C
+# test` must be given the value libbwa.a was built with.
+ZLIBNG_USE_VENDORED ?= 1
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+    LIBS += ../ext/zlib-ng/build/libz-ng.a
+else ifeq ($(UNAME_S),Darwin)
+    ZLIBNG_PREFIX ?= $(shell brew --prefix zlib-ng 2>/dev/null)
+    LIBS += -L$(ZLIBNG_PREFIX)/lib -lz-ng
+else
+    LIBS += -lz-ng
+endif
+ifeq ($(UNAME_S),Darwin)
+    LIBDEFLATE_PREFIX ?= $(shell brew --prefix libdeflate 2>/dev/null)
+    LIBS += -L$(LIBDEFLATE_PREFIX)/lib -ldeflate
+else
+    LIBS += -ldeflate
+endif
+
 ifneq ($(IS_ARM),)
     # Keep the ARM cache-line alignment in lock-step with the top-level Makefile:
     # CACHE_LINE_BYTES feeds _mm_malloc, so a build overriding
@@ -289,6 +316,12 @@ $(INTEGRATION_DIR)/placeholder.o: $(INTEGRATION_DIR)/placeholder.cpp
 # parent's flag stamp old keeps that difference from rewriting the stamp and
 # recompiling these objects; they are still rebuilt when missing or when a
 # source or header changed.
+# The vendored zlib-ng archive is linked through $(LIBS) too, so it is asked
+# for here as well: a libbwa.a restored from a cache does not bring it along.
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+PARENT_EXTRA_OBJS += ext/zlib-ng/build/libz-ng.a
+endif
+
 libsais-objs:
 	$(MAKE) -C .. -o .build-flags ext/libsais/src/libsais.o ext/libsais/src/libsais64.o $(PARENT_EXTRA_OBJS)
 
