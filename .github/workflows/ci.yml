@@ -1905,6 +1905,12 @@ jobs:
           HEADER_PARITY_WORK_DIR=/tmp/header-parity \
           bash test/regression/header_parity.sh
 
+      - name: SAM and --bam carry the same header and records (-H, sidecar @SQ order, @HD)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          HDR_PARITY_WORK_DIR=/tmp/sam-bam-header-parity \
+          bash test/regression/sam_bam_header_parity.sh
+
       - name: proper-pair ALT derivation regression (--proper-pair-from-emitted)
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \

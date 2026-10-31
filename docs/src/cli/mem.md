@@ -262,9 +262,9 @@ Notes and caveats:
   not divergences: `--fast` is an opaque multi-flag bundle (not a single knob a
   user could sanely override), and no target has a bisulfite mode, so
   "byte-identical to X under `--meth`" is undefined rather than merely violated.
-- **An `@HD` in `-H` warns but is allowed.** bwa-mem3 hoists a *leading* user
-  `@HD` above the `@SQ` block, so the header is spec-valid (`@HD` must come
-  first). Neither target does that — bwa emits `-H` records after `@SQ` and
+- **An `@HD` in `-H` warns but is allowed.** bwa-mem3 moves the user's `@HD`
+  to the first line, wherever it sits in `-H`, so the header is spec-valid
+  (`@HD` must come first). Neither target does that — bwa emits `-H` records after `@SQ` and
   bwa-mem2 has no `@HD` handling at all — so the header differs from the target
   in **line order**. Records are unaffected.
 
@@ -337,6 +337,14 @@ them to the `@PG CL:` field, preventing header corruption (fix for issue #45).
 If `STR` begins with `@`, it is injected verbatim as a header line. Otherwise
 `STR` is treated as a path and every line in the file is injected. Useful for
 adding `@CO` comments or custom `@RG` / `@PG` entries.
+
+As in bwa, `-H` `@SQ` records replace the index's `@SQ` block (and the
+`<prefix>.hdr` / `<baseprefix>.dict` sidecar is then ignored), verbatim and in
+the order given. Exactly one `@HD` is written, as the first line: the first one
+in `-H`, else the sidecar's, else the default. SAM text and `--bam` get the same
+header. A `--bam` record refers to its contig by position in the header's
+`@SQ` list, so `--bam` maps each contig by name onto the `@SQ` block and fails
+at startup, naming the contig, if an index contig has no `@SQ` record there.
 
 #### `-p` — smart pairing
 
