@@ -26,6 +26,7 @@ src/version.h
 /rescue_band_harness
 /rescue_band_kernel_eq
 /rescue_prune_eq
+/aln_sai_dump
 
 # doctest suites built by test/Makefile
 /test/bwa_mem3_tests_unit
