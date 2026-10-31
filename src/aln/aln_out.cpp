@@ -87,7 +87,9 @@ int aln_out_write_buf(aln_out_t *o, const char *buf, size_t buf_l)
 		o->line.l = 0;
 		kputsn(p, n, &o->line);
 		if (sam_parse1(&o->line, o->hdr, o->b) < 0 || sam_write1(o->hf, o->hdr, o->b) < 0) {
-			fprintf(stderr, "[E::%s] cannot convert or write a BAM record\n", __func__);
+			const char *tab = (const char*)memchr(p, '\t', n);
+			fprintf(stderr, "[E::%s] cannot convert or write the BAM record of read '%.*s' (a read containing '-' cannot be written as BAM)\n",
+					__func__, (int)(tab ? tab - p : n), p);
 			o->failed = 1;
 			return -1;
 		}

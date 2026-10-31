@@ -40,7 +40,7 @@ void aln_opt_init(aln_opt_t *o)
 	o->batch_size = 0x40000;
 }
 
-/* The stages after the search run in parallel on kt_for (design §6.2): every drand48() draw
+/* The stages after the search run in parallel on kt_for (stage order, as follows): every drand48() draw
  * stays in one serial pass, in stock order, before them; infer_isize is a barrier between the
  * paired-end passes; the records are formatted in parallel and written in read order. */
 
@@ -228,7 +228,12 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	int ret = 0;
 	bwa_seq_t *seqs[2];
 	int n_in[2];
-	while ((seqs[0] = bwa_read_seq(ks[0], o->batch_size, &n_in[0], o->gap.mode, o->gap.trim_qual)) != 0) {
+	bool r1_done = false;
+	while (true) {
+		if ((seqs[0] = bwa_read_seq(ks[0], o->batch_size, &n_in[0], o->gap.mode, o->gap.trim_qual)) == 0) {
+			r1_done = true;
+			break;
+		}
 		seqs[1] = bwa_read_seq(ks[1], o->batch_size, &n_in[1], o->gap.mode, o->gap.trim_qual);
 		if (!seqs[1]) {
 			fprintf(stderr, "[W::aln] read 2 file ended before read 1 file; ignoring the remaining %d read(s) of read 1\n", n_in[0]);
@@ -279,6 +284,14 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		if (ret) break;
 		last_ii = ii;
 		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld read pairs have been processed.\n", tot);
+	}
+	if (r1_done && !ret) { // R1 ran out first: say so if R2 still has reads
+		int n_extra = 0;
+		bwa_seq_t *extra = bwa_read_seq(ks[1], 1, &n_extra, o->gap.mode, o->gap.trim_qual);
+		if (extra) {
+			fprintf(stderr, "[W::aln] read 1 file ended before read 2 file; ignoring the remaining read(s) of read 2\n");
+			bwa_free_read_seq(n_extra, extra);
+		}
 	}
 	bwa_seq_close(ks[0]);
 	bwa_seq_close(ks[1]);
@@ -386,7 +399,7 @@ int main_aln(int argc, char *argv[])
 	aln_opt_t o;
 	aln_opt_init(&o);
 	gap_opt_t *opt = &o.gap;
-	int c, opte = -1, bam = 0, bam_level = 1, pe_flag = 0;
+	int c, opte = -1, bam = 0, bam_level = 1, pe_flag = 0, bc_len = 0;
 	const char *out_path = NULL;
 	char *rg_line = NULL;
 	static const struct option long_opts[] = {
@@ -433,7 +446,7 @@ int main_aln(int argc, char *argv[])
 			break;
 		case 'I': opt->mode |= BWA_MODE_IL13; break;
 		case 'Y': opt->mode |= BWA_MODE_CFY; break;
-		case 'B': opt->mode |= atoi(optarg) << 24; break;
+		case 'B': { int b = atoi(optarg); if (b > bc_len) bc_len = b; opt->mode |= b << 24; break; }
 		case 'a': o.pe.max_isize = atoi(optarg); pe_flag = 1; break;
 		case 'c': o.pe.ap_prior = atof(optarg); pe_flag = 1; break;
 		case 's': o.pe.is_sw = 0; pe_flag = 1; break;
@@ -459,6 +472,15 @@ int main_aln(int argc, char *argv[])
 	const int paired = optind + 3 == argc;
 	if (pe_flag && !paired)
 		fprintf(stderr, "[W::%s] paired-end options (-a, -c, -s, -A, -P, --max-occ, --max-xa-hits-discordant) are ignored with one FASTQ\n", __func__);
+
+	{
+		const int max_bc = paired ? BWA_MAX_BCLEN / 2 : BWA_MAX_BCLEN; // paired: both barcodes are joined into one buffer
+		if (bc_len > max_bc) {
+			fprintf(stderr, "[E::%s] -B %d is too long: the maximum barcode length is %d%s\n", __func__, bc_len, max_bc,
+					paired ? " with two read files (the two barcodes are joined)" : "");
+			return 1;
+		}
+	}
 
 	const char *prefix = argv[optind], *fn_fq = argv[optind + 1];
 	{

@@ -6,6 +6,8 @@
  * .sai reading and command line) in namespace bwa_aln. Each read's alignments are taken from
  * its own aln array; the dead hash-table branch is dropped; the reference is always
  * the packed in-memory copy. The mate alignment uses bwa-mem3's ksw_align and ksw_global.
+ * bwa_cal_pac_pos_pe is cut into four stages and bwa_paired_sw into a counting core and a report
+ * (the two stderr lines), so the driver can run them in parallel; each holds upstream's loop body.
  * See README.md. */
 #include "bwape.h"
 
