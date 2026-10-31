@@ -344,15 +344,14 @@ fi
 # The pipelined compressed-SA resolver (get_sa_entries_prefetch / call_one_step)
 # vs a scalar LF walk computed straight from the checkpoint blocks, over every
 # SA row of the fixture plus strided multi-occurrence intervals; gates the
-# arm64 branchless symbol test and NEON occurrence popcount in call_one_step.
+# branchless symbol select (NEON and x86 arms) and the NEON occurrence popcount
+# in call_one_step.
 if OUT="$(cd "$HERE" && env -u BWA3_SA_LANES ./sa_resolve_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
     if echo "$OUT" | grep -q "SA resolve PARITY PASS"; then
         ok "sa_resolve_parity_test"
-    elif echo "$OUT" | grep -q "SA resolve PARITY SKIP"; then
-        skip "sa_resolve_parity_test (non-AArch64)"
     else
         echo "$OUT"
-        fail "sa_resolve_parity_test: no PASS or SKIP line"
+        fail "sa_resolve_parity_test: no PASS line"
     fi
 else
     echo "$OUT"
@@ -366,11 +365,9 @@ fi
 if OUT="$(cd "$HERE" && BWA3_SA_LANES=1 ./sa_resolve_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
     if echo "$OUT" | grep -q "SA resolve PARITY PASS"; then
         ok "sa_resolve_parity_test (BWA3_SA_LANES=1)"
-    elif echo "$OUT" | grep -q "SA resolve PARITY SKIP"; then
-        skip "sa_resolve_parity_test (BWA3_SA_LANES=1, non-AArch64)"
     else
         echo "$OUT"
-        fail "sa_resolve_parity_test (BWA3_SA_LANES=1): no PASS or SKIP line"
+        fail "sa_resolve_parity_test (BWA3_SA_LANES=1): no PASS line"
     fi
 else
     echo "$OUT"
@@ -384,11 +381,9 @@ fi
 if OUT="$(cd "$HERE" && BWA3_SA_LANES=64 ./sa_resolve_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
     if echo "$OUT" | grep -q "SA resolve PARITY PASS"; then
         ok "sa_resolve_parity_test (BWA3_SA_LANES=64)"
-    elif echo "$OUT" | grep -q "SA resolve PARITY SKIP"; then
-        skip "sa_resolve_parity_test (BWA3_SA_LANES=64, non-AArch64)"
     else
         echo "$OUT"
-        fail "sa_resolve_parity_test (BWA3_SA_LANES=64): no PASS or SKIP line"
+        fail "sa_resolve_parity_test (BWA3_SA_LANES=64): no PASS line"
     fi
 else
     echo "$OUT"
@@ -402,11 +397,9 @@ for lanes in 48 40; do
     if OUT="$(cd "$HERE" && BWA3_SA_LANES=$lanes ./sa_resolve_parity_test "$FIXTURES/phix.fa" 2>&1)"; then
         if echo "$OUT" | grep -q "SA resolve PARITY PASS"; then
             ok "sa_resolve_parity_test (BWA3_SA_LANES=$lanes)"
-        elif echo "$OUT" | grep -q "SA resolve PARITY SKIP"; then
-            skip "sa_resolve_parity_test (BWA3_SA_LANES=$lanes, non-AArch64)"
         else
             echo "$OUT"
-            fail "sa_resolve_parity_test (BWA3_SA_LANES=$lanes): no PASS or SKIP line"
+            fail "sa_resolve_parity_test (BWA3_SA_LANES=$lanes): no PASS line"
         fi
     else
         echo "$OUT"
