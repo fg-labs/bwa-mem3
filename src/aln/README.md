@@ -22,6 +22,8 @@ tag. Each file keeps its upstream copyright block.
 | --- | --- |
 | `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack) |
 | `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out |
+| `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_get_seq` and `bns_cnt_ambi` from `bntseq.c` |
+| `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code: the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
 | `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
 
 ## Modifications
@@ -62,3 +64,29 @@ Each task that changes or adds upstream-derived code appends a line here.
   `bwa_aln` (option parsing and usage) and the `HAVE_PTHREAD` conditionals (pthreads
   are always used). The code is built with `-ffp-contract=off` (Makefile) so
   `bwa_cal_maxdiff` rounds as stock's does.
+- `bwase.cpp`/`bwase.h`: `bwa_aln2seq_core`, `bwa_aln2seq`, `bwa_approx_mapQ`, `bwa_sa2pos`,
+  `bwa_cal_pac_pos_core`, `bwa_refine_gapped_core`, `bwa_cal_md1`, `bwa_correct_trimmed`,
+  `pos_end`, `bwa_print_sam1` and `bwase_initialize` are upstream's bodies, in
+  `namespace bwa_aln`, with these changes: `bwa_print_sam1` and the header writer append to
+  a `kstring_t` instead of writing to stdout (`bwa_print_seq` likewise); `bwa_cal_pac_pos`
+  takes the `bwt_t` as a parameter instead of reloading `.bwt` and `.sa` from disk, and
+  `bwa_refine_gapped` always receives the packed reference (upstream's `NULL` branch that
+  reads `.pac` is dropped); the `.sai` reading, `bwa_sai2sam_se_core` and the samse command
+  line are not ported (alignments come from the search's `aln` arrays, and the driver is
+  `aln_main.cpp`); and `bwa_print_sam1` / `bwa_refine_gapped_core` have C++ casts. Output
+  goes to a sink that writes per batch, in read order.
+- `bwase.cpp`: `bns_get_seq` and `bns_cnt_ambi` are upstream `bntseq.c`'s bodies, kept as
+  file-local `aln_bns_get_seq` / `aln_bns_cnt_ambi`. bwa-mem3's own `bns_cnt_ambi` counts every
+  overlapping N run (upstream stops at the first), which would change the `XN` tag.
+- `aln_print_sam_hdr` follows bwa **0.7.19's** header output, not the Apache2 branch's
+  `bwa_print_sam_hdr`. The branch prints `@SQ` before `@HD` and finds `@HD` anywhere in the
+  `-r` text; the release prints `@HD` first (unless a line of the `-r` text starts `@HD<tab>`),
+  then `@SQ`, then the `-r` text. The release is the parity target, so its order is used. The
+  `@PG` line is bwa-mem3's own (same builder as `mem`); parity checks drop `@PG` lines.
+- `bwa-mem3 aln` differs from running `bwa aln` then `bwa samse` in its command line: it takes
+  `aln`'s options, `-f` and `-r` (samse's), and `--max-xa-hits` for samse's `-n`. `-b`, `-0`, `-1`
+  and `-2` (BAM input) are not accepted. `-r` with a literal tab is rejected as stock does
+  (bwa-mem3's `bwa_set_rg` alone would accept it). `--bam` and `--bam-level` are new.
+- `srand48(bns->seed)` is called once per run, before the first batch, and `bwa_aln2seq_core` runs
+  serially in read order, so the random choice among equally good hits is the same as stock's
+  and does not depend on `-t`.
