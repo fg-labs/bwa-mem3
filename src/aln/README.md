@@ -20,6 +20,8 @@ tag. Each file keeps its upstream copyright block.
 
 | File | Origin |
 | --- | --- |
+| `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack) |
+| `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out |
 | `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
 
 ## Modifications
@@ -41,3 +43,22 @@ Each task that changes or adds upstream-derived code appends a line here.
   local because bwa-mem3's differs at `'-'` (5 upstream, 4 here). Parsing uses
   bwa-mem3's `kseq.h`, whose record handling matches upstream's; its differences are
   an OOM guard, a wider `kseq_read` return type and extra sequence-buffer slack.
+- `bwtgap.cpp`/`bwtgap.h`: `gap_init_stack*`, `gap_destroy_stack`, `bwt_match_gap` and the
+  stack helpers are upstream's bodies, in `namespace bwa_aln`. Dropped: the `extern "C"`
+  block, the malloc wrappers and the `bwa_aln2seq` declaration (ported with the SAM
+  code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
+  `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch` and
+  `aln_batch_max_gapo`, which are new.
+- `bwtaln.cpp`: `gap_init_opt`, `bwa_cal_maxdiff` and `bwt_cal_width` are upstream's
+  bodies. `bwa_cal_sa_reg_gap` differs in three ways. (1) The read is complemented into
+  a per-thread scratch buffer instead of in place, and `name`, `seq`, `rseq` and `qual`
+  are no longer freed, so the SAM stage can use the same reads. (2) The batch-wide
+  `max_len`, the `max_diff` derived from it and the `max_gapo` cap are computed once in
+  `aln_search_batch` before the threads start (upstream repeats the same computation in
+  every thread) and passed down; the per-read `max_diff` is recomputed per read as
+  upstream does. (3) The thread count is a parameter rather than `opt->n_threads`, and
+  `i % n_threads == tid` is applied for one thread too, so a count of 0 cannot divide by
+  zero. Dropped: `bwa_aln_core` (the `.sai` writer and read loop), `bwa_open_reads`,
+  `bwa_aln` (option parsing and usage) and the `HAVE_PTHREAD` conditionals (pthreads
+  are always used). The code is built with `-ffp-contract=off` (Makefile) so
+  `bwa_cal_maxdiff` rounds as stock's does.
