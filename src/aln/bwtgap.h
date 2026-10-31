@@ -6,8 +6,8 @@
  * extern "C" block is dropped, the bwa_aln2seq declaration is left out (it is ported
  * with the SAM code), and the declarations of the search entry points from upstream's
  * bwtaln.c (gap_init_opt, bwa_cal_maxdiff, bwt_cal_width) are added together with
- * aln_search_batch, aln_batch_max_gapo, the gap_job_t interleaved search and the width_walk_t
- * resumable width walk, which are new. */
+ * aln_search_batch, aln_batch_max_gapo, the gap_job_t interleaved search with its chunked
+ * stack (gap_cstack_t, gap_pool_t) and the width_walk_t resumable width walk, which are new. */
 #ifndef BWA_MEM3_ALN_BWTGAP_H
 #define BWA_MEM3_ALN_BWTGAP_H
 
@@ -43,8 +43,66 @@ void gap_destroy_stack(gap_stack_t *stack);
 bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_width_t *w,
 						  bwt_width_t *seed_w, const gap_opt_t *opt, int *_n_aln, gap_stack_t *stack);
 
+/* The stack gap_job_t uses (new code; see bwtgap.cpp). It holds the same entries as gap_stack_t
+ * and pops them in exactly the same order (the lowest-score non-empty bucket, last in first
+ * out within a bucket), but each bucket is a chain of fixed-size chunks taken from, and given
+ * back to, a gap_pool_t, so the memory it holds follows the entries in use instead of each
+ * bucket's high-water mark. A pool serves one thread's stacks (it has no locking); it keeps at
+ * most max_free free chunks and frees the rest. */
+constexpr int GAP_CHUNK_BYTES = 16384;
+constexpr int GAP_CHUNK_ENTRIES = (int)((GAP_CHUNK_BYTES - sizeof(void*)) / sizeof(gap_entry_t));
+typedef struct gap_chunk_s gap_chunk_t;
+struct gap_chunk_s {
+	gap_chunk_t *prev; // the chunk below this one in its bucket (or in the free list)
+	gap_entry_t e[GAP_CHUNK_ENTRIES];
+};
+static_assert(sizeof(gap_chunk_t) <= GAP_CHUNK_BYTES, "a stack chunk must fit in GAP_CHUNK_BYTES");
+static_assert(GAP_CHUNK_ENTRIES == 511, "src/aln/README.md states 511 entries per chunk");
+
+typedef struct {
+	gap_chunk_t *free_list;
+	int n_free, max_free;
+	// chunks allocated through this pool and not yet freed, in use or free: leak accounting,
+	// checked by gap_destroy_pool and read by the unit tests
+	long n_alloc;
+} gap_pool_t;
+
+/* Free stack chunks a thread's pool keeps for reuse (GAP_CHUNK_BYTES each, so 4 MiB); chunks
+ * given back beyond this are freed. A read's stack gives its chunks back as its buckets drain and
+ * when it ends, so the memory held follows the entries in use; this bounds what an idle thread
+ * keeps. Output does not depend on it. */
+constexpr int ALN_POOL_KEEP = 256;
+
+typedef struct {
+	gap_chunk_t *top; // the chunk holding the last entries pushed
+	int top_n;        // entries in `top`
+	int n_entries;    // entries in the bucket
+} gap_bucket_t;
+
+typedef struct {
+	int n_stacks, best, n_entries;
+	gap_bucket_t *stacks;
+	gap_pool_t *pool;
+} gap_cstack_t;
+
+void gap_init_pool(gap_pool_t *pool, int max_free);
+void gap_destroy_pool(gap_pool_t *pool); // every stack using it must have been released (checked)
+gap_cstack_t *gap_init_cstack(int max_mm, int max_gapo, int max_gape, const gap_opt_t *opt, gap_pool_t *pool);
+void gap_release_cstack(gap_cstack_t *stack); // empties the stack, giving its chunks back to the pool
+void gap_destroy_cstack(gap_cstack_t *stack);
+
+/* Out-of-line push, pop and reset of both stacks (gap_stack_t has a reset; gap_cstack_t's is
+ * gap_release_cstack), for the unit tests that compare their pop orders. */
+void gap_stack_push_ext(gap_stack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
+						int n_ins, int n_del, int state, int is_diff, const gap_opt_t *opt);
+void gap_stack_pop_ext(gap_stack_t *stack, gap_entry_t *e);
+void gap_stack_reset_ext(gap_stack_t *stack);
+void gap_cstack_push_ext(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
+						 int n_ins, int n_del, int state, int is_diff, const gap_opt_t *opt);
+void gap_cstack_pop_ext(gap_cstack_t *stack, gap_entry_t *e);
+
 /* bwt_match_gap for one read as a resumable job (new code; see bwtgap.cpp). The caller sets
- * the inputs (len, seq, width, seed_width, opt, stack: what bwt_match_gap takes), then calls
+ * the inputs (len, seq, width, seed_width, opt: what bwt_match_gap takes, and a gap_cstack_t), then calls
  * gap_job_start, which returns 1 if the read is already done; otherwise gap_job_run until it
  * returns 1. Each gap_job_run call that returns 0 has prefetched the Occ blocks its next call
  * reads first: the next bwt_2occ4, or the next base of an exact-match tail (bwt_match_exact_alt,
@@ -57,7 +115,7 @@ typedef struct {
 	const ubyte_t *seq;      // the complemented read, as bwt_match_gap takes it
 	bwt_width_t *width, *seed_width;
 	gap_opt_t opt;
-	gap_stack_t *stack;
+	gap_cstack_t *stack;     // emptied (chunks back to its pool) when the job ends
 	// results
 	bwt_aln1_t *aln;
 	int n_aln;
