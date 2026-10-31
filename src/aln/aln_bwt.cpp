@@ -81,6 +81,12 @@ void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtin
     }
 }
 
+void bwt_prefetch_occ(const bwt_t *bwt, bwtint_t p)
+{
+    const CP_OCC *cp = (const CP_OCC *)bwt->fmi->cp_occ_data();
+    __builtin_prefetch(&cp[p >> CP_SHIFT]);
+}
+
 bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 {
     if (k == 0) return (bwtint_t)(-1); // bwa stores -1 for the `$` suffix; bwa-mem3 stores seq_len

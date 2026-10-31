@@ -8,7 +8,10 @@
  * in place or frees name/seq/rseq/qual: it complements a per-thread scratch copy, so
  * the same reads can go on to the SAM stage. The batch-wide max_gapo cap that upstream
  * computes inside every thread is computed once in aln_search_batch before the fan-out
- * and passed down. The BAM input, .sai writer and command-line parser are not ported. */
+ * and passed down. bwa_cal_sa_reg_gap's one-read-at-a-time loop is replaced by
+ * bwa_cal_sa_reg_gap_group, which prepares each read the same way and interleaves several
+ * reads' searches (gap_job_t in bwtgap.cpp). The BAM input, .sai writer and command-line
+ * parser are not ported. */
 #include "bwtgap.h"
 
 #include <math.h>
@@ -96,43 +99,102 @@ int aln_batch_max_gapo(int n_seqs, const bwa_seq_t *seqs, const gap_opt_t *opt)
 	return batch_opt(n_seqs, seqs, opt).max_gapo;
 }
 
-// `opt` is batch_opt()'s result: max_diff and max_gapo are the batch-wide values.
-static void bwa_cal_sa_reg_gap(int tid, int n_threads, bwt_t *const bwt, int n_seqs, bwa_seq_t *seqs,
-							   const gap_opt_t *opt)
+/* New code: upstream's bwa_cal_sa_reg_gap with several of the thread's reads searched at once
+ * (gap_job_*, bwtgap.cpp). Per read, everything bwa_cal_sa_reg_gap does is done in the same
+ * way: the same widths, the same per-read max_diff and seed_len, the same complemented read
+ * and a stack of its own; only the reads' steps are interleaved, so each read gets the hits
+ * bwt_match_gap gives it. `opt` is batch_opt()'s result: max_diff and max_gapo are the
+ * batch-wide values. */
+namespace {
+struct gap_slot_t {
+	gap_job_t job;
+	std::vector<bwt_width_t> w, seed_w;
+	std::vector<ubyte_t> cseq;
+	bwa_seq_t *p;
+};
+}
+
+/* Reads searched at once per thread. Measured on Apple M2 Max (hg38, 262,144 aDNA reads,
+ * -t 1, default options): 4 reads -36% wall against one at a time, 8 -43%, 12 -43%, 16 -41%,
+ * 32 -40%; 8 was also the best at -t 12. */
+#define ALN_GROUP 8
+
+/* A slot's stack keeps the capacity its largest read needed; with ALN_GROUP stacks per thread
+ * instead of one, that would multiply the stacks' peak memory. After a read whose stack grew
+ * past this many entries, the slot's stack buffers are freed (they regrow on demand), so the
+ * memory held is close to the one-stack-per-thread search's. Output does not depend on it. */
+#define ALN_STACK_KEEP 65536
+
+static void gap_stack_trim(gap_stack_t *stack)
 {
-	int i, j, max_l = 0;
-	gap_stack_t *stack;
-	bwt_width_t *w, *seed_w;
-	gap_opt_t local_opt = *opt;
-	std::vector<ubyte_t> cseq; // the complemented read; seq itself is left alone
-
-	// initiate priority stack
-	stack = gap_init_stack(local_opt.max_diff, local_opt.max_gapo, local_opt.max_gape, &local_opt);
-
-	seed_w = (bwt_width_t*)calloc(opt->seed_len+1, sizeof(bwt_width_t));
-	w = 0;
-	for (i = 0; i != n_seqs; ++i) {
-		bwa_seq_t *p = seqs + i;
-		if (i % n_threads != tid) continue;
-		p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0;
-		if (max_l < p->len) {
-			max_l = p->len;
-			w = (bwt_width_t*)realloc(w, (max_l + 1) * sizeof(bwt_width_t));
-			memset(w, 0, (max_l + 1) * sizeof(bwt_width_t));
-		}
-		bwt_cal_width(bwt, p->len, p->seq, w);
-		if (opt->fnr > 0.0) local_opt.max_diff = bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr);
-		local_opt.seed_len = opt->seed_len < p->len? opt->seed_len : 0x7fffffff;
-		if (p->len > opt->seed_len)
-			bwt_cal_width(bwt, opt->seed_len, p->seq + (p->len - opt->seed_len), seed_w);
-		// core function
-		cseq.resize(p->len + 1);
-		for (j = 0; j < p->len; ++j) // we need to complement
-			cseq[j] = p->seq[j] > 3? 4 : 3 - p->seq[j];
-		p->aln = bwt_match_gap(bwt, p->len, cseq.data(), w, p->len <= opt->seed_len? 0 : seed_w, &local_opt, &p->n_aln, stack);
+	long cap = 0;
+	for (int i = 0; i < stack->n_stacks; ++i) cap += stack->stacks[i].m_entries;
+	if (cap <= ALN_STACK_KEEP) return;
+	for (int i = 0; i < stack->n_stacks; ++i) {
+		free(stack->stacks[i].stack);
+		stack->stacks[i].stack = 0;
+		stack->stacks[i].n_entries = stack->stacks[i].m_entries = 0;
 	}
-	free(seed_w); free(w);
-	gap_destroy_stack(stack);
+	stack->n_entries = 0;
+	stack->best = stack->n_stacks;
+}
+
+static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, bwt_t *const bwt, int n_seqs, bwa_seq_t *seqs,
+									 const gap_opt_t *opt)
+{
+	const int G = ALN_GROUP;
+	std::vector<gap_slot_t> slots(G);
+	for (gap_slot_t &s : slots) {
+		s.job.stack = gap_init_stack(opt->max_diff, opt->max_gapo, opt->max_gape, opt);
+		s.seed_w.resize(opt->seed_len + 1);
+		s.p = 0;
+	}
+	int next = tid, n_active = 0;
+	// Starts the thread's next read that needs a search in slot s; returns 0 when none is left.
+	auto fill = [&](gap_slot_t &s) -> int {
+		while (next < n_seqs) {
+			bwa_seq_t *p = seqs + next;
+			next += n_threads;
+			p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0;
+			gap_job_t *j = &s.job;
+			if ((int)s.w.size() < p->len + 1) s.w.resize(p->len + 1);
+			bwt_cal_width(bwt, p->len, p->seq, s.w.data());
+			j->opt = *opt;
+			if (opt->fnr > 0.0) j->opt.max_diff = bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr);
+			j->opt.seed_len = opt->seed_len < p->len? opt->seed_len : 0x7fffffff;
+			if (p->len > opt->seed_len)
+				bwt_cal_width(bwt, opt->seed_len, p->seq + (p->len - opt->seed_len), s.seed_w.data());
+			s.cseq.resize(p->len + 1);
+			for (int k = 0; k < p->len; ++k) // we need to complement
+				s.cseq[k] = p->seq[k] > 3? 4 : 3 - p->seq[k];
+			j->len = p->len;
+			j->seq = s.cseq.data();
+			j->width = s.w.data();
+			j->seed_width = p->len <= opt->seed_len? 0 : s.seed_w.data();
+			if (gap_job_start(j, bwt) || gap_job_run(j, bwt)) { // finished without an Occ lookup
+				p->aln = j->aln; p->n_aln = j->n_aln;
+				gap_stack_trim(j->stack);
+				continue;
+			}
+			s.p = p;
+			return 1;
+		}
+		s.p = 0;
+		return 0;
+	};
+	for (gap_slot_t &s : slots)
+		if (fill(s)) ++n_active;
+	while (n_active) {
+		for (gap_slot_t &s : slots) {
+			if (!s.p) continue;
+			if (gap_job_run(&s.job, bwt)) {
+				s.p->aln = s.job.aln; s.p->n_aln = s.job.n_aln;
+				gap_stack_trim(s.job.stack);
+				if (!fill(s)) --n_active;
+			}
+		}
+	}
+	for (gap_slot_t &s : slots) gap_destroy_stack(s.job.stack);
 }
 
 typedef struct {
@@ -146,7 +208,7 @@ typedef struct {
 static void *worker(void *data)
 {
 	thread_aux_t *d = (thread_aux_t*)data;
-	bwa_cal_sa_reg_gap(d->tid, d->n_threads, d->bwt, d->n_seqs, d->seqs, d->opt);
+	bwa_cal_sa_reg_gap_group(d->tid, d->n_threads, d->bwt, d->n_seqs, d->seqs, d->opt);
 	return 0;
 }
 
@@ -155,7 +217,7 @@ void aln_search_batch(const bwt_t *bwt_, int n_seqs, bwa_seq_t *seqs, const gap_
 	bwt_t *bwt = const_cast<bwt_t*>(bwt_); // the search only reads it
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	if (n_threads <= 1) { // no multi-threading at all
-		bwa_cal_sa_reg_gap(0, 1, bwt, n_seqs, seqs, &bopt);
+		bwa_cal_sa_reg_gap_group(0, 1, bwt, n_seqs, seqs, &bopt);
 	} else {
 		pthread_t *tid;
 		pthread_attr_t attr;
