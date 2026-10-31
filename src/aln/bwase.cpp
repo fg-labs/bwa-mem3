@@ -23,7 +23,7 @@
 
 namespace bwa_aln {
 
-static int g_log_n[256];
+int g_log_n[256];
 
 void bwa_aln2seq_core(int n_aln, const bwt_aln1_t *aln, bwa_seq_t *s, int set_main, int n_multi)
 {

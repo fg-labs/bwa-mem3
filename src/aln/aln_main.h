@@ -9,7 +9,8 @@ namespace bwa_aln {
 
 struct aln_opt_t {
 	gap_opt_t gap;              // stock aln's options (n_threads included)
-	int max_xa_hits;            // --max-xa-hits: stock samse -n (default 3)
+	int max_xa_hits;            // --max-xa-hits: stock samse -n / sampe -n (default 3)
+	pe_opt_t pe;                // stock sampe's options (n_multi is kept equal to max_xa_hits)
 	int batch_size;             // reads per batch (default 0x40000); a test hook, not a CLI option
 };
 
@@ -21,6 +22,14 @@ void aln_opt_init(aln_opt_t *o);
  * forward reference. Returns 0, or 1 on an input or output error. */
 int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
 			   const char *fn_fq, aln_out_t *out);
+
+/* Paired-end run: reads fn_fq1 and fn_fq2 in lock step, in batches of batch_size reads from
+ * each, and appends each batch's records (read 1, then read 2, of each pair) to `out`. Each
+ * file is searched as its own batch, as stock runs `aln` on each file. When the files hold
+ * different numbers of reads in a batch the count of the second file is used, as sampe does,
+ * with a warning on stderr. Returns 0, or 1 on an input or output error. */
+int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
+			   const char *fn_fq1, const char *fn_fq2, aln_out_t *out);
 
 } // namespace bwa_aln
 
