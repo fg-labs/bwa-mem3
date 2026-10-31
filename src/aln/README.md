@@ -30,3 +30,14 @@ Each task that changes or adds upstream-derived code appends a line here.
   `namespace bwa_aln`. The occ and SA functions are new code with bwa's
   semantics, computed from bwa-mem3's checkpointed occ table instead of bwa's
   interleaved 2-bit `.bwt` layout.
+- `bwtaln.h`: upstream's types and constants unchanged, moved into
+  `namespace bwa_aln` (the `bwt_t`/`bwtint_t` types come from `aln_bwt.h`). Dropped:
+  `SAI_MAGIC`, the `extern "C"` function declarations and `bwa_bam_open`.
+- `bwaseqio.cpp`/`bwaseqio.h`: `bwa_seq_open`, `bwa_seq_close`, `seq_reverse`,
+  `bwa_trim_read`, `bwa_read_seq` and `bwa_free_read_seq` are upstream's bodies, in
+  `namespace bwa_aln`. Dropped: BAM input (`bwa_bam_open`, `bwa_read_bam`, the `is_bam`
+  branches and `bamlite.h`). Input is opened with `xzopen` (zlib `gzopen`, or
+  `gzdopen` on stdin for `-`), as bwa does. `nst_nt4_table` is upstream's table, kept
+  local because bwa-mem3's differs at `'-'` (5 upstream, 4 here). Parsing uses
+  bwa-mem3's `kseq.h`, whose record handling matches upstream's; its differences are
+  an OOM guard, a wider `kseq_read` return type and extra sequence-buffer slack.
