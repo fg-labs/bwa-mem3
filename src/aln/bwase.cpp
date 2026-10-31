@@ -7,7 +7,10 @@
  * .sai reading and the samse command line are dropped; the BWT is a parameter instead of
  * being reloaded from disk; bns_get_seq and bns_cnt_ambi (bntseq.c) are copied here as
  * aln_-local functions so the output does not depend on bwa-mem3's own variants of them;
- * the SAM header writer follows bwa 0.7.19's output, not this branch's. See README.md.
+ * the SAM header writer follows bwa 0.7.19's output, not this branch's; SAM fields and
+ * the MD string are formatted with kputs/kputc/kputl instead of ksprintf, because libc's
+ * vfprintf takes a process-wide locale lock that serialises the formatting threads (the
+ * text produced is the same). See README.md.
  *
  * aln_bns_get_seq and aln_bns_cnt_ambi are from bwa's bntseq.c, which carries the MIT
  * licence below (this file's other code is Apache 2.0, as stated above). */
@@ -49,6 +52,13 @@
 #include "../ksw.h"
 #include "bwaseqio.h"
 #include "bwtgap.h"
+
+// Decimal formatting without printf (see the header note). kputl takes a long, which must
+// hold every int and long long printed here; it also gives INT_MIN the right answer, which
+// kputw's negation does not.
+static_assert(sizeof(long) == sizeof(long long), "kputl must be 64-bit");
+static inline void put_int(kstring_t *s, int v) { kputl((long)v, s); }
+static inline void put_ll(kstring_t *s, long long v) { kputl((long)v, s); }
 
 namespace bwa_aln {
 
@@ -290,7 +300,7 @@ static char *bwa_cal_md1(int n_cigar, bwa_cigar_t *cigar, int len, bwtint_t pos,
 				for (z = 0; z < l && x+z < l_pac; ++z) {
 					c = pacseq[(x+z)>>2] >> ((~(x+z)&3)<<1) & 3;
 					if (c > 3 || seq[y+z] > 3 || c != seq[y+z]) {
-						ksprintf(str, "%d", u);
+						put_int(str, u);
 						kputc("ACGTN"[c], str);
 						++nm;
 						u = 0;
@@ -301,7 +311,7 @@ static char *bwa_cal_md1(int n_cigar, bwa_cigar_t *cigar, int len, bwtint_t pos,
 				y += l;
 				if (__cigar_op(cigar[k]) == FROM_I) nm += l;
 			} else if (__cigar_op(cigar[k]) == FROM_D) {
-				ksprintf(str, "%d", u);
+				put_int(str, u);
 				kputc('^', str);
 				for (z = 0; z < l && x+z < l_pac; ++z)
 					kputc("ACGT"[pacseq[(x+z)>>2] >> ((~(x+z)&3)<<1) & 3], str);
@@ -313,14 +323,14 @@ static char *bwa_cal_md1(int n_cigar, bwa_cigar_t *cigar, int len, bwtint_t pos,
 		for (z = u = 0; z < (int)len && x+z < l_pac; ++z) {
 			c = pacseq[(x+z)>>2] >> ((~(x+z)&3)<<1) & 3;
 			if (c > 3 || seq[y+z] > 3 || c != seq[y+z]) {
-				ksprintf(str, "%d", u);
+				put_int(str, u);
 				kputc("ACGTN"[c], str);
 				++nm;
 				u = 0;
 			} else ++u;
 		}
 	}
-	ksprintf(str, "%d", u);
+	put_int(str, u);
 	*_nm = nm;
 	return strdup(str->s);
 }
@@ -468,15 +478,17 @@ void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa
 				if (mate->strand) flag |= SAM_FMR;
 			} else flag |= SAM_FMU;
 		}
-		ksprintf(out, "%s\t%d\t%s\t", p->name, flag, bns->anns[seqid].name);
-		ksprintf(out, "%d\t%d\t", (int)(p->pos - bns->anns[seqid].offset + 1), p->mapQ);
+		kputs(p->name, out); kputc('\t', out); put_int(out, flag); kputc('\t', out);
+		kputs(bns->anns[seqid].name, out); kputc('\t', out);
+		put_int(out, (int)(p->pos - bns->anns[seqid].offset + 1)); kputc('\t', out);
+		put_int(out, p->mapQ); kputc('\t', out);
 
 		// print CIGAR
 		if (p->cigar) {
 			for (j = 0; j != p->n_cigar; ++j)
-				ksprintf(out, "%d%c", __cigar_len(p->cigar[j]), "MIDS"[__cigar_op(p->cigar[j])]);
-		} else if (p->type == BWA_TYPE_NO_MATCH) ksprintf(out, "*");
-		else ksprintf(out, "%dM", p->len);
+				{ put_int(out, __cigar_len(p->cigar[j])); kputc("MIDS"[__cigar_op(p->cigar[j])], out); }
+		} else if (p->type == BWA_TYPE_NO_MATCH) kputc('*', out);
+		else { put_int(out, p->len); kputc('M', out); }
 
 		// print mate coordinate
 		if (mate && mate->type != BWA_TYPE_NO_MATCH) {
@@ -485,54 +497,62 @@ void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa
 			am = mate->seQ < p->seQ? mate->seQ : p->seQ; // smaller single-end mapping quality
 			// redundant calculation here, but should not matter too much
 			aln_bns_cnt_ambi(bns, mate->pos, mate->len, &m_seqid);
-			ksprintf(out, "\t%s\t", (seqid == m_seqid)? "=" : bns->anns[m_seqid].name);
+			kputc('\t', out); kputs((seqid == m_seqid)? "=" : bns->anns[m_seqid].name, out); kputc('\t', out);
 			isize = (seqid == m_seqid)? pos_5(mate) - pos_5(p) : 0;
 			if (p->type == BWA_TYPE_NO_MATCH) isize = 0;
-			ksprintf(out, "%d\t%lld\t", (int)(mate->pos - bns->anns[m_seqid].offset + 1), isize);
-		} else if (mate) ksprintf(out, "\t=\t%d\t0\t", (int)(p->pos - bns->anns[seqid].offset + 1));
-		else ksprintf(out, "\t*\t0\t0\t");
+			put_int(out, (int)(mate->pos - bns->anns[m_seqid].offset + 1)); kputc('\t', out);
+			put_ll(out, isize); kputc('\t', out);
+		} else if (mate) {
+			kputs("\t=\t", out); put_int(out, (int)(p->pos - bns->anns[seqid].offset + 1)); kputs("\t0\t", out);
+		}
+		else kputs("\t*\t0\t0\t", out);
 
 		// print sequence and quality
 		bwa_print_seq(out, p);
 		kputc('\t', out);
 		if (p->qual) {
 			if (p->strand) seq_reverse(p->len, p->qual, 0); // reverse quality
-			ksprintf(out, "%s", p->qual);
-		} else ksprintf(out, "*");
+			kputs((const char*)p->qual, out);
+		} else kputc('*', out);
 
-		if (bwa_rg_id[0]) ksprintf(out, "\tRG:Z:%s", bwa_rg_id);
-		if (p->bc[0]) ksprintf(out, "\tBC:Z:%s", p->bc);
-		if (p->clip_len < (int)p->full_len) ksprintf(out, "\tXC:i:%d", p->clip_len);
+		if (bwa_rg_id[0]) { kputs("\tRG:Z:", out); kputs(bwa_rg_id, out); }
+		if (p->bc[0]) { kputs("\tBC:Z:", out); kputs(p->bc, out); }
+		if (p->clip_len < (int)p->full_len) { kputs("\tXC:i:", out); put_int(out, p->clip_len); }
 		if (p->type != BWA_TYPE_NO_MATCH) {
 			int i;
 			// calculate XT tag
 			XT = "NURM"[p->type];
 			if (nn > 10) XT = 'N';
 			// print tags
-			ksprintf(out, "\tXT:A:%c\t%s:i:%d", XT, (mode & BWA_MODE_COMPREAD)? "NM" : "CM", p->nm);
-			if (nn) ksprintf(out, "\tXN:i:%d", nn);
-			if (mate) ksprintf(out, "\tSM:i:%d\tAM:i:%d", (int)p->seQ, am);
-			if (p->type != BWA_TYPE_MATESW) { // X0 and X1 are not available for this type of alignment
-				ksprintf(out, "\tX0:i:%d", (int)p->c1);
-				if ((int)p->c1 <= max_top2) ksprintf(out, "\tX1:i:%d", (int)p->c2);
+			kputs("\tXT:A:", out); kputc(XT, out); kputc('\t', out);
+			kputs((mode & BWA_MODE_COMPREAD)? "NM" : "CM", out); kputs(":i:", out); put_int(out, p->nm);
+			if (nn) { kputs("\tXN:i:", out); put_int(out, nn); }
+			if (mate) {
+				kputs("\tSM:i:", out); put_int(out, (int)p->seQ); kputs("\tAM:i:", out); put_int(out, am);
 			}
-			ksprintf(out, "\tXM:i:%d\tXO:i:%d\tXG:i:%d", p->n_mm, p->n_gapo, p->n_gapo+p->n_gape);
-			if (p->md) ksprintf(out, "\tMD:Z:%s", p->md);
+			if (p->type != BWA_TYPE_MATESW) { // X0 and X1 are not available for this type of alignment
+				kputs("\tX0:i:", out); put_int(out, (int)p->c1);
+				if ((int)p->c1 <= max_top2) { kputs("\tX1:i:", out); put_int(out, (int)p->c2); }
+			}
+			kputs("\tXM:i:", out); put_int(out, p->n_mm);
+			kputs("\tXO:i:", out); put_int(out, p->n_gapo);
+			kputs("\tXG:i:", out); put_int(out, p->n_gapo+p->n_gape);
+			if (p->md) { kputs("\tMD:Z:", out); kputs(p->md, out); }
 			// print multiple hits
 			if (p->n_multi) {
-				ksprintf(out, "\tXA:Z:");
+				kputs("\tXA:Z:", out);
 				for (i = 0; i < p->n_multi; ++i) {
 					bwt_multi1_t *q = p->multi + i;
 					int k;
 					j = pos_end_multi(q, p->len) - q->pos;
 					nn = aln_bns_cnt_ambi(bns, q->pos, j, &seqid);
-					ksprintf(out, "%s,%c%d,", bns->anns[seqid].name, q->strand? '-' : '+',
-						   (int)(q->pos - bns->anns[seqid].offset + 1));
+					kputs(bns->anns[seqid].name, out); kputc(',', out); kputc(q->strand? '-' : '+', out);
+					put_int(out, (int)(q->pos - bns->anns[seqid].offset + 1)); kputc(',', out);
 					if (q->cigar) {
 						for (k = 0; k < (int)q->n_cigar; ++k)
-							ksprintf(out, "%d%c", __cigar_len(q->cigar[k]), "MIDS"[__cigar_op(q->cigar[k])]);
-					} else ksprintf(out, "%dM", p->len);
-					ksprintf(out, ",%d;", q->gap + q->mm);
+							{ put_int(out, __cigar_len(q->cigar[k])); kputc("MIDS"[__cigar_op(q->cigar[k])], out); }
+					} else { put_int(out, p->len); kputc('M', out); }
+					kputc(',', out); put_int(out, q->gap + q->mm); kputc(';', out);
 				}
 			}
 		}
@@ -540,16 +560,16 @@ void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa
 	} else { // this read has no match
 		int flag = p->extra_flag | SAM_FSU;
 		if (mate && mate->type == BWA_TYPE_NO_MATCH) flag |= SAM_FMU;
-		ksprintf(out, "%s\t%d\t*\t0\t0\t*\t*\t0\t0\t", p->name, flag);
+		kputs(p->name, out); kputc('\t', out); put_int(out, flag); kputs("\t*\t0\t0\t*\t*\t0\t0\t", out);
 		bwa_print_seq(out, p);
 		kputc('\t', out);
 		if (p->qual) {
 			if (p->strand) seq_reverse(p->len, p->qual, 0); // reverse quality
-			ksprintf(out, "%s", p->qual);
-		} else ksprintf(out, "*");
-		if (bwa_rg_id[0]) ksprintf(out, "\tRG:Z:%s", bwa_rg_id);
-		if (p->bc[0]) ksprintf(out, "\tBC:Z:%s", p->bc);
-		if (p->clip_len < (int)p->full_len) ksprintf(out, "\tXC:i:%d", p->clip_len);
+			kputs((const char*)p->qual, out);
+		} else kputc('*', out);
+		if (bwa_rg_id[0]) { kputs("\tRG:Z:", out); kputs(bwa_rg_id, out); }
+		if (p->bc[0]) { kputs("\tBC:Z:", out); kputs(p->bc, out); }
+		if (p->clip_len < (int)p->full_len) { kputs("\tXC:i:", out); put_int(out, p->clip_len); }
 		kputc('\n', out);
 	}
 }
@@ -578,18 +598,18 @@ void aln_print_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *hdr_line
 	int i;
 	const int n_HD = count_line_start(hdr_line, "@HD\t");
 	const int n_SQ = count_line_start(hdr_line, "@SQ\t");
-	if (n_HD == 0) ksprintf(out, "@HD\tVN:1.5\tSO:unsorted\tGO:query\n");
+	if (n_HD == 0) kputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", out);
 	if (n_SQ == 0) {
 		for (i = 0; i < bns->n_seqs; ++i) {
-			ksprintf(out, "@SQ\tSN:%s\tLN:%d", bns->anns[i].name, bns->anns[i].len);
-			if (bns->anns[i].is_alt) ksprintf(out, "\tAH:*\n");
+			kputs("@SQ\tSN:", out); kputs(bns->anns[i].name, out); kputs("\tLN:", out); put_int(out, bns->anns[i].len);
+			if (bns->anns[i].is_alt) kputs("\tAH:*\n", out);
 			else kputc('\n', out);
 		}
 	}
-	if (hdr_line) ksprintf(out, "%s\n", hdr_line);
+	if (hdr_line) { kputs(hdr_line, out); kputc('\n', out); }
 	if (pg_line && pg_line[0]) {
 		size_t n = strlen(pg_line);
-		ksprintf(out, "%s", pg_line);
+		kputs(pg_line, out);
 		if (pg_line[n-1] != '\n') kputc('\n', out);
 	}
 }
