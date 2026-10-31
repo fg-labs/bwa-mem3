@@ -767,11 +767,13 @@ int  mem_capped_pair_subo(const mem_alnreg_v a[2], const int z[2], int o);  /* -
 /* The 8-bit banded-SW routing gate: whether a pair may take getScores8. Exposed for
  * test/bandedswa_negative_h0_test.cpp; see bwamem.cpp for the envelope it enforces. */
 int  bsw8_envelope_ok(int len1, int len2, int w, int score_a, int zdrop, int h0);
-/* The extension tier classifier: counting-sorts pairArray into 8-bit, 16-bit and scalar
- * runs and returns each tier's count. hist needs MAX_SEQ_LEN8 + MAX_SEQ_LEN16 + 1 slots.
- * Exposed for test/bandedswa_negative_h0_test.cpp. */
+/* The extension tier classifier: stably partitions pairArray into 8-bit, 16-bit and
+ * scalar runs and returns each tier's count. tempArray needs at least count slots and
+ * must not overlap pairArray; it is not written when every pair is 8-bit or count == 0,
+ * and count == 0 leaves pairArray untouched too. Exposed for
+ * test/bandedswa_negative_h0_test.cpp and test/unit/test_ext_tier_partition.cpp. */
 void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
-                     int32_t *hist, int &numPairs128, int &numPairs16,
+                     int &numPairs128, int &numPairs16,
                      int &numPairs1, int score_a, int w, int zdrop);
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);

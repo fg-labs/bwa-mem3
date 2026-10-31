@@ -193,11 +193,10 @@ KSORT_INIT(mem_intv1, SMEM, intv_lt1)
  *   - h0 >= 0 : the seed byte cannot hold a negative h0 (--meth), and clamping
  *     it to 0 turns the seed's diagonal into a local restart.
  *
- * NOTE: minval (= h0 + min(len)*a) is still used by sortPairsLenExt as the
- * counting-sort bin index (hist[minval]) and must stay < MAX_SEQ_LEN8 there for
- * the bin to be in range; that is a histogram-sizing constraint, NOT the tier
- * decision. Pairs failing this envelope fall through to the existing 16-bit
- * (then scalar) buckets exactly as before. */
+ * NOTE: minval (= h0 + min(len)*a) decides only between the 16-bit and scalar
+ * tiers in sortPairsLenExt; it is NOT the 8-bit tier decision. Pairs failing
+ * this envelope fall through to the 16-bit tier, or to the scalar tier when
+ * they also fail the 16-bit range check. */
 #define BSW8_MAX_W 124                 /* max band: the diagonal-offset encoding spans
                                           [-(w+1), w+3] (band-grow `myband+1`, tail-trim
                                           `index+2` reaching w+3), all int8, so w <= 124.
@@ -6099,126 +6098,73 @@ void* _mm_realloc(void *ptr, int64_t csize, int64_t nsize, int16_t dsize) {
     return nptr;
 }
 
+/* Partition the extension pairs into the three kernel tiers, stably:
+ * [8-bit | 16-bit | scalar], each tier in input order, and count them.
+ *
+ * A pair's tier is decided once: 8-bit when bsw8_envelope_ok holds, else
+ * 16-bit when its lengths and minval (= h0 + min(len1, len2)*a) fit the 16-bit
+ * range, else scalar. The order inside a tier is not the kernels' packing
+ * order: bsw_score_batch counting-sorts every vector call by its own key
+ * (max(len1, len2) for an 8-bit call, len1 for a 16-bit one), and the
+ * certified probe rung buckets its pairs before that, so the order left here
+ * is only those sorts' tie-break.
+ * Each pair's result is computed in its own lane and scattered back by its
+ * (seqid, regid), so the output does not depend on it.
+ *
+ * The 8-bit pairs are compacted forward in place, so nothing is copied before
+ * the first pair of another tier and nothing at all when every pair is 8-bit
+ * (the common short-read batch). 16-bit pairs go to tempArray from the front
+ * and scalar pairs from its back (tempArray: count pairs, not overlapping
+ * pairArray; the runs cannot meet), and both are copied back behind the 8-bit
+ * run, so the layout the tier ladders read is unchanged.
+ *
+ * tempArray is not written when every pair is 8-bit or count == 0, and
+ * count == 0 leaves pairArray untouched too (test_ext_tier_partition.cpp). */
 void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
-                     int32_t *hist, int &numPairs128, int &numPairs16,
+                     int &numPairs128, int &numPairs16,
                      int &numPairs1, int score_a, int w, int zdrop)
 {
-    int32_t i;
     numPairs128 = numPairs16 = numPairs1 = 0;
-    if (count <= 0) return;   /* empty extension side: nothing to sort/count */
+    if (count <= 0) return;   /* empty extension side: nothing to partition/count */
 
-    int32_t *hist2 = hist + MAX_SEQ_LEN8;
-    int32_t *hist3 = hist + MAX_SEQ_LEN8 + MAX_SEQ_LEN16;
-
-    /* The counting-sort bin space is three concatenated regions: 8-bit
-     * (hist[0..MAX_SEQ_LEN8)), 16-bit (hist2[0..MAX_SEQ_LEN16)) and scalar
-     * (hist3[0]). The 16-bit region alone is 32768 bins, so clearing +
-     * cumulating the whole range every call was O(32768) irrespective of the
-     * pair count. Window the 16-bit region to the actual minval range: a 16-bit
-     * pair's bin is exactly its minval, so every touched bin lies within
-     * [min minval, max minval]; bins below the window hold no pairs (they add 0
-     * to the cross-region cumulative sum, so starting the sum at that offset is
-     * exact) and bins above are never read. The sorted output and the numPairs*
-     * tier counts are therefore byte-for-byte identical to the full-range sort.
-     * The 8-bit region (1088 bins) is small, so it is still cleared in full to
-     * avoid reasoning about its clamped bins. */
-    int64_t mn = 0, mx = 0;
-    for (i = 0; i < count; i++) {
-        SeqPair sp = pairArray[i];
-        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
-        if (i == 0) { mn = mx = minval; }
-        else { if (minval < mn) mn = minval; if (minval > mx) mx = minval; }
-    }
-    int32_t w_lo = mn < 0 ? 0 : (mn >= MAX_SEQ_LEN16 ? MAX_SEQ_LEN16 - 1 : (int32_t)mn);
-    int32_t w_hi = mx < 0 ? 0 : (mx >= MAX_SEQ_LEN16 ? MAX_SEQ_LEN16 - 1 : (int32_t)mx);
-
-    for (i = 0; i < MAX_SEQ_LEN8; i++) hist[i] = 0;
-    for (i = w_lo; i <= w_hi; i++)     hist2[i] = 0;
-    hist3[0] = 0;
-
-    /* minval is the counting-sort bin (sorts the 8-bit bucket by score for
-     * lane packing). The tier decision is the safe envelope, not minval:
-     * re-baselining handles arbitrary score, so a pair can be 8-bit even with
-     * minval >= MAX_SEQ_LEN8. Clamp the bin to keep it in range — only the
-     * ordering, not correctness, depends on the exact key. */
     /* BWAMEM3_DUMP_PAIRS observation buffer (empty unless the hook is armed).
      * Recording the tier from inside the branches below — rather than
      * re-deriving it afterwards — is deliberate: the dump is used to validate
      * external mirrors of this routing rule, so it must report the branch this
-     * function actually took, not a second opinion that could drift from it. */
+     * function actually took, not a second opinion that could drift from it.
+     * Rows are written in input order. */
     std::string dump_buf;
     const bool dumping = bsw_dump_armed();
     if (dumping) dump_buf.reserve((size_t)count * 24);
 
-    for(i = 0; i < count; i++)
+    int32_t n8 = 0, n16 = 0, n1 = 0;
+    for (int32_t i = 0; i < count; i++)
     {
-        SeqPair sp = pairArray[i];
-        // int minval = sp.h0 + max_(sp.len1, sp.len2);
-        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
+        const SeqPair &sp = pairArray[i];
         if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0)) {
-            int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
-            hist[bin]++;
             if (dumping) bsw_dump_pair(dump_buf, sp, w, 8);
+            if (n8 != i) pairArray[n8] = sp;   /* n8 < i: a slot already read */
+            n8++;
+            continue;
         }
-        else if(sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
-            hist2[(int)minval] ++;
+        const int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
+        if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
             if (dumping) bsw_dump_pair(dump_buf, sp, w, 16);
+            tempArray[n16++] = sp;
         }
         else {
-            hist3[0] ++;
             if (dumping) bsw_dump_pair(dump_buf, sp, w, 1);
+            tempArray[count - 1 - n1++] = sp;
         }
     }
     if (dumping) bsw_dump_flush(dump_buf);
 
-    int32_t cumulSum = 0;
-    for(i = 0; i < MAX_SEQ_LEN8; i++)
-    {
-        int32_t cur = hist[i];
-        hist[i] = cumulSum;
-        cumulSum += cur;
-    }
-    /* Skipping hist2[0..w_lo) is exact: those bins were cleared to (and hold) no
-     * counts, so they would contribute 0 to cumulSum anyway. */
-    for(i = w_lo; i <= w_hi; i++)
-    {
-        int32_t cur = hist2[i];
-        hist2[i] = cumulSum;
-        cumulSum += cur;
-    }
-    hist3[0] = cumulSum;
+    for (int32_t k = 0; k < n16; k++) pairArray[n8 + k] = tempArray[k];
+    for (int32_t k = 0; k < n1; k++)  pairArray[n8 + n16 + k] = tempArray[count - 1 - k];
 
-    for(i = 0; i < count; i++)
-    {
-        SeqPair sp = pairArray[i];
-        // int minval = sp.h0 + max_(sp.len1, sp.len2);
-        int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)score_a;
-
-        if (bsw8_envelope_ok(sp.len1, sp.len2, w, score_a, zdrop, sp.h0))
-        {
-            int bin = minval < 0 ? 0 : (minval < MAX_SEQ_LEN8 ? (int)minval : MAX_SEQ_LEN8 - 1);
-            int32_t pos = hist[bin];
-            tempArray[pos] = sp;
-            hist[bin]++;
-            numPairs128 ++;
-        }
-        else if (sp.len1 < MAX_SEQ_LEN16 && sp.len2 < MAX_SEQ_LEN16 && minval >= 0 && minval < MAX_SEQ_LEN16) {
-            int32_t pos = hist2[(int)minval];
-            tempArray[pos] = sp;
-            hist2[(int)minval]++;
-            numPairs16 ++;
-        }
-        else {
-            int32_t pos = hist3[0];
-            tempArray[pos] = sp;
-            hist3[0]++;
-            numPairs1 ++;
-        }
-    }
-
-    for(i = 0; i < count; i++) {
-        pairArray[i] = tempArray[i];
-    }
+    numPairs128 = n8;
+    numPairs16  = n16;
+    numPairs1   = n1;
 }
 
 /* Counting-sort the tier's pairs so lanes packed into one SIMD group have
@@ -7836,8 +7782,8 @@ static inline void stage_seed_extension(
         {
             int64_t minval = (int64_t)sp.h0 + (int64_t)min_(sp.len1, sp.len2) * (int64_t)opt->a;
             int t_tier;
-            /* Mirror the routing decision in sortPairsLenExt: 8-bit
-             * iff the safe envelope holds (initial band opt->w). */
+            /* Hand copy of sortPairsLenExt's tier rule (initial band
+             * opt->w): keep it in sync with that function's rule. */
             if (bsw8_envelope_ok(sp.len1, sp.len2, opt->w, opt->a, opt->zdrop, sp.h0)) {
                 numPairsLeft128++; t_tier = 0;
             }
@@ -8110,7 +8056,7 @@ static inline void stage_seed_extension(
          * resets them to 0 first), and nothing reads them before
          * that call — so the per-pair envelope check and routing
          * that used to live here were dead work. Just stage the
-         * pair; the sort assigns its tier. RIGHT histograms (Groups
+         * pair; the partition assigns its tier. RIGHT histograms (Groups
          * A & B) are populated post-left-SW once the right pass has
          * finalised sp->tight_band. */
         seqPairArrayRight128[numPairsRight] = sp;
@@ -8659,11 +8605,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
      * second batch of re-staged pairs lands in the right alnregs. Invoked once
      * here (the main batch); byte-identical to the prior inline block. */
     auto run_extension_batch = [&]() {
+    /* hist backs only sortPairsLen's key-indexed bins (tier ladders and probe rung, via
+     * bsw_score_batch); its size is kept from the former tier sort's bin layout. */
     int32_t *hist = (int32_t *)_mm_malloc((MAX_SEQ_LEN8 + MAX_SEQ_LEN16 + 32) *
                                           sizeof(int32_t), 64);
-
-    /* Sorting based score is required as that affects the use of SIMD lanes */
-    sortPairsLenExt(seqPairArrayLeft128, numPairsLeft, seqPairArrayAux, hist,
+    /* Stable [8-bit | 16-bit | scalar] tier partition; the kernels' sorts pack the lanes */
+    sortPairsLenExt(seqPairArrayLeft128, numPairsLeft, seqPairArrayAux,
                     numPairsLeft128, numPairsLeft16, numPairsLeft1, opt->a,
                     opt->w, opt->zdrop);
     assert(numPairsLeft == (numPairsLeft128 + numPairsLeft16 + numPairsLeft1));
@@ -9118,25 +9065,25 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     }
 
     sortPairsLenExt(seqPairArrayRight128, numPairsRight, seqPairArrayAux,
-                    hist, numPairsRight128, numPairsRight16, numPairsRight1, opt->a,
+                    numPairsRight128, numPairsRight16, numPairsRight1, opt->a,
                     opt->w, opt->zdrop);
 
     assert(numPairsRight == (numPairsRight128 + numPairsRight16 + numPairsRight1));
 
 #if BWAMEM3_UGP_PROFILE
     /* instrumentation (Groups A, B, C — RIGHT). Run after the post-
-     * left-SW analyze pass + tier sort: sp->tight_band is now final and the
-     * 128 region is contiguous at the head of seqPairArrayRight128. */
+     * left-SW analyze pass + tier partition: sp->tight_band is now final and
+     * the tiers are contiguous runs [8-bit | 16-bit | scalar], in that order. */
     {
         int narrow_sz = 0;
         for (int l = 0; l < numPairsRight; l++) {
             SeqPair *sp_ = &seqPairArrayRight128[l];
             int tb_ = sp_->tight_band;
             int t_tier;
-            int64_t minval_ = (int64_t)sp_->h0 + (int64_t)min_(sp_->len1, sp_->len2) * (int64_t)opt->a;
-            if (bsw8_envelope_ok(sp_->len1, sp_->len2, opt->w, opt->a, opt->zdrop, sp_->h0))             t_tier = 0;
-            else if (sp_->len1 < MAX_SEQ_LEN16 && sp_->len2 < MAX_SEQ_LEN16 && minval_ >= 0 && minval_ < MAX_SEQ_LEN16) t_tier = 1;
-            else                                                                                       t_tier = 2;
+            /* tier = position in sortPairsLenExt's partition (no 2nd copy of its rule) */
+            if      (l < numPairsRight128)                    t_tier = 0;
+            else if (l < numPairsRight128 + numPairsRight16)  t_tier = 1;
+            else                                              t_tier = 2;
             int fine_bin;
             if      (tb_ ==  0) fine_bin = 0;
             else if (tb_ <=  2) fine_bin = 1;
