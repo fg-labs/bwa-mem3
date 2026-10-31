@@ -278,3 +278,158 @@ TEST_CASE("aln_search: n_threads 1 and 4 give identical aln arrays"
     }
     CHECK(found > 20); // the comparison is not vacuous
 }
+
+// ---------------------------------------------------------------------------------------
+// bwt_match_gap (upstream's loop) and gap_job_start/gap_job_run (the resumable copy the
+// aligner runs) must give the same hits for the same read and options.
+
+namespace {
+
+struct GapResult {
+    std::vector<ba::bwt_aln1_t> aln;
+};
+
+// Prepares one read as bwa_cal_sa_reg_gap does, then runs it through both loops.
+// `codes` are nt4 codes (4 = N); the search takes the complemented read.
+void both_loops(const ba::bwt_t *bwt, const std::vector<uint8_t> &codes, const ba::gap_opt_t &base,
+                GapResult &ref, GapResult &job)
+{
+    const int len = (int)codes.size();
+    ba::gap_opt_t opt = base;
+    if (opt.fnr > 0.0) opt.max_diff = ba::bwa_cal_maxdiff(len, BWA_AVG_ERR, opt.fnr);
+    if (opt.max_diff < opt.max_gapo) opt.max_gapo = opt.max_diff;
+    ba::gap_opt_t ropt = opt;
+    ropt.seed_len = opt.seed_len < len ? opt.seed_len : 0x7fffffff;
+
+    std::vector<ba::bwt_width_t> w(len + 1), seed_w(opt.seed_len + 1);
+    std::vector<uint8_t> cseq(len + 1);
+    ba::bwt_cal_width(bwt, len, codes.data(), w.data());
+    if (len > opt.seed_len)
+        ba::bwt_cal_width(bwt, opt.seed_len, codes.data() + (len - opt.seed_len), seed_w.data());
+    for (int k = 0; k < len; ++k) cseq[k] = codes[k] > 3 ? 4 : 3 - codes[k];
+    ba::bwt_width_t *sw = len <= opt.seed_len ? nullptr : seed_w.data();
+
+    ba::gap_stack_t *st1 = ba::gap_init_stack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt);
+    int n1 = 0;
+    ba::bwt_aln1_t *a1 = ba::bwt_match_gap(const_cast<ba::bwt_t *>(bwt), len, cseq.data(), w.data(), sw, &ropt, &n1, st1);
+    ref.aln.assign(a1, a1 + n1);
+    free(a1);
+    ba::gap_destroy_stack(st1);
+
+    // gap_shadow narrows the widths in place while a search runs, so the job gets fresh ones
+    ba::bwt_cal_width(bwt, len, codes.data(), w.data());
+    if (len > opt.seed_len)
+        ba::bwt_cal_width(bwt, opt.seed_len, codes.data() + (len - opt.seed_len), seed_w.data());
+    ba::gap_job_t j;
+    memset(&j, 0, sizeof j);
+    j.opt = ropt;
+    j.len = len;
+    j.seq = cseq.data();
+    j.width = w.data();
+    j.seed_width = sw;
+    j.stack = ba::gap_init_stack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt);
+    if (!ba::gap_job_start(&j, bwt)) {
+        int guard = 0;
+        while (!ba::gap_job_run(&j, bwt)) REQUIRE(++guard < 100000000);
+    }
+    job.aln.assign(j.aln, j.aln + j.n_aln);
+    free(j.aln);
+    ba::gap_destroy_stack(j.stack);
+}
+
+std::vector<uint8_t> to_codes(const std::string &s)
+{
+    // bwa_read_seq keeps the read reversed in `seq`; the search complements that copy
+    std::vector<uint8_t> v;
+    for (auto it = s.rbegin(); it != s.rend(); ++it)
+        v.push_back(*it == 'A' ? 0 : *it == 'C' ? 1 : *it == 'G' ? 2 : *it == 'T' ? 3 : 4);
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("aln_search: gap_job_run gives the same hits as bwt_match_gap"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second, &s2 = contigs[1].second;
+    auto flip = [](std::string r, size_t i) { r[i] = r[i] == 'A' ? 'T' : 'A'; return r; };
+
+    std::vector<std::string> reads;
+    reads.push_back("");                                    // length 0
+    reads.push_back("A");                                   // length 1
+    reads.push_back(s1.substr(10, 5));                      // short
+    reads.push_back(s1.substr(450, 32));                    // exact
+    reads.push_back(s1.substr(200, 36));                    // in the reverse-complement copy
+    for (int i = 0; i < 12; ++i) {                          // mismatches
+        std::string r = s1.substr(i * 40, 30 + i);
+        reads.push_back(flip(r, 5));
+        reads.push_back(flip(flip(r, 3), r.size() - 4));
+        reads.push_back(flip(flip(flip(r, 2), 11), r.size() - 3));
+    }
+    reads.push_back(s1.substr(30, 20) + s1.substr(52, 20));           // 2 bp deletion
+    reads.push_back(s1.substr(30, 20) + "GG" + s1.substr(50, 20));    // insertion
+    reads.push_back(s1.substr(300, 25) + s1.substr(327, 30));         // 2 bp deletion, longer
+    reads.push_back(s1.substr(100, 24) + "T" + s1.substr(125, 24));   // deletion plus context
+    reads.push_back(s1.substr(400, 18) + "ACA" + s1.substr(418, 20)); // insertion plus mismatch below
+    reads.push_back(flip(s1.substr(400, 18) + "ACA" + s1.substr(418, 20), 30));
+    {   // N-heavy
+        std::string r = s1.substr(60, 40);
+        for (size_t i : {3, 9, 10, 17, 25, 33}) r[i] = 'N';
+        reads.push_back(r);
+        reads.push_back(std::string(30, 'N'));
+        reads.push_back("N" + s1.substr(70, 30));
+        reads.push_back(s1.substr(70, 30) + "N");
+        reads.push_back(s2.substr(290, 40));                // spans the N run of the reference
+    }
+    {   // tandem repeats: many equal suffixes
+        std::string r;
+        for (int i = 0; i < 16; ++i) r += "AC";
+        reads.push_back(r);
+        reads.push_back(flip(r, 9));
+        reads.push_back(r.substr(0, 11));
+    }
+
+    struct Case { const char *name; int max_diff; int max_gapo; int max_entries; int max_top2; int mode_or; int seed_len; int max_seed_diff; double fnr; };
+    const Case cases[] = {
+        {"defaults",       -1, 1, 2000000, 30,         0,                 32, 2, 0.04},
+        {"fixed -n 3 -o 2", 3, 2, 2000000, 30,         0,                 32, 2, -1.0},
+        {"tiny -m",        -1, 1, 5,       30,         0,                 32, 2, 0.04},
+        {"-m 1",            3, 1, 1,       30,         0,                 32, 2, -1.0},
+        {"-m 3",            3, 2, 3,       30,         0,                 32, 2, -1.0},
+        {"-m 10",           3, 2, 10,      30,         0,                 32, 2, -1.0},
+        {"-m 40",           4, 2, 40,      30,         0,                 32, 2, -1.0},
+        {"small -R",       -1, 1, 2000000, 1,          0,                 32, 2, 0.04},
+        {"-R 0",            3, 1, 2000000, 0,          0,                 32, 2, -1.0},
+        {"NONSTOP",         3, 2, 2000000, 0x7fffffff, BWA_MODE_NONSTOP,  32, 2, -1.0},
+        {"NONSTOP -n 0.04",-1, 1, 2000000, 0x7fffffff, BWA_MODE_NONSTOP,  32, 2, 0.04},
+        {"short seed",      3, 1, 2000000, 30,         0,                 12, 1, -1.0},
+        {"aDNA-like",      -1, 2, 2000000, 30,         0,                 1024, 2, 0.04},
+        {"-L log gap",      3, 2, 2000000, 30,         BWA_MODE_LOGGAP,   32, 2, -1.0},
+    };
+    long compared = 0, with_hits = 0;
+    for (const Case &c : cases) {
+        ba::gap_opt_t *o = ba::gap_init_opt();
+        ba::gap_opt_t opt = *o;
+        free(o);
+        opt.max_diff = c.max_diff;
+        opt.fnr = (float)c.fnr;
+        opt.max_gapo = c.max_gapo;
+        opt.max_entries = c.max_entries;
+        opt.max_top2 = c.max_top2;
+        opt.mode |= c.mode_or;
+        opt.seed_len = c.seed_len;
+        opt.max_seed_diff = c.max_seed_diff;
+        for (size_t i = 0; i < reads.size(); ++i) {
+            INFO("case " << std::string(c.name) << ", read " << i << " (" << reads[i] << ")");
+            GapResult ref, job;
+            both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job);
+            REQUIRE(ref.aln.size() == job.aln.size());
+            for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+            ++compared;
+            with_hits += !ref.aln.empty();
+        }
+    }
+    CHECK(compared > 400);
+    CHECK(with_hits > compared / 4); // not vacuous
+}
