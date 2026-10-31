@@ -43,8 +43,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
+#include <semaphore.h>
+#include <limits.h>
 
 static int32_t total_cases = 0;
 static int32_t passed_cases = 0;
@@ -62,6 +66,283 @@ static void set_jump_env(const char *v)
     if (v == NULL) unsetenv("BWA3_BWTSEED_JUMP");
     else setenv("BWA3_BWTSEED_JUMP", v, 1);
 }
+
+/* Registry names are injectable so cleanup checks never use the host registry. */
+struct ShmRegistry {
+    const char *control;
+    const char *lock;
+    const char *index_prefix;
+};
+static const ShmRegistry fixture_registry = {
+    BWA_SHM_CTL_NAME, BWA_SHM_LOCK_NAME, BWA_SHM_IDX_PREFIX
+};
+typedef void *(*RegistryMap)(void *, size_t, int, int, int, off_t);
+
+enum RegistryState { REGISTRY_MISSING, REGISTRY_READABLE, REGISTRY_UNREADABLE };
+
+/* Parse ctl_walk's uint16 count/offset header and packed int64 size + basename
+ * entries. Only a readable registry permits cleanup; a short registry is empty,
+ * matching ctl_walk, but an incomplete entry makes the registry unreadable. */
+static RegistryState read_shm_registry(std::vector<std::string> *names,
+                                       const ShmRegistry &registry = fixture_registry,
+                                       RegistryMap map_registry = mmap)
+{
+    names->clear();
+    const int fd = shm_open(registry.control, O_RDONLY, 0);
+    if (fd < 0) return errno == ENOENT ? REGISTRY_MISSING : REGISTRY_UNREADABLE;
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        close(fd);
+        return REGISTRY_UNREADABLE;
+    }
+    if ((size_t)st.st_size < BWA_SHM_CTL_SIZE) {
+        close(fd);
+        return REGISTRY_READABLE;
+    }
+    void *m = map_registry(NULL, BWA_SHM_CTL_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return REGISTRY_UNREADABLE;
+    const uint8_t *base = (const uint8_t *)m;
+    const uint8_t *end = base + BWA_SHM_CTL_SIZE;
+    uint16_t n_entries = 0;
+    memcpy(&n_entries, base, sizeof(uint16_t));
+    bool valid = true;
+    const uint8_t *p = base + 4;   /* past n_entries and next_write */
+    for (uint16_t i = 0; i < n_entries; i++) {
+        if ((size_t)(end - p) <= sizeof(int64_t)) { valid = false; break; }
+        const char *name = (const char *)(p + sizeof(int64_t));
+        const size_t name_max = (size_t)(end - (const uint8_t *)name);
+        const size_t len = strnlen(name, name_max);
+        if (len == name_max) { valid = false; break; }
+        names->push_back(std::string(name, len));
+        p = (const uint8_t *)name + len + 1;
+    }
+    munmap(m, BWA_SHM_CTL_SIZE);
+    return valid ? REGISTRY_READABLE : REGISTRY_UNREADABLE;
+}
+
+/* Undo this test's staging of `prefix` without touching any other index.
+ * Unlike bwa_shm_destroy, which unlinks every staged index, the registry and
+ * its lock, this holds the lock the stager takes (BWA_SHM_LOCK_NAME), so no
+ * stage can run while it reads the registry, and drops anything only when the
+ * registry holds only the fixture basenames owned by this run, or no entries
+ * (an aborted stage's leftover). Then it unlinks the fixture segments and registry,
+ * retaining the lock so waiting stagers cannot acquire a different semaphore.
+ * The optional second fixture is owned by this test too. If another index is
+ * registered, or the registry cannot be read, it drops nothing and warns.
+ * With no registry (a stage that failed before creating one) it does nothing. */
+static void drop_fixture_shm(const char *prefix,
+                             const ShmRegistry &registry = fixture_registry,
+                             RegistryMap map_registry = mmap,
+                             const char *second_fixture = NULL)
+{
+    const char *slash = strrchr(prefix, '/');
+    const char *fixture = slash != NULL ? slash + 1 : prefix;
+    std::vector<std::string> names;
+
+    sem_t *lock = sem_open(registry.lock, 0);
+    if (lock == SEM_FAILED) {
+        /* Every stager creates the lock before the registry. */
+        if (read_shm_registry(&names, registry, map_registry) != REGISTRY_MISSING)
+            fprintf(stderr, "[WARN] shm registry %s exists but its lock %s does not; "
+                    "left it staged (`bwa-mem3 shm -d` removes it)\n",
+                    registry.control, registry.lock);
+        return;
+    }
+    /* Up to 10 s, polled, rather than sem_wait: a stager that crashed holding
+     * the lock leaves it taken until `bwa-mem3 shm -d`, and the test must not
+     * hang on it. */
+    bool locked = false;
+    int err = 0;
+    for (int tries = 0; tries < 1000 && !locked; tries++) {
+        locked = sem_trywait(lock) == 0;
+        err = locked ? 0 : errno;
+        if (!locked && err != EAGAIN && err != EINTR) break;
+        if (!locked) usleep(10000);
+    }
+    if (!locked) {
+        fprintf(stderr, "[WARN] could not take the shm lock %s (%s); left %s staged "
+                "(`bwa-mem3 shm -d` removes it)\n", registry.lock,
+                err == EAGAIN || err == EINTR ? "still held after 10 s" : strerror(err), fixture);
+        sem_close(lock);
+        return;
+    }
+    const RegistryState state = read_shm_registry(&names, registry, map_registry);
+    if (state != REGISTRY_READABLE) {
+        if (state == REGISTRY_UNREADABLE)
+            fprintf(stderr, "[WARN] could not read shm registry %s; dropped nothing\n",
+                    registry.control);
+        sem_post(lock);
+        sem_close(lock);
+        return;
+    }
+    const bool only_fixtures = std::all_of(names.begin(), names.end(), [&](const std::string &n) {
+        return n == fixture || (second_fixture != NULL && n == second_fixture);
+    });
+    if (only_fixtures) {
+        const std::string idx = std::string(registry.index_prefix) + fixture;
+        shm_unlink(idx.c_str());   /* absent after an aborted stage */
+        if (second_fixture != NULL)
+            shm_unlink((std::string(registry.index_prefix) + second_fixture).c_str());
+        shm_unlink(registry.control);
+        sem_post(lock);
+        sem_close(lock);
+        return;
+    }
+    sem_post(lock);
+    sem_close(lock);
+    std::string staged;
+    for (const std::string &n : names) staged += (staged.empty() ? "" : ", ") + n;
+    fprintf(stderr, "[WARN] another index was staged in shm while this test ran; dropped "
+            "nothing, so %s may still be staged (registry: %s). `bwa-mem3 shm -d` removes "
+            "every staged index\n", fixture, staged.c_str());
+}
+
+/* These private names exercise cleanup even when staging a packed index is not
+ * supported, without changing the host's real staging registry. */
+static bool shm_name_exists(const char *name)
+{
+    int fd = shm_open(name, O_RDONLY, 0);
+    if (fd < 0) return false;
+    close(fd);
+    return true;
+}
+
+static void *fail_registry_map(void *, size_t, int, int, int, off_t)
+{
+    errno = ENOMEM;
+    return MAP_FAILED;
+}
+
+static void check_fixture_cleanup()
+{
+    char unique[] = "/tmp/bwa-sj-XXXXXX";
+    char *dir = mkdtemp(unique);
+    if (dir == NULL) { report(false, "cleanup fixture: unique names allocated"); return; }
+    const std::string token = std::string("/sj") + (strrchr(dir, '-') + 1);
+    const std::string ctl = token + "c", lock_name = token + "l", idx = token + "-";
+    const ShmRegistry registry = {ctl.c_str(), lock_name.c_str(), idx.c_str()};
+    const char *fixture = "fixture", *other = "other";
+    const std::string fixture_idx = idx + fixture, other_idx = idx + other;
+    std::vector<std::string> names;
+    report(read_shm_registry(&names, registry) == REGISTRY_MISSING && names.empty(),
+           "fixture registry distinguishes a missing registry");
+    sem_t *lock = sem_open(registry.lock, O_CREAT | O_EXCL, 0600, 1);
+    int fd = shm_open(registry.control, O_CREAT | O_EXCL | O_RDWR, 0600);
+    if (fd >= 0)
+        report(read_shm_registry(&names, registry) == REGISTRY_READABLE && names.empty(),
+               "fixture registry treats a short registry as empty");
+    int fixture_fd = shm_open(fixture_idx.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    int other_fd = shm_open(other_idx.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    bool ready = lock != SEM_FAILED && fd >= 0 && fixture_fd >= 0 && other_fd >= 0;
+    void *map = MAP_FAILED;
+    if (ready && ftruncate(fd, BWA_SHM_CTL_SIZE) == 0)
+        map = mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ready = ready && map != MAP_FAILED;
+    if (ready) {
+        memset(map, 0, BWA_SHM_CTL_SIZE);
+        uint16_t count = 2, offset = 4;
+        memcpy(map, &count, sizeof(count));
+        for (const char *name : {fixture, other}) {
+            int64_t bytes = 1;
+            memcpy((char *)map + offset, &bytes, sizeof(bytes));
+            offset += sizeof(bytes);
+            memcpy((char *)map + offset, name, strlen(name) + 1);
+            offset += strlen(name) + 1;
+        }
+        memcpy((char *)map + 2, &offset, sizeof(offset));
+        std::vector<uint8_t> before((uint8_t *)map, (uint8_t *)map + BWA_SHM_CTL_SIZE);
+        drop_fixture_shm(fixture, registry);
+        report(read_shm_registry(&names, registry) == REGISTRY_READABLE && names.size() == 2
+                   && names[0] == fixture && names[1] == other
+                   && shm_name_exists(fixture_idx.c_str()) && shm_name_exists(other_idx.c_str()),
+               "fixture cleanup preserves another registered index and both segments");
+        drop_fixture_shm(fixture, registry, fail_registry_map);
+        report(read_shm_registry(&names, registry) == REGISTRY_READABLE && names.size() == 2
+                   && names[0] == fixture && names[1] == other
+                   && memcmp(map, before.data(), before.size()) == 0
+                   && shm_name_exists(fixture_idx.c_str()) && shm_name_exists(other_idx.c_str()),
+               "fixture cleanup preserves an unreadable registry and its segments");
+        /* A valid fixture entry followed by an unterminated entry must not be
+         * mistaken for a fixture-only registry and removed. */
+        const size_t malformed_offset = 4 + sizeof(int64_t) + strlen(fixture) + 1;
+        memset((char *)map + malformed_offset, 'x', BWA_SHM_CTL_SIZE - malformed_offset);
+        count = 2;
+        memcpy(map, &count, sizeof(count));
+        drop_fixture_shm(fixture, registry);
+        report(read_shm_registry(&names, registry) == REGISTRY_UNREADABLE
+                   && shm_name_exists(registry.control) && shm_name_exists(fixture_idx.c_str())
+                   && shm_name_exists(other_idx.c_str()),
+               "fixture cleanup preserves a malformed registry and its segments");
+        /* Restore a fixture-only registry even when the old cleanup removed its
+         * name, so the lock-lifetime regression remains independently testable. */
+        int restored = shm_open(registry.control, O_CREAT | O_RDWR, 0600);
+        if (restored >= 0) close(restored);
+        count = 1;
+        memcpy(map, &count, sizeof(count));
+        drop_fixture_shm(fixture, registry);
+        sem_t *reopened = sem_open(registry.lock, 0);
+        bool same_lock = false;
+        if (reopened != SEM_FAILED) {
+            if (sem_trywait(lock) == 0) {
+                const int rc = sem_trywait(reopened);
+                same_lock = rc < 0 && errno == EAGAIN;
+                if (rc == 0) sem_post(reopened);
+                sem_post(lock);
+            }
+            sem_close(reopened);
+        }
+        report(same_lock, "fixture cleanup keeps the same stager lock linked and released");
+        report(!shm_name_exists(registry.control) && !shm_name_exists(fixture_idx.c_str())
+                   && shm_name_exists(other_idx.c_str()),
+               "fixture-only cleanup removes its registry and segment, not other segments");
+    } else {
+        fprintf(stderr, "[SKIP] fixture cleanup checks: private POSIX shm unavailable (%s)\n", strerror(errno));
+    }
+    if (map != MAP_FAILED) munmap(map, BWA_SHM_CTL_SIZE);
+    if (fd >= 0) close(fd);
+    if (fixture_fd >= 0) close(fixture_fd);
+    if (other_fd >= 0) close(other_fd);
+    if (lock != SEM_FAILED) sem_close(lock);
+    if (fd >= 0) shm_unlink(registry.control);
+    if (fixture_fd >= 0) shm_unlink(fixture_idx.c_str());
+    if (other_fd >= 0) shm_unlink(other_idx.c_str());
+    if (lock != SEM_FAILED) sem_unlink(registry.lock);
+    rmdir(dir);
+}
+
+/* Alias the generated disk fixture under short per-run names: POSIX staging
+ * keys on basename, not content, and macOS limits shm names to 31 characters. */
+struct ShmDiskFixtures {
+    char directory[64] = "/tmp/bwa-sj-XXXXXX";
+    std::string first, second;
+    std::vector<std::string> links;
+    bool ready = false;
+
+    explicit ShmDiskFixtures(const char *source)
+    {
+        char resolved[PATH_MAX];
+        if (realpath(source, resolved) == NULL || mkdtemp(directory) == NULL) return;
+        const std::string token = strrchr(directory, '-') + 1;
+        first = std::string(directory) + "/sj" + token + "a";
+        second = std::string(directory) + "/sj" + token + "b";
+        for (const std::string &prefix : {first, second}) {
+            for (const char *suffix : {".ann", ".amb", ".pac", ".bwt.2bit.64"}) {
+                const std::string dest = prefix + suffix;
+                const std::string src = std::string(resolved) + suffix;
+                if (symlink(src.c_str(), dest.c_str()) != 0) return;
+                links.push_back(dest);
+            }
+        }
+        ready = true;
+    }
+
+    ~ShmDiskFixtures()
+    {
+        for (const std::string &link : links) unlink(link.c_str());
+        if (!first.empty()) rmdir(directory);
+    }
+};
 
 struct Walk { int64_t k, l, s; };
 
@@ -310,6 +591,7 @@ int main(int argc, char *argv[])
         fprintf(stderr, "Usage: %s <bwa-mem3 index prefix>\n", argv[0]);
         return 2;
     }
+    check_fixture_cleanup();
     const char *prefix = argv[1];
     char name[160];
 
@@ -437,37 +719,54 @@ int main(int argc, char *argv[])
         free(buf);
     }
 
-    /* load_index's shm-attach path, which builds the table itself after the
-     * attach and carries the opt-out. Staging needs POSIX shm for the phiX
-     * segment. bwa_shm_destroy drops every index staged on the host, so the
-     * case runs only when no registry exists yet: then every segment it finds
-     * at cleanup is the fixture's own, including after a failed stage. A host
-     * with an index already staged skips the case rather than drop it. */
+    /* Use unique basenames even if another process stages an index while the
+     * test runs. Cleanup leaves the existing stager lock linked and preserves
+     * any registry containing an index not owned by this run. */
+    ShmDiskFixtures fixture(prefix);
     int ctl_fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
     if (ctl_fd >= 0) {
         close(ctl_fd);
-        fprintf(stderr, "[SKIP] load_index's shm-attach path: an index is already staged "
-                "in shm on this host (%s exists); not dropping it\n", BWA_SHM_CTL_NAME);
-    } else if (bwa_shm_stage(prefix) == 0) {
-        FMI_search *at = new FMI_search(prefix);
+        fprintf(stderr, "[SKIP] load_index's shm-attach path: a registry already exists; not changing it\n");
+    } else if (errno != ENOENT || !fixture.ready) {
+        fprintf(stderr, "[SKIP] load_index's shm-attach path: cannot prepare an isolated fixture\n");
+    } else if (bwa_shm_stage(fixture.first.c_str()) == 0) {
+        const char *staged_prefix = fixture.first.c_str();
+        FMI_search *at = new FMI_search(staged_prefix);
         at->load_index();
         report(at->shm_base != NULL && check_table(at, 10),
                "load_index (shm attach): builds the default table");
         delete at;
-        at = new FMI_search(prefix);
+        at = new FMI_search(staged_prefix);
         at->load_index(/*load_pac=*/false, /*n_threads=*/1, /*build_seed_jump=*/false);
         report(at->shm_base != NULL && at->seed_jump == NULL && at->seed_jump_depth == 0,
                "load_index(build_seed_jump=false) (shm attach): no table");
         delete at;
-        FmiSeed *h = fmi_seed_open(prefix);
+        FmiSeed *h = fmi_seed_open(staged_prefix);
         report(h != NULL && h->fmi->shm_base != NULL && h->fmi->seed_jump == NULL
                    && h->fmi->seed_jump_depth == 0,
                "fmi_seed_open (shm attach): no table");
         fmi_seed_close(h);
-        bwa_shm_destroy();
+        const char *second_prefix = fixture.second.c_str();
+        if (bwa_shm_stage(second_prefix) == 0) {
+            drop_fixture_shm(staged_prefix);
+            std::vector<std::string> names;
+            const std::string first_name = strrchr(staged_prefix, '/') + 1;
+            const std::string second_name = strrchr(second_prefix, '/') + 1;
+            report(read_shm_registry(&names) == REGISTRY_READABLE
+                       && std::find(names.begin(), names.end(), first_name) != names.end()
+                       && std::find(names.begin(), names.end(), second_name) != names.end()
+                       && bwa_shm_test(staged_prefix) == 1 && bwa_shm_test(second_prefix) == 1
+                       && shm_name_exists((std::string(BWA_SHM_IDX_PREFIX) + first_name).c_str())
+                       && shm_name_exists((std::string(BWA_SHM_IDX_PREFIX) + second_name).c_str()),
+                   "fixture cleanup preserves a second staged index and its segment");
+        } else {
+            fprintf(stderr, "[SKIP] second-index preservation: staging unavailable on this host\n");
+        }
+        /* Remove both test-owned entries only if no user entry has appeared. */
+        drop_fixture_shm(staged_prefix, fixture_registry, mmap, strrchr(second_prefix, '/') + 1);
     } else {
-        bwa_shm_destroy();   /* the registry, if the failed stage made one, is the fixture's */
-        fprintf(stderr, "[SKIP] load_index's shm-attach path: could not stage %s on this host\n", prefix);
+        drop_fixture_shm(fixture.first.c_str());
+        fprintf(stderr, "[SKIP] load_index's shm-attach path: could not stage the unique fixture on this host\n");
     }
 
     delete fmi;

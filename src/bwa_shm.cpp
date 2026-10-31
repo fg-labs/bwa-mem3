@@ -51,12 +51,6 @@
  * (two uint16_t fields). next_write_offset starts at 4 on a fresh segment. */
 #define BWA_SHM_CTL_HEADER_BYTES 4
 
-/* Named POSIX semaphore guarding read-modify-write sequences against
- * /bwactl. Created on first use and unlinked by bwa_shm_destroy alongside
- * the registry, so `bwa-mem3 shm -d` is the recovery path if a stager
- * crashes while holding the lock (POSIX semaphores have no SEM_UNDO). */
-#define BWA_SHM_LOCK_NAME "/bwactl_lock"
-
 /* .bwt.2bit.64 prefix: int64_t reference_seq_len, int64_t count[5]. */
 #define BWA_BWT_2BIT_HEADER_BYTES (sizeof(int64_t) * 6)
 
