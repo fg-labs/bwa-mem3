@@ -269,9 +269,9 @@ Notes and caveats:
   not divergences: `--fast` is an opaque multi-flag bundle (not a single knob a
   user could sanely override), and no target has a bisulfite mode, so
   "byte-identical to X under `--meth`" is undefined rather than merely violated.
-- **An `@HD` in `-H` warns but is allowed.** bwa-mem3 hoists a *leading* user
-  `@HD` above the `@SQ` block, so the header is spec-valid (`@HD` must come
-  first). Neither target does that — bwa emits `-H` records after `@SQ` and
+- **An `@HD` in `-H` warns but is allowed.** bwa-mem3 moves the user's `@HD`
+  to the first line, wherever it sits in `-H`, so the header is spec-valid
+  (`@HD` must come first). Neither target does that — bwa emits `-H` records after `@SQ` and
   bwa-mem2 has no `@HD` handling at all — so the header differs from the target
   in **line order**. Records are unaffected.
 
@@ -282,8 +282,8 @@ Notes and caveats:
   `FLAG` `0x2`, `--meth` is a different mode — and a user cannot see any of them
   in their own command line. An `@HD` they typed, they can.
 
-  Only a *leading* `@HD` diverges; a later one is emitted inline after `@SQ`
-  exactly as upstream does, and does not warn. Every other `-H` record (`@RG`,
+  Any `@HD` in `-H` diverges and warns, wherever it sits: the first one is moved
+  to the first line and any later one is dropped. Every other `-H` record (`@RG`,
   `@CO`, `@PG`, `@SQ`) and all of `-R` compose with `--compat` normally.
 - **Non-`--meth` only; combining them is a hard error**
   (`--compat is not supported with --meth`). Neither target has a bisulfite
@@ -344,6 +344,17 @@ them to the `@PG CL:` field, preventing header corruption (fix for issue #45).
 If `STR` begins with `@`, it is injected verbatim as a header line. Otherwise
 `STR` is treated as a path and every line in the file is injected. Useful for
 adding `@CO` comments or custom `@RG` / `@PG` entries.
+
+As in bwa, `-H` `@SQ` records replace the index's `@SQ` block (and the
+`<prefix>.hdr` / `<baseprefix>.dict` sidecar is then ignored), verbatim and in
+the order given. At most one `@HD` is written, always as the first line: the
+first one in `-H`, else the sidecar's, else the default, which
+`--compat=bwa-mem2` suppresses (that target then writes no `@HD`). SAM text
+and `--bam` get the same header, except that each run's `@PG` line records its
+own command line. A `--bam` record refers to its contig by position in the
+header's `@SQ` list, so `--bam` maps each contig by name onto the `@SQ` block
+and fails at startup, naming the contig, if an index contig has no `@SQ` record
+there or its record's `LN` is not the contig's length.
 
 #### `-p` — smart pairing
 

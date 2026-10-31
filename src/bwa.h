@@ -190,6 +190,13 @@ extern "C" {
 	void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
 	                        const char *hdr_line, FILE *fp,
 	                        const compat_target_t *compat);
+	/* Append the complete output header that bwa_print_sam_hdr2 prints -- the
+	 * one definition the SAM-text and --bam writers share -- to `out`, ending
+	 * with `pg` (the @PG text; NULL for none). Precedence and the verbatim @SQ
+	 * rule are documented at the definition (bwa.cpp). Returns 0, or -1 if
+	 * `out` could not be grown. */
+	int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
+	                      const char *hdr_line, const char *pg, const compat_target_t *compat);
 	/* Append the generated @SQ record for `ann` (SN, LN, and AH:* when the
 	 * contig is ALT) to `out`, without a trailing newline. The single
 	 * definition shared by the SAM-text, --bam and --meth writers. Returns 0,

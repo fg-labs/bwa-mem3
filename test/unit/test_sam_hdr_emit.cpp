@@ -13,7 +13,8 @@
 //
 // The precedence contract, from lh3/bwa#348 and bwa.c:412-438:
 //   @HD : user's (-H) > index sidecar's > the compat target's default,
-//         and EXACTLY ONE is emitted, always.
+//         and at most one is emitted; absent when compat target emits none
+//         and inputs (user -H and sidecar) supply none.
 //   @SQ : user's -H block alone if it supplies any; else the sidecar's;
 //         else generated from bns.
 
@@ -98,7 +99,7 @@ int line_index_of(const std::string &s, const char *prefix) {
 
 } // namespace
 
-TEST_CASE("@HD: exactly one is emitted, in every -H shape") {
+TEST_CASE("@HD: exactly one is emitted, in every -H shape" * doctest::test_suite("unit/sam_hdr_emit")) {
     // THE REGRESSION. Each of these emitted the right count except the third,
     // which emitted two: the default plus the user's.
     struct Case { std::string desc; const char *hdr_line; };
@@ -108,6 +109,7 @@ TEST_CASE("@HD: exactly one is emitted, in every -H shape") {
         { "-H with a NON-LEADING @HD",    "@RG\tID:x\tSM:y\n@HD\tVN:1.6\tSO:coordinate" },
         { "-H with @HD last of three",    "@RG\tID:x\n@CO\tnote\n@HD\tVN:1.6" },
         { "-H with no @HD at all",        "@RG\tID:x\tSM:y" },
+        { "-H with TWO @HD records",      "@HD\tVN:1.6\tSO:coordinate\n@RG\tID:x\n@HD\tVN:1.4" },
     };
     for (const Case &c : cases) {
         const std::string out = render(NULL, c.hdr_line, &COMPAT_TARGET_OFF);
@@ -116,30 +118,52 @@ TEST_CASE("@HD: exactly one is emitted, in every -H shape") {
     }
 }
 
-TEST_CASE("@HD: a leading user @HD wins and is hoisted above @SQ") {
+TEST_CASE("@HD: a leading user @HD wins and is hoisted above @SQ" * doctest::test_suite("unit/sam_hdr_emit")) {
     // Hoisting is what makes the header spec-valid (@HD must come first). It
     // is bwa-mem3-only -- bwa emits -H records after @SQ (bwa.c:438).
     const std::string out = render(NULL, "@HD\tVN:1.6\tSO:coordinate", &COMPAT_TARGET_OFF);
     CHECK(count_lines_starting(out, "@HD\t") == 1);
     CHECK(out.rfind("@HD\tVN:1.6\tSO:coordinate", 0) == 0);   // literally first
+    CHECK(count_lines_starting(out, "@SQ\t") == 2);
     CHECK(line_index_of(out, "@HD\t") < line_index_of(out, "@SQ\t"));
     CHECK(out.find("VN:1.5") == std::string::npos);           // default suppressed
 }
 
-TEST_CASE("@HD: a non-leading user @HD suppresses the default but stays inline") {
-    // It cannot be hoisted without reordering the user's own records, so it is
-    // emitted with the rest of -H after @SQ -- where bwa puts every -H record
-    // anyway. What it MUST do is suppress the default; failing to was the bug.
+TEST_CASE("@HD: of two user @HD records the first wins and the second is dropped" * doctest::test_suite("unit/sam_hdr_emit")) {
+    const std::string out =
+        render(NULL, "@HD\tVN:1.6\tSO:coordinate\n@RG\tID:x\n@HD\tVN:1.4", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@HD\t") == 1);
+    CHECK(out.rfind("@HD\tVN:1.6\tSO:coordinate\n", 0) == 0);  // the first, first
+    CHECK(out.find("VN:1.4") == std::string::npos);             // the second dropped
+    CHECK(out.find("VN:1.5") == std::string::npos);             // default suppressed
+    CHECK(out.find("\n@RG\tID:x\n") != std::string::npos);
+}
+
+TEST_CASE("@HD: a non-leading user @HD suppresses the default and is moved to the first line" * doctest::test_suite("unit/sam_hdr_emit")) {
+    // The SAM spec puts @HD first, and the --bam writer's htslib header does
+    // too, so the SAM text moves it there as well; the user's other records
+    // keep their order.
     const std::string out =
         render(NULL, "@RG\tID:x\tSM:y\n@HD\tVN:1.6\tSO:coordinate", &COMPAT_TARGET_OFF);
     CHECK(count_lines_starting(out, "@HD\t") == 1);
     CHECK(out.find("VN:1.5") == std::string::npos);           // default suppressed
-    CHECK(out.find("VN:1.6") != std::string::npos);           // the user's survives
-    CHECK(line_index_of(out, "@SQ\t") < line_index_of(out, "@HD\t"));   // inline, after @SQ
+    CHECK(out.rfind("@HD\tVN:1.6\tSO:coordinate\n", 0) == 0);  // the user's, first
+    CHECK(count_lines_starting(out, "@SQ\t") == 2);
+    CHECK(line_index_of(out, "@SQ\t") < line_index_of(out, "@RG\t"));
     CHECK(count_lines_starting(out, "@RG\t") == 1);             // and @RG is not lost
+    CHECK(out.find("\n@RG\tID:x\tSM:y\n") != std::string::npos); // exact line preserved
 }
 
-TEST_CASE("@HD: the index sidecar supplies one when -H does not") {
+TEST_CASE("@HD: a non-leading sidecar @HD is moved to the first line" * doctest::test_suite("unit/sam_hdr_emit")) {
+    const std::string out =
+        render("@CO\tfrom the sidecar\n@HD\tVN:1.4\tSO:queryname", NULL, &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@HD\t") == 1);
+    CHECK(out.rfind("@HD\tVN:1.4\tSO:queryname\n", 0) == 0);
+    CHECK(count_lines_starting(out, "@SQ\t") == 2);
+    CHECK(line_index_of(out, "@SQ\t") < line_index_of(out, "@CO\t"));
+}
+
+TEST_CASE("@HD: the index sidecar supplies one when -H does not" * doctest::test_suite("unit/sam_hdr_emit")) {
     const std::string out =
         render("@HD\tVN:1.4\tSO:queryname\n@CO\tfrom the sidecar", NULL, &COMPAT_TARGET_OFF);
     CHECK(count_lines_starting(out, "@HD\t") == 1);
@@ -148,7 +172,7 @@ TEST_CASE("@HD: the index sidecar supplies one when -H does not") {
     CHECK(out.find("@CO\tfrom the sidecar") != std::string::npos);
 }
 
-TEST_CASE("@HD: the user's -H beats the sidecar's, and only one survives") {
+TEST_CASE("@HD: the user's -H beats the sidecar's, and only one survives" * doctest::test_suite("unit/sam_hdr_emit")) {
     // Both @HD records lead their own stream here, which is the easy shape: the
     // loser is consumed off the front of the sidecar and simply not printed.
     const std::string out = render("@HD\tVN:1.4\tSO:queryname",
@@ -158,7 +182,7 @@ TEST_CASE("@HD: the user's -H beats the sidecar's, and only one survives") {
     CHECK(out.find("VN:1.4") == std::string::npos);           // sidecar's dropped
 }
 
-TEST_CASE("@HD: a LOSING sidecar @HD is dropped wherever it sits in the sidecar") {
+TEST_CASE("@HD: a LOSING sidecar @HD is dropped wherever it sits in the sidecar" * doctest::test_suite("unit/sam_hdr_emit")) {
     // The case above only exercised a LEADING sidecar @HD, which is consumed off
     // the front. A sidecar @HD behind another record cannot be consumed that way,
     // and used to be counted-but-still-printed -- so the stream carried two @HD
@@ -187,12 +211,14 @@ TEST_CASE("@HD: a LOSING sidecar @HD is dropped wherever it sits in the sidecar"
                       "case: ", c.desc, "\n----\n", out, "----");
         // Dropping the losing @HD must not take the sidecar's other records
         // with it.
+        CHECK_MESSAGE(out.find("\n@RG\tID:z\n") != std::string::npos,
+                      "case: ", c.desc, "\n----\n", out, "----");
         CHECK_MESSAGE(count_lines_starting(out, "@RG\tID:z") == 1,
                       "case: ", c.desc, "\n----\n", out, "----");
     }
 }
 
-TEST_CASE("@HD: only the first of several sidecar @HD records survives") {
+TEST_CASE("@HD: only the first of several sidecar @HD records survives" * doctest::test_suite("unit/sam_hdr_emit")) {
     // With no -H at all the sidecar supplies the winner, but a sidecar carrying
     // more than one @HD must still yield exactly one record.
     const std::string out =
@@ -202,9 +228,10 @@ TEST_CASE("@HD: only the first of several sidecar @HD records survives") {
     CHECK(out.find("VN:1.4") != std::string::npos);           // first wins
     CHECK(out.find("VN:1.3") == std::string::npos);
     CHECK(count_lines_starting(out, "@RG\tID:z") == 1);
+    CHECK(out.find("\n@RG\tID:z\n") != std::string::npos);
 }
 
-TEST_CASE("@HD: a compat target that emits none emits none, but -H still wins") {
+TEST_CASE("@HD: a compat target that emits none emits none, but -H still wins" * doctest::test_suite("unit/sam_hdr_emit")) {
     const compat_target_t *mem2 = compat_target_from_name("bwa-mem2");
     REQUIRE(mem2 != nullptr);
     REQUIRE(mem2->emit_hd == 0);
@@ -218,14 +245,14 @@ TEST_CASE("@HD: a compat target that emits none emits none, but -H still wins") 
     CHECK(out.find("VN:1.6") != std::string::npos);
 }
 
-TEST_CASE("@SQ: generated from bns, carrying AH:* on ALT contigs") {
+TEST_CASE("@SQ: generated from bns, carrying AH:* on ALT contigs" * doctest::test_suite("unit/sam_hdr_emit")) {
     const std::string out = render(NULL, NULL, &COMPAT_TARGET_OFF);
     CHECK(count_lines_starting(out, "@SQ\t") == 2);
     CHECK(out.find("@SQ\tSN:chr1\tLN:1000\n") != std::string::npos);
     CHECK(out.find("@SQ\tSN:chr1_alt\tLN:500\tAH:*\n") != std::string::npos);
 }
 
-TEST_CASE("@SQ: a user -H @SQ block is authoritative and suppresses generation") {
+TEST_CASE("@SQ: a user -H @SQ block is authoritative and suppresses generation" * doctest::test_suite("unit/sam_hdr_emit")) {
     // Matches both upstreams (bwa.c:429, bwa-mem2 bwa.cpp:534): if -H supplies
     // any @SQ, it is used alone -- no generation, and the sidecar is ignored.
     const std::string out = render("@SQ\tSN:from_sidecar\tLN:7",
@@ -236,7 +263,7 @@ TEST_CASE("@SQ: a user -H @SQ block is authoritative and suppresses generation")
     CHECK(out.find("SN:chr1") == std::string::npos);          // nothing generated
 }
 
-TEST_CASE("@SQ: '@SQ' named inside another record does not count as one") {
+TEST_CASE("@SQ: '@SQ' named inside another record does not count as one" * doctest::test_suite("unit/sam_hdr_emit")) {
     // The -H @SQ count decides whether the bns block is generated at all, so a
     // false positive silently drops every contig from the header. Only records
     // that BEGIN with "@SQ\t" count -- a @CO that merely mentions the tag, and a
@@ -254,7 +281,7 @@ TEST_CASE("@SQ: '@SQ' named inside another record does not count as one") {
     CHECK(one.find("SN:chr1") == std::string::npos);
 }
 
-TEST_CASE("@SQ: a record type that merely EXTENDS @SQ is not an @SQ") {
+TEST_CASE("@SQ: a record type that merely EXTENDS @SQ is not an @SQ" * doctest::test_suite("unit/sam_hdr_emit")) {
     // The record type ends at the tab, so "@SQX" is its own (unknown) type, not
     // an @SQ with a typo. count_SQ requires "@SQ\t", so generation still fires
     // and the malformed record is passed through as an ordinary -H line.
@@ -269,7 +296,7 @@ TEST_CASE("@SQ: a record type that merely EXTENDS @SQ is not an @SQ") {
     CHECK(out.find("SN:chr1_alt") != std::string::npos);
 }
 
-TEST_CASE("@SQ: -H text without a trailing newline is still counted and emitted") {
+TEST_CASE("@SQ: -H text without a trailing newline is still counted and emitted" * doctest::test_suite("unit/sam_hdr_emit")) {
     // -H text arrives unterminated from bwa_insert_header and newline-terminated
     // from a sidecar file; both must yield the same record count. If the final
     // record were dropped, generation would fire and the header would carry the
@@ -280,12 +307,15 @@ TEST_CASE("@SQ: -H text without a trailing newline is still counted and emitted"
     CHECK(out.find("SN:chr1") == std::string::npos);
 }
 
-TEST_CASE("@HD/@SQ: blank records in -H text are dropped, not emitted") {
+TEST_CASE("@HD/@SQ: blank records in -H text are dropped, not emitted" * doctest::test_suite("unit/sam_hdr_emit")) {
     // Header text can carry empty lines (a sidecar with a stray newline). They
     // are not valid records; the emitter drops them rather than writing bare
     // newlines into the header.
     const std::string out = render(NULL, "@RG\tID:a\n\n@RG\tID:b",
                                    &COMPAT_TARGET_OFF);
     CHECK(count_lines_starting(out, "@RG\t") == 2);
+    CHECK(out.find("\n@RG\tID:a\n") != std::string::npos);
+    CHECK(out.find("\n@RG\tID:b\n") != std::string::npos);
+    CHECK(out.find("\n@RG\tID:a\n") < out.find("\n@RG\tID:b\n"));
     CHECK(out.find("\n\n") == std::string::npos);
 }

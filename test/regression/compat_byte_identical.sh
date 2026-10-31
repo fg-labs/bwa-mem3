@@ -468,7 +468,8 @@ fi
 echo "PASS: bwa-mem keeps @HD + MQ:i and drops HN:i; bwa-mem2 drops all three"
 
 # --- --compat with an @HD in -H warns, and does NOT reject. --------------
-# bwa-mem3 hoists a LEADING user @HD above @SQ so the header is spec-valid;
+# bwa-mem3 hoists the user's first @HD above @SQ, wherever it sits in -H, so
+# the header is spec-valid;
 # bwa emits -H records after @SQ and bwa-mem2 has no @HD logic, so the header
 # differs from the target in line ORDER. That is an explicit, coherent request
 # ("valid header, everything else the same") -- unlike --fast/--meth, which the
@@ -495,13 +496,12 @@ head -1 "$COMPAT_WORK_DIR/hdwarn.sam" | grep -q '^@HD' \
     }
 echo "PASS: --compat with -H @HD warns and continues, user @HD wins"
 
-# A LATER @HD is emitted inline after @SQ, exactly as upstream does, so there
-# is nothing to warn about -- the warning must stay quiet or it means nothing.
+# A LATER @HD is moved to the first line too, so it diverges and warns as well.
 "$BWA_MEM3" mem --compat=bwa-mem2 -H "$rg_h" -H "$hd_h" "$ref" "$r1" "$r2" \
-    > /dev/null 2> "$COMPAT_WORK_DIR/hdquiet.log"
-if grep -q 'in line order' "$COMPAT_WORK_DIR/hdquiet.log"; then
-    echo "FAIL: warned about a non-leading @HD, which does not diverge" >&2
-    cat "$COMPAT_WORK_DIR/hdquiet.log" >&2
+    > /dev/null 2> "$COMPAT_WORK_DIR/hdlater.log"
+if ! grep -q 'in line order' "$COMPAT_WORK_DIR/hdlater.log"; then
+    echo "FAIL: a non-leading -H @HD, which is moved to the first line, did not warn" >&2
+    cat "$COMPAT_WORK_DIR/hdlater.log" >&2
     exit 1
 fi
 # ...and no warning at all without a compat target.
@@ -510,7 +510,7 @@ if grep -q 'in line order' "$COMPAT_WORK_DIR/hdoff.log"; then
     echo "FAIL: warned without a compat target selected" >&2
     exit 1
 fi
-echo "PASS: the -H @HD warning fires only when the header actually diverges"
+echo "PASS: the -H @HD warning fires for any -H @HD under --compat, and only then"
 
 # --- Exactly one @HD, always, on both output paths. -----------------------
 # A non-leading @HD in -H used to leave the SAM path emitting the DEFAULT @HD

@@ -3400,7 +3400,8 @@ int main_mem(int argc, char *argv[])
      * header would have been ordered. A new --compat guard belongs above this
      * comment, not below it.
      *
-     * bwa-mem3 hoists a LEADING user @HD above the @SQ block, so the header is
+     * bwa-mem3 hoists the user's first @HD above the @SQ block, wherever it sits
+     * in -H, so the header is
      * spec-valid (@HD must come first). Neither target does that: bwa 0.7.19
      * emits -H records after @SQ and only warns (bwa.c:426-428), bwa-mem2 has
      * no @HD logic at all. So the header differs from the target in line ORDER.
@@ -3411,11 +3412,9 @@ int main_mem(int argc, char *argv[])
      * the user cannot see those in their own command line. An @HD they typed
      * themselves, they can. Records are unaffected either way.
      *
-     * Only a LEADING @HD is hoisted, and only that case diverges; a later @HD
-     * is emitted inline after @SQ exactly as upstream does. Warn precisely, so
-     * the warning means something when it fires. */
-    if (compat_on && hdr_line != NULL &&
-        strncmp(hdr_line, "@HD\t", 4) == 0 && bwa_verbose >= 2) {
+     * Every -H @HD diverges: the first is hoisted and any later one is dropped
+     * (bwa_build_sam_hdr), so the warning fires for an @HD anywhere in -H. */
+    if (compat_on && bwa_hdr_text_has_type(hdr_line, "@HD\t") && bwa_verbose >= 2) {
         fprintf(stderr, "[W::%s] --compat=%s with an @HD from -H: bwa-mem3 emits it before "
                 "@SQ (the SAM spec requires @HD first), but %s emits -H records after @SQ, "
                 "so the header will differ from %s in line order. Records are unaffected. "
@@ -4141,12 +4140,10 @@ int main_mem(int argc, char *argv[])
     } else if (opt->bam_mode) {
         const char *bam_path = is_o ? out_path : "-";
         extern char *bwa_pg;
-        /* Suppress idx .hdr/.dict records entirely when the user's -H
-         * supplies any @SQ, matching bwa_print_sam_hdr2's SAM precedence. */
-        const char *bam_idx_hdr = bwa_hdr_text_has_type(hdr_line, "@SQ\t")
-                                ? NULL : idx_hdr_lines;
+        /* Same header as the SAM path (bwa_build_sam_hdr), which also
+         * applies the -H @SQ precedence over the index sidecar. */
         bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
-                                     bam_idx_hdr, hdr_line,
+                                     idx_hdr_lines, hdr_line,
                                      bwa_pg, opt->bam_level, opt->compat,
                                      opt->bam_threads);
         if (bam_writer == NULL) {
