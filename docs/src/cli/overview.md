@@ -1,6 +1,6 @@
 # CLI Reference Overview
 
-bwa-mem3 exposes five subcommands: `index`, `mem`, `shm`, `re-sa`, and
+bwa-mem3 exposes six subcommands: `index`, `mem`, `aln`, `shm`, `re-sa`, and
 `version`. Run `bwa-mem3 <subcommand> --help` to see the full option list for any
 command.
 
@@ -38,6 +38,11 @@ seed index) for methylation alignment.
 SAM or BAM output. It is the primary alignment subcommand. The flag surface is
 large; the `mem` reference page groups flags by purpose to make them easier to
 navigate.
+
+**[aln](aln.md)** aligns ultrashort, ancient or degraded DNA reads with bwa's
+backtracking algorithm, in one step: it replaces `bwa aln` followed by `bwa samse`
+or `bwa sampe`, with no `.sai` files, and its SAM is byte-identical to bwa 0.7.19's.
+It reads the same index as `mem`.
 
 **[shm](shm.md)** stages an FM-index into POSIX shared memory so that
 repeated `bwa-mem3 mem` invocations on the same machine skip the per-run disk

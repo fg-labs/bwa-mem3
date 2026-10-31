@@ -525,6 +525,19 @@ void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa
 	}
 }
 
+// Number of lines in `text` (may be NULL) that begin with `tag`; a tag in mid-line does not count.
+static int count_line_start(const char *text, const char *tag)
+{
+	int n = 0;
+	const size_t len = strlen(tag);
+	for (const char *line = text; line && *line; ) {
+		if (strncmp(line, tag, len) == 0) ++n;
+		const char *nl = strchr(line, '\n');
+		line = nl ? nl + 1 : NULL;
+	}
+	return n;
+}
+
 // The header stock bwa 0.7.19 samse prints. The Apache2 branch's bwa_print_sam_hdr differs
 // from the release in two ways that show in the output: it prints @SQ before @HD and it
 // looks for "@HD" anywhere in the -r text. The release is the parity target, so this
@@ -533,20 +546,9 @@ void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa
 // pg_line. A newline is added to pg_line only if it lacks one (bwa-mem3's @PG line has one).
 void aln_print_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *hdr_line, const char *pg_line)
 {
-	int i, n_HD = 0, n_SQ = 0;
-
-	if (hdr_line) {
-		const char *p = hdr_line;
-		while ((p = strstr(p, "@HD\t")) != 0) {
-			if (p == hdr_line || *(p-1) == '\n') ++n_HD;
-			p += 4;
-		}
-		p = hdr_line;
-		while ((p = strstr(p, "@SQ\t")) != 0) {
-			if (p == hdr_line || *(p-1) == '\n') ++n_SQ;
-			p += 4;
-		}
-	}
+	int i;
+	const int n_HD = count_line_start(hdr_line, "@HD\t");
+	const int n_SQ = count_line_start(hdr_line, "@SQ\t");
 	if (n_HD == 0) ksprintf(out, "@HD\tVN:1.5\tSO:unsorted\tGO:query\n");
 	if (n_SQ == 0) {
 		for (i = 0; i < bns->n_seqs; ++i) {
