@@ -19,7 +19,43 @@
 struct bam_writer_s {
     htsFile   *fp;
     sam_hdr_t *hdr;
+    /* Index contig -> header contig (tid), or NULL when they coincide. The
+     * records carry the index's contig numbers; the header's @SQ block may list
+     * the contigs in another order (it is taken verbatim from -H or the index
+     * sidecar), so they are mapped by name when written. */
+    int32_t   *tid_map;
 };
+
+/* Map every index contig to the header's @SQ record of the same name. Returns
+ * 0 and sets *map_out (NULL when the header lists the index's contigs first and
+ * in index order, so no record needs remapping), or -1 when an index contig has
+ * no @SQ record: a BAM record can only name a contig the header lists, and
+ * labelling it with the wrong one is not an option. */
+static int map_index_contigs(const sam_hdr_t *hdr, const bntseq_t *bns, int32_t **map_out)
+{
+    *map_out = NULL;
+    int32_t *map = (int32_t *)malloc(sizeof(int32_t) * (size_t)(bns->n_seqs > 0 ? bns->n_seqs : 1));
+    if (map == NULL) return -1;
+    int identity = 1;
+    for (int i = 0; i < bns->n_seqs; ++i) {
+        const int tid = sam_hdr_name2tid((sam_hdr_t *)hdr, bns->anns[i].name);
+        if (tid < 0) {
+            if (tid == -1)
+                fprintf(stderr,
+                        "ERROR: contig '%s' of the index has no @SQ record in the output "
+                        "header; with --bam, the @SQ block (from -H or the index's .hdr / "
+                        ".dict sidecar) must name every contig of the index\n",
+                        bns->anns[i].name);
+            free(map);
+            return -1;
+        }
+        map[i] = tid;
+        if (tid != i) identity = 0;
+    }
+    if (identity) free(map);
+    else *map_out = map;
+    return 0;
+}
 
 extern char bwa_rg_id[256];
 
@@ -38,103 +74,22 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
     if (path == NULL || bns == NULL) return NULL;
     if (compat == NULL) compat = &COMPAT_TARGET_OFF;
 
-    // Detect whether the index .hdr/.dict content already supplies @SQ or
-    // @HD records. If @SQ: skip auto-generating @SQ from `bns` — adding
-    // both would hit htslib's "duplicate SN" de-dup and fail. If @HD:
-    // skip the default @HD — htslib's sam_hdr_add_lines does not de-dup
-    // @HD records, so emitting both would produce two @HD lines. The
-    // caller (fastmap.cpp) has already nulled `idx_hdr_lines` when the
-    // user's -H supplies @SQ, so if we see @SQ here, they're authoritative.
-    const int idx_has_sq  = bwa_hdr_text_has_type(idx_hdr_lines, "@SQ\t");
-    const int idx_has_hd  = bwa_hdr_text_has_type(idx_hdr_lines, "@HD\t");
-    const int user_has_hd = bwa_hdr_text_has_type(hdr_line, "@HD\t");
-
-    sam_hdr_t *hdr = sam_hdr_init();
-    if (hdr == NULL) return NULL;
-    // Emit a default @HD only when neither the user's -H nor the index's
-    // .hdr/.dict supplies one. Precedence (user > index > default) is
-    // enforced by ordering: we add idx_hdr_lines before hdr_line, and the
-    // SAM text path uses the same precedence via bwa_print_sam_hdr2.
-    //
-    // @HD policy comes from the selected compat target; the evidence for each
-    // row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
-    // compat target -- suppressing it is deliberate, not an oversight.
-    //
-    // sam_hdr_add_lines over the target's exact text, NOT sam_hdr_add_line with
-    // key/value pairs: the point of #288 is that all three writers emit ONE
-    // string, and a key/value call here would be a second place to spell it.
-    if (!idx_has_hd && !user_has_hd && compat->emit_hd &&
-        sam_hdr_add_lines(hdr, compat->hd_line, 0) < 0) goto fail;
-    if (!idx_has_sq) {
-        // One shared formatter (bwa.cpp) rather than sam_hdr_add_line varargs:
-        // the @SQ contents -- including AH:* on ALT contigs -- are identical on
-        // every path, and this writer having its own spelling is how it came to
-        // silently drop AH for every ALT-aware reference (#281, fixed per-copy;
-        // #289 consolidates them). Not gated on `compat`: both upstreams emit
-        // this block, so it is correct output, not a divergence.
-        kstring_t sq = {0, 0, NULL};
-        for (int i = 0; i < bns->n_seqs; ++i) {
-            sq.l = 0;                      // reuse the buffer across contigs
-            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0) { free(sq.s); goto fail; }
-            int rc = sam_hdr_add_lines(hdr, sq.s, sq.l);
-            if (rc < 0) { free(sq.s); goto fail; }
+    // The header is the SAM-text writer's, built by the same function, so the
+    // two containers carry the same header: --bam is a container choice, not a
+    // content change.
+    sam_hdr_t *hdr = NULL;
+    int32_t *tid_map = NULL;
+    {
+        kstring_t text = {0, 0, NULL};
+        if (bwa_build_sam_hdr(&text, bns, idx_hdr_lines, hdr_line, bwa_pg, compat) < 0) {
+            free(text.s);
+            return NULL;
         }
-        free(sq.s);
+        hdr = sam_hdr_parse(text.l, text.s);
+        free(text.s);
+        if (hdr == NULL) return NULL;
     }
-    // Merge the index's .hdr/.dict records after the default @HD (and
-    // auto-generated @SQ, when the index didn't supply its own) but before
-    // the user's -H lines. Only one @HD may survive — htslib's
-    // sam_hdr_add_lines does not de-dup them — so strip every @HD from
-    // idx_hdr_lines except, when the user's -H supplies none, the first: that
-    // one is the winner. This matches the SAM text path's precedence
-    // (user > index > default) and its identical filter in bwa.cpp.
-    if (idx_hdr_lines != NULL && idx_hdr_lines[0] != '\0') {
-        const char *to_add = idx_hdr_lines;
-        char *filtered = NULL;
-        if (idx_has_hd) {
-            const int keep_first_hd = !user_has_hd;
-            int seen_hd = 0;
-            // Copy idx_hdr_lines, dropping the losing @HD records.
-            //
-            // n + 2, not n + 1: the loop below writes a '\n' after EVERY record
-            // it keeps, but bwa_load_hdr_from_index strips the trailing newline
-            // from the text it returns, so `n` counts one separator fewer than
-            // the loop emits. Keeping every record of unterminated text
-            // therefore needs n + 1 bytes plus the NUL -- the exact case a
-            // sidecar with one @HD and no user -H produces, which overflowed
-            // this buffer by one byte on every such run.
-            size_t n = strlen(idx_hdr_lines);
-            filtered = (char *)malloc(n + 2);
-            if (filtered == NULL) goto fail;
-            size_t w = 0;
-            const char *cur = idx_hdr_lines, *line; size_t len;
-            while (bwa_hdr_next_line(&cur, &line, &len)) {
-                int is_hd = (len >= 4 && strncmp(line, "@HD\t", 4) == 0);
-                if (len > 0 && (!is_hd || (keep_first_hd && !seen_hd))) {
-                    memcpy(filtered + w, line, len); w += len;
-                    filtered[w++] = '\n';
-                }
-                if (is_hd) seen_hd = 1;
-            }
-            /* The n + 2 bound above is derived from bwa_hdr_next_line never
-             * yielding a phantom empty final record. Pin that derivation here:
-             * if the iterator's trailing-newline handling ever changes, this
-             * aborts (xassert is live in every build -- NDEBUG is never defined)
-             * instead of silently overflowing the buffer by one byte again.
-             * (Post-hoc detection; a per-line pre-write bound check would be the
-             * fuller fix.) */
-            xassert(w <= n + 1, "bam_writer: header filter overran its buffer");
-            filtered[w] = '\0';
-            to_add = filtered;
-        }
-        int rc = (to_add[0] != '\0') ? sam_hdr_add_lines(hdr, to_add, 0) : 0;
-        free(filtered);
-        if (rc < 0) goto fail;
-    }
-    if (hdr_line != NULL && hdr_line[0] != '\0' && sam_hdr_add_lines(hdr, hdr_line, 0) < 0)
-        goto fail;
-    if (bwa_pg != NULL && bwa_pg[0] != '\0' && sam_hdr_add_lines(hdr, bwa_pg, 0) < 0)
-        goto fail;
+    if (map_index_contigs(hdr, bns, &tid_map) < 0) goto fail;
 
     {
         if (compression_level < 0) compression_level = 0;
@@ -158,10 +113,11 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
         if (sam_hdr_write(fp, hdr) < 0) { hts_close(fp); goto fail; }
         bam_writer_t *w = (bam_writer_t *)calloc(1, sizeof(*w));
         if (w == NULL) { hts_close(fp); goto fail; }
-        w->fp = fp; w->hdr = hdr;
+        w->fp = fp; w->hdr = hdr; w->tid_map = tid_map;
         return w;
     }
 fail:
+    free(tid_map);
     sam_hdr_destroy(hdr);
     return NULL;
 }
@@ -169,6 +125,10 @@ fail:
 int bam_writer_write(bam_writer_t *w, struct bam1_t *b)
 {
     if (w == NULL || b == NULL) return -1;
+    if (w->tid_map != NULL) {
+        if (b->core.tid >= 0)  b->core.tid  = w->tid_map[b->core.tid];
+        if (b->core.mtid >= 0) b->core.mtid = w->tid_map[b->core.mtid];
+    }
     return sam_write1(w->fp, w->hdr, b);
 }
 
@@ -178,6 +138,7 @@ int bam_writer_close(bam_writer_t *w)
     int rc = 0;
     if (w->hdr) { sam_hdr_destroy(w->hdr); w->hdr = NULL; }
     if (w->fp)  { if (hts_close(w->fp) < 0) rc = -1; w->fp = NULL; }
+    free(w->tid_map);
     free(w);
     return rc;
 }

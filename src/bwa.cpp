@@ -834,46 +834,6 @@ uint32_t *bwa_gen_cigar(const int8_t mat[25], int q, int r, int w_, int64_t l_pa
  * SAM header routines *
  ***********************/
 
-// Write the first line from `lines` to `fp` and return a pointer to the
-// remainder (or NULL when consumed). `lines` is newline-separated but not
-// required to be newline-terminated.
-static const char *hoist_line(const char *lines, FILE *fp)
-{
-    const char *nl = strchr(lines, '\n');
-    if (nl) {
-        err_fwrite(lines, 1, (size_t)(nl - lines), fp);
-        err_fputc('\n', fp);
-        return nl + 1;
-    } else {
-        err_fputs(lines, fp);
-        err_fputc('\n', fp);
-        return NULL;
-    }
-}
-
-// Write `lines` (newline-separated, not newline-terminated) to `fp`, dropping
-// every @HD record except -- when `keep_first_HD` is set -- the first one.
-//
-// Only ONE @HD may reach the output, and the loser can sit anywhere in either
-// stream, so it cannot always be consumed off the front the way hoist_line
-// handles a leading record. A winner that is not leading has to stay inline,
-// where the caller put it, hence `keep_first_HD` rather than an unconditional
-// drop. Empty lines are skipped, matching the BAM writer's equivalent filter
-// (bam_writer.cpp) -- a blank line is not a valid header record.
-static void fputs_filtering_HD(const char *lines, int keep_first_HD, FILE *fp)
-{
-    int seen_HD = 0;
-    const char *cur = lines, *line; size_t len;
-    while (bwa_hdr_next_line(&cur, &line, &len)) {
-        const int is_HD = (len >= 4 && strncmp(line, "@HD\t", 4) == 0);
-        if (len > 0 && (!is_HD || (keep_first_HD && !seen_HD))) {
-            err_fwrite(line, 1, len, fp);
-            err_fputc('\n', fp);
-        }
-        if (is_HD) seen_HD = 1;
-    }
-}
-
 /* Iterate the records of newline-separated SAM header text.
  *
  * Start with *p at the beginning of the text. Each call sets *line/*len to the
@@ -1002,12 +962,6 @@ int bwa_hdr_text_has_type(const char *s, const char *tag)
 static int has_SQ(const char *lines)
 {
     return bwa_hdr_text_has_type(lines, "@SQ\t");
-}
-
-// Return 1 iff `lines` contains an @HD record (first line, or after a newline).
-static int has_HD(const char *lines)
-{
-    return bwa_hdr_text_has_type(lines, "@HD\t");
 }
 
 // Count the number of @SQ header records in `lines`.
@@ -1141,78 +1095,89 @@ void bwa_warn_sidecar_missing_AH(const bntseq_t *bns, const char *idx_hdr_lines,
             __func__, prefix ? prefix : "<ref>", prefix ? prefix : "<ref>");
 }
 
-// Emit the full SAM header, merging (in precedence order) user `hdr_line`
-// (from -H), `bns_hdr` (loaded from <prefix>.hdr or <baseprefix>.dict), and
-// the index's @SQ records. Precedence mirrors lh3/bwa#348:
-//   @HD : user's > index's > the target's default (none, under a target that
-//         emits no @HD -- see below).
-//   @SQ : if user supplies any, use user's alone (index .hdr was already
-//         skipped by the caller); else index's @SQ; else generated from bns.
-//   Other: all remaining lines from bns_hdr, then hdr_line, then bwa_pg.
-static void print_sam_hdr(const bntseq_t *bns, const char *bns_hdr,
-                          const char *hdr_line, FILE *fp,
-                          const compat_target_t *compat)
+/* Append the records of `lines` (newline-separated, terminated or not) to
+ * `out`, one per line, dropping every @HD -- the builder emits the one that
+ * wins itself, first -- and every empty line, which is not a header record. */
+static void append_records_without_HD(kstring_t *out, const char *lines)
 {
-    int i, n_SQ = count_SQ(hdr_line);
-    extern char *bwa_pg;
+    const char *cur = lines, *line; size_t len;
+    while (bwa_hdr_next_line(&cur, &line, &len)) {
+        if (len == 0 || (len >= 4 && strncmp(line, "@HD\t", 4) == 0)) continue;
+        kputsn(line, (int)len, out);
+        kputc('\n', out);
+    }
+}
+
+/* The first @HD record of `lines`, or NULL; its length in *len. */
+static const char *first_HD(const char *lines, size_t *len)
+{
+    const char *cur = lines, *line;
+    while (bwa_hdr_next_line(&cur, &line, len))
+        if (*len >= 4 && strncmp(line, "@HD\t", 4) == 0) return line;
+    return NULL;
+}
+
+/* Build the complete output header -- the one definition the SAM-text writer
+ * prints and the --bam writer hands to htslib, so the two containers cannot
+ * carry different headers. It merges, in precedence order, the user's -H text
+ * (`hdr_line`), the index's <prefix>.hdr / <baseprefix>.dict sidecar
+ * (`idx_hdr_lines`) and records generated from `bns`. The precedence follows
+ * lh3/bwa#348, and every record is emitted verbatim:
+ *   @HD : the user's first @HD > the sidecar's first > the compat target's
+ *         default (none, under a target that emits none). Exactly one is
+ *         emitted, and always as the first line, as the SAM spec requires,
+ *         wherever it sat in its source; every other @HD is dropped.
+ *   @SQ : if -H supplies any, the user's alone (the sidecar is then ignored
+ *         entirely); else the sidecar's; else generated from bns.
+ *   Other: the sidecar's remaining records, then -H's, then `pg` (the @PG
+ *         text, newline-terminated; NULL for none).
+ * The @SQ block is authoritative as given: it is not reordered or completed
+ * against the index. The --bam writer maps its records' contigs onto it by
+ * name (bam_writer_open). Returns 0, or -1 if `out` could not be grown. */
+int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
+                      const char *hdr_line, const char *pg, const compat_target_t *compat)
+{
     if (compat == NULL) compat = &COMPAT_TARGET_OFF;
-
-    // Emit exactly one @HD record — the user's (-H) if they gave any, else the
-    // sidecar's, else the target's default. Whichever stream owns the winner,
-    // EVERY other @HD in either stream is dropped: emitting two is a spec
-    // violation, and one bwa does not have (bwa.c:412-426 counts @HD at any
-    // line start before deciding). The BAM writer already filtered the losing
-    // sidecar records this way, so this keeps the two paths in agreement.
-    const int user_HD = has_HD(hdr_line);
-    const int idx_HD  = has_HD(bns_hdr);
-    int keep_user_HD = user_HD;             // does the tail below keep its @HD?
-    int keep_idx_HD  = !user_HD && idx_HD;  // user's -H beats the sidecar's
-
-    // A LEADING winner is consumed off the front of its stream and emitted up
-    // front, so it precedes @SQ as the spec requires. A later one cannot be
-    // hoisted without reordering the user's own records, so it stays inline and
-    // is emitted with the rest of the stream after @SQ — which is where bwa
-    // puts every -H record anyway.
-    if (keep_user_HD && strncmp(hdr_line, "@HD\t", 4) == 0) {
-        hdr_line = hoist_line(hdr_line, fp);
-        keep_user_HD = 0;                   // already emitted; drop any others
+    const int n_SQ = count_SQ(hdr_line);
+    // If the user's -H supplies any @SQ, ignore the sidecar entirely: the user
+    // has taken responsibility for the @SQ block.
+    const char *bns_hdr = n_SQ > 0 ? NULL : idx_hdr_lines;
+    if (bns_hdr) {
+        const int idx_SQ = count_SQ(bns_hdr);
+        if (idx_SQ != 0 && idx_SQ != bns->n_seqs && bwa_verbose >= 2)
+            fprintf(stderr,
+                    "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
+                    "Continue anyway.\n", __func__, idx_SQ, bns->n_seqs);
     }
-    if (keep_idx_HD && strncmp(bns_hdr, "@HD\t", 4) == 0) {
-        bns_hdr = hoist_line(bns_hdr, fp);
-        keep_idx_HD = 0;
-    }
-    /* @HD policy comes from the selected compat target; the evidence for each
-     * row is in src/compat_target.cpp. DO NOT "fix" the missing @HD under a
-     * compat target -- suppressing it is deliberate, not an oversight. */
-    if (!user_HD && !idx_HD && compat->emit_hd) {
-        err_fputs(compat->hd_line, fp);
-        err_fputc('\n', fp);
-    }
-
-    // Generate @SQ from bns only when neither hdr_line nor bns_hdr supply any.
-    if (n_SQ == 0 && !has_SQ(bns_hdr)) {
-        kstring_t sq = {0, 0, NULL};
-        for (i = 0; i < bns->n_seqs; ++i) {
-            sq.l = 0;                      /* reuse the buffer across contigs */
-            /* Fatal, like every other write failure on this path (err_fputs
-             * aborts): a header missing contigs is not a usable output, and
-             * this function has no way to report a partial one to its caller. */
-            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0)
-                err_fatal(__func__, "failed to allocate the @SQ record for contig %s",
-                          bns->anns[i].name);
-            err_fputs(sq.s, fp);
-            err_fputc('\n', fp);
-        }
-        free(sq.s);
-    }
-
     if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
         fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
                 "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
 
-    if (bns_hdr) fputs_filtering_HD(bns_hdr, keep_idx_HD, fp);
-    if (hdr_line) fputs_filtering_HD(hdr_line, keep_user_HD, fp);
-    if (bwa_pg) err_fputs(bwa_pg, fp);
+    /* @HD policy for the default comes from the selected compat target; the
+     * evidence for each row is in src/compat_target.cpp. DO NOT "fix" the
+     * missing @HD under a compat target -- suppressing it is deliberate. */
+    size_t hd_len = 0;
+    const char *hd = first_HD(hdr_line, &hd_len);
+    if (hd == NULL) hd = first_HD(bns_hdr, &hd_len);
+    if (hd != NULL) {
+        kputsn(hd, (int)hd_len, out);
+        kputc('\n', out);
+    } else if (compat->emit_hd) {
+        kputs(compat->hd_line, out);
+        kputc('\n', out);
+    }
+
+    // Generate @SQ from bns only when neither -H nor the sidecar supplies any.
+    if (n_SQ == 0 && !has_SQ(bns_hdr)) {
+        for (int i = 0; i < bns->n_seqs; ++i) {
+            if (bwa_format_sq_line(out, &bns->anns[i]) < 0) return -1;
+            kputc('\n', out);
+        }
+    }
+    if (bns_hdr) append_records_without_HD(out, bns_hdr);
+    if (hdr_line) append_records_without_HD(out, hdr_line);
+    if (pg) kputs(pg, out);
+    return out->s == NULL ? -1 : 0;
 }
 
 // Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
@@ -1269,18 +1234,15 @@ void bwa_print_sam_hdr2(const bntseq_t *bns, const char *idx_hdr_lines,
                         const char *hdr_line, FILE *fp,
                         const compat_target_t *compat)
 {
-    // If the user's -H supplies any @SQ, ignore the index .hdr/.dict content
-    // entirely — the user has taken responsibility for the @SQ block.
-    const char *bns_hdr = has_SQ(hdr_line) ? NULL : idx_hdr_lines;
-
-    if (bns_hdr) {
-        int n_SQ = count_SQ(bns_hdr);
-        if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
-            fprintf(stderr,
-                    "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
-                    "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
-    }
-    print_sam_hdr(bns, bns_hdr, hdr_line, fp, compat);
+    extern char *bwa_pg;
+    kstring_t hdr = {0, 0, NULL};
+    /* Fatal, like every other write failure on this path (err_fputs aborts): a
+     * header missing records is not a usable output, and this function has no
+     * way to report a partial one to its caller. */
+    if (bwa_build_sam_hdr(&hdr, bns, idx_hdr_lines, hdr_line, bwa_pg, compat) < 0)
+        err_fatal(__func__, "failed to allocate the SAM header");
+    if (hdr.l > 0) err_fwrite(hdr.s, 1, hdr.l, fp);
+    free(hdr.s);
 }
 
 static char *bwa_escape(char *s)

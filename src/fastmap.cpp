@@ -4131,12 +4131,10 @@ int main_mem(int argc, char *argv[])
     } else if (opt->bam_mode) {
         const char *bam_path = is_o ? out_path : "-";
         extern char *bwa_pg;
-        /* Suppress idx .hdr/.dict records entirely when the user's -H
-         * supplies any @SQ, matching bwa_print_sam_hdr2's SAM precedence. */
-        const char *bam_idx_hdr = bwa_hdr_text_has_type(hdr_line, "@SQ\t")
-                                ? NULL : idx_hdr_lines;
+        /* Same header as the SAM path (bwa_build_sam_hdr), which also
+         * applies the -H @SQ precedence over the index sidecar. */
         bam_writer = bam_writer_open(bam_path, aux.fmi->idx->bns,
-                                     bam_idx_hdr, hdr_line,
+                                     idx_hdr_lines, hdr_line,
                                      bwa_pg, opt->bam_level, opt->compat,
                                      opt->bam_threads);
         if (bam_writer == NULL) {

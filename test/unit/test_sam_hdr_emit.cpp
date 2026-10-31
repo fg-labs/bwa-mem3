@@ -126,17 +126,25 @@ TEST_CASE("@HD: a leading user @HD wins and is hoisted above @SQ") {
     CHECK(out.find("VN:1.5") == std::string::npos);           // default suppressed
 }
 
-TEST_CASE("@HD: a non-leading user @HD suppresses the default but stays inline") {
-    // It cannot be hoisted without reordering the user's own records, so it is
-    // emitted with the rest of -H after @SQ -- where bwa puts every -H record
-    // anyway. What it MUST do is suppress the default; failing to was the bug.
+TEST_CASE("@HD: a non-leading user @HD suppresses the default and is moved to the first line") {
+    // The SAM spec puts @HD first, and the --bam writer's htslib header does
+    // too, so the SAM text moves it there as well; the user's other records
+    // keep their order.
     const std::string out =
         render(NULL, "@RG\tID:x\tSM:y\n@HD\tVN:1.6\tSO:coordinate", &COMPAT_TARGET_OFF);
     CHECK(count_lines_starting(out, "@HD\t") == 1);
     CHECK(out.find("VN:1.5") == std::string::npos);           // default suppressed
-    CHECK(out.find("VN:1.6") != std::string::npos);           // the user's survives
-    CHECK(line_index_of(out, "@SQ\t") < line_index_of(out, "@HD\t"));   // inline, after @SQ
+    CHECK(out.rfind("@HD\tVN:1.6\tSO:coordinate\n", 0) == 0);  // the user's, first
+    CHECK(line_index_of(out, "@SQ\t") < line_index_of(out, "@RG\t"));
     CHECK(count_lines_starting(out, "@RG\t") == 1);             // and @RG is not lost
+}
+
+TEST_CASE("@HD: a non-leading sidecar @HD is moved to the first line") {
+    const std::string out =
+        render("@CO\tfrom the sidecar\n@HD\tVN:1.4\tSO:queryname", NULL, &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@HD\t") == 1);
+    CHECK(out.rfind("@HD\tVN:1.4\tSO:queryname\n", 0) == 0);
+    CHECK(line_index_of(out, "@SQ\t") < line_index_of(out, "@CO\t"));
 }
 
 TEST_CASE("@HD: the index sidecar supplies one when -H does not") {
