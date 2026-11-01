@@ -2491,71 +2491,75 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
             }
         }
 
-        j256 = _mm256_set1_epi16(beg);
-        for(j = beg; j < end; j++)
-        {
-            __m256i f11, f21, sbt11;
-            sbt11 = _mm256_load_si256((__m256i *)(sbt_buf + j * SIMD_WIDTH16));
-            h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH16));
-            f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH16));
-
-            __m256i pj256 = j256;
-            j256 = _mm256_add_epi16(j256, one256);
-
-            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero256,
-                             e_ins256, oe_ins256,
-                             e_del256, oe_del256);
-            
-            // Masked writing
-            __m256i cmp2 = _mm256_cmpgt_epi16(head256, pj256);
-            __m256i cmp1 = _mm256_cmpgt_epi16(pj256, tail256);
-            cmp1 = _mm256_or_si256(cmp1, cmp2);
-            h10 = _mm256_andnot_si256(cmp1, h10);
-            
-            __m256i bmaxRS = maxRS1;
-            maxRS1 =_mm256_max_epi16(maxRS1, h11);
-            // "new row-max" argmax mask. maxRS1 = max(bmaxRS,h11), so
-            // cmpgt(maxRS1,bmaxRS) is a strict subset of cmpeq(maxRS1,h11)
-            // (both mean h11 >= bmaxRS); the OR was redundant. cmpeq(maxRS1,h11)
-            // is the exact combined mask — bit-identical, drops a cmpgt+or.
-            __m256i cmpA = _mm256_cmpeq_epi16(maxRS1, h11);
-            cmp1 = _mm256_cmpgt_epi16(j256, tail256); // change
-            f21 = _mm256_andnot_si256(cmp1, f21);
-            cmp1 = _mm256_or_si256(cmp1, cmp2);
-            cmpA = _mm256_blendv_epi16(y1_256, j256, cmpA);
-            y1_256 = _mm256_blendv_epi16(cmpA, y1_256, cmp1);
-            maxRS1 = _mm256_blendv_epi16(maxRS1, bmaxRS, cmp1);                     
-
-            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH16), f21);
-            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH16), h10);
-
-            h10 = h11;
-            
-            //j256 = _mm256_add_epi16(j256, one256);
-            
-            // gscore calculations
-            if (j >= minq)
-            {
-                __m256i cmp = _mm256_cmpeq_epi16(j256, qlen256);
-                // Both blendv pairs below fall back to the same operand under
-                // exit0 then cmp, so each collapses to one select against the
-                // fused mask (cmp & exit0): saves 2 port-5 blendv per qualifying
-                // cell. Bit-identical — lane masks are uniform 0xFFFF/0x0000.
-                __m256i sel = _mm256_and_si256(cmp, exit0);
-                __m256i max_gh = _mm256_max_epi16(gscore, h11);
-                __m256i cmp_gh = _mm256_cmpgt_epi16(gscore, h11);
-                __m256i cand_ie = _mm256_blendv_epi16(i1_256, max_ie256, cmp_gh);
-
-                __m256i tmp256_1 = _mm256_blendv_epi16(max_ie256, cand_ie, sel);
-
-                max_gh = _mm256_blendv_epi16(gscore, max_gh, sel);
-
-                cmp = _mm256_cmpgt_epi16(j256, tail256);
-                max_gh = _mm256_blendv_epi16(max_gh, gscore, cmp);
-                max_ie256 = _mm256_blendv_epi16(tmp256_1, max_ie256, cmp);
-                gscore = max_gh;            
-            }
+        // One DP cell of column j with the score sbt11. QCAP (a literal 0 / 1) adds the
+        // query-end capture; see BSW16_RUN_256.
+#define DP_CELL_BODY16_256(sbt11, QCAP) \
+        { \
+            __m256i f11, f21; \
+            h00 = _mm256_load_si256((__m256i *)(H_h + j * SIMD_WIDTH16)); \
+            f11 = _mm256_load_si256((__m256i *)(F + j * SIMD_WIDTH16)); \
+ \
+            __m256i pj256 = j256; \
+            j256 = _mm256_add_epi16(j256, one256); \
+ \
+            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero256, \
+                             e_ins256, oe_ins256, \
+                             e_del256, oe_del256); \
+ \
+            /* Masked writing */ \
+            __m256i cmp2 = _mm256_cmpgt_epi16(head256, pj256); \
+            __m256i cmp1 = _mm256_cmpgt_epi16(pj256, tail256); \
+            cmp1 = _mm256_or_si256(cmp1, cmp2); \
+            h10 = _mm256_andnot_si256(cmp1, h10); \
+ \
+            __m256i bmaxRS = maxRS1; \
+            maxRS1 =_mm256_max_epi16(maxRS1, h11); \
+            /* "new row-max" argmax mask. maxRS1 = max(bmaxRS,h11), so */ \
+            /* cmpgt(maxRS1,bmaxRS) is a strict subset of cmpeq(maxRS1,h11) */ \
+            /* (both mean h11 >= bmaxRS); the OR was redundant. cmpeq(maxRS1,h11) */ \
+            /* is the exact combined mask — bit-identical, drops a cmpgt+or. */ \
+            __m256i cmpA = _mm256_cmpeq_epi16(maxRS1, h11); \
+            cmp1 = _mm256_cmpgt_epi16(j256, tail256); /* change */ \
+            f21 = _mm256_andnot_si256(cmp1, f21); \
+            cmp1 = _mm256_or_si256(cmp1, cmp2); \
+            cmpA = _mm256_blendv_epi16(y1_256, j256, cmpA); \
+            y1_256 = _mm256_blendv_epi16(cmpA, y1_256, cmp1); \
+            maxRS1 = _mm256_blendv_epi16(maxRS1, bmaxRS, cmp1); \
+ \
+            _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH16), f21); \
+            _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH16), h10); \
+ \
+            h10 = h11; \
+ \
+            /* j256 = _mm256_add_epi16(j256, one256); */ \
+ \
+            /* query-end capture: h11 at this lane's last query column; the */ \
+            /* gscore / max_ie update is folded once per row after the loop */ \
+            if (QCAP) \
+            { \
+                __m256i qcol = _mm256_cmpeq_epi16(j256, qlen256); \
+                hqe256 = _mm256_blendv_epi16(hqe256, h11, qcol); \
+            } \
         }
+        // The cell loop, split at the group's shortest query end: a lane's last query
+        // column is >= minq, so columns before it never capture. Two loops with the
+        // capture compiled in or out, rather than a per-cell (j >= minq) test that the
+        // compiler may turn into a per-cell vector select.
+#define BSW16_RUN_256(SBT_AT) \
+        do { \
+            const int jq_ = minq < beg ? beg : (minq > end ? end : minq); \
+            for (j = beg; j < jq_; j++) { SBT_AT(j, sbt11) DP_CELL_BODY16_256(sbt11, 0) } \
+            for (j = jq_; j < end; j++) { SBT_AT(j, sbt11) DP_CELL_BODY16_256(sbt11, 1) } \
+        } while (0)
+#define BSW16_SBT_BUF_AT(jj, S) \
+            __m256i S = _mm256_load_si256((__m256i *)(sbt_buf + (jj) * SIMD_WIDTH16));
+
+        j256 = _mm256_set1_epi16(beg);
+        __m256i hqe256 = zero256;   /* query-end capture (see the fold below) */
+        BSW16_RUN_256(BSW16_SBT_BUF_AT);
+#undef BSW16_SBT_BUF_AT
+#undef BSW16_RUN_256
+#undef DP_CELL_BODY16_256
         __m256i cmp2 = _mm256_cmpgt_epi16(head256, j256);
         __m256i cmp1 = _mm256_cmpgt_epi16(j256, tail256);
         cmp1 = _mm256_or_si256(cmp1, cmp2);
@@ -2564,6 +2568,25 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
         _mm256_store_si256((__m256i *)(H_h + j * SIMD_WIDTH16), h10);
         _mm256_store_si256((__m256i *)(F + j * SIMD_WIDTH16), zero256);
                 
+        /* Query-end fold (gscore / max_ie), once per row and BEFORE the zero-row
+         * break: the in-cell capture above ran on this row, and the old in-cell
+         * update ran before this break too. The old per-cell update fired for a lane
+         * iff j+1 == qlen && exit0 && !(j+1 > tail); exit0, tail and qlen are fixed
+         * for the row, so only the column varies and it matches at most once per lane
+         * per row: at column qlen-1, inside the row's columns iff beg < qlen <= end.
+         * The cell loop captured that column's h11 in hqe; apply the old update's own
+         * algebra to it here (h11 >= gscore takes the row, as before). */
+        {
+            __m256i qin = _mm256_andnot_si256(_mm256_cmpgt_epi16(qlen256, _mm256_set1_epi16(end)),
+                                              _mm256_cmpgt_epi16(qlen256, _mm256_set1_epi16(beg)));
+            __m256i upd = _mm256_andnot_si256(_mm256_cmpgt_epi16(qlen256, tail256),
+                                              _mm256_and_si256(qin, exit0));
+            __m256i cmp_gh = _mm256_cmpgt_epi16(gscore, hqe256);
+            __m256i cand_ie = _mm256_blendv_epi16(i1_256, max_ie256, cmp_gh);
+            max_ie256 = _mm256_blendv_epi16(max_ie256, cand_ie, upd);
+            gscore = _mm256_blendv_epi16(gscore, _mm256_max_epi16(gscore, hqe256), upd);
+        }
+
         /* exit due to zero score by a row */
         __m256i bmaxScore256 = maxScore256;
         __m256i tmp = _mm256_cmpeq_epi16(maxRS1, zero256);
@@ -4585,67 +4608,73 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
             }
         }
 
+        // One DP cell of column j with the score sbt11. QCAP (a literal 0 / 1) adds the
+        // query-end capture; see BSW16_RUN_512.
+#define DP_CELL_BODY16_512(sbt11, QCAP) \
+        { \
+            __m512i f11, f21, f31, f41, f51, jj512; \
+            h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH16)); \
+            f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH16)); \
+ \
+            __m512i pj512 = j512; \
+            j512 = _mm512_add_epi16(j512, one512); \
+ \
+            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero512, \
+                             e_ins512, oe_ins512, \
+                             e_del512, oe_del512); \
+ \
+            /* Masked writing */ \
+            __mmask32 cmp2 = _mm512_cmpgt_epi16_mask(head512, pj512); \
+            __mmask32 cmp1 = _mm512_cmpgt_epi16_mask(pj512, tail512); \
+            cmp1 = cmp1 | cmp2; \
+            h10 = _mm512_mask_blend_epi16(cmp1, h10, zero512); \
+ \
+            /* Part of main code MAIN_CODE */ \
+            __m512i bmaxRS = maxRS1, blend512; \
+            maxRS1 =_mm512_max_epi16(maxRS1, h11); \
+            /* maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict */ \
+            /* subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the AVX2 */ \
+            /* twin). Drops a cmpgt + kor per cell. */ \
+            __mmask32 cmpA = _mm512_cmpeq_epi16_mask(maxRS1, h11); \
+            cmp1 = _mm512_cmpgt_epi16_mask(j512, tail512); \
+            f21 = _mm512_mask_blend_epi16(cmp1, f21, zero512); \
+            cmp1 = cmp1 | cmp2; \
+            blend512 = _mm512_mask_blend_epi16(cmpA, y1_512, j512); \
+            y1_512 = _mm512_mask_blend_epi16(cmp1, blend512, y1_512); \
+            maxRS1 = _mm512_mask_blend_epi16(cmp1, maxRS1, bmaxRS); \
+ \
+            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH16), f21); \
+            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH16), h10); \
+ \
+            h10 = h11; \
+ \
+            /* query-end capture: h11 at this lane's last query column; the \
+             * gscore / max_ie update is folded once per row after the loop */ \
+            if (QCAP) \
+            { \
+                __mmask32 qcol = _mm512_cmpeq_epi16_mask(j512, qlen512); \
+                hqe512 = _mm512_mask_mov_epi16(hqe512, qcol, h11); \
+            } \
+        }
+        // The cell loop, split at the group's shortest query end: a lane's last query
+        // column is >= minq, so columns before it never capture. Two loops with the
+        // capture compiled in or out, rather than a per-cell (j >= minq) test that the
+        // compiler may turn into a per-cell vector select.
+#define BSW16_RUN_512(SBT_AT) \
+        do { \
+            const int jq_ = minq < beg ? beg : (minq > end ? end : minq); \
+            for (j = beg; j < jq_; j++) { SBT_AT(j, sbt11) DP_CELL_BODY16_512(sbt11, 0) } \
+            for (j = jq_; j < end; j++) { SBT_AT(j, sbt11) DP_CELL_BODY16_512(sbt11, 1) } \
+        } while (0)
+#define BSW16_SBT_BUF_AT(jj, S) \
+            __m512i S = _mm512_load_si512((__m512i *)(sbt_buf + (jj) * SIMD_WIDTH16));
+
         j512 = _mm512_set1_epi16(beg);
-        for(j = beg; j < end; j++)
-        {
-            __m512i f11, f21, f31, f41, f51, jj512, sbt11;
-            h00 = _mm512_load_si512((__m512i *)(H_h + j * SIMD_WIDTH16));
-            f11 = _mm512_load_si512((__m512i *)(F + j * SIMD_WIDTH16));
-            sbt11 = _mm512_load_si512((__m512i *)(sbt_buf + j * SIMD_WIDTH16));
-
-            __m512i pj512 = j512;
-            j512 = _mm512_add_epi16(j512, one512);
-
-            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero512,
-                             e_ins512, oe_ins512,
-                             e_del512, oe_del512);
-
-            // Masked writing
-            __mmask32 cmp2 = _mm512_cmpgt_epi16_mask(head512, pj512);
-            __mmask32 cmp1 = _mm512_cmpgt_epi16_mask(pj512, tail512);
-            cmp1 = cmp1 | cmp2;
-            h10 = _mm512_mask_blend_epi16(cmp1, h10, zero512);
-            
-            /* Part of main code MAIN_CODE */
-            __m512i bmaxRS = maxRS1, blend512;                                      
-            maxRS1 =_mm512_max_epi16(maxRS1, h11);                          
-            // maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict
-            // subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the AVX2
-            // twin). Drops a cmpgt + kor per cell.
-            __mmask32 cmpA = _mm512_cmpeq_epi16_mask(maxRS1, h11);
-            cmp1 = _mm512_cmpgt_epi16_mask(j512, tail512);
-            f21 = _mm512_mask_blend_epi16(cmp1, f21, zero512);
-            cmp1 = cmp1 | cmp2;
-            blend512 = _mm512_mask_blend_epi16(cmpA, y1_512, j512);
-            y1_512 = _mm512_mask_blend_epi16(cmp1, blend512, y1_512);
-            maxRS1 = _mm512_mask_blend_epi16(cmp1, maxRS1, bmaxRS);                     
-
-            _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH16), f21);
-            _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH16), h10);
-
-            h10 = h11;
-                        
-            /* gscore calculations */
-            if (j >= minq)
-            {
-                __mmask32 cmp = _mm512_cmpeq_epi16_mask(j512, qlen512);
-                __m512i max_gh = _mm512_max_epi16(gscore, h11);
-                __mmask32 cmp_gh = _mm512_cmpgt_epi16_mask(gscore, h11);
-                __m512i tmp512_1 = _mm512_mask_blend_epi16(cmp_gh, i1_512, max_ie512);
-
-                tmp512_1 = _mm512_mask_blend_epi16(cmp, max_ie512, tmp512_1);
-                __mmask32 mex0 = _mm512_movepi16_mask(exit0);
-                tmp512_1 = _mm512_mask_blend_epi16(mex0, max_ie512, tmp512_1);
-                
-                max_gh = _mm512_mask_blend_epi16(mex0, gscore, max_gh);
-                max_gh = _mm512_mask_blend_epi16(cmp, gscore, max_gh);              
-
-                cmp = _mm512_cmpgt_epi16_mask(j512, tail512); 
-                max_gh = _mm512_mask_blend_epi16(cmp, max_gh, gscore);
-                max_ie512 = _mm512_mask_blend_epi16(cmp, tmp512_1, max_ie512);
-                gscore = max_gh;
-            }
-        }        
+        __m512i hqe512 = zero512;   /* query-end capture (see the fold below) */
+        BSW16_RUN_512(BSW16_SBT_BUF_AT);
+#undef BSW16_SBT_BUF_AT
+#undef BSW16_RUN_512
+#undef DP_CELL_BODY16_512
         __mmask32 cmp2 = _mm512_cmpgt_epi16_mask(head512, j512);
         __mmask32 cmp1 = _mm512_cmpgt_epi16_mask(j512, tail512);
         cmp1 = cmp1 | cmp2;
@@ -4654,6 +4683,25 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
         _mm512_store_si512((__m512i *)(H_h + j * SIMD_WIDTH16), h10);
         _mm512_store_si512((__m512i *)(F + j * SIMD_WIDTH16), zero512);
                         
+        /* Query-end fold (gscore / max_ie), once per row and BEFORE the zero-row
+         * break: the in-cell capture above ran on this row, and the old in-cell
+         * update ran before this break too. The old per-cell update fired for a lane
+         * iff j+1 == qlen && exit0 && !(j+1 > tail); exit0, tail and qlen are fixed
+         * for the row, so only the column varies and it matches at most once per lane
+         * per row: at column qlen-1, inside the row's columns iff beg < qlen <= end.
+         * The cell loop captured that column's h11 in hqe; apply the old update's own
+         * algebra to it here (h11 >= gscore takes the row, as before). */
+        {
+            __mmask32 qin = _mm512_cmpgt_epi16_mask(qlen512, _mm512_set1_epi16(beg))
+                          & ~_mm512_cmpgt_epi16_mask(qlen512, _mm512_set1_epi16(end));
+            __mmask32 upd = qin & _mm512_movepi16_mask(exit0)
+                          & ~_mm512_cmpgt_epi16_mask(qlen512, tail512);
+            __mmask32 cmp_gh = _mm512_cmpgt_epi16_mask(gscore, hqe512);
+            __m512i cand_ie = _mm512_mask_blend_epi16(cmp_gh, i1_512, max_ie512);
+            max_ie512 = _mm512_mask_blend_epi16(upd, max_ie512, cand_ie);
+            gscore = _mm512_mask_blend_epi16(upd, gscore, _mm512_max_epi16(gscore, hqe512));
+        }
+
         /* exit due to zero score by a row */
         __mmask32 cval = dmask;
         __m512i bmaxScore512 = maxScore512;
@@ -5654,64 +5702,71 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
             }
         }
 
-        j128 = _mm_set1_epi16(beg);
-        for(j = beg; j < end; j++)
-        {
-            __m128i f11, f21, sbt11;
-            h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH16));
-            f11 = _mm_load_si128((__m128i *)(F + j * SIMD_WIDTH16));
-            sbt11 = _mm_load_si128((__m128i *)(sbt_buf + j * SIMD_WIDTH16));
-
-            __m128i pj128 = j128;
-            j128 = _mm_add_epi16(j128, one128);
-
-            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero128,
-                             e_ins128, oe_ins128,
-                             e_del128, oe_del128);
-
-            // Masked writing
-            __m128i cmp1 = _mm_cmpgt_epi16(head128, pj128);
-            __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128);
-            cmp1 = _mm_or_si128(cmp1, cmp2);
-            h10 = _mm_andnot_si128(cmp1, h10);   /* full-width mask: andnot == select-zero */
-            
-            __m128i bmaxRS = maxRS1;
-            maxRS1 =_mm_max_epi16(maxRS1, h11);
-            // maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict
-            // subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the
-            // AVX2 and 128-bit-8 twins). Runs on NEON and x86 SSE4.1.
-            __m128i cmpA = _mm_cmpeq_epi16(maxRS1, h11);
-            cmp1 = _mm_cmpgt_epi16(j128, tail128); // change
-            f21 = _mm_andnot_si128(cmp1, f21);
-            cmpA = _mm_blendv_epi16(y1_128, j128, cmpA);
-            y1_128 = _mm_blendv_epi16(cmpA, y1_128, cmp1);
-            maxRS1 = _mm_blendv_epi16(maxRS1, bmaxRS, cmp1);                        
-
-            _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH16), f21);
-            _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH16), h10);
-
-            h10 = h11;
-            
-            // gscore calculations
-            if (j >= minq)
-            {
-                __m128i cmp = _mm_cmpeq_epi16(j128, qlen128);
-                __m128i max_gh = _mm_max_epi16(gscore, h11);
-                __m128i cmp_gh = _mm_cmpgt_epi16(gscore, h11);
-                __m128i tmp128_1 = _mm_blendv_epi16(i1_128, max_ie128, cmp_gh);
-
-                __m128i tmp128_t = _mm_blendv_epi16(max_ie128, tmp128_1, cmp);
-                tmp128_1 = _mm_blendv_epi16(max_ie128, tmp128_t, exit0);                
-                
-                max_gh = _mm_blendv_epi16(gscore, max_gh, exit0);
-                max_gh = _mm_blendv_epi16(gscore, max_gh, cmp);             
-
-                cmp = _mm_cmpgt_epi16(j128, tail128); 
-                max_gh = _mm_blendv_epi16(max_gh, gscore, cmp);
-                max_ie128 = _mm_blendv_epi16(tmp128_1, max_ie128, cmp);
-                gscore = max_gh;
-            }
+        // One DP cell of column j with the score sbt11. QCAP (a literal 0 / 1) adds the
+        // query-end capture; see BSW16_RUN_128.
+#define DP_CELL_BODY16_128(sbt11, QCAP) \
+        { \
+            __m128i f11, f21; \
+            h00 = _mm_load_si128((__m128i *)(H_h + j * SIMD_WIDTH16)); \
+            f11 = _mm_load_si128((__m128i *)(F + j * SIMD_WIDTH16)); \
+ \
+            __m128i pj128 = j128; \
+            j128 = _mm_add_epi16(j128, one128); \
+ \
+            MAIN_CODE16_CORE(sbt11, h00, h11, e11, f11, f21, zero128, \
+                             e_ins128, oe_ins128, \
+                             e_del128, oe_del128); \
+ \
+            /* Masked writing */ \
+            __m128i cmp1 = _mm_cmpgt_epi16(head128, pj128); \
+            __m128i cmp2 = _mm_cmpgt_epi16(pj128, tail128); \
+            cmp1 = _mm_or_si128(cmp1, cmp2); \
+            h10 = _mm_andnot_si128(cmp1, h10);   /* full-width mask: andnot == select-zero */ \
+ \
+            __m128i bmaxRS = maxRS1; \
+            maxRS1 =_mm_max_epi16(maxRS1, h11); \
+            /* maxRS1 = max_epi16(bmaxRS,h11): cmpgt(maxRS1,bmaxRS) is a strict */ \
+            /* subset of cmpeq(maxRS1,h11); the OR was redundant (mirrors the */ \
+            /* AVX2 and 128-bit-8 twins). Runs on NEON and x86 SSE4.1. */ \
+            __m128i cmpA = _mm_cmpeq_epi16(maxRS1, h11); \
+            cmp1 = _mm_cmpgt_epi16(j128, tail128); /* change */ \
+            f21 = _mm_andnot_si128(cmp1, f21); \
+            cmpA = _mm_blendv_epi16(y1_128, j128, cmpA); \
+            y1_128 = _mm_blendv_epi16(cmpA, y1_128, cmp1); \
+            maxRS1 = _mm_blendv_epi16(maxRS1, bmaxRS, cmp1); \
+ \
+            _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH16), f21); \
+            _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH16), h10); \
+ \
+            h10 = h11; \
+ \
+            /* query-end capture: h11 at this lane's last query column; the */ \
+            /* gscore / max_ie update is folded once per row after the loop */ \
+            if (QCAP) \
+            { \
+                __m128i qcol = _mm_cmpeq_epi16(j128, qlen128); \
+                hqe128 = _mm_blendv_epi16(hqe128, h11, qcol); \
+            } \
         }
+        // The cell loop, split at the group's shortest query end: a lane's last query
+        // column is >= minq, so columns before it never capture. Two loops with the
+        // capture compiled in or out, rather than a per-cell (j >= minq) test that the
+        // compiler may turn into a per-cell vector select.
+#define BSW16_RUN_128(SBT_AT) \
+        do { \
+            const int jq_ = minq < beg ? beg : (minq > end ? end : minq); \
+            for (j = beg; j < jq_; j++) { SBT_AT(j, sbt11) DP_CELL_BODY16_128(sbt11, 0) } \
+            for (j = jq_; j < end; j++) { SBT_AT(j, sbt11) DP_CELL_BODY16_128(sbt11, 1) } \
+        } while (0)
+#define BSW16_SBT_BUF_AT(jj, S) \
+            __m128i S = _mm_load_si128((__m128i *)(sbt_buf + (jj) * SIMD_WIDTH16));
+
+        j128 = _mm_set1_epi16(beg);
+        __m128i hqe128 = zero128;   /* query-end capture (see the fold below) */
+        BSW16_RUN_128(BSW16_SBT_BUF_AT);
+#undef BSW16_SBT_BUF_AT
+#undef BSW16_RUN_128
+#undef DP_CELL_BODY16_128
         __m128i cmp1 = _mm_cmpgt_epi16(head128, j128);
         __m128i cmp2 = _mm_cmpgt_epi16(j128, tail128);
         cmp1 = _mm_or_si128(cmp1, cmp2);
@@ -5720,6 +5775,25 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
         _mm_store_si128((__m128i *)(H_h + j * SIMD_WIDTH16), h10);
         _mm_store_si128((__m128i *)(F + j * SIMD_WIDTH16), zero128);
         
+        /* Query-end fold (gscore / max_ie), once per row and BEFORE the zero-row
+         * break: the in-cell capture above ran on this row, and the old in-cell
+         * update ran before this break too. The old per-cell update fired for a lane
+         * iff j+1 == qlen && exit0 && !(j+1 > tail); exit0, tail and qlen are fixed
+         * for the row, so only the column varies and it matches at most once per lane
+         * per row: at column qlen-1, inside the row's columns iff beg < qlen <= end.
+         * The cell loop captured that column's h11 in hqe; apply the old update's own
+         * algebra to it here (h11 >= gscore takes the row, as before). */
+        {
+            __m128i qin = _mm_andnot_si128(_mm_cmpgt_epi16(qlen128, _mm_set1_epi16(end)),
+                                           _mm_cmpgt_epi16(qlen128, _mm_set1_epi16(beg)));
+            __m128i upd = _mm_andnot_si128(_mm_cmpgt_epi16(qlen128, tail128),
+                                           _mm_and_si128(qin, exit0));
+            __m128i cmp_gh = _mm_cmpgt_epi16(gscore, hqe128);
+            __m128i cand_ie = _mm_blendv_epi16(i1_128, max_ie128, cmp_gh);
+            max_ie128 = _mm_blendv_epi16(max_ie128, cand_ie, upd);
+            gscore = _mm_blendv_epi16(gscore, _mm_max_epi16(gscore, hqe128), upd);
+        }
+
         /* exit due to zero score by a row */
         __m128i bmaxScore128 = maxScore128;
         __m128i tmp = _mm_cmpeq_epi16(maxRS1, zero128);
