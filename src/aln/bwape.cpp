@@ -10,6 +10,7 @@
  * (the two stderr lines), so the driver can run them in parallel; each holds upstream's loop body.
  * See README.md. */
 #include "bwape.h"
+#include "aln_alloc.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -34,7 +35,7 @@ typedef struct {
 pe_opt_t *bwa_init_pe_opt(void)
 {
 	pe_opt_t *po;
-	po = (pe_opt_t*)calloc(1, sizeof(pe_opt_t));
+	po = (pe_opt_t*)aln_calloc(1, sizeof(pe_opt_t));
 	po->max_isize = 500;
 	po->force_isize = 0;
 	po->max_occ = 100000;
@@ -57,7 +58,7 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 
 	ii->avg = ii->std = -1.0;
 	ii->low = ii->high = ii->high_bayesian = 0;
-	isizes = (uint64_t*)calloc(n_seqs, 8);
+	isizes = (uint64_t*)aln_calloc(n_seqs, 8);
 	for (i = 0, tot = 0; i != n_seqs; ++i) {
 		bwa_seq_t *p[2];
 		p[0] = seqs[0] + i; p[1] = seqs[1] + i;
@@ -278,7 +279,7 @@ int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *se
 	int i, j, cnt_chg = 0;
 	pe_data_t *d;
 
-	d = (pe_data_t*)calloc(1, sizeof(pe_data_t));
+	d = (pe_data_t*)aln_calloc(1, sizeof(pe_data_t));
 
 	// PE
 	for (i = 0; i != n_seqs; ++i) {
@@ -374,7 +375,7 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 	if ((float)x/len >= 0.25 || len - x < SW_MIN_MATCH_LEN) return 0;
 
 	// get reference subsequence
-	ref_seq = (ubyte_t*)calloc(reglen, 1);
+	ref_seq = (ubyte_t*)aln_calloc(reglen, 1);
 	for (k = *beg, l = 0; l < reglen && k < l_pac; ++k)
 		ref_seq[l++] = pacseq[k>>2] >> ((~k&3)<<1) & 3;
 
@@ -407,7 +408,7 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 	{ // update cigar and coordinate;
 		int start = r.qb, end = r.qe + 1;
 		*beg += r.tb;
-		cigar = (bwa_cigar_t*)realloc(cigar, sizeof(bwa_cigar_t) * (*n_cigar + 2));
+		cigar = (bwa_cigar_t*)aln_realloc(cigar, sizeof(bwa_cigar_t) * (*n_cigar + 2));
 		if (start) {
 			memmove(cigar + 1, cigar, sizeof(bwa_cigar_t) * (*n_cigar));
 			cigar[0] = __cigar_create(3, start);

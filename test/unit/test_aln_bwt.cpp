@@ -34,7 +34,8 @@ struct AlnIndex {
 
     AlnIndex()
     {
-        char tmpl[] = "/tmp/aln_bwt_unit_XXXXXX";
+        std::string tmpl_s = aln_test::tmp_template("aln_bwt_unit");
+        char *tmpl = &tmpl_s[0];
         REQUIRE(mkdtemp(tmpl) != nullptr);
         dir = tmpl;
         prefix = dir + "/ref.fa";

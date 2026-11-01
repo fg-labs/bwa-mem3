@@ -24,9 +24,8 @@ struct aln_out_t {
 	int failed;
 };
 
-aln_out_t *aln_out_open(const char *path, int bam, int bam_level, const bntseq_t *bns, const char *hdr_text)
+aln_out_t *aln_out_open(const char *path, int bam, int bam_level, const char *hdr_text)
 {
-	(void)bns;
 	aln_out_t *o = (aln_out_t*)calloc(1, sizeof(aln_out_t));
 	if (!o) return NULL;
 	if (!hdr_text) hdr_text = "";

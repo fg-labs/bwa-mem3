@@ -32,7 +32,8 @@ struct BamIndex {
 
     BamIndex()
     {
-        char tmpl[] = "/tmp/aln_se_bam_XXXXXX";
+        std::string tmpl_s = aln_test::tmp_template("aln_se_bam");
+        char *tmpl = &tmpl_s[0];
         REQUIRE(mkdtemp(tmpl) != nullptr);
         dir = tmpl;
         prefix = dir + "/ref.fa";
@@ -81,7 +82,7 @@ TEST_CASE("aln_se: BAM output holds the reads, mapped where the SAM puts them"
     ba::aln_opt_t o;
     ba::aln_opt_init(&o);
     const char *hdr = "@HD\tVN:1.5\tSO:unsorted\tGO:query\n@SQ\tSN:c1\tLN:600\n@SQ\tSN:c2\tLN:550\n@SQ\tSN:c3\tLN:128\n";
-    ba::aln_out_t *out = ba::aln_out_open(bam.c_str(), 1, 1, ix.bns(), hdr);
+    ba::aln_out_t *out = ba::aln_out_open(bam.c_str(), 1, 1, hdr);
     REQUIRE(out != nullptr);
     REQUIRE(ba::aln_run_se(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, fq.c_str(), out) == 0);
     REQUIRE(ba::aln_out_close(out) == 0);

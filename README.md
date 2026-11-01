@@ -126,7 +126,7 @@ See the [installation guide](https://bwa-mem3.readthedocs.io/en/latest/getting-s
 
 ## Other subcommands
 
-`bwa-mem3 aln` aligns ultrashort, ancient or degraded DNA with bwa's backtracking algorithm. It fuses `bwa aln` and `bwa samse`/`bwa sampe` into one command and writes SAM that is byte-identical to bwa 0.7.19's (see [aln](https://bwa-mem3.readthedocs.io/en/latest/cli/aln.html)). `index`, `mem`, `shm`, `re-sa` and `version` are the others.
+`bwa-mem3 aln` aligns ultrashort, ancient or degraded DNA with bwa's backtracking algorithm. It fuses `bwa aln` and `bwa samse`/`bwa sampe` into one command and writes SAM that is byte-identical to bwa 0.7.19's on the generated reads the parity checks use, on Linux x86_64, Linux arm64 and macOS arm64 (see [aln](https://bwa-mem3.readthedocs.io/en/latest/cli/aln.html)). `index`, `mem`, `shm`, `re-sa` and `version` are the others.
 
 ## Quick links
 

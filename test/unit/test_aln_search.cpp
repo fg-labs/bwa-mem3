@@ -34,7 +34,8 @@ struct SearchIndex {
 
     SearchIndex()
     {
-        char tmpl[] = "/tmp/aln_search_unit_XXXXXX";
+        std::string tmpl_s = aln_test::tmp_template("aln_search_unit");
+        char *tmpl = &tmpl_s[0];
         REQUIRE(mkdtemp(tmpl) != nullptr);
         dir = tmpl;
         prefix = dir + "/ref.fa";
@@ -65,7 +66,8 @@ struct Batch {
     int n = 0;
     explicit Batch(const std::vector<std::string> &reads)
     {
-        char tmpl[] = "/tmp/aln_search_fq_XXXXXX";
+        std::string tmpl_s = aln_test::tmp_template("aln_search_fq");
+        char *tmpl = &tmpl_s[0];
         int fd = mkstemp(tmpl);
         REQUIRE(fd >= 0);
         close(fd);
@@ -177,7 +179,9 @@ TEST_CASE("aln_search: AC-repeat read gives c1 > 1 (the repeat type is set later
     for (int i = 0; i < b.seqs[0].n_aln; ++i)
         if (b.seqs[0].aln[i].score == b.seqs[0].aln[0].score)
             top += b.seqs[0].aln[i].l - b.seqs[0].aln[i].k + 1;
-    CHECK(top > 1);
+    // c3 is 64 x "AC" (128 bp), so a 32-mer "ACAC..." starts at every even offset 0..96: 49
+    // places, all with zero differences; no other contig holds it.
+    CHECK(top == 49);
 }
 
 TEST_CASE("aln_search: max_gapo cap uses the batch's longest read"

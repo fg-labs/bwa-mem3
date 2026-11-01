@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Build the stock bwa 0.7.19 reference ("oracle") binary used to check the
 # bwa-mem3 aln port against upstream.
 #

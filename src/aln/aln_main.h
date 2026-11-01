@@ -2,6 +2,7 @@
 #ifndef BWA_MEM3_ALN_MAIN_H
 #define BWA_MEM3_ALN_MAIN_H
 
+#include "../bntseq.h"
 #include "aln_out.h"
 #include "bwtaln.h"
 
