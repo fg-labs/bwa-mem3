@@ -14,7 +14,8 @@
 # Inputs (env vars):
 #   BWA_MEM3          -- path to the bwa-mem3 binary under test
 #   BWA_ORACLE        -- path to a stock bwa 0.7.19 binary
-#                        (test/tools/build_bwa_oracle.sh); unset => SKIP
+#                        (test/tools/build_bwa_oracle.sh); unset => SKIP, unless
+#   BWA_ORACLE_REQUIRED=1  -- (CI) an unset or non-executable BWA_ORACLE is a FAIL
 #   FIXTURES          -- directory holding phix.fa (default: test/fixtures)
 #   ALN_PARITY_BIN    -- path to aln_index_parity_test (default: repo root)
 
@@ -22,6 +23,10 @@ set -Eeuo pipefail
 # shellcheck disable=SC2154  # rc is assigned by `rc=$?` at the start of the trap body
 trap 'rc=$?; echo "FAIL: unexpected command failure at line $LINENO (exit $rc)" >&2; exit "$rc"' ERR
 
+if [ "${BWA_ORACLE_REQUIRED:-0}" = 1 ] && [ ! -x "${BWA_ORACLE:-}" ]; then
+    echo "FAIL: BWA_ORACLE_REQUIRED=1 but BWA_ORACLE ('${BWA_ORACLE:-}') is not an executable" >&2
+    exit 1
+fi
 if [ -z "${BWA_ORACLE:-}" ]; then
     echo "SKIP: BWA_ORACLE unset"
     exit 0

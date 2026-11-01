@@ -1,28 +1,19 @@
 # Seeded read generator shared by aln_sai_parity.sh and aln_parity.sh.
-# usage: awk -v seed=S -v n=N -v lens=L -v tail=T -f aln_reads.awk ref.fa
+# usage: awk -v seed=S -v n=N -v lens=L -v tail=T -f aln_rng.awk -f aln_reads.awk ref.fa
 #   lens  -- comma-separated read lengths, or MIN-MAX for a uniform range
 #   tail  -- 1 gives a fifth of the reads a low-quality 30-base tail
-# Park-Miller generator (16807 mod 2^31-1): products stay below 2^46, so the
-# arithmetic is exact in any awk's doubles.
-function rnd() { st = (st * 16807) % 2147483647; return st }
-function ri(n) { return rnd() % n }
-function rc(s,   i, r, c) {
-    r = ""
-    for (i = length(s); i >= 1; i--) {
-        c = substr(s, i, 1)
-        r = r (c == "A" ? "T" : c == "C" ? "G" : c == "G" ? "C" : c == "T" ? "A" : c)
-    }
-    return r
-}
-function other(c,   b, k) {
-    b = "ACGT"
-    do { k = substr(b, ri(4) + 1, 1) } while (k == c)
-    return k
-}
+# rnd, ri, rc and other come from aln_rng.awk (the Park-Miller generator, shared with
+# aln_pairs.awk).
+# The reference needs at least one contig and no empty one; with a single contig, the reads meant
+# for the reverse-complement copy come from it.
 /^>/ { nc++; name[nc] = substr($1, 2); next }
 { seq[nc] = seq[nc] toupper($0) }
 END {
-    st = seed
+    if ("" in seq) { print "aln_reads.awk: the reference has no FASTA header before its sequence" > "/dev/stderr"; exit 1 }
+    if (nc == 0) { print "aln_reads.awk: the reference has no sequence" > "/dev/stderr"; exit 1 }
+    for (c = 1; c <= nc; c++)
+        if (length(seq[c]) == 0) { print "aln_reads.awk: contig " name[c] " is empty" > "/dev/stderr"; exit 1 }
+    seed_rng(seed)
     for (i = 0; i < 20; i++) rnd()
     nl = split(lens, lv, ",")
     for (r = 0; r < n; r++) {
@@ -32,10 +23,10 @@ END {
         # contig: a tenth of the reads come from the tandem repeat, another tenth
         # from the reverse-complement copy, the rest uniformly over contigs
         x = ri(10)
-        if (x == 0) c = nc; else if (x == 1) c = nc - 1; else c = ri(nc) + 1
+        if (x == 0) c = nc; else if (x == 1) c = (nc > 1) ? nc - 1 : nc; else c = ri(nc) + 1
         s = seq[c]
         L = length(s)
-        if (c == nc - 1 && x == 1) { lo = 1; span = 300 } else { lo = 1; span = L }
+        if (c == nc - 1 && x == 1) { lo = 1; span = (L < 300) ? L : 300 } else { lo = 1; span = L }
         if (len > span) len = span
         pos = lo + ri(span - len + 1)
         t = substr(s, pos, len)
