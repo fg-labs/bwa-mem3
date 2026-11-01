@@ -19,7 +19,32 @@
 
 #include "../utils.h"
 #include "../kseq.h"
-KSEQ_DECLARE(gzFile)
+
+/* New code: this reader's own kseq instance. Its read function records a gzread error instead of
+ * exiting (utils.cpp's err_gzread exits), and ends the stream there. bwa_read_seq then exits with
+ * err_gzread's message itself, as stock does, unless the caller deferred read errors
+ * (bwa_seq_defer_read_errors): the aln driver reads the next batch on a helper thread, where an
+ * exit would cut short the batch the other threads are still writing, so it reports the error on
+ * its own thread at the point the read happened in stock's order and ends the run there. */
+namespace {
+thread_local int t_gz_failed = 0;   // a gzread call on this thread failed since bwa_read_seq began
+thread_local char t_gz_msg[256];    // its message, as err_gzread prints it
+
+int aln_gzread(gzFile file, void *ptr, unsigned int len)
+{
+	int ret = gzread(file, ptr, len);
+	if (ret < 0) {
+		int errnum = 0;
+		const char *msg = gzerror(file, &errnum);
+		snprintf(t_gz_msg, sizeof t_gz_msg, "%s", Z_ERRNO == errnum ? strerror(errno) : msg);
+		t_gz_failed = 1;
+		return 0; // end of stream for kseq
+	}
+	return ret;
+}
+
+KSEQ_INIT2(static, gzFile, aln_gzread)
+} // namespace
 
 namespace bwa_aln {
 
@@ -49,6 +74,8 @@ struct __bwa_seqio_t {
 	char *fn;      // for messages
 	long n_rec;    // records parsed so far
 	int n_bad;     // malformed records skipped
+	int defer_errors; // bwa_seq_defer_read_errors was called
+	char *read_error; // a deferred gzread error's message, or 0
 };
 
 bwa_seqio_t *bwa_seq_open(const char *fn)
@@ -72,8 +99,20 @@ int bwa_seq_close(bwa_seqio_t *bs)
 	}
 	kseq_destroy(bs->ks);
 	free(bs->fn);
+	free(bs->read_error);
 	free(bs);
 	return ret;
+}
+
+void bwa_seq_defer_read_errors(bwa_seqio_t *bs) { bs->defer_errors = 1; }
+
+int bwa_seq_read_failed(const bwa_seqio_t *bs) { return bs->read_error != 0; }
+
+int bwa_seq_report_read_error(const bwa_seqio_t *bs)
+{
+	if (!bs->read_error) return 0;
+	fprintf(stderr, "[gzread] %s\n", bs->read_error); // err_gzread's message
+	return 1;
 }
 
 int bwa_seq_n_bad(const bwa_seqio_t *bs)
@@ -128,6 +167,7 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 	}
 	n_seqs = 0;
 	seqs = (bwa_seq_t*)aln_calloc(n_needed, sizeof(bwa_seq_t));
+	t_gz_failed = 0;
 	while ((l = kseq_read(seq)) >= 0) {
 		++bs->n_rec;
 		if ((mode & BWA_MODE_CFY) && (seq->comment.l != 0)) {
@@ -176,6 +216,14 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 			if (t > 2 && p->name[t-2] == '/' && (p->name[t-1] == '1' || p->name[t-1] == '2')) p->name[t-2] = '\0';
 		}
 		if (n_seqs == n_needed) break;
+	}
+	if (t_gz_failed) { // stock exits inside the read (err_gzread); the records read so far are dropped
+		t_gz_failed = 0;
+		if (!bs->defer_errors) _err_fatal_simple("gzread", t_gz_msg);
+		if (!bs->read_error) bs->read_error = aln_strdup(t_gz_msg);
+		bwa_free_read_seq(n_seqs, seqs);
+		*n = 0;
+		return 0;
 	}
 	if (l == -2) { // a truncated record ends the batch, as in stock; the next call resumes after it
 		++bs->n_bad;

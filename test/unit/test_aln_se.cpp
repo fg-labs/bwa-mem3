@@ -23,6 +23,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <zlib.h>
 
 namespace {
 
@@ -477,4 +478,88 @@ TEST_CASE("aln_se: bwa_print_sam1 matches the ksprintf printer"
         u.qual.clear(); u.s.qual = nullptr;
         check_same(u, nullptr, mode, 1);
     }
+}
+
+namespace {
+
+// Writes `reads` as one gzip member, then a second member whose deflate data is invalid (a block
+// of the reserved type), so gzread fails once the first member's reads are read.
+std::string write_fastq_gz_corrupt_tail(const std::string &path, const std::vector<std::string> &reads)
+{
+    gzFile gz = gzopen(path.c_str(), "wb");
+    REQUIRE(gz != nullptr);
+    for (size_t i = 0; i < reads.size(); ++i) {
+        std::string rec = "@r" + std::to_string(i) + "\n" + reads[i] + "\n+\n" + std::string(reads[i].size(), 'I') + "\n";
+        REQUIRE(gzwrite(gz, rec.data(), (unsigned)rec.size()) == (int)rec.size());
+    }
+    REQUIRE(gzclose(gz) == Z_OK);
+    const unsigned char bad[] = {0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 0x03, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    FILE *fp = fopen(path.c_str(), "ab");
+    REQUIRE(fp != nullptr);
+    REQUIRE(fwrite(bad, 1, sizeof bad, fp) == sizeof bad);
+    fclose(fp);
+    return path;
+}
+
+} // namespace
+
+// The driver reads the next batch on a helper thread. A gzip read error there must not end the run
+// before the batch being aligned is written: stock writes every batch before the one whose read
+// fails, then exits 1 with the gzread message, and so must the driver (batches of 3, 7 good reads:
+// two batches written, the third fails).
+TEST_CASE("aln_se: a gzip read error in the next batch still lets the current batch be written"
+          * doctest::test_suite("unit/aln_se")) {
+    SeIndex &ix = index_fixture();
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::vector<std::string> reads;
+    for (int i = 0; i < 6000; ++i) reads.push_back(c1.substr(420 + (i % 7) * 20, 36)); // outside the c1/c2 copy
+    const std::string fq = write_fastq_gz_corrupt_tail(ix.dir + "/corrupt.fq.gz", reads);
+    const int batch = 1000;
+    // Where stock's loop stops: the reads of the batches read before the read that fails (zlib
+    // can report the error before the first member's last bytes, so this is counted, not assumed).
+    int expected = 0, n_batches = 0;
+    {
+        ba::bwa_seqio_t *bs = ba::bwa_seq_open(fq.c_str());
+        REQUIRE(bs != nullptr);
+        ba::bwa_seq_defer_read_errors(bs);
+        int n;
+        ba::bwa_seq_t *seqs;
+        while ((seqs = ba::bwa_read_seq(bs, batch, &n, 0, 0)) != nullptr) {
+            expected += n, ++n_batches;
+            ba::bwa_free_read_seq(n, seqs);
+        }
+        REQUIRE(ba::bwa_seq_read_failed(bs));
+        ba::bwa_seq_close(bs);
+    }
+    REQUIRE(n_batches >= 2); // the error falls in a batch read ahead while an earlier one is aligned
+    // The driver reads the next batch on a helper thread; its read error is reported after the
+    // current batch is written, and the run returns 1 (stderr captured around it).
+    const std::string out_path = ix.dir + "/corrupt.sam", err_path = ix.dir + "/corrupt.err";
+    ba::aln_opt_t o;
+    ba::aln_opt_init(&o);
+    o.batch_size = batch;
+    ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
+    REQUIRE(out != nullptr);
+    fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    FILE *ef = fopen(err_path.c_str(), "w");
+    REQUIRE(saved >= 0);
+    REQUIRE(ef != nullptr);
+    REQUIRE(dup2(fileno(ef), fileno(stderr)) >= 0);
+    const int ret = ba::aln_run_se(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, fq.c_str(), out);
+    fflush(stderr);
+    REQUIRE(dup2(saved, fileno(stderr)) >= 0);
+    close(saved);
+    fclose(ef);
+    REQUIRE(ba::aln_out_close(out) == 0);
+    CHECK(ret == 1);
+    std::ifstream in(out_path);
+    int n_rec = 0;
+    for (std::string l; std::getline(in, l);) n_rec += !l.empty() && l[0] != '@';
+    CHECK(n_rec == expected);
+    std::ifstream e(err_path);
+    std::stringstream ss;
+    ss << e.rdbuf();
+    INFO("stderr: " << ss.str());
+    CHECK(ss.str().find("[gzread] ") != std::string::npos);
 }
