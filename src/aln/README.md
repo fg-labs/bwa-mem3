@@ -28,11 +28,12 @@ contributors" line in the headers of the files derived from them was added here.
 | `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_get_seq` and `bns_cnt_ambi` from `bntseq.c` |
 | `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, `bwa_paired_sw`) |
 | `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code: the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
+| `aln_alloc.h` | new code: `aln_malloc`/`aln_calloc`/`aln_realloc`/`aln_strdup`, which exit with a message on allocation failure; every allocation in the files above goes through them (upstream dereferences the result unchecked) |
 | `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
 
 ## Modifications
 
-Each task that changes or adds upstream-derived code appends a line here.
+Each change to upstream-derived code adds a line here.
 
 - `aln_bwt.cpp`: `bwt_match_exact_alt` is upstream's body verbatim, moved into
   `namespace bwa_aln`. The occ and SA functions are new code with bwa's
@@ -150,3 +151,8 @@ Each task that changes or adds upstream-derived code appends a line here.
   what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the check. Reads are still dealt to
   threads round-robin. A slot whose stack grew past 65,536 entries frees its stack buffers after that
   read, so each thread keeps at most 8 x 65,536 (`ALN_STACK_KEEP`) stack entries across its slots.
+- Failure handling (new code, no output change). Allocations go through `aln_alloc.h` instead of the
+  bare libc calls. The three `assert`s in `bwa_refine_gapped_core` (window inside the packed reference,
+  window length, a CIGAR was produced) are `xassert`, so they hold in a build with `NDEBUG` defined too.
+  `aln_search_batch` runs a thread's share of the reads itself if `pthread_create` fails, instead of
+  leaving those reads unsearched.

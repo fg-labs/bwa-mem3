@@ -27,6 +27,7 @@
  * SOFTWARE.
  */
 #include "aln_bwt.h"
+#include "aln_alloc.h"
 
 #include "../FMI_search.h"
 
@@ -36,7 +37,7 @@ namespace bwa_aln {
 
 bwt_t *bwt_from_fmi(FMI_search *fmi)
 {
-    bwt_t *bwt = (bwt_t *)calloc(1, sizeof(bwt_t));
+    bwt_t *bwt = (bwt_t *)aln_calloc(1, sizeof(bwt_t));
     const int64_t *count = fmi->count_data();
     for (int i = 0; i < 5; ++i) bwt->L2[i] = (bwtint_t)count[i] - 1; // count[] includes the `$`
     bwt->seq_len = (bwtint_t)fmi->reference_seq_len - 1;

@@ -41,14 +41,15 @@
    SOFTWARE.
 */
 #include "bwase.h"
+#include "aln_alloc.h"
 
-#include <assert.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "../bwa.h"
+#include "../utils.h"
 #include "../ksw.h"
 #include "bwaseqio.h"
 #include "bwtgap.h"
@@ -108,7 +109,7 @@ void bwa_aln2seq_core(int n_aln, const bwt_aln1_t *aln, bwa_seq_t *s, int set_ma
 		 * simply output all hits, but the following samples "rest"
 		 * number of random hits. */
 		rest = n_occ > n_multi + 1? n_multi + 1 : n_occ; // find one additional for ->sa
-		s->multi = (bwt_multi1_t*)calloc(rest, sizeof(bwt_multi1_t));
+		s->multi = (bwt_multi1_t*)aln_calloc(rest, sizeof(bwt_multi1_t));
 		for (k = 0; k < n_aln; ++k) {
 			const bwt_aln1_t *q = aln + k;
 			if (q->l - q->k + 1 <= (bwtint_t)rest) {
@@ -214,7 +215,7 @@ static uint8_t *aln_bns_get_seq(int64_t l_pac, const uint8_t *pac, int64_t beg, 
 	if (beg >= l_pac || end <= l_pac) {
 		int64_t k, l = 0;
 		*len = end - beg;
-		seq = (uint8_t*)malloc(end - beg);
+		seq = (uint8_t*)aln_malloc(end - beg);
 		if (beg >= l_pac) { // reverse strand
 			int64_t beg_f = (l_pac<<1) - 1 - end;
 			int64_t end_f = (l_pac<<1) - 1 - beg;
@@ -264,12 +265,12 @@ static bwa_cigar_t *bwa_refine_gapped_core(bwtint_t l_pac, const ubyte_t *pacseq
 
 	bwa_fill_scmat(1, 3, mat);
 	rb = *_rb; re = rb + len + ref_shift;
-	assert(re <= (int64_t)l_pac);
+	xassert(re <= (int64_t)l_pac, "reference window runs past the packed reference");
 	rseq = aln_bns_get_seq(l_pac, pacseq, rb, re, &rlen);
-	assert(re - rb == rlen);
+	xassert(re - rb == rlen, "reference window length mismatch");
 	w = abs((int)rlen - len) * 1.5;
 	ksw_global(len, seq, rlen, rseq, 5, mat, 5, 1, SW_BW > w? SW_BW : w, n_cigar, &cigar32);
-	assert(*n_cigar > 0);
+	xassert(*n_cigar > 0, "global alignment returned no CIGAR");
 	if ((cigar32[*n_cigar - 1]&0xf) == 1) cigar32[*n_cigar - 1] = (cigar32[*n_cigar - 1]>>4<<4) | 3; // change endding ins to soft clipping
 	if ((cigar32[0]&0xf) == 1) cigar32[0] = (cigar32[0]>>4<<4) | 3; // change beginning ins to soft clipping
 	if ((cigar32[*n_cigar - 1]&0xf) == 2) --*n_cigar; // delete endding del
@@ -332,7 +333,7 @@ static char *bwa_cal_md1(int n_cigar, bwa_cigar_t *cigar, int len, bwtint_t pos,
 	}
 	put_int(str, u);
 	*_nm = nm;
-	return strdup(str->s);
+	return aln_strdup(str->s);
 }
 
 static void bwa_correct_trimmed(bwa_seq_t *s)
@@ -344,11 +345,11 @@ static void bwa_correct_trimmed(bwa_seq_t *s)
 		} else {
 			if (s->cigar == 0) {
 				s->n_cigar = 2;
-				s->cigar = (bwa_cigar_t*)calloc(s->n_cigar, sizeof(bwa_cigar_t));
+				s->cigar = (bwa_cigar_t*)aln_calloc(s->n_cigar, sizeof(bwa_cigar_t));
 				s->cigar[0] = __cigar_create(0, s->len);
 			} else {
 				++s->n_cigar;
-				s->cigar = (bwa_cigar_t*)realloc(s->cigar, s->n_cigar * sizeof(bwa_cigar_t));
+				s->cigar = (bwa_cigar_t*)aln_realloc(s->cigar, s->n_cigar * sizeof(bwa_cigar_t));
 			}
 			s->cigar[s->n_cigar-1] = __cigar_create(3, (s->full_len - s->len));
 		}
@@ -358,11 +359,11 @@ static void bwa_correct_trimmed(bwa_seq_t *s)
 		} else {
 			if (s->cigar == 0) {
 				s->n_cigar = 2;
-				s->cigar = (bwa_cigar_t*)calloc(s->n_cigar, sizeof(bwa_cigar_t));
+				s->cigar = (bwa_cigar_t*)aln_calloc(s->n_cigar, sizeof(bwa_cigar_t));
 				s->cigar[1] = __cigar_create(0, s->len);
 			} else {
 				++s->n_cigar;
-				s->cigar = (bwa_cigar_t*)realloc(s->cigar, s->n_cigar * sizeof(bwa_cigar_t));
+				s->cigar = (bwa_cigar_t*)aln_realloc(s->cigar, s->n_cigar * sizeof(bwa_cigar_t));
 				memmove(s->cigar + 1, s->cigar, (s->n_cigar-1) * sizeof(bwa_cigar_t));
 			}
 			s->cigar[0] = __cigar_create(3, (s->full_len - s->len));
@@ -394,7 +395,7 @@ void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t
 		if (s->cigar == 0) s->type = BWA_TYPE_NO_MATCH;
 	}
 	// generate MD tag
-	str = (kstring_t*)calloc(1, sizeof(kstring_t));
+	str = (kstring_t*)aln_calloc(1, sizeof(kstring_t));
 	for (i = 0; i != n_seqs; ++i) {
 		bwa_seq_t *s = seqs + i;
 		if (s->type != BWA_TYPE_NO_MATCH) {

@@ -34,7 +34,8 @@ struct AlnIndex {
 
     AlnIndex()
     {
-        char tmpl[] = "/tmp/aln_bwt_unit_XXXXXX";
+        std::string tmpl_s = aln_test::tmp_template("aln_bwt_unit");
+        char *tmpl = &tmpl_s[0];
         REQUIRE(mkdtemp(tmpl) != nullptr);
         dir = tmpl;
         prefix = dir + "/ref.fa";
@@ -49,8 +50,7 @@ struct AlnIndex {
     {
         ba::bwt_destroy(bwt);
         fmi.reset();
-        std::string cmd = "rm -rf '" + dir + "'";
-        if (system(cmd.c_str()) != 0) std::fprintf(stderr, "warning: could not remove %s\n", dir.c_str());
+        aln_test::remove_dir(dir);
     }
 };
 
