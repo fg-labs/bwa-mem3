@@ -1064,24 +1064,23 @@ of M reads written early`); measurement only, the output is unchanged.
 
 #### `--huge-pages` — back the index with 1 GB huge pages (Linux, opt-in)
 
-Reserve the FM-index / suffix-array structures on explicit **1 GB huge pages** to
-cut data-TLB misses in seeding. bwa-mem3's allocator is mimalloc, and this flag
-sizes the reservation from the index footprint and reserves it before the index
-loads. **Safe by default:** when the host has no free 1 GB hugepage pool (or too
+Reserve explicit **1 GB huge pages** through mimalloc, intended to cut data-TLB
+misses on the FM-index / suffix-array structures in seeding. The flag sizes the
+reservation from the whole index footprint and reserves it before the index loads.
+**Experimental:** the largest index arrays (over 2 GiB) are not placed on the
+reserved pages yet and no speedup is currently claimed; see
+[Memory allocator → Measured effect](../user-guide/allocator.md#measured-effect).
+**Safe by default:** when the host has no available 1 GB hugepage pool (or too
 few pages), it prints a one-line `[M::]` note and runs on the default page size —
-it never fails or degrades a run.
+it never fails a run.
 
 Requires 1 GB hugepages reserved on the host
 (`echo N | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`).
 **Linux only**, needs the bundled mimalloc. The **alignment records are
 byte-identical** — page size does not affect alignments; only the `@PG` record
-differs, since its `CL:` field records the `--huge-pages` flag. Measured ~1.5 %
-whole-aligner wall on a 5 M-read WGS slice (HG00096, hg38), AMD Zen3, avx2 tier,
-32 threads ([PR #405](https://github.com/fg-labs/bwa-mem3/pull/405)) — a
-single-host, single-config measurement, not a cross-architecture or cross-thread
-claim. See
+differs, since its `CL:` field records the `--huge-pages` flag. See
 [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever)
-for reservation, verification, the measurement conditions, and the manual
+for reservation, verification, the limitation and the measurement, and the manual
 `MIMALLOC_RESERVE_HUGE_OS_PAGES` equivalent.
 
 #### Transparent huge page fallback warning (Linux)
