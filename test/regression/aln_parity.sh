@@ -218,6 +218,7 @@ run_case nonstop 209 600 36 0 "" "" -N
 # ---- option sweep: each stock option alone, against stock aln + samse ----------------------
 run_case sw_n3 221 1000 36 0 "" "" -n 3
 run_case sw_n001 222 1000 36 0 "" "" -n 0.01
+run_case sw_n0 240 1000 36 0 "" "" -n 0 # exact-match search, -n as an integer
 run_case sw_o0 223 1000 100 0 "" "" -o 0
 run_case sw_e2 224 1000 100 0 "" "" -e 2
 run_case sw_i10 225 1000 100 0 "" "" -i 10
@@ -245,7 +246,7 @@ run_case sw_M0O0 237 600 36 0 "" "" -M 0 -O 0
 run_case sw_om1 238 600 100 0 "" "" -o -1
 run_case sw_l0 239 600 36 0 "" "" -l 0
 run_case sw_B4B2 240 600 36 0 "" "" -B 4 -B 2
-need_tag sw_Y 'XT:A:'
+need_tag sw_B4B2 'XT:A:'
 # The optimistic stack bound exceeds the packed score range, but actual scores fit.
 run_case sw_M1024 241 100 36 0 "" "" -M 1024 -n 1 -o 0
 need_tag sw_M1024 'XT:A:'
@@ -354,6 +355,15 @@ bam_vs_sam() { # tag sam bam
         echo "SKIP: $1: samtools not found"
         return
     fi
+    # headers too (a wrong @SQ length or a lost @RG would pass a records-only check); @PG is
+    # dropped from both, as samtools view -H adds its own
+    grep -a '^@' "$2" | grep -av '^@PG' > "$work/bam.hexpect" || true
+    samtools view -H "$3" | grep -av '^@PG' > "$work/bam.hgot" || true
+    if ! cmp -s "$work/bam.hexpect" "$work/bam.hgot"; then
+        diff -a "$work/bam.hexpect" "$work/bam.hgot" | head -n 10 >&2 || true
+        echo "FAIL: aln_parity: $1: --bam header differs from the SAM header" >&2
+        exit 1
+    fi
     grep -av '^@' "$2" > "$work/bam.expect" || true
     samtools view "$3" > "$work/bam.got"
     if ! cmp -s "$work/bam.expect" "$work/bam.got"; then
@@ -369,6 +379,9 @@ bam_vs_sam() { # tag sam bam
 }
 "$BWA_MEM3" aln -t 1 --bam "$ref_mem3" "$form_fq" > "$work/form.bam" 2> /dev/null
 bam_vs_sam "--bam SE" "$work/form.stdout.sam" "$work/form.bam"
+"$BWA_MEM3" aln -t 1 -r '@RG\tID:x\tSM:y' "$ref_mem3" "$form_fq" > "$work/form.rg.sam" 2> /dev/null
+"$BWA_MEM3" aln -t 1 -r '@RG\tID:x\tSM:y' --bam "$ref_mem3" "$form_fq" > "$work/form.rg.bam" 2> /dev/null
+bam_vs_sam "--bam SE -r" "$work/form.rg.sam" "$work/form.rg.bam"
 
 # index forms: an index built with --meth (the normal index plus a .meth seed index) gives the
 # same output as the plain index of the same FASTA
@@ -681,6 +694,11 @@ rc=0
 "$BWA_MEM3" aln -B 31 "$ref_mem3" "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
 if [ "$rc" -ne 0 ]; then
     echo "FAIL: aln_parity: PE -B 31 is within the limit and must run (exit $rc)" >&2
+    exit 1
+fi
+records="$(awk '!/^@/ { n++ } END { print n+0 }' "$work/none.out")"
+if [ "$records" -ne 4000 ]; then # pe36: 2,000 pairs
+    echo "FAIL: aln_parity: PE -B 31 produced $records records, expected 4000" >&2
     exit 1
 fi
 

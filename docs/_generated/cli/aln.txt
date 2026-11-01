@@ -9,7 +9,7 @@ Each option shows its default and the stock command it comes from.
 
 Search options (from bwa aln):
   -n NUM    max #diff (int) or missing prob under 0.02 err rate (float) [0.04]
-  -o INT    maximum number or fraction of gap opens [1]
+  -o INT    maximum number of gap opens [1]
   -e INT    maximum number of gap extensions, -1 for disabling long gaps [-1]
   -i INT    do not put an indel within INT bp towards the ends [5]
   -d INT    maximum occurrences for extending a long deletion [10]
