@@ -149,35 +149,34 @@ locus. All uniquely-mapped reads are unaffected.
 
 ## 8. Reserve 1 GB huge pages for the index (Linux, opt-in)
 
-Seeding is memory-latency-bound. On Linux, backing the FM-index / suffix-array
-arrays with explicit 1 GB huge pages cuts data-TLB pressure for a small
-wall-time gain — ~1.5 % on a 5 M-read WGS slice (HG00096/hg38, AMD Zen3, avx2
-tier, `-t 32` with no explicit `-K`, so the default per-batch size — `chunk_size`
-= 10 Mbp per thread — applied identically to both runs, index warm in the page
-cache; the two runs differed only by `--huge-pages`;
-[PR #405](https://github.com/fg-labs/bwa-mem3/pull/405), reproducible method under [Benchmarks](../performance/benchmarks.md)). The alignment records
-stay byte-identical (page size does not change alignments); only the `@PG`
-`CL:` header field differs, since it records the `--huge-pages` option on the
-command line. Reserve some 1 GB hugepages on the host, then pass `--huge-pages` —
-it sizes the reservation from the index and is a safe no-op when the pool is
-missing or too small. Needs the shipping mimalloc build (`bwa-mem3 version`
-reports `(active)`); 1 GB HugeTLB support is host-dependent, so reserve only when
-the pool exists.
+Seeding is memory-latency-bound. On Linux, `--huge-pages` maps the FM-index
+occurrence table on explicit 1 GB huge pages, which removes nearly all of
+seeding's data-TLB page walks on a host whose 1 GB pages reach the TLB. On hg38 WGS (5 M pairs), `-t 16`, warm page cache, x86-64 AVX-512BW and AVX2, it measured about 0.7 % faster on Intel Sapphire Rapids and within run-to-run noise on two AMD Zen 4 instances (one other measured 0.6-1.1 % slower); measure on your own host before relying on it (see [Measured effect](../user-guide/allocator.md#measured-effect)). The alignment records
+stay byte-identical (page size does not change alignments); only the `@PG` `CL:`
+header field differs, since it records the `--huge-pages` option on the command
+line. Reserve 1 GB hugepages on the host (hg38 needs 6; a `--meth` index about
+12), then pass
+`--huge-pages`; a table that does not fit in the pool falls back to the default
+pages. 1 GB HugeTLB support is host-dependent, so reserve only when the pool
+exists.
 
-`nr_hugepages` is a **host-wide total**, not a delta: `echo 16` sets the whole
-1 GB pool to 16 pages (it does not add 16), so on a shared host writing an
+`nr_hugepages` is a **host-wide total**, not a delta: `echo 6` sets the whole
+1 GB pool to 6 pages (it does not add 6), so on a shared host writing an
 absolute value below the current pool shrinks it under other processes — read the
 current count first and pick a non-decreasing target.
 
 ```bash
-if [ -d /sys/kernel/mm/hugepages/hugepages-1048576kB ]; then
-    echo 16 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+pool=/sys/kernel/mm/hugepages/hugepages-1048576kB
+if [ -d "$pool" ]; then
+    cur=$(cat "$pool/nr_hugepages")
+    want=6   # hg38; about 12 for a --meth index
+    echo $(( cur > want ? cur : want )) | sudo tee "$pool/nr_hugepages"
 fi
 bwa-mem3 mem --huge-pages ref.fa r1.fq r2.fq > out.sam
 ```
 
 This is host configuration (privileged, pinned RAM), so the flag is opt-in, not a
-default, and Linux-only. See
+default, and needs Linux 5.14 or later. See
 [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever).
 
 ## 9. Keep transparent huge pages working (Linux)
@@ -287,7 +286,7 @@ them.
 | SMEM deduplication | `--smem-dedup`; ~10 % fewer SA lookups; opt-in, not byte-identical | [Features → --smem-dedup](../whats-different/features.md#--smem-dedup-smem-deduplication) |
 | Reproducible output | `-K INT`; pins the batch size so output does not move with `-t` | [Aligning → `-K`](../user-guide/aligning.md) |
 | Pipeline overlap at very high `-t` | `--chunk-cap INT`; off by default, opt-in, not byte-identical | [`mem` → `--chunk-cap`](../cli/mem.md) |
-| 1 GB huge pages for the index (Linux) | reserve `nr_hugepages` (host-wide total), run `mem --huge-pages`; ~1.5 % lower wall on a 32-thread WGS slice (Zen3, avx2, warm page cache); alignment records byte-identical, only the `@PG` `CL:` field differs | [Memory allocator → Large pages](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever) |
+| 1 GB huge pages for the index (Linux) | reserve `nr_hugepages` (host-wide total; 6 pages for hg38), run `mem --huge-pages`; hg38 WGS (5 M pairs), `-t 16`, warm page cache, x86-64 AVX-512BW and AVX2: ~0.7 % faster on Sapphire Rapids, within noise on two Zen 4 instances (one other measured 0.6-1.1 % slower), so measure first; alignment records byte-identical, only the `@PG` `CL:` field differs | [Memory allocator → Large pages](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever) |
 | Transparent huge pages (Linux) | THP `madvise`/`always`; free, unfragmented memory at start (drop page cache or a memory-limited cgroup); heed the two-line `[W::]` THP warning | [Keep transparent huge pages working](#9-keep-transparent-huge-pages-working-linux) |
 
 ---
