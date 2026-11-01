@@ -1841,7 +1841,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup STR   extension-DP job dedup: 'off', 'on' (dedup identical jobs within each batch), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode (@PG excluded, it embeds argv) [auto]\n");
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
-    fprintf(stderr, "    --huge-pages  back the index with 1 GB huge pages via mimalloc when the host has enough free 1 GB pages reserved; cuts dTLB misses in seeding; Linux only, alignment records byte-identical (only @PG CL differs, recording the flag), safe no-op otherwise [off]\n");
+    fprintf(stderr, "    --huge-pages  put the FM-index occurrence table and suffix-array samples on 1 GB huge pages from the host's reserved 1 GB pool (~10 pages for hg38 indexed at the default -u 3; a lower -u stores more suffix-array samples and needs more); cuts dTLB page walks in seeding; Linux 5.14+ only, alignment records byte-identical (only @PG CL differs, recording the flag), falls back to default pages when the pool is missing or too small; no effect on an index attached from shared memory [off]\n");
     fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries [%s]\n", opt->skip_contained_ext? "off":"on");
     fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
@@ -3762,10 +3762,13 @@ int main_mem(int argc, char *argv[])
     uint64_t tim = __rdtsc();
 
     fprintf(stderr, "* Ref file: %s\n", ref_prefix);
-    /* Opt-in --huge-pages: reserve 1 GB pages for the index BEFORE it is
-     * allocated below, so the FM-index / SA arrays land on them. Safe no-op when
-     * the host has no reserved 1 GB pool. See bwa_hugepages.{h,cpp}, issue #402. */
-    if (want_huge_pages) bwamem_reserve_huge_pages(ref_prefix);
+    /* Opt-in --huge-pages: load_index below maps the occurrence table and the
+     * SA samples on 1 GB pages from the host's hugetlb pool, falling back to
+     * the default allocation per array when it cannot. See
+     * bwa_hugepages.{h,cpp}, issue #402. The scope restores the previous mode
+     * on every return from main_mem. */
+    bwamem_hugetlb_mode_scope hugetlb_mode(want_huge_pages ? BWAMEM_HUGETLB_ON
+                                                           : bwamem_hugetlb_index_mode());
     aux.fmi = new FMI_search(ref_prefix);
     /* D3 dual-index: the FM-index AND its BNS/PAC come from the `.meth` SEED prefix.
      * The seed BNS is required to decode seed positions into (seed contig, local pos,

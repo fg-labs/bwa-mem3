@@ -1,162 +1,172 @@
 #include "bwa_hugepages.h"
 
+#include <errno.h>
+#include <pthread.h>
+#include <sched.h>
 #include <stdio.h>
-#include <sys/stat.h>
+#include <stdlib.h>
 
-#if defined(__linux__) && defined(USE_MIMALLOC)
-/* Weak reference to mimalloc's reservation entry point, rather than including
- * <mimalloc.h>. The shipping executable whole-archives libmimalloc, so this
- * binds to the real symbol; a target that links libbwa.a WITHOUT mimalloc (the
- * doctest unit binary does) leaves it NULL, and we fall back at runtime instead
- * of failing to link. The weak attribute must be on our own declaration. */
-extern "C" int mi_reserve_huge_os_pages_interleave(size_t pages, size_t numa_nodes,
-                                                   size_t timeout_msecs) __attribute__((weak));
+#include <atomic>
+#include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
 #endif
 
 /* 1 GiB in bytes. */
 static const unsigned long long BWAMEM_ONE_GB = 1024ULL * 1024ULL * 1024ULL;
-/* Extra pages beyond the raw index footprint, covering 1 GB rounding of each
- * array plus mimalloc's own arena metadata. hg38 (~10.5 GiB of .bwt.2bit.64 +
- * .pac) sizes to 11 pages, so this +2 gives 13 to cover the ~10.76 GiB resident
- * index with headroom. */
-static const size_t BWAMEM_HUGE_MARGIN_PAGES = 2;
 
-size_t bwamem_huge_pages_needed(long long bwt_bytes, long long pac_bytes)
+static std::atomic<int> g_hugetlb_index_mode{BWAMEM_HUGETLB_OFF};
+
+void bwamem_hugetlb_set_index_mode(bwamem_hugetlb_mode_t mode)
 {
-    if (bwt_bytes <= 0) return 0;
-    unsigned long long total = (unsigned long long)bwt_bytes;
-    if (pac_bytes > 0) total += (unsigned long long)pac_bytes;
-    /* Ceil division as quotient + (remainder != 0), rather than
-     * (total + ONE_GB - 1) / ONE_GB, so a near-SIZE_MAX total cannot overflow
-     * the numerator. */
-    size_t pages = (size_t)(total / BWAMEM_ONE_GB);
-    if (total % BWAMEM_ONE_GB != 0) pages++;
-    return pages + BWAMEM_HUGE_MARGIN_PAGES;
+    g_hugetlb_index_mode.store((int)mode, std::memory_order_relaxed);
 }
 
-bwamem_huge_outcome_t bwamem_classify_huge_reservation(
-    int rc, long free_before, long free_after, size_t need, long *reserved_out)
+bwamem_hugetlb_mode_t bwamem_hugetlb_index_mode(void)
 {
-    /* Actual pages reserved = the drop in the hugetlb free count. Only trust it
-     * when both reads succeeded and the count did not rise (a rise means another
-     * process perturbed the pool, so the delta is not ours to interpret). */
-    long got = (free_before >= 0 && free_after >= 0 && free_after <= free_before)
-                   ? (free_before - free_after)
-                   : -1;
-    if (reserved_out) *reserved_out = got;
-    if (rc != 0) return BWAMEM_HUGE_FAILED;
-    /* rc == 0 but the delta is unmeasurable: mimalloc only returns a status code
-     * (>= 1 page per NUMA node), and the host-global free count did not give us a
-     * trustworthy per-call delta, so the true count is unknown — do NOT claim a
-     * full reservation. */
-    if (got < 0) return BWAMEM_HUGE_UNVERIFIED;
-    return (got >= (long)need) ? BWAMEM_HUGE_FULL : BWAMEM_HUGE_PARTIAL;
+    return (bwamem_hugetlb_mode_t)g_hugetlb_index_mode.load(std::memory_order_relaxed);
 }
 
-#if defined(__linux__) && defined(USE_MIMALLOC)
-
-static long long bwamem_file_size(const char *path)
+size_t bwamem_hugetlb_round_up(size_t bytes)
 {
-    struct stat st;
-    if (stat(path, &st) != 0) return -1;
-    return (long long)st.st_size;
+    if (bytes == 0) return 0;
+    const size_t page = (size_t)BWAMEM_ONE_GB;
+    size_t pages = bytes / page + (bytes % page != 0);
+    if (pages > (size_t)-1 / page) return 0;
+    return pages * page;
 }
 
-/* Free 1 GB pages currently in the hugetlb pool, or -1 if the pool does not
- * exist (no 1 GB hugepage support / not reserved). */
-static long bwamem_free_1g_hugepages(void)
+void bwamem_hugetlb_unmap(bwamem_hugetlb_buf_t *b)
 {
-    FILE *f = fopen("/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages", "r");
-    if (f == NULL) return -1;
-    long n = -1;
-    if (fscanf(f, "%ld", &n) != 1) n = -1;
-    fclose(f);
-    return n;
+    if (b == NULL) return;
+#if defined(__linux__)
+    if (b->base != NULL) munmap(b->base, b->map_bytes);
+#endif
+    b->base = NULL;
+    b->map_bytes = 0;
 }
 
-void bwamem_reserve_huge_pages(const char *idxbase)
+#if defined(__linux__)
+
+#ifndef MAP_HUGE_SHIFT
+#define MAP_HUGE_SHIFT 26
+#endif
+#ifndef MAP_HUGE_1GB
+#define MAP_HUGE_1GB (30 << MAP_HUGE_SHIFT)
+#endif
+
+int bwamem_hugetlb_map(size_t bytes, bwamem_hugetlb_buf_t *out)
 {
-    char path[4096];
-    snprintf(path, sizeof(path), "%s.bwt.2bit.64", idxbase);
-    long long bwt = bwamem_file_size(path);
-    snprintf(path, sizeof(path), "%s.pac", idxbase);
-    long long pac = bwamem_file_size(path);
-
-    size_t need = bwamem_huge_pages_needed(bwt, pac);
-    if (need == 0) {
-        fprintf(stderr, "[M::%s] --huge-pages: cannot size the index at %s "
-                "(missing .bwt.2bit.64?); running on default pages\n",
-                __func__, idxbase);
-        return;
-    }
-
-    long freep = bwamem_free_1g_hugepages();
-    if (freep < 0) {
-        fprintf(stderr, "[M::%s] --huge-pages: this host has no 1 GB hugepage "
-                "pool; reserve some first (e.g. `echo %zu | sudo tee "
-                "/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`). "
-                "Running on default pages\n", __func__, need);
-        return;
-    }
-    if ((size_t)freep < need) {
-        fprintf(stderr, "[M::%s] --huge-pages: the index needs ~%zu free 1 GB "
-                "pages but only %ld are available; not reserving (raise "
-                "nr_hugepages). Running on default pages\n", __func__, need, freep);
-        return;
-    }
-
-    if (mi_reserve_huge_os_pages_interleave == NULL) {
-        fprintf(stderr, "[M::%s] --huge-pages: this binary was built without "
-                "mimalloc; running on default pages\n", __func__);
-        return;
-    }
-    /* Interleave across all NUMA nodes (matches MIMALLOC_RESERVE_HUGE_OS_PAGES).
-     * Bound the reservation with a finite timeout: a sufficient free-page count
-     * was just checked, but reserving contiguous 1 GB blocks can still stall
-     * under memory fragmentation, and a 0 (disabled) timeout would let that
-     * block startup indefinitely. Budget 1 s per page (floor 5 s); pre-reserved
-     * pages normally return at once, and on ETIMEDOUT the rc != 0 branch below
-     * falls back to default pages. */
-    size_t timeout_msecs = need * 1000;
-    if (timeout_msecs < 5000) timeout_msecs = 5000;
-    int rc = mi_reserve_huge_os_pages_interleave(need, 0, timeout_msecs);
-
-    /* rc == 0 only means mimalloc reserved at least one page per NUMA node, which
-     * can be fewer than `need` under fragmentation — a partial reservation leaves
-     * part of the index on default pages. Confirm the pool actually gave up
-     * `need` pages via the free-count delta rather than trusting rc alone. */
-    long freep_after = bwamem_free_1g_hugepages();
-    long got = -1;
-    switch (bwamem_classify_huge_reservation(rc, freep, freep_after, need, &got)) {
-    case BWAMEM_HUGE_FULL:
-        fprintf(stderr, "[M::%s] --huge-pages: reserved %zu x 1 GB huge pages "
-                "for the index via mimalloc\n", __func__, need);
-        break;
-    case BWAMEM_HUGE_PARTIAL:
-        fprintf(stderr, "[M::%s] --huge-pages: mimalloc reserved only %ld of %zu "
-                "requested 1 GB pages; the remainder of the index falls back to "
-                "default pages\n", __func__, got, need);
-        break;
-    case BWAMEM_HUGE_FAILED:
-        fprintf(stderr, "[M::%s] --huge-pages: mimalloc could not reserve %zu x "
-                "1 GB pages (rc=%d); running on default pages\n",
-                __func__, need, rc);
-        break;
-    case BWAMEM_HUGE_UNVERIFIED:
-        fprintf(stderr, "[M::%s] --huge-pages: mimalloc accepted the 1 GB "
-                "reservation but the host pool count could not be confirmed; "
-                "some of the index may still be on default pages\n", __func__);
-        break;
-    }
+    out->base = NULL;
+    out->map_bytes = 0;
+    size_t len = bwamem_hugetlb_round_up(bytes);
+    if (len == 0) return EINVAL;
+    if (bwamem_hugetlb_index_mode() == BWAMEM_HUGETLB_FORCE_FAIL) return ECANCELED;
+    void *p = mmap(NULL, len, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_HUGE_1GB, -1, 0);
+    if (p == MAP_FAILED) return errno != 0 ? errno : ENOMEM;
+    out->base = p;
+    out->map_bytes = len;
+    return 0;
 }
 
-#else /* not (Linux && mimalloc) */
+namespace {
 
-void bwamem_reserve_huge_pages(const char *idxbase)
+struct PrefaultJob {
+    std::vector<char *> pages;      /* start of every 1 GiB page to fault in */
+    std::vector<int>    owner;      /* index into bufs of each page's mapping */
+    std::vector<std::atomic<int>> *failed;  /* per mapping: a fault failed */
+    std::atomic<size_t> next{0};
+    std::atomic<bool>   go{false};          /* set once every worker exists */
+};
+
+/* Fault in one 1 GiB page for writing. MADV_POPULATE_WRITE (Linux 5.14) reports
+ * a failure as an error instead of a SIGBUS. Any failure, including EINVAL from
+ * a kernel without it, is returned rather than retried by touching the page:
+ * the mapping reserved its pages, but a limit charged at fault time (a hugetlb
+ * cgroup's 1 GB max) can still fail the first touch, and that is a SIGBUS that
+ * kills the run instead of a fallback to default pages. */
+bool prefault_page(char *page)
 {
-    (void)idxbase;
-    fprintf(stderr, "[M::bwamem_reserve_huge_pages] --huge-pages is only "
-            "supported on Linux with the mimalloc build; ignored\n");
+#ifndef MADV_POPULATE_WRITE
+#define MADV_POPULATE_WRITE 23
+#endif
+    return madvise(page, (size_t)BWAMEM_ONE_GB, MADV_POPULATE_WRITE) == 0;
+}
+
+void *prefault_worker(void *arg)
+{
+    PrefaultJob *job = (PrefaultJob *)arg;
+    while (!job->go.load(std::memory_order_acquire)) sched_yield();
+    for (;;) {
+        size_t i = job->next.fetch_add(1, std::memory_order_relaxed);
+        if (i >= job->pages.size()) break;
+        if (!prefault_page(job->pages[i]))
+            (*job->failed)[(size_t)job->owner[i]].store(1, std::memory_order_relaxed);
+    }
+    return NULL;
+}
+
+}  // namespace
+
+int bwamem_hugetlb_prefault(bwamem_hugetlb_buf_t *bufs, int n, int nthreads)
+{
+    if (bufs == NULL || n <= 0) return 0;
+    std::vector<std::atomic<int>> failed((size_t)n);
+    PrefaultJob job;
+    job.failed = &failed;
+    for (int b = 0; b < n; b++) {
+        failed[(size_t)b].store(0, std::memory_order_relaxed);
+        for (size_t off = 0; bufs[b].base != NULL && off < bufs[b].map_bytes;
+             off += (size_t)BWAMEM_ONE_GB) {
+            job.pages.push_back((char *)bufs[b].base + off);
+            job.owner.push_back(b);
+        }
+    }
+    size_t nt = nthreads > 0 ? (size_t)nthreads : 1;
+    if (nt > job.pages.size()) nt = job.pages.size();
+    /* The calling thread is one of the workers; a thread that cannot be
+     * created just leaves its share to the others. No worker starts faulting
+     * until every thread exists: creating a thread maps its stack, which takes
+     * the address-space lock for writing, and that waits for every fault in
+     * flight (each holds the lock for reading while it zeroes a whole 1 GB
+     * page) and blocks new ones behind it. Measured on a 16-thread load of
+     * hg38, starting each worker as it was created left only two or three
+     * faulting at a time (0.59 s for 10 pages instead of about 0.15 s). */
+    std::vector<pthread_t> tids;
+    for (size_t t = 1; t < nt; t++) {
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, prefault_worker, &job) == 0) tids.push_back(tid);
+    }
+    job.go.store(true, std::memory_order_release);
+    prefault_worker(&job);
+    for (pthread_t tid : tids) pthread_join(tid, NULL);
+
+    int n_failed = 0;
+    for (int b = 0; b < n; b++) {
+        if (failed[(size_t)b].load(std::memory_order_relaxed)) {
+            bwamem_hugetlb_unmap(&bufs[b]);
+            n_failed++;
+        }
+    }
+    return n_failed;
+}
+
+#else /* not Linux */
+
+int bwamem_hugetlb_map(size_t bytes, bwamem_hugetlb_buf_t *out)
+{
+    (void)bytes;
+    out->base = NULL;
+    out->map_bytes = 0;
+    return ENOSYS;
+}
+
+int bwamem_hugetlb_prefault(bwamem_hugetlb_buf_t *bufs, int n, int nthreads)
+{
+    (void)bufs; (void)n; (void)nthreads;
+    return 0;
 }
 
 #endif
