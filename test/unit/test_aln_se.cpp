@@ -5,6 +5,7 @@
 
 #include "doctest/doctest.h"
 
+#include "aln_test_gz.h"
 #include "aln_test_ref.h"
 #include "run_in_child.h"
 #include "../../src/FMI_search.h"
@@ -14,6 +15,7 @@
 #include "../../src/bwa.h"
 #include "../../src/read_index_ele.h"
 
+#include <cerrno>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
@@ -24,6 +26,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -582,4 +585,63 @@ TEST_CASE("aln_se: a read of 65536 bases is refused at input and the run exits 1
     std::stringstream body;
     body << sam.rdbuf();
     for (const std::string &l : lines(body.str())) CHECK(l[0] == '@'); // the read is not stored, so not written
+}
+
+// The driver reads the next batch on a helper thread. A gzip read error there must not end the run
+// before the batch being aligned is written: stock writes every batch before the one whose read
+// fails, then exits 1 with the gzread message, and so must the driver (batches of 1000 reads, the
+// first two at least written). The input's path is longer than 255 bytes, so the message, which
+// zlib starts with the path, is checked to keep the cause at its end.
+TEST_CASE("aln_se: a gzip read error in the next batch still lets the current batch be written"
+          * doctest::test_suite("unit/aln_se")) {
+    SeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_se_case"}; // this case's files, removed when it ends
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::vector<std::string> reads;
+    for (int i = 0; i < 6000; ++i) reads.push_back(c1.substr(420 + (i % 7) * 20, 36)); // outside the c1/c2 copy
+    const std::string long_dir = scratch.path() + "/" + std::string(200, 'd');
+    REQUIRE((mkdir(long_dir.c_str(), 0700) == 0 || errno == EEXIST));
+    const std::string fq = aln_test::write_fastq_gz_corrupt_tail(long_dir + "/" + std::string(100, 'c') + ".fq.gz", reads, "r");
+    REQUIRE(fq.size() > 255);
+    const int batch = 1000;
+    // Where stock's loop stops: the reads of the batches read before the read that fails (zlib
+    // can report the error before the first member's last bytes, so this is counted, not assumed),
+    // counted from zlib directly rather than with the reader under test.
+    const int expected = aln_test::gz_reads_before_error(fq, batch);
+    REQUIRE(expected >= 2 * batch); // the error falls in a batch read ahead while an earlier one is aligned
+    // The driver reads the next batch on a helper thread; its read error is reported after the
+    // current batch is written, and the run returns 1 (stderr captured around it).
+    const std::string out_path = scratch.path() + "/corrupt.sam", err_path = scratch.path() + "/corrupt.err";
+    ba::aln_opt_t o;
+    ba::aln_opt_init(&o);
+    o.batch_size = batch;
+    ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
+    REQUIRE(out != nullptr);
+    fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    FILE *ef = fopen(err_path.c_str(), "w");
+    REQUIRE(saved >= 0);
+    REQUIRE(ef != nullptr);
+    REQUIRE(dup2(fileno(ef), fileno(stderr)) >= 0);
+    const int ret = ba::aln_run_se(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, fq.c_str(), out);
+    fflush(stderr);
+    REQUIRE(dup2(saved, fileno(stderr)) >= 0);
+    close(saved);
+    fclose(ef);
+    REQUIRE(ba::aln_out_close(out) == 0);
+    CHECK(ret == 1);
+    std::ifstream in(out_path);
+    int n_rec = 0;
+    for (std::string l; std::getline(in, l);) {
+        if (l.empty() || l[0] == '@') continue;
+        CHECK(l.substr(0, l.find('\t')) == "r" + std::to_string(n_rec)); // the first reads, in order
+        ++n_rec;
+    }
+    CHECK(n_rec == expected);
+    std::ifstream e(err_path);
+    std::stringstream ss;
+    ss << e.rdbuf();
+    INFO("stderr: " << ss.str());
+    // zlib's message is the path, then the cause: all of it is printed
+    CHECK(ss.str().find("[gzread] " + fq + ": invalid block type\n") != std::string::npos);
 }

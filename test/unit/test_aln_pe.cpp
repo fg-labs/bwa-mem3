@@ -7,6 +7,7 @@
 
 #include "doctest/doctest.h"
 
+#include "aln_test_gz.h"
 #include "aln_test_ref.h"
 #include "temp_index.h"
 #include "../../src/FMI_search.h"
@@ -70,13 +71,15 @@ PeIndex &index_fixture()
     return idx;
 }
 
-std::string write_fastq(const std::string &path, const std::vector<std::string> &reads)
+// Reads are named p0, p1, ...; read `renamed` (if >= 0) is named x<i> instead.
+std::string write_fastq(const std::string &path, const std::vector<std::string> &reads, int renamed = -1)
 {
     FILE *fp = fopen(path.c_str(), "w");
     REQUIRE(fp != nullptr);
     bool ok = true;
     for (size_t i = 0; i < reads.size(); ++i)
-        ok = ok && fprintf(fp, "@p%zu\n%s\n+\n%s\n", i, reads[i].c_str(), std::string(reads[i].size(), 'I').c_str()) >= 0;
+        ok = ok && fprintf(fp, "@%s%zu\n%s\n+\n%s\n", (int)i == renamed ? "x" : "p", i, reads[i].c_str(),
+                           std::string(reads[i].size(), 'I').c_str()) >= 0;
     REQUIRE((fclose(fp) == 0 && ok));
     return path;
 }
@@ -705,8 +708,10 @@ TEST_CASE("aln_pe: batched pairing equals upstream's loop for every grouping (ma
 
 namespace {
 
-// Runs aln_run_pe (the shipped driver) and returns the FLAG of every record, in output order.
-std::vector<int> run_pe_flags(int batch_size, const std::string &f1, const std::string &f2, const std::string &out_path)
+// Runs aln_run_pe (the shipped driver) with batches of batch_size pairs. Returns its exit code and
+// the SAM record lines (no header) in output order; *err (if given) gets what it printed on stderr.
+int run_pe_lines(int batch_size, const std::string &f1, const std::string &f2, const std::string &out_path,
+                 std::vector<std::string> *lines, std::string *err = nullptr)
 {
     PeIndex &ix = index_fixture();
     ba::aln_opt_t o;
@@ -714,16 +719,51 @@ std::vector<int> run_pe_flags(int batch_size, const std::string &f1, const std::
     o.batch_size = batch_size;
     ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
     REQUIRE(out != nullptr);
-    REQUIRE(ba::aln_run_pe(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, f1.c_str(), f2.c_str(), out) == 0);
+    const std::string err_path = out_path + ".err";
+    fflush(stderr);
+    const int saved = dup(fileno(stderr));
+    FILE *ef = fopen(err_path.c_str(), "w");
+    REQUIRE(saved >= 0);
+    REQUIRE(ef != nullptr);
+    REQUIRE(dup2(fileno(ef), fileno(stderr)) >= 0);
+    const int ret = ba::aln_run_pe(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, f1.c_str(), f2.c_str(), out);
+    fflush(stderr);
+    REQUIRE(dup2(saved, fileno(stderr)) >= 0);
+    close(saved);
+    fclose(ef);
     REQUIRE(ba::aln_out_close(out) == 0);
-    std::ifstream in(out_path);
-    std::vector<int> flags;
-    for (std::string l; std::getline(in, l);) {
-        if (l.empty() || l[0] == '@') continue;
-        size_t t = l.find('\t');
-        REQUIRE(t != std::string::npos);
-        flags.push_back(std::atoi(l.c_str() + t + 1));
+    if (err) {
+        std::ifstream e(err_path);
+        std::stringstream ss;
+        ss << e.rdbuf();
+        *err = ss.str();
     }
+    std::ifstream in(out_path);
+    lines->clear();
+    for (std::string l; std::getline(in, l);)
+        if (!l.empty() && l[0] != '@') lines->push_back(l);
+    return ret;
+}
+
+// Column `col` (0-based) of every SAM line.
+std::vector<std::string> sam_column(const std::vector<std::string> &lines, int col)
+{
+    std::vector<std::string> v;
+    for (const std::string &l : lines) {
+        size_t st = 0;
+        for (int c = 0; c < col; ++c) st = l.find('\t', st) + 1;
+        v.push_back(l.substr(st, l.find('\t', st) - st));
+    }
+    return v;
+}
+
+// Runs aln_run_pe and returns the FLAG of every record, in output order.
+std::vector<int> run_pe_flags(int batch_size, const std::string &f1, const std::string &f2, const std::string &out_path)
+{
+    std::vector<std::string> lines;
+    REQUIRE(run_pe_lines(batch_size, f1, f2, out_path, &lines) == 0);
+    std::vector<int> flags;
+    for (const std::string &f : sam_column(lines, 1)) flags.push_back(std::atoi(f.c_str()));
     return flags;
 }
 
@@ -871,4 +911,113 @@ TEST_CASE("aln_pe: aln_run_pe bounds the joined barcode to BWA_MAX_BCLEN"
         CHECK(bc == want); // both mates carry the same joined barcode
     }
     CHECK(n_rec == 10);
+}
+
+namespace {
+
+// The record names of pairs p0 .. p(n - 1), two records each.
+std::vector<std::string> pair_names(int n)
+{
+    std::vector<std::string> v;
+    for (int i = 0; i < n; ++i) v.insert(v.end(), 2, "p" + std::to_string(i));
+    return v;
+}
+
+} // namespace
+
+// The driver reads the next batch (or pair of batches) while the current one is aligned. A run that
+// stops early (pair names that differ, one file ending first) must still stop at the same record
+// as when each batch was read only after the previous one was written, with batches of 3 pairs so
+// that every stop falls after a batch has already been read ahead.
+TEST_CASE("aln_pe: aln_run_pe stops at the same pair with the next batch read ahead"
+          * doctest::test_suite("unit/aln_pe")) {
+    PeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_pe_case"}; // this case's files, removed when it ends
+    std::vector<std::string> r1, r2;
+    well_placed(ix.contig, 10, 36, 100, &r1, &r2);
+    std::vector<std::string> lines;
+    std::string err;
+    SUBCASE("pair names differ in the second batch: output ends with that pair, exit 1") {
+        CHECK(run_pe_lines(3, write_fastq(scratch.path() + "/ra_n1.fq", r1), write_fastq(scratch.path() + "/ra_n2.fq", r2, 4),
+                           scratch.path() + "/ra_n.sam", &lines, &err) == 1);
+        std::vector<std::string> want = pair_names(4);
+        want.push_back("p4"), want.push_back("x4");
+        CHECK(sam_column(lines, 0) == want);
+        CHECK(err.find("paired reads have different names: \"p4\", \"x4\"") != std::string::npos);
+    }
+    SUBCASE("read 2 file ends first: the pairs up to its last read, exit 0") {
+        std::vector<std::string> s2(r2.begin(), r2.begin() + 7);
+        CHECK(run_pe_lines(3, write_fastq(scratch.path() + "/ra_a1.fq", r1), write_fastq(scratch.path() + "/ra_a2.fq", s2),
+                           scratch.path() + "/ra_a.sam", &lines, &err) == 0);
+        CHECK(sam_column(lines, 0) == pair_names(7));
+        CHECK(err.find("read counts differ in this batch: R1 3, R2 1") != std::string::npos);
+        CHECK(err.find("read 2 file ended before read 1 file") != std::string::npos);
+        CHECK(err.find("read 1 file ended before read 2 file") == std::string::npos);
+    }
+    SUBCASE("read 1 file ends first: the pairs up to its last read, exit 0, and R2's rest is noticed") {
+        std::vector<std::string> s1(r1.begin(), r1.begin() + 7);
+        CHECK(run_pe_lines(3, write_fastq(scratch.path() + "/ra_b1.fq", s1), write_fastq(scratch.path() + "/ra_b2.fq", r2),
+                           scratch.path() + "/ra_b.sam", &lines, &err) == 0);
+        CHECK(sam_column(lines, 0) == pair_names(7));
+        // R2 is read only after a non-empty R1 batch, so p9 is still unread when R1 ends: the
+        // driver reads it and warns (a read-ahead that read R2 past R1's end would not)
+        CHECK(err.find("read 1 file ended before read 2 file") != std::string::npos);
+    }
+    SUBCASE("equal files in batches of 3 and in one batch: the same records") {
+        const std::string f1 = write_fastq(scratch.path() + "/ra_e1.fq", r1), f2 = write_fastq(scratch.path() + "/ra_e2.fq", r2);
+        std::vector<std::string> one;
+        CHECK(run_pe_lines(3, f1, f2, scratch.path() + "/ra_e3.sam", &lines) == 0);
+        CHECK(run_pe_lines(0x40000, f1, f2, scratch.path() + "/ra_e.sam", &one) == 0);
+        CHECK(sam_column(lines, 0) == pair_names(10));
+        // the fields that do not depend on the per-batch insert-size estimate: QNAME, RNAME, POS,
+        // CIGAR, SEQ, QUAL (FLAG, MAPQ and the mate fields can follow the estimate)
+        for (int col : {0, 2, 3, 5, 9, 10}) {
+            CAPTURE(col);
+            CHECK(sam_column(lines, col) == sam_column(one, col));
+        }
+    }
+}
+
+// A gzip read error in R2's next batch (read ahead while the current pairs are aligned) ends the
+// run after the current batch is written, with stock's message and exit status 1; the pairs
+// written are the first pairs, those of the batches read before the failing read (counted from
+// zlib directly, not with the reader under test).
+TEST_CASE("aln_pe: a gzip read error in the next R2 batch still lets the current batch be written"
+          * doctest::test_suite("unit/aln_pe")) {
+    PeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_pe_case"}; // this case's files, removed when it ends
+    std::vector<std::string> r1, r2;
+    well_placed(ix.contig, 200, 36, 100, &r1, &r2);
+    std::vector<std::string> a1, a2;
+    for (int k = 0; k < 30; ++k) a1.insert(a1.end(), r1.begin(), r1.end()), a2.insert(a2.end(), r2.begin(), r2.end());
+    const std::string f1 = write_fastq(scratch.path() + "/gz1.fq", a1);
+    const std::string f2 = aln_test::write_fastq_gz_corrupt_tail(scratch.path() + "/gz2.fq.gz", a2, "p");
+    const int batch = 1000;
+    const int expected_pairs = aln_test::gz_reads_before_error(f2, batch);
+    REQUIRE(expected_pairs >= 2 * batch); // the error falls in a batch read ahead while an earlier one is aligned
+    std::vector<std::string> lines;
+    std::string err;
+    CHECK(run_pe_lines(batch, f1, f2, scratch.path() + "/gz.sam", &lines, &err) == 1);
+    CHECK((int)lines.size() == 2 * expected_pairs);
+    CHECK(sam_column(lines, 0) == pair_names(expected_pairs)); // the first pairs, in order
+    CHECK(err.find("[gzread] " + f2 + ": invalid block type\n") != std::string::npos);
+}
+
+// The same error in R2's first batch: R1's first batch was read and is freed (LeakSanitizer checks
+// it under ASAN), nothing is written, and the run returns 1 with the message.
+TEST_CASE("aln_pe: a gzip read error in the first R2 batch writes nothing and returns 1"
+          * doctest::test_suite("unit/aln_pe")) {
+    PeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_pe_case"}; // this case's files, removed when it ends
+    std::vector<std::string> r1, r2;
+    well_placed(ix.contig, 50, 36, 100, &r1, &r2);
+    const std::string f1 = write_fastq(scratch.path() + "/gzfirst1.fq", r1);
+    const std::string f2 = aln_test::write_fastq_gz_corrupt_tail(scratch.path() + "/gzfirst2.fq.gz", r2, "p");
+    const int batch = 1000; // more than the file holds: the first read of R2 fails
+    REQUIRE(aln_test::gz_reads_before_error(f2, batch) == 0);
+    std::vector<std::string> lines;
+    std::string err;
+    CHECK(run_pe_lines(batch, f1, f2, scratch.path() + "/gzfirst.sam", &lines, &err) == 1);
+    CHECK(lines.empty());
+    CHECK(err.find("[gzread] " + f2 + ": invalid block type\n") != std::string::npos);
 }
