@@ -60,19 +60,22 @@ inline std::vector<std::pair<std::string, std::string>> test_contigs()
     return {{"c1", c1}, {"c2", c2}, {"c3", c3}};
 }
 
-// Writes the contigs as a FASTA (60 columns); returns false on I/O failure.
-inline bool write_test_fasta(const std::string &path)
+// Writes `contigs` as a FASTA (60 columns); returns false on I/O failure.
+inline bool write_test_fasta(const std::string &path, const std::vector<std::pair<std::string, std::string>> &contigs)
 {
     FILE *fp = std::fopen(path.c_str(), "w");
     if (!fp) return false;
     bool ok = true;
-    for (const auto &c : test_contigs()) {
+    for (const auto &c : contigs) {
         ok = ok && std::fprintf(fp, ">%s\n", c.first.c_str()) >= 0;
         for (size_t i = 0; i < c.second.size(); i += 60)
             ok = ok && std::fprintf(fp, "%s\n", c.second.substr(i, 60).c_str()) >= 0;
     }
     return (std::fclose(fp) == 0) && ok;
 }
+
+// The test contigs (test_contigs()) as a FASTA.
+inline bool write_test_fasta(const std::string &path) { return write_test_fasta(path, test_contigs()); }
 
 } // namespace aln_test
 
