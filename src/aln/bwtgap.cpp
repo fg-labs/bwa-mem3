@@ -11,7 +11,8 @@
  * bwt_match_gap keeps upstream's gap_stack_t. gap_cpush builds each entry in a local and stores
  * it whole, where gap_push assigns the slot's fields one by one. gap_job_run keeps the last child
  * of each expansion in registers and, when it is the entry the next pop returns, continues with it
- * without storing or loading it (top-of-stack forwarding), counting it as pushed and popped. */
+ * without storing or loading it (top-of-stack forwarding), counting it as pushed and popped. The
+ * job's stack helpers are forced inline and its rare paths (hits, chunk get/put) kept out of line. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
 #include "../utils.h"
@@ -27,6 +28,13 @@ namespace bwa_aln {
 #define STATE_D 2
 
 #define aln_score(m,o,e,p) ((m)*(p)->s_mm + (o)*(p)->s_gapo + (e)*(p)->s_gape)
+
+// For the interleaved search below: its hot helpers are forced inline into gap_job_run, and the
+// rare paths (a found hit, a stack chunk taken from or given back to the pool) are kept out of
+// line, so the loop holds fewer live values and the compiler lays the common path out straight.
+// GCC/clang only, like the __builtin_expect and __builtin_prefetch calls here.
+#define GAP_HOT inline __attribute__((always_inline))
+#define GAP_COLD __attribute__((noinline, cold))
 
 gap_stack_t *gap_init_stack2(int max_score)
 {
@@ -201,7 +209,7 @@ void gap_destroy_cstack(gap_cstack_t *stack)
 // (gap_cstore) or kept in registers (gap_job_run's forwarding). Assigning n_mm, n_gapo, n_gape and
 // state to a stack slot's bitfield word one by one makes the compiler load the word to keep its
 // other bits (n_seed_mm, which nothing reads), and that load of a slot not yet in cache stalls.
-static inline void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
+static GAP_HOT void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
 							  int n_ins, int n_del, int state, int is_diff)
 {
 	t->info = (uint32_t)score<<21 | i;
@@ -211,16 +219,30 @@ static inline void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwti
 	t->k = k; t->l = l;
 }
 
+// Bucket q's top chunk is full (or q has none): put a new chunk from the pool on top.
+static GAP_COLD void gap_bucket_grow(gap_cstack_t *stack, gap_bucket_t *q)
+{
+	gap_chunk_t *c = gap_pool_get(stack->pool);
+	c->prev = q->top;
+	q->top = c;
+	q->top_n = 0;
+}
+
+// Bucket q's top chunk has just been emptied: give it back to the pool.
+static GAP_COLD void gap_bucket_shrink(gap_cstack_t *stack, gap_bucket_t *q)
+{
+	gap_chunk_t *c = q->top;
+	q->top = c->prev;
+	q->top_n = q->top? GAP_CHUNK_ENTRIES : 0;
+	gap_pool_put(stack->pool, c);
+}
+
 // The rest of gap_push: store entry t, whose score is `score`, on top of its bucket.
-static inline void gap_cstore(gap_cstack_t *stack, int score, const gap_entry_t *t)
+static GAP_HOT void gap_cstore(gap_cstack_t *stack, int score, const gap_entry_t *t)
 {
 	gap_bucket_t *q = stack->stacks + score;
-	if (q->top == 0 || q->top_n == GAP_CHUNK_ENTRIES) { // start a new chunk
-		gap_chunk_t *c = gap_pool_get(stack->pool);
-		c->prev = q->top;
-		q->top = c;
-		q->top_n = 0;
-	}
+	if (__builtin_expect(q->top == 0 || q->top_n == GAP_CHUNK_ENTRIES, 0)) // start a new chunk
+		gap_bucket_grow(stack, q);
 	q->top->e[q->top_n] = *t;
 	++(q->top_n);
 	++(q->n_entries);
@@ -228,7 +250,7 @@ static inline void gap_cstore(gap_cstack_t *stack, int score, const gap_entry_t 
 	if (stack->best > score) stack->best = score;
 }
 
-static inline void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
+static GAP_HOT void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
 							 int state, int is_diff, const gap_opt_t *opt)
 {
 	int score = aln_score(n_mm, n_gapo, n_gape, opt);
@@ -237,17 +259,13 @@ static inline void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l,
 	gap_cstore(stack, score, &t);
 }
 
-static inline void gap_cpop(gap_cstack_t *stack, gap_entry_t *e)
+static GAP_HOT void gap_cpop(gap_cstack_t *stack, gap_entry_t *e)
 {
 	gap_bucket_t *q;
 	q = stack->stacks + stack->best;
 	*e = q->top->e[q->top_n - 1];
-	if (--(q->top_n) == 0) { // the top chunk is empty: give it back
-		gap_chunk_t *c = q->top;
-		q->top = c->prev;
-		q->top_n = q->top? GAP_CHUNK_ENTRIES : 0;
-		gap_pool_put(stack->pool, c);
-	}
+	if (__builtin_expect(--(q->top_n) == 0, 0)) // the top chunk is empty: give it back
+		gap_bucket_shrink(stack, q);
 	--(q->n_entries);
 	--(stack->n_entries);
 	if (q->n_entries == 0 && stack->n_entries) { // reset best
@@ -504,7 +522,7 @@ int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 
 /* bwt_match_gap's action for a found hit (entry e, SA interval [k, l]). Returns 1 where
  * bwt_match_gap breaks out of its loop (top2b behaviour). */
-static inline int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_t *e, bwtint_t k, bwtint_t l)
+static GAP_COLD int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
 	const gap_opt_t *opt = &J->opt;
 	int score = aln_score(e->n_mm, e->n_gapo, e->n_gape, opt);
@@ -544,7 +562,7 @@ static inline int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_t 
 /* bwt_match_exact_alt's next base, seq[i-1], for the entry in J->e: saves (i, k, l), prefetches
  * the two Occ blocks bwt_2occ(k - 1, l) reads and returns 1 (yield). Its N check (return 0, no
  * match) mirrors bwt_match_exact_alt but cannot fire from either call site in gap_job_run. */
-static inline int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bwtint_t k, bwtint_t l)
+static GAP_HOT int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bwtint_t k, bwtint_t l)
 {
 	// Kept to mirror bwt_match_exact_alt. Unreachable from both call sites: an N in the read
 	// forces a width restart, so an entry that reaches the tail with no differences left has
@@ -562,7 +580,7 @@ static inline int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bwt
  * forwards it (see there). Storing each child just before the next push, rather than at its own
  * push, changes nothing another push or the next pop can see: no pop runs in between, and the
  * next push stores after it whatever bucket it goes to. */
-static inline void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_score, int i, bwtint_t k, bwtint_t l,
+static GAP_HOT void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_score, int i, bwtint_t k, bwtint_t l,
 								   int n_mm, int n_gapo, int n_gape, int n_ins, int n_del, int state, int is_diff,
 								   const gap_opt_t *opt)
 {

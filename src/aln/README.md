@@ -169,7 +169,7 @@ Each change to upstream-derived code adds a line here.
 - Interleaved search. `bwtgap.cpp` gains `gap_job_start` and `gap_job_run` (new code, appended; the
   upstream functions above them are unchanged): `bwt_match_gap`'s loop for one read as a resumable job,
   which stops just before each `bwt_2occ4` lookup after prefetching the two Occ blocks the lookup
-  reads (`bwt_prefetch_occ`, new in `aln_bwt.cpp`). The loop body is upstream's, statement for
+  reads (`bwt_prefetch_occ`, new; now inline in `aln_bwt.h`). The loop body is upstream's, statement for
   statement, with its locals moved into the job. In `bwtaln.cpp`, `bwa_cal_sa_reg_gap` is replaced by
   `bwa_cal_sa_reg_gap_group`, which prepares each read as upstream does (widths, per-read
   `max_diff` and `seed_len`, complemented copy) and keeps `ALN_GROUP` of the thread's reads in
@@ -230,6 +230,13 @@ Each change to upstream-derived code adds a line here.
   `-m` break see the count a push would give), and a push followed by that pop would leave every
   bucket count, the total and `best` as they are, so the entries searched, their order and every
   break are unchanged.
+- Hot-loop layout (new code). `bwt_occ`, `bwt_2occ`, `bwt_2occ4` and `bwt_prefetch_occ` are defined
+  inline in `aln_bwt.h` (same bodies), reading the occ table through a pointer cached in `bwt_t`, so
+  `gap_job_run` and the width walks no longer call into `aln_bwt.cpp` for them (`bwt_2occ4` is left
+  to the compiler's inlining choice: forcing it inline measured slower on x86-64 and arm64). In
+  `bwtgap.cpp` the search's stack helpers are forced inline and its rare paths (a found hit, a stack
+  chunk taken from or given back to the pool) are kept out of line. Code placement only; the
+  statements run are the same.
 - Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
   walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
   block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone
