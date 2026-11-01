@@ -49,6 +49,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "io_utils.h"       /* parallel index-array read family (fmi_pread_*, index_load_threads) */
 #include "lockstep_width.h"  /* SMEM_LOCKSTEP_N (+ _MAX), runtime width + probe */
 #include "fmi_seed_api.h"
+#include "bwa_hugepages.h"  /* bwamem_hugetlb_buf_t (--huge-pages occurrence table) */
 
 #define DUMMY_CHAR 6
 
@@ -243,8 +244,15 @@ class FMI_search: public indexEle
      * build_seed_jump=false skips the seed jump table (seed_jump stays NULL,
      * seed_jump_depth 0, as under BWA3_BWTSEED_JUMP=0): for a loader that never
      * runs the lockstep seeding drivers, such as the fmi_seed_api facade. The
-     * table is built on both the disk and the shm-attach path. */
-    void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true);
+     * table is built on both the disk and the shm-attach path.
+     * huge_pages: BWAMEM_HUGETLB_ON (main_mem's --huge-pages) maps the
+     * occurrence table on 1 GB pages where it can, falling back to the default
+     * allocation when it cannot; the SA samples always use the default
+     * allocation. Disk path only (an shm attach prints that it has no effect).
+     * Production callers pass OFF or ON; the other values are unit-test seams.
+     * See bwa_hugepages.h. */
+    void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true,
+                    bwamem_hugetlb_mode_t huge_pages = BWAMEM_HUGETLB_OFF);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
@@ -477,6 +485,12 @@ private:
          * shm-backed buffers. */
         uint8_t *shm_base;
         size_t   shm_len;
+
+        /* --huge-pages: when mapped, cp_occ is cp_occ_huge.base and the
+         * destructor unmaps it instead of calling _mm_free. Unmapped (base
+         * NULL) on every other path. The suffix-array samples are always on the
+         * default allocation. */
+        bwamem_hugetlb_buf_t cp_occ_huge;
 
         /* Seed jump table: the bidirectional interval (k, l, s) of every
          * string of length 1..seed_jump_depth, level L at offset

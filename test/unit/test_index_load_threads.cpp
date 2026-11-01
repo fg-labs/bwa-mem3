@@ -114,3 +114,21 @@ TEST_CASE("index_load_threads: a valid override wins and is clamped to the 64 ce
         CHECK(index_load_threads(4) == 5);
     }
 }
+
+TEST_CASE("index_load_threads: override_applied is true only for a valid override"
+          * doctest::test_suite("unit/index_load_threads")) {
+    // The --huge-pages load reads with more workers unless the user capped them:
+    // it must treat only a value index_load_threads accepted as a cap, not an
+    // unset, empty or malformed one that index_load_threads ignored.
+    struct Case { const char *value; bool applied; };
+    for (const Case c : {Case{nullptr, false}, Case{"", false}, Case{"abc", false},
+                         Case{"0", false}, Case{"-3", false}, Case{"4x", false},
+                         Case{"3", true}, Case{"100000", true}}) {
+        CAPTURE(c.value ? c.value : "(unset)");
+        LoadThreadsEnv env(c.value);
+        bool applied = !c.applied;  // poisoned: the call must always write it
+        const int t = index_load_threads(32, &applied);
+        CHECK(applied == c.applied);
+        CHECK(t == (c.applied ? (c.value[0] == '3' ? 3 : 64) : 8));
+    }
+}

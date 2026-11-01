@@ -134,7 +134,10 @@ void fmi_pread_from_stream(FILE *fp, const char *path, void *dst, size_t nbytes,
 /* Worker count for the index load: the caller's request clamped to [1, 8]
  * (bandwidth-bound past ~8), overridable via BWA3_LOAD_THREADS (clamped to 64).
  * A malformed override is warned about once and ignored. Always returns >= 1.
+ * When `override_applied` is non-NULL it is set to whether a valid
+ * BWA3_LOAD_THREADS value set the result (false for an unset, empty or
+ * malformed one), so a caller can tell an explicit cap from the default.
  * Exposed so the fail-closed env-parse is unit-testable without an index. */
-int index_load_threads(int n_threads);
+int index_load_threads(int n_threads, bool *override_applied = nullptr);
 
 #endif
