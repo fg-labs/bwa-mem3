@@ -1,7 +1,8 @@
 // test/unit/test_bandedswa_compact16.cpp
 //
-// Same-row lane compaction in getScores16 (src/bandedSWA_compact16.inc, NEON). The driver runs
-// a batch in superblocks of K 8-lane groups in block lockstep, R rows per block, and at block
+// Same-row lane compaction in getScores16 (src/bandedSWA_compact16.inc on NEON,
+// bandedSWA_compact16_256.inc on AVX2, bandedSWA_compact16_512.inc on AVX-512BW). The driver runs
+// a batch in superblocks of K lane groups in block lockstep, R rows per block, and at block
 // ends moves the live lanes of the emptiest group into dead lanes of the others once they fit.
 // It is a pure speed change: every pair must return the same six result fields (score, tle,
 // qle, gscore, gtle, max_off) as the plain wrapper, and as the pair scored alone.
@@ -21,11 +22,13 @@
 // fail. (The nbeg update is kept for the same reason as the others, but no batch here, and no
 // profile batch of the kernel goldens, has needed it: a group's nbeg trails its lanes' heads.)
 // The reference is the same kernel copy with compaction off (set_lane_compaction16(0, 0)),
-// batch for batch, and each pair scored alone. Tiers without 16-bit compaction (x86) are
-// checked to ignore the setting.
+// batch for batch, and each pair scored alone. Every compacting tier this host runs is checked
+// (batches are sized in its lane count); the SSE tiers, which do not compact, are checked to
+// ignore the setting.
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <random>
 #include <string>
@@ -62,10 +65,59 @@ ExtScoring with_matrix(ExtScoring sc, int kind)
     return sc;
 }
 
-std::unique_ptr<IBandedPairWiseSW> make(const ExtScoring &sc, int groups, int rows)
+using Factory = IBandedPairWiseSW *(*)(int, int, int, int, int, int, const int8_t *, int8_t, int8_t, int);
+
+/// A kernel tier, with its getScores16 lane count and its default groups per superblock (0: it
+/// does not compact the 16-bit kernel).
+struct Tier {
+    std::string name;
+    Factory make;
+    int lanes;
+    int default_groups;
+};
+
+#if defined(__aarch64__)
+IBandedPairWiseSW *make_neon(int o_del, int e_del, int o_ins, int e_ins, int zdrop, int end_bonus,
+                             const int8_t *mat, int8_t a, int8_t b, int nthreads)
 {
-    std::unique_ptr<IBandedPairWiseSW> k(new BandedPairWiseSW(sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop,
-                                                              sc.pen_clip, sc.mat, (int8_t)sc.a, (int8_t)sc.b, 1));
+    return new BandedPairWiseSW(o_del, e_del, o_ins, e_ins, zdrop, end_bonus, mat, a, b, nthreads);
+}
+#endif
+
+/// The tiers with 16-bit compaction that this host runs. As in test_bandedswa_compact.cpp, an
+/// empty list records a WARN, and BWA_REQUIRE_COMPACTION_TIER (1, or a tier name) makes a
+/// missing tier a failure.
+std::vector<Tier> compacting_tiers()
+{
+    std::vector<Tier> ts;
+#if defined(__aarch64__)
+    ts.push_back({"neon", make_neon, 8, BSW16_COMPACT_GROUPS_NEON});
+#elif defined(__x86_64__) || defined(__i386__)
+    __builtin_cpu_init();
+    if (__builtin_cpu_supports("avx2")) ts.push_back({"avx2", make_bsw_kernel_avx2, 16, BSW16_COMPACT_GROUPS_AVX2});
+    if (__builtin_cpu_supports("avx512bw"))
+        ts.push_back({"avx512bw", make_bsw_kernel_avx512bw, 32, BSW16_COMPACT_GROUPS_AVX512});
+#endif
+    const char *req = std::getenv("BWA_REQUIRE_COMPACTION_TIER");
+    if (req != nullptr && req[0] != '\0' && std::string(req) != "0") {
+        const std::string want(req);
+        const bool named = want != "1";
+        const bool found = named ? std::any_of(ts.begin(), ts.end(), [&](const Tier &t) { return t.name == want; })
+                                 : !ts.empty();
+        if (!found)
+            FAIL("lane compaction 16-bit: BWA_REQUIRE_COMPACTION_TIER=" << want << " but this host has "
+                 << (named ? "no such compacting SIMD tier" : "no compacting SIMD tier"));
+    } else if (ts.empty()) {
+        WARN_MESSAGE(false, "lane compaction 16-bit: this host has no compacting SIMD tier (needs avx2 or "
+                            "avx512bw on x86); the equivalence tests are skipped here");
+    }
+    return ts;
+}
+
+std::unique_ptr<IBandedPairWiseSW> make(const Tier &t, const ExtScoring &sc, int groups, int rows)
+{
+    std::unique_ptr<IBandedPairWiseSW> k(
+        t.make(sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop, sc.pen_clip, sc.mat, (int8_t)sc.a, (int8_t)sc.b, 1));
     k->set_lane_compaction16(groups, rows);
     return k;
 }
@@ -114,12 +166,12 @@ ExtPair shifted(std::mt19937_64 &rng, int d, int len, int h0)
     return p;
 }
 
-/// Staggered finishes: `groups` * 8 pairs, mostly matches of lengths spread over [8, 400] with
-/// a few mismatches and 16-bit-range seeds, a quarter divergent or z-dropping.
-std::vector<ExtPair> staggered_batch(std::mt19937_64 &rng, int groups)
+/// Staggered finishes: `groups` * `lanes` pairs, mostly matches of lengths spread over [8, 400]
+/// with a few mismatches and 16-bit-range seeds, a quarter divergent or z-dropping.
+std::vector<ExtPair> staggered_batch(std::mt19937_64 &rng, int lanes, int groups)
 {
     std::vector<ExtPair> v;
-    for (int q = 0; q < 8 * groups; q++) {
+    for (int q = 0; q < lanes * groups; q++) {
         const int kind = (int)(rng() % 8);
         if (kind == 0) {
             const int len2 = 10 + (int)(rng() % 120);
@@ -141,13 +193,13 @@ std::vector<ExtPair> staggered_batch(std::mt19937_64 &rng, int groups)
 /// Score `batch` with compaction at `groups` / `rows` and with it off (the whole batch, then
 /// each pair alone); every field must agree. Returns the number of disagreements; adds the
 /// compacted run's counters to `moves` and `retired`.
-int check_batch(const ExtScoring &sc, const std::vector<ExtPair> &batch, int w, int groups, int rows,
-                const std::string &what, uint64_t &moves, uint64_t &retired)
+int check_batch(const Tier &t, const ExtScoring &sc, const std::vector<ExtPair> &batch, int w, int groups,
+                int rows, const std::string &what, uint64_t &moves, uint64_t &retired)
 {
     std::vector<const ExtPair *> ptrs;
     for (const ExtPair &p : batch) ptrs.push_back(&p);
-    const std::unique_ptr<IBandedPairWiseSW> cmp = make(sc, groups, rows);
-    const std::unique_ptr<IBandedPairWiseSW> plain = make(sc, 0, 0);
+    const std::unique_ptr<IBandedPairWiseSW> cmp = make(t, sc, groups, rows);
+    const std::unique_ptr<IBandedPairWiseSW> plain = make(t, sc, 0, 0);
     const std::vector<ExtResult> got = bwa_tests::score_bsw_batch(*cmp, ptrs, 16, w);
     const std::vector<ExtResult> ref = bwa_tests::score_bsw_batch(*plain, ptrs, 16, w);
     const BswCompactCounts c = cmp->lane_compaction16_counts();
@@ -158,7 +210,7 @@ int check_batch(const ExtScoring &sc, const std::vector<ExtPair> &batch, int w, 
         const ExtResult alone = bwa_tests::score_bsw_batch(*plain, {ptrs[q]}, 16, w)[0];
         if (got[q] == ref[q] && got[q] == alone) continue;
         if (bad++ < 4)
-            MESSAGE(what << " K=" << groups << " R=" << rows << " w=" << w << " pair " << q << ": compacted "
+            MESSAGE(t.name << " " << what << " K=" << groups << " R=" << rows << " w=" << w << " pair " << q << ": compacted "
                          << show(got[q]) << ", plain " << show(ref[q]) << ", alone " << show(alone)
                          << " (len1=" << batch[q].target.size() << " len2=" << batch[q].query.size()
                          << " h0=" << batch[q].h0 << "; score/tle/qle/gscore/gtle/max_off)");
@@ -168,31 +220,32 @@ int check_batch(const ExtScoring &sc, const std::vector<ExtPair> &batch, int w, 
 
 } // namespace
 
-#if defined(__aarch64__)
-
 TEST_CASE("lane compaction 16-bit: staggered finishes, every field equals plain and alone"
           * doctest::test_suite("unit/bandedswa")) {
-    std::mt19937_64 rng(0xC0A1E516ull);
-    uint64_t moves = 0, retired = 0;
-    int bad = 0;
-    const ExtScoring scs[] = {scoring(1, 4, 6, 1, 6, 1, 100, 5), scoring(1, 4, 6, 1, 6, 1, 20, 5),
-                              scoring(2, 5, 7, 2, 5, 3, 150, 0), scoring(1, 9, 12, 1, 3, 2, 60, 20)};
-    for (int groups : {2, 3, 8}) {
-        for (int rows : {1, 3, 8, 16}) {
-            for (int rep = 0; rep < 3; rep++) {
-                // every scoring with each matrix kind (symmetric, rank-1, generic) across the reps
-                const int s = (groups + rows + rep) % 4;
-                const ExtScoring sc = with_matrix(scs[s], (rows + rep) % 3);
-                const std::vector<ExtPair> batch = staggered_batch(rng, groups);
-                for (int w : {100, 40, 12})
-                    bad += check_batch(sc, batch, w, groups, rows, "staggered", moves, retired);
+    for (const Tier &t : compacting_tiers()) {
+        INFO("tier " << t.name);
+        std::mt19937_64 rng(0xC0A1E516ull);
+        uint64_t moves = 0, retired = 0;
+        int bad = 0;
+        const ExtScoring scs[] = {scoring(1, 4, 6, 1, 6, 1, 100, 5), scoring(1, 4, 6, 1, 6, 1, 20, 5),
+                                  scoring(2, 5, 7, 2, 5, 3, 150, 0), scoring(1, 9, 12, 1, 3, 2, 60, 20)};
+        for (int groups : {2, 3, 8}) {
+            for (int rows : {1, 3, 8, 16}) {
+                for (int rep = 0; rep < 3; rep++) {
+                    // every scoring with each matrix kind (symmetric, rank-1, generic) across the reps
+                    const int s = (groups + rows + rep) % 4;
+                    const ExtScoring sc = with_matrix(scs[s], (rows + rep) % 3);
+                    const std::vector<ExtPair> batch = staggered_batch(rng, t.lanes, groups);
+                    for (int w : {100, 40, 12})
+                        bad += check_batch(t, sc, batch, w, groups, rows, "staggered", moves, retired);
+                }
             }
         }
+        MESSAGE(t.name << " 16-bit: " << moves << " moves, " << retired << " groups retired by evacuation");
+        CHECK(moves > 100);
+        CHECK(retired > 20);
+        CHECK(bad == 0);
     }
-    MESSAGE("16-bit: " << moves << " moves, " << retired << " groups retired by evacuation");
-    CHECK(moves > 100);
-    CHECK(retired > 20);
-    CHECK(bad == 0);
 }
 
 TEST_CASE("lane compaction 16-bit: a lane moved into a just-finished lane's slot ignores its stale cells"
@@ -203,30 +256,34 @@ TEST_CASE("lane compaction 16-bit: a lane moved into a just-finished lane's slot
     // the live lanes fit in one group, so group 0 is evacuated and the incoming lanes land in
     // the dead lanes' slots, whose cells left of the incoming heads are large: only the move's
     // clear keeps them out of the incoming lanes' horizontal carry.
-    std::mt19937_64 rng(0x5107C16Eull);
-    uint64_t moves = 0, retired = 0;
-    int bad = 0, batches = 0;
-    for (int e : {2, 3})
-        for (int w : {50, 100})
-            for (int d : {4, 8})
-                for (int r0 : {30, 50})
-                    for (int rows : {1, 8}) {
-                        const ExtScoring sc = scoring(1, 4, 6, e, 6, e, 100, 5);
-                        std::vector<ExtPair> batch;
-                        for (int q = 0; q < 2; q++) batch.push_back(shifted(rng, d, 110, 6 + e * d + 15));
-                        while (batch.size() < 8) batch.push_back(perfect(rng, 4, 0, 10));
-                        for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, r0, 0, 120));
-                        while (batch.size() < 16) batch.push_back(perfect(rng, 130, 10, batches % 2 ? 30 : 5));
-                        const uint64_t m0 = moves;
-                        bad += check_batch(sc, batch, w, 2, rows,
-                                           "stale cells e=" + std::to_string(e) + " d=" + std::to_string(d) +
-                                               " r0=" + std::to_string(r0),
-                                           moves, retired);
-                        CHECK(moves > m0);   // the incoming lanes moved
-                        batches++;
-                    }
-    MESSAGE("16-bit: " << batches << " stale-cell batches, " << moves << " moves");
-    CHECK(bad == 0);
+    for (const Tier &t : compacting_tiers()) {
+        INFO("tier " << t.name);
+        const size_t L = (size_t)t.lanes;
+        std::mt19937_64 rng(0x5107C16Eull);
+        uint64_t moves = 0, retired = 0;
+        int bad = 0, batches = 0;
+        for (int e : {2, 3})
+            for (int w : {50, 100})
+                for (int d : {4, 8})
+                    for (int r0 : {30, 50})
+                        for (int rows : {1, 8}) {
+                            const ExtScoring sc = scoring(1, 4, 6, e, 6, e, 100, 5);
+                            std::vector<ExtPair> batch;
+                            for (int q = 0; q < 2; q++) batch.push_back(shifted(rng, d, 110, 6 + e * d + 15));
+                            while (batch.size() < L) batch.push_back(perfect(rng, 4, 0, 10));
+                            for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, r0, 0, 120));
+                            while (batch.size() < 2 * L) batch.push_back(perfect(rng, 130, 10, batches % 2 ? 30 : 5));
+                            const uint64_t m0 = moves;
+                            bad += check_batch(t, sc, batch, w, 2, rows,
+                                               "stale cells e=" + std::to_string(e) + " d=" + std::to_string(d) +
+                                                   " r0=" + std::to_string(r0),
+                                               moves, retired);
+                            CHECK(moves > m0);   // the incoming lanes moved
+                            batches++;
+                        }
+        MESSAGE(t.name << " 16-bit: " << batches << " stale-cell batches, " << moves << " moves");
+        CHECK(bad == 0);
+    }
 }
 
 TEST_CASE("lane compaction 16-bit: a lane moved into a group with a narrower column range keeps its own"
@@ -236,25 +293,29 @@ TEST_CASE("lane compaction 16-bit: a lane moved into a group with a narrower col
     // queries of 160-240 and align d columns right of the main diagonal, so right after the
     // move their best cells lie past the receiving group's nend. The move must widen nend and
     // ncol, and lower the group's minq, or the incoming lanes lose those columns.
-    std::mt19937_64 rng(0x0C011A16ull);
-    uint64_t moves = 0, retired = 0;
-    int bad = 0;
-    for (int len : {160, 240})
-        for (int w : {60, 100})
-            for (int rows : {1, 8})
-                for (int d : {30, 50}) {
-                    const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
-                    std::vector<ExtPair> batch;
-                    for (int q = 0; q < 2; q++) batch.push_back(shifted(rng, d, len, 6 + d + 20));
-                    while (batch.size() < 8) batch.push_back(perfect(rng, 4, 0, 10));
-                    for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, 20, 0, 60));
-                    while (batch.size() < 16) batch.push_back(perfect(rng, 40, 300, 90));
-                    const uint64_t m0 = moves;
-                    bad += check_batch(sc, batch, w, 2, rows, "narrow receiver len=" + std::to_string(len), moves,
-                                       retired);
-                    CHECK(moves > m0);
-                }
-    CHECK(bad == 0);
+    for (const Tier &t : compacting_tiers()) {
+        INFO("tier " << t.name);
+        const size_t L = (size_t)t.lanes;
+        std::mt19937_64 rng(0x0C011A16ull);
+        uint64_t moves = 0, retired = 0;
+        int bad = 0;
+        for (int len : {160, 240})
+            for (int w : {60, 100})
+                for (int rows : {1, 8})
+                    for (int d : {30, 50}) {
+                        const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
+                        std::vector<ExtPair> batch;
+                        for (int q = 0; q < 2; q++) batch.push_back(shifted(rng, d, len, 6 + d + 20));
+                        while (batch.size() < L) batch.push_back(perfect(rng, 4, 0, 10));
+                        for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, 20, 0, 60));
+                        while (batch.size() < 2 * L) batch.push_back(perfect(rng, 40, 300, 90));
+                        const uint64_t m0 = moves;
+                        bad += check_batch(t, sc, batch, w, 2, rows, "narrow receiver len=" + std::to_string(len),
+                                           moves, retired);
+                        CHECK(moves > m0);
+                    }
+        CHECK(bad == 0);
+    }
 }
 
 TEST_CASE("lane compaction 16-bit: a lane moved into a group further right keeps its left columns"
@@ -262,67 +323,91 @@ TEST_CASE("lane compaction 16-bit: a lane moved into a group further right keeps
     // The receiving group's live lanes align d columns right of the main diagonal, with narrow
     // bands, so the group's leading all-zero columns push its nbeg right of where the incoming
     // lanes (main diagonal) still need cells. The move must lower the receiving nbeg.
-    std::mt19937_64 rng(0x1EF7C016ull);
-    uint64_t moves = 0, retired = 0;
-    int bad = 0;
-    for (int d : {40, 80})
-        for (int w : {20, 40})
-            for (int rows : {1, 8}) {
-                const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
-                std::vector<ExtPair> batch;
-                for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, 180, 20, 60));
-                while (batch.size() < 8) batch.push_back(perfect(rng, 4, 0, 10));
-                for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, 24, 0, 30));
-                while (batch.size() < 16) batch.push_back(shifted(rng, d, 160, 6 + d + 20));
-                const uint64_t m0 = moves;
-                bad += check_batch(sc, batch, w, 2, rows, "right receiver d=" + std::to_string(d), moves, retired);
-                CHECK(moves > m0);
-            }
-    CHECK(bad == 0);
+    for (const Tier &t : compacting_tiers()) {
+        INFO("tier " << t.name);
+        const size_t L = (size_t)t.lanes;
+        std::mt19937_64 rng(0x1EF7C016ull);
+        uint64_t moves = 0, retired = 0;
+        int bad = 0;
+        for (int d : {40, 80})
+            for (int w : {20, 40})
+                for (int rows : {1, 8}) {
+                    const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
+                    std::vector<ExtPair> batch;
+                    for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, 180, 20, 60));
+                    while (batch.size() < L) batch.push_back(perfect(rng, 4, 0, 10));
+                    for (int q = 0; q < 2; q++) batch.push_back(perfect(rng, 24, 0, 30));
+                    while (batch.size() < 2 * L) batch.push_back(shifted(rng, d, 160, 6 + d + 20));
+                    const uint64_t m0 = moves;
+                    bad += check_batch(t, sc, batch, w, 2, rows, "right receiver d=" + std::to_string(d), moves,
+                                       retired);
+                    CHECK(moves > m0);
+                }
+        CHECK(bad == 0);
+    }
 }
 
 TEST_CASE("lane compaction 16-bit: the default setting, the clamps and the one-group gate"
           * doctest::test_suite("unit/bandedswa")) {
-    std::mt19937_64 rng(0xDEFA1716ull);
-    const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
-    const std::vector<ExtPair> batch = staggered_batch(rng, 4);
-    std::vector<const ExtPair *> ptrs;
-    for (const ExtPair &p : batch) ptrs.push_back(&p);
-    uint64_t moves = 0, retired = 0;
-    SUBCASE("the default compacts at the tier's groups and rows") {
-        std::unique_ptr<IBandedPairWiseSW> k(new BandedPairWiseSW(sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop,
-                                                                  sc.pen_clip, sc.mat, (int8_t)sc.a, (int8_t)sc.b, 1));
-        const std::unique_ptr<IBandedPairWiseSW> plain = make(sc, 0, 0);
-        const std::vector<ExtResult> got = bwa_tests::score_bsw_batch(*k, ptrs, 16, 100);
-        const std::vector<ExtResult> ref = bwa_tests::score_bsw_batch(*plain, ptrs, 16, 100);
-        CHECK(got == ref);
-        CHECK(k->lane_compaction16_counts().superblocks == (uint64_t)((4 + BSW16_COMPACT_GROUPS_NEON - 1) / BSW16_COMPACT_GROUPS_NEON));
-        CHECK(plain->lane_compaction16_counts().superblocks == 0);
-    }
-    SUBCASE("one lane group runs the plain wrapper") {
-        const std::unique_ptr<IBandedPairWiseSW> k = make(sc, 8, 8);
-        const std::vector<const ExtPair *> one(ptrs.begin(), ptrs.begin() + 8);
-        bwa_tests::score_bsw_batch(*k, one, 16, 100);
-        CHECK(k->lane_compaction16_counts().superblocks == 0);
-    }
-    SUBCASE("groups past the cap and rows below 1 are clamped") {
-        CHECK(check_batch(sc, batch, 100, 1000, 0, "clamped", moves, retired) == 0);
-        CHECK(check_batch(sc, batch, 100, 1, -5, "one group", moves, retired) == 0);
+    for (const Tier &t : compacting_tiers()) {
+        INFO("tier " << t.name);
+        std::mt19937_64 rng(0xDEFA1716ull);
+        const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
+        const std::vector<ExtPair> batch = staggered_batch(rng, t.lanes, 4);
+        std::vector<const ExtPair *> ptrs;
+        for (const ExtPair &p : batch) ptrs.push_back(&p);
+        uint64_t moves = 0, retired = 0;
+        {   // the default compacts at the tier's groups and rows
+            std::unique_ptr<IBandedPairWiseSW> k(t.make(sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop, sc.pen_clip,
+                                                        sc.mat, (int8_t)sc.a, (int8_t)sc.b, 1));
+            const std::unique_ptr<IBandedPairWiseSW> plain = make(t, sc, 0, 0);
+            const std::vector<ExtResult> got = bwa_tests::score_bsw_batch(*k, ptrs, 16, 100);
+            const std::vector<ExtResult> ref = bwa_tests::score_bsw_batch(*plain, ptrs, 16, 100);
+            CHECK(got == ref);
+            CHECK(k->lane_compaction16_counts().superblocks ==
+                  (uint64_t)((4 + t.default_groups - 1) / t.default_groups));
+            CHECK(plain->lane_compaction16_counts().superblocks == 0);
+        }
+        {   // one lane group runs the plain wrapper
+            const std::unique_ptr<IBandedPairWiseSW> k = make(t, sc, 8, 8);
+            const std::vector<const ExtPair *> one(ptrs.begin(), ptrs.begin() + t.lanes);
+            bwa_tests::score_bsw_batch(*k, one, 16, 100);
+            CHECK(k->lane_compaction16_counts().superblocks == 0);
+        }
+        // groups past the cap and rows below 1 are clamped
+        CHECK(check_batch(t, sc, batch, 100, 1000, 0, "clamped", moves, retired) == 0);
+        CHECK(check_batch(t, sc, batch, 100, 1, -5, "one group", moves, retired) == 0);
     }
 }
-
-#else   // tiers without 16-bit compaction
 
 TEST_CASE("lane compaction 16-bit: tiers without it ignore the setting"
           * doctest::test_suite("unit/bandedswa")) {
+#if defined(__x86_64__) || defined(__i386__)
+    __builtin_cpu_init();
+    struct Plain { const char *name; Factory make; bool ok; };
+    const Plain tiers[] = {{"sse41", make_bsw_kernel_sse41, __builtin_cpu_supports("sse4.1") != 0},
+                           {"sse42", make_bsw_kernel_sse42, __builtin_cpu_supports("sse4.2") != 0},
+                           {"avx", make_bsw_kernel_avx, __builtin_cpu_supports("avx") != 0}};
     std::mt19937_64 rng(0x0FF16C0Dull);
     const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5);
-    const std::vector<ExtPair> batch = staggered_batch(rng, 4);
-    uint64_t moves = 0, retired = 0;
-    CHECK(check_batch(sc, batch, 100, 8, 8, "ignored", moves, retired) == 0);
-    CHECK(moves == 0);
-    CHECK(retired == 0);
+    for (const Plain &p : tiers) {
+        if (!p.ok) continue;
+        INFO("tier " << p.name);
+        const Tier t{p.name, p.make, 8, 0};
+        const std::vector<ExtPair> batch = staggered_batch(rng, 8, 4);
+        uint64_t moves = 0, retired = 0;
+        CHECK(check_batch(t, sc, batch, 100, 8, 8, "ignored", moves, retired) == 0);
+        const std::unique_ptr<IBandedPairWiseSW> k = make(t, sc, 8, 8);
+        std::vector<const ExtPair *> ptrs;
+        for (const ExtPair &q : batch) ptrs.push_back(&q);
+        (void)bwa_tests::score_bsw_batch(*k, ptrs, 16, 100);
+        CHECK(k->lane_compaction16_counts().superblocks == 0);   // the compaction driver never ran
+        CHECK(moves == 0);
+        CHECK(retired == 0);
+    }
+#else
+    MESSAGE("lane compaction 16-bit: every aarch64 build has the driver; nothing to check here");
+#endif
 }
 
-#endif
 #endif   // HAVE_BSW_VECTOR_8_16
