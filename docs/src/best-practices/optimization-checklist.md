@@ -237,7 +237,13 @@ the same file took ~8 ms on a fragmented host and 50–190 ms with ~26 GiB on 4 
 pages, because the kernel visits every page-table entry. A run samples once per
 power-of-two batch and stops at the first warning; on a fully-THP Graviton4 WGS
 run the check cost −0.007 % ± 0.031 % wall against a build without it (12
-interleaved reps per arm). The warning never changes the output. At `-v 4` each
+interleaved reps per arm). A walk also visits the page-table entries of shared
+mappings, so with a `bwa-mem3 shm` index (11 GB on 4 KB pages for hg38) one walk
+costs about 100 ms, and about 200 ms when the kernel happens to generate that
+mapping's entry twice. Every warning needs ≥ 4 GiB of anonymous memory, so a
+sample first reads `RssAnon` from `/proc/self/status` and makes no walk while it
+is under 2 GiB, as it is for a `-t 16` run against a staged index (about 1 GiB);
+no warning is possible then. `-v 4` always walks, for its debug line. The warning never changes the output. At `-v 4` each
 sample is logged as a `[D::main_mem] THP check batch N:` line, or as
 `check disabled: <reason>` when the check stops.
 

@@ -205,6 +205,8 @@ typedef struct {
     int walks;                /* smaps walks made (<= 3) */
     int complete;             /* the last walk passed bwa_thp_sample_complete */
     int retry;                /* this sample was the deferred retry */
+    int below_floor;          /* skipped the walk: RssAnon under half of BWA_THP_MIN_ANON_KB
+                               * (verbose < 4 only), so no verdict was possible */
     bwa_thp_stop_t stop;      /* set when this step stopped the check for good */
     bwa_thp_usage_t usage;    /* the last walk */
     bwa_thp_status_t status;  /* status read after the last walk */
@@ -218,7 +220,9 @@ typedef struct {
  * lands inside a longer allocation phase, which would otherwise wait for the
  * next power-of-two batch (e.g. 64 -> 128) and so may never be judged.
  *
- * One completed batch. Pure apart from `io`: with verbose < 2 it stops; it
+ * One completed batch. Pure apart from `io`: with verbose < 2 it stops; below
+ * -v 4 a sample whose RssAnon is under half of BWA_THP_MIN_ANON_KB makes no
+ * walk (rep->below_floor; no verdict is possible below the floor); it
  * samples on the bwa_thp_should_sample() schedule, plus one deferred retry on
  * the next batch when a scheduled sample had no complete walk in
  * BWA_THP_MAX_WALKS; the first sample resolves the config and stops when the

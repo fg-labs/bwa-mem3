@@ -527,6 +527,37 @@ TEST_CASE("thp: per-batch step" * doctest::test_suite("unit/bwa_thp")) {
         CHECK(bwa_thp_step(&m, 3, &io, &r) == BWA_THP_WARN_DISABLED);
         CHECK(std::string(m.cfg.knob) == PMD);
     }
+    SUBCASE("below half the anonymous floor, no walk is made (verbose < 4)") {
+        f.walks = { usage(1 * GiB_kB, 0, 0, 0) };
+        f.statuses = { status(BWA_THP_MIN_ANON_KB / 2 - 1, 1) };
+        for (int b = 1; b <= 8; ++b) CHECK(bwa_thp_step(&m, 3, &io, &r) == BWA_THP_OK);
+        CHECK(f.n_walks == 0);
+        CHECK(r.below_floor == 1);
+        CHECK(r.sampled == 1);
+        CHECK(m.done == 0);
+        CHECK(m.retry_pending == 0);
+        CHECK(f.n_knob_reads == 9);   // the config is still resolved on the first sample
+    }
+    SUBCASE("at half the anonymous floor, the walk is made") {
+        f.walks = { frag };
+        f.statuses = { status(BWA_THP_MIN_ANON_KB / 2, 1), st_ok };
+        CHECK(bwa_thp_step(&m, 3, &io, &r) == BWA_THP_WARN_FALLBACK);
+        CHECK(f.n_walks == 1);
+        CHECK(r.below_floor == 0);
+    }
+    SUBCASE("-v 4 walks below the floor, for its debug line") {
+        f.walks = { usage(1 * GiB_kB, 0, 0, 0) };
+        f.statuses = { status(1 * GiB_kB, 1) };
+        CHECK(bwa_thp_step(&m, 4, &io, &r) == BWA_THP_OK);
+        CHECK(f.n_walks == 1);
+        CHECK(r.below_floor == 0);
+        CHECK(r.usage.anon_kb == 1 * GiB_kB);
+    }
+    SUBCASE("an unreadable status does not skip the walk") {
+        f.walks = { frag };
+        CHECK(bwa_thp_step(&m, 3, &io, &r) == BWA_THP_WARN_FALLBACK);
+        CHECK(f.n_walks == 1);
+    }
     SUBCASE("NULL monitor or io is a no-op") {
         CHECK(bwa_thp_step(NULL, 3, &io, &r) == BWA_THP_OK);
         CHECK(bwa_thp_step(&m, 3, NULL, &r) == BWA_THP_OK);
