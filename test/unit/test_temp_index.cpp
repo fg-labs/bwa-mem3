@@ -130,6 +130,27 @@ TEST_CASE("TempDir: a forked child that destroys one leaves the parent's directo
     CHECK_FALSE(exists(path));
 }
 
+TEST_CASE("TempDir: remove() deletes the directory now, and only once"
+          * doctest::test_suite("unit/test_framework")) {
+    std::string path, file, err;
+    {
+        bwa_tests::StderrCapture cap;
+        {
+            bwa_tests::TempDir dir;
+            dir.write("x.txt", "hello\n");
+            path = dir.path();
+            file = dir.file("x.txt");
+            dir.remove();
+            CHECK_FALSE(exists(file));
+            CHECK_FALSE(exists(path));
+            CHECK(dir.path().empty());
+            dir.remove();   // a second call does nothing
+        }                   // nor does the destructor: no warning
+        err = cap.text();
+    }
+    CHECK(err == "");
+}
+
 TEST_CASE("TempDir and temp_path.h: scratch paths go under $TMPDIR"
           * doctest::test_suite("unit/test_framework")) {
     bwa_tests::TempDir root("tmpdir_root");
@@ -273,6 +294,23 @@ TEST_CASE("TempIndex: honours the SA sampling shift"
     const std::vector<Contig> ref = {{"chrA", random_bases(rng, 500)}};
     bwa_tests::TempIndex idx(ref, /*sa_compx=*/1);
     CHECK(idx.fmi()->sa_compx == 1);
+    CHECK(sa_lookup_mismatches(idx, ref) == 0);
+}
+
+TEST_CASE("TempIndex: drop_files deletes the index files and the loaded index still answers"
+          * doctest::test_suite("unit/test_framework")) {
+    std::mt19937 rng(31);
+    const std::vector<Contig> ref = {{"chrA", random_bases(rng, 700)}, {"chrB", random_bases(rng, 300)}};
+    bwa_tests::TempIndex idx(ref);
+    const std::string prefix = idx.prefix();
+    const std::string dir = prefix.substr(0, prefix.rfind('/'));
+    REQUIRE(exists(prefix));
+    idx.drop_files();
+    CHECK_FALSE(exists(prefix));
+    CHECK_FALSE(exists(dir));
+    REQUIRE(idx.bns() != NULL);
+    CHECK(idx.bns()->n_seqs == 2);
+    CHECK(idx.bns()->l_pac == 1000);
     CHECK(sa_lookup_mismatches(idx, ref) == 0);
 }
 
