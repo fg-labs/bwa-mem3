@@ -21,6 +21,14 @@ int bwa_seq_n_bad(const bwa_seqio_t *bs);
 void seq_reverse(int len, ubyte_t *seq, int is_comp);
 int bwa_trim_read(int trim_qual, bwa_seq_t *p);
 bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int trim_qual);
+/* A read error of the input (gzread) makes bwa_read_seq exit with stock's message. After
+ * bwa_seq_defer_read_errors it instead ends that call with no batch (returns 0) and keeps the
+ * error: bwa_seq_read_failed reports it, and bwa_seq_report_read_error prints stock's message and
+ * returns 1 (0, printing nothing, if there is none). For a caller that reads on a helper thread
+ * and ends the run on its own thread. */
+void bwa_seq_defer_read_errors(bwa_seqio_t *bs);
+int bwa_seq_read_failed(const bwa_seqio_t *bs);
+int bwa_seq_report_read_error(const bwa_seqio_t *bs);
 void bwa_free_read_seq(int n_seqs, bwa_seq_t *seqs);
 
 } // namespace bwa_aln

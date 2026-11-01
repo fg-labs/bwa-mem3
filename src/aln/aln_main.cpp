@@ -4,6 +4,7 @@
  * paired-end options; see README.md. */
 #include "aln_main.h"
 
+#include <assert.h>
 #include <getopt.h>
 #include <math.h>
 #include <stdio.h>
@@ -15,8 +16,11 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <functional>
 #include <string>
 #include <vector>
+
+#include <pthread.h>
 
 #include "../FMI_search.h"
 #include "../bwa.h"
@@ -43,6 +47,8 @@ void aln_opt_init(aln_opt_t *o)
 	free(pe);
 	o->batch_size = 0x40000;
 }
+
+/* The next batch is read on a helper thread while the current one is processed (background_task_t). */
 
 /* The stages after the search run in parallel on kt_for (stage order, as follows): every drand48() draw
  * stays in one serial pass, in stock order, before them; infer_isize is a barrier between the
@@ -97,6 +103,49 @@ struct fmt_bufs_t {
 		}
 		return 0;
 	}
+};
+
+/* Runs one function on a helper thread while the caller works; wait() joins it. If the thread
+ * cannot be created, wait() runs the function itself, so the result is the same either way. The
+ * batch loops use it to read and parse the next batch while the current one is aligned: the
+ * reader is then the only user of the input streams, and the batches are still aligned and
+ * written in input order. The reader is one thread on top of the -t threads. A read error does not
+ * exit on it (bwa_seq_defer_read_errors): the loop reports it after the current batch is written,
+ * where stock's read of the next batch would have failed, and the run returns 1 (stock exits
+ * there; returning lets the caller close the output, as for a failed close of the input). */
+class background_task_t {
+public:
+	background_task_t() = default;
+	background_task_t(const background_task_t &) = delete;
+	background_task_t &operator=(const background_task_t &) = delete;
+	~background_task_t() // a task still running (a path that skipped wait) is joined, never left behind
+	{
+		if (started_) pthread_join(th_, 0);
+	}
+	void start(std::function<void()> fn)
+	{
+		assert(!pending_); // one task at a time: wait() before the next start()
+		fn_ = std::move(fn);
+		pending_ = true;
+		started_ = pthread_create(&th_, 0, run, this) == 0;
+	}
+	void wait()
+	{
+		if (!pending_) return; // nothing started
+		if (started_) pthread_join(th_, 0);
+		else fn_(); // the thread could not be created: run the task here
+		started_ = pending_ = false;
+	}
+private:
+	static void *run(void *self)
+	{
+		((background_task_t*)self)->fn_();
+		return 0;
+	}
+	std::function<void()> fn_;
+	pthread_t th_;
+	bool started_ = false; // a thread is running fn_ (joined by wait or the destructor)
+	bool pending_ = false; // start() was called and wait() not yet
 };
 
 struct se_ctx_t {
@@ -187,14 +236,23 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		fprintf(stderr, "[E::aln] cannot open '%s'\n", fn_fq);
 		return 1;
 	}
+	bwa_seq_defer_read_errors(ks); // reported below, on this thread (see background_task_t)
 	bwase_initialize();
 	srand48(bns->seed); // once per run, never per batch
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
 	fmt_bufs_t fb(n_threads);
 	long long tot = 0;
-	int n_seqs, ret = 0;
-	bwa_seq_t *seqs;
-	while ((seqs = bwa_read_seq(ks, o->batch_size, &n_seqs, o->gap.mode, o->gap.trim_qual)) != 0) {
+	int ret = 0;
+	struct batch_t { bwa_seq_t *seqs; int n; };
+	auto read_batch = [&](batch_t *b) { b->seqs = bwa_read_seq(ks, o->batch_size, &b->n, o->gap.mode, o->gap.trim_qual); };
+	batch_t cur, next;
+	read_batch(&cur);
+	if (bwa_seq_report_read_error(ks)) ret = 1; // cur.seqs is then 0: no batch is processed
+	background_task_t ahead;
+	while (cur.seqs) {
+		ahead.start([&] { read_batch(&next); }); // the next batch is read while this one is aligned
+		bwa_seq_t *seqs = cur.seqs;
+		const int n_seqs = cur.n;
 		tot += n_seqs;
 		aln_search_batch(bwt, n_seqs, seqs, &o->gap, o->gap.n_threads);
 		// serial and in read order: bwa_aln2seq_core draws from drand48
@@ -206,8 +264,17 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		int stop;
 		if (fb.write(out, &stop) != 0) ret = 1;
 		bwa_free_read_seq(n_seqs, seqs);
-		if (ret) break;
+		ahead.wait();
+		if (ret) {
+			if (next.seqs) bwa_free_read_seq(next.n, next.seqs);
+			break;
+		}
 		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld sequences have been processed.\n", tot);
+		if (bwa_seq_report_read_error(ks)) { // where stock's read of the next batch would have exited
+			ret = 1;
+			break;
+		}
+		cur = next;
 	}
 	if (bwa_seq_n_bad(ks)) ret = 1; // malformed records were skipped (and named on stderr)
 	// Not fatal (stock's err_gzclose exits): the caller still closes the output, so a BAM is
@@ -242,12 +309,26 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	bwa_seq_t *seqs[2];
 	int n_in[2];
 	bool r1_done = false;
-	while (true) {
-		if ((seqs[0] = bwa_read_seq(ks[0], o->batch_size, &n_in[0], o->gap.mode, o->gap.trim_qual)) == 0) {
+	// A batch pair: R1's batch, then R2's, read only if R1's is non-empty (as stock reads them: a
+	// read error or the end of R1 leaves R2 unread).
+	struct pe_batch_t { bwa_seq_t *seqs[2]; int n[2]; };
+	auto read_batch = [&](pe_batch_t *b) {
+		b->seqs[1] = 0, b->n[1] = 0;
+		if ((b->seqs[0] = bwa_read_seq(ks[0], o->batch_size, &b->n[0], o->gap.mode, o->gap.trim_qual)) != 0)
+			b->seqs[1] = bwa_read_seq(ks[1], o->batch_size, &b->n[1], o->gap.mode, o->gap.trim_qual);
+	};
+	pe_batch_t cur, next;
+	bwa_seq_defer_read_errors(ks[0]); // reported below, on this thread (see background_task_t)
+	bwa_seq_defer_read_errors(ks[1]);
+	read_batch(&cur);
+	if (bwa_seq_report_read_error(ks[0]) || bwa_seq_report_read_error(ks[1])) ret = 1;
+	background_task_t ahead;
+	while (!ret) {
+		seqs[0] = cur.seqs[0], seqs[1] = cur.seqs[1], n_in[0] = cur.n[0], n_in[1] = cur.n[1];
+		if (seqs[0] == 0) {
 			r1_done = true;
 			break;
 		}
-		seqs[1] = bwa_read_seq(ks[1], o->batch_size, &n_in[1], o->gap.mode, o->gap.trim_qual);
 		if (!seqs[1]) {
 			// n_in[0] is only the R1 batch just read; later R1 batches are not read, so the
 			// count is a lower bound
@@ -255,6 +336,9 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			bwa_free_read_seq(n_in[0], seqs[0]);
 			break;
 		}
+		// the next pair of batches is read while this one is aligned; started only past the end
+		// checks above, so after R2 ends no further R1 batch is read, as before
+		ahead.start([&] { read_batch(&next); });
 		int n_seqs = n_in[1]; // as sampe: the second file's count
 		if (n_in[0] != n_in[1]) {
 			if (n_seqs > n_in[0]) n_seqs = n_in[0]; // sampe would read past the first file's reads
@@ -296,14 +380,27 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		}
 		bwa_free_read_seq(n_in[0], seqs[0]);
 		bwa_free_read_seq(n_in[1], seqs[1]);
-		if (ret) break;
+		ahead.wait();
+		if (ret) {
+			for (int j = 0; j < 2; ++j)
+				if (next.seqs[j]) bwa_free_read_seq(next.n[j], next.seqs[j]);
+			break;
+		}
 		last_ii = ii;
 		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld read pairs have been processed.\n", tot);
+		if (bwa_seq_report_read_error(ks[0]) || bwa_seq_report_read_error(ks[1])) { // where stock's read would have exited
+			for (int j = 0; j < 2; ++j)
+				if (next.seqs[j]) bwa_free_read_seq(next.n[j], next.seqs[j]);
+			ret = 1;
+			break;
+		}
+		cur = next;
 	}
 	if (r1_done && !ret) { // R1 ran out first: say so if R2 still has reads
 		int n_extra = 0;
 		bwa_seq_t *extra = bwa_read_seq(ks[1], 1, &n_extra, o->gap.mode, o->gap.trim_qual);
-		if (extra) {
+		if (bwa_seq_report_read_error(ks[1])) ret = 1;
+		else if (extra) {
 			fprintf(stderr, "[W::aln] read 1 file ended before read 2 file; ignoring the remaining read(s) of read 2\n");
 			bwa_free_read_seq(n_extra, extra);
 		}
