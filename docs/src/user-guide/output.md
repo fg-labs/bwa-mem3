@@ -143,12 +143,15 @@ possible field widths.
 HN:i:<count>
 ```
 
-The total number of primary alignments (both reported and suppressed) that
-the aligner found for this read, before the `-h` supplementary cap is applied.
-Useful for distinguishing "uniquely mapped" from "multi-mapped" reads without
-relying solely on MAPQ.
+The number of alternative hits this record shadows: the hits that would be
+listed in its `XA:Z`, counted before the `-h` cap truncates that list (so
+`HN` can be nonzero on a record that carries no `XA:Z`). Useful for
+distinguishing "uniquely mapped" from "multi-mapped" reads without relying
+solely on MAPQ.
 
-`HN:i` is emitted on the primary alignment record only.
+`HN:i` is written on every primary and supplementary record (not on
+secondary records), each counting its own shadowed hits. It is absent under
+`-a` and under `--compat`.
 
 ### `pa:f` — ratio to the better ALT hit
 
