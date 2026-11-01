@@ -1058,91 +1058,74 @@ jobs:
 
       - name: Cache stock bwa 0.7.19 oracle
         # Stock bwa built from the pinned tarball (test/tools/build_bwa_oracle.sh),
-        # used as the reference for the aln port's FM-index parity check below.
-        # The key carries the tarball's sha256 prefix, so changing the pin in the
-        # script invalidates the cache.
+        # used as the reference for the aln port's parity checks below. The key
+        # hashes the build script, so changing its pin, flags or compiler choice
+        # invalidates the cache (the script reuses any cached binary that reports
+        # 0.7.19 and cannot tell how it was built).
         if: matrix.canonical == true || matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest'
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/bwa-oracle
-          key: bwa-oracle-0.7.19-${{ runner.os }}-${{ runner.arch }}-cdff5db6
+          key: bwa-oracle-0.7.19-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('test/tools/build_bwa_oracle.sh') }}
+
+      - name: Build aln parity tools and the stock bwa oracle
+        # aln_index_parity_test and aln_sai_dump carry the row's
+        # arch/CXX/USE_MIMALLOC for the same build-flags-stamp reason as the
+        # pwrite_all_status_test step above. The oracle path is assigned on its
+        # own line, so a failed download or build fails this step (as a prefix
+        # assignment on the script's command line it would leave BWA_ORACLE empty
+        # and the scripts would SKIP and pass); it is then exported to the
+        # parity steps, which also set BWA_ORACLE_REQUIRED so an unset oracle is
+        # a FAIL there, not a SKIP.
+        if: matrix.canonical == true || matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest'
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+          ORACLE_DIR: ${{ runner.temp }}/bwa-oracle
+        run: |
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_index_parity_test aln_sai_dump \
+              arch="$MATRIX_BASELINE_ARCH" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          else
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_index_parity_test aln_sai_dump \
+              arch="$MATRIX_ARCH_FLAG" \
+              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          fi
+          oracle="$(bash test/tools/build_bwa_oracle.sh "$ORACLE_DIR")"
+          if [ ! -x "$oracle" ]; then
+            echo "FAIL: build_bwa_oracle.sh printed no executable path ('$oracle')" >&2
+            exit 1
+          fi
+          echo "BWA_ORACLE=$oracle" >> "$GITHUB_ENV"
 
       - name: aln index parity vs bwa 0.7.19
         # bwa-mem3's index must agree with a stock `bwa index` on every row
         # (occ, SA, primary, L2), which is what lets the aln port reuse bwa-mem3's
-        # index. The test binary carries the row's arch/CXX/USE_MIMALLOC for the
-        # same build-flags-stamp reason as the pwrite_all_status_test step above.
+        # index.
         if: matrix.canonical == true || matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest'
         env:
-          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
-          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
-          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
-          ORACLE_DIR: ${{ runner.temp }}/bwa-oracle
-        run: |
-          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_index_parity_test \
-              arch="$MATRIX_BASELINE_ARCH" \
-              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
-          else
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_index_parity_test \
-              arch="$MATRIX_ARCH_FLAG" \
-              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
-          fi
-          BWA_ORACLE="$(bash test/tools/build_bwa_oracle.sh "$ORACLE_DIR")" \
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          bash test/regression/aln_index_parity.sh
+          BWA_ORACLE_REQUIRED: 1
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_index_parity.sh
 
       - name: aln search parity vs bwa 0.7.19
         # The aln port's backtracking search must write the same .sai body as stock
-        # `bwa aln` (bodies only: stock's header records -t). aln_sai_dump carries the
-        # row's arch/CXX/USE_MIMALLOC for the same build-flags-stamp reason as the
-        # aln index parity step above; the oracle comes from the same cache.
+        # `bwa aln` (bodies only: stock's header records -t).
         if: matrix.canonical == true || matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest'
         env:
-          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
-          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
-          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
-          ORACLE_DIR: ${{ runner.temp }}/bwa-oracle
-        run: |
-          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_sai_dump \
-              arch="$MATRIX_BASELINE_ARCH" \
-              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
-          else
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_sai_dump \
-              arch="$MATRIX_ARCH_FLAG" \
-              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
-          fi
-          BWA_ORACLE="$(bash test/tools/build_bwa_oracle.sh "$ORACLE_DIR")" \
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          bash test/regression/aln_sai_parity.sh
+          BWA_ORACLE_REQUIRED: 1
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_sai_parity.sh
 
       - name: aln SE/PE parity vs bwa 0.7.19
         # `bwa-mem3 aln` must write the same SAM as stock `bwa aln` followed by
         # `bwa samse` (single end) or `bwa sampe` (paired end); the @PG line is the
-        # one difference. aln_sai_dump
-        # is built only because the script takes the synthetic reference from it, with
-        # the row's arch/CXX/USE_MIMALLOC for the same build-flags-stamp reason as the
-        # aln search parity step above; the oracle comes from the same cache.
+        # one difference. aln_sai_dump (built above) supplies the synthetic
+        # reference.
         if: matrix.canonical == true || matrix.os == 'ubuntu-24.04-arm' || matrix.os == 'macos-latest'
         env:
-          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
-          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
-          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
-          ORACLE_DIR: ${{ runner.temp }}/bwa-oracle
-        run: |
-          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_sai_dump \
-              arch="$MATRIX_BASELINE_ARCH" \
-              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
-          else
-            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" aln_sai_dump \
-              arch="$MATRIX_ARCH_FLAG" \
-              CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
-          fi
-          BWA_ORACLE="$(bash test/tools/build_bwa_oracle.sh "$ORACLE_DIR")" \
-          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
-          bash test/regression/aln_parity.sh
+          BWA_ORACLE_REQUIRED: 1
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_parity.sh
 
       - name: Run integration tests
         if: matrix.run_integration == true

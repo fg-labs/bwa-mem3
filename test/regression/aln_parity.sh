@@ -29,7 +29,8 @@
 # Inputs (env vars):
 #   BWA_MEM3          -- path to the bwa-mem3 binary under test
 #   BWA_ORACLE        -- path to a stock bwa 0.7.19 binary
-#                        (test/tools/build_bwa_oracle.sh); unset => SKIP
+#                        (test/tools/build_bwa_oracle.sh); unset => SKIP, unless
+#   BWA_ORACLE_REQUIRED=1  -- (CI) an unset or non-executable BWA_ORACLE is a FAIL
 #   FIXTURES          -- directory holding phix.fa (default: test/fixtures)
 #   ALN_SAI_DUMP      -- path to aln_sai_dump, used only to write the synthetic contigs
 #                        (default: repo root)
@@ -38,6 +39,10 @@ set -Eeuo pipefail
 # shellcheck disable=SC2154  # rc is assigned by `rc=$?` at the start of the trap body
 trap 'rc=$?; echo "FAIL: unexpected command failure at line $LINENO (exit $rc)" >&2; exit "$rc"' ERR
 
+if [ "${BWA_ORACLE_REQUIRED:-0}" = 1 ] && [ ! -x "${BWA_ORACLE:-}" ]; then
+    echo "FAIL: BWA_ORACLE_REQUIRED=1 but BWA_ORACLE ('${BWA_ORACLE:-}') is not an executable" >&2
+    exit 1
+fi
 if [ -z "${BWA_ORACLE:-}" ]; then
     echo "SKIP: BWA_ORACLE unset"
     exit 0
@@ -69,7 +74,7 @@ for d in plain alt; do
 done
 
 gen_reads() {
-    awk -v seed="$1" -v n="$2" -v lens="$3" -v tail="$4" -f "$repo_root/test/regression/aln_reads.awk" "$work/ref.fa"
+    awk -v seed="$1" -v n="$2" -v lens="$3" -v tail="$4" -f "$repo_root/test/regression/aln_rng.awk" -f "$repo_root/test/regression/aln_reads.awk" "$work/ref.fa"
 }
 
 # Rewrites every eighth read: lower case, an R, a Y, a '-', an N (the rest are untouched).
@@ -89,6 +94,22 @@ n_cfg=0
 mapped_total=0
 xa_total=0
 ah_total=0
+
+# check_vs_stock <label> <stock command>: $work/mem3.sam must equal $work/stock.sam apart from the
+# @PG line, and must have one; leaves both without @PG in $work/{stock,mem3}.nopg.
+check_vs_stock() {
+    grep -av '^@PG' "$work/stock.sam" > "$work/stock.nopg" || true
+    grep -av '^@PG' "$work/mem3.sam" > "$work/mem3.nopg" || true
+    if ! diff -a "$work/stock.nopg" "$work/mem3.nopg" > "$work/sam.diff"; then
+        echo "FAIL: aln_parity: $1 differs from stock $2; first lines of diff (< stock, > ours):" >&2
+        head -n 10 "$work/sam.diff" >&2
+        exit 1
+    fi
+    if ! grep -q '^@PG' "$work/mem3.sam"; then
+        echo "FAIL: aln_parity: $1 has no @PG line" >&2
+        exit 1
+    fi
+}
 
 # compare <tag> <refdir> <fq> <xa> <rg> [aln options...]
 # xa and rg are the samse -n / --max-xa-hits value and the -r line; "" leaves them at the default.
@@ -112,17 +133,7 @@ compare() {
             > "$work/stock.sam" 2> "$work/stock.samse.log"
         "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$work/$d/mem3/ref.fa" "$fq" \
             > "$work/mem3.sam" 2> "$work/mem3.aln.log"
-        grep -av '^@PG' "$work/stock.sam" > "$work/stock.nopg" || true
-        grep -av '^@PG' "$work/mem3.sam" > "$work/mem3.nopg" || true
-        if ! diff -a "$work/stock.nopg" "$work/mem3.nopg" > "$work/sam.diff"; then
-            echo "FAIL: aln_parity: $tag -t $t $* differs from stock samse; first lines of diff (< stock, > ours):" >&2
-            head -n 10 "$work/sam.diff" >&2
-            exit 1
-        fi
-        if ! grep -q '^@PG' "$work/mem3.sam"; then
-            echo "FAIL: aln_parity: $tag -t $t has no @PG line" >&2
-            exit 1
-        fi
+        check_vs_stock "$tag -t $t $*" samse
         mapped_total=$((mapped_total + $({ grep -av '^@' "$work/mem3.nopg" || true; } | mawk_or_awk '$3 != "*"' | wc -l)))
         xa_total=$((xa_total + $(grep -ac 'XA:Z:' "$work/mem3.nopg" || true)))
         ah_total=$((ah_total + $(grep -ac 'AH:\*' "$work/mem3.nopg" || true)))
@@ -215,6 +226,13 @@ compare sw_I plain "$work/sw_I.fq" "" "" -I -q 20
 # Casava comments: every other read carries " 1:Y:0:ACGT" (filtered) or " 1:N:0:ACGT"
 gen_reads 235 800 36 0 | mawk_or_awk 'NR % 4 == 1 { $0 = $0 " 1:" ((NR % 8 == 1) ? "Y" : "N") ":0:ACGT" } 1' > "$work/sw_Y.fq"
 compare sw_Y plain "$work/sw_Y.fq" "" "" -Y
+# values at the edge of what the option checks refuse, which stock runs: they must still run and
+# match (zero penalties that leave room, no gap opens via -o -1, -l 0, two -B values OR-ed)
+run_case sw_E0 236 600 100 0 "" "" -E 0 -n 0.04 -o 2
+run_case sw_M0O0 237 600 36 0 "" "" -M 0 -O 0
+run_case sw_om1 238 600 100 0 "" "" -o -1
+run_case sw_l0 239 600 36 0 "" "" -l 0
+run_case sw_B4B2 240 600 36 0 "" "" -B 4 -B 2
 need_tag sw_Y 'XT:A:'
 
 # One 1,000 bp read and twenty 250 bp reads in a single batch (the batch-wide gap-open cap
@@ -392,6 +410,50 @@ if [ "$rc" -ne 1 ] || ! grep -q 'is a directory' "$work/none.err" || grep -q 'In
 fi
 echo "aln_parity: ok fail-before-side-effects (missing FASTQ, missing R2, unwritable -f)"
 
+# refused before the index loads, with no output: values stock crashes, aborts or drops every read
+# on, malformed numbers, standard input for both files, and an -f that names an input
+refuse() { # tag expected-stderr-pattern args...
+    local tag="$1" pat="$2" rc=0
+    shift 2
+    "$BWA_MEM3" aln "$@" > "$work/none.out" 2> "$work/none.err" || rc=$?
+    if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q -- "$pat" "$work/none.err" \
+        || grep -q 'Index file found' "$work/none.err"; then
+        echo "FAIL: aln_parity: $tag must exit 1 before the index loads with '$pat' (exit $rc)" >&2
+        cat "$work/none.err" >&2
+        exit 1
+    fi
+}
+refuse "-l -1" "-l wants a non-negative integer" -l -1 "$ref_mem3" "$form_fq"
+refuse "-B -1" "-B wants a non-negative integer" -B -1 "$ref_mem3" "$form_fq"
+refuse "-M 0 -O 0 -E 0" "no room for a difference" -M 0 -O 0 -E 0 "$ref_mem3" "$form_fq"
+refuse "-n -2" "-n wants a non-negative integer" -n -2 "$ref_mem3" "$form_fq"
+refuse "-q 20x" "-q wants an integer" -q 20x "$ref_mem3" "$form_fq"
+refuse "aln ref - -" "standard input ('-') can stand for only one" "$ref_mem3" - - < "$form_fq"
+cp "$form_fq" "$work/self.fq"
+refuse "-f naming the input" "is also an input" -f "$work/self.fq" "$ref_mem3" "$work/self.fq"
+if ! cmp -s "$form_fq" "$work/self.fq"; then
+    echo "FAIL: aln_parity: -f naming the input changed the input" >&2
+    exit 1
+fi
+echo "aln_parity: ok refused option values and inputs"
+
+# a malformed record (quality shorter than the sequence) in the middle: stock skips it and exits 0;
+# ours writes the same records, names the record and exits 1
+{
+    head -n 400 "$form_fq"
+    printf '@trunc\nACGTACGTACGTACGTACGT\n+\nIIII\n'
+    sed -n '401,800p' "$form_fq" # not tail | head: head's early exit is a SIGPIPE under pipefail
+} > "$work/malformed.fq"
+stock_se "$work/malformed.stock.sam" "$work/malformed.fq" -t 1
+rc=0
+"$BWA_MEM3" aln -t 1 "$ref_mem3" "$work/malformed.fq" > "$work/malformed.ours.sam" 2> "$work/malformed.err" || rc=$?
+if [ "$rc" -ne 1 ] || ! grep -q 'record 101 is malformed' "$work/malformed.err"; then
+    echo "FAIL: aln_parity: a malformed record must be named and exit 1 (exit $rc)" >&2
+    cat "$work/malformed.err" >&2
+    exit 1
+fi
+same_records "malformed record: same records as stock" "$work/malformed.stock.sam" "$work/malformed.ours.sam"
+
 # ---- paired end: aln R1, aln R2, sampe ------------------------------------------------
 # Reads come from aln_pairs.awk (fragments of 250-349 bp, so most pairs are concordant; a few
 # have a far second mate or a random one; "rescue" gives some second mates too many scattered
@@ -403,7 +465,7 @@ pe_ref=plain
 gen_pairs() { # seed n lens rescue names out1 out2 [lens2 heavy1]
     awk -v seed="$1" -v n="$2" -v lens="$3" -v rescue="$4" -v names="$5" -v out1="$6" -v out2="$7" \
         -v lens2="${8:-}" -v heavy1="${9:-}" \
-        -f "$repo_root/test/regression/aln_pairs.awk" "$work/ref.fa"
+        -f "$repo_root/test/regression/aln_rng.awk" -f "$repo_root/test/regression/aln_pairs.awk" "$work/ref.fa"
 }
 
 # compare_pe <tag> <fq1> <fq2> <sampe args> <ours args> [aln options...]
@@ -422,17 +484,7 @@ compare_pe() {
             > "$work/stock.sam" 2> "$work/stock.sampe.log"
         "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$work/$pe_ref/mem3/ref.fa" "$fq1" "$fq2" \
             > "$work/mem3.sam" 2> "$work/mem3.aln.log"
-        grep -av '^@PG' "$work/stock.sam" > "$work/stock.nopg" || true
-        grep -av '^@PG' "$work/mem3.sam" > "$work/mem3.nopg" || true
-        if ! diff -a "$work/stock.nopg" "$work/mem3.nopg" > "$work/sam.diff"; then
-            echo "FAIL: aln_parity: PE $tag -t $t $* differs from stock sampe; first lines of diff (< stock, > ours):" >&2
-            head -n 10 "$work/sam.diff" >&2
-            exit 1
-        fi
-        if ! grep -q '^@PG' "$work/mem3.sam"; then
-            echo "FAIL: aln_parity: PE $tag -t $t has no @PG line" >&2
-            exit 1
-        fi
+        check_vs_stock "PE $tag -t $t $*" sampe
         pe_xt_m=$((pe_xt_m + $(grep -ac 'XT:A:M' "$work/mem3.nopg" || true)))
         echo "aln_parity: ok PE $tag -t $t $* ($(grep -avc '^@' "$work/mem3.nopg" || true) records)"
     done
@@ -502,7 +554,7 @@ pe_ref=multi
 for spec in "multi_default||" "multi_xa5|-n 5|--max-xa-hits 5" "multi_xa20|-N 20|--max-xa-hits-discordant 20" "multi_occ|-o 3|--max-occ 3"; do
     IFS='|' read -r name sampe_s ours_s <<< "$spec"
     awk -v seed=517 -v n=800 -v lens=36 -v rescue=0 -v uniform=1 -v names=plain -v out1="$work/$name.1.fq" -v out2="$work/$name.2.fq" \
-        -f "$repo_root/test/regression/aln_pairs.awk" "$work/multi.fa"
+        -f "$repo_root/test/regression/aln_rng.awk" -f "$repo_root/test/regression/aln_pairs.awk" "$work/multi.fa"
     compare_pe "$name" "$work/$name.1.fq" "$work/$name.2.fq" "$sampe_s" "$ours_s"
     if [ "$name" = multi_xa5 ]; then need_pe multi_xa5 'XA:Z:'; fi
 done
@@ -523,6 +575,16 @@ fi
 "$BWA_MEM3" aln -t 1 "$ref_mem3" "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/form.pe.sam" 2> /dev/null
 "$BWA_MEM3" aln -t 1 --bam "$ref_mem3" "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/form.pe.bam" 2> /dev/null
 bam_vs_sam "--bam PE" "$work/form.pe.sam" "$work/form.pe.bam"
+
+# --bam with an -r whose @SQ lines replace the index's: a record naming a contig the header lacks
+# is an error, not a silently unmapped BAM record (SAM keeps stock's text)
+rc=0
+"$BWA_MEM3" aln -t 1 --bam -r '@RG\tID:x\n@SQ\tSN:foo\tLN:10' "$ref_mem3" "$form_fq" > "$work/badsq.bam" 2> "$work/badsq.err" || rc=$?
+if [ "$rc" -ne 1 ] || ! grep -q 'is not in the BAM header' "$work/badsq.err"; then
+    echo "FAIL: aln_parity: --bam with an -r @SQ that hides the index's contigs must exit 1 (exit $rc)" >&2
+    exit 1
+fi
+echo "aln_parity: ok --bam refuses references missing from the header"
 
 # Empty FASTQs: a header and nothing else, exit 0, same as stock sampe
 : > "$work/pe_empty.1.fq"

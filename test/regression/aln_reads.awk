@@ -1,24 +1,9 @@
 # Seeded read generator shared by aln_sai_parity.sh and aln_parity.sh.
-# usage: awk -v seed=S -v n=N -v lens=L -v tail=T -f aln_reads.awk ref.fa
+# usage: awk -v seed=S -v n=N -v lens=L -v tail=T -f aln_rng.awk -f aln_reads.awk ref.fa
 #   lens  -- comma-separated read lengths, or MIN-MAX for a uniform range
 #   tail  -- 1 gives a fifth of the reads a low-quality 30-base tail
-# Park-Miller generator (16807 mod 2^31-1): products stay below 2^46, so the
-# arithmetic is exact in any awk's doubles.
-function rnd() { st = (st * 16807) % 2147483647; return st }
-function ri(n) { return rnd() % n }
-function rc(s,   i, r, c) {
-    r = ""
-    for (i = length(s); i >= 1; i--) {
-        c = substr(s, i, 1)
-        r = r (c == "A" ? "T" : c == "C" ? "G" : c == "G" ? "C" : c == "T" ? "A" : c)
-    }
-    return r
-}
-function other(c,   b, k) {
-    b = "ACGT"
-    do { k = substr(b, ri(4) + 1, 1) } while (k == c)
-    return k
-}
+# rnd, ri, rc and other come from aln_rng.awk (the Park-Miller generator, shared with
+# aln_pairs.awk).
 /^>/ { nc++; name[nc] = substr($1, 2); next }
 { seq[nc] = seq[nc] toupper($0) }
 END {
