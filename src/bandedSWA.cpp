@@ -5177,6 +5177,13 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
     xassert(this->m != 7 || cpg_, "bandedSWA: a 7-code kernel object needs set_meth_cpg before getScores");
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
+#if defined(__aarch64__)
+        /* same-row lane compaction (bandedSWA_compact16.inc; see set_lane_compaction16) */
+        if (compact16_groups_ > 0 && numPairs > SIMD_WIDTH16) {
+            if (cpg_) smithWatermanBatchWrapper16Compact<true>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact16_groups_, compact16_rows_);
+            else      smithWatermanBatchWrapper16Compact<false>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact16_groups_, compact16_rows_);
+        } else
+#endif
         if (cpg_) smithWatermanBatchWrapper16<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
         else      smithWatermanBatchWrapper16<false>(pairArray, seqBufRef,
                                     seqBufQer, numPairs,
@@ -6004,6 +6011,8 @@ void BandedPairWiseSW::smithWaterman128_16(uint16_t seq1SoA[],
     
     return;
 }
+
+#include "bandedSWA_compact16.inc"
 
 /********************************************************************************/
 /* 128-bit - 8 bit version */
