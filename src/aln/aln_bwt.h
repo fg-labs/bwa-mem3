@@ -15,7 +15,8 @@
  *
  * bwt_match_exact_alt is from bwa's Apache2 branch (bwt.c; see README.md). This file
  * is MODIFIED from the original: the declarations are re-expressed in namespace
- * bwa_aln over bwa-mem3's index, and bwt_t is a different struct.
+ * bwa_aln over bwa-mem3's index, and bwt_t is a different struct. The occ functions are
+ * new code, defined inline here so the search loop can inline them.
  *
  * The MIT License
  *
@@ -46,6 +47,8 @@
 
 #include <stdint.h>
 
+#include "../fmi_seed_api.h" // CP_OCC and the checkpoint block constants
+
 class FMI_search;
 
 namespace bwa_aln {
@@ -58,19 +61,52 @@ struct bwt_t {
     bwtint_t L2[5];     /* cumulative base counts, `$` excluded */
     bwtint_t seq_len;   /* 2 * l_pac */
     FMI_search *fmi;    /* not owned; non-const because the SA accessor is non-const */
+    const CP_OCC *cp;   /* fmi's checkpointed occ table (fmi->cp_occ_data()), for the inline occ functions */
 };
 
 /* `fmi` must already be loaded (load_index) with the compressed SA. */
 bwt_t *bwt_from_fmi(FMI_search *fmi);
 void bwt_destroy(bwt_t *bwt); /* does not free the FMI */
 
+namespace detail {
+/* Count of c in bwa-mem3 BWT rows [0, p): an exclusive bound, unlike the bwt_occ* functions'
+ * inclusive row k, so it is internal to bwt_occ. The `$` row has no base bit set, so it adds
+ * nothing, which is exactly bwa's `$`-removed convention. */
+inline bwtint_t occ_rows_before(const bwt_t *bwt, bwtint_t p, ubyte_t c)
+{
+    const CP_OCC &blk = bwt->cp[p >> CP_SHIFT];
+    const unsigned r = (unsigned)(p & CP_MASK);
+    const uint64_t mask = r ? ~0ULL << (CP_BLOCK_SIZE - r) : 0;
+    return (bwtint_t)blk.cp_count[c] + (bwtint_t)__builtin_popcountll(blk.one_hot_bwt_str[c] & mask);
+}
+} // namespace detail
+
 /* Number of c in the `$`-removed BWT up to and including row k; 0 for k == (bwtint_t)-1. */
-bwtint_t bwt_occ(const bwt_t *bwt, bwtint_t k, ubyte_t c);
-void bwt_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l, ubyte_t c, bwtint_t *ok, bwtint_t *ol);
-void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4]);
+inline bwtint_t bwt_occ(const bwt_t *bwt, bwtint_t k, ubyte_t c)
+{
+    if (k == (bwtint_t)(-1)) return 0;
+    return detail::occ_rows_before(bwt, k + 1, c);
+}
+
+inline void bwt_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l, ubyte_t c, bwtint_t *ok, bwtint_t *ol)
+{
+    *ok = bwt_occ(bwt, k, c);
+    *ol = bwt_occ(bwt, l, c);
+}
+
+inline void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4])
+{
+    for (int c = 0; c < 4; ++c) {
+        cntk[c] = bwt_occ(bwt, k, (ubyte_t)c);
+        cntl[c] = bwt_occ(bwt, l, (ubyte_t)c);
+    }
+}
 
 /* Prefetches the Occ block that bwt_occ(bwt, p - 1, c) reads (any c). */
-void bwt_prefetch_occ(const bwt_t *bwt, bwtint_t p);
+inline void bwt_prefetch_occ(const bwt_t *bwt, bwtint_t p)
+{
+    __builtin_prefetch(&bwt->cp[p >> CP_SHIFT]);
+}
 
 /* Prefetches the two Occ blocks that bwt_2occ(bwt, k - 1, l, ...) and bwt_2occ4(bwt, k - 1, l, ...)
  * read: those of rows k and l + 1. */
