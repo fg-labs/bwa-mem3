@@ -292,14 +292,16 @@ namespace {
 struct GapResult {
     std::vector<ba::bwt_aln1_t> aln;
     long exact_yields = 0; // gap_job_run calls that stopped inside an exact-match tail
+    int max_entries = 0; // job only: the most entries its stack held
 };
 
 // Prepares one read as bwa_cal_sa_reg_gap does, then runs it through both loops.
 // `codes` are nt4 codes (4 = N); the search takes the complemented read.
 // `batch_max_gapo` >= 0 is the driver's batch-wide cap on max_gapo (aln_batch_max_gapo);
 // -1 caps it with this read's own max_diff.
+// `pool_keep` is the job stack's pool cap (free chunks kept); production uses ALN_POOL_KEEP.
 void both_loops(const ba::bwt_t *bwt, const std::vector<uint8_t> &codes, const ba::gap_opt_t &base,
-                GapResult &ref, GapResult &job, int batch_max_gapo = -1)
+                GapResult &ref, GapResult &job, int batch_max_gapo = -1, int pool_keep = ba::ALN_POOL_KEEP)
 {
     const int len = (int)codes.size();
     ba::gap_opt_t opt = base;
@@ -335,7 +337,9 @@ void both_loops(const ba::bwt_t *bwt, const std::vector<uint8_t> &codes, const b
     j.seq = cseq.data();
     j.width = w.data();
     j.seed_width = sw;
-    j.stack = ba::gap_init_stack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt);
+    ba::gap_pool_t pool;
+    ba::gap_init_pool(&pool, pool_keep);
+    j.stack = ba::gap_init_cstack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt, &pool);
     if (!ba::gap_job_start(&j, bwt)) {
         int guard = 0;
         while (!ba::gap_job_run(&j, bwt)) {
@@ -343,9 +347,16 @@ void both_loops(const ba::bwt_t *bwt, const std::vector<uint8_t> &codes, const b
             job.exact_yields += j.pending == ba::JOB_EXACT;
         }
     }
+    // a finished job has given every chunk back: none in use, at most pool_keep kept
+    CHECK(j.stack->n_entries == 0);
+    CHECK(pool.n_alloc == pool.n_free);
+    CHECK(pool.n_free <= pool_keep);
     job.aln.assign(j.aln, j.aln + j.n_aln);
+    job.max_entries = j.max_entries;
     free(j.aln);
-    ba::gap_destroy_stack(j.stack);
+    ba::gap_destroy_cstack(j.stack);
+    ba::gap_destroy_pool(&pool);
+    CHECK(pool.n_alloc == 0);
 }
 
 std::vector<uint8_t> to_codes(const std::string &s)
@@ -467,6 +478,246 @@ TEST_CASE("aln_search: gap_job_run gives the same hits as bwt_match_gap"
     CHECK(exact_yields > compared); // the exact-match tails yield (one stop per base), not run in one call
 }
 
+// Stack-heavy searches: many differences allowed (NONSTOP keeps every branch alive), so the job's
+// stack holds thousands of entries spread over its buckets, buckets drain and refill, chunks
+// cross between buckets through the pool, and -m caps fall on and around the chunk size. Small
+// pool caps make the pool free chunks it cannot keep.
+TEST_CASE("aln_search: gap_job_run matches bwt_match_gap on large stacks and around the chunk size"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second, &s2 = contigs[1].second;
+    auto flip = [](std::string r, size_t i) { r[i] = r[i] == 'A' ? 'T' : 'A'; return r; };
+    std::vector<std::string> reads;
+    uint32_t x = 4242;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    for (int t = 0; t < 16; ++t) {
+        int len = 40 + (int)rnd(60);
+        const std::string &src = t & 1 ? s2 : s1;
+        std::string r = src.substr(rnd((uint32_t)(src.size() - len)), len);
+        for (int f = 0; f < t % 4; ++f) r = flip(r, rnd(len));
+        reads.push_back(r);
+        std::string q;
+        for (int k = 0; k < len; ++k) q += "ACGT"[rnd(4)];
+        reads.push_back(q);
+    }
+    { std::string r; for (int i = 0; i < 25; ++i) r += "AC"; reads.push_back(flip(r, 20)); }
+
+    const int C = ba::GAP_CHUNK_ENTRIES;
+    struct Case { const char *name; int max_diff; int max_gapo; int max_gape; int max_entries; int mode_or; int pool_keep; };
+    const Case cases[] = {
+        {"-n 5 -o 2 NONSTOP",           5, 2, 6, 2000000, BWA_MODE_NONSTOP, ba::ALN_POOL_KEEP},
+        {"-n 6 -o 2 -e 3 NONSTOP keep 0", 6, 2, 3, 2000000, BWA_MODE_NONSTOP, 0},
+        {"-n 6 -o 2 keep 2",            6, 2, 6, 2000000, 0,                2},
+        {"-n 6 -o 2 -m 1",              6, 2, 6, 1,       BWA_MODE_NONSTOP, ba::ALN_POOL_KEEP},
+        {"-m chunk-1",                  6, 2, 6, C - 1,   BWA_MODE_NONSTOP, 1},
+        {"-m chunk",                    6, 2, 6, C,       BWA_MODE_NONSTOP, 1},
+        {"-m chunk+1",                  6, 2, 6, C + 1,   BWA_MODE_NONSTOP, 1},
+        {"-m 2chunk+1",                 6, 2, 6, 2 * C + 1, BWA_MODE_NONSTOP, 3},
+        {"-m 4chunk+1",                 6, 2, 6, 4 * C + 1, BWA_MODE_NONSTOP, ba::ALN_POOL_KEEP},
+        {"-n 8 -o 2 NONSTOP keep 4",    8, 2, 6, 2000000, BWA_MODE_NONSTOP, 4},
+    };
+    long compared = 0, with_hits = 0, big = 0, capped = 0, max_seen = 0;
+    for (const Case &c : cases) {
+        long case_capped = 0, case_big = 0;
+        ba::gap_opt_t opt = make_opt(c.max_diff, c.max_gapo);
+        opt.max_gape = c.max_gape;
+        opt.max_entries = c.max_entries;
+        opt.mode |= c.mode_or;
+        opt.max_top2 = c.mode_or & BWA_MODE_NONSTOP ? 0x7fffffff : opt.max_top2;
+        for (size_t i = 0; i < reads.size(); ++i) {
+            INFO("case " << std::string(c.name) << ", read " << i << " (" << reads[i] << ")");
+            GapResult ref, job;
+            both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job, -1, c.pool_keep);
+            REQUIRE(ref.aln.size() == job.aln.size());
+            for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+            ++compared;
+            with_hits += !ref.aln.empty();
+            case_big += job.max_entries > 4 * C;
+            if (job.max_entries > max_seen) max_seen = job.max_entries;
+            case_capped += job.max_entries > c.max_entries;
+        }
+        // each case reaches what it is there for: an -m case stops on its cap at least once, and
+        // an uncapped NONSTOP case builds a stack of more than 4 chunks at least once
+        INFO("case " << std::string(c.name) << ": stopped by -m " << case_capped << ", over 4 chunks " << case_big);
+        if (c.max_entries < 2000000) CHECK(case_capped > 0);
+        else if (c.mode_or & BWA_MODE_NONSTOP) CHECK(case_big > 0);
+        big += case_big;
+        capped += case_capped;
+    }
+    MESSAGE("compared " << compared << ", with hits " << with_hits << ", stacks over 4 chunks " << big
+            << ", stopped by -m " << capped << ", largest stack " << max_seen);
+    // floors for this fixed-seed data set (the reads come from a seeded LCG)
+    CHECK(with_hits > compared / 4);
+    CHECK(big > 10);     // large stacks are exercised
+    CHECK(max_seen > 16 * C);
+    CHECK(capped > 20);  // and the -m stop at, below and above the chunk size
+}
+
+// gap_cstack_t (the job's stack) against gap_stack_t (upstream's): random push/pop sequences
+// must pop the same entries in the same order, with the same counts and best bucket after
+// every step; and the pool must hold exactly the chunks the buckets need.
+TEST_CASE("aln_search: gap_cstack_t pops in gap_stack_t's order"
+          * doctest::test_suite("unit/aln_search")) {
+    ba::gap_opt_t opt = make_opt(4, 2);
+    opt.max_gape = 3;
+    const int C = ba::GAP_CHUNK_ENTRIES;
+    REQUIRE(C > 8);
+    uint32_t x = 99;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 8) % n; };
+    for (int keep : {0, 1, ba::ALN_POOL_KEEP}) {
+        ba::gap_pool_t pool;
+        ba::gap_init_pool(&pool, keep);
+        ba::gap_stack_t *a = ba::gap_init_stack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt);
+        ba::gap_cstack_t *b = ba::gap_init_cstack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt, &pool);
+        REQUIRE(a->n_stacks == b->n_stacks);
+        ba::gap_stack_reset_ext(a); // as bwt_match_gap does before its first push
+        long n_pops = 0, seq_id = 0, peak_in_use = 0;
+        // compared with plain C++ and asserted once per call: a doctest assertion per bucket per
+        // step would cost ~0.5 s
+        auto check_state = [&]() {
+            const char *bad = nullptr;
+            int bad_bucket = -1;
+            long chunks = 0;
+            if (a->n_entries != b->n_entries) bad = "n_entries";
+            else if (a->best != b->best) bad = "best";
+            for (int s = 0; s < b->n_stacks && !bad; ++s) {
+                if (a->stacks[s].n_entries != b->stacks[s].n_entries) { bad = "bucket n_entries"; bad_bucket = s; }
+                chunks += (b->stacks[s].n_entries + C - 1) / C;
+            }
+            if (!bad && pool.n_alloc - pool.n_free != chunks) bad = "in-use chunks != entries' chunks";
+            if (!bad && pool.n_free > keep) bad = "pool keeps more than max_free";
+            // free chunks are reused before new ones are allocated: the pool never holds more
+            // chunks than were in use at once
+            if (pool.n_alloc - pool.n_free > peak_in_use) peak_in_use = pool.n_alloc - pool.n_free;
+            if (!bad && pool.n_alloc > peak_in_use) bad = "pool allocated a chunk while holding a free one";
+            INFO("sequence " << seq_id << ", pop " << n_pops << ": " << (bad ? bad : "") << " (bucket " << bad_bucket << ")");
+            REQUIRE(bad == nullptr);
+        };
+        // one push into the bucket of (mm, go, ge), with the other fields drawn at random
+        auto push = [&](int mm, int go, int ge) {
+            int i = (int)rnd(200), state = (int)rnd(3), is_diff = (int)rnd(2);
+            ba::bwtint_t k = rnd(100000), l = k + rnd(1000);
+            int ins = (int)rnd(5), del = (int)rnd(5);
+            ba::gap_stack_push_ext(a, i, k, l, mm, go, ge, ins, del, state, is_diff, &opt);
+            ba::gap_cstack_push_ext(b, i, k, l, mm, go, ge, ins, del, state, is_diff, &opt);
+        };
+        auto pop = [&]() {
+            ba::gap_entry_t ea, eb;
+            ba::gap_stack_pop_ext(a, &ea);
+            ba::gap_cstack_pop_ext(b, &eb);
+            const bool same = ea.info == eb.info && ea.n_mm == eb.n_mm && ea.n_gapo == eb.n_gapo
+                && ea.n_gape == eb.n_gape && ea.state == eb.state && ea.n_ins == eb.n_ins
+                && ea.n_del == eb.n_del && ea.last_diff_pos == eb.last_diff_pos && ea.k == eb.k && ea.l == eb.l;
+            INFO("sequence " << seq_id << ", pop " << n_pops << ": info " << ea.info << "/" << eb.info
+                 << " k " << ea.k << "/" << eb.k << " l " << ea.l << "/" << eb.l);
+            REQUIRE(same);
+            ++n_pops;
+        };
+        auto rand_push = [&]() {
+            push((int)rnd(opt.max_diff + 1), (int)rnd(opt.max_gapo + 1), (int)rnd(opt.max_gape + 1));
+        };
+        // (1) one bucket filled to 1, C-1, C, C+1, 2C, 2C+1 entries, drained, refilled
+        for (int n : {1, C - 1, C, C + 1, 2 * C, 2 * C + 1}) {
+            ++seq_id;
+            for (int r = 0; r < 2; ++r) {
+                for (int t = 0; t < n; ++t) { push(1, 0, 0); check_state(); }
+                for (int t = 0; t < n; ++t) { pop(); check_state(); }
+            }
+            // oscillate across the chunk boundary
+            for (int t = 0; t < n; ++t) push(1, 0, 0);
+            for (int r = 0; r < 5; ++r) { push(1, 0, 0); check_state(); pop(); check_state(); pop(); check_state(); push(1, 0, 0); }
+            while (a->n_entries) { pop(); check_state(); }
+        }
+        // (2) random sequences: bursts of pushes into random buckets, then runs of pops, so
+        // the best bucket moves up and down and buckets drain and refill
+        for (int sq = 0; sq < 30; ++sq) {
+            ++seq_id;
+            int steps = 50 + (int)rnd(400);
+            for (int st = 0; st < steps; ++st) {
+                if (a->n_entries == 0 || rnd(100) < 55) {
+                    int burst = rnd(10) == 0 ? (int)rnd(3 * C) : 1 + (int)rnd(8);
+                    if (rnd(4) == 0) { // all in one bucket, to cross chunk boundaries
+                        int mm = (int)rnd(opt.max_diff + 1), go = (int)rnd(opt.max_gapo + 1), ge = (int)rnd(opt.max_gape + 1);
+                        for (int t = 0; t < burst; ++t) push(mm, go, ge);
+                    } else {
+                        for (int t = 0; t < burst; ++t) rand_push();
+                    }
+                } else {
+                    int run = rnd(10) == 0 ? (int)rnd(3 * C) : 1 + (int)rnd(8);
+                    for (int t = 0; t < run && a->n_entries; ++t) pop();
+                }
+                check_state();
+            }
+            if (sq % 2) { // empty both the way the searches do at the start of a read
+                ba::gap_stack_reset_ext(a);
+                ba::gap_release_cstack(b);
+                check_state();
+                REQUIRE(pool.n_alloc == pool.n_free);
+            } else {
+                while (a->n_entries) pop();
+                check_state();
+            }
+        }
+        // (3) two stacks sharing the pool, as a thread's slots do: interleaved pushes and pops on
+        // both, each checked against its own gap_stack_t, and the pool's in-use chunks equal to
+        // the two stacks' chunks together
+        {
+            ++seq_id;
+            ba::gap_stack_t *a2 = ba::gap_init_stack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt);
+            ba::gap_cstack_t *b2 = ba::gap_init_cstack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt, &pool);
+            ba::gap_stack_reset_ext(a2);
+            auto chunks_of = [&](const ba::gap_cstack_t *s) {
+                long n = 0;
+                for (int q = 0; q < s->n_stacks; ++q) n += (s->stacks[q].n_entries + C - 1) / C;
+                return n;
+            };
+            bool ok = true;
+            for (int st = 0; st < 3000 && ok; ++st) {
+                const bool second = rnd(2) != 0;
+                ba::gap_stack_t *ra = second ? a2 : a;
+                ba::gap_cstack_t *rb = second ? b2 : b;
+                if (ra->n_entries == 0 || rnd(100) < 52) {
+                    const int burst = rnd(20) == 0 ? (int)rnd(2 * C) : 1 + (int)rnd(6);
+                    const int mm = (int)rnd(opt.max_diff + 1), go = (int)rnd(opt.max_gapo + 1), ge = (int)rnd(opt.max_gape + 1);
+                    for (int t = 0; t < burst; ++t) {
+                        int i = (int)rnd(200), state = (int)rnd(3), is_diff = (int)rnd(2);
+                        ba::bwtint_t k = rnd(100000), l = k + rnd(1000);
+                        ba::gap_stack_push_ext(ra, i, k, l, mm, go, ge, 0, 0, state, is_diff, &opt);
+                        ba::gap_cstack_push_ext(rb, i, k, l, mm, go, ge, 0, 0, state, is_diff, &opt);
+                    }
+                } else {
+                    const int run = rnd(20) == 0 ? (int)rnd(2 * C) : 1 + (int)rnd(6);
+                    for (int t = 0; t < run && ra->n_entries && ok; ++t) {
+                        ba::gap_entry_t ea, eb;
+                        ba::gap_stack_pop_ext(ra, &ea);
+                        ba::gap_cstack_pop_ext(rb, &eb);
+                        ok = ea.info == eb.info && ea.k == eb.k && ea.l == eb.l && ea.last_diff_pos == eb.last_diff_pos
+                            && ea.n_mm == eb.n_mm && ea.n_gapo == eb.n_gapo && ea.n_gape == eb.n_gape && ea.state == eb.state;
+                    }
+                }
+                ok = ok && a->n_entries == b->n_entries && a2->n_entries == b2->n_entries && a->best == b->best
+                    && a2->best == b2->best && pool.n_alloc - pool.n_free == chunks_of(b) + chunks_of(b2)
+                    && pool.n_free <= keep;
+            }
+            INFO("keep " << keep << ": two stacks on one pool");
+            REQUIRE(ok);
+            ba::gap_destroy_stack(a2);
+            ba::gap_destroy_cstack(b2);
+            ba::gap_stack_reset_ext(a);
+            ba::gap_release_cstack(b);
+            REQUIRE(pool.n_alloc == pool.n_free);
+        }
+        CHECK(n_pops > 15000); // a floor for this fixed seed
+        ba::gap_destroy_stack(a);
+        ba::gap_destroy_cstack(b);
+        CHECK(pool.n_alloc == pool.n_free);
+        CHECK(pool.n_free <= keep);
+        ba::gap_destroy_pool(&pool);
+        CHECK(pool.n_alloc == 0);
+    }
+}
+
 // The aligner's driver (aln_search_batch: ALN_GROUP reads in flight per thread, each slot
 // refilled as its read finishes) gives every read exactly bwt_match_gap's hits.
 TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for each read"
@@ -509,6 +760,11 @@ TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for
         {"defaults", -1, 1, 2000000, 0.04},
         {"-n 3 -m 5", 3, 1, 5, -1.0},
         {"-n 0", 0, 1, 2000000, -1.0}, // the root entry runs as an exact tail
+        // more differences, so the slots' stacks hold more chunks and draw on the thread's pool;
+        // the pool cap (ALN_POOL_KEEP) is not reached here: the single-stack tests (pool caps 0
+        // and 1) and "two stacks sharing the pool" cover the path where the pool frees chunks
+        {"-n 5 -o 2", 5, 2, 2000000, -1.0},
+        {"-n 5 -o 2 -m chunk+1", 5, 2, ba::GAP_CHUNK_ENTRIES + 1, -1.0},
     };
     long with_hits = 0, compared = 0;
     for (const Case &c : cases) {
