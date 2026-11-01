@@ -233,7 +233,7 @@ run_case sw_M0O0 237 600 36 0 "" "" -M 0 -O 0
 run_case sw_om1 238 600 100 0 "" "" -o -1
 run_case sw_l0 239 600 36 0 "" "" -l 0
 run_case sw_B4B2 240 600 36 0 "" "" -B 4 -B 2
-need_tag sw_Y 'XT:A:'
+need_tag sw_B4B2 'XT:A:'
 # The optimistic stack bound exceeds the packed score range, but actual scores fit.
 run_case sw_M1024 241 100 36 0 "" "" -M 1024 -n 1 -o 0
 need_tag sw_M1024 'XT:A:'

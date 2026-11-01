@@ -41,7 +41,8 @@ navigate.
 
 **[aln](aln.md)** aligns ultrashort, ancient or degraded DNA reads with bwa's
 backtracking algorithm, in one step: it replaces `bwa aln` followed by `bwa samse`
-or `bwa sampe`, with no `.sai` files, and its SAM is byte-identical to bwa 0.7.19's.
+or `bwa sampe`, with no `.sai` files, and its SAM is byte-identical to bwa 0.7.19's on
+the parity checks' generated reads (CI hosts and scope are on the [aln](aln.md) page).
 It reads the same index as `mem`.
 
 **[shm](shm.md)** stages an FM-index into POSIX shared memory so that
