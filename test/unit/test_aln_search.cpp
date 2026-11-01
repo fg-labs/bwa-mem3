@@ -32,14 +32,15 @@ struct SearchIndex {
     std::unique_ptr<FMI_search> fmi;
     ba::bwt_t *bwt = nullptr;
 
-    SearchIndex()
+    SearchIndex() : SearchIndex(aln_test::test_contigs()) {}
+    explicit SearchIndex(const std::vector<std::pair<std::string, std::string>> &contigs)
     {
         std::string tmpl_s = aln_test::tmp_template("aln_search_unit");
         char *tmpl = &tmpl_s[0];
         REQUIRE(mkdtemp(tmpl) != nullptr);
         dir = tmpl;
         prefix = dir + "/ref.fa";
-        REQUIRE(aln_test::write_test_fasta(prefix));
+        REQUIRE(aln_test::write_test_fasta(prefix, contigs));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         fmi.reset(new FMI_search(prefix.c_str()));
         fmi->load_index(false, 1);
@@ -57,6 +58,28 @@ struct SearchIndex {
 SearchIndex &index_fixture()
 {
     static SearchIndex idx;
+    return idx;
+}
+
+// A reference with a diverged copy: p2 is p1[50:350] with a 1-bp deletion (at p1 150), a 1-bp
+// insertion (after p1 250) and two mismatches (p1 100 and 300), so one read can align exactly or
+// with mismatches to p1 and with a gap to p2.
+std::vector<std::pair<std::string, std::string>> paralog_contigs()
+{
+    uint32_t st = 77;
+    std::string p1 = aln_test::lcg_dna(st, 400), p3 = aln_test::lcg_dna(st, 300);
+    std::string c = p1.substr(50, 300); // c[i] = p1[50 + i]
+    auto other = [](char b) { return b == 'A' ? 'C' : 'A'; };
+    c[250] = other(c[250]);                  // p1 300
+    c.insert(201, 1, other(c[200]));         // after p1 250
+    c.erase(100, 1);                         // p1 150
+    c[50] = other(c[50]);                    // p1 100
+    return {{"p1", p1}, {"p2", c}, {"p3", p3}};
+}
+
+SearchIndex &paralog_fixture()
+{
+    static SearchIndex idx(paralog_contigs());
     return idx;
 }
 
@@ -554,6 +577,142 @@ TEST_CASE("aln_search: gap_job_run matches bwt_match_gap on large stacks and aro
     CHECK(capped > 20);  // and the -m stop at, below and above the chunk size
 }
 
+// Targets gap_job_run's top-of-stack forwarding (the last child of an expansion used without a
+// store and a pop when it is the entry the pop would return, counted as pushed). Forwarding is
+// common (the match child usually lands in the lowest bucket), so a -m cap swept over every small
+// value makes the -m break fall on a forwarded entry (counted with the stack) as well as on stored
+// ones; -R swept over small values does the same for the top2 break. Scoring variants change which
+// child is pushed last and which bucket is lowest: with -O below -M an insertion child can sit below
+// the last (mismatch) child, which must then be stored and the older entry popped; reads with an N
+// give four children in the same bucket. Forwarding is output-neutral by design, so this checks
+// that forwarding is correct, not that it happens: a build that never forwards passes too (and
+// only runs slower).
+TEST_CASE("aln_search: gap_job_run matches bwt_match_gap at every small -m and -R and under odd scoring"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second, &s2 = contigs[1].second;
+    auto flip = [](std::string r, size_t i) { r[i] = r[i] == 'A' ? 'T' : 'A'; return r; };
+    std::vector<std::string> reads;
+    uint32_t x = 31337;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    for (int t = 0; t < 10; ++t) {
+        int len = 25 + (int)rnd(40);
+        const std::string &src = t & 1 ? s2 : s1;
+        std::string r = src.substr(rnd((uint32_t)(src.size() - len)), len);
+        for (int f = 0; f < 1 + t % 3; ++f) r = flip(r, rnd(len));
+        if (t % 4 == 3) r[rnd(len)] = 'N';
+        if (t % 5 == 4) r = r.substr(0, len / 2) + r.substr(len / 2 + 1); // deletion
+        reads.push_back(r);
+    }
+    { std::string r; for (int i = 0; i < 14; ++i) r += "AC"; reads.push_back(r); reads.push_back(flip(r, 7)); }
+    { std::string r = s1.substr(120, 36); r[10] = 'N'; r[25] = 'N'; reads.push_back(r); }
+
+    struct Score { const char *name; int s_mm, s_gapo, s_gape; };
+    const Score scores[] = {{"stock", 3, 11, 4}, {"-M 5 -O 2 -E 1", 5, 2, 1}, {"-M 1 -O 1 -E 1", 1, 1, 1}};
+    long compared = 0, with_hits = 0, capped = 0, m_compared = 0;
+    for (const Score &sc : scores) {
+        // -m 1..48 at -n 3 -o 2, NONSTOP off and on
+        for (int nonstop = 0; nonstop < 2; ++nonstop) {
+            for (int m = 1; m <= 48; ++m) {
+                ba::gap_opt_t opt = make_opt(3, 2);
+                opt.s_mm = sc.s_mm; opt.s_gapo = sc.s_gapo; opt.s_gape = sc.s_gape;
+                opt.max_entries = m;
+                if (nonstop) { opt.mode |= BWA_MODE_NONSTOP; opt.max_top2 = 0x7fffffff; }
+                for (size_t i = 0; i < reads.size(); ++i) {
+                    INFO("scoring " << sc.name << ", NONSTOP " << nonstop << ", -m " << m << ", read " << i << " (" << reads[i] << ")");
+                    GapResult ref, job;
+                    both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job);
+                    REQUIRE(ref.aln.size() == job.aln.size());
+                    for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+                    ++compared;
+                    ++m_compared;
+                    with_hits += !ref.aln.empty();
+                    capped += job.max_entries > m;
+                }
+            }
+        }
+        // -R 0..12 (top2 break), at -n 2 and -n 4
+        for (int top2 = 0; top2 <= 12; ++top2) {
+            for (int nd : {2, 4}) {
+                ba::gap_opt_t opt = make_opt(nd, 1);
+                opt.s_mm = sc.s_mm; opt.s_gapo = sc.s_gapo; opt.s_gape = sc.s_gape;
+                opt.max_top2 = top2;
+                for (size_t i = 0; i < reads.size(); ++i) {
+                    INFO("scoring " << sc.name << ", -R " << top2 << ", -n " << nd << ", read " << i << " (" << reads[i] << ")");
+                    GapResult ref, job;
+                    both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job);
+                    REQUIRE(ref.aln.size() == job.aln.size());
+                    for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+                    ++compared;
+                    with_hits += !ref.aln.empty();
+                }
+            }
+        }
+    }
+    MESSAGE("compared " << compared << ", with hits " << with_hits << ", stopped by -m " << capped << " of "
+            << m_compared);
+    CHECK(with_hits > compared / 4);
+    CHECK(capped > m_compared / 2); // the -m sweep does stop most of its searches
+}
+
+// The score break (stop once the entry popped scores above the first hit's score + s_mm) only
+// changes the hits when an entry above that score could still become a hit: one more difference
+// than the best hit, where that difference is a gap (it costs more than s_mm). Reads with a
+// mismatch or an indel next to a short repeat give such second alignments; -M 1 makes every gap
+// cost more than the cut allows.
+TEST_CASE("aln_search: gap_job_run matches bwt_match_gap where the score break decides the hits"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = paralog_fixture();
+    auto contigs = paralog_contigs();
+    const std::string &s1 = contigs[0].second, &s2 = contigs[1].second;
+    uint32_t x = 2718;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    auto mutate = [&](std::string r, size_t i) { r[i] = "ACGT"[(std::string("ACGT").find(r[i]) + 1 + rnd(3)) % 4]; return r; };
+    std::vector<std::string> reads;
+    // 300 reads: an off-by-one score_cut (best_score + s_mm + 1) changes the hits of 12 read/option pairs
+    for (int t = 0; t < 300; ++t) {
+        int len = 30 + (int)rnd(30);
+        const std::string &src = t % 3 == 2 ? s2 : s1;
+        // mostly from the diverged span p1[50:350] (or its copy), so most reads have a second locus
+        size_t start = t % 6 == 5 ? rnd((uint32_t)(src.size() - len - 4)) : (&src == &s1 ? 50 : 0) + rnd(300 - len - 4);
+        std::string r = src.substr(start, len + 2);
+        switch (t % 5) {
+        case 4: break; // unchanged
+        case 0: r = mutate(r, 8 + rnd(len - 16)); break;
+        case 1: { size_t p = 8 + rnd(len - 16); r = r.substr(0, p) + r.substr(p + 1); } break; // deletion
+        case 2: { size_t p = 8 + rnd(len - 16); r = r.substr(0, p) + r[p] + r.substr(p); } break; // duplicated base
+        default: r = mutate(mutate(r, 6 + rnd(len / 2 - 6)), len / 2 + rnd(len / 2 - 6)); break;
+        }
+        reads.push_back(r.substr(0, len));
+    }
+    struct Case { const char *name; int max_diff, max_gapo, s_mm, s_gapo, s_gape; };
+    const Case cases[] = {
+        {"-n 2 -o 1", 2, 1, 3, 11, 4}, {"-n 3 -o 1", 3, 1, 3, 11, 4}, {"-n 3 -o 2", 3, 2, 3, 11, 4},
+        {"-n 2 -o 1 -M 1", 2, 1, 1, 11, 4}, {"-n 3 -o 2 -M 1", 3, 2, 1, 11, 4}, {"-n 3 -o 2 -M 2 -O 5 -E 3", 3, 2, 2, 5, 3},
+    };
+    long compared = 0, with_hits = 0, gapped = 0;
+    for (const Case &c : cases) {
+        ba::gap_opt_t opt = make_opt(c.max_diff, c.max_gapo);
+        opt.s_mm = c.s_mm; opt.s_gapo = c.s_gapo; opt.s_gape = c.s_gape;
+        for (size_t i = 0; i < reads.size(); ++i) {
+            INFO("case " << std::string(c.name) << ", read " << i << " (" << reads[i] << ")");
+            GapResult ref, job;
+            both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job);
+            REQUIRE(ref.aln.size() == job.aln.size());
+            for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+            ++compared;
+            with_hits += !ref.aln.empty();
+            bool g = false;
+            for (const auto &a : ref.aln) g = g || a.n_gapo;
+            gapped += g;
+        }
+    }
+    MESSAGE("compared " << compared << ", with hits " << with_hits << ", with a gapped hit " << gapped);
+    CHECK(with_hits > compared / 2);
+    CHECK(gapped > compared / 10);
+}
+
 // gap_cstack_t (the job's stack) against gap_stack_t (upstream's): random push/pop sequences
 // must pop the same entries in the same order, with the same counts and best bucket after
 // every step; and the pool must hold exactly the chunks the buckets need.
@@ -788,6 +947,49 @@ TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for
     }
     CHECK(compared == 2L * (long)(sizeof cases / sizeof cases[0]) * (long)reads.size());
     CHECK(with_hits > compared / 3); // not vacuous
+}
+
+// gap_slots_run's slot states: batches smaller than, equal to and just over the group size
+// (ALN_GROUP: 8, or 12 on Apple arm64) and run on more threads than reads, so some threads get no
+// read and some slots never fill or go empty early; all-N and one-base reads end in gap_job_start,
+// before any search step, so their slot is refilled straight from GAP_SLOT_WIDTHS.
+TEST_CASE("aln_search: aln_search_batch gives bwt_match_gap's hits for batches around the group size"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second;
+    uint32_t x = 4242;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    std::vector<std::string> pool;
+    for (int i = 0; i < 30; ++i) {
+        if (i % 5 == 1) { pool.push_back(std::string(20 + i, 'N')); continue; }
+        if (i % 5 == 3) { pool.push_back("ACGT"[i % 4] + std::string()); continue; }
+        int len = 25 + (int)rnd(30);
+        std::string r = s1.substr(rnd((uint32_t)(s1.size() - len)), len);
+        if (i % 2) r[rnd(len)] = r[0] == 'A' ? 'C' : 'A';
+        pool.push_back(r);
+    }
+    ba::gap_opt_t opt = make_opt(2, 1);
+    long compared = 0, with_hits = 0;
+    for (int n : {1, 2, 7, 8, 9, 11, 12, 13, 25}) {
+        std::vector<std::string> reads(pool.begin(), pool.begin() + n);
+        for (int nt : {1, 3, 16}) {
+            Batch b(reads);
+            ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, nt);
+            const int cap = ba::aln_batch_max_gapo(b.n, b.seqs, &opt);
+            for (int i = 0; i < b.n; ++i) {
+                INFO("batch " << n << ", -t " << nt << ", read " << i << " (" << reads[i] << ")");
+                GapResult ref, job;
+                both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job, cap);
+                REQUIRE(b.seqs[i].n_aln == (int)ref.aln.size());
+                for (int k = 0; k < b.seqs[i].n_aln; ++k) CHECK(same_aln(ref.aln[k], b.seqs[i].aln[k]));
+                ++compared;
+                with_hits += !ref.aln.empty();
+            }
+        }
+    }
+    CHECK(compared == 3L * (1 + 2 + 7 + 8 + 9 + 11 + 12 + 13 + 25));
+    CHECK(with_hits > compared / 3);
 }
 
 // The resumable width walk (width_walk_init/width_walk_run, which the driver interleaves) must
