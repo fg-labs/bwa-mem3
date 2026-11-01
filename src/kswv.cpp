@@ -351,9 +351,18 @@ static inline void kswv_dummy_lane_bytes(uint8_t *out, int width, int nreal)
  * The row-invariant constants still come from the enclosing scope by name:
  * permS512 / permSft512, qpad512, zero512, sft512, highbit512, oe512, e_ins512,
  * e_del512 and freedval512 (one value for both rows), plus the Sgn and HasFreed
- * template parameters. */
-#define MAIN_SAM_CODE8_FS(s1, s2, h00, h11, e11, f11, f21, act, imax, APPLY_BND, NEED_DUMMY) \
+ * template parameters.
+ *
+ * PADC: a column of the all-pad range [jzero, jsplit) of the signed-domain body,
+ * where every real lane's query byte is X86_QPAD8, so the NEED_DUMMY blend makes
+ * the score 0 and _mm512_adds_epi8(h00, 0) == h00: m11 is the diagonal as is
+ * (see jzero in kswv512_u8_impl). */
+#define MAIN_SAM_CODE8_FS(s1, s2, h00, h11, e11, f11, f21, act, imax, APPLY_BND, NEED_DUMMY, PADC) \
     {                                                                   \
+        __m512i m11;                                                    \
+        if ((PADC) && Sgn) {                                            \
+            m11 = (h00);                                                \
+        } else {                                                        \
         __m512i sbt11 = _mm512_shuffle_epi8(Sgn ? permS512 : permSft512, _mm512_xor_si512(s1, s2)); \
         if (NEED_DUMMY)                                                 \
             sbt11 = _mm512_mask_blend_epi8(_mm512_cmpeq_epu8_mask(s2, qpad512), \
@@ -361,7 +370,6 @@ static inline void kswv_dummy_lane_bytes(uint8_t *out, int width, int nreal)
         if (HasFreed)                                                   \
             sbt11 = _mm512_mask_blend_epi8(                             \
                 _mm512_cmpeq_epi8_mask(s2, act), sbt11, freedval512);   \
-        __m512i m11;                                                    \
         if (Sgn) {                                                      \
             m11 = APPLY_BND                                             \
                 ? _mm512_mask_adds_epi8(highbit512, _mm512_testn_epi8_mask(s2, highbit512), h00, sbt11) \
@@ -371,6 +379,7 @@ static inline void kswv_dummy_lane_bytes(uint8_t *out, int width, int nreal)
                 ? _mm512_maskz_adds_epu8(_mm512_testn_epi8_mask(s2, highbit512), h00, sbt11) \
                 : _mm512_adds_epu8(h00, sbt11);                         \
             m11 = _mm512_subs_epu8(m11, sft512);                        \
+        }                                                               \
         }                                                               \
         const __m512i g11 = Sgn ? _mm512_max_epi8(m11, f11) : _mm512_max_epu8(m11, f11); \
         const __m512i t11 = Sgn ? _mm512_subs_epi8(g11, oe512) : _mm512_subs_epu8(g11, oe512); \
@@ -752,6 +761,14 @@ static bool rescue_score2_bits_enabled() { return rescue_env_on("BWA3_RESCUE_SCO
  * body (kswv512_u8_impl); 0 restores the one-row sweep. */
 __attribute__((unused))   // read by the NEON and AVX-512BW kernels only
 static bool rescue_rowpair_enabled() { return rescue_env_on("BWA3_RESCUE_ROWPAIR"); }
+/* BWA3_RESCUE_QE_REVSCAN and BWA3_RESCUE_PADCOLS (default ON): the lazy query-end
+ * rescan's backward order and the all-pad query columns. Read by the NEON kernels
+ * and the AVX-512BW u8 kernel; each one's note is in the NEON section, under its
+ * name. */
+__attribute__((unused))   // read by the NEON and AVX-512BW kernels only
+static bool rescue_qe_revscan_enabled() { return rescue_env_on("BWA3_RESCUE_QE_REVSCAN"); }
+__attribute__((unused))   // read by the NEON and AVX-512BW u8 kernels only
+static bool rescue_padcols_enabled() { return rescue_env_on("BWA3_RESCUE_PADCOLS"); }
 /* Whether the x86 u8 dispatchers (kswv256_u8, kswv512_u8) take the signed-domain FScan body
  * (kswv256_u8_impl): the FScan body is on (fscan: BWA3_RESCUE_FSCAN and fscan_scoring_ok),
  * BWA3_RESCUE_USQADD is on, and the gap constants fit a positive int8. fscan_scoring_ok makes the
@@ -950,7 +967,8 @@ void kswv::kswvBatchWrapper8(SeqPair *pairArray,
  * BWA3_RESCUE_LAZYQE=0 restores the inline argmax. */
 static bool rescue_lazyqe_enabled() { return rescue_env_on("BWA3_RESCUE_LAZYQE"); }
 
-/* Lazy query-end rescan order (BWA3_RESCUE_QE_REVSCAN, NEON 8- and 16-bit). The
+/* Lazy query-end rescan order (BWA3_RESCUE_QE_REVSCAN, NEON 8- and 16-bit, and
+ * the AVX-512BW u8 kernel's KSWV512_U8_EPILOGUE). The
  * rescan wants, per improved lane, the first column of the row whose H equals the
  * row max, and it only scans the QE_BLK block where that lane's running max first
  * reaches it (the checkpoints are prefix maxima). The forward scan keeps a found
@@ -961,14 +979,14 @@ static bool rescue_lazyqe_enabled() { return rescue_env_on("BWA3_RESCUE_LAZYQE")
  * one `pending` mask (improved lanes not yet found) in place of the found mask
  * and the recomputed improvement mask. Both forms compute
  * min{ j : H[j] == imax } over the same stored values for the same lanes, so the
- * result is identical. Default ON; 0 restores the forward scan. */
-static bool rescue_qe_revscan_enabled() { return rescue_env_on("BWA3_RESCUE_QE_REVSCAN"); }
+ * result is identical. Default ON; 0 restores the forward scan. The reader,
+ * rescue_qe_revscan_enabled, is with the shared toggles above. */
 
-/* BWA3_RESCUE_PADCOLS (default ON): the u8 NEON FScan bodies run the group's
+/* BWA3_RESCUE_PADCOLS (default ON): the u8 NEON FScan bodies (and the AVX-512BW
+ * u8 signed-domain FScan bodies; see jzero in kswv512_u8_impl) run the group's
  * all-pad query columns, [jzero, jsplit), with a cell that takes the diagonal as
  * m11 instead of gathering a score that is provably 0 there. See jzero in
  * kswv_neon_u8_impl; 0 leaves that range empty. */
-static bool rescue_padcols_enabled() { return rescue_env_on("BWA3_RESCUE_PADCOLS"); }
 
 /* FScan (BWA3_RESCUE_FSCAN): the u8 NEON cell rebuilt around G = max(m11, f11),
  * the cell's score before the in-row gap, with one sat(G - oe) opening both
@@ -4918,6 +4936,35 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
      * subdivides the [0, jsplit) range. */
     const int jdummy = compute_jdummy(p, nreal, ncol, jsplit);
 
+    /* All-pad columns (BWA3_RESCUE_PADCOLS, signed-domain FScan bodies only), as
+     * in kswv_neon_u8_impl. From the group's longest query up to jsplit, every
+     * real lane's query byte is X86_QPAD8: each is past its len2 and short of its
+     * quantum. The NEED_DUMMY blend then sets the score to the domain's 0
+     * (zero512 under Sgn) and _mm512_adds_epi8(h00, 0) == h00, so the cell's m11
+     * is its diagonal as is: [jzero, jsplit) runs a cell with no xor, shuffle,
+     * pad compare, blend or add (MAIN_SAM_CODE8_FS's PADC). The freed-cell
+     * override never fires there: it compares s2 with a base code or
+     * FREED_INACTIVE8, never X86_QPAD8. The FScan bodies apply no boundary mask
+     * below jsplit, so nothing else differs. jsplit is taken over the real
+     * lanes; a dummy tail lane's cells are never read (real_msk keeps it out of
+     * gmax / te / qe, so it never exits either). A lane whose len2 is a multiple
+     * of 16 pins jsplit to at most that len2, so the range is empty then. The
+     * biased (!Sgn) body is excluded: its pad cell is subs(adds(h, shift),
+     * shift), which is not h when h + shift saturates. jdummy <= jzero always
+     * (jdummy is some real lane's len2 when below jsplit). 0 leaves the range
+     * empty. */
+    int jzero = jsplit;
+    if (Sgn && FScan && rescue_padcols_enabled()) {
+        int maxLen2 = 0;
+        for (int l = 0; l < nreal; l++)
+            if (p[l].len2 > maxLen2) maxLen2 = p[l].len2;
+        jzero = maxLen2 < jsplit ? maxLen2 : jsplit;
+        if (jzero < jdummy) jzero = jdummy;
+    }
+    /* The lazy query-end rescan's order (BWA3_RESCUE_QE_REVSCAN); see the
+     * epilogue below. */
+    const bool qe_revscan = rescue_qe_revscan_enabled();
+
     /* Per-row epilogue, shared by the one-row and two-row sweeps: close the
      * final checkpoint block, Block I (the lagged rowMax store), Block II (gmax,
      * te and the deferred query-end rescan) and the end-score / saturation exit
@@ -4973,7 +5020,39 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
          * kswv_neon_u8_impl for the derivation. `found` and the per-block      \
          * masks are k-regs here, so a block that holds no active lane's max    \
          * costs one compare, one kandn and one kor. */                         \
-        if (cmp0)                                                               \
+        if (cmp0 && qe_revscan)                                                 \
+        {                                                                       \
+            /* Backward column rescan (BWA3_RESCUE_QE_REVSCAN; see the note     \
+             * above rescue_qe_revscan_enabled). Inside a block the columns are  \
+             * scanned last to first with a compare masked by `newly` and a      \
+             * merge-masked load of the column index: the last write leaves each \
+             * such lane at its FIRST column holding the max, the forward scan's \
+             * first hit, without its `got` mask. */                             \
+            __m512i iqe512 = _mm512_set1_epi8(-1);                              \
+            __mmask64 foundBlk = 0;                                             \
+            const uint8_t *colIdx = this->colIdx8;                              \
+            const int nblocks = (ncol + QE_BLK - 1) / QE_BLK;                   \
+            for (int b = 0; b < nblocks; b++) {                                 \
+                __mmask64 reached = _mm512_cmpeq_epu8_mask(                     \
+                    _mm512_load_si512((__m512i *)(__bmax + b * SIMD_WIDTH8)), imax_h); \
+                __mmask64 newly = reached & ~foundBlk & cmp0;                   \
+                foundBlk |= reached;                                            \
+                if (newly) {                                                    \
+                    const int j0 = b * QE_BLK;                                  \
+                    const int j1 = (j0 + QE_BLK < ncol) ? (j0 + QE_BLK) : ncol; \
+                    for (int j2 = j1 - 1; j2 >= j0; j2--) {                     \
+                        const __mmask64 eq = _mm512_mask_cmpeq_epu8_mask(newly, \
+                            _mm512_load_si512((__m512i *)(__hbase + j2 * SIMD_WIDTH8)), \
+                            imax_h);                                            \
+                        iqe512 = _mm512_mask_loadu_epi8(iqe512, eq,             \
+                            (const void *)(colIdx + j2 * SIMD_WIDTH8));          \
+                    }                                                           \
+                }                                                               \
+                if ((foundBlk & cmp0) == cmp0) break;                           \
+            }                                                                   \
+            qe512 = _mm512_mask_blend_epi8(cmp0, qe512, iqe512);                \
+        }                                                                       \
+        else if (cmp0)                                                          \
         {                                                                       \
             __m512i iqe512 = _mm512_set1_epi8(-1);                              \
             __mmask64 foundBlk = 0;                                             \
@@ -5049,7 +5128,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
 
             /* Reads the pair's state above (s1_0/s1_1, act0/act1, e11_0/e11_1,
              * imax0/imax1, d, qeNext, qeBlk) and the loop index j by name. */
-#define KSWV_AVX512_U8_CELL_PAIR_FS(APPLY_BND, NEED_DUMMY)                          \
+#define KSWV_AVX512_U8_CELL_PAIR_FS(APPLY_BND, NEED_DUMMY, PADC)                    \
             {                                                                       \
                 __m512i h00, s2, f11, h0v, h1v, f0, f1;                             \
                 h00 = _mm512_load_si512((__m512i *)(H0 + j * SIMD_WIDTH8));         \
@@ -5057,9 +5136,9 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
                 f11 = _mm512_load_si512((__m512i *)(F + (j + 1) * SIMD_WIDTH8));    \
                                                                                     \
                 MAIN_SAM_CODE8_FS(s1_0, s2, h00, h0v, e11_0, f11, f0, act0, imax0,  \
-                                  (APPLY_BND), (NEED_DUMMY));                       \
+                                  (APPLY_BND), (NEED_DUMMY), (PADC));               \
                 MAIN_SAM_CODE8_FS(s1_1, s2, d, h1v, e11_1, f0, f1, act1, imax1,     \
-                                  (APPLY_BND), (NEED_DUMMY));                       \
+                                  (APPLY_BND), (NEED_DUMMY), (PADC));               \
                                                                                     \
                 _mm512_store_si512((__m512i *)(H0 + j * SIMD_WIDTH8), h0v);         \
                 _mm512_store_si512((__m512i *)(H1 + (j + 1) * SIMD_WIDTH8), h1v);   \
@@ -5072,9 +5151,10 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
                 }                                                                   \
             }
 
-            for (j = 0; j < jdummy; j++)  KSWV_AVX512_U8_CELL_PAIR_FS(false, false)
-            for (; j < jsplit; j++)       KSWV_AVX512_U8_CELL_PAIR_FS(false, true)
-            for (; j < ncol; j++)         KSWV_AVX512_U8_CELL_PAIR_FS(true, true)
+            for (j = 0; j < jdummy; j++)  KSWV_AVX512_U8_CELL_PAIR_FS(false, false, false)
+            for (; j < jzero; j++)        KSWV_AVX512_U8_CELL_PAIR_FS(false, true, false)
+            for (; j < jsplit; j++)       KSWV_AVX512_U8_CELL_PAIR_FS(false, true, true)
+            for (; j < ncol; j++)         KSWV_AVX512_U8_CELL_PAIR_FS(true, true, false)
 #undef KSWV_AVX512_U8_CELL_PAIR_FS
 
             /* Row epilogues in row order: an exit at row i must stop before
@@ -5152,7 +5232,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
          * off the contended vector ports. */
         /* FScan: the G-based cell, with only the query half of the boundary
          * mask and only from jsplit on (see MAIN_SAM_CODE8_FS). */
-#define KSWV_AVX512_U8_CELL_FS(APPLY_BND, NEED_DUMMY)                               \
+#define KSWV_AVX512_U8_CELL_FS(APPLY_BND, NEED_DUMMY, PADC)                         \
         {                                                                           \
             __m512i f11, s2, f21;                                                   \
             h00 = _mm512_load_si512((__m512i *)(H0 + j * SIMD_WIDTH8));             \
@@ -5160,7 +5240,7 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
             f11 = _mm512_load_si512((__m512i *)(F + (j+1) * SIMD_WIDTH8));          \
                                                                                     \
             MAIN_SAM_CODE8_FS(s1, s2, h00, h11, e11, f11, f21, active_frread512, imax512, \
-                              (APPLY_BND), (NEED_DUMMY));                   \
+                              (APPLY_BND), (NEED_DUMMY), (PADC));           \
                                                                                     \
             _mm512_store_si512((__m512i *)(H1 + (j + 1) * SIMD_WIDTH8), h11);       \
             _mm512_store_si512((__m512i *)(F + (j + 1)* SIMD_WIDTH8), f21);         \
@@ -5172,9 +5252,10 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
         }
 
         if (FScan) {
-            for (j = 0; j < jdummy; j++)  KSWV_AVX512_U8_CELL_FS(false, false)
-            for (; j < jsplit; j++)       KSWV_AVX512_U8_CELL_FS(false, true)
-            for (; j < ncol; j++)         KSWV_AVX512_U8_CELL_FS(true, true)
+            for (j = 0; j < jdummy; j++)  KSWV_AVX512_U8_CELL_FS(false, false, false)
+            for (; j < jzero; j++)        KSWV_AVX512_U8_CELL_FS(false, true, false)
+            for (; j < jsplit; j++)       KSWV_AVX512_U8_CELL_FS(false, true, true)
+            for (; j < ncol; j++)         KSWV_AVX512_U8_CELL_FS(true, true, false)
         } else {
             for (j = 0; j < jdummy; j++)
                 KSWV_AVX512_U8_CELL(HasFreed
