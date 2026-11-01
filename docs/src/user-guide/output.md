@@ -131,11 +131,10 @@ key off the mate's MAPQ don't need to look at the mate record. Both SAM
 and `--bam` output paths emit it. Backported from `lh3/bwa` PR #330 in
 fg-labs PR #35.
 
-The `XA:Z` field set widens from `chr,pos,CIGAR,NM` to
-`chr,pos,CIGAR,NM,score,mapq` when `-u` (a.k.a. the upstream "XB" toggle)
-is passed; the tag name itself remains `XA:Z` for downstream
-compatibility. Tools that parse `XA:Z` need to be aware of the two
-possible field widths.
+With `-u`, the alternative-hit list gains each hit's score and mapping
+quality (`chr,pos,CIGAR,NM,score,mapq`) and is written as `XB:Z` instead of
+`XA:Z`, as in bwa, so a reader of `XA:Z` always sees bwa's four-field layout.
+All three writers (SAM text, `--bam` and `--meth`) name it the same way.
 
 ### `HN:i` — total alignment hit count
 

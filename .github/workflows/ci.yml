@@ -1997,6 +1997,12 @@ jobs:
           METH_ALT_PA_WORK_DIR=/tmp/meth-alt-pa-parity \
           bash test/regression/meth_alt_pa_parity.sh
 
+      - name: "-u names the hit list XB:Z (SAM, --bam, --meth)"
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          U_XB_WORK_DIR=/tmp/u-xb-tag \
+          bash test/regression/u_xb_tag.sh
+
       - name: --meth output container follows --bam
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \

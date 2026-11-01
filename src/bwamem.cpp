@@ -5748,7 +5748,8 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
         }
     }
 
-    if (p->XA) { kputsn_u("\tXA:Z:", 6, str); kputs_u(p->XA, str); }
+    /* -u adds each hit's score and MAPQ to the list and, as in bwa, names it XB. */
+    if (p->XA) { kputsn_u((opt->flag & MEM_F_XB)? "\tXB:Z:" : "\tXA:Z:", 6, str); kputs_u(p->XA, str); }
     if (p->HN >= 0 && opt->compat->emit_hn) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 
     if (s->comment) { kputc_u('\t', str); kputs_u(s->comment, str); }
