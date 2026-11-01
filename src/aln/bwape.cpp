@@ -8,6 +8,7 @@
  * the packed in-memory copy. The mate alignment uses bwa-mem3's ksw_align and ksw_global.
  * bwa_cal_pac_pos_pe is cut into four stages and bwa_paired_sw into a counting core and a report
  * (the two stderr lines), so the driver can run them in parallel; each holds upstream's loop body.
+ * The bwa_paired_sw wrapper itself is not kept (nothing calls it).
  * See README.md. */
 #include "bwape.h"
 #include "aln_alloc.h"
@@ -447,7 +448,7 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,
 						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2])
 {
-	ubyte_t *pacseq = (ubyte_t*)_pacseq;
+	const ubyte_t *pacseq = _pacseq;
 	int i;
 
 	if (!popt->is_sw || ii->avg < 0.0) return;
@@ -558,18 +559,6 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 			free(cigar[0]); free(cigar[1]);
 		}
 	}
-}
-
-ubyte_t *bwa_paired_sw(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt, const isize_info_t *ii)
-{
-	ubyte_t *pacseq = (ubyte_t*)_pacseq;
-	uint64_t n_tot[2], n_mapped[2];
-
-	if (!popt->is_sw || ii->avg < 0.0) return pacseq;
-	n_tot[0] = n_tot[1] = n_mapped[0] = n_mapped[1] = 0;
-	bwa_paired_sw_core(bns, _pacseq, n_seqs, seqs, popt, ii, n_tot, n_mapped);
-	bwa_paired_sw_report(n_tot, n_mapped);
-	return pacseq;
 }
 
 void bwa_paired_sw_report(const uint64_t n_tot[2], const uint64_t n_mapped[2])

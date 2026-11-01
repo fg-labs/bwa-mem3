@@ -117,7 +117,9 @@ struct gap_slot_t {
 
 /* Reads searched at once per thread. Measured on Apple M2 Max (hg38, 262,144 aDNA reads,
  * -t 1, default options): 4 reads -36% wall against one at a time, 8 -43%, 12 -43%, 16 -41%,
- * 32 -40%; 8 was also the best at -t 12. */
+ * 32 -40%; 8 was also the best at -t 12. Only that host was swept; x86-64 and Linux arm64 have
+ * not been measured at other depths. The search is scalar (no SIMD tier is involved) and the
+ * hits do not depend on the depth, so the value is a tuning choice only. */
 #define ALN_GROUP 8
 
 /* A slot's stack keeps the capacity its largest read needed; with ALN_GROUP stacks per thread
@@ -126,6 +128,9 @@ struct gap_slot_t {
  * memory held is close to the one-stack-per-thread search's. Output does not depend on it. */
 #define ALN_STACK_KEEP 65536
 
+/* O(n_stacks) per read, the same walk gap_reset_stack already does for every read, and n_stacks
+ * is small (score(max_diff + 1, ...), tens to a few hundred), so it is not tracked incrementally
+ * in gap_push. */
 static void gap_stack_trim(gap_stack_t *stack)
 {
 	long cap = 0;
@@ -140,15 +145,14 @@ static void gap_stack_trim(gap_stack_t *stack)
 	stack->best = stack->n_stacks;
 }
 
-static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, bwt_t *const bwt, int n_seqs, bwa_seq_t *seqs,
+static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs,
 									 const gap_opt_t *opt)
 {
 	const int G = ALN_GROUP;
 	std::vector<gap_slot_t> slots(G);
 	for (gap_slot_t &s : slots) {
 		s.job.stack = gap_init_stack(opt->max_diff, opt->max_gapo, opt->max_gape, opt);
-		s.seed_w.resize(opt->seed_len + 1);
-		s.p = 0;
+		s.p = 0; // seed_w is sized on first use: only reads longer than -l use it
 	}
 	int next = tid, n_active = 0;
 	// Starts the thread's next read that needs a search in slot s; returns 0 when none is left.
@@ -163,8 +167,12 @@ static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, bwt_t *const bwt, i
 			j->opt = *opt;
 			if (opt->fnr > 0.0) j->opt.max_diff = bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr);
 			j->opt.seed_len = opt->seed_len < p->len? opt->seed_len : 0x7fffffff;
-			if (p->len > opt->seed_len)
+			if (p->len > opt->seed_len) {
+				// sized here, not per slot up front: a large -l (seeding off) would otherwise cost
+				// (-l + 1) x 16 B per slot even though no read is longer; here -l < p->len
+				if (s.seed_w.size() < (size_t)opt->seed_len + 1) s.seed_w.resize((size_t)opt->seed_len + 1);
 				bwt_cal_width(bwt, opt->seed_len, p->seq + (p->len - opt->seed_len), s.seed_w.data());
+			}
 			s.cseq.resize(p->len + 1);
 			for (int k = 0; k < p->len; ++k) // we need to complement
 				s.cseq[k] = p->seq[k] > 3? 4 : 3 - p->seq[k];
@@ -200,7 +208,7 @@ static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, bwt_t *const bwt, i
 
 typedef struct {
 	int tid, n_threads;
-	bwt_t *bwt;
+	const bwt_t *bwt;
 	int n_seqs;
 	bwa_seq_t *seqs;
 	const gap_opt_t *opt;
@@ -213,9 +221,16 @@ static void *worker(void *data)
 	return 0;
 }
 
-void aln_search_batch(const bwt_t *bwt_, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads)
+/* The search keeps upstream's fan-out: fresh joinable pthreads per batch, each taking reads tid,
+ * tid + n_threads, ... (the thread count is a parameter). The post-search stages use kt_for_nt,
+ * but the search is not moved onto it: kt_for_nt hands out item ranges of its own layout, so the
+ * ALN_GROUP slots (stacks, width buffers) would have to become per-tid state, the interleave would
+ * drain at every range boundary, and the group depth was tuned for this striding. Hits do not
+ * depend on which thread searches a read, so either is output-identical; a change would need a
+ * same-host throughput A/B on each shipped tier. One thread spawn per thread per batch of 0x40000
+ * reads is small next to the search. */
+void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads)
 {
-	bwt_t *bwt = const_cast<bwt_t*>(bwt_); // the search only reads it
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	if (n_threads <= 1) { // no multi-threading at all
 		bwa_cal_sa_reg_gap_group(0, 1, bwt, n_seqs, seqs, &bopt);

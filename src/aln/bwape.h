@@ -29,6 +29,9 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
  * n_aln. Consumes drand48(): call serially, in read order. When the batch gives no estimate
  * and last_ii->avg > 0, last_ii is used. Returns the number of alignments whose position
  * changed. */
+/* The driver (aln_run_pe) runs the four stages below itself, so it can run stages 2 and 4 in
+ * parallel; this composition is kept as upstream's function for the unit tests, which check the
+ * stages against it. aln_run_pe's own insert-size carry-over is tested separately. */
 int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
 					   isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt,
 					   const isize_info_t *last_ii);
@@ -49,11 +52,8 @@ void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t
 int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
 				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt);
 
-/* Mate Smith-Waterman for unpaired reads. `pacseq` is the packed forward reference; it is
- * returned (stock may load it itself, here it is always given). */
-ubyte_t *bwa_paired_sw(const bntseq_t *bns, const ubyte_t *pacseq, int n_seqs, bwa_seq_t *seqs[2],
-					   const pe_opt_t *popt, const isize_info_t *ii);
-/* bwa_paired_sw without its stderr report: does nothing unless popt->is_sw and ii->avg >= 0;
+/* Mate Smith-Waterman for unpaired reads: upstream's bwa_paired_sw without its stderr report
+ * (the driver calls these two directly; upstream's wrapper is not kept). Does nothing unless popt->is_sw and ii->avg >= 0;
  * otherwise adds its singleton (index 1) and discordant (index 0) counts to n_tot and
  * n_mapped. Independent per pair; no RNG. bwa_paired_sw_report prints the counts. */
 void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,

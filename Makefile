@@ -663,9 +663,21 @@ DEFAULT_BUILD_GOAL ?= all
 
 CXXFLAGS+=	-g -O3 -std=gnu++14 -fpermissive $(ARCH_FLAGS) $(ASAN_FLAGS) $(LIBSAIS_OPENMP_CFLAGS) $(EXTRA_CXXFLAGS) #-Wall ##-xSSE2
 
-# The aln port's floating-point code (bwa_cal_maxdiff) must round exactly as stock bwa's
-# does, which is compiled without fused multiply-add. Applies to every src/aln object.
-src/aln/%.o: CXXFLAGS += -ffp-contract=off
+# The aln port's floating-point code must round exactly as stock bwa's does: infer_isize's
+# `y * std + avg` and its erfc loop, the pairing score `-4.343 * log(...) + .499` and the mate
+# Smith-Waterman window arithmetic in bwape.cpp (bwa_cal_maxdiff in bwtaln.cpp has no
+# multiply-add to fuse). The parity target is stock built without FP contraction: what its own
+# Makefile gives on x86-64 (no FMA in the baseline ISA) and what the CI oracle is built with
+# (test/tools/build_bwa_oracle.sh). A stock bwa built with its default flags on arm64 fuses
+# those expressions and may differ at rounding boundaries. Applies to every src/aln object.
+#
+# An explicit rule with its own variable, not `src/aln/%.o: CXXFLAGS += ...`: a pattern-specific
+# value is inherited by prerequisites, so $(FLAGS_STAMP) would record whichever CXXFLAGS the first
+# target to reach it had, and alternating `make` with a single-object build would rebuild
+# everything. The rule must stay above `.cpp.o` (GNU make 3.81 takes the first matching rule).
+ALN_CXXFLAGS = -ffp-contract=off
+src/aln/%.o: src/aln/%.cpp
+	$(CXX) -c $(CXXFLAGS) $(ALN_CXXFLAGS) $(LTO_CFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 # The C TUs in $(OBJS) (src/fast_reader*.c, src/fr_fastq.c: the FASTQ reader)
 # get the C++ TUs' -g -O3 and $(ARCH_FLAGS). Outside sanitizer builds nothing
@@ -936,7 +948,7 @@ CALLOC_INTERPOSE_CXXFLAGS = -fno-builtin-malloc
 # cost a full rebuild, while a command-line flag change must. Same
 # write-only-if-changed trick as src/version.h below.
 FLAGS_STAMP = .build-flags
-FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|SRC_CFLAGS=$(SRC_CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|LTO_CFLAGS=$(LTO_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
+FLAGS_SIG = CXX=$(CXX)|CC=$(CC)|CXXFLAGS=$(CXXFLAGS)|ALN_CXXFLAGS=$(ALN_CXXFLAGS)|BASE_CXXFLAGS=$(BASE_CXXFLAGS)|CFLAGS=$(CFLAGS)|SRC_CFLAGS=$(SRC_CFLAGS)|CPPFLAGS=$(CPPFLAGS)|INCLUDES=$(INCLUDES)|LIBSAIS_CFLAGS=$(LIBSAIS_CFLAGS)|LTO_CFLAGS=$(LTO_CFLAGS)|CALLOC_INTERPOSE_CXXFLAGS=$(CALLOC_INTERPOSE_CXXFLAGS)|TIERS=$(KERNEL_FLAGS_sse41),$(KERNEL_FLAGS_sse42),$(KERNEL_FLAGS_avx),$(KERNEL_FLAGS_avx2),$(KERNEL_FLAGS_avx512bw)
 
 # Passed through the ENVIRONMENT and expanded double-quoted in the recipe, not
 # interpolated by make into single quotes. `printf '%s\n' '$(FLAGS_SIG)'` puts the
@@ -1028,7 +1040,7 @@ all-single: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) $(if $(filter 1,$(ZLIBNG_USE_V
 
 # ARM64/Apple Silicon build target - single binary, no multi-binary launcher needed
 arm64:
-	rm -f src/*.o $(BWA_LIB)
+	rm -f src/*.o src/aln/*.o $(BWA_LIB)
 	$(MAKE) arch=arm64 EXE=bwa-mem3.arm64 CXX="$(CXX)" all
 	ln -sf bwa-mem3.arm64 bwa-mem3
 
@@ -1684,7 +1696,7 @@ $(ZLIBNG_LIB):
 clean: pgo-clean profile-clean lto-clean
 	rm -fr src/*.o src/*.d src/aln/*.o src/aln/*.d src/version.h test/*.o test/*.d $(FLAGS_STAMP) $(BWA_LIB) $(EXE) $(STANDALONE_TESTS) kvec_alloc_fail_test klib_alloc_fail_test rescue_band_harness rescue_band_kernel_eq rescue_prune_eq bwa-mem3.arm64
 	rm -f $(LIBSAIS_OBJS) $(LIBSAIS_OBJS:.o=.d)
-	rm -f src/*.gcno src/*.gcda
+	rm -f src/*.gcno src/*.gcda src/aln/*.gcno src/aln/*.gcda
 	$(MAKE) -C test clean
 	-[ -f ext/htslib/config.mk ] && cd ext/htslib && $(MAKE) distclean
 	rm -rf $(MIMALLOC_BUILD)
@@ -1789,13 +1801,13 @@ else
 endif
 
 pgo-generate:
-	rm -f src/*.o $(BWA_LIB)
+	rm -f src/*.o src/aln/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_INSTR_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-generate=$(PGO_PROFILE_DIR)" CXX="$(CXX)" all
 	@echo "PGO instrumented binary built: $(PGO_INSTR_EXE) (arch=$(PGO_ARCH), profile dir=$(PGO_PROFILE_DIR))"
 	@echo "Run training workload with $(PGO_INSTR_EXE), then: make pgo-use PGO_ARCH=$(PGO_ARCH) PGO_PROFILE_DIR=$(PGO_PROFILE_DIR)"
 
 pgo-use:
-	rm -f src/*.o $(BWA_LIB)
+	rm -f src/*.o src/aln/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PGO_ARCH) EXE=$(PGO_FINAL_EXE) EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -fprofile-use=$(PGO_PROFILE_DIR) -fprofile-correction" CXX="$(CXX)" all
 	@echo "PGO optimized binary built: $(PGO_FINAL_EXE) (arch=$(PGO_ARCH))"
 
@@ -1824,12 +1836,12 @@ endif
 #        make profile-build PROFILE_ARCH=avx2     # cross-build
 #        ./bwa-mem3.profile mem -t N idx r1.fq.gz r2.fq.gz
 profile-build:
-	rm -f src/*.o $(BWA_LIB)
+	rm -f src/*.o src/aln/*.o $(BWA_LIB)
 	$(MAKE) arch=$(PROFILE_ARCH) EXE=bwa-mem3.profile EXTRA_CXXFLAGS="$(EXTRA_CXXFLAGS) -DDISABLE_OUTPUT" CXX="$(CXX)" all
 	@echo "Compute-only profile binary: bwa-mem3.profile (arch=$(PROFILE_ARCH), output I/O skipped)"
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -DDISABLE_OUTPUT objects.
-	rm -f src/*.o $(BWA_LIB)
+	rm -f src/*.o src/aln/*.o $(BWA_LIB)
 
 profile-clean:
 	rm -f bwa-mem3.profile
@@ -1851,7 +1863,7 @@ profile-clean:
 # or missing $(CXX) doesn't print a "command not found" warning on every
 # `make` invocation that doesn't even target lto-build.
 lto-build:
-	rm -f src/*.o $(BWA_LIB)
+	rm -f src/*.o src/aln/*.o $(BWA_LIB)
 	# GCC + Docker BuildKit jobserver workaround (fg-labs/bwa-mem3#121).
 	#
 	# Symptom: under BuildKit `make lto-build` dies with
@@ -1908,7 +1920,7 @@ lto-build:
 	# Drop variant-flagged objects from the shared cache so a subsequent
 	# `make all` doesn't relink stale -flto / -fno-semantic-interposition
 	# objects.
-	rm -f src/*.o $(BWA_LIB)
+	rm -f src/*.o src/aln/*.o $(BWA_LIB)
 
 lto-clean:
 	rm -f bwa-mem3.lto

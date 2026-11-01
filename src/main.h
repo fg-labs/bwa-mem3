@@ -42,4 +42,6 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 
 int bwa_index(int argc, char *argv[]);
 int main_resa(int argc, char *argv[]);
+// `bwa-mem3 aln` (src/aln/aln_main.cpp); its internal header stays out of main.cpp
+int main_aln(int argc, char *argv[]);
 #endif
