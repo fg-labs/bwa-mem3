@@ -32,14 +32,16 @@
 #               read, with ~35 full scans per run.
 #
 # Each fixture run is repeated with BWA3_CHAIN_FLAT_CAP=0 (every read on the
-# kbtree from its first seed) and =3, on the default seed order, on the opt-in
-# reorder path (--seed-order local-longest, which replays from its own seed
-# buffer), and under --meth; each must match its default run byte for byte. A
-# malformed cap must be reported, which proves the knob is read at all. A cap
-# above the packed key's 2^20 chain ceiling must print the clamp warning and
-# leave the output identical; no fixture read has 2^20 chains, so this does not
-# exercise the clamped value itself (the unit test test_chain_flat_key.cpp is
-# the oracle for that).
+# kbtree from its first seed), =1 (a read is replayed when its second chain
+# would open) and =3, on the default seed order, on the opt-in reorder path
+# (--seed-order local-longest, which replays from its own seed buffer), and
+# under --meth; each must match its default run byte for byte. A malformed cap
+# must be reported, which proves the knob is read at all. A cap of exactly the
+# packed key's 2^20 chain ceiling must be taken as given (no clamp warning), and
+# one above it must print the clamp warning; both must leave the output
+# identical. No fixture read has 2^20 chains, so these do not exercise a read
+# reaching that cap (the unit test test_chain_flat_key.cpp is the oracle for
+# the parse and clamp).
 #
 # When CHR22_FA / CHR22_SIM_DIR are set, the same cap 0 / cap 3 identity is also
 # checked on the chr22 holodeck reads. CI runs the fixture-only mode (unset
@@ -157,6 +159,9 @@ flat=$(stat_of flat_reads def.err)
 [ "$(stat_of flat_cap def.err)" = 512 ] || fail "the default run did not chain with the 512-chain cap (flat_cap)"
 align cap0 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=0 BWA3_CHAIN_STATS=1
 [ "$(stat_of flat_reads cap0.err)" = 0 ] || fail "BWA3_CHAIN_FLAT_CAP=0 left reads on the flat index"
+align cap1 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=1 BWA3_CHAIN_STATS=1
+[ "$(stat_of flat_declined_cap cap1.err)" -gt 0 ] || fail "BWA3_CHAIN_FLAT_CAP=1 declined no read (flat_declined_cap=0)"
+[ "$(stat_of flat_cap cap1.err)" = 1 ] || fail "BWA3_CHAIN_FLAT_CAP=1 was not the cap chaining applied (flat_cap)"
 align cap3 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=3 BWA3_CHAIN_STATS=1
 capped=$(stat_of flat_declined_cap cap3.err)
 [ "$capped" -gt 0 ] || fail "BWA3_CHAIN_FLAT_CAP=3 declined no read mid-way (flat_declined_cap=0)"
@@ -165,8 +170,17 @@ align bad ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=not-a-number
 grep -q 'ERROR: BWA3_CHAIN_FLAT_CAP="not-a-number" is not a non-negative integer' bad.err \
     || fail "a malformed BWA3_CHAIN_FLAT_CAP was not reported; is the knob still read?"
 same "flat index != kbtree (cap 0)" def.sam cap0.sam
+same "flat index != second-chain replay (cap 1)" def.sam cap1.sam
 same "flat index != mid-read replay (cap 3)" def.sam cap3.sam
 same "malformed cap changed the output" def.sam bad.sam
+# Cap at exactly the ceiling: accepted unclamped, applied, output unchanged.
+align ceil ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=1048576 BWA3_CHAIN_STATS=1
+if grep -q 'BWA3_CHAIN_FLAT_CAP' ceil.err; then
+    fail "BWA3_CHAIN_FLAT_CAP=1048576 (exactly the 2^20 ceiling) was reported as malformed or clamped"
+fi
+[ "$(stat_of flat_cap ceil.err)" = 1048576 ] \
+    || fail "BWA3_CHAIN_FLAT_CAP=1048576 was not the cap chaining applied (flat_cap)"
+same "ceiling cap (2^20) changed the output" def.sam ceil.sam
 # Over-ceiling cap: proves the clamp warning is printed, the clamped value is
 # the cap chaining applies (flat_cap, read back from the chaining code rather
 # than inferred from output: no read here reaches 2^20 chains), and the output
@@ -180,14 +194,18 @@ same "clamped cap changed the output" def.sam huge.sam
 
 align ord ref.fa reads.fq -- -- --seed-order local-longest
 align ord3 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=3 -- --seed-order local-longest
+align ord1 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=1 -- --seed-order local-longest
 align ord0 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=0 -- --seed-order local-longest
 same "reorder path: flat index != mid-read replay (cap 3)" ord.sam ord3.sam
+same "reorder path: flat index != second-chain replay (cap 1)" ord.sam ord1.sam
 same "reorder path: flat index != kbtree (cap 0)" ord.sam ord0.sam
 
 align meth ref.fa reads.fq -- -- --meth
 align meth3 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=3 -- --meth
+align meth1 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=1 -- --meth
 align meth0 ref.fa reads.fq -- BWA3_CHAIN_FLAT_CAP=0 -- --meth
 same "--meth: flat index != mid-read replay (cap 3)" meth.sam meth3.sam
+same "--meth: flat index != second-chain replay (cap 1)" meth.sam meth1.sam
 same "--meth: flat index != kbtree (cap 0)" meth.sam meth0.sam
 fixture="fixture: $(grep -cv '^@' def.sam) records, $ties tie and $capped cap declines, $linear full Pass-3 scans"
 
