@@ -28,17 +28,14 @@ namespace ba = bwa_aln;
 // Builds and loads the index once for all cases, then deletes its files: load_index has read
 // the whole index (and the packed reference) into memory.
 struct AlnIndex {
-    std::string dir, prefix;
+    bwa_tests::TempDir tmp_dir{"aln_bwt_unit"}; // removed only by the process that made it
+    std::string dir = tmp_dir.path(), prefix;
     int64_t l_pac = 0;
     std::unique_ptr<FMI_search> fmi;
     ba::bwt_t *bwt = nullptr;
 
     AlnIndex()
     {
-        std::string tmpl_s = aln_test::tmp_template("aln_bwt_unit");
-        char *tmpl = &tmpl_s[0];
-        REQUIRE(mkdtemp(tmpl) != nullptr);
-        dir = tmpl;
         prefix = dir + "/ref.fa";
         REQUIRE(aln_test::write_test_fasta(prefix));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
@@ -52,7 +49,6 @@ struct AlnIndex {
     {
         ba::bwt_destroy(bwt);
         fmi.reset();
-        aln_test::remove_dir(dir);
     }
 };
 

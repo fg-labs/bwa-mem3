@@ -5,10 +5,13 @@
  * MODIFIED from the original: the code is moved into namespace bwa_aln, the
  * extern "C" block and the malloc wrappers are dropped, and the bwa_aln2seq
  * declaration is left out (it is ported with the SAM code). gap_job_start/gap_job_run at the
- * end of the file are new: bwt_match_gap's loop as a resumable job, for interleaved search. */
+ * end of the file are new: bwt_match_gap's loop as a resumable job, for interleaved search.
+ * Score bounds saturate at the packed score capacity; actual scores are checked before a
+ * stack lookup or packing, and score arithmetic is widened to avoid integer overflow. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -19,20 +22,46 @@ namespace bwa_aln {
 #define STATE_I 1
 #define STATE_D 2
 
-#define aln_score(m,o,e,p) ((m)*(p)->s_mm + (o)*(p)->s_gapo + (e)*(p)->s_gape)
+#define aln_score(m,o,e,p) ((int64_t)(m)*(p)->s_mm + (int64_t)(o)*(p)->s_gapo + (int64_t)(e)*(p)->s_gape)
+
+// info packs score into its upper 11 bits. Only actual scores must fit: a large
+// optimistic bound alone must not reject otherwise representable searches.
+static const int GAP_SCORE_LIMIT = 1 << 11;
+static const int GAP_LEN_LIMIT = 0xffff; // info's low 16 bits hold the remaining read length
+
+static int gap_stack_bound(int max_mm, int max_gapo, int max_gape, const gap_opt_t *opt)
+{
+	const int64_t terms[] = {
+		((int64_t)max_mm + 1) * opt->s_mm,
+		((int64_t)max_gapo + 1) * opt->s_gapo,
+		((int64_t)max_gape + 1) * opt->s_gape
+	};
+	// Account for stock's negative -o values before saturating positive terms.
+	// Each product fits int64_t, but the sum of three unrestricted products may not.
+	int64_t score = 0;
+	for (int64_t term : terms) if (term < 0) score += term;
+	for (int64_t term : terms) {
+		if (term <= 0) continue;
+		if (term >= GAP_SCORE_LIMIT - score) return GAP_SCORE_LIMIT;
+		score += term;
+	}
+	if (score <= 0) _err_fatal_simple_core("aln", "search has no positive score bound");
+	return (int)score;
+}
 
 gap_stack_t *gap_init_stack2(int max_score)
 {
 	gap_stack_t *stack;
 	stack = (gap_stack_t*)aln_calloc(1, sizeof(gap_stack_t));
-	stack->n_stacks = max_score;
+	if (max_score <= 0) _err_fatal_simple_core("aln", "search has no positive score bound");
+	stack->n_stacks = max_score < GAP_SCORE_LIMIT ? max_score : GAP_SCORE_LIMIT;
 	stack->stacks = (gap_stack1_t*)aln_calloc(stack->n_stacks, sizeof(gap_stack1_t));
 	return stack;
 }
 
 gap_stack_t *gap_init_stack(int max_mm, int max_gapo, int max_gape, const gap_opt_t *opt)
 {
-	return gap_init_stack2(aln_score(max_mm+1, max_gapo+1, max_gape+1, opt));
+	return gap_init_stack2(gap_stack_bound(max_mm, max_gapo, max_gape, opt));
 }
 
 void gap_destroy_stack(gap_stack_t *stack)
@@ -58,7 +87,17 @@ static inline void gap_push(gap_stack_t *stack, int i, bwtint_t k, bwtint_t l, i
 	int score;
 	gap_entry_t *p;
 	gap_stack1_t *q;
-	score = aln_score(n_mm, n_gapo, n_gape, opt);
+	const int64_t wide_score = aln_score(n_mm, n_gapo, n_gape, opt);
+	if (wide_score < 0 || wide_score >= stack->n_stacks || wide_score >= GAP_SCORE_LIMIT) {
+		fprintf(stderr, "[E::aln] search score %lld cannot be represented (stack bound %d, maximum packed score %d); lower the search penalties or difference limits\n",
+				(long long)wide_score, stack->n_stacks, GAP_SCORE_LIMIT - 1);
+		exit(1);
+	}
+	if (i > GAP_LEN_LIMIT) { // the entry packs the remaining length into info's low 16 bits
+		fprintf(stderr, "[E::aln] a read of %d bases cannot be searched (the maximum is %d)\n", i, GAP_LEN_LIMIT);
+		exit(1);
+	}
+	score = (int)wide_score;
 	q = stack->stacks + score;
 	if (q->n_entries == q->m_entries) {
 		q->m_entries = q->m_entries? q->m_entries<<1 : 4;
@@ -116,8 +155,8 @@ static inline int int_log2(uint32_t v)
 bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_width_t *width,
 						  bwt_width_t *seed_width, const gap_opt_t *opt, int *_n_aln, gap_stack_t *stack)
 { // $seq is the reverse complement of the input read
-	int best_score = aln_score(opt->max_diff+1, opt->max_gapo+1, opt->max_gape+1, opt);
-	int best_diff = opt->max_diff + 1, max_diff = opt->max_diff;
+	int best_score = gap_stack_bound(opt->max_diff, opt->max_gapo, opt->max_gape, opt);
+	int best_diff = opt->max_diff == INT_MAX ? INT_MAX : opt->max_diff + 1, max_diff = opt->max_diff;
 	int best_cnt = 0;
 	int max_entries = 0, j, _j, n_aln, m_aln;
 	bwt_aln1_t *aln;
@@ -147,7 +186,7 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 		gap_pop(stack, &e); // get the best entry
 		k = e.k; l = e.l; // SA interval
 		i = e.info&0xffff; // length
-		if (!(opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > best_score + opt->s_mm) break; // no need to proceed
+		if (!(opt->mode & BWA_MODE_NONSTOP) && (int64_t)(e.info>>21) > (int64_t)best_score + opt->s_mm) break; // no need to proceed
 
 		m = max_diff - (e.n_mm + e.n_gapo);
 		if (opt->mode & BWA_MODE_GAPE) m -= e.n_gape;
@@ -286,8 +325,8 @@ int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 {
 	const gap_opt_t *opt = &j->opt;
 	int jj, _j;
-	j->best_score = aln_score(opt->max_diff+1, opt->max_gapo+1, opt->max_gape+1, opt);
-	j->best_diff = opt->max_diff + 1; j->max_diff = opt->max_diff;
+	j->best_score = gap_stack_bound(opt->max_diff, opt->max_gapo, opt->max_gape, opt);
+	j->best_diff = opt->max_diff == INT_MAX ? INT_MAX : opt->max_diff + 1; j->max_diff = opt->max_diff;
 	j->best_cnt = 0;
 	j->max_entries = 0;
 	j->m_aln = 4; j->n_aln = 0;
@@ -330,7 +369,7 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 			gap_pop(stack, &e); // get the best entry
 			k = e.k; l = e.l; // SA interval
 			i = e.info&0xffff; // length
-			if (!(opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > J->best_score + opt->s_mm) break; // no need to proceed
+			if (!(opt->mode & BWA_MODE_NONSTOP) && (int64_t)(e.info>>21) > (int64_t)J->best_score + opt->s_mm) break; // no need to proceed
 
 			m = J->max_diff - (e.n_mm + e.n_gapo);
 			if (opt->mode & BWA_MODE_GAPE) m -= e.n_gape;

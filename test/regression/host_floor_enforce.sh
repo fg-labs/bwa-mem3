@@ -5,7 +5,7 @@
 # host doesn't meet the build's SIMD floor. Uses the BWAMEM3_TESTING_HOST_TIER
 # injection hook (only present in builds compiled with -DBWAMEM3_TESTING).
 #
-# Three scenarios:
+# Scenarios:
 #   1. 'bwa-mem3 mem ref r1.fq r2.fq' with a below-floor injected tier must
 #      exit 2 with a stderr message containing the [E::bwamem3] precheck
 #      header AND a "detected: <tier>" clause naming the injected tier.
@@ -14,6 +14,8 @@
 #      stderr regardless of the version banner's stdout stream).
 #   3. 'bwa-mem3 mem -h N ...' must ALSO exit 2: for mem, -h is the XA-hits
 #      option (an INT), not a help alias, so it must not bypass the precheck.
+#   3b. 'bwa-mem3 aln -h' must exit 2 as well: aln has no -h option (its help
+#      is --help), so -h is not a help alias there either.
 #   4. On a host that MEETS the floor, a BWAMEM3_FORCE_TIER downgrade to a
 #      sub-AVX2 x86 tier (sse41/sse42/avx) must make 'bwa-mem3 mem' exit 2:
 #      those tiers have no batched mate-rescue kswv kernel (getScores8/16 are
@@ -128,6 +130,23 @@ if ! grep -q '\[E::bwamem3\]' "$OUT_DIR/memh.stderr"; then
     exit 1
 fi
 
+# --- Scenario 3b: 'aln -h' still runs the precheck (must exit 2) ---
+rc=0
+BWAMEM3_TESTING_HOST_TIER="$INJECTED_TIER" \
+    "$BWA_MEM3_TESTING" aln -h "$PARITY_FA" /dev/null \
+    > "$OUT_DIR/alnh.stdout" 2> "$OUT_DIR/alnh.stderr" || rc=$?
+
+if [[ $rc -ne 2 ]]; then
+    echo "FAIL: bwa-mem3 aln -h exited $rc (expected 2 — aln has no -h, so it must not bypass the precheck)" >&2
+    cat "$OUT_DIR/alnh.stderr" >&2
+    exit 1
+fi
+if ! grep -q '\[E::bwamem3\]' "$OUT_DIR/alnh.stderr"; then
+    echo "FAIL: 'aln -h' stderr lacks the [E::bwamem3] precheck header (precheck skipped?)" >&2
+    cat "$OUT_DIR/alnh.stderr" >&2
+    exit 1
+fi
+
 # Scenarios 4 and 5 exercise the forced-sub-AVX2 guard, which is x86-only (the
 # sse41/sse42/avx tiers and the guard itself are compiled only on x86; on arm64
 # BWAMEM3_FORCE_TIER to an x86 tier is ignored and there is nothing to refuse).
@@ -184,4 +203,4 @@ case "$(uname -m)" in
         ;;
 esac
 
-echo "PASS: bwa-mem3 mem (and 'mem -h N') exits 2 on an injected too-old host${force_tier_msg}; bwa-mem3 version warns"
+echo "PASS: bwa-mem3 mem (and 'mem -h N', 'aln -h') exits 2 on an injected too-old host${force_tier_msg}; bwa-mem3 version warns"

@@ -33,7 +33,6 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #include "simd_dispatch.h"
 #include "version.h"
 #include "bwa_shm.h"
-#include "aln/aln_main.h"
 
 #ifdef USE_MIMALLOC
 #include <stdlib.h>  /* strtol: MIMALLOC_PURGE_DELAY check */
@@ -251,7 +250,8 @@ int main(int argc, char* argv[])
      * (`h:` in main_mem's optstring, fastmap.cpp), taking an INT value. So
      * `mem -h 5 ref r1 r2` must NOT be treated as help -- doing so skipped the
      * precheck and ran the full alignment on a below-floor host, the SIGILL the
-     * precheck exists to turn into a clean exit(2).
+     * precheck exists to turn into a clean exit(2). `aln` has no `-h` either
+     * (its help is `--help`), so `aln -h` gets the precheck too.
      * Only argv[2] is checked: matching --help / -h anywhere in argv
      * would false-positive on pathological invocations like
      * `mem -R --help ref r1 r2` (where --help is the VALUE of -R) and
@@ -259,7 +259,8 @@ int main(int argc, char* argv[])
      * invocations put --help right after the subcommand. */
     bool wants_help = (argc >= 3) &&
                       (strcmp(argv[2], "--help") == 0 ||
-                       (strcmp(argv[2], "-h") == 0 && strcmp(argv[1], "mem") != 0));
+                       (strcmp(argv[2], "-h") == 0 && strcmp(argv[1], "mem") != 0 &&
+                        strcmp(argv[1], "aln") != 0));
     if (strcmp(argv[1], "version") != 0 && !wants_help) {
         bwamem3_enforce_host_floor();
 
@@ -364,8 +365,10 @@ int main(int argc, char* argv[])
     }
     else if (strcmp(argv[1], "aln") == 0)
     {
-        // `aln --help` skipped the host-floor precheck above, so print the help before anything
-        // else runs, as `mem --help` does: the @PG builder below is BASELINE_ARCH code.
+        // `aln --help` skipped the host-floor precheck above and goes straight to main_aln, as
+        // `mem --help` goes to main_mem, so the help prints before the @PG builder and the run's
+        // setup. main_aln, like main_mem, is BASELINE_ARCH code: this keeps the help path short,
+        // it does not make it safe on a host below the floor.
         if (wants_help) return main_aln(argc-1, argv+1);
         extern char *bwa_pg;
         kstring_t pg = {0,0,0};

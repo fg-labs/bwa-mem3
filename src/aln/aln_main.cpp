@@ -1,5 +1,7 @@
+/* SPDX-License-Identifier: MIT */
 /* New code for bwa-mem3 (not from upstream bwa): the `aln` subcommand driver. The option
- * set is stock `bwa aln`'s plus samse's -n (as --max-xa-hits), -f and -r; see README.md. */
+ * set is stock `bwa aln`'s plus the samse/sampe -n (as --max-xa-hits), -f and -r, and sampe's
+ * paired-end options; see README.md. */
 #include "aln_main.h"
 
 #include <getopt.h>
@@ -9,14 +11,17 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "../FMI_search.h"
 #include "../bwa.h"
+#include "../bwa_shm.h"
 #include "../kthread.h"
 #include "../read_index_ele.h"
 #include "aln_bwt.h"
@@ -55,7 +60,12 @@ struct fmt_seg_t {
 	size_t off, len;
 };
 
-/* Per-thread output buffers and segment lists for one pass, reused across batches. */
+/* Per-thread output buffers and segment lists for one pass, reused across batches. The
+ * records are written after the whole pass rather than through kt_for_prefix as they finish:
+ * kt_for_prefix hands on_prefix only (st, ed), so each item would still need its own buffer,
+ * the items it never offers need a tail write after it returns, and the paired-end stop at
+ * mismatched names would have to be applied in both places. Formatting is a small share of
+ * the run next to the search, so the simpler write-after-pass is kept. */
 struct fmt_bufs_t {
 	std::vector<kstring_t> buf;
 	std::vector<std::vector<fmt_seg_t>> segs;
@@ -154,8 +164,11 @@ void pe_post_worker(void *data, int st, int n, int tid)
 	for (int i = 0; i < n; ++i) {
 		bwa_seq_t *p0 = s[0] + i, *p1 = s[1] + i;
 		if (p0->bc[0] || p1->bc[0]) {
-			strcat(p0->bc, p1->bc);
-			strcpy(p1->bc, p0->bc);
+			// Join read 2's barcode onto read 1's, keeping at most BWA_MAX_BCLEN bases: main_aln
+			// limits -B to half that with two files, but this driver is a public entry point.
+			const size_t l0 = strlen(p0->bc);
+			snprintf(p0->bc + l0, sizeof p0->bc - l0, "%s", p1->bc);
+			memcpy(p1->bc, p0->bc, sizeof p0->bc);
 		}
 		bwa_print_sam1(k, c->bns, p0, p1, c->o->gap.mode, c->o->gap.max_top2);
 		bwa_print_sam1(k, c->bns, p1, p0, c->o->gap.mode, c->o->gap.max_top2);
@@ -179,7 +192,6 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	}
 	bwa_seqio_t *ks = bwa_seq_open(fn_fq);
 	if (!ks) {
-		fprintf(stderr, "[E::%s] cannot open '%s'\n", __func__, fn_fq);
 		return 1;
 	}
 	bwase_initialize();
@@ -204,7 +216,10 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		if (ret) break;
 		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld sequences have been processed.\n", tot);
 	}
-	bwa_seq_close(ks);
+	if (bwa_seq_n_bad(ks)) ret = 1; // malformed records were skipped (and named on stderr)
+	// Not fatal (stock's err_gzclose exits): the caller still closes the output, so a BAM is
+	// flushed and terminated before the run exits 1.
+	if (bwa_seq_close(ks) != 0) ret = 1;
 	return ret;
 }
 
@@ -218,12 +233,10 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	bwa_seqio_t *ks[2];
 	ks[0] = bwa_seq_open(fn_fq1);
 	if (!ks[0]) {
-		fprintf(stderr, "[E::%s] cannot open '%s'\n", __func__, fn_fq1);
 		return 1;
 	}
 	ks[1] = bwa_seq_open(fn_fq2);
 	if (!ks[1]) {
-		fprintf(stderr, "[E::%s] cannot open '%s'\n", __func__, fn_fq2);
 		bwa_seq_close(ks[0]);
 		return 1;
 	}
@@ -245,7 +258,9 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		}
 		seqs[1] = bwa_read_seq(ks[1], o->batch_size, &n_in[1], o->gap.mode, o->gap.trim_qual);
 		if (!seqs[1]) {
-			fprintf(stderr, "[W::aln] read 2 file ended before read 1 file; ignoring the remaining %d read(s) of read 1\n", n_in[0]);
+			// n_in[0] is only the R1 batch just read; later R1 batches are not read, so the
+			// count is a lower bound
+			fprintf(stderr, "[W::aln] read 2 file ended before read 1 file; ignoring the rest of read 1 (%d or more read(s))\n", n_in[0]);
 			bwa_free_read_seq(n_in[0], seqs[0]);
 			break;
 		}
@@ -302,8 +317,9 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			bwa_free_read_seq(n_extra, extra);
 		}
 	}
-	bwa_seq_close(ks[0]);
-	bwa_seq_close(ks[1]);
+	if (bwa_seq_n_bad(ks[0]) || bwa_seq_n_bad(ks[1])) ret = 1; // malformed records, named on stderr
+	if (bwa_seq_close(ks[0]) != 0) ret = 1;
+	if (bwa_seq_close(ks[1]) != 0) ret = 1;
 	return ret;
 }
 
@@ -318,12 +334,14 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "Usage:   bwa-mem3 aln [options] <prefix> <in.fq> [<in2.fq>]\n\n");
 	fprintf(fp, "Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one\n");
 	fprintf(fp, "step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe\n");
-	fprintf(fp, "(two files), with no .sai files. Output matches bwa 0.7.19. <prefix> is an index made\n");
-	fprintf(fp, "by `bwa-mem3 index` (also one made with --meth, or one staged by `bwa-mem3 shm`).\n");
+	fprintf(fp, "(two files), with no .sai files. On the tested inputs its records match bwa 0.7.19's\n");
+	fprintf(fp, "(@PG differs), except that `-n 1e-2` is a probability here and the integer 1 in stock.\n");
+	fprintf(fp, "<prefix> is an index made by `bwa-mem3 index` (also one made with --meth, or one staged\n");
+	fprintf(fp, "by `bwa-mem3 shm`).\n");
 	fprintf(fp, "Each option shows its default and the stock command it comes from.\n\n");
 	fprintf(fp, "Search options (from bwa aln):\n");
 	fprintf(fp, "  -n NUM    max #diff (int) or missing prob under %.2f err rate (float) [%.2f]\n", BWA_AVG_ERR, g->fnr);
-	fprintf(fp, "  -o INT    maximum number or fraction of gap opens [%d]\n", g->max_gapo);
+	fprintf(fp, "  -o INT    maximum number of gap opens [%d]\n", g->max_gapo);
 	fprintf(fp, "  -e INT    maximum number of gap extensions, -1 for disabling long gaps [-1]\n");
 	fprintf(fp, "  -i INT    do not put an indel within INT bp towards the ends [%d]\n", g->indel_end_skip);
 	fprintf(fp, "  -d INT    maximum occurrences for extending a long deletion [%d]\n", g->max_del_occ);
@@ -426,6 +444,97 @@ static int aln_output_ok(const char *path)
 	return 1;
 }
 
+/* 1 if -f names the regular file on standard input, which is read when an input is "-": opening
+ * -f for writing would truncate it before it is read. */
+static int aln_out_is_stdin(const char *out)
+{
+	struct stat so, si;
+	if (!out || strcmp(out, "-") == 0) return 0;
+	if (stat(out, &so) != 0 || fstat(STDIN_FILENO, &si) != 0 || !S_ISREG(si.st_mode)) return 0;
+	return so.st_dev == si.st_dev && so.st_ino == si.st_ino;
+}
+
+/* 1 if `out` names an existing file that is also the input `in`: opening -f for writing would
+ * truncate the input before it is read. "-" on either side is never the same file. */
+static int aln_same_file(const char *out, const char *in)
+{
+	struct stat so, si;
+	if (!out || strcmp(out, "-") == 0 || strcmp(in, "-") == 0) return 0;
+	if (stat(out, &so) != 0 || stat(in, &si) != 0) return 0;
+	return so.st_dev == si.st_dev && so.st_ino == si.st_ino;
+}
+
+/* With --bam, every @SQ line of an -r text (which replaces the index's @SQ lines, as in stock
+ * samse) that names an index contig must give that contig's length: htslib would otherwise
+ * write records past the declared end of the reference. A name the index lacks is left to the
+ * record writer, which refuses a record on it. Returns 0 after naming the mismatch. */
+static int aln_bam_sq_lengths_ok(const char *hdr, const bntseq_t *bns)
+{
+	std::vector<std::pair<std::string, int64_t>> idx;
+	idx.reserve(bns->n_seqs);
+	for (int i = 0; i < bns->n_seqs; ++i) idx.emplace_back(bns->anns[i].name, bns->anns[i].len);
+	std::sort(idx.begin(), idx.end());
+	for (const char *p = hdr; p && *p;) {
+		const char *nl = strchr(p, '\n');
+		const size_t n = nl ? (size_t)(nl - p) : strlen(p);
+		if (n > 4 && strncmp(p, "@SQ\t", 4) == 0) {
+			std::string sn, ln;
+			for (const char *f = p + 4, *end = p + n; f < end;) {
+				const char *t = (const char*)memchr(f, '\t', end - f);
+				const char *fe = t ? t : end;
+				if (fe - f > 3 && strncmp(f, "SN:", 3) == 0) sn.assign(f + 3, fe);
+				else if (fe - f > 3 && strncmp(f, "LN:", 3) == 0) ln.assign(f + 3, fe);
+				f = fe + 1;
+			}
+			auto it = std::lower_bound(idx.begin(), idx.end(), std::make_pair(sn, (int64_t)INT64_MIN));
+			if (it == idx.end() || it->first != sn) { p = nl ? nl + 1 : p + n; continue; }
+			char *lend = NULL;
+			errno = 0;
+			const long long len = ln.empty() ? -1 : strtoll(ln.c_str(), &lend, 10);
+			if (ln.empty() || errno != 0 || *lend != '\0' || len != (long long)it->second) {
+				fprintf(stderr, "[E::aln] --bam: the -r header gives @SQ %s length %s, but the index contig is %lld bp\n",
+						sn.c_str(), ln.empty() ? "(none)" : ln.c_str(), (long long)it->second);
+				return 0;
+			}
+		}
+		p = nl ? nl + 1 : p + n;
+	}
+	return 1;
+}
+
+/* Strict number parsing. Stock parses with atoi/atof, which turn "abc" into 0 and "20x" into 20;
+ * here a malformed value, or one outside [lo, hi], is an error that names the option. */
+static int aln_parse_int(const char *flag, const char *s, long lo, long hi, int *out)
+{
+	char *end = NULL;
+	errno = 0;
+	long v = strtol(s, &end, 10);
+	if (*s == '\0' || *end != '\0' || errno == ERANGE || v < lo || v > hi) {
+		if (lo == 0 && hi == INT_MAX)
+			fprintf(stderr, "[E::aln] %s wants a non-negative integer, not '%s'\n", flag, s);
+		else if (lo == INT_MIN && hi == INT_MAX)
+			fprintf(stderr, "[E::aln] %s wants an integer, not '%s'\n", flag, s);
+		else
+			fprintf(stderr, "[E::aln] %s wants an integer from %ld to %ld, not '%s'\n", flag, lo, hi, s);
+		return 0;
+	}
+	*out = (int)v;
+	return 1;
+}
+
+static int aln_parse_double(const char *flag, const char *s, double lo, double *out)
+{
+	char *end = NULL;
+	errno = 0;
+	double v = strtod(s, &end);
+	if (*s == '\0' || *end != '\0' || errno == ERANGE || !isfinite(v) || !(v >= lo)) {
+		fprintf(stderr, "[E::aln] %s wants a finite number%s, not '%s'\n", flag, lo > -HUGE_VAL ? " of at least 0" : "", s);
+		return 0;
+	}
+	*out = v;
+	return 1;
+}
+
 enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP };
 
 int main_aln(int argc, char *argv[])
@@ -435,7 +544,7 @@ int main_aln(int argc, char *argv[])
 	gap_opt_t *opt = &o.gap;
 	int c, opte = -1, bam = 0, bam_level = 1, pe_flag = 0, bc_len = 0;
 	const char *out_path = NULL;
-	char *rg_line = NULL;
+	std::unique_ptr<char, decltype(&free)> rg_line(NULL, &free);
 	static const struct option long_opts[] = {
 		{"max-xa-hits", required_argument, 0, OPT_MAX_XA},
 		{"max-xa-hits-discordant", required_argument, 0, OPT_MAX_XA_DISC},
@@ -446,83 +555,129 @@ int main_aln(int argc, char *argv[])
 		{0, 0, 0, 0}
 	};
 
-	optind = 1;
+	// Negative values are refused where they are meaningless and stock crashes, aborts or drops
+	// every read on them (-l, -m, -M, -O, -E, -B, an integer -n); other options take any integer, as
+	// stock does (-e -1 is the documented "no long gaps", for example).
+#define ALN_INT(flag, lo, dst) do { if (!aln_parse_int(flag, optarg, lo, INT_MAX, dst)) return 1; } while (0)
+	bwa_rg_id[0] = '\0'; // bwa_set_rg's global: a run without -r must not tag reads with an earlier run's ID
+	optind = 1; // a clean reparse (the unit tests call main_aln more than once)
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+	optreset = 1; // BSD getopt also keeps a static `place` pointer
+#endif
 	while ((c = getopt_long(argc, argv, "n:o:e:i:d:l:k:LR:m:t:NM:O:E:q:f:r:IYB:a:c:sAP", long_opts, 0)) >= 0) {
 		switch (c) {
 		case 'n':
-			if (strstr(optarg, ".")) opt->fnr = atof(optarg), opt->max_diff = -1;
-			else opt->max_diff = atoi(optarg), opt->fnr = -1.0;
+			if (strpbrk(optarg, ".eE")) { // stock tests only for '.'; it reads `1e-2` as the integer 1
+				double fnr;
+				if (!aln_parse_double("-n", optarg, 0.0, &fnr)) return 1;
+				if (!((float)fnr > 0.0f)) { // stock runs fnr <= 0 as -n -1 and leaves every read unmapped
+					fprintf(stderr, "[E::aln] -n wants a probability above 0, not '%s'\n", optarg);
+					return 1;
+				}
+				opt->fnr = fnr; // a float, as stock's `opt->fnr = atof(optarg)`
+				opt->max_diff = -1;
+			} else {
+				ALN_INT("-n", 0, &opt->max_diff);
+				opt->fnr = -1.0;
+			}
 			break;
-		case 'o': opt->max_gapo = atoi(optarg); break;
-		case 'e': opte = atoi(optarg); break;
-		case 'M': opt->s_mm = atoi(optarg); break;
-		case 'O': opt->s_gapo = atoi(optarg); break;
-		case 'E': opt->s_gape = atoi(optarg); break;
-		case 'd': opt->max_del_occ = atoi(optarg); break;
-		case 'i': opt->indel_end_skip = atoi(optarg); break;
-		case 'l': opt->seed_len = atoi(optarg); break;
-		case 'k': opt->max_seed_diff = atoi(optarg); break;
-		case 'm': opt->max_entries = atoi(optarg); break;
-		case 't': opt->n_threads = atoi(optarg); break;
+		case 'o': ALN_INT("-o", INT_MIN, &opt->max_gapo); break;
+		case 'e': ALN_INT("-e", INT_MIN, &opte); break;
+		case 'M': ALN_INT("-M", 0, &opt->s_mm); break;
+		case 'O': ALN_INT("-O", 0, &opt->s_gapo); break;
+		case 'E': ALN_INT("-E", 0, &opt->s_gape); break;
+		case 'd': ALN_INT("-d", INT_MIN, &opt->max_del_occ); break;
+		case 'i': ALN_INT("-i", INT_MIN, &opt->indel_end_skip); break;
+		case 'l': ALN_INT("-l", 0, &opt->seed_len); break;
+		case 'k': ALN_INT("-k", INT_MIN, &opt->max_seed_diff); break;
+		case 'm': ALN_INT("-m", 0, &opt->max_entries); break;
+		case 't': ALN_INT("-t", INT_MIN, &opt->n_threads); break;
 		case 'L': opt->mode |= BWA_MODE_LOGGAP; break;
-		case 'R': opt->max_top2 = atoi(optarg); break;
-		case 'q': opt->trim_qual = atoi(optarg); break;
+		case 'R': ALN_INT("-R", INT_MIN, &opt->max_top2); break;
+		case 'q': ALN_INT("-q", INT_MIN, &opt->trim_qual); break;
 		case 'N': opt->mode |= BWA_MODE_NONSTOP; opt->max_top2 = 0x7fffffff; break;
 		case 'f': out_path = optarg; break;
 		case 'r':
 			// stock bwa_set_rg rejects a literal tab; bwa-mem3's bwa_set_rg does not
 			if (strchr(optarg, '\t') != NULL) {
-				fprintf(stderr, "[E::%s] the read group line contained literal <tab> characters -- replace with escaped tabs: \\t\n", __func__);
+				fprintf(stderr, "[E::aln] the read group line contained literal <tab> characters -- replace with escaped tabs: \\t\n");
 				return 1;
 			}
-			free(rg_line);
-			if ((rg_line = bwa_set_rg(optarg)) == 0) return 1;
+			rg_line.reset(bwa_set_rg(optarg));
+			if (!rg_line) return 1;
+			{ // Escaping can introduce interior blank lines; the writer adds the final newline.
+				const size_t rl = strlen(rg_line.get());
+				if ((rl && rg_line.get()[rl - 1] == '\n') || strstr(rg_line.get(), "\n\n")) {
+					fprintf(stderr, "[E::aln] the read group text would write an empty SAM header line\n");
+					return 1;
+				}
+			}
 			break;
 		case 'I': opt->mode |= BWA_MODE_IL13; break;
 		case 'Y': opt->mode |= BWA_MODE_CFY; break;
-		case 'B': { int b = atoi(optarg); if (b > bc_len) bc_len = b; opt->mode |= b << 24; break; }
-		case 'a': o.pe.max_isize = atoi(optarg); pe_flag = 1; break;
-		case 'c': o.pe.ap_prior = atof(optarg); pe_flag = 1; break;
-		case 's': o.pe.is_sw = 0; pe_flag = 1; break;
-		case 'A': o.pe.force_isize = 1; pe_flag = 1; break;
-		case 'P': o.pe.is_preload = 1; pe_flag = 1; break;
-		case OPT_MAX_XA: o.max_xa_hits = atoi(optarg); o.pe.n_multi = o.max_xa_hits; break;
-		case OPT_MAX_XA_DISC: o.pe.N_multi = atoi(optarg); pe_flag = 1; break;
-		case OPT_MAX_OCC: o.pe.max_occ = atoi(optarg); pe_flag = 1; break;
-		case OPT_BAM: bam = 1; break;
-		case OPT_BAM_LEVEL: {
-			char *end = NULL;
-			long v = strtol(optarg, &end, 10);
-			if (*optarg == '\0' || *end != '\0' || v < 0 || v > 9) {
-				fprintf(stderr, "[E::%s] --bam-level wants an integer from 0 to 9, not '%s'\n", __func__, optarg);
-				return 1;
-			}
-			bam_level = (int)v;
+		case 'B': {
+			// A negative length would set every mode bit and make every read "shorter than its
+			// barcode" (stock drops them all and exits 0). Repeated -B values are OR-ed into the
+			// mode, as stock does; over BWA_MAX_BCLEN is refused below, where the limit for one
+			// or two read files is known (the shift is skipped then so it stays defined).
+			int b;
+			ALN_INT("-B", 0, &b);
+			if (b > bc_len) bc_len = b;
+			if (b <= BWA_MAX_BCLEN) opt->mode |= b << 24;
 			break;
 		}
+		case 'a': ALN_INT("-a", INT_MIN, &o.pe.max_isize); pe_flag = 1; break;
+		case 'c': if (!aln_parse_double("-c", optarg, -HUGE_VAL, &o.pe.ap_prior)) return 1; pe_flag = 1; break;
+		case 's': o.pe.is_sw = 0; pe_flag = 1; break;
+		case 'A': o.pe.force_isize = 1; pe_flag = 1; break;
+		case 'P': pe_flag = 1; break; // sampe -P preloads the index; it is always in memory here
+		case OPT_MAX_XA: ALN_INT("--max-xa-hits", INT_MIN, &o.max_xa_hits); o.pe.n_multi = o.max_xa_hits; break;
+		case OPT_MAX_XA_DISC: ALN_INT("--max-xa-hits-discordant", INT_MIN, &o.pe.N_multi); pe_flag = 1; break;
+		case OPT_MAX_OCC: ALN_INT("--max-occ", INT_MIN, &o.pe.max_occ); pe_flag = 1; break;
+		case OPT_BAM: bam = 1; break;
+		case OPT_BAM_LEVEL:
+			if (!aln_parse_int("--bam-level", optarg, 0, 9, &bam_level)) return 1;
+			break;
 		case OPT_HELP: return aln_usage(&o, stdout);
 		default: return 1;
 		}
 	}
+#undef ALN_INT
 	if (opte > 0) {
 		opt->max_gape = opte;
 		opt->mode &= ~BWA_MODE_GAPE;
 	}
 	if (opt->n_threads < 1) {
-		fprintf(stderr, "[W::%s] -t %d is below 1; using 1 thread\n", __func__, opt->n_threads);
+		fprintf(stderr, "[W::aln] -t %d is below 1; using 1 thread\n", opt->n_threads);
 		opt->n_threads = 1;
+	}
+	{
+		// The search keeps one priority stack per score below
+		// score(max_diff + 1, max_gapo + 1, max_gape + 1) and indexes it by an entry's score. With
+		// non-negative penalties every entry fits when one more difference of each kind still adds
+		// a positive score: all three penalties 0, or a -o below -1 that cancels the others, leaves
+		// too few stacks, and stock writes past the end of them.
+		const long long room = opt->max_gapo >= 0
+			? (long long)opt->s_mm + opt->s_gapo + opt->s_gape
+			: (long long)opt->s_mm + (long long)(opt->max_gapo + 1) * opt->s_gapo + ((long long)opt->max_gape + 1) * opt->s_gape;
+		if (room <= 0) {
+			fprintf(stderr, "[E::aln] -M %d -O %d -E %d with -o %d leaves the search no room for a difference; "
+					"use a positive penalty%s\n", opt->s_mm, opt->s_gapo, opt->s_gape, opt->max_gapo,
+					opt->max_gapo < -1 ? " or -o -1 or more" : "");
+			return 1;
+		}
 	}
 
 	if (optind + 2 > argc) return aln_usage(&o, stderr);
 	if (optind + 4 <= argc) return aln_usage(&o, stderr);
 	const int paired = optind + 3 == argc;
 	if (pe_flag && !paired)
-		fprintf(stderr, "[W::%s] paired-end options (-a, -c, -s, -A, -P, --max-occ, --max-xa-hits-discordant) are ignored with one FASTQ\n", __func__);
+		fprintf(stderr, "[W::aln] paired-end options (-a, -c, -s, -A, -P, --max-occ, --max-xa-hits-discordant) are ignored with one FASTQ\n");
 
 	{
 		const int max_bc = paired ? BWA_MAX_BCLEN / 2 : BWA_MAX_BCLEN; // paired: both barcodes are joined into one buffer
 		if (bc_len > max_bc) {
-			fprintf(stderr, "[E::%s] -B %d is too long: the maximum barcode length is %d%s\n", __func__, bc_len, max_bc,
+			fprintf(stderr, "[E::aln] -B %d is too long: the maximum barcode length is %d%s\n", bc_len, max_bc,
 					paired ? " with two read files (the two barcodes are joined)" : "");
 			return 1;
 		}
@@ -530,23 +685,52 @@ int main_aln(int argc, char *argv[])
 
 	const char *prefix = argv[optind], *fn_fq = argv[optind + 1];
 	{
+		// An index staged with `bwa-mem3 shm` is attached by load_index without reading the
+		// disk files, so only an index that is not staged must be on disk.
 		std::string probe = std::string(prefix) + ".bwt.2bit.64";
-		if (access(probe.c_str(), F_OK) != 0) {
-			fprintf(stderr, "[E::%s] fail to locate the index '%s' (no %s); run `bwa-mem3 index` first\n",
-					__func__, prefix, probe.c_str());
+		if (bwa_shm_test(prefix) != 1 && access(probe.c_str(), F_OK) != 0) {
+			fprintf(stderr, "[E::aln] fail to locate the index '%s' (no %s); run `bwa-mem3 index` first\n",
+					prefix, probe.c_str());
 			return 1;
 		}
 	}
-	if (!aln_input_ok(fn_fq) || (paired && !aln_input_ok(argv[optind + 2])) || !aln_output_ok(out_path))
+	if (paired && strcmp(fn_fq, "-") == 0 && strcmp(argv[optind + 2], "-") == 0) {
+		// the first '-' would take all of standard input and leave the second empty
+		fprintf(stderr, "[E::aln] standard input ('-') can stand for only one of the two read files\n");
 		return 1;
+	}
+	if (!aln_input_ok(fn_fq) || (paired && !aln_input_ok(argv[optind + 2])))
+		return 1;
+	for (int k = 0; k < (paired ? 2 : 1); ++k) {
+		const char *in = argv[optind + 1 + k];
+		if (aln_same_file(out_path, in) || (strcmp(in, "-") == 0 && aln_out_is_stdin(out_path))) {
+			fprintf(stderr, "[E::aln] -f '%s' is also an input; writing it would truncate the reads before they are read\n", out_path);
+			return 1;
+		}
+	}
+	{ // -f naming an index file would truncate it before (or while) the index is read; the
+	  // `.meth.*` files are an `index --meth` seed index, which aln does not read but `mem --meth` needs
+		static const char *const idx_sfx[] = {"", ".bwt.2bit.64", ".pac", ".ann", ".amb", ".0123", ".alt",
+											  ".meth.bwt.2bit.64", ".meth.pac", ".meth.ann", ".meth.amb"};
+		for (const char *sfx : idx_sfx) {
+			std::string comp = std::string(prefix) + sfx;
+			if (aln_same_file(out_path, comp.c_str())) {
+				fprintf(stderr, "[E::aln] -f '%s' is the index file '%s'; writing it would overwrite the index\n",
+						out_path, comp.c_str());
+				return 1;
+			}
+		}
+	}
+	if (!aln_output_ok(out_path)) return 1;
 	FMI_search *fmi = new FMI_search(prefix);
 	fmi->load_index(/*load_pac=*/true, opt->n_threads);
 	const bntseq_t *bns = fmi->idx->bns;
 	bwa_aln::bwt_t *bwt = bwt_from_fmi(fmi);
 
 	kstring_t hdr = {0, 0, 0};
-	aln_print_sam_hdr(&hdr, bns, rg_line, bwa_pg);
-	aln_out_t *out = aln_out_open(out_path, bam, bam_level, hdr.s);
+	aln_print_sam_hdr(&hdr, bns, rg_line.get(), bwa_pg);
+	aln_out_t *out = (!bam || aln_bam_sq_lengths_ok(rg_line.get(), bns))
+		? aln_out_open(out_path, bam, bam_level, hdr.s, opt->n_threads) : NULL;
 	free(hdr.s);
 	int ret = 1;
 	if (out) {
@@ -557,6 +741,5 @@ int main_aln(int argc, char *argv[])
 
 	bwt_destroy(bwt);
 	delete fmi;
-	free(rg_line);
 	return ret;
 }

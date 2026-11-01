@@ -216,6 +216,21 @@ compare sw_I plain "$work/sw_I.fq" "" "" -I -q 20
 gen_reads 235 800 36 0 | mawk_or_awk 'NR % 4 == 1 { $0 = $0 " 1:" ((NR % 8 == 1) ? "Y" : "N") ":0:ACGT" } 1' > "$work/sw_Y.fq"
 compare sw_Y plain "$work/sw_Y.fq" "" "" -Y
 need_tag sw_Y 'XT:A:'
+# The optimistic stack bound exceeds the packed score range, but actual scores fit.
+run_case sw_M1024 241 100 36 0 "" "" -M 1024 -n 1 -o 0
+need_tag sw_M1024 'XT:A:'
+run_case sw_M2047 243 100 36 0 "" "" -M 2047 -n 1 -o 0
+run_case sw_M512 244 100 36 0 "" "" -M 512 -n 3 -o 0
+# This used to wrap the stack-allocation score to 39 and then index far beyond it.
+gen_reads 242 1 36 0 > "$work/score_overflow.fq"
+rc=0
+"$BWA_MEM3" aln -M 1073741824 -n 3 -o 0 "$work/plain/mem3/ref.fa" "$work/score_overflow.fq" \
+    > "$work/score_overflow.sam" 2> "$work/score_overflow.err" || rc=$?
+if [ "$rc" -ne 1 ] || ! grep -q 'search score .* cannot be represented' "$work/score_overflow.err"; then
+    echo "FAIL: aln_parity: an unrepresentable search score must exit 1 with its diagnostic, not crash (exit $rc)" >&2
+    exit 1
+fi
+echo "aln_parity: ok unrepresentable search score exits 1"
 
 # One 1,000 bp read and twenty 250 bp reads in a single batch (the batch-wide gap-open cap
 # follows the longest read), plus an all-N read (the '-' reads are in the `ambig` set).

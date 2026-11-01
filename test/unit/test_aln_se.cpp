@@ -6,6 +6,7 @@
 #include "doctest/doctest.h"
 
 #include "aln_test_ref.h"
+#include "run_in_child.h"
 #include "../../src/FMI_search.h"
 #include "../../src/aln/aln_main.h"
 #include "../../src/aln/bwase.h"
@@ -17,11 +18,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
 #include <vector>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace {
@@ -29,29 +32,25 @@ namespace {
 namespace ba = bwa_aln;
 
 struct SeIndex {
-    std::string dir, prefix;
+    bwa_tests::TempDir tmp_dir{"aln_se_unit"}; // removed only by the process that made it
+    std::string dir = tmp_dir.path(), prefix;
     std::unique_ptr<FMI_search> fmi;
     ba::bwt_t *bwt = nullptr;
 
     SeIndex()
     {
-        std::string tmpl_s = aln_test::tmp_template("aln_se_unit");
-        char *tmpl = &tmpl_s[0];
-        REQUIRE(mkdtemp(tmpl) != nullptr);
-        dir = tmpl;
         prefix = dir + "/ref.fa";
         REQUIRE(aln_test::write_test_fasta(prefix));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         fmi.reset(new FMI_search(prefix.c_str()));
         fmi->load_index(true, 1);
         bwt = ba::bwt_from_fmi(fmi.get());
+        tmp_dir.remove(); // loaded: the cases need only the in-memory index
     }
     ~SeIndex()
     {
         ba::bwt_destroy(bwt);
         fmi.reset();
-        std::string cmd = "rm -rf '" + dir + "'";
-        if (system(cmd.c_str()) != 0) std::fprintf(stderr, "warning: could not remove %s\n", dir.c_str());
     }
     const bntseq_t *bns() const { return fmi->idx->bns; }
 };
@@ -143,16 +142,76 @@ TEST_CASE("aln_se: @HD in -r text suppresses the default @HD"
 TEST_CASE("aln_se: drand48 is seeded once per run, not per batch"
           * doctest::test_suite("unit/aln_se")) {
     SeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_se_case"}; // this case's files, removed when it ends
     // c1[150:186] lies in the c1/c2 reverse-complement copy: two equally good hits, so every
     // read draws from drand48. Four copies of it, as one batch of 4 and as two batches of 2.
     std::string rep = aln_test::test_contigs()[0].second.substr(150, 36);
-    std::string fq = write_fastq(ix.dir, "rep.fq", {rep, rep, rep, rep});
-    std::string one = run_se(4, fq, ix.dir + "/one.sam");
-    std::string two = run_se(2, fq, ix.dir + "/two.sam");
+    std::string fq = write_fastq(scratch.path(), "rep.fq", {rep, rep, rep, rep});
+    std::string one = run_se(4, fq, scratch.path() + "/one.sam");
+    std::string two = run_se(2, fq, scratch.path() + "/two.sam");
     CHECK(one == two);
     CHECK(one.find("X0:i:2") != std::string::npos);
     // A re-run in the same process reseeds, so it reproduces the first run.
-    CHECK(run_se(4, fq, ix.dir + "/again.sam") == one);
+    CHECK(run_se(4, fq, scratch.path() + "/again.sam") == one);
+}
+
+TEST_CASE("aln_se: a huge -l allocates no seed widths for shorter reads and matches -l 1024"
+          * doctest::test_suite("unit/aln_se")) {
+    // The seed-width buffer is sized only for a read longer than -l. Sized per search slot up
+    // front, -l 2^28 would zero-fill 8 x 4 GiB per thread here; with INT_MAX, -l + 1 overflowed.
+    SeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_se_case"}; // this case's files, removed when it ends
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::string fq = write_fastq(scratch.path(), "seedw.fq", {c1.substr(40, 36), c1.substr(300, 36), c1.substr(77, 30)});
+    auto run = [&](int seed_len, const std::string &out_path) {
+        ba::aln_opt_t o;
+        ba::aln_opt_init(&o);
+        o.gap.seed_len = seed_len;
+        ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
+        REQUIRE(out != nullptr);
+        REQUIRE(ba::aln_run_se(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, fq.c_str(), out) == 0);
+        REQUIRE(ba::aln_out_close(out) == 0);
+        std::ifstream in(out_path);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+    const std::string base = run(1024, scratch.path() + "/seedw_1024.sam");
+    CHECK(base.find("\tXT:A:U") != std::string::npos);
+    CHECK(run(1 << 28, scratch.path() + "/seedw_big.sam") == base);
+    CHECK(run(INT_MAX, scratch.path() + "/seedw_max.sam") == base);
+    // and a read longer than -l still gets its seed widths
+    CHECK(run(20, scratch.path() + "/seedw_20.sam").find("\tXT:A:U") != std::string::npos);
+}
+
+TEST_CASE("aln_pe: drand48 is seeded once per run, not per batch, in aln_run_pe too"
+          * doctest::test_suite("unit/aln_se")) {
+    // Both ends of each pair lie in c1[100:400], which c2 holds reverse-complemented, so each
+    // end has two equally good hits and draws from drand48. Eight copies of the pair, in batches
+    // of 4 and of 2: the draws stay in one serial pass seeded once per run, so the records match.
+    SeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_se_case"}; // this case's files, removed when it ends
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    const std::string m1 = c1.substr(150, 36), m2 = aln_test::revcomp(c1.substr(150 + 200 - 36, 36));
+    std::vector<std::string> v1(8, m1), v2(8, m2);
+    const std::string f1 = write_fastq(scratch.path(), "rep_pe1.fq", v1), f2 = write_fastq(scratch.path(), "rep_pe2.fq", v2);
+    auto run = [&](int bs, const std::string &path) {
+        ba::aln_opt_t o;
+        ba::aln_opt_init(&o);
+        o.batch_size = bs;
+        ba::aln_out_t *out = ba::aln_out_open(path.c_str(), 0, 0, "");
+        REQUIRE(out != nullptr);
+        REQUIRE(ba::aln_run_pe(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, f1.c_str(), f2.c_str(), out) == 0);
+        REQUIRE(ba::aln_out_close(out) == 0);
+        std::ifstream in(path);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+    const std::string four = run(4, scratch.path() + "/rep_pe_4.sam");
+    CHECK(four.find("X0:i:2") != std::string::npos);
+    CHECK(run(2, scratch.path() + "/rep_pe_2.sam") == four);
+    CHECK(run(4, scratch.path() + "/rep_pe_again.sam") == four);
 }
 
 // --- SAM formatting without printf -------------------------------------------------------
@@ -421,4 +480,106 @@ TEST_CASE("aln_se: bwa_print_sam1 matches the ksprintf printer"
         u.qual.clear(); u.s.qual = nullptr;
         check_same(u, nullptr, mode, 1);
     }
+}
+
+namespace {
+
+// A one-contig index of `len` bases, for reads longer than the shared reference's contigs.
+struct LongIndex {
+    bwa_tests::TempDir tmp_dir{"aln_se_long"}; // removed only by the process that made it
+    std::string dir = tmp_dir.path(), prefix, contig;
+    std::unique_ptr<FMI_search> fmi;
+    ba::bwt_t *bwt = nullptr;
+
+    explicit LongIndex(int len)
+    {
+        prefix = dir + "/ref.fa";
+        uint32_t state = 97;
+        contig = aln_test::lcg_dna(state, len);
+        FILE *fp = fopen(prefix.c_str(), "w");
+        REQUIRE(fp != nullptr);
+        const bool ok = fprintf(fp, ">long\n%s\n", contig.c_str()) >= 0;
+        REQUIRE((fclose(fp) == 0 && ok));
+        REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
+        fmi.reset(new FMI_search(prefix.c_str()));
+        fmi->load_index(true, 1);
+        bwt = ba::bwt_from_fmi(fmi.get());
+    }
+    ~LongIndex()
+    {
+        ba::bwt_destroy(bwt);
+        fmi.reset();
+    }
+};
+
+} // namespace
+
+TEST_CASE("aln_se: a CIGAR operation of 16384 bases or more keeps its length"
+          * doctest::test_suite("unit/aln_se")) {
+    // stock's 16-bit bwa_cigar_t holds 14 bits of length: 17000M would wrap into another op
+    LongIndex ix(21000);
+    const std::string read = ix.contig.substr(500, 17000) + ix.contig.substr(17501, 3000); // 1-bp deletion
+    const std::string fq = write_fastq(ix.dir, "long.fq", {read});
+    ba::aln_opt_t o;
+    ba::aln_opt_init(&o);
+    o.gap.max_diff = 2;
+    o.gap.fnr = -1.0;
+    const std::string out_path = ix.dir + "/long.sam";
+    ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
+    REQUIRE(out != nullptr);
+    REQUIRE(ba::aln_run_se(&o, ix.bwt, ix.fmi->idx->bns, ix.fmi->idx->pac, fq.c_str(), out) == 0);
+    REQUIRE(ba::aln_out_close(out) == 0);
+    std::ifstream in(out_path);
+    std::string rec;
+    for (std::string l; std::getline(in, l);)
+        if (!l.empty() && l[0] != '@') rec = l;
+    std::istringstream f(rec);
+    std::string name, flag, rname, pos, mapq, cigar;
+    f >> name >> flag >> rname >> pos >> mapq >> cigar;
+    CHECK(rname == "long");
+    CHECK(pos == "501");
+    // the deletion may be placed anywhere in a run of equal bases; the lengths must sum to the read
+    int m = 0, d = 0, big = 0;
+    for (size_t i = 0; i < cigar.size();) {
+        size_t j = i;
+        while (j < cigar.size() && isdigit((unsigned char)cigar[j])) ++j;
+        REQUIRE(j < cigar.size());
+        const int len = std::stoi(cigar.substr(i, j - i));
+        if (cigar[j] == 'M') m += len;
+        else if (cigar[j] == 'D') d += len;
+        if (len >= 16384) ++big;
+        i = j + 1;
+    }
+    CAPTURE(cigar);
+    CHECK(m == 20000);
+    CHECK(d == 1);
+    CHECK(big == 1);
+}
+
+TEST_CASE("aln_se: a read of 65536 bases is refused at input and the run exits 1"
+          * doctest::test_suite("unit/aln_se")) {
+    LongIndex ix(70000);
+    const std::string fq = write_fastq(ix.dir, "huge.fq", {ix.contig.substr(100, 65536)});
+    const std::string err_path = ix.dir + "/huge.err";
+    const int status = bwa_tests::run_in_child([&] {
+        ba::aln_opt_t o;
+        ba::aln_opt_init(&o);
+        o.gap.max_diff = 2;
+        o.gap.fnr = -1.0;
+        ba::aln_out_t *out = ba::aln_out_open((ix.dir + "/huge.sam").c_str(), 0, 0, "");
+        if (!out) _exit(3);
+        int rc = ba::aln_run_se(&o, ix.bwt, ix.fmi->idx->bns, ix.fmi->idx->pac, fq.c_str(), out);
+        if (ba::aln_out_close(out) != 0) rc = 4;
+        _exit(rc);
+    }, err_path.c_str());
+    REQUIRE(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 1);
+    std::ifstream e(err_path);
+    std::stringstream ss;
+    ss << e.rdbuf();
+    CHECK(ss.str().find("record 1 has 65536 bases; the maximum is 65535") != std::string::npos);
+    std::ifstream sam(ix.dir + "/huge.sam");
+    std::stringstream body;
+    body << sam.rdbuf();
+    for (const std::string &l : lines(body.str())) CHECK(l[0] == '@'); // the read is not stored, so not written
 }

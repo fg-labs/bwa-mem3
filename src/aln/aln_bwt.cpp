@@ -92,7 +92,9 @@ bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 {
     if (k == 0) return (bwtint_t)(-1); // bwa stores -1 for the `$` suffix; bwa-mem3 stores seq_len
     int64_t pos = (int64_t)k, sa_entry = 0, offset = 0;
-    // drop_sentinel_offset = 0: bwa's walk reaching the `$` row keeps its offset
+    // drop_sentinel_offset = 0: bwa's walk reaching the `$` row keeps its offset. This is the walk
+    // FMI_search::get_sa_entry_compressed does (same values); call_one_step is used for its
+    // branchless NEON symbol select, which the scalar get_sa_entry_compressed chain lacks.
     while (!bwt->fmi->call_one_step(pos, sa_entry, offset, 0)) pos = sa_entry;
     return (bwtint_t)sa_entry;
 }

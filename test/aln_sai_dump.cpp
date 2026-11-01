@@ -21,6 +21,9 @@
 #include "aln/aln_bwt.h"
 #include "aln/bwaseqio.h"
 #include "aln/bwtgap.h"
+// The synthetic reference is the unit tests' own generator, included rather than copied: the
+// regression scripts' expected outputs depend on its exact sequence, so a second copy (in awk,
+// say) could drift from the one the unit tests check.
 #include "unit/aln_test_ref.h"
 
 #include <cstdio>
@@ -164,5 +167,6 @@ int main(int argc, char *argv[])
     bwa_seq_close(ks);
     bwt_destroy(bwt);
     free(opt);
-    return fflush(stdout) == 0 ? 0 : 1;
+    // ferror as well: a failed fwrite of the body can leave nothing for fflush to report
+    return (fflush(stdout) == 0 && !ferror(stdout)) ? 0 : 1;
 }

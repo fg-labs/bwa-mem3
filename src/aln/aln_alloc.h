@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* New code for bwa-mem3 (not from upstream bwa): allocation that stops with a message on
  * failure. The upstream code dereferences the result of every malloc/calloc/realloc/strdup
  * unchecked; these wrappers keep its call sites and turn a failed allocation into a clean
@@ -19,7 +20,8 @@ static inline void *aln_nonnull(void *p, size_t bytes)
 	return p;
 }
 static inline void *aln_malloc(size_t n) { return aln_nonnull(malloc(n), n); }
-static inline void *aln_calloc(size_t n, size_t sz) { return aln_nonnull(calloc(n, sz), n * sz); }
+// (n && sz), not n * sz: a product that wraps to 0 would let calloc's NULL pass as a 0-byte success
+static inline void *aln_calloc(size_t n, size_t sz) { return aln_nonnull(calloc(n, sz), n && sz); }
 static inline void *aln_realloc(void *p, size_t n) { return aln_nonnull(realloc(p, n), n); }
 static inline char *aln_strdup(const char *s) { return (char*)aln_nonnull(strdup(s), 1); }
 

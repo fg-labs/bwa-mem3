@@ -56,7 +56,10 @@ Each change to upstream-derived code adds a line here.
   block, the malloc wrappers and the `bwa_aln2seq` declaration (ported with the SAM
   code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
   `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch` and
-  `aln_batch_max_gapo`, which are new.
+  `aln_batch_max_gapo`, which are new. Score arithmetic is widened, the optimistic
+  stack bound saturates at 2048 (the 11-bit packed score capacity), and an actual score
+  outside the stack or packed range exits 1 with a diagnostic before indexing or packing.
+  A large optimistic bound alone does not reject a search whose actual scores fit.
 - `bwtaln.cpp`: `gap_init_opt`, `bwa_cal_maxdiff` and `bwt_cal_width` are upstream's
   bodies. `bwa_cal_sa_reg_gap` differs in three ways. (1) The read is complemented into
   a per-thread scratch buffer instead of in place, and `name`, `seq`, `rseq` and `qual`

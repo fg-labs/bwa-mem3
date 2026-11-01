@@ -3,11 +3,16 @@
  * Version 2.0 (see LICENSE in this directory).
  *
  * MODIFIED from the original: moved into namespace bwa_aln, BAM input is dropped,
- * and C++ casts are added. */
+ * and C++ casts are added. bwa_seq_open returns NULL when the file cannot be opened, and
+ * bwa_seq_close reports a failed gzclose and returns -1, instead of exiting; bwa_read_seq
+ * names a malformed record it skips (bwa_seq_n_bad counts them), refuses a batch size below
+ * 1, and counts a barcode length above BWA_MAX_BCLEN as a failure instead of an end of file.
+ * Which reads are returned, and in which batches, is unchanged. */
 #include "bwaseqio.h"
 #include "aln_alloc.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,24 +48,47 @@ static const unsigned char nst_nt4_table[256] = {
 
 struct __bwa_seqio_t {
 	kseq_t *ks;
+	char *fn;      // for messages
+	long n_rec;    // records parsed so far
+	int n_bad;     // malformed records skipped
+	int stop;      // a read too long to search was refused: no further reads are returned
 };
 
 bwa_seqio_t *bwa_seq_open(const char *fn)
 {
 	gzFile fp;
 	bwa_seqio_t *bs;
+	// not xzopen, which exits: the caller returns, so an output already open is still closed
+	// (a BAM gets its EOF block) when an input vanishes after the preflight check
+	errno = 0;
+	fp = strcmp(fn, "-") ? gzopen(fn, "r") : gzdopen(fileno(stdin), "r");
+	if (fp == 0) {
+		fprintf(stderr, "[E::aln] fail to open file '%s': %s\n", fn, errno ? strerror(errno) : "out of memory");
+		return 0;
+	}
 	bs = (bwa_seqio_t*)aln_calloc(1, sizeof(bwa_seqio_t));
-	fp = xzopen(fn, "r");
 	bs->ks = kseq_init(fp);
+	bs->fn = aln_strdup(fn);
 	return bs;
 }
 
-void bwa_seq_close(bwa_seqio_t *bs)
+int bwa_seq_close(bwa_seqio_t *bs)
 {
-	if (bs == 0) return;
-	err_gzclose(bs->ks->f->f);
+	int ret = 0, z;
+	if (bs == 0) return 0;
+	if ((z = gzclose(bs->ks->f->f)) != Z_OK) { // stock: err_gzclose, which exits
+		fprintf(stderr, "[E::aln] closing '%s' failed: %s\n", bs->fn, z == Z_ERRNO ? strerror(errno) : zError(z));
+		ret = -1;
+	}
 	kseq_destroy(bs->ks);
+	free(bs->fn);
 	free(bs);
+	return ret;
+}
+
+int bwa_seq_n_bad(const bwa_seqio_t *bs)
+{
+	return bs ? bs->n_bad : 0;
 }
 
 void seq_reverse(int len, ubyte_t *seq, int is_comp)
@@ -106,11 +134,24 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 
 	if (l_bc > BWA_MAX_BCLEN) {
 		fprintf(stderr, "[%s] the maximum barcode length is %d.\n", __func__, BWA_MAX_BCLEN);
+		++bs->n_bad; // stock returns NULL with *n unset, which a caller reads as end of file
+		bs->stop = 1;
+		*n = 0;
+		return 0;
+	}
+	if (n_needed <= 0) {
+		fprintf(stderr, "[%s] the batch size must be positive, not %d.\n", __func__, n_needed);
+		*n = 0;
+		return 0;
+	}
+	if (bs->stop) {
+		*n = 0;
 		return 0;
 	}
 	n_seqs = 0;
 	seqs = (bwa_seq_t*)aln_calloc(n_needed, sizeof(bwa_seq_t));
 	while ((l = kseq_read(seq)) >= 0) {
+		++bs->n_rec;
 		if ((mode & BWA_MODE_CFY) && (seq->comment.l != 0)) {
 			// skip reads that are marked to be filtered by Casava
 			char *s = index(seq->comment.s, ':');
@@ -121,6 +162,16 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 		if (is_64 && seq->qual.l)
 			for (i = 0; i < seq->qual.l; ++i) seq->qual.s[i] -= 31;
 		if (seq->seq.l <= l_bc) continue; // sequence length equals or smaller than the barcode length
+		if (seq->seq.l - l_bc > ALN_MAX_READ_LEN) {
+			// len and full_len are 20-bit fields and the search packs the remaining length into
+			// 16 bits, so a longer read would be stored or searched as a shorter one. Refuse it
+			// before it is stored; the reads before it are still aligned, and the run exits 1.
+			++bs->n_bad;
+			bs->stop = 1;
+			fprintf(stderr, "[E::aln] '%s': record %ld has %ld bases; the maximum is %d. Reading stops here, and the run will exit 1\n",
+					bs->fn, bs->n_rec, (long)(seq->seq.l - l_bc), ALN_MAX_READ_LEN);
+			break;
+		}
 		p = &seqs[n_seqs++];
 		if (l_bc) { // then trim barcode
 			for (i = 0; i < l_bc; ++i)
@@ -142,7 +193,7 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 		n_tot += p->full_len;
 		p->seq = (ubyte_t*)aln_calloc(p->full_len, 1);
 		for (i = 0; i != p->full_len; ++i)
-			p->seq[i] = nst_nt4_table[(int)seq->seq.s[i]];
+			p->seq[i] = nst_nt4_table[(unsigned char)seq->seq.s[i]]; // a high-bit byte is 4, not a read before the table
 		if (seq->qual.l) { // copy quality
 			p->qual = (ubyte_t*)aln_strdup((char*)seq->qual.s);
 			if (trim_qual >= 1) n_trimmed += bwa_trim_read(trim_qual, p);
@@ -157,6 +208,13 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 			if (t > 2 && p->name[t-2] == '/' && (p->name[t-1] == '1' || p->name[t-1] == '2')) p->name[t-2] = '\0';
 		}
 		if (n_seqs == n_needed) break;
+	}
+	if (l == -2) { // a truncated record ends the batch, as in stock; the next call resumes after it
+		++bs->n_bad;
+		fprintf(stderr, "[E::aln] '%s': record %ld is malformed (no quality line, or one not as long as the sequence); "
+				"it ends the batch as in bwa (with no read before it in the batch, reading stops), and the run will exit 1\n",
+				bs->fn, bs->n_rec + 1);
+		++bs->n_rec; // the malformed record is a record too: later diagnostics count past it
 	}
 	*n = n_seqs;
 	if (n_seqs && trim_qual >= 1)

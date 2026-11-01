@@ -15,6 +15,7 @@
 #include "../../src/aln/bwtgap.h"
 #include "../../src/bwa.h"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -28,29 +29,25 @@ namespace {
 namespace ba = bwa_aln;
 
 struct SearchIndex {
-    std::string dir, prefix;
+    bwa_tests::TempDir tmp_dir{"aln_search_unit"}; // removed only by the process that made it
+    std::string dir = tmp_dir.path(), prefix;
     std::unique_ptr<FMI_search> fmi;
     ba::bwt_t *bwt = nullptr;
 
     SearchIndex()
     {
-        std::string tmpl_s = aln_test::tmp_template("aln_search_unit");
-        char *tmpl = &tmpl_s[0];
-        REQUIRE(mkdtemp(tmpl) != nullptr);
-        dir = tmpl;
         prefix = dir + "/ref.fa";
         REQUIRE(aln_test::write_test_fasta(prefix));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         fmi.reset(new FMI_search(prefix.c_str()));
         fmi->load_index(false, 1);
         bwt = ba::bwt_from_fmi(fmi.get());
+        tmp_dir.remove(); // loaded: the cases need only the in-memory index
     }
     ~SearchIndex()
     {
         ba::bwt_destroy(bwt);
         fmi.reset();
-        std::string cmd = "rm -rf '" + dir + "'";
-        if (system(cmd.c_str()) != 0) std::fprintf(stderr, "warning: could not remove %s\n", dir.c_str());
     }
 };
 
@@ -60,27 +57,22 @@ SearchIndex &index_fixture()
     return idx;
 }
 
-// Reads for a batch, loaded through bwa_read_seq.
+// Reads for a batch, loaded through bwa_read_seq from a FASTQ in the batch's own scratch
+// directory (removed with the file on destruction).
 struct Batch {
+    bwa_tests::TempDir dir{"aln_search_fq"};
     ba::bwa_seq_t *seqs = nullptr;
     int n = 0;
     explicit Batch(const std::vector<std::string> &reads)
     {
-        std::string tmpl_s = aln_test::tmp_template("aln_search_fq");
-        char *tmpl = &tmpl_s[0];
-        int fd = mkstemp(tmpl);
-        REQUIRE(fd >= 0);
-        close(fd);
-        FILE *fp = fopen(tmpl, "w");
-        REQUIRE(fp != nullptr);
+        std::string text;
         for (size_t i = 0; i < reads.size(); ++i)
-            fprintf(fp, "@r%zu\n%s\n+\n%s\n", i, reads[i].c_str(), std::string(reads[i].size(), 'I').c_str());
-        fclose(fp);
-        ba::bwa_seqio_t *bs = ba::bwa_seq_open(tmpl);
+            text += "@r" + std::to_string(i) + "\n" + reads[i] + "\n+\n" + std::string(reads[i].size(), 'I') + "\n";
+        dir.write("r.fq", text); // throws on a short write
+        ba::bwa_seqio_t *bs = ba::bwa_seq_open(dir.file("r.fq").c_str());
         REQUIRE(bs != nullptr);
         seqs = ba::bwa_read_seq(bs, 0x40000, &n, 0, 0);
         ba::bwa_seq_close(bs);
-        remove(tmpl);
         REQUIRE(n == (int)reads.size());
     }
     ~Batch() { ba::bwa_free_read_seq(n, seqs); }
@@ -107,6 +99,21 @@ std::string exact32() { return c1().substr(450, 32); }
 // 40-mer with c1[480] deleted: a 1-bp deletion in the read relative to the reference.
 std::string deletion40() { return c1().substr(460, 20) + c1().substr(481, 20); }
 
+// Checks that alignment `a` is a single SA row placing the read on the forward strand of c1 at
+// 0-based `start`, covering `span` reference bases. The index text is the forward strand followed
+// by its reverse complement (l_pac bases each, c1 first). bwa aln searches the read reversed, so a
+// read that matches the forward strand is found in the reverse-complement half, at row value
+// 2 * l_pac - (start + span); bwa_sa2pos maps that back with strand = !is_rev. A reverse-strand
+// read would be found in the forward half.
+void check_planted(const ba::bwt_t *bwt, const ba::bwt_aln1_t &a, int64_t start, int64_t span)
+{
+    REQUIRE(a.l == a.k);
+    const int64_t l_pac = (int64_t)bwt->seq_len / 2, sa = (int64_t)ba::bwt_sa(bwt, a.k);
+    CAPTURE(sa);
+    CHECK(sa >= l_pac); // a forward-strand hit
+    CHECK(sa == 2 * l_pac - (start + span));
+}
+
 bool same_aln(const ba::bwt_aln1_t &a, const ba::bwt_aln1_t &b)
 {
     return a.n_mm == b.n_mm && a.n_gapo == b.n_gapo && a.n_gape == b.n_gape && a.score == b.score
@@ -114,6 +121,36 @@ bool same_aln(const ba::bwt_aln1_t &a, const ba::bwt_aln1_t &b)
 }
 
 } // namespace
+
+TEST_CASE("aln_search: priority stack bounds saturate without overflowing"
+          * doctest::test_suite("unit/aln_search")) {
+    ba::gap_opt_t opt = make_opt(3, 0);
+    opt.s_mm = 1 << 30;
+    ba::gap_stack_t *stack = ba::gap_init_stack(3, 0, 6, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 1024;
+    stack = ba::gap_init_stack(3, 0, 6, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 3;
+    stack = ba::gap_init_stack(3, 0, 6, &opt);
+    CHECK(stack->n_stacks == 51);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 2047;
+    opt.s_gapo = opt.s_gape = 0;
+    stack = ba::gap_init_stack(0, 0, 0, &opt);
+    CHECK(stack->n_stacks == 2047);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 2048;
+    stack = ba::gap_init_stack(0, 0, 0, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = opt.s_gapo = opt.s_gape = INT_MAX;
+    stack = ba::gap_init_stack(INT_MAX, INT_MAX, INT_MAX, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+}
 
 TEST_CASE("aln_search: exact 32-mer from c1 gives one hit, score 0, n_mm 0"
           * doctest::test_suite("unit/aln_search")) {
@@ -127,6 +164,7 @@ TEST_CASE("aln_search: exact 32-mer from c1 gives one hit, score 0, n_mm 0"
     CHECK((int)a.n_mm == 0);
     CHECK((int)a.n_gapo == 0);
     CHECK(a.l - a.k + 1 == 1);
+    check_planted(ix.bwt, a, 450, 32);
     CHECK((int)b.seqs[0].type == BWA_TYPE_NO_MATCH);
     CHECK(b.seqs[0].sa == 0);
     CHECK((uint64_t)b.seqs[0].c1 == 0);
@@ -145,6 +183,7 @@ TEST_CASE("aln_search: one planted mismatch gives n_mm 1 at -n 2"
     CHECK((int)b.seqs[0].aln[0].n_mm == 1);
     CHECK((int)b.seqs[0].aln[0].n_gapo == 0);
     CHECK((int)b.seqs[0].aln[0].score == opt.s_mm);
+    check_planted(ix.bwt, b.seqs[0].aln[0], 450, 32);
 }
 
 TEST_CASE("aln_search: one planted 1-bp deletion found with -o 1, not with -o 0"
@@ -157,6 +196,7 @@ TEST_CASE("aln_search: one planted 1-bp deletion found with -o 1, not with -o 0"
     CHECK((int)with_gap.seqs[0].aln[0].n_gapo == 1);
     CHECK((int)with_gap.seqs[0].aln[0].n_del == 1);
     CHECK((int)with_gap.seqs[0].aln[0].n_mm == 0);
+    check_planted(ix.bwt, with_gap.seqs[0].aln[0], 460, 41);
 
     Batch no_gap({deletion40()});
     ba::gap_opt_t o0 = make_opt(2, 0);
@@ -191,7 +231,7 @@ TEST_CASE("aln_search: max_gapo cap uses the batch's longest read"
     CHECK(ba::bwa_cal_maxdiff(20, BWA_AVG_ERR, 0.04) == 2);
     CHECK(ba::bwa_cal_maxdiff(100, BWA_AVG_ERR, 0.04) == 5);
 
-    ba::gap_opt_t opt = ba::gap_init_opt()[0];
+    ba::gap_opt_t opt = make_opt(-1, 4);
     opt.fnr = 0.04;
     opt.max_diff = -1;
     opt.max_gapo = 4; // `-n 0.04 -o 4`
@@ -219,7 +259,7 @@ TEST_CASE("aln_search: max_gapo cap uses the batch's longest read"
     // bwa_cal_maxdiff(20) == 2, bound it first), and the 20 bp read with two
     // 1-bp deletions is found in both.
     std::string two_del = c1().substr(450, 8) + c1().substr(459, 10) + c1().substr(470, 12);
-    opt = ba::gap_init_opt()[0];
+    opt = make_opt(-1, 4);
     opt.fnr = 0.04; opt.max_diff = -1; opt.max_gapo = 4; opt.indel_end_skip = 5;
     Batch a2(std::vector<std::string>{two_del});
     Batch m2(std::vector<std::string>{two_del, r100});

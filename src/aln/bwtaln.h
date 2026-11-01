@@ -30,6 +30,7 @@
 #define BWA_MIN_RDLEN 35 // for read trimming
 
 #define BWA_MAX_BCLEN 63 // maximum barcode length; 127 is the maximum
+#define ALN_MAX_READ_LEN 0xffff // the search packs the remaining length into 16 bits; read input refuses longer reads
 
 #ifndef bns_pac
 #define bns_pac(pac, k) ((pac)[(k)>>2] >> ((~(k)&3)<<1) & 3)
