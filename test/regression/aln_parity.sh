@@ -218,6 +218,7 @@ run_case nonstop 209 600 36 0 "" "" -N
 # ---- option sweep: each stock option alone, against stock aln + samse ----------------------
 run_case sw_n3 221 1000 36 0 "" "" -n 3
 run_case sw_n001 222 1000 36 0 "" "" -n 0.01
+run_case sw_n0 240 1000 36 0 "" "" -n 0 # exact-match search, -n as an integer
 run_case sw_o0 223 1000 100 0 "" "" -o 0
 run_case sw_e2 224 1000 100 0 "" "" -e 2
 run_case sw_i10 225 1000 100 0 "" "" -i 10
@@ -245,7 +246,7 @@ run_case sw_M0O0 237 600 36 0 "" "" -M 0 -O 0
 run_case sw_om1 238 600 100 0 "" "" -o -1
 run_case sw_l0 239 600 36 0 "" "" -l 0
 run_case sw_B4B2 240 600 36 0 "" "" -B 4 -B 2
-need_tag sw_Y 'XT:A:'
+need_tag sw_B4B2 'XT:A:'
 # The optimistic stack bound exceeds the packed score range, but actual scores fit.
 run_case sw_M1024 241 100 36 0 "" "" -M 1024 -n 1 -o 0
 need_tag sw_M1024 'XT:A:'
@@ -288,7 +289,8 @@ if [ "$mapped_total" -le 0 ] || [ "$xa_total" -le 0 ] || [ "$ah_total" -le 0 ]; 
     echo "FAIL: aln_parity: the cases found no mapped reads, XA tags or AH:* markers" >&2
     exit 1
 fi
-echo "PASS: aln_parity SE ($((n_cfg / 2)) cases x 2 thread counts)"
+n_se_cases=$((n_cfg / 2))
+echo "aln_parity: ok SE ($n_se_cases cases x 2 thread counts)"
 
 # ---- input, output and index forms; fail before side effects -----------------------------
 ref_stock="$work/plain/stock/ref.fa"
@@ -354,6 +356,15 @@ bam_vs_sam() { # tag sam bam
         echo "SKIP: $1: samtools not found"
         return
     fi
+    # headers too (a wrong @SQ length or a lost @RG would pass a records-only check); @PG is
+    # dropped from both, as samtools view -H adds its own
+    grep -a '^@' "$2" | grep -av '^@PG' > "$work/bam.hexpect" || true
+    samtools view -H "$3" | grep -av '^@PG' > "$work/bam.hgot" || true
+    if ! cmp -s "$work/bam.hexpect" "$work/bam.hgot"; then
+        diff -a "$work/bam.hexpect" "$work/bam.hgot" | head -n 10 >&2 || true
+        echo "FAIL: aln_parity: $1: --bam header differs from the SAM header" >&2
+        exit 1
+    fi
     grep -av '^@' "$2" > "$work/bam.expect" || true
     samtools view "$3" > "$work/bam.got"
     if ! cmp -s "$work/bam.expect" "$work/bam.got"; then
@@ -369,6 +380,11 @@ bam_vs_sam() { # tag sam bam
 }
 "$BWA_MEM3" aln -t 1 --bam "$ref_mem3" "$form_fq" > "$work/form.bam" 2> /dev/null
 bam_vs_sam "--bam SE" "$work/form.stdout.sam" "$work/form.bam"
+"$BWA_MEM3" aln -t 1 -r '@RG\tID:x\tSM:y' "$ref_mem3" "$form_fq" > "$work/form.rg.sam" 2> /dev/null
+"$BWA_MEM3" aln -t 1 -r '@RG\tID:x\tSM:y' --bam "$ref_mem3" "$form_fq" > "$work/form.rg.bam" 2> /dev/null
+bam_vs_sam "--bam SE -r" "$work/form.rg.sam" "$work/form.rg.bam"
+"$BWA_MEM3" aln -t 1 --bam --bam-level 9 "$ref_mem3" "$form_fq" > "$work/form.l9.bam" 2> /dev/null
+bam_vs_sam "--bam --bam-level 9 SE" "$work/form.stdout.sam" "$work/form.l9.bam"
 
 # index forms: an index built with --meth (the normal index plus a .meth seed index) gives the
 # same output as the plain index of the same FASTA
@@ -383,11 +399,15 @@ same_records "--meth index equals plain index" "$work/form.stdout.sam" "$work/fo
 # at the end only while its own index is the sole entry: it never removes another run's index.
 # (A private namespace would be cleaner but is not portable: macOS has none, and hosts that
 # block unprivileged user namespaces cannot give one to an ordinary user.)
+# The registry is read through the shared guard predicate, which counts a failing `shm -l` as a
+# foreign registry: an empty listing from a broken `shm -l` must not look like an empty registry.
+# shellcheck source=test/framework/shm_registry_guard.sh
+source "$repo_root/test/framework/shm_registry_guard.sh"
 shm_listed() { "$BWA_MEM3" shm -l 2> /dev/null | cut -f1 || true; }
 if [ "$(uname -s)" != Linux ]; then
     echo "SKIP: aln_parity: shared-memory index (macOS POSIX shm cannot hold an index)"
-elif [ -n "$(shm_listed)" ]; then
-    echo "SKIP: aln_parity: shared-memory index (another index is already staged; run bwa-mem3 shm -d to clear it)"
+elif ! shm_registry_holds_only "$BWA_MEM3"; then
+    echo "SKIP: aln_parity: shared-memory index (another index is already staged, or bwa-mem3 shm -l failed; run bwa-mem3 shm -d to clear it)"
 else
     shm_drop_own() {
         local listed
@@ -450,8 +470,9 @@ if grep -q 'is a directory' "$work/none.err"; then
 fi
 mkdir -p "$work/adir"
 rc=0
-"$BWA_MEM3" aln "$ref_mem3" "$work/adir" > /dev/null 2> "$work/none.err" || rc=$?
-if [ "$rc" -ne 1 ] || ! grep -q 'is a directory' "$work/none.err" || grep -q 'Index file found' "$work/none.err"; then
+"$BWA_MEM3" aln "$ref_mem3" "$work/adir" > "$work/none.out" 2> "$work/none.err" || rc=$?
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q 'is a directory' "$work/none.err" \
+    || grep -q 'Index file found' "$work/none.err"; then
     echo "FAIL: aln_parity: a directory input must exit 1 and be reported as a directory (exit $rc)" >&2
     exit 1
 fi
@@ -572,6 +593,7 @@ run_pe pe_slash 512 800 36 0 slash "" ""
 run_pe pe_comment 513 800 36 0 comment "" ""
 run_pe pe_rg 514 500 36 0 plain "-r @RG\\tID:x\\tSM:y" "-r @RG\\tID:x\\tSM:y"
 need_pe pe_rg 'RG:Z:x'
+run_pe pe_P 522 500 36 0 plain "-P" "-P" # sampe -P preloads the index; ours accepts and ignores it
 
 # Repeats: contigs of five and of twelve exact copies of a 200 bp unit, 40 bp apart, so each end
 # has five (twelve) equally good places and XA lists depend on --max-xa-hits and
@@ -689,7 +711,8 @@ if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q 'too long: the maximu
 fi
 rc=0
 "$BWA_MEM3" aln -B 64 "$ref_mem3" "$work/pe36.1.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
-if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q 'too long: the maximum barcode length is 63' "$work/none.err"; then
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q 'too long: the maximum barcode length is 63' "$work/none.err" \
+    || grep -q 'Index file found' "$work/none.err"; then
     echo "FAIL: aln_parity: SE -B 64 must exit 1 with the barcode-length error (exit $rc)" >&2
     exit 1
 fi
@@ -699,9 +722,14 @@ if [ "$rc" -ne 0 ]; then
     echo "FAIL: aln_parity: PE -B 31 is within the limit and must run (exit $rc)" >&2
     exit 1
 fi
+records="$(awk '!/^@/ { n++ } END { print n+0 }' "$work/none.out")"
+if [ "$records" -ne 4000 ]; then # pe36: 2,000 pairs
+    echo "FAIL: aln_parity: PE -B 31 produced $records records, expected 4000" >&2
+    exit 1
+fi
 
 if [ "$pe_xt_m" -le 0 ]; then
     echo "FAIL: aln_parity: no PE case produced a mate-rescued record (XT:A:M)" >&2
     exit 1
 fi
-echo "PASS: aln_parity PE ($((pe_cfg / 2)) cases x 2 thread counts, $pe_xt_m rescued mates)"
+echo "PASS: aln_parity (SE $n_se_cases cases and PE $((pe_cfg / 2)) cases x 2 thread counts, $pe_xt_m rescued mates; option sweep, input, output and index forms)"
