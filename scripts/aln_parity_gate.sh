@@ -42,11 +42,17 @@
 #   ADNA_THREADS thread counts for case 9 (default "4 $THREADS": -t 1 is too slow there)
 #   CASES        space-separated case numbers (default: 1 2 3 4 5 6 7 8 9 10)
 #   SEED         base seed for the simulated reads (default 20261030)
+#   AWK          the awk-compatible interpreter for the text steps (default: awk; a faster one
+#                helps on the large cases)
 #
-# Requires holodeck, samtools, gzip and mawk or awk on PATH. Exits 0 only if no case FAILed
-# (a case with missing inputs is reported SKIP and does not fail the run, so check the
-# summary). On a FAIL the first differing record from each side is printed.
+# Requires holodeck, samtools, gzip and an awk-compatible interpreter on PATH. Exits 0 only if at least one
+# comparison PASSed and none FAILed. A case with missing inputs is reported SKIP and does not
+# by itself fail the run, so check the summary; a run in which every case was skipped exits 1.
+# On a FAIL the first differing record from each side is printed.
 
+# The awk programs are single-quoted on purpose ($2, $0 are awk fields, not shell). Run through
+# "$AWK", shellcheck does not recognize them as awk and would flag every one.
+# shellcheck disable=SC2016
 set -Eeuo pipefail
 
 : "${BWA_ORACLE:?BWA_ORACLE must be set}"
@@ -73,7 +79,7 @@ T_LIST="1 $THREADS"
 if [ "$THREADS" = 1 ]; then T_LIST=1; fi
 n_fail=0
 
-mawk_or_awk() { if command -v mawk > /dev/null 2>&1; then mawk "$@"; else awk "$@"; fi; }
+AWK="${AWK:-awk}"
 say() { printf '%s\n' "$*"; }
 
 # result <PASS|FAIL|SKIP> <case tag> <detail>
@@ -86,20 +92,40 @@ result() {
 # ---- references -------------------------------------------------------------------------
 # prepare_ref <name> <fasta> [stock prefix] [mem3 prefix]
 # Sets, for later use, REF_<name>_FA (the FASTA with its .fai), _STOCK and _MEM3 (index prefixes).
+# A prefix that is given is used as is; each one that is not is built into WORK from the FASTA.
+# The workspace records which FASTA it was built from (path, size and modification time) and is
+# rebuilt from scratch when that changes, so a WORK reused with another reference never compares
+# against the old one's link, .fai or indexes.
 prepare_ref() {
-    local name="$1" fa="$2" stock="${3:-}" mem3="${4:-}" d="$WORK/ref_$1"
+    local name="$1" fa="$2" stock="${3:-}" mem3="${4:-}" d="$WORK/ref_$1" stamp tool
+    case "$fa" in /*) ;; *) fa="$PWD/$fa" ;; esac # the link below must not resolve inside $d
+    if [ ! -f "$fa" ]; then
+        echo "FAIL: reference '$fa' is not a file" >&2
+        exit 2
+    fi
+    stamp="$fa $(wc -c < "$fa" | tr -d ' ') $(date -r "$fa" +%s 2> /dev/null || stat -c %Y "$fa")"
+    if [ -d "$d" ] && [ "$(cat "$d/source" 2> /dev/null || true)" != "$stamp" ]; then
+        rm -rf "$d"
+    fi
     mkdir -p "$d"
-    if [ ! -e "$d/ref.fa" ]; then ln -s "$fa" "$d/ref.fa"; fi
+    printf '%s\n' "$stamp" > "$d/source"
+    ln -sfn "$fa" "$d/ref.fa" # -f replaces a dangling link left by an earlier run
     if [ ! -s "$d/ref.fa.fai" ]; then samtools faidx "$d/ref.fa"; fi
-    if [ -z "$stock" ]; then
-        mkdir -p "$d/stock" "$d/mem3"
-        for tool in stock mem3; do
+    for tool in stock mem3; do
+        if [ "$tool" = stock ] && [ -n "$stock" ]; then continue; fi
+        if [ "$tool" = mem3 ] && [ -n "$mem3" ]; then continue; fi
+        mkdir -p "$d/$tool"
+        if [ ! -s "$d/$tool/ref.fa" ]; then
             cp "$fa" "$d/$tool/ref.fa"
             if [ -f "$fa.alt" ]; then cp "$fa.alt" "$d/$tool/ref.fa.alt"; fi
-        done
+        fi
+    done
+    if [ -z "$stock" ]; then
         if [ ! -s "$d/stock/ref.fa.bwt" ]; then "$BWA_ORACLE" index "$d/stock/ref.fa" > "$d/stock.index.log" 2>&1; fi
-        if [ ! -s "$d/mem3/ref.fa.bwt.2bit.64" ]; then "$BWA_MEM3" index "$d/mem3/ref.fa" > "$d/mem3.index.log" 2>&1; fi
         stock="$d/stock/ref.fa"
+    fi
+    if [ -z "$mem3" ]; then
+        if [ ! -s "$d/mem3/ref.fa.bwt.2bit.64" ]; then "$BWA_MEM3" index "$d/mem3/ref.fa" > "$d/mem3.index.log" 2>&1; fi
         mem3="$d/mem3/ref.fa"
     fi
     printf -v "REF_${name}_FA" '%s' "$d/ref.fa"
@@ -122,9 +148,9 @@ gen() {
     local prefix="$1" n="$2" len="$3" pe="$4" seed="$5"
     shift 5
     local glen cov d="$RUN/holo.$$" i got
-    glen="$(mawk_or_awk '{s += $2} END {print s}' "$RFA.fai")"
+    glen="$("$AWK" '{s += $2} END {print s}' "$RFA.fai")"
     # generous: a part of the reference is N, and a few pairs are rejected and resampled
-    cov="$(mawk_or_awk -v n="$n" -v len="$len" -v g="$glen" -v pe="$pe" 'BEGIN { printf "%.4f", 1.6 * n * len * (pe ? 2 : 1) / g }')"
+    cov="$("$AWK" -v n="$n" -v len="$len" -v g="$glen" -v pe="$pe" 'BEGIN { printf "%.4f", 1.6 * n * len * (pe ? 2 : 1) / g }')"
     rm -rf "$d"
     mkdir -p "$d"
     local pe_args=(--single-end)
@@ -133,12 +159,12 @@ gen() {
         ${pe_args[@]+"${pe_args[@]}"} "$@" > "$d/holo.log" 2>&1
     if [ "$pe" = 1 ]; then
         for i in 1 2; do
-            gzip -dc "$d/h.r$i.fastq.gz" | mawk_or_awk -v lim="$((4 * n))" 'NR <= lim' > "$prefix.$i.fq"
+            gzip -dc "$d/h.r$i.fastq.gz" | "$AWK" -v lim="$((4 * n))" 'NR <= lim' > "$prefix.$i.fq"
         done
     else
         local f="$d/h.fastq.gz"
         if [ ! -e "$f" ]; then f="$d/h.r1.fastq.gz"; fi
-        gzip -dc "$f" | mawk_or_awk -v lim="$((4 * n))" 'NR <= lim' > "$prefix.fq"
+        gzip -dc "$f" | "$AWK" -v lim="$((4 * n))" 'NR <= lim' > "$prefix.fq"
     fi
     rm -rf "$d"
     for got in "$prefix.fq" "$prefix.1.fq" "$prefix.2.fq"; do
@@ -152,7 +178,7 @@ gen() {
 # Filters (stdin to stdout) over four-line FASTQ records.
 # trim_lengths <lo> <hi> <seed>: cut every read to a random length in [lo, hi] (if longer).
 trim_lengths() {
-    mawk_or_awk -v lo="$1" -v hi="$2" -v seed="$3" 'BEGIN { srand(seed) }
+    "$AWK" -v lo="$1" -v hi="$2" -v seed="$3" 'BEGIN { srand(seed) }
         NR % 4 == 2 { l = lo + int(rand() * (hi - lo + 1)); if (l < length($0)) $0 = substr($0, 1, l); n = length($0) }
         NR % 4 == 0 { $0 = substr($0, 1, n) }
         { print }'
@@ -160,31 +186,31 @@ trim_lengths() {
 # randomize_range <first record> <last record> <seed>: replace the bases of those records (1-based)
 # with random sequence.
 randomize_range() {
-    mawk_or_awk -v lo="$1" -v hi="$2" -v seed="$3" 'BEGIN { srand(seed) }
+    "$AWK" -v lo="$1" -v hi="$2" -v seed="$3" 'BEGIN { srand(seed) }
         NR % 4 == 2 { r = int((NR - 2) / 4) + 1
             if (r >= lo && r <= hi) { s = ""; for (i = 0; i < length($0); i++) s = s substr("ACGT", int(rand() * 4) + 1, 1); $0 = s } }
         { print }'
 }
 # rename_se: names ending /1, /2, /3, or carrying a comment, in turn.
 rename_se() {
-    mawk_or_awk 'NR % 4 == 1 { i = int((NR - 1) / 4) % 4
+    "$AWK" 'NR % 4 == 1 { i = int((NR - 1) / 4) % 4
         if (i == 0) $0 = $0 "/1"; else if (i == 1) $0 = $0 "/2"; else if (i == 2) $0 = $0 "/3"
         else $0 = $0 " 1:N:0:ACGT extra comment" } { print }'
 }
 # rename_pe <mate 1|2>: pairs named base/1 + base/2, base/3 + base/3, base + comment, base/1 + comment.
 rename_pe() {
-    mawk_or_awk -v m="$1" 'NR % 4 == 1 { i = int((NR - 1) / 4) % 4
+    "$AWK" -v m="$1" 'NR % 4 == 1 { i = int((NR - 1) / 4) % 4
         if (i == 0) $0 = $0 "/" m; else if (i == 1) $0 = $0 "/3"
         else if (i == 2) $0 = $0 " " m ":N:0:ACGT"; else $0 = $0 "/" m " mate comment" } { print }'
 }
 # phred64: shift the qualities from phred+33 to phred+64.
 phred64() {
-    mawk_or_awk 'BEGIN { for (i = 33; i < 127; i++) ord[sprintf("%c", i)] = i }
+    "$AWK" 'BEGIN { for (i = 33; i < 127; i++) ord[sprintf("%c", i)] = i }
         NR % 4 == 0 { s = ""; for (i = 1; i <= length($0); i++) s = s sprintf("%c", ord[substr($0, i, 1)] + 31); $0 = s }
         { print }'
 }
 # casava: add a Casava 1.8 comment to every read, filtered (Y) on every other one.
-casava() { mawk_or_awk 'NR % 4 == 1 { $0 = $0 " 1:" ((int((NR - 1) / 4) % 2) ? "Y" : "N") ":0:ACGT" } { print }'; }
+casava() { "$AWK" 'NR % 4 == 1 { $0 = $0 " 1:" ((int((NR - 1) / 4) % 2) ? "Y" : "N") ":0:ACGT" } { print }'; }
 
 # ---- comparison -----------------------------------------------------------------------------
 n_records() { grep -avc '^@' "$1" || true; }
@@ -194,7 +220,7 @@ n_records() { grep -avc '^@' "$1" || true; }
 same_sam() {
     if cmp -s <(grep -av '^@PG' "$1" || true) <(grep -av '^@PG' "$2" || true); then return 0; fi
     local line
-    line="$(cmp <(grep -av '^@PG' "$1" || true) <(grep -av '^@PG' "$2" || true) 2>&1 | mawk_or_awk '{ for (i = 1; i <= NF; i++) if ($i == "line") { gsub(",", "", $(i + 1)); print $(i + 1); exit } }' || true)"
+    line="$(cmp <(grep -av '^@PG' "$1" || true) <(grep -av '^@PG' "$2" || true) 2>&1 | "$AWK" '{ for (i = 1; i <= NF; i++) if ($i == "line") { gsub(",", "", $(i + 1)); print $(i + 1); exit } }' || true)"
     say "  first difference at line ${line:-?} of the SAM without @PG lines"
     say "  stock: $(grep -av '^@PG' "$1" | sed -n "${line:-1}p" | cut -c1-600 || true)"
     say "  ours:  $(grep -av '^@PG' "$2" | sed -n "${line:-1}p" | cut -c1-600 || true)"
@@ -206,8 +232,8 @@ run_tool() {
     local log="$1"
     shift
     if ! "$@" 2> "$log"; then
-        say "  command failed: $*"
-        tail -n 5 "$log" | sed 's/^/  | /'
+        say "  command failed: $*" >&2 # callers redirect stdout to the data file
+        tail -n 5 "$log" | sed 's/^/  | /' >&2
         return 1
     fi
 }
@@ -218,26 +244,22 @@ split_words() {
     read -r -a WORDS <<< "$1" || true
 }
 
-# compare_se <tag> <fq> <samse args> <ours args> [aln options...]
-compare_se() {
-    local tag="$1" fq="$2" samse_s="$3" ours_s="$4" t t0 w_stock w_ours ok=1 detail=""
-    shift 4
-    local samse_args=() ours_args=()
-    split_words "$samse_s"
-    samse_args=(${WORDS[@]+"${WORDS[@]}"})
+# ours_vs_stock <SE|PE> <tag> <stock seconds> <ours args string> <n inputs> <inputs...> [aln options...]
+# Runs bwa-mem3 at every thread count in T_LIST on the inputs, compares each run with
+# $RUN/stock.sam (already written by the caller) and reports the case. The part compare_se and
+# compare_pe share; they differ only in the stock pipeline and the number of inputs.
+ours_vs_stock() {
+    local kind="$1" tag="$2" w_stock="$3" ours_s="$4" n_in="$5" t t0 w_ours ok=1 detail
+    shift 5
+    local inputs=("${@:1:$n_in}")
+    shift "$n_in"
+    local ours_args=()
     split_words "$ours_s"
     ours_args=(${WORDS[@]+"${WORDS[@]}"})
-    t0=$SECONDS
-    if ! { run_tool "$RUN/stock.aln.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq" > "$RUN/stock.sai" \
-        && run_tool "$RUN/stock.samse.err" "$BWA_ORACLE" samse ${samse_args[@]+"${samse_args[@]}"} "$RS" "$RUN/stock.sai" "$fq" > "$RUN/stock.sam"; }; then
-        result FAIL "SE $tag" "stock failed"
-        return
-    fi
-    w_stock=$((SECONDS - t0))
     detail="stock ${w_stock}s"
     for t in $T_LIST; do
         t0=$SECONDS
-        if ! run_tool "$RUN/ours.err" "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$RM" "$fq" > "$RUN/ours.sam"; then
+        if ! run_tool "$RUN/ours.err" "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$RM" "${inputs[@]}" > "$RUN/ours.sam"; then
             ok=0
             detail="$detail; -t $t: bwa-mem3 failed"
             continue
@@ -252,23 +274,37 @@ compare_se() {
         fi
     done
     if [ "$ok" = 1 ]; then
-        result PASS "SE $tag $*" "$(n_records "$RUN/ours.sam") records; $detail"
+        result PASS "$kind $tag $*" "$(n_records "$RUN/ours.sam") records; $detail"
     else
-        result FAIL "SE $tag $*" "$detail"
+        result FAIL "$kind $tag $*" "$detail"
     fi
+}
+
+# compare_se <tag> <fq> <samse args> <ours args> [aln options...]
+compare_se() {
+    local tag="$1" fq="$2" samse_s="$3" ours_s="$4" t0
+    shift 4
+    local samse_args=()
+    split_words "$samse_s"
+    samse_args=(${WORDS[@]+"${WORDS[@]}"})
+    t0=$SECONDS
+    if ! { run_tool "$RUN/stock.aln.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq" > "$RUN/stock.sai" \
+        && run_tool "$RUN/stock.samse.err" "$BWA_ORACLE" samse ${samse_args[@]+"${samse_args[@]}"} "$RS" "$RUN/stock.sai" "$fq" > "$RUN/stock.sam"; }; then
+        result FAIL "SE $tag" "stock failed"
+        return
+    fi
+    ours_vs_stock SE "$tag" $((SECONDS - t0)) "$ours_s" 1 "$fq" "$@"
     rm -f "$RUN"/stock.sai "$RUN"/stock.sam "$RUN"/ours.sam
 }
 
 # compare_pe <tag> <fq1> <fq2> <sampe args> <ours args> [aln options...]
 # Prints, into $RUN/stock.sampe.err, stock's messages (cases look for infer_isize failures).
 compare_pe() {
-    local tag="$1" fq1="$2" fq2="$3" sampe_s="$4" ours_s="$5" t t0 w_stock w_ours ok=1 detail=""
+    local tag="$1" fq1="$2" fq2="$3" sampe_s="$4" ours_s="$5" t0
     shift 5
-    local sampe_args=() ours_args=()
+    local sampe_args=()
     split_words "$sampe_s"
     sampe_args=(${WORDS[@]+"${WORDS[@]}"})
-    split_words "$ours_s"
-    ours_args=(${WORDS[@]+"${WORDS[@]}"})
     t0=$SECONDS
     if ! { run_tool "$RUN/stock.aln1.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq1" > "$RUN/stock.1.sai" \
         && run_tool "$RUN/stock.aln2.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq2" > "$RUN/stock.2.sai" \
@@ -276,29 +312,7 @@ compare_pe() {
         result FAIL "PE $tag" "stock failed"
         return
     fi
-    w_stock=$((SECONDS - t0))
-    detail="stock ${w_stock}s"
-    for t in $T_LIST; do
-        t0=$SECONDS
-        if ! run_tool "$RUN/ours.err" "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$RM" "$fq1" "$fq2" > "$RUN/ours.sam"; then
-            ok=0
-            detail="$detail; -t $t: bwa-mem3 failed"
-            continue
-        fi
-        w_ours=$((SECONDS - t0))
-        if same_sam "$RUN/stock.sam" "$RUN/ours.sam" > "$RUN/diff.txt"; then
-            detail="$detail; -t $t ${w_ours}s"
-        else
-            ok=0
-            detail="$detail; -t $t DIFFERS"
-            cat "$RUN/diff.txt"
-        fi
-    done
-    if [ "$ok" = 1 ]; then
-        result PASS "PE $tag $*" "$(n_records "$RUN/ours.sam") records; $detail"
-    else
-        result FAIL "PE $tag $*" "$detail"
-    fi
+    ours_vs_stock PE "$tag" $((SECONDS - t0)) "$ours_s" 2 "$fq1" "$fq2" "$@"
     rm -f "$RUN"/stock.1.sai "$RUN"/stock.2.sai "$RUN"/stock.sam "$RUN"/ours.sam
 }
 
@@ -342,12 +356,14 @@ if wanted 2 && need_ref 2; then
     randomize_range "$((BATCH + 1))" "$((2 * BATCH))" 11 < "$R/c2.1.fq" > "$R/c2r.1.fq"
     randomize_range "$((BATCH + 1))" "$((2 * BATCH))" 12 < "$R/c2.2.fq" > "$R/c2r.2.fq"
     compare_pe c2 "$R/c2r.1.fq" "$R/c2r.2.fq" "" ""
-    n_isize="$(grep -c 'fail to infer insert size' "$RUN/stock.sampe.err" || true)"
-    if [ "$n_isize" -lt 1 ]; then
-        result FAIL "PE c2 setup" "stock did not hit an infer_isize failure, so the carry-over is not exercised"
-    else
-        result PASS "PE c2 setup" "stock hit $n_isize infer_isize failure(s)"
-    fi
+    # the carry-over needs, in this order: an estimate inferred in batch 1, then a failure in
+    # batch 2. One letter per batch: E (estimate) or F (failure), from stock's own messages.
+    isize_seq="$(grep -aoE 'inferred external isize|fail to infer insert size' "$RUN/stock.sampe.err" 2> /dev/null \
+        | sed -e 's/^inferred.*/E/' -e 's/^fail.*/F/' | tr -d '\n' || true)"
+    case "$isize_seq" in
+        EF*) result PASS "PE c2 setup" "stock inferred an estimate in batch 1 and failed in batch 2 ($isize_seq)" ;;
+        *) result FAIL "PE c2 setup" "stock's per-batch insert-size outcomes are '$isize_seq', not E then F, so the carry-over is not exercised" ;;
+    esac
     end_case
 fi
 
@@ -492,7 +508,7 @@ if wanted 10 && need_ref 10; then
     say "== case 10: R2 ends before R1 at a batch boundary"
     gen "$R/c10" "$((BATCH + 8000))" 100 1 16 --max-error-rate 0.03
     for n2 in "$((BATCH - 1))" "$BATCH" "$((BATCH + 1))" "$((BATCH + 5000))"; do
-        mawk_or_awk -v lim="$((4 * n2))" 'NR <= lim' "$R/c10.2.fq" > "$R/c10s.2.fq"
+        "$AWK" -v lim="$((4 * n2))" 'NR <= lim' "$R/c10.2.fq" > "$R/c10s.2.fq"
         compare_pe "c10_r2_${n2}" "$R/c10.1.fq" "$R/c10s.2.fq" "" ""
         if ! grep -Eq 'read 2 file ended before read 1|read counts differ' "$RUN/ours.err" 2> /dev/null; then
             result FAIL "PE c10_r2_${n2} warning" "no warning about the shorter R2 on stderr"
@@ -507,6 +523,10 @@ say "== summary ($(grep -c '^PASS' "$RESULTS" || true) PASS, $n_fail FAIL, $(gre
 cat "$RESULTS"
 if [ "$n_fail" -gt 0 ]; then
     say "FAIL: aln_parity_gate: $n_fail case(s) differ from stock"
+    exit 1
+fi
+if ! grep -q '^PASS' "$RESULTS"; then
+    say "FAIL: aln_parity_gate: no comparison ran (every selected case was skipped for missing inputs)"
     exit 1
 fi
 say "PASS: aln_parity_gate"

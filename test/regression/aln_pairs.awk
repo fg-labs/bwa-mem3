@@ -1,5 +1,5 @@
 # Seeded read-pair generator for aln_parity.sh (paired-end section).
-# usage: awk -v seed=S -v n=N -v lens=L -v rescue=R -v names=M -v out1=F1 -v out2=F2 -f aln_pairs.awk ref.fa
+# usage: awk -v seed=S -v n=N -v lens=L -v rescue=R -v names=M -v out1=F1 -v out2=F2 -f aln_rng.awk -f aln_pairs.awk ref.fa
 #   lens   -- one read length, or MIN-MAX for a uniform range
 #   rescue -- percent of pairs whose second mate carries len/12 spread mismatches (too many for
 #             the search, within reach of the mate Smith-Waterman)
@@ -9,22 +9,7 @@
 #   uniform -- 1 draws every pair from a uniformly chosen contig (default: mostly the first)
 #   names  -- "plain" (r<i>), "slash" (r<i>/1, r<i>/2) or "comment" (r<i> c1 / r<i> c2)
 # Fragments are 250-349 bp from the contigs; 3% of pairs get a second mate from elsewhere and
-# 3% a random second mate. Park-Miller generator, as aln_reads.awk.
-function rnd() { st = (st * 16807) % 2147483647; return st }
-function ri(n) { return rnd() % n }
-function rc(s,   i, r, c) {
-    r = ""
-    for (i = length(s); i >= 1; i--) {
-        c = substr(s, i, 1)
-        r = r (c == "A" ? "T" : c == "C" ? "G" : c == "G" ? "C" : c == "T" ? "A" : c)
-    }
-    return r
-}
-function other(c,   b, k) {
-    b = "ACGT"
-    do { k = substr(b, ri(4) + 1, 1) } while (k == c)
-    return k
-}
+# 3% a random second mate. rnd, ri, rc and other come from aln_rng.awk (shared with aln_reads.awk).
 function edit(t,   e, p, len) {
     len = length(t)
     e = ri(100)
@@ -59,15 +44,16 @@ function qual(m,   q, i) { q = ""; for (i = 1; i <= m; i++) q = q "I"; return q 
 function pick(   x) {
     if (uniform) return ri(nc) + 1
     x = ri(10)
-    if (x == 6) return nc - 2
-    if (x == 7) return nc - 1
+    # with fewer than three contigs, nc - 2 (or nc - 1) names no contig: fall back to the first
+    if (x == 6) return nc >= 3 ? nc - 2 : 1
+    if (x == 7) return nc >= 2 ? nc - 1 : 1
     if (x == 8) return nc
     return 1
 }
 /^>/ { nc++; next }
 { seq[nc] = seq[nc] toupper($0) }
 END {
-    st = seed
+    seed_rng(seed)
     for (i = 0; i < 20; i++) rnd()
     for (r = 0; r < n; r++) {
         if (index(lens, "-")) { split(lens, mm, "-"); len = mm[1] + ri(mm[2] - mm[1] + 1) } else len = lens + 0
