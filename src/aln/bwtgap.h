@@ -7,12 +7,18 @@
  * with the SAM code), and the declarations of the search entry points from upstream's
  * bwtaln.c (gap_init_opt, bwa_cal_maxdiff, bwt_cal_width) are added together with
  * aln_search_batch, aln_batch_max_gapo, the gap_job_t interleaved search and its chunked
- * stack (gap_cstack_t, gap_pool_t), the width walks and gap_slots_run, which are new. */
+ * stack (gap_cstack_t, gap_pool_t), the width walks, gap_slots_run and the search threads' read
+ * counter (read_claim_t, ALN_CLAIM_CHUNK) and thread-creation hook (aln_thread_create), which are new. */
 #ifndef BWA_MEM3_ALN_BWTGAP_H
 #define BWA_MEM3_ALN_BWTGAP_H
 
 #include "aln_bwt.h"
 #include "bwtaln.h"
+
+#include <pthread.h>
+
+#include <atomic>
+#include <cstdint>
 
 namespace bwa_aln {
 
@@ -197,11 +203,38 @@ int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt);
  * length when opt->fnr > 0, else opt->max_diff). Computed once per batch, never per read. */
 int aln_batch_max_gapo(int n_seqs, const bwa_seq_t *seqs, const gap_opt_t *opt);
 
-/* Searches every read of the batch on n_threads threads (reads are dealt round-robin).
+/* Searches every read of the batch on n_threads threads (each claims chunks of consecutive reads
+ * from a shared counter, read_claim_t; the hits do not depend on the thread count).
  * On return each seqs[i] has aln/n_aln set and sa = 0, type = BWA_TYPE_NO_MATCH,
  * c1 = c2 = 0. name, seq, rseq and qual are left intact (stock bwa frees them and
  * complements seq in place; here the search complements a per-thread copy). */
 void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads);
+
+/* Reads a search thread claims at a time from read_claim_t. A read's hits do not depend on which
+ * thread searches it; the chunk size only trades the counter's traffic against the imbalance at
+ * the end of the batch. */
+constexpr int ALN_CLAIM_CHUNK = 64;
+
+/* The next unclaimed read of a batch of n_seqs reads, shared by its search threads (new code;
+ * bwtaln.cpp). claim() returns the first read of the next ALN_CLAIM_CHUNK reads (fewer at the
+ * end) and sets *end one past the last, or returns -1 once [0, n_seqs) is used up. The chunks of
+ * concurrent claims are disjoint and cover [0, n_seqs). Aligned to its own cache line (128 bytes
+ * covers Apple arm64): the threads write it, and in aln_search_batch's frame it would otherwise
+ * share a line with the options every search step reads. Exported for the unit tests. */
+struct alignas(128) read_claim_t {
+	// `first` (default 0) is where the claims start: a unit-test hook to reach the end of a batch
+	// of up to INT_MAX reads without claiming every chunk before it.
+	explicit read_claim_t(int n_seqs, int first = 0) : next_(first), n_seqs_(n_seqs) {}
+	int claim(int *end);
+private:
+	// 64-bit so the claims past the end (one per thread) cannot wrap it for any int n_seqs
+	std::atomic<int64_t> next_;
+	const int n_seqs_;
+};
+
+/* aln_search_batch creates its search threads through this (pthread_create by default). A unit-
+ * test hook: the tests swap in a function that fails, to cover the caller's fallback worker. */
+extern int (*aln_thread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
 
 } // namespace bwa_aln
 

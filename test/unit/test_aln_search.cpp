@@ -16,6 +16,10 @@
 #include "../../src/aln/bwtgap.h"
 #include "../../src/bwa.h"
 
+#include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <initializer_list>
 #include <climits>
 #include <cstdint>
 #include <cstdio>
@@ -26,7 +30,9 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+#include <pthread.h>
 #include <unistd.h>
 
 namespace {
@@ -354,9 +360,10 @@ TEST_CASE("aln_search: name/seq/rseq/qual survive the search unchanged"
 TEST_CASE("aln_search: n_threads 1 and 4 give identical aln arrays"
           * doctest::test_suite("unit/aln_search")) {
     SearchIndex &ix = index_fixture();
+    // 300 reads, several ALN_CLAIM_CHUNKs, so that -t 4 splits them among the threads
     std::vector<std::string> reads;
-    for (int i = 0; i < 40; ++i) {
-        std::string r = c1().substr(i * 13, 32 + (i % 5));
+    for (int i = 0; i < 300; ++i) {
+        std::string r = c1().substr((i * 13) % 520, 32 + (i % 5));
         if (i % 3 == 1) r[12] = r[12] == 'A' ? 'T' : 'A';
         if (i % 7 == 2) r = deletion40();
         if (i % 11 == 3) { r.clear(); for (int j = 0; j < 16; ++j) r += "AC"; }
@@ -1316,8 +1323,9 @@ TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for
 }
 
 // gap_slots_run's slot states: batches smaller than, equal to and just over the group size
-// (ALN_GROUP: 8, or 12 on Apple arm64) and run on more threads than reads, so some threads get no
-// read and some slots never fill or go empty early; all-N and one-base reads end in gap_job_start,
+// (ALN_GROUP: 8, or 12 on Apple arm64), all within one ALN_CLAIM_CHUNK, so the first thread to
+// claim searches the whole batch and the others get no read; some slots never fill or go empty
+// early; all-N and one-base reads end in gap_job_start,
 // before any search step, so their slot is refilled straight from GAP_SLOT_WIDTHS.
 TEST_CASE("aln_search: aln_search_batch gives bwt_match_gap's hits for batches around the group size"
           * doctest::test_suite("unit/aln_search")) {
@@ -1356,6 +1364,228 @@ TEST_CASE("aln_search: aln_search_batch gives bwt_match_gap's hits for batches a
     }
     CHECK(compared == 3L * (1 + 2 + 7 + 8 + 9 + 11 + 12 + 13 + 25));
     CHECK(with_hits > compared / 3);
+}
+
+// The reads of the thread-count cases below: random 20-79 bp substrings of the first contig with
+// up to two substitutions each, the first n of a fixed list of 701 (so 640 is a multiple of the
+// chunk size and 701 is not).
+std::vector<std::string> claim_reads(int n)
+{
+    const std::string &s1 = c1();
+    uint32_t x = 1618;
+    auto rnd = [&x](uint32_t m) { x = x * 1103515245u + 12345u; return (x >> 16) % m; };
+    std::vector<std::string> all;
+    for (int i = 0; i < 701; ++i) {
+        int len = 20 + (int)rnd(60);
+        std::string r = s1.substr(rnd((uint32_t)(s1.size() - len)), len);
+        for (int m = (int)rnd(3); m > 0; --m) r[rnd(len)] = "ACGT"[rnd(4)];
+        all.push_back(r);
+    }
+    return std::vector<std::string>(all.begin(), all.begin() + n);
+}
+
+// Searches the n reads at -t 1 and checks each against bwt_match_gap (the independent reference),
+// then at each thread count of nts and checks each read gets the -t 1 hits.
+void check_thread_counts(int n, std::initializer_list<int> nts)
+{
+    SearchIndex &ix = index_fixture();
+    std::vector<std::string> reads = claim_reads(n);
+    ba::gap_opt_t opt = make_opt(2, 1);
+    Batch one(reads);
+    for (int i = 0; i < one.n; ++i) one.seqs[i].n_aln = -1;
+    ba::aln_search_batch(ix.bwt, one.n, one.seqs, &opt, 1);
+    const int cap = ba::aln_batch_max_gapo(one.n, one.seqs, &opt);
+    long with_hits = 0;
+    for (int i = 0; i < one.n; ++i) {
+        INFO("batch " << n << ", -t 1, read " << i);
+        REQUIRE(one.seqs[i].n_aln >= 0); // searched
+        GapResult ref, job;
+        both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job, cap);
+        REQUIRE(one.seqs[i].n_aln == (int)ref.aln.size());
+        for (int k = 0; k < one.seqs[i].n_aln; ++k) CHECK(same_aln(ref.aln[k], one.seqs[i].aln[k]));
+        with_hits += one.seqs[i].n_aln > 0;
+    }
+    if (n) CHECK(with_hits > one.n / 2);
+    for (int nt : nts) {
+        INFO("batch " << n << ", -t " << nt);
+        Batch b(reads);
+        for (int i = 0; i < b.n; ++i) b.seqs[i].n_aln = -1;
+        ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, nt);
+        for (int i = 0; i < b.n; ++i) {
+            INFO("read " << i);
+            REQUIRE(b.seqs[i].n_aln == one.seqs[i].n_aln);
+            for (int k = 0; k < b.seqs[i].n_aln; ++k) CHECK(same_aln(one.seqs[i].aln[k], b.seqs[i].aln[k]));
+        }
+    }
+}
+
+// The threads claim chunks of reads from a shared counter. Every read must be searched and get
+// bwt_match_gap's hits, whatever the thread count, including batches that are and are not a
+// multiple of the chunk size, more threads than chunks, an empty batch and -t 0. (That no read is
+// searched twice is checked on the claims themselves, in the read_claim_t cases.)
+TEST_CASE("aln_search: aln_search_batch gives every read the same hits at any thread count (701 reads, -t 0/2)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_thread_counts(701, {0, 2});
+}
+
+TEST_CASE("aln_search: aln_search_batch gives every read the same hits at any thread count (701 reads, -t 3/7)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_thread_counts(701, {3, 7});
+}
+
+TEST_CASE("aln_search: aln_search_batch gives every read the same hits at any thread count (701 reads, -t 16/40)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_thread_counts(701, {16, 40});
+}
+
+TEST_CASE("aln_search: aln_search_batch gives every read the same hits at any thread count (640 reads, -t 0/2)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_thread_counts(640, {0, 2});
+}
+
+TEST_CASE("aln_search: aln_search_batch gives every read the same hits at any thread count (640 reads, -t 3/7)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_thread_counts(640, {3, 7});
+}
+
+TEST_CASE("aln_search: aln_search_batch gives every read the same hits at any thread count (640 reads, -t 16/40)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_thread_counts(640, {16, 40});
+}
+
+TEST_CASE("aln_search: aln_search_batch gives every read the same hits at any thread count (0 reads)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_thread_counts(0, {0, 2, 3, 7, 16, 40});
+}
+
+// Thread creation hooks for aln_thread_create: one that always fails and one that fails every
+// other call; ThreadCreateHook installs one for a scope and puts pthread_create back.
+std::atomic<int> create_calls{0};
+int create_fail_all(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *)
+{
+    create_calls.fetch_add(1);
+    return EAGAIN;
+}
+int create_fail_odd(pthread_t *t, const pthread_attr_t *a, void *(*f)(void *), void *d)
+{
+    return create_calls.fetch_add(1) % 2 ? EAGAIN : pthread_create(t, a, f, d);
+}
+struct ThreadCreateHook {
+    explicit ThreadCreateHook(int (*f)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *))
+        : prev(ba::aln_thread_create) { ba::aln_thread_create = f; }
+    ~ThreadCreateHook() { ba::aln_thread_create = prev; }
+    int (*prev)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *);
+};
+
+// When the search threads cannot be created, the calling thread searches in their place: with
+// every creation failing it searches the whole batch alone, with some failing it shares the batch
+// with the threads that started. Every read gets the -t 1 hits.
+TEST_CASE("aln_search: aln_search_batch searches every read when its threads cannot be created"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    std::vector<std::string> reads = claim_reads(300);
+    ba::gap_opt_t opt = make_opt(2, 1);
+    Batch one(reads);
+    ba::aln_search_batch(ix.bwt, one.n, one.seqs, &opt, 1);
+    long with_hits = 0;
+    for (int i = 0; i < one.n; ++i) with_hits += one.seqs[i].n_aln > 0;
+    CHECK(with_hits > one.n / 2); // not vacuous
+    struct { const char *name; int (*f)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *); } hooks[] = {
+        {"every creation fails", create_fail_all}, {"every other creation fails", create_fail_odd}};
+    for (const auto &h : hooks) {
+        for (int nt : {2, 5}) {
+            INFO(h.name << ", -t " << nt);
+            create_calls = 0;
+            ThreadCreateHook hook(h.f);
+            Batch b(reads);
+            for (int i = 0; i < b.n; ++i) b.seqs[i].n_aln = -1;
+            ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, nt);
+            CHECK(create_calls == nt); // every creation went through the hook
+            for (int i = 0; i < b.n; ++i) {
+                INFO("read " << i);
+                REQUIRE(b.seqs[i].n_aln == one.seqs[i].n_aln); // searched (not -1), with the same hits
+                for (int k = 0; k < b.seqs[i].n_aln; ++k) CHECK(same_aln(one.seqs[i].aln[k], b.seqs[i].aln[k]));
+            }
+        }
+    }
+}
+
+// read_claim_t: threads claiming at once get disjoint chunks of at most ALN_CLAIM_CHUNK reads that
+// cover [0, n) exactly once, and every claim after the counter is used up returns -1. The threads
+// start claiming together (a spin barrier) and each configuration is repeated `reps` times, so the
+// claims overlap more often (not guaranteed); each read's owner is set with an atomic exchange, so
+// two claims of the same read are always seen.
+void check_concurrent_claims(std::initializer_list<int> ns, int reps)
+{
+    for (int n : ns) {
+        for (int nt : {1, 4, 16}) {
+            for (int rep = 0; rep < reps; ++rep) {
+                INFO("n " << n << ", " << nt << " threads, repeat " << rep);
+                ba::read_claim_t claim(n);
+                std::unique_ptr<std::atomic<int>[]> owner(new std::atomic<int>[n > 0 ? n : 1]);
+                for (int i = 0; i < n; ++i) owner[i].store(-1, std::memory_order_relaxed);
+                std::vector<char> bad(nt, 0);
+                std::atomic<int> ready{0};
+                std::vector<std::thread> th;
+                for (int t = 0; t < nt; ++t)
+                    th.emplace_back([&, t] {
+                        ready.fetch_add(1);
+                        while (ready.load() < nt) std::this_thread::yield();
+                        int st, en;
+                        while ((st = claim.claim(&en)) >= 0) {
+                            if (en <= st || en - st > ba::ALN_CLAIM_CHUNK || en > n) bad[t] = 1;
+                            for (int i = st; i < en && i < n; ++i)
+                                if (owner[i].exchange(t, std::memory_order_relaxed) != -1) bad[t] = 1; // claimed twice
+                        }
+                        if (claim.claim(&en) >= 0) bad[t] = 1; // used up stays used up
+                    });
+                for (auto &x : th) x.join();
+                for (int t = 0; t < nt; ++t) CHECK(!bad[t]);
+                long covered = 0;
+                for (int i = 0; i < n; ++i) covered += owner[i].load() >= 0;
+                CHECK(covered == n);
+            }
+        }
+        // one thread: exactly [k * ALN_CLAIM_CHUNK, min((k + 1) * ALN_CLAIM_CHUNK, n)) for k = 0, 1, ...
+        ba::read_claim_t claim(n);
+        int st, en = -1, k = 0;
+        while ((st = claim.claim(&en)) >= 0) {
+            CHECK(st == k * ba::ALN_CLAIM_CHUNK);
+            CHECK(en == std::min((k + 1) * ba::ALN_CLAIM_CHUNK, n));
+            ++k;
+        }
+        CHECK(k == (n + ba::ALN_CLAIM_CHUNK - 1) / ba::ALN_CLAIM_CHUNK);
+    }
+}
+
+TEST_CASE("aln_search: read_claim_t chunks cover the batch once under concurrent claims (at most two chunks)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_concurrent_claims({0, 1, 63, 64, 65}, 3);
+}
+
+TEST_CASE("aln_search: read_claim_t chunks cover the batch once under concurrent claims (about ten chunks)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_concurrent_claims({640, 701}, 3);
+}
+
+TEST_CASE("aln_search: read_claim_t chunks cover the batch once under concurrent claims (1563 chunks)"
+          * doctest::test_suite("unit/aln_search")) {
+    check_concurrent_claims({100000}, 2);
+}
+
+// read_claim_t at the end of a batch of INT_MAX reads: the last chunk's end does not overflow, and
+// the counter does not wrap however many claims follow (each would add ALN_CLAIM_CHUNK to it).
+TEST_CASE("aln_search: read_claim_t ends a batch of INT_MAX reads without overflowing"
+          * doctest::test_suite("unit/aln_search")) {
+    ba::read_claim_t claim(INT_MAX, INT_MAX - 100);
+    int en = 0;
+    CHECK(claim.claim(&en) == INT_MAX - 100);
+    CHECK(en == INT_MAX - 100 + ba::ALN_CLAIM_CHUNK);
+    CHECK(claim.claim(&en) == INT_MAX - 100 + ba::ALN_CLAIM_CHUNK);
+    CHECK(en == INT_MAX);
+    bool used_up = true;
+    for (int i = 0; i < 1000000; ++i) used_up = used_up && claim.claim(&en) == -1;
+    CHECK(used_up);
 }
 
 // The resumable width walk (width_walk_init/width_walk_run, which the driver interleaves) must
