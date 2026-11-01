@@ -475,6 +475,8 @@ int ref_pe_pair(const bntseq_t *bns, const ba::bwt_t *bwt, int n_seqs, ba::bwa_s
                         kv_push(pair64_t, arr, x);
                     }
                 }
+            // bwa_pe_pairing sorts with pdqsort_128, not upstream's ks_introsort_128, so this
+            // reference shares that sort; test_pair64_sort.cpp checks the two sorts agree.
             cnt_chg += ba::bwa_pe_pairing(p, &arr, opt, gopt->s_mm, ii);
         }
         if (opt->N_multi || opt->n_multi) {

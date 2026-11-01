@@ -230,3 +230,6 @@ Each change to upstream-derived code adds a line here.
   same input), then resolves the group's extra-hit rows and finishes each pair. A pair over
   `max_occ` still skips its extra hits. A pair's body reads and writes only that pair's reads, and
   no stage here draws from `drand48`, so the output is the same as upstream's single pass.
+- Pairing sort (new code). `pairing` sorts its (position, k<<2 | strand<<1 | end) rows with
+  `pdqsort_128` in place of `ks_introsort_128`. Both order rows by the whole (x, y), so rows equal
+  under that order are identical bytes and the sorted array is the same whichever sort makes it.

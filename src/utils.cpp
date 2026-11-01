@@ -45,11 +45,10 @@
 #include "pdqsort_wrap.h"
 /* pair64_lt comes from utils.h */
 KSORT_INIT(128, pair64_t, pair64_lt)
-/* pdqsort_128 is only for arrays with pairwise-distinct (x, y) keys (see its
- * declaration in utils.h), whose sorted order is unique, so the branchless
- * partition is output-identical here (and equal pair64_t elements would be
- * bitwise identical anyway). pair64_lt_bf is pair64_lt without short-circuits
- * (utils.h). */
+/* pair64_lt orders the whole element, so equal pair64_t are bitwise identical
+ * and the sorted array is unique: the branchless partition gives the same array
+ * as ks_introsort_128 for any input (see its declaration in utils.h).
+ * pair64_lt_bf is pair64_lt without short-circuits (utils.h). */
 PDQSORT_BRANCHLESS_INIT(128, pair64_t, pair64_lt_bf)
 KSORT_INIT(64,  uint64_t, ks_lt_generic)
 
