@@ -122,7 +122,75 @@ if [ "$n_del" -lt 2 ]; then
     echo "FAIL: built only $n_del deletion pairs (phix too short?) — test would be vacuous" >&2
     exit 1
 fi
-echo "fixture: $n_pairs exact PE pairs + $n_del deletion-bearing pairs (DEL=$DEL > w0) sliced from phix"
+
+# --- Mismatch-bearing pairs so the certified probe rung itself runs. ---
+# Neither kind of pair above reaches the rung: the exact pairs need no extension
+# and the DEL=24 pairs need a band wider than its widest ceiling, so the rung sees
+# no eligible pair. These pairs carry k = 1..6 substitutions spaced SUB_STEP bp
+# apart from each end of each read (k cycles independently per read), so both
+# extensions run through a few mismatches and get a proven-narrow band; one read1
+# in five also carries a 2 bp deletion and another one in five a 1 bp insertion.
+# Positions are arithmetic and built with bash string operations only (no PRNG,
+# no awk, no per-base subprocess). read2 is sliced from the reverse complement
+# of the whole reference, computed once.
+#
+# Checked with stderr counters in a scratch build (the binary has none to assert
+# on): at default parameters the rung gets eligible pairs in all four buckets, and
+# under -d 70 / -w 30 (cap 20, below) in the 8, 16 and 24 buckets, the 24 bucket
+# run at 20 and holding the pairs that need 17..20; in both, the carry keeps whole
+# lane groups below the top ceiling on NEON (16 lanes) and AVX2 (32),
+# and the largest AVX2 call puts 75 pairs in the 8 bucket, over one AVX-512BW group.
+# What the A/Bs below can catch here is a pair the rung loses (its stale fields
+# diverge from --no-band-cert). A pair run at the wrong band, or
+# accepted without its certificate, is not reliably caught: as noted above,
+# mem_reg2aln re-aligns and masks extension differences on these short reads.
+rcseq="$(printf '%s' "$seq" | rev | tr 'ACGT' 'TGCA')"
+N="${#seq}"
+SUB_STEP=7
+flip_at() { # <pos>: substitute the base at <pos> of $mm (A->C->G->T->A)
+    local c="${mm:$1:1}"
+    case "$c" in
+        A) c=C ;;
+        C) c=G ;;
+        G) c=T ;;
+        *) c=A ;;
+    esac
+    mm="${mm:0:$1}${c}${mm:$1+1}"
+}
+mutate_ends() { # <k>: k substitutions SUB_STEP bp apart from each end of $mm
+    local i
+    for ((i = 0; i < $1; i++)); do
+        flip_at $((i * SUB_STEP + 1))
+        flip_at $((${#mm} - 2 - i * SUB_STEP))
+    done
+}
+N_MM=512
+span=$((N - G - 2 * L - 8))
+q="$(printf 'I%.0s' $(seq 1 "$L"))"
+n_mm=0
+for ((j = 0; j < N_MM; j++)); do
+    off=$(((j * 37) % span))
+    case $((j % 5)) in
+        0) mm="${seq:off:20}${seq:off+22:L-20}" ;;  # 2 bp deletion after base 20
+        2) mm="${seq:off:95}A${seq:off+95:L-96}" ;; # 1 bp insertion after base 95
+        *) mm="${seq:off:L}" ;;
+    esac
+    mutate_ends $((j % 6 + 1))
+    m1="$mm"
+    p2=$((off + G))
+    mm="${rcseq:N-p2-L:L}"
+    mutate_ends $(((j / 6) % 6 + 1))
+    m2="$mm"
+    [ "${#m1}" -eq "$L" ] && [ "${#m2}" -eq "$L" ] || continue
+    printf '@mm%d/1\n%s\n+\n%s\n' "$n_mm" "$m1" "$q" >> "$r1"
+    printf '@mm%d/2\n%s\n+\n%s\n' "$n_mm" "$m2" "$q" >> "$r2"
+    n_mm=$((n_mm + 1))
+done
+if [ "$n_mm" -ne "$N_MM" ]; then
+    echo "FAIL: built only $n_mm of $N_MM mismatch-bearing pairs (phix slicing regression?)" >&2
+    exit 1
+fi
+echo "fixture: $n_pairs exact PE pairs + $n_del deletion-bearing pairs (DEL=$DEL > w0) + $n_mm mismatch-bearing pairs sliced from phix"
 
 # --- Index the reference. ---
 "$BWA_MEM3" index "$ref" > "$BAND_CERT_WORK_DIR/index.log" 2>&1
@@ -252,7 +320,7 @@ fi
 ab_identical() { # <label> <mem args...>
     local label="$1"
     shift
-    "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" 2> /dev/null | grep -v '^@PG' > "$BAND_CERT_WORK_DIR/ab_def.sam"
+    "$BWA_MEM3" mem "$@" "$ref" "$r1" "$r2" 2> "$BAND_CERT_WORK_DIR/ab_def.err" | grep -v '^@PG' > "$BAND_CERT_WORK_DIR/ab_def.sam"
     "$BWA_MEM3" mem --no-band-cert "$@" "$ref" "$r1" "$r2" 2> /dev/null | grep -v '^@PG' > "$BAND_CERT_WORK_DIR/ab_raw.sam"
     if ! diff -q "$BAND_CERT_WORK_DIR/ab_def.sam" "$BAND_CERT_WORK_DIR/ab_raw.sam" > /dev/null; then
         echo "FAIL: default != --no-band-cert under '$label' ($*)" >&2
@@ -266,7 +334,29 @@ ab_identical "large clip penalty (-L 8)" -L 8
 ab_identical "custom gaps (-O 2 -E 1)" -O 2 -E 1
 ab_identical "custom scoring (-A 2 -B 6)" -A 2 -B 6
 ab_identical "combined (-d 15 -L 10)" -d 15 -L 10
-echo "PASS: default == --no-band-cert across non-default -d/-L/-O/-E/-A/-B"
+# The probe rung's widest admissible width falls from 30 to 20 when the 24
+# ceiling fails its envelope check but the startup check at 20 passes, and its
+# 24 bucket then runs at 20. At default scoring: -d 70 fails the zdrop margin
+# at 24 (70 <= 6 + 49 + 24) and clears it at 20 (70 > 6 + 41 + 20); -w 30 fails
+# the band condition at 24 (15 + 7 <= 24 + 1) and clears it at 20 (22 > 21).
+# The cases fail if band_cert was switched off at startup (the envelope note on
+# stderr), which would make them compare --no-band-cert with itself. With
+# band_cert on, the mismatch-bearing pairs run the rung at cap 20 (8 and 16
+# buckets at their ceilings, the 24 bucket at 20, carry stopping there) and the
+# pairs needing more go to the ladder, and the output must match --no-band-cert.
+# What this cannot catch: a pair run ABOVE the cap. The certificate is checked
+# at the width the pair actually ran at, so such a pair still emits the ladder's
+# record and the A/B stays identical; that bound is held by the code, not here.
+ab_identical_certified() { # <label> <mem args...>: ab_identical, band_cert kept on
+    ab_identical "$@"
+    if grep -q 'outside the certified-band safety envelope' "$BAND_CERT_WORK_DIR/ab_def.err"; then
+        echo "FAIL: band_cert fell back to the full-width ladder under '$1', so the A/B compared --no-band-cert with itself" >&2
+        exit 1
+    fi
+}
+ab_identical_certified "rung cap 20 (-d 70)" -d 70
+ab_identical_certified "rung cap 20 (-w 30)" -w 30
+echo "PASS: default == --no-band-cert across non-default -d/-w/-L/-O/-E/-A/-B"
 
 # --- BAM path: same assertion, if samtools is available. ---
 if command -v samtools > /dev/null 2>&1; then
