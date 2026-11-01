@@ -250,6 +250,15 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
         np = m;
     }
     if (np == 0) return B1;
+    /* Early FULL. The gate below counts nh = np + the extra occurrences of the hit rows' codes, and
+     * every hit row's code occurs in the query at least once (its presence bit and its table entry
+     * are set together), so nh >= np and the count only grows as step 4 walks the rows. Once a
+     * count of rows seen plus their extra occurrences passes max_hits, the gate's verdict is FULL
+     * whatever the rest of the window holds, and nothing between here and the gate returns anything
+     * else: return it now. Here, with every hit row counted once; below, every 64 rows of step 4.
+     * (A running test inside step 3's row scan was measured too, on NEON: it slowed the filter by
+     * about 10% at the default gate, so the scan runs to the end.) */
+    if (np > max_hits) return FULL;
     // ---- 4+5. accumulate hits (layer 1, then layers >= 2), as lean_neon ----
     int hits = np;
     const __m128i koff = _mm_set1_epi16((short)off), one16 = _mm_set1_epi16(1);
@@ -298,6 +307,11 @@ static inline Kind lean_x86_core(const Job &jb, X86Scratch &s, int &hb, int &he,
             x86_st(mp, _mm_shuffle_epi8(r, sh));
             x86_st(jp, _mm_shuffle_epi8(Rel ? x86_ld(s.PC + k0) : _mm_sub_epi16(koff, tv), sh));   // Rel: the code
             mp += s.pc[m >> 8]; jp += s.pc[m >> 8];
+            if ((k0 & 63) == 56 && k0 + 8 < np) {   // early FULL, every 64 rows (see above)
+                __m128i x = _mm_add_epi32(extra, _mm_srli_si128(extra, 8));
+                x = _mm_add_epi32(x, _mm_srli_si128(x, 4));
+                if ((long)(k0 + 8) + (uint32_t)_mm_cvtsi128_si32(x) > max_hits) return FULL;
+            }
         }
         n = (int)(mp - s.RA);
         extra = _mm_add_epi32(extra, _mm_srli_si128(extra, 8));
