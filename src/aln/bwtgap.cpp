@@ -12,11 +12,13 @@
  * it whole, where gap_push assigns the slot's fields one by one. gap_job_run keeps the last child
  * of each expansion in registers and, when it is the entry the next pop returns, continues with it
  * without storing or loading it (top-of-stack forwarding), counting it as pushed and popped. The
- * job's stack helpers are forced inline and its rare paths (hits, chunk get/put) kept out of line. */
+ * job's stack helpers are forced inline and its rare paths (hits, chunk get/put) kept out of line,
+ * and the options it reads are copied into the job (gap_job_const_t) with two expressions precomputed. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
 #include "../utils.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -502,7 +504,12 @@ int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 	const gap_opt_t *opt = &j->opt;
 	int jj, _j;
 	j->best_score = aln_score(opt->max_diff+1, opt->max_gapo+1, opt->max_gape+1, opt);
+	j->score_cut = (opt->mode & BWA_MODE_NONSTOP)? INT_MAX : j->best_score + opt->s_mm;
 	j->best_diff = opt->max_diff + 1; j->max_diff = opt->max_diff;
+	j->c.s_mm = opt->s_mm; j->c.s_gapo = opt->s_gapo; j->c.s_gape = opt->s_gape; j->c.mode = opt->mode;
+	j->c.max_entries = opt->max_entries; j->c.max_gapo = opt->max_gapo; j->c.max_gape = opt->max_gape;
+	j->c.max_seed_diff = opt->max_seed_diff; j->c.indel_end_skip = opt->indel_end_skip;
+	j->c.max_del_occ = opt->max_del_occ; j->c.seed_off = j->len - opt->seed_len;
 	j->best_cnt = 0;
 	j->max_entries = 0;
 	j->m_aln = 4; j->n_aln = 0;
@@ -529,6 +536,7 @@ static GAP_COLD int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_
 	int do_add = 1, j;
 	if (J->n_aln == 0) {
 		J->best_score = score;
+		if (!(opt->mode & BWA_MODE_NONSTOP)) J->score_cut = score + opt->s_mm;
 		J->best_diff = e->n_mm + e->n_gapo;
 		if (opt->mode & BWA_MODE_GAPE) J->best_diff += e->n_gape;
 		if (!(opt->mode & BWA_MODE_NONSTOP))
@@ -582,7 +590,7 @@ static GAP_HOT int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bw
  * next push stores after it whatever bucket it goes to. */
 static GAP_HOT void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_score, int i, bwtint_t k, bwtint_t l,
 								   int n_mm, int n_gapo, int n_gape, int n_ins, int n_del, int state, int is_diff,
-								   const gap_opt_t *opt)
+								   const gap_job_const_t *opt)
 {
 	if (*f_score >= 0) gap_cstore(stack, *f_score, f);
 	*f_score = aln_score(n_mm, n_gapo, n_gape, opt);
@@ -603,7 +611,7 @@ static GAP_HOT void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_
  * next pass of the loop, before any yield, so nothing about it is kept in the job. */
 int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 {
-	const gap_opt_t *opt = &J->opt;
+	const gap_job_const_t *opt = &J->c; // the options it reads, copied by gap_job_start
 	gap_cstack_t *stack = J->stack;
 	const ubyte_t *seq = J->seq;
 	bwt_width_t *width = J->width, *seed_width = J->seed_width;
@@ -648,7 +656,7 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 			else gap_cpop(stack, &e); // get the best entry
 			k = e.k; l = e.l; // SA interval
 			i = e.info&0xffff; // length
-			if (!(opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > J->best_score + opt->s_mm) break; // no need to proceed
+			if (e.info>>21 > J->score_cut) break; // no need to proceed (score_cut: INT_MAX under NONSTOP, else best_score + s_mm)
 
 			m = J->max_diff - (e.n_mm + e.n_gapo);
 			if (opt->mode & BWA_MODE_GAPE) m -= e.n_gape;
@@ -684,7 +692,7 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 		// test whether diff is allowed
 		allow_diff = allow_M = 1;
 		if (i > 0) {
-			int ii = i - (len - opt->seed_len);
+			int ii = i - opt->seed_off; // i - (len - seed_len)
 			if (width[i-1].bid > m-1) allow_diff = 0;
 			else if (width[i-1].bid == m-1 && width[i].bid == m-1 && width[i-1].w == width[i].w) allow_M = 0;
 			if (seed_width && ii > 0) {

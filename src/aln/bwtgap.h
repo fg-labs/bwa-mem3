@@ -109,23 +109,42 @@ void gap_cstack_pop_ext(gap_cstack_t *stack, gap_entry_t *e);
  * returns 1. Each gap_job_run call that returns 0 has prefetched the Occ blocks its next call
  * reads first: the next bwt_2occ4, or the next base of an exact-match tail (bwt_match_exact_alt,
  * which the job runs one base per call). When done, aln/n_aln hold what bwt_match_gap returns
- * (the caller owns aln). */
+ * (the caller owns aln).
+ *
+ * The fields gap_job_run reads on every call come first, so that they share as few cache lines as
+ * possible: the resume state, the inputs it uses, and `c`, the options it reads, copied from opt by
+ * gap_job_start (with seed_off = len - opt.seed_len precomputed).
+ *
+ * Invariants: `c` and `score_cut` are valid only after gap_job_start, and neither opt nor len may
+ * change after it (the hit path reads opt, the step reads c). score_cut tracks best_score: every
+ * write of best_score (gap_job_start, gap_job_hit's first hit) updates it too. */
 enum { JOB_OCC4 = 1, JOB_EXACT = 2 }; // gap_job_t::pending: the lookup the next call resumes at
+typedef struct { // gap_job_run's copy of the options it reads (set by gap_job_start)
+	int s_mm, s_gapo, s_gape, mode;
+	int max_entries, max_gapo, max_gape, max_seed_diff;
+	int indel_end_skip, max_del_occ, seed_off;
+} gap_job_const_t;
+
 typedef struct {
-	// inputs
-	int len;
-	const ubyte_t *seq;      // the complemented read, as bwt_match_gap takes it
-	bwt_width_t *width, *seed_width;
-	gap_opt_t opt;
-	gap_cstack_t *stack;     // emptied (chunks back to its pool) when the job ends
-	// results
-	bwt_aln1_t *aln;
-	int n_aln;
-	// state
-	int best_score, best_diff, max_diff, best_cnt, max_entries, m_aln;
+	// state: what the next gap_job_run call resumes from
 	int pending, i, m, m_seed; // pending: 0, JOB_OCC4 or JOB_EXACT
 	bwtint_t k, l;
 	gap_entry_t e;
+	// inputs
+	gap_cstack_t *stack;     // emptied (chunks back to its pool) when the job ends
+	const ubyte_t *seq;      // the complemented read, as bwt_match_gap takes it
+	bwt_width_t *width, *seed_width;
+	int len;
+	// state read on every call
+	int max_diff, score_cut; // score_cut: the score above which the search stops
+	int max_entries;         // the most entries the stack has held (a statistic; the -m limit is c.max_entries)
+	gap_job_const_t c;
+	// inputs and state the hits use
+	gap_opt_t opt;
+	int best_score, best_diff, best_cnt, m_aln;
+	// results
+	bwt_aln1_t *aln;
+	int n_aln;
 } gap_job_t;
 int gap_job_start(gap_job_t *j, const bwt_t *bwt);
 int gap_job_run(gap_job_t *j, const bwt_t *bwt);

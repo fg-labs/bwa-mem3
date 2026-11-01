@@ -62,7 +62,8 @@ Each change to upstream-derived code adds a line here.
   block, the malloc wrappers and the `bwa_aln2seq` declaration (ported with the SAM
   code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
   `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch`,
-  `aln_batch_max_gapo`, `width_walk_t`/`width_walk_init`/`width_walk_run`, the chunked stack
+  `aln_batch_max_gapo`, `gap_job_t` with its option copy `gap_job_const_t`,
+  `width_walk_t`/`width_walk_init`/`width_walk_run`, the chunked stack
   (`gap_chunk_t`, `gap_pool_t`, `gap_bucket_t`, `gap_cstack_t` and their init, release and destroy
   functions, `ALN_POOL_KEEP`) and the out-of-line push, pop and reset wrappers the unit tests use
   (`gap_stack_push_ext`, `gap_stack_pop_ext`, `gap_stack_reset_ext`, `gap_cstack_push_ext`,
@@ -237,6 +238,11 @@ Each change to upstream-derived code adds a line here.
   `bwtgap.cpp` the search's stack helpers are forced inline and its rare paths (a found hit, a stack
   chunk taken from or given back to the pool) are kept out of line. Code placement only; the
   statements run are the same.
+- Job layout (new code). `gap_job_t` puts the fields `gap_job_run` reads on every call first (resume
+  state, inputs, then `c`, a copy of the options it reads, made by `gap_job_start`), and two
+  expressions are precomputed: `seed_off = len - seed_len` per read, and `score_cut`, the score above
+  which the search stops (`best_score + s_mm`, updated where `best_score` is, or `INT_MAX` under
+  `NONSTOP`, where upstream skips the test). Same values, compared the same way.
 - Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
   walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
   block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone

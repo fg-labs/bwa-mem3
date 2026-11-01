@@ -32,14 +32,15 @@ struct SearchIndex {
     std::unique_ptr<FMI_search> fmi;
     ba::bwt_t *bwt = nullptr;
 
-    SearchIndex()
+    SearchIndex() : SearchIndex(aln_test::test_contigs()) {}
+    explicit SearchIndex(const std::vector<std::pair<std::string, std::string>> &contigs)
     {
         std::string tmpl_s = aln_test::tmp_template("aln_search_unit");
         char *tmpl = &tmpl_s[0];
         REQUIRE(mkdtemp(tmpl) != nullptr);
         dir = tmpl;
         prefix = dir + "/ref.fa";
-        REQUIRE(aln_test::write_test_fasta(prefix));
+        REQUIRE(aln_test::write_test_fasta(prefix, contigs));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         fmi.reset(new FMI_search(prefix.c_str()));
         fmi->load_index(false, 1);
@@ -57,6 +58,28 @@ struct SearchIndex {
 SearchIndex &index_fixture()
 {
     static SearchIndex idx;
+    return idx;
+}
+
+// A reference with a diverged copy: p2 is p1[50:350] with a 1-bp deletion (at p1 150), a 1-bp
+// insertion (after p1 250) and two mismatches (p1 100 and 300), so one read can align exactly or
+// with mismatches to p1 and with a gap to p2.
+std::vector<std::pair<std::string, std::string>> paralog_contigs()
+{
+    uint32_t st = 77;
+    std::string p1 = aln_test::lcg_dna(st, 400), p3 = aln_test::lcg_dna(st, 300);
+    std::string c = p1.substr(50, 300); // c[i] = p1[50 + i]
+    auto other = [](char b) { return b == 'A' ? 'C' : 'A'; };
+    c[250] = other(c[250]);                  // p1 300
+    c.insert(201, 1, other(c[200]));         // after p1 250
+    c.erase(100, 1);                         // p1 150
+    c[50] = other(c[50]);                    // p1 100
+    return {{"p1", p1}, {"p2", c}, {"p3", p3}};
+}
+
+SearchIndex &paralog_fixture()
+{
+    static SearchIndex idx(paralog_contigs());
     return idx;
 }
 
@@ -631,6 +654,63 @@ TEST_CASE("aln_search: gap_job_run matches bwt_match_gap at every small -m and -
             << m_compared);
     CHECK(with_hits > compared / 4);
     CHECK(capped > m_compared / 2); // the -m sweep does stop most of its searches
+}
+
+// The score break (stop once the entry popped scores above the first hit's score + s_mm) only
+// changes the hits when an entry above that score could still become a hit: one more difference
+// than the best hit, where that difference is a gap (it costs more than s_mm). Reads with a
+// mismatch or an indel next to a short repeat give such second alignments; -M 1 makes every gap
+// cost more than the cut allows.
+TEST_CASE("aln_search: gap_job_run matches bwt_match_gap where the score break decides the hits"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = paralog_fixture();
+    auto contigs = paralog_contigs();
+    const std::string &s1 = contigs[0].second, &s2 = contigs[1].second;
+    uint32_t x = 2718;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    auto mutate = [&](std::string r, size_t i) { r[i] = "ACGT"[(std::string("ACGT").find(r[i]) + 1 + rnd(3)) % 4]; return r; };
+    std::vector<std::string> reads;
+    // 300 reads: an off-by-one score_cut (best_score + s_mm + 1) changes the hits of 12 read/option pairs
+    for (int t = 0; t < 300; ++t) {
+        int len = 30 + (int)rnd(30);
+        const std::string &src = t % 3 == 2 ? s2 : s1;
+        // mostly from the diverged span p1[50:350] (or its copy), so most reads have a second locus
+        size_t start = t % 6 == 5 ? rnd((uint32_t)(src.size() - len - 4)) : (&src == &s1 ? 50 : 0) + rnd(300 - len - 4);
+        std::string r = src.substr(start, len + 2);
+        switch (t % 5) {
+        case 4: break; // unchanged
+        case 0: r = mutate(r, 8 + rnd(len - 16)); break;
+        case 1: { size_t p = 8 + rnd(len - 16); r = r.substr(0, p) + r.substr(p + 1); } break; // deletion
+        case 2: { size_t p = 8 + rnd(len - 16); r = r.substr(0, p) + r[p] + r.substr(p); } break; // duplicated base
+        default: r = mutate(mutate(r, 6 + rnd(len / 2 - 6)), len / 2 + rnd(len / 2 - 6)); break;
+        }
+        reads.push_back(r.substr(0, len));
+    }
+    struct Case { const char *name; int max_diff, max_gapo, s_mm, s_gapo, s_gape; };
+    const Case cases[] = {
+        {"-n 2 -o 1", 2, 1, 3, 11, 4}, {"-n 3 -o 1", 3, 1, 3, 11, 4}, {"-n 3 -o 2", 3, 2, 3, 11, 4},
+        {"-n 2 -o 1 -M 1", 2, 1, 1, 11, 4}, {"-n 3 -o 2 -M 1", 3, 2, 1, 11, 4}, {"-n 3 -o 2 -M 2 -O 5 -E 3", 3, 2, 2, 5, 3},
+    };
+    long compared = 0, with_hits = 0, gapped = 0;
+    for (const Case &c : cases) {
+        ba::gap_opt_t opt = make_opt(c.max_diff, c.max_gapo);
+        opt.s_mm = c.s_mm; opt.s_gapo = c.s_gapo; opt.s_gape = c.s_gape;
+        for (size_t i = 0; i < reads.size(); ++i) {
+            INFO("case " << std::string(c.name) << ", read " << i << " (" << reads[i] << ")");
+            GapResult ref, job;
+            both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job);
+            REQUIRE(ref.aln.size() == job.aln.size());
+            for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+            ++compared;
+            with_hits += !ref.aln.empty();
+            bool g = false;
+            for (const auto &a : ref.aln) g = g || a.n_gapo;
+            gapped += g;
+        }
+    }
+    MESSAGE("compared " << compared << ", with hits " << with_hits << ", with a gapped hit " << gapped);
+    CHECK(with_hits > compared / 2);
+    CHECK(gapped > compared / 10);
 }
 
 // gap_cstack_t (the job's stack) against gap_stack_t (upstream's): random push/pop sequences
