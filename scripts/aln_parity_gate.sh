@@ -218,26 +218,22 @@ split_words() {
     read -r -a WORDS <<< "$1" || true
 }
 
-# compare_se <tag> <fq> <samse args> <ours args> [aln options...]
-compare_se() {
-    local tag="$1" fq="$2" samse_s="$3" ours_s="$4" t t0 w_stock w_ours ok=1 detail=""
-    shift 4
-    local samse_args=() ours_args=()
-    split_words "$samse_s"
-    samse_args=(${WORDS[@]+"${WORDS[@]}"})
+# ours_vs_stock <SE|PE> <tag> <stock seconds> <ours args string> <n inputs> <inputs...> [aln options...]
+# Runs bwa-mem3 at every thread count in T_LIST on the inputs, compares each run with
+# $RUN/stock.sam (already written by the caller) and reports the case. The part compare_se and
+# compare_pe share; they differ only in the stock pipeline and the number of inputs.
+ours_vs_stock() {
+    local kind="$1" tag="$2" w_stock="$3" ours_s="$4" n_in="$5" t t0 w_ours ok=1 detail
+    shift 5
+    local inputs=("${@:1:$n_in}")
+    shift "$n_in"
+    local ours_args=()
     split_words "$ours_s"
     ours_args=(${WORDS[@]+"${WORDS[@]}"})
-    t0=$SECONDS
-    if ! { run_tool "$RUN/stock.aln.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq" > "$RUN/stock.sai" \
-        && run_tool "$RUN/stock.samse.err" "$BWA_ORACLE" samse ${samse_args[@]+"${samse_args[@]}"} "$RS" "$RUN/stock.sai" "$fq" > "$RUN/stock.sam"; }; then
-        result FAIL "SE $tag" "stock failed"
-        return
-    fi
-    w_stock=$((SECONDS - t0))
     detail="stock ${w_stock}s"
     for t in $T_LIST; do
         t0=$SECONDS
-        if ! run_tool "$RUN/ours.err" "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$RM" "$fq" > "$RUN/ours.sam"; then
+        if ! run_tool "$RUN/ours.err" "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$RM" "${inputs[@]}" > "$RUN/ours.sam"; then
             ok=0
             detail="$detail; -t $t: bwa-mem3 failed"
             continue
@@ -252,23 +248,37 @@ compare_se() {
         fi
     done
     if [ "$ok" = 1 ]; then
-        result PASS "SE $tag $*" "$(n_records "$RUN/ours.sam") records; $detail"
+        result PASS "$kind $tag $*" "$(n_records "$RUN/ours.sam") records; $detail"
     else
-        result FAIL "SE $tag $*" "$detail"
+        result FAIL "$kind $tag $*" "$detail"
     fi
+}
+
+# compare_se <tag> <fq> <samse args> <ours args> [aln options...]
+compare_se() {
+    local tag="$1" fq="$2" samse_s="$3" ours_s="$4" t0
+    shift 4
+    local samse_args=()
+    split_words "$samse_s"
+    samse_args=(${WORDS[@]+"${WORDS[@]}"})
+    t0=$SECONDS
+    if ! { run_tool "$RUN/stock.aln.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq" > "$RUN/stock.sai" \
+        && run_tool "$RUN/stock.samse.err" "$BWA_ORACLE" samse ${samse_args[@]+"${samse_args[@]}"} "$RS" "$RUN/stock.sai" "$fq" > "$RUN/stock.sam"; }; then
+        result FAIL "SE $tag" "stock failed"
+        return
+    fi
+    ours_vs_stock SE "$tag" $((SECONDS - t0)) "$ours_s" 1 "$fq" "$@"
     rm -f "$RUN"/stock.sai "$RUN"/stock.sam "$RUN"/ours.sam
 }
 
 # compare_pe <tag> <fq1> <fq2> <sampe args> <ours args> [aln options...]
 # Prints, into $RUN/stock.sampe.err, stock's messages (cases look for infer_isize failures).
 compare_pe() {
-    local tag="$1" fq1="$2" fq2="$3" sampe_s="$4" ours_s="$5" t t0 w_stock w_ours ok=1 detail=""
+    local tag="$1" fq1="$2" fq2="$3" sampe_s="$4" ours_s="$5" t0
     shift 5
-    local sampe_args=() ours_args=()
+    local sampe_args=()
     split_words "$sampe_s"
     sampe_args=(${WORDS[@]+"${WORDS[@]}"})
-    split_words "$ours_s"
-    ours_args=(${WORDS[@]+"${WORDS[@]}"})
     t0=$SECONDS
     if ! { run_tool "$RUN/stock.aln1.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq1" > "$RUN/stock.1.sai" \
         && run_tool "$RUN/stock.aln2.err" "$BWA_ORACLE" aln "$@" -t "$THREADS" "$RS" "$fq2" > "$RUN/stock.2.sai" \
@@ -276,29 +286,7 @@ compare_pe() {
         result FAIL "PE $tag" "stock failed"
         return
     fi
-    w_stock=$((SECONDS - t0))
-    detail="stock ${w_stock}s"
-    for t in $T_LIST; do
-        t0=$SECONDS
-        if ! run_tool "$RUN/ours.err" "$BWA_MEM3" aln "$@" -t "$t" ${ours_args[@]+"${ours_args[@]}"} "$RM" "$fq1" "$fq2" > "$RUN/ours.sam"; then
-            ok=0
-            detail="$detail; -t $t: bwa-mem3 failed"
-            continue
-        fi
-        w_ours=$((SECONDS - t0))
-        if same_sam "$RUN/stock.sam" "$RUN/ours.sam" > "$RUN/diff.txt"; then
-            detail="$detail; -t $t ${w_ours}s"
-        else
-            ok=0
-            detail="$detail; -t $t DIFFERS"
-            cat "$RUN/diff.txt"
-        fi
-    done
-    if [ "$ok" = 1 ]; then
-        result PASS "PE $tag $*" "$(n_records "$RUN/ours.sam") records; $detail"
-    else
-        result FAIL "PE $tag $*" "$detail"
-    fi
+    ours_vs_stock PE "$tag" $((SECONDS - t0)) "$ours_s" 2 "$fq1" "$fq2" "$@"
     rm -f "$RUN"/stock.1.sai "$RUN"/stock.2.sai "$RUN"/stock.sam "$RUN"/ours.sam
 }
 
