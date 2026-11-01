@@ -562,29 +562,28 @@ See [Optimization checklist → Reorder seeds longest-first](../best-practices/o
 
 ## `--huge-pages` 1 GB huge pages for the index
 
-`--huge-pages` (Linux, off by default) backs the FM-index and suffix-array
-structures with explicit **1 GB huge pages** to cut data-TLB misses on the random
-SA/BWT accesses that dominate seeding. bwa-mem3's allocator is the vendored
-mimalloc (above), so the flag reserves the pages through it
-(`mi_reserve_huge_os_pages_interleave`) — sizing the reservation from the index
-footprint and reserving before the index loads.
+`--huge-pages` (Linux, off by default) maps the FM-index occurrence table and the
+suffix-array samples on explicit **1 GB huge pages** (`mmap` with `MAP_HUGETLB`)
+to cut data-TLB page walks on the random SA/BWT accesses that dominate seeding.
+The pages are faulted in over several threads before the arrays are read into
+them; on the host measured below this kept index load no slower than the default
+path. Load time on other hosts, thread counts and filesystems is unmeasured.
 
-It is **safe by default**: when the host has no free 1 GB hugepage pool, has too
-few pages, is not Linux, or was built without mimalloc, the flag prints a one-line
-`[M::]` note and runs on the default page size. The pages must be pre-reserved on
-the host (`nr_hugepages`); transparent huge pages (2 MB) do not reproduce the win.
+It is **safe by default**: when the host's 1 GB pool is missing or has too few
+free pages, a process limit (`RLIMIT_AS`, `vm.max_map_count`) refuses the
+mapping, the kernel is older than 5.14 (no `MADV_POPULATE_WRITE` to fault the
+pages in), or the host is not Linux, each array that cannot be mapped uses the
+default pages and a one-line `[M::]` note says so. The pages must be pre-reserved
+on the host (`nr_hugepages`); transparent huge pages (2 MB) alone are not
+equivalent.
 
 The **alignment records are byte-identical** — page size does not change
 alignments; only the `@PG` record differs, since its `CL:` field records the
-`--huge-pages` flag on the command line. Measured effect: ~1.5 % whole-aligner
-wall and ~0.9 % user CPU on a 5 M-read WGS slice (HG00096, hg38), AMD Zen3, avx2
-tier, 32 threads ([#405](https://github.com/fg-labs/bwa-mem3/pull/405)). This is a
-single-host, single-config measurement, not a cross-architecture or cross-thread
-claim.
+`--huge-pages` flag on the command line. Measured on one x86 host (Intel Sapphire Rapids, hg38, 5 M WGS read pairs, `-t 16`): about 1 % lower wall time and 0.3–0.4 % lower CPU time on both the avx512bw and avx2 tiers, with index load no slower on that host.
 
 See [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever)
 and [Optimization checklist → Reserve 1 GB huge pages](../best-practices/optimization-checklist.md#8-reserve-1-gb-huge-pages-for-the-index-linux-opt-in)
-for reservation, verification, and the manual `MIMALLOC_RESERVE_HUGE_OS_PAGES` equivalent.
+for reservation and verification.
 
 ## Certified adaptive extension band (default on; `--no-band-cert` to disable)
 
@@ -717,7 +716,7 @@ Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#re
 | `--extend-mate-concordant` mate-concordant chain retention | [#195](https://github.com/fg-labs/bwa-mem3/pull/195) | — | fork-only (opt-in, not byte-identical) |
 | `--extend-tie-frac` / `--extend-tie-floor` score-gated chain-extension cap | [#269](https://github.com/fg-labs/bwa-mem3/pull/269) | — | fork-only (**default on under `--fast`** — including `--meth --fast` — at `0.95` / `1`; opt-in and off elsewhere, not byte-identical — the gate can drop candidate chains before banded-SW, moving secondaries / `XS` / `MAPQ`) |
 | `--extend-csub` pruned-competitor `MAPQ` seed | [#269](https://github.com/fg-labs/bwa-mem3/pull/269) | — | fork-only (**forced on under `--fast`**, including `--meth --fast`; opt-in elsewhere, not byte-identical — changes emitted `MAPQ` on both the scalar SE and batched paired-end paths when the cap/gate prunes) |
-| `--huge-pages` 1 GB huge pages for the index | [#405](https://github.com/fg-labs/bwa-mem3/pull/405) | — | fork-only (Linux, opt-in, off by default; alignment records byte-identical, `@PG` `CL:` excepted; single-host measurement, not a cross-host/cross-tier claim) |
+| `--huge-pages` 1 GB huge pages for the index | [#405](https://github.com/fg-labs/bwa-mem3/pull/405) | — | fork-only (Linux, opt-in, off by default; alignment records byte-identical, `@PG` `CL:` excepted; measured on one x86 host, both SIMD tiers) |
 | Transparent huge page fallback warning (stderr) | [#587](https://github.com/fg-labs/bwa-mem3/pull/587) | — | fork-only (Linux, stderr-only; at most one two-line `[W::]` warning per run, suppressed at `-v 1`; alignment records byte-identical, `@PG` `CL:` excepted, on 5M-pair WGS and WES slices (hg38), default and both `--compat` targets, on AWS Graviton 4 (arm64, NEON tier) and AMD Zen 5 (x86-64, AVX-512BW tier); CI's phiX smoke test also compares the records at `-v 3` and `-v 4` on the Linux x86-64 AVX2 row) |
 | Missing read inputs reported before the index load | [#645](https://github.com/fg-labs/bwa-mem3/pull/645) | — | fork-only (error timing; same message and exit status for a missing or unreachable path; a directory input now gets `fail to open file` before the load instead of the reader's error after it; alignment output unchanged) |
 | Certified adaptive extension band (`--no-band-cert` to disable) | [#420](https://github.com/fg-labs/bwa-mem3/pull/420) | — | fork-only (**default on**, alignment records byte-identical by a per-pair certificate — `@PG` `CL:` excepted; throughput measured on a 5M-read WGS slice, Apple M2 Max / arm64 NEON tier — see [the measurement](#certified-adaptive-extension-band-default-on---no-band-cert-to-disable) for full scope) |
