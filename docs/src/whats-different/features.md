@@ -247,6 +247,23 @@ stride-8 index and is the recommended speed-per-GB operating point; `-u 1`
 [CLI Reference → re-sa](../cli/re-sa.md) and
 [shm → `-u`](../cli/shm.md#-u-int--densify-the-staged-sa-sample-table).
 
+## Backtracking aligner: `bwa-mem3 aln` (PR #689)
+
+`bwa-mem3 aln` ports bwa's backtracking aligner for ultrashort, ancient and degraded DNA: it runs
+`bwa aln` followed by `bwa samse` (one read file) or `bwa sampe` (two) in one command, with no
+`.sai` files, on the index `bwa-mem3 index` writes. Its SAM records are byte-identical to stock
+bwa 0.7.19's (the `@PG` line differs) on the generated reads the parity checks use, at one and
+four threads, in CI on Linux x86-64 (AVX2 build), Linux arm64 and macOS arm64. `--bam` and
+`--bam-level` are new; the long options `--max-xa-hits`, `--max-occ` and
+`--max-xa-hits-discordant` stand in for samse/sampe `-n`, sampe `-o` and sampe `-N`. Option values
+on which stock crashes or drops every read (for example a negative `-l` or `-B`) are refused. See
+[CLI Reference → aln](../cli/aln.md).
+
+```bash
+bwa-mem3 aln -l 1024 -n 0.04 -o 2 -t 8 ref.fa reads.fq.gz > out.sam
+bwa-mem3 aln -l 1024 -n 0.04 -o 2 --bam ref.fa r1.fq.gz r2.fq.gz > out.bam
+```
+
 ## `HN:i` hit count tag (PR #42)
 
 Every primary SAM/BAM record now carries an `HN:i:<n>` tag reporting the
@@ -703,6 +720,7 @@ Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#re
 | `--hic` Hi-C preset | [#372](https://github.com/fg-labs/bwa-mem3/pull/372) | — | fork-only spelling (opt-in, off by default; sets the same flag bits as `-5SP`, which both upstreams also accept, so identical by construction — the regression confirms byte-identity on phix-derived PE reads with `@PG` excluded, not a cross-host/cross-tier claim) |
 | `bwa-mem3 shm` shared-memory index | [#65](https://github.com/fg-labs/bwa-mem3/pull/65) | — | fork-only |
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
+| `bwa-mem3 aln` backtracking aligner (bwa 0.7.19 `aln` + `samse`/`sampe`) | [#689](https://github.com/fg-labs/bwa-mem3/pull/689) | — | fork-only (records byte-identical to stock bwa 0.7.19 built without FP contraction, `@PG` excluded, on the parity checks' generated reads; Linux x86-64 AVX2 build, Linux arm64, macOS arm64) |
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
 | `--smem-dedup` SMEM deduplication | [#187](https://github.com/fg-labs/bwa-mem3/pull/187) | — | fork-only (opt-in, not byte-identical) |
