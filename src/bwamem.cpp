@@ -6183,8 +6183,8 @@ static inline int32_t pair_sort_key(const SeqPair &sp, PairSortKey key)
  *   PAIR_SORT_LEN1 (16-bit tier): len1 (the historical bwa-mem2 behavior).
  *   PAIR_SORT_MAX (8-bit tier diverted to the 16-bit kernel, w > BSW8_MAX_W):
  *     max(len1, len2), the key this call had before (EXT-13); it equals len1, as
- *     bsw8_envelope_ok admits only len1 >= len2. The 16-bit calls keep their old
- *     keys (LEN1 for the 16-bit tier, MAX here); a len2 key for them was not measured.
+ *     bsw8_envelope_ok admits only len1 >= len2.
+ *   The 16-bit calls sort on two keys, chosen per call (sortPairsLen16 below).
  *   PAIR_SORT_LEN2 (8-bit kernels): len2, the query length. The int8 kernels
  *     bound each lane by its query: the band's tail is clamped to qlen - i, a
  *     lane ends by its row bound min(len1, len2 + band), and the group's column
@@ -6252,6 +6252,49 @@ inline void sortPairsLen(SeqPair *pairArray, int32_t count, SeqPair *tempArray, 
     }
 }
 
+/* The 16-bit kernel's pair order (both of its calls: the 16-bit tier and the 8-bit tier
+ * diverted to it). A 16-bit lane group runs max(len1) rows (the zero-row break rarely cuts a
+ * long lane short) of up to max(len2) columns, and the query-end (gscore) capture runs on the
+ * columns past the group's shortest len2. So a group's work is about max(len1) x max(len2), and
+ * packing lanes of similar len2 also shrinks the columns past the shortest query.
+ *
+ * Which key should lead depends on the call's pairs:
+ *   - pairs with len1 >= len2 (long extensions: the bulk of 16-bit work on long reads, -A > 1
+ *     and wide bands) pack best len2-major with len1 ties: equal-len2 lanes share their
+ *     column range and their query end, and len1 then bounds the rows;
+ *   - pairs with len1 < len2 (short reference windows at contig edges or past a mismatch
+ *     cluster: nearly all of the 16-bit tier on short reads at default settings) spread
+ *     widely in len1 at a given len2, so a len2-major order mixes long and short len1 in a
+ *     group and every lane pays for the longest; len1-major with len2 ties bounds the rows.
+ * Each call takes the order its majority calls for: len1-major when strictly more than half
+ * of its pairs have len1 < len2, len2-major otherwise (ties, n = 0 and the diverted call,
+ * whose pairs all have len1 >= len2, go len2-major).
+ *
+ * As for sortPairsLen, only the packing order changes: results scatter back by
+ * (seqid, regid), so every order is byte-identical. */
+bool bsw16_len1_major_order(const SeqPair *pairArray, int32_t count)
+{
+    int32_t shorter_ref = 0;
+    for (int32_t i = 0; i < count; i++) shorter_ref += pairArray[i].len1 < pairArray[i].len2;
+    return 2 * shorter_ref > count;
+}
+
+/* Stable two-key order for a 16-bit call (see bsw16_len1_major_order): two stable counting
+ * sorts, the minor key first. `diverted` selects the diverted 8-bit call, whose len1 key is
+ * its historical max(len1, len2) (equal to len1 there). hist needs MAX_SEQ_LEN16 + 1 slots. */
+void sortPairsLen16(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist,
+                    bool diverted)
+{
+    const PairSortKey len1_key = diverted ? PAIR_SORT_MAX : PAIR_SORT_LEN1;
+    if (bsw16_len1_major_order(pairArray, count)) {
+        sortPairsLen(pairArray, count, tempArray, hist, PAIR_SORT_LEN2);
+        sortPairsLen(pairArray, count, tempArray, hist, len1_key);
+    } else {
+        sortPairsLen(pairArray, count, tempArray, hist, len1_key);
+        sortPairsLen(pairArray, count, tempArray, hist, PAIR_SORT_LEN2);
+    }
+}
+
 /* ------------------------------------------------------------------------- *
  * D3 (--meth, A1/PR-4): per-hypothesis banded-SW tier dispatch.
  *
@@ -6286,7 +6329,7 @@ static inline void bsw_score_batch(BswMethTier tier, IBandedPairWiseSW *bsw,
 #if !HAVE_BSW_VECTOR_8_16
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
 #else
-        sortPairsLen(pa, n, sort_scratch, hist, PAIR_SORT_LEN1);
+        sortPairsLen16(pa, n, sort_scratch, hist, false);
         bsw->getScores16(pa, ref, qer, n, nthreads, w);
 #endif
         break;
@@ -6295,14 +6338,14 @@ static inline void bsw_score_batch(BswMethTier tier, IBandedPairWiseSW *bsw,
         bsw->scalarBandedSWAWrapper(pa, ref, qer, n, nthreads, w);
 #else
         /* Pack the int8 lane groups by len2, the query length bounding each lane's
-         * band; the diverted 16-bit call keeps max(len1,len2) (see sortPairsLen).
+         * band; the diverted 16-bit call takes the 16-bit order (sortPairsLen16).
          * Only the packing order changes; results scatter back by (seqid,regid).
          * int8 diagonals can't encode a band >= 128: past it, divert to 16-bit. */
         if (w <= BSW8_MAX_W) {
             sortPairsLen(pa, n, sort_scratch, hist, PAIR_SORT_LEN2);
             bsw->getScores8(pa, ref, qer, n, nthreads, w);
         } else {
-            sortPairsLen(pa, n, sort_scratch, hist, PAIR_SORT_MAX);
+            sortPairsLen16(pa, n, sort_scratch, hist, true);
             bsw->getScores16(pa, ref, qer, n, nthreads, w);
         }
 #endif
