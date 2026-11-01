@@ -11,7 +11,9 @@
  * the SAM header writer follows bwa 0.7.19's output, not this branch's; SAM fields and
  * the MD string are formatted with kputs/kputc/kputl instead of ksprintf, because libc's
  * vfprintf takes a process-wide locale lock that serialises the formatting threads (the
- * text produced is the same). See README.md.
+ * text produced is the same); bwa_sa2pos's tail is split out as bwa_pos_from_sa, and
+ * bwa_cal_pac_pos makes all its SA lookups in one batch (bwt_sa_batch) before upstream's loop.
+ * See README.md.
  *
  * aln_bns_cnt_ambi is from bwa's bntseq.c, which carries the MIT licence below (this file's
  * other code is Apache 2.0, as stated above). The reference window in bwa_refine_gapped_core
@@ -49,6 +51,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <vector>
 
 #include "../bwa.h"
 #include "../utils.h"
@@ -157,17 +161,34 @@ int bwa_approx_mapQ(const bwa_seq_t *p, int mm)
 	return (23 < g_log_n[n])? 0 : 23 - g_log_n[n];
 }
 
-bwtint_t bwa_sa2pos(const bntseq_t *bns, const bwt_t *bwt, bwtint_t sapos, int ref_len, int *strand)
+bwtint_t bwa_pos_from_sa(const bntseq_t *bns, bwtint_t pos_f, int ref_len, int *strand)
 {
-	bwtint_t pos_f;
 	int is_rev;
 	*strand = 0; // initialise strand to 0 otherwise we could return without setting it
-	pos_f = bwt_sa(bwt, sapos); // position on the forward-reverse coordinate
 	if (pos_f < (bwtint_t)bns->l_pac && (bwtint_t)bns->l_pac < pos_f + ref_len) return (bwtint_t)-1;
 	pos_f = bns_depos(bns, pos_f, &is_rev); // position on the forward strand; this may be the first base or the last base
 	*strand = !is_rev;
 	if (is_rev) pos_f = pos_f + 1 < (bwtint_t)ref_len? 0 : pos_f - ref_len + 1; // position of the first base
 	return pos_f; // FIXME: it is possible that pos_f < bns->anns[ref_id].offset
+}
+
+bwtint_t bwa_sa2pos(const bntseq_t *bns, const bwt_t *bwt, bwtint_t sapos, int ref_len, int *strand)
+{
+	// position on the forward-reverse coordinate, then upstream's tail
+	return bwa_pos_from_sa(bns, bwt_sa(bwt, sapos), ref_len, strand);
+}
+
+/* bwa_cal_pac_pos_core's body after its type check, with the SA lookup done by the caller:
+ * pos_f = bwt_sa(seq->sa). Both callers make the check (the read is UNIQUE or REPEAT). */
+static void cal_pac_pos_core_sa(const bntseq_t *bns, bwtint_t pos_f, bwa_seq_t *seq, const int max_mm, const float fnr)
+{
+	int max_diff, strand;
+	max_diff = fnr > 0.0? bwa_cal_maxdiff(seq->len, BWA_AVG_ERR, fnr) : max_mm;
+	seq->seQ = seq->mapQ = bwa_approx_mapQ(seq, max_diff);
+	seq->pos = bwa_pos_from_sa(bns, pos_f, seq->len + seq->ref_shift, &strand);
+	seq->strand = strand;
+	seq->seQ = seq->mapQ = bwa_approx_mapQ(seq, max_diff);
+	if (seq->pos == (bwtint_t)-1) seq->type = BWA_TYPE_NO_MATCH;
 }
 
 /**
@@ -178,25 +199,30 @@ bwtint_t bwa_sa2pos(const bntseq_t *bns, const bwt_t *bwt, bwtint_t sapos, int r
  */
 void bwa_cal_pac_pos_core(const bntseq_t *bns, const bwt_t *bwt, bwa_seq_t *seq, const int max_mm, const float fnr)
 {
-	int max_diff, strand;
 	if (seq->type != BWA_TYPE_UNIQUE && seq->type != BWA_TYPE_REPEAT) return;
-	max_diff = fnr > 0.0? bwa_cal_maxdiff(seq->len, BWA_AVG_ERR, fnr) : max_mm;
-	seq->seQ = seq->mapQ = bwa_approx_mapQ(seq, max_diff);
-	seq->pos = bwa_sa2pos(bns, bwt, seq->sa, seq->len + seq->ref_shift, &strand);
-	seq->strand = strand;
-	seq->seQ = seq->mapQ = bwa_approx_mapQ(seq, max_diff);
-	if (seq->pos == (bwtint_t)-1) seq->type = BWA_TYPE_NO_MATCH;
+	cal_pac_pos_core_sa(bns, bwt_sa(bwt, seq->sa), seq, max_mm, fnr);
 }
 
 void bwa_cal_pac_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, int max_mm, float fnr)
 {
 	int i, j, strand, n_multi;
+	// Pass 1: every SA row the loop below looks up, in its order, resolved in one batch.
+	std::vector<bwtint_t> sa;
+	sa.reserve((size_t)n_seqs);
+	for (i = 0; i != n_seqs; ++i) {
+		const bwa_seq_t *p = &seqs[i];
+		if (p->type == BWA_TYPE_UNIQUE || p->type == BWA_TYPE_REPEAT) sa.push_back(p->sa);
+		for (j = 0; j < p->n_multi; ++j) sa.push_back(p->multi[j].pos);
+	}
+	bwt_sa_batch(bwt, sa.data(), (int64_t)sa.size(), sa.data());
+	// Pass 2: upstream's loop, taking each lookup's result from the batch.
+	size_t c = 0;
 	for (i = 0; i != n_seqs; ++i) {
 		bwa_seq_t *p = &seqs[i];
-		bwa_cal_pac_pos_core(bns, bwt, p, max_mm, fnr);
+		if (p->type == BWA_TYPE_UNIQUE || p->type == BWA_TYPE_REPEAT) cal_pac_pos_core_sa(bns, sa[c++], p, max_mm, fnr);
 		for (j = n_multi = 0; j < p->n_multi; ++j) {
 			bwt_multi1_t *q = p->multi + j;
-			q->pos = bwa_sa2pos(bns, bwt, q->pos, p->len + q->ref_shift, &strand);
+			q->pos = bwa_pos_from_sa(bns, sa[c++], p->len + q->ref_shift, &strand);
 			q->strand = strand;
 			if (q->pos != p->pos && q->pos != (bwtint_t)-1)
 				p->multi[n_multi++] = *q;
