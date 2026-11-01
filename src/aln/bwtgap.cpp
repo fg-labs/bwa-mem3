@@ -9,11 +9,13 @@
  * with bwt_match_exact_alt's loop (aln_bwt.cpp) run inside the job one base at a time. The job
  * uses a new stack, gap_cstack_t (after gap_pop), whose buckets are chains of pooled chunks;
  * bwt_match_gap keeps upstream's gap_stack_t. gap_cpush builds each entry in a local and stores
- * it whole, where gap_push assigns the slot's fields one by one. gap_job_run keeps the last child
+ * it whole, where gap_push assigns the slot's fields one by one. The job step keeps the last child
  * of each expansion in registers and, when it is the entry the next pop returns, continues with it
  * without storing or loading it (top-of-stack forwarding), counting it as pushed and popped. The
  * job's stack helpers are forced inline and its rare paths (hits, chunk get/put) kept out of line,
- * and the options it reads are copied into the job (gap_job_const_t) with two expressions precomputed. */
+ * and the options it reads are copied into the job (gap_job_const_t) with two expressions precomputed.
+ * width_walk_init/width_walk_run (moved here from bwtaln.cpp) and gap_slots_run, the slot loop of
+ * the interleaved search with the job and width-walk steps inlined, are new as well. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
 #include "../utils.h"
@@ -31,7 +33,7 @@ namespace bwa_aln {
 
 #define aln_score(m,o,e,p) ((m)*(p)->s_mm + (o)*(p)->s_gapo + (e)*(p)->s_gape)
 
-// For the interleaved search below: its hot helpers are forced inline into gap_job_run, and the
+// For the interleaved search below: its hot helpers are forced inline into the job step, and the
 // rare paths (a found hit, a stack chunk taken from or given back to the pool) are kept out of
 // line, so the loop holds fewer live values and the compiler lays the common path out straight.
 // GCC/clang only, like the __builtin_expect and __builtin_prefetch calls here.
@@ -208,7 +210,7 @@ void gap_destroy_cstack(gap_cstack_t *stack)
 }
 
 // gap_push's entry for the child (i, k, l, ...), built in a local so that it can be stored whole
-// (gap_cstore) or kept in registers (gap_job_run's forwarding). Assigning n_mm, n_gapo, n_gape and
+// (gap_cstore) or kept in registers (gap_job_step's forwarding). Assigning n_mm, n_gapo, n_gape and
 // state to a stack slot's bitfield word one by one makes the compiler load the word to keep its
 // other bits (n_seed_mm, which nothing reads), and that load of a slot not yet in cache stalls.
 static GAP_HOT void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
@@ -569,7 +571,7 @@ static GAP_COLD int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_
 
 /* bwt_match_exact_alt's next base, seq[i-1], for the entry in J->e: saves (i, k, l), prefetches
  * the two Occ blocks bwt_2occ(k - 1, l) reads and returns 1 (yield). Its N check (return 0, no
- * match) mirrors bwt_match_exact_alt but cannot fire from either call site in gap_job_run. */
+ * match) mirrors bwt_match_exact_alt but cannot fire from either call site in gap_job_step. */
 static GAP_HOT int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bwtint_t k, bwtint_t l)
 {
 	// Kept to mirror bwt_match_exact_alt. Unreachable from both call sites: an N in the read
@@ -582,9 +584,9 @@ static GAP_HOT int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bw
 	return 1;
 }
 
-/* gap_cpush for the children of one expansion in gap_job_run, one behind: the child is built into
+/* gap_cpush for the children of one expansion in gap_job_step, one behind: the child is built into
  * *f, and the child held there before it (if *f_score >= 0) is stored first. So every child but
- * the last is stored in push order, and the last stays in *f; gap_job_run then stores it or
+ * the last is stored in push order, and the last stays in *f; gap_job_step then stores it or
  * forwards it (see there). Storing each child just before the next push, rather than at its own
  * push, changes nothing another push or the next pop can see: no pop runs in between, and the
  * next push stores after it whatever bucket it goes to. */
@@ -609,7 +611,7 @@ static GAP_HOT void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_
  * bucket, or n_stacks for an empty stack). Otherwise (f_score > stack->best) the pop would return
  * an older entry, so f is stored and popped as usual. The forwarded entry is consumed by the very
  * next pass of the loop, before any yield, so nothing about it is kept in the job. */
-int gap_job_run(gap_job_t *J, const bwt_t *bwt)
+static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt)
 {
 	const gap_job_const_t *opt = &J->c; // the options it reads, copied by gap_job_start
 	gap_cstack_t *stack = J->stack;
@@ -752,6 +754,77 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 	}
 	gap_release_cstack(stack); // the read is done: its stack's chunks go back to the pool
 	return 1;
+}
+
+// gap_job_step as a call (the driver inlines it through gap_slots_run); for the unit tests.
+int gap_job_run(gap_job_t *J, const bwt_t *bwt) { return gap_job_step(J, bwt); }
+
+/* New code: bwt_cal_width (bwtaln.cpp) as a resumable walk, so that a read's widths can be computed
+ * interleaved with other reads' work. width_walk_run runs bwt_cal_width's loop until the next base
+ * that needs an Occ lookup, prefetches the two Occ blocks that lookup reads (bwt_prefetch_2occ) and
+ * returns 0; the next call does the lookup and carries on. It returns 1 once width[0..len] is
+ * written, holding exactly what bwt_cal_width writes. */
+void width_walk_init(width_walk_t *w, const bwt_t *bwt, int len, const ubyte_t *str, bwt_width_t *width)
+{
+	w->str = str; w->width = width; w->len = len;
+	w->i = 0; w->bid = 0; w->pending = 0;
+	w->k = 0; w->l = bwt->seq_len;
+}
+
+static GAP_HOT int width_walk_step(width_walk_t *w, const bwt_t *bwt)
+{
+	bwtint_t k = w->k, l = w->l, ok, ol;
+	int i = w->i, bid = w->bid;
+	for (; i < w->len; ++i) {
+		ubyte_t c = w->str[i];
+		if (c < 4) {
+			if (!w->pending) { // yield before the lookup
+				w->pending = 1;
+				w->i = i; w->bid = bid; w->k = k; w->l = l;
+				bwt_prefetch_2occ(bwt, k, l);
+				return 0;
+			}
+			w->pending = 0;
+			bwt_2occ(bwt, k - 1, l, c, &ok, &ol);
+			k = bwt->L2[c] + ok + 1;
+			l = bwt->L2[c] + ol;
+		}
+		if (k > l || c > 3) { // then restart
+			k = 0;
+			l = bwt->seq_len;
+			++bid;
+		}
+		w->width[i].w = l - k + 1;
+		w->width[i].bid = bid;
+	}
+	w->width[w->len].w = 0;
+	w->width[w->len].bid = ++bid;
+	w->i = i; w->bid = bid; w->k = k; w->l = l;
+	return 1;
+}
+
+int width_walk_run(width_walk_t *w, const bwt_t *bwt) { return width_walk_step(w, bwt); }
+
+/* New code: the slot loop of bwa_cal_sa_reg_gap_group (bwtaln.cpp) as one function, with the
+ * job and width-walk steps inlined, so a step costs no call and return, and the per-read
+ * events (widths done, search done) go back to the caller. Which slot is stepped when changes
+ * only the interleaving: each read's own steps run in the same order. */
+int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt)
+{
+	int i = *pos;
+	for (;;) {
+		if (++i == n) i = 0;
+		gap_slot_core_t *s = &slots[i];
+		if (s->state == GAP_SLOT_SEARCH) {
+			if (gap_job_step(&s->job, bwt)) break;
+		} else if (s->state == GAP_SLOT_WIDTHS) {
+			if (!s->widths_done) s->widths_done = width_walk_step(&s->ww, bwt);
+			if (!s->seed_done) s->seed_done = width_walk_step(&s->sw, bwt);
+			if (s->widths_done && s->seed_done) break;
+		}
+	}
+	*pos = i;
+	return i;
 }
 
 } // namespace bwa_aln

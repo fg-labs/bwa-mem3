@@ -6,8 +6,8 @@
  * extern "C" block is dropped, the bwa_aln2seq declaration is left out (it is ported
  * with the SAM code), and the declarations of the search entry points from upstream's
  * bwtaln.c (gap_init_opt, bwa_cal_maxdiff, bwt_cal_width) are added together with
- * aln_search_batch, aln_batch_max_gapo, the gap_job_t interleaved search with its chunked
- * stack (gap_cstack_t, gap_pool_t) and the width_walk_t resumable width walk, which are new. */
+ * aln_search_batch, aln_batch_max_gapo, the gap_job_t interleaved search and its chunked
+ * stack (gap_cstack_t, gap_pool_t), the width walks and gap_slots_run, which are new. */
 #ifndef BWA_MEM3_ALN_BWTGAP_H
 #define BWA_MEM3_ALN_BWTGAP_H
 
@@ -106,12 +106,13 @@ void gap_cstack_pop_ext(gap_cstack_t *stack, gap_entry_t *e);
 /* bwt_match_gap for one read as a resumable job (new code; see bwtgap.cpp). The caller sets
  * the inputs (len, seq, width, seed_width, opt: what bwt_match_gap takes, and a gap_cstack_t), then calls
  * gap_job_start, which returns 1 if the read is already done; otherwise gap_job_run until it
- * returns 1. Each gap_job_run call that returns 0 has prefetched the Occ blocks its next call
- * reads first: the next bwt_2occ4, or the next base of an exact-match tail (bwt_match_exact_alt,
- * which the job runs one base per call). When done, aln/n_aln hold what bwt_match_gap returns
+ * returns 1 (the driver steps jobs through gap_slots_run, which runs the same step, gap_job_step,
+ * inlined; gap_job_run is that step as a call, for the unit tests). Each call that returns 0 has
+ * prefetched the Occ blocks its next call reads first: the next bwt_2occ4, or the next base of an
+ * exact-match tail (bwt_match_exact_alt, which the job runs one base per call). When done, aln/n_aln hold what bwt_match_gap returns
  * (the caller owns aln).
  *
- * The fields gap_job_run reads on every call come first, so that they share as few cache lines as
+ * The fields the job step reads on every call come first, so that they share as few cache lines as
  * possible: the resume state, the inputs it uses, and `c`, the options it reads, copied from opt by
  * gap_job_start (with seed_off = len - opt.seed_len precomputed).
  *
@@ -119,14 +120,14 @@ void gap_cstack_pop_ext(gap_cstack_t *stack, gap_entry_t *e);
  * change after it (the hit path reads opt, the step reads c). score_cut tracks best_score: every
  * write of best_score (gap_job_start, gap_job_hit's first hit) updates it too. */
 enum { JOB_OCC4 = 1, JOB_EXACT = 2 }; // gap_job_t::pending: the lookup the next call resumes at
-typedef struct { // gap_job_run's copy of the options it reads (set by gap_job_start)
+typedef struct { // the job step's copy of the options it reads (set by gap_job_start)
 	int s_mm, s_gapo, s_gape, mode;
 	int max_entries, max_gapo, max_gape, max_seed_diff;
 	int indel_end_skip, max_del_occ, seed_off;
 } gap_job_const_t;
 
 typedef struct {
-	// state: what the next gap_job_run call resumes from
+	// state: what the next step resumes from
 	int pending, i, m, m_seed; // pending: 0, JOB_OCC4 or JOB_EXACT
 	bwtint_t k, l;
 	gap_entry_t e;
@@ -157,7 +158,7 @@ int bwa_cal_maxdiff(int l, double err, double thres);
 /* `width` must hold len+1 zeroed entries. */
 int bwt_cal_width(const bwt_t *bwt, int len, const ubyte_t *str, bwt_width_t *width);
 
-/* bwt_cal_width as a resumable walk (new code; see bwtaln.cpp), so that a read's widths can be
+/* bwt_cal_width as a resumable walk (new code; see bwtgap.cpp), so that a read's widths can be
  * computed interleaved with other reads' work. width_walk_init, then width_walk_run until it
  * returns 1; width[0..len] then holds what bwt_cal_width writes (and `bid` its return value).
  * Do not call width_walk_run again after it has returned 1 (it would bump `bid` and rewrite
@@ -170,6 +171,26 @@ typedef struct {
 } width_walk_t;
 void width_walk_init(width_walk_t *w, const bwt_t *bwt, int len, const ubyte_t *str, bwt_width_t *width);
 int width_walk_run(width_walk_t *w, const bwt_t *bwt);
+
+/* One read's place in the interleaved search (new code; see bwtgap.cpp): its two width walks
+ * (whole read and seed), then its search job. bwa_cal_sa_reg_gap_group (bwtaln.cpp) sets them
+ * up; gap_slots_run steps them. */
+enum {
+	GAP_SLOT_EMPTY = 0,  // no read
+	GAP_SLOT_WIDTHS = 1, // the width walks run until widths_done and seed_done are both set
+	GAP_SLOT_SEARCH = 2, // the search is started (set just before gap_job_start; stepped once it returns 0)
+};
+typedef struct {
+	gap_job_t job;
+	width_walk_t ww, sw;
+	int state, widths_done, seed_done;
+} gap_slot_core_t;
+/* Steps the n slots (an array, so a step reads no pointer to reach its slot) in turn, starting with
+ * the one after *pos (one width_walk_run of each unfinished walk, or one job step), until a slot's
+ * widths are done (it is left in GAP_SLOT_WIDTHS for the caller to start its search) or its search
+ * is done (GAP_SLOT_SEARCH, with job.aln/n_aln set). Sets *pos to that slot and returns it. Some
+ * slot must be non-empty. */
+int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt);
 
 /* max_gapo as the search applies it to this batch: opt->max_gapo capped at the number of
  * differences allowed for the longest read of the whole batch (bwa_cal_maxdiff of that

@@ -949,6 +949,49 @@ TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for
     CHECK(with_hits > compared / 3); // not vacuous
 }
 
+// gap_slots_run's slot states: batches smaller than, equal to and just over the group size
+// (ALN_GROUP: 8, or 12 on Apple arm64) and run on more threads than reads, so some threads get no
+// read and some slots never fill or go empty early; all-N and one-base reads end in gap_job_start,
+// before any search step, so their slot is refilled straight from GAP_SLOT_WIDTHS.
+TEST_CASE("aln_search: aln_search_batch gives bwt_match_gap's hits for batches around the group size"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second;
+    uint32_t x = 4242;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    std::vector<std::string> pool;
+    for (int i = 0; i < 30; ++i) {
+        if (i % 5 == 1) { pool.push_back(std::string(20 + i, 'N')); continue; }
+        if (i % 5 == 3) { pool.push_back("ACGT"[i % 4] + std::string()); continue; }
+        int len = 25 + (int)rnd(30);
+        std::string r = s1.substr(rnd((uint32_t)(s1.size() - len)), len);
+        if (i % 2) r[rnd(len)] = r[0] == 'A' ? 'C' : 'A';
+        pool.push_back(r);
+    }
+    ba::gap_opt_t opt = make_opt(2, 1);
+    long compared = 0, with_hits = 0;
+    for (int n : {1, 2, 7, 8, 9, 11, 12, 13, 25}) {
+        std::vector<std::string> reads(pool.begin(), pool.begin() + n);
+        for (int nt : {1, 3, 16}) {
+            Batch b(reads);
+            ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, nt);
+            const int cap = ba::aln_batch_max_gapo(b.n, b.seqs, &opt);
+            for (int i = 0; i < b.n; ++i) {
+                INFO("batch " << n << ", -t " << nt << ", read " << i << " (" << reads[i] << ")");
+                GapResult ref, job;
+                both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job, cap);
+                REQUIRE(b.seqs[i].n_aln == (int)ref.aln.size());
+                for (int k = 0; k < b.seqs[i].n_aln; ++k) CHECK(same_aln(ref.aln[k], b.seqs[i].aln[k]));
+                ++compared;
+                with_hits += !ref.aln.empty();
+            }
+        }
+    }
+    CHECK(compared == 3L * (1 + 2 + 7 + 8 + 9 + 11 + 12 + 13 + 25));
+    CHECK(with_hits > compared / 3);
+}
+
 // The resumable width walk (width_walk_init/width_walk_run, which the driver interleaves) must
 // write exactly what bwt_cal_width writes, and end on the same bid.
 TEST_CASE("aln_search: width_walk_run matches bwt_cal_width"

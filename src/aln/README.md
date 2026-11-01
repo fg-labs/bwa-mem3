@@ -23,8 +23,8 @@ contributors" line in the headers of the files derived from them was added here.
 
 | File | Origin |
 | --- | --- |
-| `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack), plus the chunked stack `gap_cstack_t`/`gap_pool_t` (new) |
-| `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out, plus `width_walk_init`/`width_walk_run` (new) |
+| `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack), plus the chunked stack `gap_cstack_t`/`gap_pool_t`, `width_walk_init`/`width_walk_run` and `gap_slots_run` (new) |
+| `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out |
 | `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_cnt_ambi` from `bntseq.c`; `bwa_pos_from_sa` (new) is `bwa_sa2pos`'s tail, split out |
 | `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, and `bwa_paired_sw`'s body as `bwa_paired_sw_core`/`bwa_paired_sw_report`) |
 | `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code (MIT, as the rest of bwa-mem3; `SPDX-License-Identifier` line): the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
@@ -63,7 +63,8 @@ Each change to upstream-derived code adds a line here.
   code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
   `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch`,
   `aln_batch_max_gapo`, `gap_job_t` with its option copy `gap_job_const_t`,
-  `width_walk_t`/`width_walk_init`/`width_walk_run`, the chunked stack
+  `width_walk_t`/`width_walk_init`/`width_walk_run`, `gap_slot_core_t`/`GAP_SLOT_*`/`gap_slots_run`,
+  the chunked stack
   (`gap_chunk_t`, `gap_pool_t`, `gap_bucket_t`, `gap_cstack_t` and their init, release and destroy
   functions, `ALN_POOL_KEEP`) and the out-of-line push, pop and reset wrappers the unit tests use
   (`gap_stack_push_ext`, `gap_stack_pop_ext`, `gap_stack_reset_ext`, `gap_cstack_push_ext`,
@@ -223,7 +224,7 @@ Each change to upstream-derived code adds a line here.
   word to keep `n_seed_mm`; the slot is often a line not yet in cache, so the load stalled. Nothing
   reads `n_seed_mm`, so the entries popped are the same. `gap_push` is unchanged and still used by
   `bwt_match_gap`.
-- Top-of-stack forwarding (new code). After expanding an entry, `gap_job_run` stores each child but
+- Top-of-stack forwarding (new code). After expanding an entry, the job step stores each child but
   the last as before and keeps the last in registers. If its score is at most the stack's best bucket
   once the others are stored, it is the entry the next pop would return (the last entry of the lowest
   non-empty bucket), so the loop continues with it directly; otherwise it is stored and the pop runs.
@@ -233,16 +234,22 @@ Each change to upstream-derived code adds a line here.
   break are unchanged.
 - Hot-loop layout (new code). `bwt_occ`, `bwt_2occ`, `bwt_2occ4` and `bwt_prefetch_occ` are defined
   inline in `aln_bwt.h` (same bodies), reading the occ table through a pointer cached in `bwt_t`, so
-  `gap_job_run` and the width walks no longer call into `aln_bwt.cpp` for them (`bwt_2occ4` is left
+  the job step and the width walks no longer call into `aln_bwt.cpp` for them (`bwt_2occ4` is left
   to the compiler's inlining choice: forcing it inline measured slower on x86-64 and arm64). In
   `bwtgap.cpp` the search's stack helpers are forced inline and its rare paths (a found hit, a stack
   chunk taken from or given back to the pool) are kept out of line. Code placement only; the
   statements run are the same.
-- Job layout (new code). `gap_job_t` puts the fields `gap_job_run` reads on every call first (resume
+- Job layout (new code). `gap_job_t` puts the fields the job step reads on every call first (resume
   state, inputs, then `c`, a copy of the options it reads, made by `gap_job_start`), and two
   expressions are precomputed: `seed_off = len - seed_len` per read, and `score_cut`, the score above
   which the search stops (`best_score + s_mm`, updated where `best_score` is, or `INT_MAX` under
   `NONSTOP`, where upstream skips the test). Same values, compared the same way.
+- Slot loop (new code). `gap_slots_run` (`bwtgap.cpp`) is the loop of `bwa_cal_sa_reg_gap_group` over
+  its slots, with the job step (`gap_job_step`, also behind `gap_job_run` for the unit tests) and the
+  width-walk step inlined, so stepping a slot is no longer a call; it returns to the driver only
+  when a read's widths are done (the driver starts its search) or its search is done (the driver
+  takes the hits and refills the slot). `width_walk_init`/`width_walk_run` move from `bwtaln.cpp` to `bwtgap.cpp` for
+  this. Only the interleaving of the reads changes; each read's steps and hits are the same.
 - Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
   walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
   block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone
