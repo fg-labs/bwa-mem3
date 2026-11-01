@@ -33,7 +33,6 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #include "simd_dispatch.h"
 #include "version.h"
 #include "bwa_shm.h"
-#include "aln/aln_main.h"
 
 #ifdef USE_MIMALLOC
 #include <stdlib.h>  /* strtol: MIMALLOC_PURGE_DELAY check */
@@ -251,7 +250,8 @@ int main(int argc, char* argv[])
      * (`h:` in main_mem's optstring, fastmap.cpp), taking an INT value. So
      * `mem -h 5 ref r1 r2` must NOT be treated as help -- doing so skipped the
      * precheck and ran the full alignment on a below-floor host, the SIGILL the
-     * precheck exists to turn into a clean exit(2).
+     * precheck exists to turn into a clean exit(2). `aln` has no `-h` either
+     * (its help is `--help`), so `aln -h` gets the precheck too.
      * Only argv[2] is checked: matching --help / -h anywhere in argv
      * would false-positive on pathological invocations like
      * `mem -R --help ref r1 r2` (where --help is the VALUE of -R) and
@@ -259,7 +259,8 @@ int main(int argc, char* argv[])
      * invocations put --help right after the subcommand. */
     bool wants_help = (argc >= 3) &&
                       (strcmp(argv[2], "--help") == 0 ||
-                       (strcmp(argv[2], "-h") == 0 && strcmp(argv[1], "mem") != 0));
+                       (strcmp(argv[2], "-h") == 0 && strcmp(argv[1], "mem") != 0 &&
+                        strcmp(argv[1], "aln") != 0));
     if (strcmp(argv[1], "version") != 0 && !wants_help) {
         bwamem3_enforce_host_floor();
 

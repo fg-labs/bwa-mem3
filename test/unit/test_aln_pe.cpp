@@ -1,8 +1,9 @@
 // Unit tests for the paired-end half of `bwa-mem3 aln` (src/aln/bwape.cpp and aln_run_pe in
 // aln_main.cpp). Byte-for-byte agreement with stock bwa aln + sampe is
 // test/regression/aln_parity.sh; these cases pin two behaviours the parity script reaches only
-// indirectly: the carry-over of the insert-size estimate across batches, and the per-file
-// batch used for the gap-open cap.
+// indirectly: the carry-over of the insert-size estimate across batches (in upstream's
+// bwa_cal_pac_pos_pe, which the stages are checked against, and in the shipped driver
+// aln_run_pe over several batches), and the per-file batch used for the gap-open cap.
 
 #include "doctest/doctest.h"
 
@@ -59,8 +60,7 @@ struct PeIndex {
     {
         ba::bwt_destroy(bwt);
         fmi.reset();
-        std::string cmd = "rm -rf '" + dir + "'";
-        if (system(cmd.c_str()) != 0) std::fprintf(stderr, "warning: could not remove %s\n", dir.c_str());
+        aln_test::remove_dir(dir);
     }
     const bntseq_t *bns() const { return fmi->idx->bns; }
 };
@@ -239,7 +239,130 @@ TEST_CASE("aln_pe: the gap-open cap is per file (helper values) and mixed read l
     REQUIRE(ba::aln_out_close(out) == 0);
     std::ifstream in(out_path);
     int n_rec = 0;
-    for (std::string l; std::getline(in, l);) n_rec += !l.empty() && l[0] != '@';
-    CHECK(n_rec == 60);
+    std::vector<std::string> names;
+    std::vector<int> flags;
+    for (std::string l; std::getline(in, l);) {
+        if (l.empty() || l[0] == '@') continue;
+        ++n_rec;
+        std::istringstream f(l);
+        std::string name;
+        int flag = 0;
+        f >> name >> flag;
+        names.push_back(name);
+        flags.push_back(flag);
+    }
+    REQUIRE(n_rec == 60);
+    for (int i = 0; i < 30; ++i) { // pair i is p<i> as read 1, then p<i> as read 2
+        CAPTURE(i);
+        const std::string want = "p" + std::to_string(i);
+        CHECK(names[2 * i] == want);
+        CHECK(names[2 * i + 1] == want);
+        CHECK((flags[2 * i] & 0xc1) == 0x41);     // paired, first in pair
+        CHECK((flags[2 * i + 1] & 0xc1) == 0x81); // paired, second in pair
+    }
     free(gap);
+}
+
+namespace {
+
+// Runs aln_run_pe (the shipped driver) and returns the FLAG of every record, in output order.
+std::vector<int> run_pe_flags(int batch_size, const std::string &f1, const std::string &f2, const std::string &out_path)
+{
+    PeIndex &ix = index_fixture();
+    ba::aln_opt_t o;
+    ba::aln_opt_init(&o);
+    o.batch_size = batch_size;
+    ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
+    REQUIRE(out != nullptr);
+    REQUIRE(ba::aln_run_pe(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, f1.c_str(), f2.c_str(), out) == 0);
+    REQUIRE(ba::aln_out_close(out) == 0);
+    std::ifstream in(out_path);
+    std::vector<int> flags;
+    for (std::string l; std::getline(in, l);) {
+        if (l.empty() || l[0] == '@') continue;
+        size_t t = l.find('\t');
+        REQUIRE(t != std::string::npos);
+        flags.push_back(std::atoi(l.c_str() + t + 1));
+    }
+    return flags;
+}
+
+} // namespace
+
+TEST_CASE("aln_pe: aln_run_pe carries the insert-size estimate into a batch too small for its own"
+          * doctest::test_suite("unit/aln_pe")) {
+    // 200 well-placed pairs (fragments of 280-320 bp), then 5 pairs from 470 bp fragments, in
+    // batches of 200. The 5-pair batch is below infer_isize's minimum of 20 pairs, so it has no
+    // estimate of its own. With the first batch's estimate carried over (aln_run_pe's last_ii),
+    // 470 bp is far above its upper bound and the pairs are not proper (no 0x2). Without an
+    // estimate the bound is -a (500), so the same 5 pairs on their own are proper: the flag can
+    // only come from the carry-over.
+    PeIndex &ix = index_fixture();
+    std::vector<std::string> r1, r2;
+    well_placed(ix.contig, 200, 36, 100, &r1, &r2);
+    std::vector<std::string> t1, t2;
+    for (int i = 0; i < 5; ++i) {
+        const int pos = 4500 + i * 40, frag = 470;
+        t1.push_back(ix.contig.substr(pos, 36));
+        t2.push_back(aln_test::revcomp(ix.contig.substr(pos + frag - 36, 36)));
+    }
+    std::vector<std::string> a1(r1), a2(r2);
+    a1.insert(a1.end(), t1.begin(), t1.end());
+    a2.insert(a2.end(), t2.begin(), t2.end());
+    const std::string f1 = write_fastq(ix.dir + "/carry1.fq", a1), f2 = write_fastq(ix.dir + "/carry2.fq", a2);
+
+    std::vector<int> alone = run_pe_flags(200, write_fastq(ix.dir + "/tail1.fq", t1), write_fastq(ix.dir + "/tail2.fq", t2),
+                                          ix.dir + "/tail.sam");
+    REQUIRE(alone.size() == 10);
+    for (int f : alone) CHECK((f & 0x2) != 0);
+
+    std::vector<int> two = run_pe_flags(200, f1, f2, ix.dir + "/carry_200.sam");
+    REQUIRE(two.size() == 410);
+    for (size_t i = 400; i < 410; ++i) {
+        CAPTURE(i);
+        CHECK((two[i] & 0x2) == 0);
+    }
+    // the first batch is flagged as in a single-batch run of the same pairs
+    std::vector<int> one = run_pe_flags(0x40000, f1, f2, ix.dir + "/carry_one.sam");
+    REQUIRE(one.size() == 410);
+    for (size_t i = 0; i < 400; ++i) CHECK((one[i] & 0x2) == (two[i] & 0x2));
+
+    // and each first-batch record is what its construction implies, independent of either run:
+    // the reads are exact copies of a unique contig, so R1 is forward at pos, R2 reverse at
+    // pos + frag - 36, both 36M, a proper pair with TLEN +-frag (well_placed's arithmetic)
+    std::ifstream in(ix.dir + "/carry_200.sam");
+    std::vector<std::vector<std::string>> recs;
+    for (std::string l; std::getline(in, l);) {
+        if (l.empty() || l[0] == '@') continue;
+        std::vector<std::string> f;
+        std::istringstream ls(l);
+        for (std::string x; std::getline(ls, x, '\t');) f.push_back(x);
+        REQUIRE(f.size() >= 11);
+        recs.push_back(f);
+    }
+    REQUIRE(recs.size() == 410);
+    for (int i = 0; i < 200; ++i) {
+        const int frag = 280 + (i * 7) % 41, pos = 100 + i * 20; // well_placed(..., 100, ...)
+        const int p1 = pos + 1, p2 = pos + frag - 36 + 1;
+        const std::vector<std::string> &a = recs[2 * i], &b = recs[2 * i + 1];
+        CAPTURE(i);
+        CHECK(a[1] == "99");
+        CHECK(b[1] == "147");
+        CHECK(a[2] == "u1");
+        CHECK(b[2] == "u1");
+        CHECK(a[3] == std::to_string(p1));
+        CHECK(b[3] == std::to_string(p2));
+        CHECK(std::atoi(a[4].c_str()) >= 20);
+        CHECK(std::atoi(b[4].c_str()) >= 20);
+        CHECK(a[5] == "36M");
+        CHECK(b[5] == "36M");
+        CHECK(a[6] == "=");
+        CHECK(b[6] == "=");
+        CHECK(a[7] == std::to_string(p2));
+        CHECK(b[7] == std::to_string(p1));
+        CHECK(a[8] == std::to_string(frag));
+        CHECK(b[8] == std::to_string(-frag));
+        CHECK(a[9] == r1[i]);
+        CHECK(b[9] == ix.contig.substr(pos + frag - 36, 36)); // reverse strand: SEQ is the reference strand
+    }
 }

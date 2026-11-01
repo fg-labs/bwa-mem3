@@ -36,6 +36,9 @@ typedef struct {
 gap_stack_t *gap_init_stack2(int max_score);
 gap_stack_t *gap_init_stack(int max_mm, int max_gapo, int max_gape, const gap_opt_t *opt);
 void gap_destroy_stack(gap_stack_t *stack);
+/* Upstream's search for one read, unchanged. The shipped search runs gap_job_* (below), a copy of
+ * this loop as a resumable job; bwt_match_gap stays as the in-tree reference that the unit tests
+ * check gap_job_run against (test_aln_search.cpp). No production code calls it. */
 bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_width_t *w,
 						  bwt_width_t *seed_w, const gap_opt_t *opt, int *_n_aln, gap_stack_t *stack);
 
