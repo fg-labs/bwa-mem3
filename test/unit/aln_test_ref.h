@@ -13,9 +13,12 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include "../framework/temp_path.h"
 
 namespace aln_test {
 
@@ -43,6 +46,22 @@ inline std::string revcomp(const std::string &s)
         }
     }
     return r;
+}
+
+// A mkdtemp/mkstemp template under $TMPDIR (or /tmp), as the other unit tests do: CI and
+// sandboxed hosts point TMPDIR somewhere writable. `stem` is e.g. "aln_se_unit".
+// Removes a fixture directory and the regular files in it, without a shell (a path with a
+// quote in it can neither break nor redirect the removal); warns if anything is left behind.
+inline void remove_dir(const std::string &dir)
+{
+    if (bwa_test_remove_flat_dir(dir.c_str()) != 0)
+        std::fprintf(stderr, "warning: could not remove %s\n", dir.c_str());
+}
+
+inline std::string tmp_template(const char *stem)
+{
+    const char *d = std::getenv("TMPDIR");
+    return std::string(d && *d ? d : "/tmp") + "/" + stem + "_XXXXXX";
 }
 
 // (name, sequence) for c1, c2, c3.

@@ -34,9 +34,10 @@ bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 **Byte-identity.** The SAM records are byte-identical to the
 output of stock bwa 0.7.19 `aln` + `samse`/`sampe` (the header is too, except
 the `@PG` line, which names the program that ran). This is checked against a
-stock bwa 0.7.19 binary on generated single-end and paired-end reads with every
-option below, at one and at four threads (the input, output and index forms
-are checked at one thread).
+stock bwa 0.7.19 binary on generated single-end and paired-end reads (a phiX plus
+synthetic-contig reference, a few thousand reads per case) with every option below, at
+one and at four threads (the input, output and index forms are checked at one thread).
+The check runs in CI on Linux x86_64 (AVX2 build), Linux arm64 and macOS arm64.
 
 The index is the one `bwa-mem3 index` writes (bwa-mem3's own format, not a
 stock `bwa index`). An index built with `index --meth` works and gives the same
@@ -70,7 +71,7 @@ and the name it has there when it differs.
 | `-q INT` | aln | 0 | Quality threshold for trimming reads down to 35 bp |
 | `-B INT` | aln | 0 | Barcode length (at most 63, or 31 with two read files) |
 | `-L`, `-N`, `-I`, `-Y` | aln | off | Log-scaled gap penalty; non-iterative search; Illumina 1.3+ qualities; drop Casava-filtered reads |
-| `--max-xa-hits INT` | samse `-n` | 3 | Maximum alternative hits in the `XA` tag |
+| `--max-xa-hits INT` | samse, sampe `-n` | 3 | Maximum alternative hits in the `XA` tag |
 | `-r STR` | samse, sampe | none | Read-group header line |
 | `-f FILE` | samse, sampe | stdout | Output file |
 | `-a INT` | sampe | 500 | Maximum insert size |
@@ -80,7 +81,7 @@ and the name it has there when it differs.
 | `-s`, `-A` | sampe | off | Skip Smith-Waterman for an unmapped mate; skip the insert size estimate |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
 | `--bam` | new | off | Write BAM instead of SAM |
-| `--bam-level INT` | new | 1 | BAM compression level (0-9) |
+| `--bam-level INT` | new | 1 | BAM compression level (0-9; other values are an error) |
 
 The long names exist because `-n` and `-o` already mean the search options.
 `--max-xa-hits` applies to single-end and paired-end output alike.
