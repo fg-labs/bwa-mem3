@@ -1,5 +1,73 @@
 # Changelog
 
+## [0.16.0](https://github.com/fg-labs/bwa-mem3/compare/v0.15.1...v0.16.0) (2026-11-01)
+
+
+### Features
+
+* **meth:** accept --meth=5base for Illumina 5-base libraries ([#650](https://github.com/fg-labs/bwa-mem3/issues/650)) ([bcc70d8](https://github.com/fg-labs/bwa-mem3/commit/bcc70d892825eea81e3cfc23ba55e6cd9ef44c15))
+* **meth:** add --meth-context cpg to mem ([#663](https://github.com/fg-labs/bwa-mem3/issues/663)) ([89573bb](https://github.com/fg-labs/bwa-mem3/commit/89573bbb9f09d1b444430c6209661059844a2d45))
+
+
+### Bug Fixes
+
+* **build:** ignore -O and -DNDEBUG injected through CPPFLAGS ([#640](https://github.com/fg-labs/bwa-mem3/issues/640)) ([5947e20](https://github.com/fg-labs/bwa-mem3/commit/5947e20088b253805d97d64656c1dd6de17d8aba))
+* **cli:** reject a negative or oversized -w band width at parse ([#630](https://github.com/fg-labs/bwa-mem3/issues/630)) ([523975c](https://github.com/fg-labs/bwa-mem3/commit/523975c5737540fac65de9af2dd27d47e25f0d7f))
+* **extend:** keep a negative seed score off the 8-bit banded extension kernels ([#667](https://github.com/fg-labs/bwa-mem3/issues/667)) ([e2b046f](https://github.com/fg-labs/bwa-mem3/commit/e2b046f9eb3ab2e59d36b0f92b1da67caf6efc8f))
+* **extend:** keep the second seed prefetch hint inside a short seed array ([#628](https://github.com/fg-labs/bwa-mem3/issues/628)) ([df33b89](https://github.com/fg-labs/bwa-mem3/commit/df33b89ebf93ad079bdb3f2eb90290a055060edd))
+* **kswv:** always write score2 and bound the 8-bit tier by the largest substitution score ([#633](https://github.com/fg-labs/bwa-mem3/issues/633)) ([5d55798](https://github.com/fg-labs/bwa-mem3/commit/5d55798aec0b2c905f36c61c047e30a91794d219))
+* **kswv:** give the x86 8-bit query pad a code no query byte can hold, and match the AVX-512BW 16-bit table to the other tiers ([#636](https://github.com/fg-labs/bwa-mem3/issues/636)) ([ab7c044](https://github.com/fg-labs/bwa-mem3/commit/ab7c0446201dfad1b07e4f7f3c058e23b2bd161a))
+* **mem:** report a missing input before the index load ([#645](https://github.com/fg-labs/bwa-mem3/issues/645)) ([ea3fb47](https://github.com/fg-labs/bwa-mem3/commit/ea3fb47db46332fdb2675e4ff9d659347c5c773e))
+* **meth:** let the last --meth choose the chemistry ([#671](https://github.com/fg-labs/bwa-mem3/issues/671)) ([79f7217](https://github.com/fg-labs/bwa-mem3/commit/79f7217f1f8964cff29d1b6ee1cf18c5b6a615c9))
+* **meth:** pair no region with a negative score ([#659](https://github.com/fg-labs/bwa-mem3/issues/659)) ([ba3d2c0](https://github.com/fg-labs/bwa-mem3/commit/ba3d2c050c5796b0ae5df3164a20e5d79f25ee21))
+* reject scorings the aligner cannot carry ([#634](https://github.com/fg-labs/bwa-mem3/issues/634)) ([1a31b60](https://github.com/fg-labs/bwa-mem3/commit/1a31b601d26975ace25e431e172097993d1b5c26))
+* report corrupt index, bad -T and stream/pthread failures as errors ([#649](https://github.com/fg-labs/bwa-mem3/issues/649)) ([3acc95a](https://github.com/fg-labs/bwa-mem3/commit/3acc95a4ce641be67be24ac0681566b78027951c))
+* **rescue:** keep the anchor table's empty marker outside the k-mer code space at --rescue-kmer=16 ([#631](https://github.com/fg-labs/bwa-mem3/issues/631)) ([735e685](https://github.com/fg-labs/bwa-mem3/commit/735e685d66550316c6417934d2a17a22f093d6c3))
+* score a read base '-' as N on every path and tier ([#639](https://github.com/fg-labs/bwa-mem3/issues/639)) ([4ba55bb](https://github.com/fg-labs/bwa-mem3/commit/4ba55bb0c148168132e7c5ba771498bef355a833))
+
+
+### Performance
+
+* **bam:** stream the last batch's records at --bam=0 ([#652](https://github.com/fg-labs/bwa-mem3/issues/652)) ([1b48b8f](https://github.com/fg-labs/bwa-mem3/commit/1b48b8f3f591149adb479a671f65312320a73cf2))
+* **bntseq:** write window tails as 16-base pieces at any base phase ([#661](https://github.com/fg-labs/bwa-mem3/issues/661)) ([0497a37](https://github.com/fg-labs/bwa-mem3/commit/0497a377c16997955a3b6d5b497f36f0f43f9e31))
+* **bsw8:** capture the AVX2 8-bit banded-SW query end with a per-row sentinel ([#666](https://github.com/fg-labs/bwa-mem3/issues/666)) ([63445e0](https://github.com/fg-labs/bwa-mem3/commit/63445e0ee75612a8f3eb438126735acc82abf39d))
+* **bsw:** keep the AVX-512BW 8-bit extension in a biased signed domain ([#647](https://github.com/fg-labs/bwa-mem3/issues/647)) ([65cb0c1](https://github.com/fg-labs/bwa-mem3/commit/65cb0c18502b15321dce816a5da3ca328312c404))
+* **chain:** force the per-seed chaining helpers inline into mem_chain_seeds ([#664](https://github.com/fg-labs/bwa-mem3/issues/664)) ([a5f5987](https://github.com/fg-labs/bwa-mem3/commit/a5f5987d2cb7b0132d92d907a2839e79a8f0666b))
+* **chain:** pack the flat chaining index into one (pos, chain index) key array ([#642](https://github.com/fg-labs/bwa-mem3/issues/642)) ([b5a4449](https://github.com/fg-labs/bwa-mem3/commit/b5a4449d57f306961feaa1279d944e5dd8b6b184))
+* **chain:** read the filter's survivors through contiguous records on x86-64 ([#669](https://github.com/fg-labs/bwa-mem3/issues/669)) ([1e2b0d2](https://github.com/fg-labs/bwa-mem3/commit/1e2b0d2edc33a83cd039d79a97fe9405d4f9260a))
+* **ext:** pack 8-bit extension lane groups by query length ([#681](https://github.com/fg-labs/bwa-mem3/issues/681)) ([66b3865](https://github.com/fg-labs/bwa-mem3/commit/66b38652f7a547427dbccd9f03f7b4d9526f7de8))
+* **ext:** partition extension pairs into tiers instead of sorting them ([#680](https://github.com/fg-labs/bwa-mem3/issues/680)) ([f309f21](https://github.com/fg-labs/bwa-mem3/commit/f309f21b1a1edc596073c3e3ad1a5186d261ff1d))
+* **fmi:** compare unique matches with the text and keep their position for SA lookup ([#670](https://github.com/fg-labs/bwa-mem3/issues/670)) ([8a3b2e5](https://github.com/fg-labs/bwa-mem3/commit/8a3b2e54ac193d47898403912183608e9d9aeecb))
+* **fmi:** drop the cross-slot T1 look-ahead from the seeding drivers ([#676](https://github.com/fg-labs/bwa-mem3/issues/676)) ([2380aa4](https://github.com/fg-labs/bwa-mem3/commit/2380aa4424444906b214ed25a7139542e2c70eb0))
+* **fmi:** keep the backward step's loop invariants in registers ([#677](https://github.com/fg-labs/bwa-mem3/issues/677)) ([adf0d41](https://github.com/fg-labs/bwa-mem3/commit/adf0d41b17ab150b8ade411250d7c4ebdedde7f3))
+* **fmi:** reuse the SMEM pass's first walk for the bwtSeed pass ([#674](https://github.com/fg-labs/bwa-mem3/issues/674)) ([3ff7709](https://github.com/fg-labs/bwa-mem3/commit/3ff77099038e922e033d38609d9b5f746d61cf77))
+* **fmi:** select the SA walk's BWT symbol without a branch on x86 ([#679](https://github.com/fg-labs/bwa-mem3/issues/679)) ([6b8bfba](https://github.com/fg-labs/bwa-mem3/commit/6b8bfbadf0c7fc71423030bb4078e96f5fef290a))
+* **fmi:** take the seeding walks' first steps from a jump table ([#672](https://github.com/fg-labs/bwa-mem3/issues/672)) ([5a699fe](https://github.com/fg-labs/bwa-mem3/commit/5a699fea9fcece5dd3d3428ebf8df135629e5d55))
+* **fmi:** write the forward phase's prev[] entries downward ([#678](https://github.com/fg-labs/bwa-mem3/issues/678)) ([aa0b4b4](https://github.com/fg-labs/bwa-mem3/commit/aa0b4b415d8c2946a58e5de2288ad2380e376249))
+* **ksw:** give the x86 wavefront kernels the NEON kernels' boundary handling ([#651](https://github.com/fg-labs/bwa-mem3/issues/651)) ([4d66f15](https://github.com/fg-labs/bwa-mem3/commit/4d66f15e420749b8d4875d1e88230056c70b3e4e))
+* **kswv:** keep the column rails and the u8 query SoA apart modulo 4 KiB ([#658](https://github.com/fg-labs/bwa-mem3/issues/658)) ([e37c5c6](https://github.com/fg-labs/bwa-mem3/commit/e37c5c6b357d630f9eec0c08bc55c7aeb62c3cb2))
+* **kswv:** sweep two target rows per column in the AVX-512BW u8 FScan kernel ([#646](https://github.com/fg-labs/bwa-mem3/issues/646)) ([1336807](https://github.com/fg-labs/bwa-mem3/commit/133680734fe7402229f8636e4628f9a10326c308))
+* **kswv:** take the u8 column split over a partial group's real lanes ([#668](https://github.com/fg-labs/bwa-mem3/issues/668)) ([c0901ac](https://github.com/fg-labs/bwa-mem3/commit/c0901ace22d4d8a9f9ef1134bdcb96c366c98d65))
+* **mem:** skip the seedcov recount when MAPQ does not read it ([#641](https://github.com/fg-labs/bwa-mem3/issues/641)) ([6c2cd79](https://github.com/fg-labs/bwa-mem3/commit/6c2cd79f06a937ff962eeb4baa7d996568c71e3c))
+* **pair:** keep a sorted mate rb index across the _post rescue calls ([#643](https://github.com/fg-labs/bwa-mem3/issues/643)) ([4702472](https://github.com/fg-labs/bwa-mem3/commit/470247264b32bdf0b4e3d391a864914932858229))
+* **pair:** vectorize the in-place reverse of the rescue prefixes ([#644](https://github.com/fg-labs/bwa-mem3/issues/644)) ([14429df](https://github.com/fg-labs/bwa-mem3/commit/14429dff9380e1d9a9855d5f5a39bc8e5b47d543))
+* **profiling:** resolve the rdtsc tick rate at report time, not with a start-up sleep ([#662](https://github.com/fg-labs/bwa-mem3/issues/662)) ([fcbffba](https://github.com/fg-labs/bwa-mem3/commit/fcbffba0b66c0c62b08221c8ae64faa359db720e))
+* **shm:** request transparent huge pages for the shm index segment ([#657](https://github.com/fg-labs/bwa-mem3/issues/657)) ([8ea2e56](https://github.com/fg-labs/bwa-mem3/commit/8ea2e56163496a0d92e5fcaa774c858321485835))
+* **smem:** sort SMEMs on 16-byte (key, index) pairs ([#648](https://github.com/fg-labs/bwa-mem3/issues/648)) ([a41dc32](https://github.com/fg-labs/bwa-mem3/commit/a41dc323e659166958f09d256f5b775a27d4c919))
+* vectorize byte reversal and the bwa_gen_cigar4 M-op scan ([#660](https://github.com/fg-labs/bwa-mem3/issues/660)) ([530f7cc](https://github.com/fg-labs/bwa-mem3/commit/530f7ccabae6ccc54760e1d20b8c8f58a34ea81e))
+* **xa:** build only the XA strings a pair emits and reuse duplicate hits ([#653](https://github.com/fg-labs/bwa-mem3/issues/653)) ([9cef616](https://github.com/fg-labs/bwa-mem3/commit/9cef6164553bfb8a6a68c87c06a09c0bfe8d0e3f))
+
+
+### Refactoring
+
+* **smem:** check finish()'s match count and make LockstepParked's state read-only ([#629](https://github.com/fg-labs/bwa-mem3/issues/629)) ([24a2c92](https://github.com/fg-labs/bwa-mem3/commit/24a2c92abc14c321b3d042c1f80a50aa1ae39480))
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.15.1 ([#635](https://github.com/fg-labs/bwa-mem3/issues/635)) ([4cb767a](https://github.com/fg-labs/bwa-mem3/commit/4cb767acb6003ddc5f1869c51e5bf47975618ca1))
+* **rescue:** record the AVX-512BW rescue gates' re-measure after the two-row kswv sweep ([#665](https://github.com/fg-labs/bwa-mem3/issues/665)) ([5b64bd6](https://github.com/fg-labs/bwa-mem3/commit/5b64bd680f2f8f0adb3e5f8f0935dc32a7136dcd))
+
 ## [0.15.1](https://github.com/fg-labs/bwa-mem3/compare/v0.15.0...v0.15.1) (2026-10-24)
 
 
