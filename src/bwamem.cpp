@@ -4110,6 +4110,13 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
         for (i = 0; i < chain->n; ++i)
             chain->a[i].frac_rep = (float)l_rep / seq_[l].l_seq;
 
+        /* Filter this read's chains now, while they and their seeds are still in cache. This
+         * was a separate pass over the batch in mem_kernel1_core, after every read had been
+         * chained, by which time the batch's chains and seed window had left L2. The filter
+         * reads only this read's chains, opt and tid's scratch, and nothing reads the chains
+         * between here and that pass, so the result is the same. */
+        chain->n = mem_chain_flt(opt, (int)chain->n, chain->a, tid);
+
         kb_reset(chn, tree); // reuse the tree for the next read (no destroy/re-init)
 
     } // iterations over input reads
@@ -4278,25 +4285,9 @@ int mem_kernel1_core(FMI_search *fmi,
     /************** Post-processing of collected smems/chains ************/
     // tim = __rdtsc();
     printf_(VER, "6.1. Calling mem_chain_flt..\n");
-    /* Pass 1: filter every read first, so the mate's filtered chains are
-     * available to the mate-concordance-aware cap (--extend-mate-concordant) below. */
-    for (int l=0; l<nseq; l++) {
-        /* Each read's chains are a separate heap buffer written by the chaining
-         * pass above, so the filter's first load from it is usually a miss the
-         * stream prefetcher cannot predict. Hint the next read's first two lines
-         * (its first 48-byte mem_chain_t can straddle both) while this read is
-         * filtered. Both addresses stay inside the list: p + 64 lies in the
-         * second chain when there is one, and a one-chain list hints its chain's
-         * last byte instead. A hint only: no value, control flow or allocation
-         * changes. */
-        if (l + 1 < nseq && chain_ar[l + 1].n > 0) {
-            const char *p = (const char *) chain_ar[l + 1].a;
-            __builtin_prefetch(p, 0, 3);
-            __builtin_prefetch(chain_ar[l + 1].n > 1 ? p + 64 : p + sizeof(mem_chain_t) - 1, 0, 3);
-        }
-        chn = &chain_ar[l];
-        chn->n = mem_chain_flt(opt, chn->n, chn->a, tid);
-    }
+    /* Pass 1, the chain filter, runs inside mem_chain_seeds at the end of each read
+     * (mem_chain_flt there), so every read's filtered chains, and its mate's, are in
+     * place for the mate-concordance-aware cap (--extend-mate-concordant) below. */
     int cap_mate_concordant = opt->mate_concordant_window != 0 && (opt->flag & MEM_F_PE)
                               && opt->max_extend_chains > 0;
     /* Resolve the concordance window: fixed CLI value if >0; else (auto == -1) the
