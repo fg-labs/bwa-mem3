@@ -554,6 +554,85 @@ TEST_CASE("aln_search: gap_job_run matches bwt_match_gap on large stacks and aro
     CHECK(capped > 20);  // and the -m stop at, below and above the chunk size
 }
 
+// Targets gap_job_run's top-of-stack forwarding (the last child of an expansion used without a
+// store and a pop when it is the entry the pop would return, counted as pushed). Forwarding is
+// common (the match child usually lands in the lowest bucket), so a -m cap swept over every small
+// value makes the -m break fall on a forwarded entry (counted with the stack) as well as on stored
+// ones; -R swept over small values does the same for the top2 break. Scoring variants change which
+// child is pushed last and which bucket is lowest: with -O below -M an insertion child can sit below
+// the last (mismatch) child, which must then be stored and the older entry popped; reads with an N
+// give four children in the same bucket. Forwarding is output-neutral by design, so this checks
+// that forwarding is correct, not that it happens: a build that never forwards passes too (and
+// only runs slower).
+TEST_CASE("aln_search: gap_job_run matches bwt_match_gap at every small -m and -R and under odd scoring"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second, &s2 = contigs[1].second;
+    auto flip = [](std::string r, size_t i) { r[i] = r[i] == 'A' ? 'T' : 'A'; return r; };
+    std::vector<std::string> reads;
+    uint32_t x = 31337;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    for (int t = 0; t < 10; ++t) {
+        int len = 25 + (int)rnd(40);
+        const std::string &src = t & 1 ? s2 : s1;
+        std::string r = src.substr(rnd((uint32_t)(src.size() - len)), len);
+        for (int f = 0; f < 1 + t % 3; ++f) r = flip(r, rnd(len));
+        if (t % 4 == 3) r[rnd(len)] = 'N';
+        if (t % 5 == 4) r = r.substr(0, len / 2) + r.substr(len / 2 + 1); // deletion
+        reads.push_back(r);
+    }
+    { std::string r; for (int i = 0; i < 14; ++i) r += "AC"; reads.push_back(r); reads.push_back(flip(r, 7)); }
+    { std::string r = s1.substr(120, 36); r[10] = 'N'; r[25] = 'N'; reads.push_back(r); }
+
+    struct Score { const char *name; int s_mm, s_gapo, s_gape; };
+    const Score scores[] = {{"stock", 3, 11, 4}, {"-M 5 -O 2 -E 1", 5, 2, 1}, {"-M 1 -O 1 -E 1", 1, 1, 1}};
+    long compared = 0, with_hits = 0, capped = 0, m_compared = 0;
+    for (const Score &sc : scores) {
+        // -m 1..48 at -n 3 -o 2, NONSTOP off and on
+        for (int nonstop = 0; nonstop < 2; ++nonstop) {
+            for (int m = 1; m <= 48; ++m) {
+                ba::gap_opt_t opt = make_opt(3, 2);
+                opt.s_mm = sc.s_mm; opt.s_gapo = sc.s_gapo; opt.s_gape = sc.s_gape;
+                opt.max_entries = m;
+                if (nonstop) { opt.mode |= BWA_MODE_NONSTOP; opt.max_top2 = 0x7fffffff; }
+                for (size_t i = 0; i < reads.size(); ++i) {
+                    INFO("scoring " << sc.name << ", NONSTOP " << nonstop << ", -m " << m << ", read " << i << " (" << reads[i] << ")");
+                    GapResult ref, job;
+                    both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job);
+                    REQUIRE(ref.aln.size() == job.aln.size());
+                    for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+                    ++compared;
+                    ++m_compared;
+                    with_hits += !ref.aln.empty();
+                    capped += job.max_entries > m;
+                }
+            }
+        }
+        // -R 0..12 (top2 break), at -n 2 and -n 4
+        for (int top2 = 0; top2 <= 12; ++top2) {
+            for (int nd : {2, 4}) {
+                ba::gap_opt_t opt = make_opt(nd, 1);
+                opt.s_mm = sc.s_mm; opt.s_gapo = sc.s_gapo; opt.s_gape = sc.s_gape;
+                opt.max_top2 = top2;
+                for (size_t i = 0; i < reads.size(); ++i) {
+                    INFO("scoring " << sc.name << ", -R " << top2 << ", -n " << nd << ", read " << i << " (" << reads[i] << ")");
+                    GapResult ref, job;
+                    both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job);
+                    REQUIRE(ref.aln.size() == job.aln.size());
+                    for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
+                    ++compared;
+                    with_hits += !ref.aln.empty();
+                }
+            }
+        }
+    }
+    MESSAGE("compared " << compared << ", with hits " << with_hits << ", stopped by -m " << capped << " of "
+            << m_compared);
+    CHECK(with_hits > compared / 4);
+    CHECK(capped > m_compared / 2); // the -m sweep does stop most of its searches
+}
+
 // gap_cstack_t (the job's stack) against gap_stack_t (upstream's): random push/pop sequences
 // must pop the same entries in the same order, with the same counts and best bucket after
 // every step; and the pool must hold exactly the chunks the buckets need.

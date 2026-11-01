@@ -9,7 +9,9 @@
  * with bwt_match_exact_alt's loop (aln_bwt.cpp) run inside the job one base at a time. The job
  * uses a new stack, gap_cstack_t (after gap_pop), whose buckets are chains of pooled chunks;
  * bwt_match_gap keeps upstream's gap_stack_t. gap_cpush builds each entry in a local and stores
- * it whole, where gap_push assigns the slot's fields one by one. */
+ * it whole, where gap_push assigns the slot's fields one by one. gap_job_run keeps the last child
+ * of each expansion in registers and, when it is the entry the next pop returns, continues with it
+ * without storing or loading it (top-of-stack forwarding), counting it as pushed and popped. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
 #include "../utils.h"
@@ -195,33 +197,44 @@ void gap_destroy_cstack(gap_cstack_t *stack)
 	free(stack);
 }
 
-static inline void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
-							 int state, int is_diff, const gap_opt_t *opt)
+// gap_push's entry for the child (i, k, l, ...), built in a local so that it can be stored whole
+// (gap_cstore) or kept in registers (gap_job_run's forwarding). Assigning n_mm, n_gapo, n_gape and
+// state to a stack slot's bitfield word one by one makes the compiler load the word to keep its
+// other bits (n_seed_mm, which nothing reads), and that load of a slot not yet in cache stalls.
+static inline void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape,
+							  int n_ins, int n_del, int state, int is_diff)
 {
-	int score;
-	gap_entry_t t;
-	gap_bucket_t *q;
-	score = aln_score(n_mm, n_gapo, n_gape, opt);
-	q = stack->stacks + score;
+	t->info = (uint32_t)score<<21 | i;
+	t->n_mm = n_mm; t->n_gapo = n_gapo; t->n_gape = n_gape; t->state = state; t->n_seed_mm = 0;
+	t->n_ins = n_ins; t->n_del = n_del;
+	t->last_diff_pos = is_diff? i : 0;
+	t->k = k; t->l = l;
+}
+
+// The rest of gap_push: store entry t, whose score is `score`, on top of its bucket.
+static inline void gap_cstore(gap_cstack_t *stack, int score, const gap_entry_t *t)
+{
+	gap_bucket_t *q = stack->stacks + score;
 	if (q->top == 0 || q->top_n == GAP_CHUNK_ENTRIES) { // start a new chunk
 		gap_chunk_t *c = gap_pool_get(stack->pool);
 		c->prev = q->top;
 		q->top = c;
 		q->top_n = 0;
 	}
-	// Build the entry here and store it whole. Assigning n_mm, n_gapo, n_gape and state to the
-	// slot's bitfield word one by one makes the compiler load the word to keep its other bits
-	// (n_seed_mm, which nothing reads), and that load of a slot not yet in cache stalls.
-	t.info = (uint32_t)score<<21 | i;
-	t.n_mm = n_mm; t.n_gapo = n_gapo; t.n_gape = n_gape; t.state = state; t.n_seed_mm = 0;
-	t.n_ins = n_ins; t.n_del = n_del;
-	t.last_diff_pos = is_diff? i : 0;
-	t.k = k; t.l = l;
-	q->top->e[q->top_n] = t;
+	q->top->e[q->top_n] = *t;
 	++(q->top_n);
 	++(q->n_entries);
 	++(stack->n_entries);
 	if (stack->best > score) stack->best = score;
+}
+
+static inline void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
+							 int state, int is_diff, const gap_opt_t *opt)
+{
+	int score = aln_score(n_mm, n_gapo, n_gape, opt);
+	gap_entry_t t;
+	gap_centry(&t, score, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff);
+	gap_cstore(stack, score, &t);
 }
 
 static inline void gap_cpop(gap_cstack_t *stack, gap_entry_t *e)
@@ -543,6 +556,33 @@ static inline int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bwt
 	return 1;
 }
 
+/* gap_cpush for the children of one expansion in gap_job_run, one behind: the child is built into
+ * *f, and the child held there before it (if *f_score >= 0) is stored first. So every child but
+ * the last is stored in push order, and the last stays in *f; gap_job_run then stores it or
+ * forwards it (see there). Storing each child just before the next push, rather than at its own
+ * push, changes nothing another push or the next pop can see: no pop runs in between, and the
+ * next push stores after it whatever bucket it goes to. */
+static inline void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_score, int i, bwtint_t k, bwtint_t l,
+								   int n_mm, int n_gapo, int n_gape, int n_ins, int n_del, int state, int is_diff,
+								   const gap_opt_t *opt)
+{
+	if (*f_score >= 0) gap_cstore(stack, *f_score, f);
+	*f_score = aln_score(n_mm, n_gapo, n_gape, opt);
+	gap_centry(f, *f_score, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff);
+}
+
+/* Top-of-stack forwarding. After an expansion, bwt_match_gap pops the stack's best entry: the last
+ * entry of the lowest non-empty bucket. When the expansion's last child went into that bucket (its
+ * score is at most stack->best once the other children are stored), that child is the entry the
+ * pop returns, and it is still in f, so it is used from there (fwd = 1) and never stored or loaded.
+ * The loop top treats it as on the stack: n = stack->n_entries + 1 entries for the "is the stack
+ * empty", max_entries and -m tests, exactly the count a push would have made. A push then pop of
+ * it would leave the stack as it is now: its bucket's count goes up and back down, the total too,
+ * and best, which was min(best, f_score) = f_score in between, goes back by gap_cpop's rescan to
+ * the lowest non-empty bucket, which is the current best (best always names the lowest non-empty
+ * bucket, or n_stacks for an empty stack). Otherwise (f_score > stack->best) the pop would return
+ * an older entry, so f is stored and popped as usual. The forwarded entry is consumed by the very
+ * next pass of the loop, before any yield, so nothing about it is kept in the job. */
 int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 {
 	const gap_opt_t *opt = &J->opt;
@@ -551,6 +591,8 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 	bwt_width_t *width = J->width, *seed_width = J->seed_width;
 	const int len = J->len;
 	int j;
+	gap_entry_t f; // the last child of the last expansion, while f_score >= 0 (gap_cpush_defer)
+	int f_score = -1, fwd = 0; // fwd: f is the entry the next pop would return (forwarding, above)
 
 	for (;;) {
 		gap_entry_t e;
@@ -579,11 +621,13 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 			if (gap_job_hit(J, bwt, &J->e, k, l)) break;
 			continue;
 		} else {
-			if (!stack->n_entries) break;
+			const int n_entries = stack->n_entries + fwd; // with a forwarded entry counted as pushed
+			if (!n_entries) break;
 			m_seed = 0;
-			if (J->max_entries < stack->n_entries) J->max_entries = stack->n_entries;
-			if (stack->n_entries > opt->max_entries) break;
-			gap_cpop(stack, &e); // get the best entry
+			if (J->max_entries < n_entries) J->max_entries = n_entries;
+			if (n_entries > opt->max_entries) break;
+			if (fwd) { e = f; fwd = 0; } // the entry gap_cpop would return
+			else gap_cpop(stack, &e); // get the best entry
 			k = e.k; l = e.l; // SA interval
 			i = e.info&0xffff; // length
 			if (!(opt->mode & BWA_MODE_NONSTOP) && e.info>>21 > J->best_score + opt->s_mm) break; // no need to proceed
@@ -618,6 +662,7 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 
 		bwt_2occ4(bwt, k - 1, l, cnt_k, cnt_l); // retrieve Occ values
 		occ = l - k + 1;
+		f_score = -1; // no child held yet
 		// test whether diff is allowed
 		allow_diff = allow_M = 1;
 		if (i > 0) {
@@ -636,24 +681,24 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 			if (e.state == STATE_M) { // gap open
 				if (e.n_gapo < opt->max_gapo) { // gap open is allowed
 					// insertion
-					gap_cpush(stack, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
 					// deletion
 					for (j = 0; j != 4; ++j) {
 						k = bwt->L2[j] + cnt_k[j] + 1;
 						l = bwt->L2[j] + cnt_l[j];
-						if (k <= l) gap_cpush(stack, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+						if (k <= l) gap_cpush_defer(stack, &f, &f_score, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
 					}
 				}
 			} else if (e.state == STATE_I) { // extention of an insertion
 				if (e.n_gape < opt->max_gape) // gap extention is allowed
-					gap_cpush(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
 			} else if (e.state == STATE_D) { // extention of a deletion
 				if (e.n_gape < opt->max_gape) { // gap extention is allowed
 					if (e.n_gape + e.n_gapo < J->max_diff || occ < opt->max_del_occ) {
 						for (j = 0; j != 4; ++j) {
 							k = bwt->L2[j] + cnt_k[j] + 1;
 							l = bwt->L2[j] + cnt_l[j];
-							if (k <= l) gap_cpush(stack, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+							if (k <= l) gap_cpush_defer(stack, &f, &f_score, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
 						}
 					}
 				}
@@ -666,13 +711,17 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 				int is_mm = (j != 4 || seq[i] > 3);
 				k = bwt->L2[c] + cnt_k[c] + 1;
 				l = bwt->L2[c] + cnt_l[c];
-				if (k <= l) gap_cpush(stack, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
+				if (k <= l) gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
 			}
 		} else if (seq[i] < 4) { // try exact match only
 			int c = seq[i] & 3;
 			k = bwt->L2[c] + cnt_k[c] + 1;
 			l = bwt->L2[c] + cnt_l[c];
-			if (k <= l) gap_cpush(stack, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
+			if (k <= l) gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
+		}
+		if (f_score >= 0) { // the last child: forward it if the next pop would return it, else store it
+			if (f_score <= stack->best) fwd = 1;
+			else gap_cstore(stack, f_score, &f);
 		}
 	}
 	gap_release_cstack(stack); // the read is done: its stack's chunks go back to the pool

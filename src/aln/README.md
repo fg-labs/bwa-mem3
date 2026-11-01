@@ -222,6 +222,14 @@ Each change to upstream-derived code adds a line here.
   word to keep `n_seed_mm`; the slot is often a line not yet in cache, so the load stalled. Nothing
   reads `n_seed_mm`, so the entries popped are the same. `gap_push` is unchanged and still used by
   `bwt_match_gap`.
+- Top-of-stack forwarding (new code). After expanding an entry, `gap_job_run` stores each child but
+  the last as before and keeps the last in registers. If its score is at most the stack's best bucket
+  once the others are stored, it is the entry the next pop would return (the last entry of the lowest
+  non-empty bucket), so the loop continues with it directly; otherwise it is stored and the pop runs.
+  The loop top counts a forwarded entry as on the stack (the empty-stack test, `max_entries` and the
+  `-m` break see the count a push would give), and a push followed by that pop would leave every
+  bucket count, the total and `best` as they are, so the entries searched, their order and every
+  break are unchanged.
 - Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
   walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
   block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone
