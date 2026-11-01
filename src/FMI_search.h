@@ -49,6 +49,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "io_utils.h"       /* parallel index-array read family (fmi_pread_*, index_load_threads) */
 #include "lockstep_width.h"  /* SMEM_LOCKSTEP_N (+ _MAX), runtime width + probe */
 #include "fmi_seed_api.h"
+#include "bwa_hugepages.h"  /* bwamem_hugetlb_buf_t (--huge-pages index arrays) */
 
 #define DUMMY_CHAR 6
 
@@ -477,6 +478,14 @@ private:
          * shm-backed buffers. */
         uint8_t *shm_base;
         size_t   shm_len;
+
+        /* --huge-pages: when mapped, cp_occ is cp_occ_huge.base, and
+         * sa_ms_byte and sa_ls_word share sa_huge (sa_ms_byte at its start,
+         * sa_ls_word at the next 64-byte boundary), so the two SA arrays take
+         * one set of 1 GiB pages. The destructor unmaps a mapped buffer instead
+         * of calling _mm_free. Unmapped (base NULL) on every other path. */
+        bwamem_hugetlb_buf_t cp_occ_huge;
+        bwamem_hugetlb_buf_t sa_huge;
 
         /* Seed jump table: the bidirectional interval (k, l, s) of every
          * string of length 1..seed_jump_depth, level L at offset

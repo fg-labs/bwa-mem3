@@ -362,6 +362,59 @@ static void fmi_build_path(char *out, size_t outsz, const char *prefix, const ch
     }
 }
 
+/* --huge-pages: offset of sa_ls_word inside the shared SA mapping (sa_ms_byte
+ * comes first; sa_ls_word starts at the next 64-byte boundary). */
+static size_t fmi_sa_ls_offset(size_t sa_ms_bytes)
+{
+    return (sa_ms_bytes + 63) & ~(size_t)63;
+}
+
+/* --huge-pages: map the occurrence table and the two SA arrays (one mapping) on
+ * 1 GB pages, then fault their pages in over `nthreads` threads before the
+ * index readers fill them (see bwamem_hugetlb_prefault for why). A buffer that
+ * cannot be mapped or faulted in is left unmapped, and the caller allocates it
+ * as usual: the arrays' contents, and so the output, are the same either way.
+ * One [M::] line per buffer reports the outcome. */
+static void fmi_map_index_arrays_huge(size_t cp_occ_bytes, size_t sa_ms_bytes,
+                                      size_t sa_ls_bytes, int nthreads,
+                                      bwamem_hugetlb_buf_t *cp, bwamem_hugetlb_buf_t *sa)
+{
+    struct { const char *what; size_t bytes; bwamem_hugetlb_buf_t *buf; int err; } want[2] = {
+        { "occurrence table", cp_occ_bytes, cp, 0 },
+        { "suffix-array samples", fmi_sa_ls_offset(sa_ms_bytes) + sa_ls_bytes, sa, 0 },
+    };
+    bwamem_hugetlb_buf_t bufs[2];
+    for (int i = 0; i < 2; i++) {
+        want[i].err = bwamem_hugetlb_map(want[i].bytes, &bufs[i]);
+    }
+    /* Mapping reserves the pages; faulting them in is what costs time. */
+    bwamem_hugetlb_prefault(bufs, 2, nthreads);
+    for (int i = 0; i < 2; i++) {
+        *want[i].buf = bufs[i];
+        const double gib = (double)want[i].bytes / (1024.0 * 1024.0 * 1024.0);
+        if (bufs[i].base != NULL) {
+            fprintf(stderr, "[M::%s] --huge-pages: %s (%.2f GiB) on %zu x 1 GB pages\n",
+                    __func__, want[i].what, gib, bufs[i].map_bytes >> 30);
+        } else if (want[i].err == ENOMEM) {
+            fprintf(stderr, "[M::%s] --huge-pages: could not map the %s (%.2f GiB) on "
+                    "1 GB pages (%s: the host's 1 GB pool is missing or has fewer than "
+                    "%zu free pages, see /sys/kernel/mm/hugepages/hugepages-1048576kB; "
+                    "or a process limit such as RLIMIT_AS or vm.max_map_count was "
+                    "reached); using default pages for it\n", __func__, want[i].what, gib,
+                    strerror(want[i].err), bwamem_hugetlb_round_up(want[i].bytes) >> 30);
+        } else if (want[i].err != 0) {
+            fprintf(stderr, "[M::%s] --huge-pages: could not map the %s (%.2f GiB) on "
+                    "1 GB pages (%s); using default pages for it\n",
+                    __func__, want[i].what, gib, strerror(want[i].err));
+        } else {
+            fprintf(stderr, "[M::%s] --huge-pages: could not fault in the 1 GB pages "
+                    "for the %s (%.2f GiB; needs Linux 5.14+ for MADV_POPULATE_WRITE, "
+                    "or a hugetlb cgroup limit was reached); using default pages for it\n",
+                    __func__, want[i].what, gib);
+        }
+    }
+}
+
 FMI_search::FMI_search(const char *fname)
 {
     fprintf(stderr, "* Entering FMI_search\n");
@@ -375,6 +428,8 @@ FMI_search::FMI_search(const char *fname)
     cp_occ = NULL;
     shm_base = NULL;
     shm_len = 0;
+    cp_occ_huge = bwamem_hugetlb_buf_t{NULL, 0};
+    sa_huge = bwamem_hugetlb_buf_t{NULL, 0};
     seed_jump = NULL;
     seed_jump_depth = 0;
 
@@ -393,9 +448,14 @@ FMI_search::~FMI_search()
         shm_base = NULL;
         shm_len  = 0;
     } else {
-        if (sa_ms_byte) _mm_free(sa_ms_byte);
-        if (sa_ls_word) _mm_free(sa_ls_word);
-        if (cp_occ)     _mm_free(cp_occ);
+        if (sa_huge.base != NULL) {
+            bwamem_hugetlb_unmap(&sa_huge);  /* holds sa_ms_byte and sa_ls_word */
+        } else {
+            if (sa_ms_byte) _mm_free(sa_ms_byte);
+            if (sa_ls_word) _mm_free(sa_ls_word);
+        }
+        if (cp_occ_huge.base != NULL) bwamem_hugetlb_unmap(&cp_occ_huge);
+        else if (cp_occ)              _mm_free(cp_occ);
     }
     /* Process-private on both paths (never part of the shm segment). */
     if (seed_jump) _mm_free(seed_jump);
@@ -895,14 +955,45 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump)
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;
     cp_occ = NULL;
 
+    // Suffix-array sample arrays: one entry per sampled row (every row when
+    // the SA is not compressed). Sized here so --huge-pages can map them with
+    // the occurrence table and fault both in together.
+    #if SA_COMPRESSION
+    const int64_t sa_count = (reference_seq_len >> sa_compx) + 1;
+    #else
+    const int64_t sa_count = reference_seq_len;
+    #endif
+    const int64_t sa_ms_bytes = sa_count * (int64_t)sizeof(int8_t);
+    const int64_t sa_ls_bytes = sa_count * (int64_t)sizeof(uint32_t);
+
     err_fread_noeof(&count[0], sizeof(int64_t), 5, cpstream);
     int64_t cp_occ_bytes = cp_occ_size * sizeof(CP_OCC);
-    cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
-    index_alloc += cp_occ_bytes;
-    assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
-    bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
+    // A buffer on pre-faulted 1 GB pages needs no page faults while it is
+    // filled, so the read is a plain copy out of the page cache and keeps
+    // scaling past the default worker cap (index_load_threads): read it, and
+    // fault its pages in, with every worker the run has. An explicit
+    // BWA3_LOAD_THREADS still wins for both, so a filesystem or host that wants
+    // fewer threads (e.g. S3 Mountpoint) keeps its cap.
+    const char *load_nt_env = getenv("BWA3_LOAD_THREADS");
+    const int huge_load_nt = (load_nt_env != NULL && *load_nt_env != '\0')
+                                 ? load_nt
+                                 : std::max(load_nt, std::min(n_threads, 64));
+    if (bwamem_hugetlb_index_mode() != BWAMEM_HUGETLB_OFF) {
+        fmi_map_index_arrays_huge((size_t)cp_occ_bytes, (size_t)sa_ms_bytes,
+                                  (size_t)sa_ls_bytes, huge_load_nt, &cp_occ_huge, &sa_huge);
+    }
+    if (cp_occ_huge.base != NULL) {
+        cp_occ = (CP_OCC *)cp_occ_huge.base;
+        index_alloc += cp_occ_bytes;
+    } else {
+        cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
+        index_alloc += cp_occ_bytes;
+        assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
+        bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
+    }
 
-    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes, load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes,
+                          cp_occ_huge.base != NULL ? huge_load_nt : load_nt);
     int64_t ii = 0;
     // Validate the RAW on-disk count[] before the +1 adjustment below. Doing the
     // bounds/monotonicity checks on the raw values (rather than after +1) is what
@@ -945,38 +1036,23 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump)
                 "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
     }
 
-    #if SA_COMPRESSION
-
-    int64_t reference_seq_len_ = (reference_seq_len >> sa_compx) + 1;
-    int64_t sa_ms_bytes = reference_seq_len_ * sizeof(int8_t);
-    int64_t sa_ls_bytes = reference_seq_len_ * sizeof(uint32_t);
-    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
-    index_alloc += sa_ms_bytes;
-    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
-    sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
-    index_alloc += sa_ls_bytes;
-    assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
-    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
-    bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
-    fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
-
-    #else
-
-    int64_t sa_ms_bytes = reference_seq_len * sizeof(int8_t);
-    int64_t sa_ls_bytes = reference_seq_len * sizeof(uint32_t);
-    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
-    index_alloc += sa_ms_bytes;
-    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
-    sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
-    index_alloc += sa_ls_bytes;
-    assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
-    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
-    bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
-    fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
-
-    #endif
+    if (sa_huge.base != NULL) {
+        sa_ms_byte = (int8_t *)sa_huge.base;
+        sa_ls_word = (uint32_t *)((char *)sa_huge.base + fmi_sa_ls_offset((size_t)sa_ms_bytes));
+        index_alloc += sa_ms_bytes + sa_ls_bytes;
+    } else {
+        sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
+        index_alloc += sa_ms_bytes;
+        assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
+        sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
+        index_alloc += sa_ls_bytes;
+        assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
+        bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
+        bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
+    }
+    const int sa_load_nt = sa_huge.base != NULL ? huge_load_nt : load_nt;
+    fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, sa_load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, sa_load_nt);
 
     sentinel_index = -1;
     #if SA_COMPRESSION
