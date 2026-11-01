@@ -19,19 +19,15 @@ extern "C" {
 typedef struct bam_writer_s bam_writer_t;
 
 /* Open a BAM writer at `path` ("-" for stdout). compression_level 0 = no
- * deflate (fast, same size as SAM), 1..9 = BGZF deflate levels. @SQ is
- * built directly from `bns->anns`. `idx_hdr_lines` carries header records
- * loaded from <prefix>.hdr or <baseprefix>.dict (or NULL if neither exists,
- * or if the user's `hdr_line` supplies @SQ records — in which case the index
- * file is ignored entirely, matching the SAM text path). These are inserted
- * after the default @HD/@SQ but before user `hdr_line`, so user -H entries
- * win on any @HD/@SQ collision via htslib's header de-dup rules. `hdr_line`
- * carries user-supplied header lines (e.g., `@RG` from `-R` and `-H`
- * insertions, as accumulated by bwa_insert_header); it is inserted before
- * `@PG`. `bwa_pg` is inserted as-is. All three may be NULL. `compat` selects
- * the output-compatibility target whose @HD policy the header follows (NULL =
- * COMPAT_TARGET_OFF); it shapes only the default @HD, never @SQ. Returns NULL
- * on failure. */
+ * deflate (fast, same size as SAM), 1..9 = BGZF deflate levels. The header is
+ * the SAM-text writer's, from bwa_build_sam_hdr over `idx_hdr_lines` (records
+ * loaded from <prefix>.hdr or <baseprefix>.dict, or NULL), `hdr_line` (the
+ * user's -R / -H text) and `bwa_pg`, with the same precedence; all three may be
+ * NULL. `compat` selects the output-compatibility target whose @HD policy the
+ * header follows (NULL = COMPAT_TARGET_OFF). The @SQ block is taken as given,
+ * so records are mapped onto its contigs by name when written; an index contig
+ * with no @SQ record fails the open with a message on stderr. Returns NULL on
+ * failure. */
 bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
                               const char *idx_hdr_lines,
                               const char *hdr_line, const char *bwa_pg,
