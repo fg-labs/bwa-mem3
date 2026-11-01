@@ -6,7 +6,8 @@
  * extern "C" block is dropped, the bwa_aln2seq declaration is left out (it is ported
  * with the SAM code), and the declarations of the search entry points from upstream's
  * bwtaln.c (gap_init_opt, bwa_cal_maxdiff, bwt_cal_width) are added together with
- * aln_search_batch, aln_batch_max_gapo and the gap_job_t interleaved search, which are new. */
+ * aln_search_batch, aln_batch_max_gapo, the gap_job_t interleaved search and the width_walk_t
+ * resumable width walk, which are new. */
 #ifndef BWA_MEM3_ALN_BWTGAP_H
 #define BWA_MEM3_ALN_BWTGAP_H
 
@@ -46,7 +47,10 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
  * the inputs (len, seq, width, seed_width, opt, stack: what bwt_match_gap takes), then calls
  * gap_job_start, which returns 1 if the read is already done; otherwise gap_job_run until it
  * returns 1. Each gap_job_run call that returns 0 has prefetched the Occ blocks its next call
- * reads first. When done, aln/n_aln hold what bwt_match_gap returns (the caller owns aln). */
+ * reads first: the next bwt_2occ4, or the next base of an exact-match tail (bwt_match_exact_alt,
+ * which the job runs one base per call). When done, aln/n_aln hold what bwt_match_gap returns
+ * (the caller owns aln). */
+enum { JOB_OCC4 = 1, JOB_EXACT = 2 }; // gap_job_t::pending: the lookup the next call resumes at
 typedef struct {
 	// inputs
 	int len;
@@ -59,7 +63,7 @@ typedef struct {
 	int n_aln;
 	// state
 	int best_score, best_diff, max_diff, best_cnt, max_entries, m_aln;
-	int pending, i, m, m_seed;
+	int pending, i, m, m_seed; // pending: 0, JOB_OCC4 or JOB_EXACT
 	bwtint_t k, l;
 	gap_entry_t e;
 } gap_job_t;
@@ -73,6 +77,20 @@ gap_opt_t *gap_init_opt(void);
 int bwa_cal_maxdiff(int l, double err, double thres);
 /* `width` must hold len+1 zeroed entries. */
 int bwt_cal_width(const bwt_t *bwt, int len, const ubyte_t *str, bwt_width_t *width);
+
+/* bwt_cal_width as a resumable walk (new code; see bwtaln.cpp), so that a read's widths can be
+ * computed interleaved with other reads' work. width_walk_init, then width_walk_run until it
+ * returns 1; width[0..len] then holds what bwt_cal_width writes (and `bid` its return value).
+ * Do not call width_walk_run again after it has returned 1 (it would bump `bid` and rewrite
+ * width[len]); width_walk_init starts a new walk. Exposed for the unit tests. */
+typedef struct {
+	const ubyte_t *str;
+	bwt_width_t *width;
+	int len, i, bid, pending;
+	bwtint_t k, l;
+} width_walk_t;
+void width_walk_init(width_walk_t *w, const bwt_t *bwt, int len, const ubyte_t *str, bwt_width_t *width);
+int width_walk_run(width_walk_t *w, const bwt_t *bwt);
 
 /* max_gapo as the search applies it to this batch: opt->max_gapo capped at the number of
  * differences allowed for the longest read of the whole batch (bwa_cal_maxdiff of that

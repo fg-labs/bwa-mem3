@@ -291,17 +291,21 @@ namespace {
 
 struct GapResult {
     std::vector<ba::bwt_aln1_t> aln;
+    long exact_yields = 0; // gap_job_run calls that stopped inside an exact-match tail
 };
 
 // Prepares one read as bwa_cal_sa_reg_gap does, then runs it through both loops.
 // `codes` are nt4 codes (4 = N); the search takes the complemented read.
+// `batch_max_gapo` >= 0 is the driver's batch-wide cap on max_gapo (aln_batch_max_gapo);
+// -1 caps it with this read's own max_diff.
 void both_loops(const ba::bwt_t *bwt, const std::vector<uint8_t> &codes, const ba::gap_opt_t &base,
-                GapResult &ref, GapResult &job)
+                GapResult &ref, GapResult &job, int batch_max_gapo = -1)
 {
     const int len = (int)codes.size();
     ba::gap_opt_t opt = base;
     if (opt.fnr > 0.0) opt.max_diff = ba::bwa_cal_maxdiff(len, BWA_AVG_ERR, opt.fnr);
-    if (opt.max_diff < opt.max_gapo) opt.max_gapo = opt.max_diff;
+    if (batch_max_gapo >= 0) opt.max_gapo = batch_max_gapo;
+    else if (opt.max_diff < opt.max_gapo) opt.max_gapo = opt.max_diff;
     ba::gap_opt_t ropt = opt;
     ropt.seed_len = opt.seed_len < len ? opt.seed_len : 0x7fffffff;
 
@@ -334,7 +338,10 @@ void both_loops(const ba::bwt_t *bwt, const std::vector<uint8_t> &codes, const b
     j.stack = ba::gap_init_stack(opt.max_diff, opt.max_gapo, opt.max_gape, &opt);
     if (!ba::gap_job_start(&j, bwt)) {
         int guard = 0;
-        while (!ba::gap_job_run(&j, bwt)) REQUIRE(++guard < 100000000);
+        while (!ba::gap_job_run(&j, bwt)) {
+            REQUIRE(++guard < 100000000);
+            job.exact_yields += j.pending == ba::JOB_EXACT;
+        }
     }
     job.aln.assign(j.aln, j.aln + j.n_aln);
     free(j.aln);
@@ -393,6 +400,25 @@ TEST_CASE("aln_search: gap_job_run gives the same hits as bwt_match_gap"
         reads.push_back(flip(r, 9));
         reads.push_back(r.substr(0, 11));
     }
+    {   // the exact-match tail (no differences left): reads with an N (which force a width restart,
+        // so none reaches the tail with an N still ahead), a miss part-way, long tails
+        std::string r = s1.substr(500, 40);
+        for (size_t n : {1, 6, 20, 33, 38}) {
+            std::string a = r; a[n] = 'N';
+            reads.push_back(a);
+            reads.push_back(flip(a, n < 20 ? 30 : 4));
+            reads.push_back(flip(flip(a, n < 20 ? 30 : 4), 15));
+        }
+        uint32_t x = 12345;
+        for (int t = 0; t < 6; ++t) { // not in the reference: every tail misses
+            std::string q;
+            for (int i = 0; i < 28 + 4 * t; ++i) { x = x * 1103515245u + 12345u; q += "ACGT"[(x >> 16) & 3]; }
+            reads.push_back(q);
+            reads.push_back(s1.substr(410 + 7 * t, 18) + q.substr(0, 10 + t)); // matches, then misses
+        }
+        reads.push_back(flip(s1.substr(420, 150), 75));     // a long tail
+        reads.push_back(flip(flip(s1.substr(470, 90), 3), 85));
+    }
 
     struct Case { const char *name; int max_diff; int max_gapo; int max_entries; int max_top2; int mode_or; int seed_len; int max_seed_diff; double fnr; };
     const Case cases[] = {
@@ -410,8 +436,9 @@ TEST_CASE("aln_search: gap_job_run gives the same hits as bwt_match_gap"
         {"short seed",      3, 1, 2000000, 30,         0,                 12, 1, -1.0},
         {"aDNA-like",      -1, 2, 2000000, 30,         0,                 1024, 2, 0.04},
         {"-L log gap",      3, 2, 2000000, 30,         BWA_MODE_LOGGAP,   32, 2, -1.0},
+        {"-n 0",            0, 1, 2000000, 30,         0,                 32, 2, -1.0}, // root entry runs as an exact tail
     };
-    long compared = 0, with_hits = 0;
+    long compared = 0, with_hits = 0, exact_yields = 0;
     for (const Case &c : cases) {
         ba::gap_opt_t *o = ba::gap_init_opt();
         ba::gap_opt_t opt = *o;
@@ -432,8 +459,126 @@ TEST_CASE("aln_search: gap_job_run gives the same hits as bwt_match_gap"
             for (size_t k = 0; k < ref.aln.size(); ++k) CHECK(same_aln(ref.aln[k], job.aln[k]));
             ++compared;
             with_hits += !ref.aln.empty();
+            exact_yields += job.exact_yields;
         }
     }
     CHECK(compared > 400);
     CHECK(with_hits > compared / 4); // not vacuous
+    CHECK(exact_yields > compared); // the exact-match tails yield (one stop per base), not run in one call
+}
+
+// The aligner's driver (aln_search_batch: ALN_GROUP reads in flight per thread, each slot
+// refilled as its read finishes) gives every read exactly bwt_match_gap's hits.
+TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for each read"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second, &s2 = contigs[1].second;
+    auto flip = [](std::string r, size_t i) { r[i] = r[i] == 'A' ? 'T' : 'A'; return r; };
+    std::vector<std::string> reads;
+    uint32_t x = 777;
+    auto rnd = [&x](uint32_t n) { x = x * 1103515245u + 12345u; return (x >> 16) % n; };
+    for (int i = 0; i < 150; ++i) { // mixed lengths and kinds, so slots finish at different times
+        const std::string &src = (i % 4 == 3) ? s2 : s1;
+        int len = 20 + (int)rnd(60);
+        std::string r = src.substr(rnd((uint32_t)(src.size() - len)), len);
+        switch (i % 6) {
+        case 1: r = flip(r, rnd(len)); break;
+        case 2: r = flip(flip(r, rnd(len)), rnd(len)); break;
+        case 3: r[rnd(len)] = 'N'; r = flip(r, rnd(len)); break;
+        case 4: r = r.substr(0, len / 2) + r.substr(len / 2 + 1 + rnd(2)); break; // deletion
+        case 5: { std::string q; for (int k = 0; k < len; ++k) q += "ACGT"[rnd(4)]; r = (i % 12 == 5) ? q : r.substr(0, len / 2) + q.substr(len / 2); } break;
+        default: break;
+        }
+        reads.push_back(r);
+    }
+    for (int i = 0; i < 8; ++i) { std::string r; for (int j = 0; j < 12 + i; ++j) r += "AC"; reads.push_back(r); }
+    // edge lengths and contents: a single base, all-N, exactly seed_len (32) and seed_len + 1
+    reads.push_back("A");
+    reads.push_back("N");
+    reads.push_back(std::string(25, 'N'));
+    reads.push_back(s1.substr(200, 32));
+    reads.push_back(s1.substr(200, 33));
+    reads.push_back(flip(s1.substr(240, 32), 10));
+    reads.push_back(flip(s1.substr(240, 33), 10));
+
+    struct Case { const char *name; int max_diff; int max_gapo; int max_entries; double fnr; };
+    const Case cases[] = {
+        {"-n 2 -o 1", 2, 1, 2000000, -1.0},
+        {"-n 3 -o 2", 3, 2, 2000000, -1.0},
+        {"defaults", -1, 1, 2000000, 0.04},
+        {"-n 3 -m 5", 3, 1, 5, -1.0},
+        {"-n 0", 0, 1, 2000000, -1.0}, // the root entry runs as an exact tail
+    };
+    long with_hits = 0, compared = 0;
+    for (const Case &c : cases) {
+        ba::gap_opt_t opt = make_opt(c.max_diff, c.max_gapo);
+        opt.fnr = (float)c.fnr;
+        opt.max_entries = c.max_entries;
+        for (int nt : {1, 3}) {
+            Batch b(reads);
+            ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, nt);
+            const int cap = ba::aln_batch_max_gapo(b.n, b.seqs, &opt); // what the driver applies
+            for (int i = 0; i < b.n; ++i) {
+                INFO("case " << std::string(c.name) << ", -t " << nt << ", read " << i << " (" << reads[i] << ")");
+                GapResult ref, job;
+                both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job, cap);
+                REQUIRE(b.seqs[i].n_aln == (int)ref.aln.size());
+                for (int k = 0; k < b.seqs[i].n_aln; ++k) CHECK(same_aln(ref.aln[k], b.seqs[i].aln[k]));
+                ++compared;
+                with_hits += !ref.aln.empty();
+            }
+        }
+    }
+    CHECK(compared == 2L * (long)(sizeof cases / sizeof cases[0]) * (long)reads.size());
+    CHECK(with_hits > compared / 3); // not vacuous
+}
+
+// The resumable width walk (width_walk_init/width_walk_run, which the driver interleaves) must
+// write exactly what bwt_cal_width writes, and end on the same bid.
+TEST_CASE("aln_search: width_walk_run matches bwt_cal_width"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto contigs = aln_test::test_contigs();
+    const std::string &s1 = contigs[0].second;
+    auto flip = [](std::string r, size_t i) { r[i] = r[i] == 'A' ? 'T' : 'A'; return r; };
+    std::vector<std::string> reads;
+    reads.push_back("");                                  // len 0
+    reads.push_back("A");                                 // len 1
+    reads.push_back(s1.substr(10, 1));
+    reads.push_back(std::string(40, 'N'));                // all N
+    { std::string r = s1.substr(60, 50); r[20] = r[21] = r[22] = 'N'; reads.push_back(r); } // N run mid-read
+    { std::string r = s1.substr(60, 50); r[7] = 'N'; reads.push_back(r); }
+    reads.push_back(flip(s1.substr(300, 60), 30));        // mid-read miss (k > l restart)
+    reads.push_back(s1.substr(300, 28) + "ACGTTGCAACGTTGCAGGCCTTAAGGCC"); // match, then off-reference
+    reads.push_back(s1.substr(500, 32));                  // seed_len
+    reads.push_back(s1.substr(500, 33));                  // seed_len + 1
+    reads.push_back(s1.substr(150, 400));                 // long (c1 is 600 bp)
+    reads.push_back(flip(flip(s1.substr(150, 400), 100), 300));
+    long restarts = 0;
+    for (const std::string &r : reads) {
+        INFO("read " << r);
+        std::vector<uint8_t> codes = to_codes(r);
+        const int len = (int)codes.size();
+        std::vector<ba::bwt_width_t> a(len + 1), b(len + 1);
+        for (auto &x : a) { x.w = 0; x.bid = 0; }
+        for (auto &x : b) { x.w = 0; x.bid = 0; }
+        int bid = ba::bwt_cal_width(ix.bwt, len, codes.data(), a.data());
+        ba::width_walk_t ww;
+        ba::width_walk_init(&ww, ix.bwt, len, codes.data(), b.data());
+        int yields = 0;
+        while (!ba::width_walk_run(&ww, ix.bwt))
+            if (++yields >= 10000000) break;
+        // one yield before each Occ lookup, i.e. per non-N base, so the walk interleaves
+        int lookups = 0;
+        for (uint8_t c : codes) lookups += c < 4;
+        CHECK(yields == lookups);
+        CHECK(ww.bid == bid);
+        for (int i = 0; i <= len; ++i) {
+            CHECK(a[i].w == b[i].w);
+            CHECK(a[i].bid == b[i].bid);
+        }
+        restarts += bid > 1;
+    }
+    CHECK(restarts >= 6); // restarts are exercised
 }

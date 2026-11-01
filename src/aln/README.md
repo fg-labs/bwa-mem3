@@ -24,7 +24,7 @@ contributors" line in the headers of the files derived from them was added here.
 | File | Origin |
 | --- | --- |
 | `bwtgap.h`, `bwtgap.cpp` | `bwtgap.h`/`bwtgap.c`: the backtracking search (`bwt_match_gap` and its priority stack) |
-| `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out |
+| `bwtaln.cpp` | the search half of `bwtaln.c`: `gap_init_opt`, `bwa_cal_maxdiff`, `bwt_cal_width`, `bwa_cal_sa_reg_gap` and the thread fan-out, plus `width_walk_init`/`width_walk_run` (new) |
 | `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_cnt_ambi` from `bntseq.c` |
 | `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, and `bwa_paired_sw`'s body as `bwa_paired_sw_core`/`bwa_paired_sw_report`) |
 | `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code (MIT, as the rest of bwa-mem3; `SPDX-License-Identifier` line): the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
@@ -61,8 +61,8 @@ Each change to upstream-derived code adds a line here.
   reference the unit tests check `gap_job_run` against. Dropped: the `extern "C"`
   block, the malloc wrappers and the `bwa_aln2seq` declaration (ported with the SAM
   code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
-  `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch` and
-  `aln_batch_max_gapo`, which are new.
+  `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch`,
+  `aln_batch_max_gapo` and `width_walk_t`/`width_walk_init`/`width_walk_run`, which are new.
 - `bwtaln.cpp`: `gap_init_opt`, `bwa_cal_maxdiff` and `bwt_cal_width` are upstream's
   bodies. `bwa_cal_sa_reg_gap` differs in three ways. (1) The read is complemented into
   a per-thread scratch buffer instead of in place, and `name`, `seq`, `rseq` and `qual`
@@ -182,3 +182,15 @@ Each change to upstream-derived code adds a line here.
   window length, a CIGAR was produced) are `xassert`, so they hold in a build with `NDEBUG` defined too.
   `aln_search_batch` runs a thread's share of the reads itself if `pthread_create` fails, instead of
   leaving those reads unsearched.
+- Interleaved exact-match walks (new code). When an entry has no differences left, `gap_job_run` runs
+  `bwt_match_exact_alt`'s loop itself, one base per call: it prefetches the two Occ blocks of the
+  next `bwt_2occ` and yields, and the next call does that lookup and updates `k`/`l` as
+  `bwt_match_exact_alt` does, with its early exit on `k > l` (its N check is kept but cannot fire
+  here: an N forces a width restart, so no entry reaches the tail with an N ahead). The hit, if any, is then
+  handled by the same code as before (moved into `gap_job_hit`). `bwt_match_exact_alt` and
+  `bwt_match_gap` themselves are unchanged. Likewise, `bwa_cal_sa_reg_gap_group` computes a read's
+  two widths (whole read and seed) with `width_walk_run`, `bwt_cal_width`'s loop as a resumable walk
+  that yields before each `bwt_2occ`, so they overlap the other slots' lookups; `bwt_cal_width` is
+  unchanged and still used by the unit tests as the reference. Per read, the same lookups are done:
+  the search's in the same order as before, while the whole-read and seed width walks, which share
+  no state, now take turns. Only the interleaving changes; the output does not.
