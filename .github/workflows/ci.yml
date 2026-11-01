@@ -716,8 +716,8 @@ jobs:
         run: BWA_MEM3=./bwa-mem3 bash test/regression/arg_range_validation.sh
 
       - name: mem CLI helpers still fail on bad input
-        # The self-test of the shell helpers mem_cli_basics.sh is built on,
-        # run first: a helper that stopped failing would make it pass without
+        # The self-test of the shell helpers the mem CLI scripts are built on,
+        # run first: a helper that stopped failing would make them pass without
         # checking anything.
         if: matrix.os == 'ubuntu-24.04-arm'
         run: bash test/regression/mem_cli_selftest.sh
@@ -729,6 +729,14 @@ jobs:
         # and, where the runner has it, avx512bw; this row adds neon.
         if: matrix.os == 'ubuntu-24.04-arm'
         run: BWA_MEM3=./bwa-mem3 bash test/regression/mem_cli_basics.sh
+
+      - name: mem CLI input and output (hand-derived records, each SIMD tier)
+        # mem_cli_basics.sh's approach applied to read bases, split reads,
+        # XA/HN and the input and output options; neon here, avx2 and
+        # avx512bw in canonical-regressions. With MEM_IO_CLI_REQUIRE_TOOLS=1 a
+        # missing samtools fails the step instead of skipping the check.
+        if: matrix.os == 'ubuntu-24.04-arm'
+        run: BWA_MEM3=./bwa-mem3 MEM_IO_CLI_REQUIRE_TOOLS=1 bash test/regression/mem_io_cli.sh
 
       - name: Build doctest framework and unit binary
         # Invoke via the parent `test-binaries` target so ARCH_FLAGS
@@ -1690,7 +1698,7 @@ jobs:
           bash test/regression/all_tiers_parity.sh
 
       - name: mem CLI helpers still fail on bad input
-        # Run before mem_cli_basics.sh, as on the Linux ARM64 row.
+        # Run before the mem CLI scripts, as on the Linux ARM64 row.
         run: bash test/regression/mem_cli_selftest.sh
 
       - name: mem CLI basics (hand-derived records, each SIMD tier)
@@ -1700,6 +1708,14 @@ jobs:
         # runner has it, avx512bw, and required byte-identical across them;
         # the Linux ARM64 row runs it under neon.
         run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/mem_cli_basics.sh
+
+      - name: mem CLI input and output (hand-derived records, each SIMD tier)
+        # Read bases, split reads, XA/HN and the input and output options
+        # (--bam decoded with this job's samtools), by hand on the same
+        # reference, under avx2 and, where the runner has it, avx512bw; the
+        # Linux ARM64 row runs it under neon. A missing samtools fails the
+        # step (MEM_IO_CLI_REQUIRE_TOOLS=1).
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" MEM_IO_CLI_REQUIRE_TOOLS=1 bash test/regression/mem_io_cli.sh
 
       - name: Rescue identity under each forced x86 tier (generated PE fixture)
         # The kswv rescue kernels differ per tier, so the 11-op cell (and the
