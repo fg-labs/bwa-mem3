@@ -106,8 +106,11 @@ static bool run_case(FMI_search *fmi,
     // read (one per backward-step decision plus the final prev[0]), so
     // numReads * max_readlength safely caps both scalar_out and lockstep_out.
     const int32_t max_out = numReads * max_readlength;
-    SMEM *scalar_out   = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
-    SMEM *lockstep_out = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
+    /* At least one element, so an empty case's buffer is not a NULL that the
+     * allocation check below would report as a failure. */
+    const size_t out_bytes = (size_t)(max_out > 0 ? max_out : 1) * sizeof(SMEM);
+    SMEM *scalar_out   = (SMEM *)_mm_malloc(out_bytes, 64);
+    SMEM *lockstep_out = (SMEM *)_mm_malloc(out_bytes, 64);
 
     int32_t *qpa_s = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *qpa_l = (int32_t *)malloc(numReads * sizeof(int32_t));
@@ -115,7 +118,7 @@ static bool run_case(FMI_search *fmi,
     int32_t *mia_l = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *rid_s = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *rid_l = (int32_t *)malloc(numReads * sizeof(int32_t));
-    if (!qpa_s || !qpa_l || !mia_s || !mia_l || !rid_s || !rid_l) {
+    if (!scalar_out || !lockstep_out || !qpa_s || !qpa_l || !mia_s || !mia_l || !rid_s || !rid_l) {
         fprintf(stderr, "[FAIL] %s: allocation failed\n", case_name);
         _mm_free(scalar_out);
         _mm_free(lockstep_out);
@@ -804,8 +807,10 @@ int main(int argc, char *argv[]) {
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
         encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
         const int32_t max_out = numReads * max_readlength;
-        SMEM *scalar_out   = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
-        SMEM *lockstep_out = (SMEM *)_mm_malloc(max_out * sizeof(SMEM), 64);
+        SMEM *scalar_out   = (SMEM *)alloc_or_exit(_mm_malloc(max_out * sizeof(SMEM), 64),
+                                               "Case 9 AllPos driver");
+        SMEM *lockstep_out = (SMEM *)alloc_or_exit(_mm_malloc(max_out * sizeof(SMEM), 64),
+                                               "Case 9 AllPos driver");
         /* The lockstep variant now owns its per-slot prev/match scratch
          * internally (sized by MAX_READ_LEN_FOR_LOCKSTEP); no external
          * lockstep buffers are needed here. */
@@ -1014,7 +1019,7 @@ int main(int argc, char *argv[]) {
             char *bufs[6] = {0};
             for (int32_t i = 0; i < want; i++) {
                 if (off[i] + rl > ref_len) continue;   /* keep in-bounds */
-                char *b = (char *)malloc(rl + 1);
+                char *b = (char *)alloc_or_exit(malloc(rl + 1), "Case 13");
                 memcpy(b, ref + off[i], rl);
                 b[rl] = '\0';
                 bufs[numReads++] = b;
@@ -1080,7 +1085,7 @@ int main(int argc, char *argv[]) {
             const char *reads[NZ];
             int32_t qpa[NZ], mia[NZ], rid[NZ];
             for (int32_t i = 0; i < NZ; i++) {
-                bufs[i] = (char *)malloc(rl + 1);
+                bufs[i] = (char *)alloc_or_exit(malloc(rl + 1), "Case 13z");
                 memcpy(bufs[i], ref + i * step, rl);
                 bufs[i][rl] = '\0';
                 reads[i] = bufs[i];
@@ -1137,7 +1142,7 @@ int main(int argc, char *argv[]) {
             for (int32_t i = 0; i < NR; i++) {
                 const int32_t len = 30 + (i * 7) % (MAXL - 29);           /* 30..90 */
                 const int32_t off = (int32_t)(((int64_t)i * 977) % (ref_len - MAXL));
-                bufs[i] = (char *)malloc(len + 1);
+                bufs[i] = (char *)alloc_or_exit(malloc(len + 1), "Case 14");
                 memcpy(bufs[i], ref + off, len);
                 bufs[i][len] = '\0';
                 if (i % 11 == 5) bufs[i][len / 3] = 'N';                   /* early stop */

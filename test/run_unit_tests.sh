@@ -245,11 +245,14 @@ else
 fi
 
 # --- the two lockstep parity tests under BWA3_BWTSEED_JUMP ----------------
-# The jump-table depth is a speed knob only: every depth (0 = no table, 2..12;
-# 3 is the deepest level the table builder fills serially) must pass every
-# case with the same per-case lines (seed and SMEM counts) as the default
-# depth, and a malformed or out-of-range value must be reported, with the
-# default depth used, so its output also equals the default's.
+# The jump-table depth is a speed knob only: every accepted depth (0 = no
+# table, and each of 2..12; 3 is the deepest level the table builder fills
+# serially, 12 builds a 537 MB table) must pass every case, each of which
+# compares the lockstep driver (which reads the table) with the scalar driver
+# (which never does), with the same per-case lines (seed and SMEM counts) as
+# the default depth. Each run takes well under a second on phiX. A malformed
+# or out-of-range value must be reported, with the default depth used, so its
+# output also equals the default's.
 jump_case_lines() { grep -E '^\[(PASS|FAIL|SKIP)\]|cases passed$' || true; }
 for t in smem_lockstep_parity_test bwtseed_lockstep_parity_test; do
     DEF_OUT="$(cd "$HERE" && env -u BWA3_BWTSEED_JUMP ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
@@ -265,7 +268,7 @@ for t in smem_lockstep_parity_test bwtseed_lockstep_parity_test; do
             echo "$DEF_OUT"
             fail "$t (default depth): no case summary to compare the other depths with"
         }
-    for depth in 0 2 3 12; do
+    for depth in 0 2 3 4 5 6 7 8 9 10 11 12; do
         OUT="$(cd "$HERE" && BWA3_BWTSEED_JUMP=$depth ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
             || {
                 echo "$OUT"
