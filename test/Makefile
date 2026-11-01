@@ -64,6 +64,33 @@ endif
 LIBS    += $(HTSLIB_static_LIBS)
 LDFLAGS += $(HTSLIB_static_LDFLAGS)
 
+# The default FASTQ reader in libbwa.a (src/fast_reader.c, reached through
+# bseq_read_fast and fr_fastq_next) inflates plain gzip with zlib-ng's native
+# zng_* API and decodes BGZF blocks with libdeflate. Link both, resolved as the
+# parent Makefile resolves them, so a test can call the reader: the vendored
+# static zlib-ng archive by default (built before libbwa.a, whose
+# src/fast_reader.o depends on it), a host zlib-ng with ZLIBNG_USE_VENDORED=0,
+# and libdeflate from Homebrew on macOS. On Linux htslib's static deps usually
+# carry -ldeflate already; naming it again is harmless. Each library comes
+# after -lbwa in $(LIBS), as a static link needs. A ZLIBNG_USE_VENDORED given
+# to the parent's command line reaches this sub-make; a standalone `make -C
+# test` must be given the value libbwa.a was built with.
+ZLIBNG_USE_VENDORED ?= 1
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+    LIBS += ../ext/zlib-ng/build/libz-ng.a
+else ifeq ($(UNAME_S),Darwin)
+    ZLIBNG_PREFIX ?= $(shell brew --prefix zlib-ng 2>/dev/null)
+    LIBS += -L$(ZLIBNG_PREFIX)/lib -lz-ng
+else
+    LIBS += -lz-ng
+endif
+ifeq ($(UNAME_S),Darwin)
+    LIBDEFLATE_PREFIX ?= $(shell brew --prefix libdeflate 2>/dev/null)
+    LIBS += -L$(LIBDEFLATE_PREFIX)/lib -ldeflate
+else
+    LIBS += -ldeflate
+endif
+
 ifneq ($(IS_ARM),)
     # Keep the ARM cache-line alignment in lock-step with the top-level Makefile:
     # CACHE_LINE_BYTES feeds _mm_malloc, so a build overriding
@@ -289,6 +316,12 @@ $(INTEGRATION_DIR)/placeholder.o: $(INTEGRATION_DIR)/placeholder.cpp
 # parent's flag stamp old keeps that difference from rewriting the stamp and
 # recompiling these objects; they are still rebuilt when missing or when a
 # source or header changed.
+# The vendored zlib-ng archive is linked through $(LIBS) too, so it is asked
+# for here as well: a libbwa.a restored from a cache does not bring it along.
+ifeq ($(ZLIBNG_USE_VENDORED),1)
+PARENT_EXTRA_OBJS += ext/zlib-ng/build/libz-ng.a
+endif
+
 libsais-objs:
 	$(MAKE) -C .. -o .build-flags ext/libsais/src/libsais.o ext/libsais/src/libsais64.o $(PARENT_EXTRA_OBJS)
 
@@ -386,19 +419,22 @@ print-%:
 # changes (the parent's .build-flags trick): switching COVERAGE, COVERAGE_OPT or ASAN
 # on an incremental build recompiles every test object instead of linking
 # objects instrumented at the old level (or not at all) against a libbwa.a
-# built at the new one. It is keyed on the coverage knobs only, not on the
-# whole flag text, because this directory is built both by the parent's
-# test-binaries (with its arch flags) and standalone by test/run_unit_tests.sh
-# (without them); a full-text key would rebuild every object between the two.
+# built at the new one. ZLIBNG_USE_VENDORED is keyed too: it picks which
+# zlib-ng the unit binary links, and no object prerequisite changes when it
+# flips, so without it a switched build would keep the old link. It is keyed
+# on those knobs only, not on the whole flag text, because this directory is
+# built both by the parent's test-binaries (with its arch flags) and
+# standalone by test/run_unit_tests.sh (without them); a full-text key would
+# rebuild every object between the two.
 #
 # Written at parse time rather than by a FORCE recipe, so the stamp is a plain
 # file to make: a dry run (`make -n`, which test/regression/make_test_relink.sh
 # relies on) would otherwise assume a FORCE'd stamp was remade and report every
-# object and binary out of date. The value is three make flags (no quotes), and
+# object and binary out of date. The value is four make flags (no quotes), and
 # the write goes through a per-process temp file and mv, so concurrent makes
 # cannot leave a torn stamp.
 TEST_FLAGS_STAMP := .test-build-flags
-TEST_FLAGS_SIG := COVERAGE=$(COVERAGE)|COVERAGE_OPT=$(if $(COVERAGE),$(COVERAGE_OPT))|ASAN=$(strip $(ASAN))
+TEST_FLAGS_SIG := COVERAGE=$(COVERAGE)|COVERAGE_OPT=$(if $(COVERAGE),$(COVERAGE_OPT))|ASAN=$(strip $(ASAN))|ZLIBNG_USE_VENDORED=$(ZLIBNG_USE_VENDORED)
 ifneq ($(shell cat $(TEST_FLAGS_STAMP) 2>/dev/null),$(TEST_FLAGS_SIG))
     $(shell printf '%s\n' '$(TEST_FLAGS_SIG)' > $(TEST_FLAGS_STAMP).$$$$ && mv $(TEST_FLAGS_STAMP).$$$$ $(TEST_FLAGS_STAMP))
 endif
