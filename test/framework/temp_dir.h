@@ -78,6 +78,18 @@ public:
         const bool ok = fwrite(text.data(), 1, text.size(), fp) == text.size();
         if (fclose(fp) != 0 || !ok) throw std::runtime_error("short write to " + file(name));
     }
+
+    // The contents of file(name), or "" if it cannot be opened.
+    std::string read(const std::string &name) const {
+        std::string text;
+        FILE *fp = fopen(file(name).c_str(), "rb");
+        if (fp == NULL) return text;
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, fp)) > 0) text.append(buf, n);
+        fclose(fp);
+        return text;
+    }
 private:
     std::string path_;
     pid_t owner_ = getpid();
