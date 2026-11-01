@@ -3,7 +3,8 @@
  * (kswv mate rescue, bandedSWA extension), 8-bit lanes (x86_soa_pack) and
  * 16-bit lanes (x86_soa_pack_u16): the x86 counterpart of the tiled packing
  * the NEON batch wrappers use (neon_soa_pack.h; the headers share the same
- * contract).
+ * contract). Its bounded tile load, x86_soa_tail16, also loads the < 16-base
+ * tail of ungapped_analyze (src/ungapped_ext.h); its contract binds both.
  *
  * The kernels read their sequences in SoA form: row k holds position k of
  * every lane, SIMD_WIDTH8 bytes (or SIMD_WIDTH16 halfwords) per row. The
@@ -11,14 +12,13 @@
  * lane's bytes are loaded 16 (or 8) at a time and a register transpose turns
  * 16 (or 8) positions of every lane into that many SoA rows.
  *
- * The transpose is the 16x16 byte zip network (bytes, halfwords, words,
- * doublewords). On x86 the unpacklo/unpackhi instructions operate within
- * each 128-bit lane of a wider register, so one network on __m256i transposes
- * two independent 16-lane groups at once and one on __m512i four: register j
- * holds lane j in its first 128 bits, lane j+16 in its second, and so on, and
- * after the transpose register k holds SoA row k for all SIMD_WIDTH8 lanes in
- * the order the kernels expect. The single-register 8x8 halfword network
- * (x86_transpose8x8_s16) lives here too, for the x86 rescue filter. */
+ * The transpose is the 16x16 byte zip network (bytes, halfwords, words, doublewords).
+ * On x86 the unpacklo/unpackhi instructions operate within each 128-bit lane of a wider
+ * register, so one network on __m256i transposes two independent 16-lane groups at once
+ * and one on __m512i four: register j holds lane j in its first 128 bits, lane j+16 in
+ * its second, and so on, and after the transpose register k holds SoA row k for all
+ * SIMD_WIDTH8 lanes in the order the kernels expect. The single-register 8x8 halfword
+ * network (x86_transpose8x8_s16) lives here too, for the x86 rescue filter. */
 #ifndef BWAMEM3_X86_SOA_PACK_H
 #define BWAMEM3_X86_SOA_PACK_H
 
@@ -31,9 +31,9 @@
 
 /* The first r = len - kb bytes of a boundary tile (positions [kb, len), 1 <= r <= 15) in bytes
  * [0, r) of a vector, read without touching memory outside [seq, seq + len); bytes [r, 16) are
- * unspecified. With len >= 16 the tile's bases are the last r bytes of the 16 that end at
- * seq + len: one load and one shuffle. A shorter sequence (then kb == 0) is read as its first and
- * last a bytes, a the largest power of two <= len, which together cover it. */
+ * unspecified. Callers: x86_soa_piece16 and ungapped_analyze (src/ungapped_ext.h). len >= 16:
+ * the last r of the 16 bytes ending at seq + len, one load and one shuffle. A shorter sequence
+ * (kb == 0) is read as its first and last a bytes, a the largest power of two <= len. */
 static inline __m128i x86_soa_tail16(const uint8_t *seq, int len, int kb)
 {
     const __m128i iota = _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);

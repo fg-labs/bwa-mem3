@@ -18,6 +18,7 @@
     #include "simd_compat.h"
 #elif (__AVX512BW__ || __AVX2__)
     #include <immintrin.h>
+    #include "x86_soa_pack.h"   /* x86_soa_tail16: the analyzer's < 16-base tail */
 #else
     #include <smmintrin.h>  // for SSE4.1
 #endif
@@ -294,6 +295,27 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
          * never straddles a 64-bit boundary. */
         mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
     }
+#if defined(__AVX2__)
+    /* Tail (r = N - i, 1..15 bases) in one 16-byte step. x86_soa_tail16 puts
+     * positions [i, N) in bytes [0, r) without reading outside [qs, qs + N) or
+     * [rs, rs + N) (rs holds len1 >= N bases); bytes [r, 16) are unspecified,
+     * so both tests keep only the r valid lanes. The ambiguity test is the
+     * #else branch's scalar one (any bit outside 0x03, so codes >= 128 count
+     * too), not the 16-byte loop's signed compare. As in the loop above, i is
+     * 16-aligned, so the mask lands within one bitmap word. */
+    if (i < N) {
+        const int r = N - i;
+        const unsigned valid = (1u << r) - 1u;
+        const __m128i qv = x86_soa_tail16(qs, N, i);
+        const __m128i rv = x86_soa_tail16(rs, N, i);
+        const __m128i hi = _mm_and_si128(_mm_or_si128(qv, rv), _mm_set1_epi8((char)0xFC));
+        const unsigned clean = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(hi, _mm_setzero_si128()));
+        if (~clean & valid) return FP_STATUS_FALLBACK;
+        const unsigned mism_mask = ~(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(qv, rv)) & valid;
+        total_mis += __builtin_popcount(mism_mask);
+        mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
+    }
+#else
     /* Tail (< 16 bases): branch-free. The per-base mismatch test is data
      * dependent and mispredicted often as a branch; accumulate it, and the
      * ambiguity test, arithmetically and decide once. Returning FALLBACK after
@@ -308,6 +330,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         mis[i >> 6] |= ((uint64_t)ne) << (i & 63);
     }
     if (tail_ambig) return FP_STATUS_FALLBACK;
+#endif
 
     if (total_mis > x_threshold) {
         /* Only a pair within FP_TIGHT_MAX carries a tight_band (see the define);

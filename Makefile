@@ -1471,7 +1471,7 @@ test/kswv_freed_cell_test.o: test/kswv_freed_cell_test.cpp
 # binary records the skip. Carries -Iext for doctest like kswv_freed_cell_test.
 x86_soa_pack_test: test/x86_soa_pack_test.o
 	$(CXX) $(BASE_CXXFLAGS) -march=native $(LDFLAGS) test/x86_soa_pack_test.o -o $@
-test/x86_soa_pack_test.o: test/x86_soa_pack_test.cpp
+test/x86_soa_pack_test.o: test/x86_soa_pack_test.cpp test/guarded_seq_test_util.h
 	$(CXX) -c $(BASE_CXXFLAGS) -march=native $(CPPFLAGS) $(INCLUDES) -Iext $(DEPFLAGS) $< -o $@
 
 test/bandedswa_padding_test.o: test/bandedswa_padding_test.cpp
