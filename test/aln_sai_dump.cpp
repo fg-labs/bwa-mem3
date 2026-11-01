@@ -21,6 +21,9 @@
 #include "aln/aln_bwt.h"
 #include "aln/bwaseqio.h"
 #include "aln/bwtgap.h"
+// The synthetic reference is the unit tests' own generator, included rather than copied: the
+// regression scripts' expected outputs depend on its exact sequence, so a second copy (in awk,
+// say) could drift from the one the unit tests check.
 #include "unit/aln_test_ref.h"
 
 #include <cstdio>

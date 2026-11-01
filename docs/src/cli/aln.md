@@ -89,6 +89,12 @@ The long names exist because `-n` and `-o` already mean the search options.
 The paired-end options are ignored, with a warning, when only one input file is
 given.
 
+During search, an actual score outside the priority stack or its 11-bit packed range
+(0-2047) exits 1 with a diagnostic instead of overflowing or indexing beyond the stack.
+This check depends on the reads and can occur after output has begun. Large penalties
+are not rejected just because their theoretical score bound exceeds that range: searches
+whose actual scores fit still run.
+
 ## Common usage
 
 Ancient DNA, single end, four threads, written to a file:

@@ -154,6 +154,63 @@ TEST_CASE("aln_se: drand48 is seeded once per run, not per batch"
     CHECK(run_se(4, fq, ix.dir + "/again.sam") == one);
 }
 
+TEST_CASE("aln_se: a huge -l allocates no seed widths for shorter reads and matches -l 1024"
+          * doctest::test_suite("unit/aln_se")) {
+    // The seed-width buffer is sized only for a read longer than -l. Sized per search slot up
+    // front, -l 2^28 would zero-fill 8 x 4 GiB per thread here; with INT_MAX, -l + 1 overflowed.
+    SeIndex &ix = index_fixture();
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::string fq = write_fastq(ix.dir, "seedw.fq", {c1.substr(40, 36), c1.substr(300, 36), c1.substr(77, 30)});
+    auto run = [&](int seed_len, const std::string &out_path) {
+        ba::aln_opt_t o;
+        ba::aln_opt_init(&o);
+        o.gap.seed_len = seed_len;
+        ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
+        REQUIRE(out != nullptr);
+        REQUIRE(ba::aln_run_se(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, fq.c_str(), out) == 0);
+        REQUIRE(ba::aln_out_close(out) == 0);
+        std::ifstream in(out_path);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+    const std::string base = run(1024, ix.dir + "/seedw_1024.sam");
+    CHECK(base.find("\tXT:A:U") != std::string::npos);
+    CHECK(run(1 << 28, ix.dir + "/seedw_big.sam") == base);
+    CHECK(run(INT_MAX, ix.dir + "/seedw_max.sam") == base);
+    // and a read longer than -l still gets its seed widths
+    CHECK(run(20, ix.dir + "/seedw_20.sam").find("\tXT:A:U") != std::string::npos);
+}
+
+TEST_CASE("aln_pe: drand48 is seeded once per run, not per batch, in aln_run_pe too"
+          * doctest::test_suite("unit/aln_se")) {
+    // Both ends of each pair lie in c1[100:400], which c2 holds reverse-complemented, so each
+    // end has two equally good hits and draws from drand48. Eight copies of the pair, in batches
+    // of 4 and of 2: the draws stay in one serial pass seeded once per run, so the records match.
+    SeIndex &ix = index_fixture();
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    const std::string m1 = c1.substr(150, 36), m2 = aln_test::revcomp(c1.substr(150 + 200 - 36, 36));
+    std::vector<std::string> v1(8, m1), v2(8, m2);
+    const std::string f1 = write_fastq(ix.dir, "rep_pe1.fq", v1), f2 = write_fastq(ix.dir, "rep_pe2.fq", v2);
+    auto run = [&](int bs, const std::string &path) {
+        ba::aln_opt_t o;
+        ba::aln_opt_init(&o);
+        o.batch_size = bs;
+        ba::aln_out_t *out = ba::aln_out_open(path.c_str(), 0, 0, "");
+        REQUIRE(out != nullptr);
+        REQUIRE(ba::aln_run_pe(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, f1.c_str(), f2.c_str(), out) == 0);
+        REQUIRE(ba::aln_out_close(out) == 0);
+        std::ifstream in(path);
+        std::stringstream ss;
+        ss << in.rdbuf();
+        return ss.str();
+    };
+    const std::string four = run(4, ix.dir + "/rep_pe_4.sam");
+    CHECK(four.find("X0:i:2") != std::string::npos);
+    CHECK(run(2, ix.dir + "/rep_pe_2.sam") == four);
+    CHECK(run(4, ix.dir + "/rep_pe_again.sam") == four);
+}
+
 // --- SAM formatting without printf -------------------------------------------------------
 // bwa_print_sam1 formats with kputs/kputc/kputl so the formatting threads do not contend on
 // libc's locale lock. These cases hold that text equal to what ksprintf produced.

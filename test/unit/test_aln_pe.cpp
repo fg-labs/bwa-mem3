@@ -1,8 +1,9 @@
 // Unit tests for the paired-end half of `bwa-mem3 aln` (src/aln/bwape.cpp and aln_run_pe in
 // aln_main.cpp). Byte-for-byte agreement with stock bwa aln + sampe is
 // test/regression/aln_parity.sh; these cases pin two behaviours the parity script reaches only
-// indirectly: the carry-over of the insert-size estimate across batches, and the per-file
-// batch used for the gap-open cap.
+// indirectly: the carry-over of the insert-size estimate across batches (in upstream's
+// bwa_cal_pac_pos_pe, which the stages are checked against, and in the shipped driver
+// aln_run_pe over several batches), and the per-file batch used for the gap-open cap.
 
 #include "doctest/doctest.h"
 
@@ -242,4 +243,69 @@ TEST_CASE("aln_pe: the gap-open cap is per file (helper values) and mixed read l
     for (std::string l; std::getline(in, l);) n_rec += !l.empty() && l[0] != '@';
     CHECK(n_rec == 60);
     free(gap);
+}
+
+namespace {
+
+// Runs aln_run_pe (the shipped driver) and returns the FLAG of every record, in output order.
+std::vector<int> run_pe_flags(int batch_size, const std::string &f1, const std::string &f2, const std::string &out_path)
+{
+    PeIndex &ix = index_fixture();
+    ba::aln_opt_t o;
+    ba::aln_opt_init(&o);
+    o.batch_size = batch_size;
+    ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
+    REQUIRE(out != nullptr);
+    REQUIRE(ba::aln_run_pe(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, f1.c_str(), f2.c_str(), out) == 0);
+    REQUIRE(ba::aln_out_close(out) == 0);
+    std::ifstream in(out_path);
+    std::vector<int> flags;
+    for (std::string l; std::getline(in, l);) {
+        if (l.empty() || l[0] == '@') continue;
+        size_t t = l.find('\t');
+        REQUIRE(t != std::string::npos);
+        flags.push_back(std::atoi(l.c_str() + t + 1));
+    }
+    return flags;
+}
+
+} // namespace
+
+TEST_CASE("aln_pe: aln_run_pe carries the insert-size estimate into a batch too small for its own"
+          * doctest::test_suite("unit/aln_pe")) {
+    // 200 well-placed pairs (fragments of 280-320 bp), then 5 pairs from 470 bp fragments, in
+    // batches of 200. The 5-pair batch is below infer_isize's minimum of 20 pairs, so it has no
+    // estimate of its own. With the first batch's estimate carried over (aln_run_pe's last_ii),
+    // 470 bp is far above its upper bound and the pairs are not proper (no 0x2). Without an
+    // estimate the bound is -a (500), so the same 5 pairs on their own are proper: the flag can
+    // only come from the carry-over.
+    PeIndex &ix = index_fixture();
+    std::vector<std::string> r1, r2;
+    well_placed(ix.contig, 200, 36, 100, &r1, &r2);
+    std::vector<std::string> t1, t2;
+    for (int i = 0; i < 5; ++i) {
+        const int pos = 4500 + i * 40, frag = 470;
+        t1.push_back(ix.contig.substr(pos, 36));
+        t2.push_back(aln_test::revcomp(ix.contig.substr(pos + frag - 36, 36)));
+    }
+    std::vector<std::string> a1(r1), a2(r2);
+    a1.insert(a1.end(), t1.begin(), t1.end());
+    a2.insert(a2.end(), t2.begin(), t2.end());
+    const std::string f1 = write_fastq(ix.dir + "/carry1.fq", a1), f2 = write_fastq(ix.dir + "/carry2.fq", a2);
+
+    std::vector<int> alone = run_pe_flags(200, write_fastq(ix.dir + "/tail1.fq", t1), write_fastq(ix.dir + "/tail2.fq", t2),
+                                          ix.dir + "/tail.sam");
+    REQUIRE(alone.size() == 10);
+    for (int f : alone) CHECK((f & 0x2) != 0);
+
+    std::vector<int> two = run_pe_flags(200, f1, f2, ix.dir + "/carry_200.sam");
+    REQUIRE(two.size() == 410);
+    for (size_t i = 400; i < 410; ++i) {
+        CAPTURE(i);
+        CHECK((two[i] & 0x2) == 0);
+    }
+    // the first batch is flagged as in a single-batch run of the same pairs
+    std::vector<int> one = run_pe_flags(0x40000, f1, f2, ix.dir + "/carry_one.sam");
+    REQUIRE(one.size() == 410);
+    for (size_t i = 0; i < 400; ++i) CHECK((one[i] & 0x2) == (two[i] & 0x2));
 }

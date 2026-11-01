@@ -15,6 +15,7 @@
 #include "../../src/aln/bwtgap.h"
 #include "../../src/bwa.h"
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -115,6 +116,36 @@ bool same_aln(const ba::bwt_aln1_t &a, const ba::bwt_aln1_t &b)
 
 } // namespace
 
+TEST_CASE("aln_search: priority stack bounds saturate without overflowing"
+          * doctest::test_suite("unit/aln_search")) {
+    ba::gap_opt_t opt = make_opt(3, 0);
+    opt.s_mm = 1 << 30;
+    ba::gap_stack_t *stack = ba::gap_init_stack(3, 0, 6, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 1024;
+    stack = ba::gap_init_stack(3, 0, 6, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 3;
+    stack = ba::gap_init_stack(3, 0, 6, &opt);
+    CHECK(stack->n_stacks == 51);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 2047;
+    opt.s_gapo = opt.s_gape = 0;
+    stack = ba::gap_init_stack(0, 0, 0, &opt);
+    CHECK(stack->n_stacks == 2047);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = 2048;
+    stack = ba::gap_init_stack(0, 0, 0, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+    opt.s_mm = opt.s_gapo = opt.s_gape = INT_MAX;
+    stack = ba::gap_init_stack(INT_MAX, INT_MAX, INT_MAX, &opt);
+    CHECK(stack->n_stacks == 2048);
+    ba::gap_destroy_stack(stack);
+}
+
 TEST_CASE("aln_search: exact 32-mer from c1 gives one hit, score 0, n_mm 0"
           * doctest::test_suite("unit/aln_search")) {
     SearchIndex &ix = index_fixture();
@@ -191,7 +222,7 @@ TEST_CASE("aln_search: max_gapo cap uses the batch's longest read"
     CHECK(ba::bwa_cal_maxdiff(20, BWA_AVG_ERR, 0.04) == 2);
     CHECK(ba::bwa_cal_maxdiff(100, BWA_AVG_ERR, 0.04) == 5);
 
-    ba::gap_opt_t opt = ba::gap_init_opt()[0];
+    ba::gap_opt_t opt = make_opt(-1, 4);
     opt.fnr = 0.04;
     opt.max_diff = -1;
     opt.max_gapo = 4; // `-n 0.04 -o 4`
@@ -219,7 +250,7 @@ TEST_CASE("aln_search: max_gapo cap uses the batch's longest read"
     // bwa_cal_maxdiff(20) == 2, bound it first), and the 20 bp read with two
     // 1-bp deletions is found in both.
     std::string two_del = c1().substr(450, 8) + c1().substr(459, 10) + c1().substr(470, 12);
-    opt = ba::gap_init_opt()[0];
+    opt = make_opt(-1, 4);
     opt.fnr = 0.04; opt.max_diff = -1; opt.max_gapo = 4; opt.indel_end_skip = 5;
     Batch a2(std::vector<std::string>{two_del});
     Batch m2(std::vector<std::string>{two_del, r100});

@@ -3,11 +3,14 @@
  * Version 2.0 (see LICENSE in this directory).
  *
  * MODIFIED from the original: moved into namespace bwa_aln, BAM input is dropped,
- * and C++ casts are added. */
+ * and C++ casts are added. bwa_seq_close reports a failed gzclose and returns -1 instead of
+ * exiting, and bwa_read_seq names a malformed record it skips (bwa_seq_n_bad counts them);
+ * which reads are returned, and in which batches, is unchanged. */
 #include "bwaseqio.h"
 #include "aln_alloc.h"
 
 #include <ctype.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +46,9 @@ static const unsigned char nst_nt4_table[256] = {
 
 struct __bwa_seqio_t {
 	kseq_t *ks;
+	char *fn;      // for messages
+	long n_rec;    // records parsed so far
+	int n_bad;     // malformed records skipped
 };
 
 bwa_seqio_t *bwa_seq_open(const char *fn)
@@ -52,15 +58,27 @@ bwa_seqio_t *bwa_seq_open(const char *fn)
 	bs = (bwa_seqio_t*)aln_calloc(1, sizeof(bwa_seqio_t));
 	fp = xzopen(fn, "r");
 	bs->ks = kseq_init(fp);
+	bs->fn = aln_strdup(fn);
 	return bs;
 }
 
-void bwa_seq_close(bwa_seqio_t *bs)
+int bwa_seq_close(bwa_seqio_t *bs)
 {
-	if (bs == 0) return;
-	err_gzclose(bs->ks->f->f);
+	int ret = 0, z;
+	if (bs == 0) return 0;
+	if ((z = gzclose(bs->ks->f->f)) != Z_OK) { // stock: err_gzclose, which exits
+		fprintf(stderr, "[E::aln] closing '%s' failed: %s\n", bs->fn, z == Z_ERRNO ? strerror(errno) : zError(z));
+		ret = -1;
+	}
 	kseq_destroy(bs->ks);
+	free(bs->fn);
 	free(bs);
+	return ret;
+}
+
+int bwa_seq_n_bad(const bwa_seqio_t *bs)
+{
+	return bs ? bs->n_bad : 0;
 }
 
 void seq_reverse(int len, ubyte_t *seq, int is_comp)
@@ -111,6 +129,7 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 	n_seqs = 0;
 	seqs = (bwa_seq_t*)aln_calloc(n_needed, sizeof(bwa_seq_t));
 	while ((l = kseq_read(seq)) >= 0) {
+		++bs->n_rec;
 		if ((mode & BWA_MODE_CFY) && (seq->comment.l != 0)) {
 			// skip reads that are marked to be filtered by Casava
 			char *s = index(seq->comment.s, ':');
@@ -157,6 +176,12 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 			if (t > 2 && p->name[t-2] == '/' && (p->name[t-1] == '1' || p->name[t-1] == '2')) p->name[t-2] = '\0';
 		}
 		if (n_seqs == n_needed) break;
+	}
+	if (l == -2) { // a truncated record ends the batch, as in stock; the next call resumes after it
+		++bs->n_bad;
+		fprintf(stderr, "[E::aln] '%s': record %ld is malformed (no quality line, or one not as long as the sequence); "
+				"it ends the batch as in bwa (with no read before it in the batch, reading stops), and the run will exit 1\n",
+				bs->fn, bs->n_rec + 1);
 	}
 	*n = n_seqs;
 	if (n_seqs && trim_qual >= 1)

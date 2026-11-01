@@ -33,7 +33,6 @@ Contacts: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@
 #include "simd_dispatch.h"
 #include "version.h"
 #include "bwa_shm.h"
-#include "aln/aln_main.h"
 
 #ifdef USE_MIMALLOC
 #include <stdlib.h>  /* strtol: MIMALLOC_PURGE_DELAY check */

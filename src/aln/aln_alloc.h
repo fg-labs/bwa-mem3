@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: MIT */
 /* New code for bwa-mem3 (not from upstream bwa): allocation that stops with a message on
  * failure. The upstream code dereferences the result of every malloc/calloc/realloc/strdup
  * unchecked; these wrappers keep its call sites and turn a failed allocation into a clean

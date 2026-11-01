@@ -174,3 +174,30 @@ TEST_CASE("aln_seqio: empty file returns NULL with n == 0") {
     CHECK(n == 0);
     ba::bwa_seq_close(bs);
 }
+
+TEST_CASE("aln_seqio: a malformed record ends the batch as in bwa and is counted") {
+    // r1's quality is shorter than its sequence: kseq_read returns -2, which stock's loop treats
+    // as the end of the batch. The batch is unchanged here; the record is now counted, so the
+    // driver can exit 1 after writing the same records.
+    TmpFastq f({rec("r0", "ACGTACGT", "IIIIIIII"), rec("r1", "ACGTACGT", "III"), rec("r2", "ACGTACGT", "IIIIIIII"),
+                rec("r3", "ACGTACGT", "IIIIIIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    REQUIRE(bs != nullptr);
+    CHECK(ba::bwa_seq_n_bad(bs) == 0);
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 10, &n, 0, 0);
+    REQUIRE(s != nullptr);
+    CHECK(n == 1);
+    CHECK(std::string(s[0].name) == "r0");
+    CHECK(ba::bwa_seq_n_bad(bs) == 1);
+    ba::bwa_free_read_seq(n, s);
+    // reading resumes after the bad record, as before
+    int total = 0;
+    while ((s = ba::bwa_read_seq(bs, 10, &n, 0, 0)) != nullptr) {
+        total += n;
+        ba::bwa_free_read_seq(n, s);
+    }
+    CHECK(total >= 1);
+    CHECK(ba::bwa_seq_n_bad(bs) == 1);
+    CHECK(ba::bwa_seq_close(bs) == 0);
+}

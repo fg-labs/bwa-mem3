@@ -5,15 +5,17 @@
  * MODIFIED from the original: this file holds bwase.c's SAM-producing half in
  * namespace bwa_aln. Printing appends to a kstring_t instead of writing to stdout; the
  * .sai reading and the samse command line are dropped; the BWT is a parameter instead of
- * being reloaded from disk; bns_get_seq and bns_cnt_ambi (bntseq.c) are copied here as
- * aln_-local functions so the output does not depend on bwa-mem3's own variants of them;
+ * being reloaded from disk; bns_cnt_ambi (bntseq.c) is copied here as an aln_-local function
+ * because bwa-mem3's own variant counts differently (the XN tag must match stock's), while
+ * bns_get_seq is bwa-mem3's bns_get_seq_into, whose semantics are upstream's;
  * the SAM header writer follows bwa 0.7.19's output, not this branch's; SAM fields and
  * the MD string are formatted with kputs/kputc/kputl instead of ksprintf, because libc's
  * vfprintf takes a process-wide locale lock that serialises the formatting threads (the
  * text produced is the same). See README.md.
  *
- * aln_bns_get_seq and aln_bns_cnt_ambi are from bwa's bntseq.c, which carries the MIT
- * licence below (this file's other code is Apache 2.0, as stated above). */
+ * aln_bns_cnt_ambi is from bwa's bntseq.c, which carries the MIT licence below (this file's
+ * other code is Apache 2.0, as stated above). The reference window in bwa_refine_gapped_core
+ * comes from bwa-mem3's bns_get_seq_into, which keeps upstream bns_get_seq's semantics. */
 /* The MIT License
 
    Copyright (c) 2018-     Dana-Farber Cancer Institute
@@ -205,30 +207,6 @@ void bwa_cal_pac_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_
 
 #define SW_BW 50
 
-// bntseq.c bns_get_seq, unchanged apart from the C++ casts.
-static uint8_t *aln_bns_get_seq(int64_t l_pac, const uint8_t *pac, int64_t beg, int64_t end, int64_t *len)
-{
-	uint8_t *seq = 0;
-	if (end < beg) end ^= beg, beg ^= end, end ^= beg; // if end is smaller, swap
-	if (end > l_pac<<1) end = l_pac<<1;
-	if (beg < 0) beg = 0;
-	if (beg >= l_pac || end <= l_pac) {
-		int64_t k, l = 0;
-		*len = end - beg;
-		seq = (uint8_t*)aln_malloc(end - beg);
-		if (beg >= l_pac) { // reverse strand
-			int64_t beg_f = (l_pac<<1) - 1 - end;
-			int64_t end_f = (l_pac<<1) - 1 - beg;
-			for (k = end_f; k > beg_f; --k)
-				seq[l++] = 3 - bns_pac(pac, k);
-		} else { // forward strand
-			for (k = beg; k < end; ++k)
-				seq[l++] = bns_pac(pac, k);
-		}
-	} else *len = 0; // if bridging the forward-reverse boundary, return nothing
-	return seq;
-}
-
 // bntseq.c bns_cnt_ambi. bwa-mem3's own variant counts every overlapping N run; this one
 // stops at the first, as stock does, and the XN tag must match stock's.
 static int aln_bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
@@ -266,7 +244,11 @@ static bwa_cigar_t *bwa_refine_gapped_core(bwtint_t l_pac, const ubyte_t *pacseq
 	bwa_fill_scmat(1, 3, mat);
 	rb = *_rb; re = rb + len + ref_shift;
 	xassert(re <= (int64_t)l_pac, "reference window runs past the packed reference");
-	rseq = aln_bns_get_seq(l_pac, pacseq, rb, re, &rlen);
+	// bwa-mem3's bns_get_seq_into has upstream bns_get_seq's clamp, swap and bridge rules (here
+	// 0 <= rb <= re <= l_pac, so none applies) and fills a caller buffer
+	xassert(rb <= re, "reference window has a negative length");
+	rseq = (ubyte_t*)aln_malloc(re - rb);
+	bns_get_seq_into(l_pac, pacseq, rb, re, rseq, &rlen);
 	xassert(re - rb == rlen, "reference window length mismatch");
 	w = abs((int)rlen - len) * 1.5;
 	ksw_global(len, seq, rlen, rseq, 5, mat, 5, 1, SW_BW > w? SW_BW : w, n_cigar, &cigar32);
