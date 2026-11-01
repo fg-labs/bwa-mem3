@@ -2,7 +2,6 @@
 #ifndef BWA_MEM3_ALN_OUT_H
 #define BWA_MEM3_ALN_OUT_H
 
-#include "../bntseq.h"
 #include "../kstring.h"
 
 namespace bwa_aln {
@@ -13,7 +12,7 @@ struct aln_out_t;
  * is the complete SAM header (newline-terminated lines, from aln_print_sam_hdr). For BAM
  * it is parsed with htslib; bam_level is the BGZF level 0-9. Returns NULL on failure
  * after printing why. */
-aln_out_t *aln_out_open(const char *path, int bam, int bam_level, const bntseq_t *bns, const char *hdr_text);
+aln_out_t *aln_out_open(const char *path, int bam, int bam_level, const char *hdr_text);
 /* Writes complete SAM lines (each ending in a newline). Returns 0, or -1 on failure.
  * The buffer form is the real function: aln_out.cpp sees htslib's kstring_t, every other
  * file bwa-mem3's, and the two have different C++ names. */

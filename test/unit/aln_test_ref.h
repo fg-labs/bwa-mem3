@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -43,6 +44,14 @@ inline std::string revcomp(const std::string &s)
         }
     }
     return r;
+}
+
+// A mkdtemp/mkstemp template under $TMPDIR (or /tmp), as the other unit tests do: CI and
+// sandboxed hosts point TMPDIR somewhere writable. `stem` is e.g. "aln_se_unit".
+inline std::string tmp_template(const char *stem)
+{
+    const char *d = std::getenv("TMPDIR");
+    return std::string(d && *d ? d : "/tmp") + "/" + stem + "_XXXXXX";
 }
 
 // (name, sequence) for c1, c2, c3.

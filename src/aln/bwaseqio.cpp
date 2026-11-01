@@ -5,6 +5,7 @@
  * MODIFIED from the original: moved into namespace bwa_aln, BAM input is dropped,
  * and C++ casts are added. */
 #include "bwaseqio.h"
+#include "aln_alloc.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -48,7 +49,7 @@ bwa_seqio_t *bwa_seq_open(const char *fn)
 {
 	gzFile fp;
 	bwa_seqio_t *bs;
-	bs = (bwa_seqio_t*)calloc(1, sizeof(bwa_seqio_t));
+	bs = (bwa_seqio_t*)aln_calloc(1, sizeof(bwa_seqio_t));
 	fp = xzopen(fn, "r");
 	bs->ks = kseq_init(fp);
 	return bs;
@@ -108,7 +109,7 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 		return 0;
 	}
 	n_seqs = 0;
-	seqs = (bwa_seq_t*)calloc(n_needed, sizeof(bwa_seq_t));
+	seqs = (bwa_seq_t*)aln_calloc(n_needed, sizeof(bwa_seq_t));
 	while ((l = kseq_read(seq)) >= 0) {
 		if ((mode & BWA_MODE_CFY) && (seq->comment.l != 0)) {
 			// skip reads that are marked to be filtered by Casava
@@ -139,18 +140,18 @@ bwa_seq_t *bwa_read_seq(bwa_seqio_t *bs, int n_needed, int *n, int mode, int tri
 		p->qual = 0;
 		p->full_len = p->clip_len = p->len = l;
 		n_tot += p->full_len;
-		p->seq = (ubyte_t*)calloc(p->full_len, 1);
+		p->seq = (ubyte_t*)aln_calloc(p->full_len, 1);
 		for (i = 0; i != p->full_len; ++i)
 			p->seq[i] = nst_nt4_table[(int)seq->seq.s[i]];
 		if (seq->qual.l) { // copy quality
-			p->qual = (ubyte_t*)strdup((char*)seq->qual.s);
+			p->qual = (ubyte_t*)aln_strdup((char*)seq->qual.s);
 			if (trim_qual >= 1) n_trimmed += bwa_trim_read(trim_qual, p);
 		}
-		p->rseq = (ubyte_t*)calloc(p->full_len, 1);
+		p->rseq = (ubyte_t*)aln_calloc(p->full_len, 1);
 		memcpy(p->rseq, p->seq, p->len);
 		seq_reverse(p->len, p->seq, 0); // *IMPORTANT*: will be reversed back in bwa_refine_gapped()
 		seq_reverse(p->len, p->rseq, is_comp);
-		p->name = strdup((const char*)seq->name.s);
+		p->name = aln_strdup((const char*)seq->name.s);
 		{ // trim /[12]$
 			int t = seq->name.l;
 			if (t > 2 && p->name[t-2] == '/' && (p->name[t-1] == '1' || p->name[t-1] == '2')) p->name[t-2] = '\0';

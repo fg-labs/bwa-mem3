@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <string>
 #include <vector>
 
 #include "../FMI_search.h"
@@ -332,8 +333,8 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  -N        non-iterative mode: search for all n-difference hits (slooow)\n");
 	fprintf(fp, "  -I        the input is in the Illumina 1.3+ FASTQ-like format\n");
 	fprintf(fp, "  -Y        filter Casava-filtered sequences\n");
-	fprintf(fp, "\nSingle-end output options (from bwa samse):\n");
-	fprintf(fp, "  --max-xa-hits INT   maximum number of alternative hits in the XA tag [%d] (samse -n)\n", o->max_xa_hits);
+	fprintf(fp, "\nOutput options (from bwa samse and sampe; they apply to single-end and paired-end output):\n");
+	fprintf(fp, "  --max-xa-hits INT   maximum number of alternative hits in the XA tag [%d] (samse and sampe -n)\n", o->max_xa_hits);
 	fprintf(fp, "  -r STR    read group header line such as '@RG\\tID:foo\\tSM:bar' [null] (samse and sampe -r)\n");
 	fprintf(fp, "  -f FILE   file to write output to instead of stdout (samse and sampe -f)\n");
 	fprintf(fp, "\nPaired-end options (two input files; from bwa sampe):\n");
@@ -456,7 +457,16 @@ int main_aln(int argc, char *argv[])
 		case OPT_MAX_XA_DISC: o.pe.N_multi = atoi(optarg); pe_flag = 1; break;
 		case OPT_MAX_OCC: o.pe.max_occ = atoi(optarg); pe_flag = 1; break;
 		case OPT_BAM: bam = 1; break;
-		case OPT_BAM_LEVEL: bam_level = atoi(optarg); break;
+		case OPT_BAM_LEVEL: {
+			char *end = NULL;
+			long v = strtol(optarg, &end, 10);
+			if (*optarg == '\0' || *end != '\0' || v < 0 || v > 9) {
+				fprintf(stderr, "[E::%s] --bam-level wants an integer from 0 to 9, not '%s'\n", __func__, optarg);
+				return 1;
+			}
+			bam_level = (int)v;
+			break;
+		}
 		case OPT_HELP: return aln_usage(&o, stdout);
 		default: return 1;
 		}
@@ -465,7 +475,10 @@ int main_aln(int argc, char *argv[])
 		opt->max_gape = opte;
 		opt->mode &= ~BWA_MODE_GAPE;
 	}
-	if (opt->n_threads < 1) opt->n_threads = 1;
+	if (opt->n_threads < 1) {
+		fprintf(stderr, "[W::%s] -t %d is below 1; using 1 thread\n", __func__, opt->n_threads);
+		opt->n_threads = 1;
+	}
 
 	if (optind + 2 > argc) return aln_usage(&o, stderr);
 	if (optind + 4 <= argc) return aln_usage(&o, stderr);
@@ -500,7 +513,7 @@ int main_aln(int argc, char *argv[])
 
 	kstring_t hdr = {0, 0, 0};
 	aln_print_sam_hdr(&hdr, bns, rg_line, bwa_pg);
-	aln_out_t *out = aln_out_open(out_path, bam, bam_level, bns, hdr.s);
+	aln_out_t *out = aln_out_open(out_path, bam, bam_level, hdr.s);
 	free(hdr.s);
 	int ret = 1;
 	if (out) {

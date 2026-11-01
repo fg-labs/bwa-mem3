@@ -38,7 +38,8 @@ struct PeIndex {
 
     PeIndex()
     {
-        char tmpl[] = "/tmp/aln_pe_unit_XXXXXX";
+        std::string tmpl_s = aln_test::tmp_template("aln_pe_unit");
+        char *tmpl = &tmpl_s[0];
         REQUIRE(mkdtemp(tmpl) != nullptr);
         dir = tmpl;
         prefix = dir + "/ref.fa";
@@ -232,7 +233,7 @@ TEST_CASE("aln_pe: the gap-open cap is per file (helper values) and mixed read l
     ba::aln_opt_init(&o);
     o.gap.max_gapo = 5;
     const std::string out_path = ix.dir + "/pe.sam";
-    ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, ix.bns(), "");
+    ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
     REQUIRE(out != nullptr);
     REQUIRE(ba::aln_run_pe(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, f1.c_str(), f2.c_str(), out) == 0);
     REQUIRE(ba::aln_out_close(out) == 0);

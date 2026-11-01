@@ -7,6 +7,7 @@
  * declaration is left out (it is ported with the SAM code). gap_job_start/gap_job_run at the
  * end of the file are new: bwt_match_gap's loop as a resumable job, for interleaved search. */
 #include "bwtgap.h"
+#include "aln_alloc.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,9 +24,9 @@ namespace bwa_aln {
 gap_stack_t *gap_init_stack2(int max_score)
 {
 	gap_stack_t *stack;
-	stack = (gap_stack_t*)calloc(1, sizeof(gap_stack_t));
+	stack = (gap_stack_t*)aln_calloc(1, sizeof(gap_stack_t));
 	stack->n_stacks = max_score;
-	stack->stacks = (gap_stack1_t*)calloc(stack->n_stacks, sizeof(gap_stack1_t));
+	stack->stacks = (gap_stack1_t*)aln_calloc(stack->n_stacks, sizeof(gap_stack1_t));
 	return stack;
 }
 
@@ -61,7 +62,7 @@ static inline void gap_push(gap_stack_t *stack, int i, bwtint_t k, bwtint_t l, i
 	q = stack->stacks + score;
 	if (q->n_entries == q->m_entries) {
 		q->m_entries = q->m_entries? q->m_entries<<1 : 4;
-		q->stack = (gap_entry_t*)realloc(q->stack, sizeof(gap_entry_t) * q->m_entries);
+		q->stack = (gap_entry_t*)aln_realloc(q->stack, sizeof(gap_entry_t) * q->m_entries);
 	}
 	p = q->stack + q->n_entries;
 	p->info = (uint32_t)score<<21 | i; p->k = k; p->l = l;
@@ -122,7 +123,7 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 	bwt_aln1_t *aln;
 
 	m_aln = 4; n_aln = 0;
-	aln = (bwt_aln1_t*)calloc(m_aln, sizeof(bwt_aln1_t));
+	aln = (bwt_aln1_t*)aln_calloc(m_aln, sizeof(bwt_aln1_t));
 
 	// check whether there are too many N
 	for (j = _j = 0; j < len; ++j)
@@ -189,7 +190,7 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
 				gap_shadow(l - k + 1, len, bwt->seq_len, e.last_diff_pos, width);
 				if (n_aln == m_aln) {
 					m_aln <<= 1;
-					aln = (bwt_aln1_t*)realloc(aln, m_aln * sizeof(bwt_aln1_t));
+					aln = (bwt_aln1_t*)aln_realloc(aln, m_aln * sizeof(bwt_aln1_t));
 					memset(aln + m_aln/2, 0, m_aln/2*sizeof(bwt_aln1_t));
 				}
 				p = aln + n_aln;
@@ -290,7 +291,7 @@ int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 	j->best_cnt = 0;
 	j->max_entries = 0;
 	j->m_aln = 4; j->n_aln = 0;
-	j->aln = (bwt_aln1_t*)calloc(j->m_aln, sizeof(bwt_aln1_t));
+	j->aln = (bwt_aln1_t*)aln_calloc(j->m_aln, sizeof(bwt_aln1_t));
 	j->pending = 0;
 
 	// check whether there are too many N
@@ -370,7 +371,7 @@ int gap_job_run(gap_job_t *J, const bwt_t *bwt)
 					gap_shadow(l - k + 1, len, bwt->seq_len, e.last_diff_pos, width);
 					if (J->n_aln == J->m_aln) {
 						J->m_aln <<= 1;
-						J->aln = (bwt_aln1_t*)realloc(J->aln, J->m_aln * sizeof(bwt_aln1_t));
+						J->aln = (bwt_aln1_t*)aln_realloc(J->aln, J->m_aln * sizeof(bwt_aln1_t));
 						memset(J->aln + J->m_aln/2, 0, J->m_aln/2*sizeof(bwt_aln1_t));
 					}
 					p = J->aln + J->n_aln;

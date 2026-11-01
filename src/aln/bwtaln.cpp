@@ -13,6 +13,7 @@
  * reads' searches (gap_job_t in bwtgap.cpp). The BAM input, .sai writer and command-line
  * parser are not ported. */
 #include "bwtgap.h"
+#include "aln_alloc.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -25,7 +26,7 @@ namespace bwa_aln {
 gap_opt_t *gap_init_opt(void)
 {
 	gap_opt_t *o;
-	o = (gap_opt_t*)calloc(1, sizeof(gap_opt_t));
+	o = (gap_opt_t*)aln_calloc(1, sizeof(gap_opt_t));
 	/* IMPORTANT: s_mm*10 should be about the average base error
 	   rate. Voilating this requirement will break pairing! */
 	o->s_mm = 3; o->s_gapo = 11; o->s_gape = 4;
@@ -225,14 +226,20 @@ void aln_search_batch(const bwt_t *bwt_, int n_seqs, bwa_seq_t *seqs, const gap_
 		int j;
 		pthread_attr_init(&attr);
 		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-		data = (thread_aux_t*)calloc(n_threads, sizeof(thread_aux_t));
-		tid = (pthread_t*)calloc(n_threads, sizeof(pthread_t));
+		data = (thread_aux_t*)aln_calloc(n_threads, sizeof(thread_aux_t));
+		tid = (pthread_t*)aln_calloc(n_threads, sizeof(pthread_t));
+		std::vector<char> started(n_threads, 0);
 		for (j = 0; j < n_threads; ++j) {
 			data[j].tid = j; data[j].n_threads = n_threads; data[j].bwt = bwt;
 			data[j].n_seqs = n_seqs; data[j].seqs = seqs; data[j].opt = &bopt;
-			pthread_create(&tid[j], &attr, worker, data + j);
+			started[j] = pthread_create(&tid[j], &attr, worker, data + j) == 0;
 		}
-		for (j = 0; j < n_threads; ++j) pthread_join(tid[j], 0);
+		// A thread that could not be created leaves its share of the reads unsearched (and the
+		// join below would wait on a thread that does not exist), so the caller runs that share.
+		for (j = 0; j < n_threads; ++j)
+			if (!started[j]) worker(data + j);
+		for (j = 0; j < n_threads; ++j)
+			if (started[j]) pthread_join(tid[j], 0);
 		free(data); free(tid);
 		pthread_attr_destroy(&attr);
 	}
