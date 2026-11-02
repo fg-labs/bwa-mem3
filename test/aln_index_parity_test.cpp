@@ -223,7 +223,7 @@ int main(int argc, char *argv[])
     stock::bwt_restore_sa((stock_prefix + ".sa").c_str(), s);
 
     FMI_search fmi(argv[2]);
-    fmi.load_index(false, 1);
+    fmi.load_index(false, 1, /*build_seed_jump=*/false);  // as main_aln loads it
     bwa_aln::bwt_t *m = bwa_aln::bwt_from_fmi(&fmi);
 
     if (s->primary != m->primary) mismatch("primary", 0, 0, s->primary, m->primary);

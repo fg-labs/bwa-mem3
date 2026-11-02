@@ -242,8 +242,9 @@ class FMI_search: public indexEle
      * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior.
      * build_seed_jump=false skips the seed jump table (seed_jump stays NULL,
      * seed_jump_depth 0, as under BWA3_BWTSEED_JUMP=0): for a loader that never
-     * runs the lockstep seeding drivers, such as the fmi_seed_api facade. The
-     * table is built on both the disk and the shm-attach path. */
+     * runs the lockstep seeding drivers, such as the fmi_seed_api facade. With
+     * build_seed_jump=true (the default) the table is built on both the disk
+     * and the shm-attach path. */
     void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
