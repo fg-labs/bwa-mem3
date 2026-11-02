@@ -15,8 +15,8 @@ their own: `profile_slice_cpu.sh` runs from `profiling-build` (see below);
 `host_floor_enforce.sh`, `stream_output_order.sh` and `short_read_smoke.sh` run from `rebuild-variants`,
 which builds the canonical row's configuration (Linux x86_64, avx2, clang-19)
 three more ways -- every opt-in debug macro on (rerunning `chr22_parity.sh`
-against it), `TESTING_BUILD=1`, and `ASAN=1` (rerunning `header_parity.sh`
-against it) -- in parallel with the matrix rather than at the end of the
+against it), `TESTING_BUILD=1`, and `ASAN=1` (rerunning `header_parity.sh` and other
+memory-safety checks against it, and the whole unit suite) -- in parallel with the matrix rather than at the end of the
 canonical row; and the `ndebug_gate_lint*`, `debug_macro_flag_lint*`,
 `calloc_interpose_flag_lint*`, `shell_lint*`, `regression_coverage_lint*`,
 `readme_contract_lint*` and `rescue_docs_lint*` pairs need no binary at all and

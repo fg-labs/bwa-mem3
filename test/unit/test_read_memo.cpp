@@ -64,6 +64,17 @@ std::string longread(char end, char mid) {
 
 read_memo_state fresh_state() { return read_memo_state{ 0, nullptr, nullptr, 0 }; }
 
+// Owns a read_memo_state for one test case and frees its buffers on exit, also
+// when a REQUIRE ends the case early, so the unit binary runs clean under
+// LeakSanitizer. read_memo_state_free tolerates a second call.
+struct OwnedState {
+    read_memo_state st = fresh_state();
+    OwnedState() = default;
+    OwnedState(const OwnedState &) = delete;
+    OwnedState &operator=(const OwnedState &) = delete;
+    ~OwnedState() { read_memo_state_free(&st); }
+};
+
 } // namespace
 
 TEST_CASE("identical pairs are grouped; distinct pairs are not"
@@ -72,7 +83,8 @@ TEST_CASE("identical pairs are grouped; distinct pairs are not"
     ps.add("AAAACCCC", "GGGGTTTT");   // pair 0
     ps.add("AAAACCCC", "GGGGTTTT");   // pair 1 == pair 0
     ps.add("AAAACCCC", "GGGGTTTA");   // pair 2: r2 differs -> distinct
-    read_memo_state st = fresh_state();
+    OwnedState owned_st;
+    read_memo_state &st = owned_st.st;
     read_memo_result r = ps.run(&st);
 
     CHECK(r.pairs == 3);
@@ -99,7 +111,8 @@ TEST_CASE("convert_non_reps converts DUPs once and leaves REPs to kernel1"
     ps.add("ACGT-Nac", "TTGG-CCA");   // pair 0: REP
     ps.add("GGGGCCCC", "AAAA-TTT");   // pair 1: REP (distinct)
     ps.add("ACGT-Nac", "TTGG-CCA");   // pair 2: DUP of pair 0
-    read_memo_state st = fresh_state();
+    OwnedState owned_st;
+    read_memo_state &st = owned_st.st;
     ps.run(&st);
     REQUIRE(st.role[0] == READ_MEMO_ROLE_REP);
     REQUIRE(st.role[1] == READ_MEMO_ROLE_REP);
@@ -128,7 +141,8 @@ TEST_CASE("convert_non_reps indexes roles by the work item's global read index"
     ps.add("ACGT-Nac", "TTGG-CCA");   // pair 0: REP (outside the work item)
     ps.add("GGGGCCCC", "AAAA-TTT");   // pair 1: REP
     ps.add("ACGT-Nac", "TTGG-CCA");   // pair 2: DUP of pair 0
-    read_memo_state st = fresh_state();
+    OwnedState owned_st;
+    read_memo_state &st = owned_st.st;
     ps.run(&st);
     const std::vector<std::string> ascii = ps.bases;  // seqs alias ps.bases: snapshot
 
@@ -148,7 +162,8 @@ TEST_CASE("ends-only fingerprint collision is caught by the byte verify"
     PairSet ps;
     ps.add(longread('A', 'C'), longread('G', 'T'));
     ps.add(longread('A', 'X'), longread('G', 'T'));   // r1 middle differs
-    read_memo_state st = fresh_state();
+    OwnedState owned_st;
+    read_memo_state &st = owned_st.st;
     read_memo_result r = ps.run(&st);
 
     CHECK(r.dup_pairs == 0);
@@ -163,7 +178,8 @@ TEST_CASE("both mates must match, and mate order matters"
     ps.add("AAAA", "GGGG");            // r2 differs -> distinct
     ps.add("CCCC", "AAAA");            // swapped order -> distinct from pair 0
     ps.add("AAAA", "CCCC");            // == pair 0
-    read_memo_state st = fresh_state();
+    OwnedState owned_st;
+    read_memo_state &st = owned_st.st;
     read_memo_result r = ps.run(&st);
 
     CHECK(r.dup_pairs == 1);
@@ -178,7 +194,8 @@ TEST_CASE("length mismatch is not a duplicate"
     PairSet ps;
     ps.add("AAAACCCC", "GGGG");
     ps.add("AAAACCCC", "GGGGG");       // r2 one base longer
-    read_memo_state st = fresh_state();
+    OwnedState owned_st;
+    read_memo_state &st = owned_st.st;
     read_memo_result r = ps.run(&st);
     CHECK(r.dup_pairs == 0);
 }
@@ -187,7 +204,8 @@ TEST_CASE("three-way duplicate set collapses to one representative"
           * doctest::test_suite("unit/read_memo")) {
     PairSet ps;
     for (int i = 0; i < 3; ++i) ps.add("ACGTACGT", "TTGGCCAA");
-    read_memo_state st = fresh_state();
+    OwnedState owned_st;
+    read_memo_state &st = owned_st.st;
     read_memo_result r = ps.run(&st);
     CHECK(r.dup_pairs == 2);
     CHECK(st.role[0] == 1);
@@ -321,7 +339,8 @@ TEST_CASE("concurrent pre-passes on different chunks each get their own answer"
 
     int bad_a = 0, bad_b = 0;
     auto loop = [](PairSet *ps, const read_memo_state *expect, int64_t dups, int *bad) {
-        read_memo_state st = fresh_state();
+        OwnedState owned_st;
+        read_memo_state &st = owned_st.st;
         for (int it = 0; it < 25; ++it) {
             const read_memo_result r = ps->run(&st);
             if (r.dup_pairs != dups || st.npairs != expect->npairs

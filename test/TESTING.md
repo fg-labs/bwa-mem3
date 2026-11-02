@@ -43,10 +43,11 @@ bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit   # run as one concurren
 
 ```bash
 make ASAN=1 test-binaries                 # add the row's arch= (e.g. arch=avx2) to match a CI build
-ASAN_OPTIONS=allocator_may_return_null=1:detect_leaks=0 ./test/bwa_mem3_tests_unit
+ASAN_OPTIONS=exitcode=86 ./test/bwa_mem3_tests_unit --source-file-exclude='*test_bam_rec_scratch.cpp' --test-case-exclude='LoggedStderr*'
+ASAN_OPTIONS=exitcode=86:allocator_may_return_null=1 ./test/bwa_mem3_tests_unit --source-file='*test_bam_rec_scratch.cpp'
 ```
 
-A run of the whole unit binary needs both options for now, because of two existing tests: `test_bam_rec_scratch.cpp` requests a `SIZE_MAX` allocation on purpose to check the overflow guard, which AddressSanitizer aborts on unless `allocator_may_return_null=1`; and LeakSanitizer reports 25 KB that `read_memo_prepass` (`src/read_memo.cpp`) allocates for the `read_memo_state` buffers in `test_read_memo.cpp`, whose cases do not release them with `read_memo_state_free`. A run filtered to other files (`-sf`, `-ts`) needs neither option.
+CI runs these two commands (the first through `test/run_unit_shards.sh`) in the `Unit suite (ASAN)` step of `rebuild-variants`. `test_bam_rec_scratch.cpp` requests a `SIZE_MAX` allocation on purpose to check the overflow guard, which AddressSanitizer aborts on unless `allocator_may_return_null=1`, so only that file runs with it. `exitcode=86` keeps a memory error inside a death test's forked child from exiting with status 1, which the death tests that expect `err_fatal`'s `EXIT_FAILURE` would accept. LeakSanitizer stays on: a test that allocates must free what it allocates. A death test's forked child skips LeakSanitizer at its exit (`test/framework/run_in_child.h`), since a body that ends the process on purpose leaves its allocations behind; that also skips any exit handler the runner registered before the fork, so the test of one such handler (`LoggedStderr`, TempIndex's log replay) is left out of the asan run.
 
 ### Run integration tests
 

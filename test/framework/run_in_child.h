@@ -19,6 +19,16 @@
 // The parent's stdio buffers are flushed before the fork: a body that ends in
 // exit() flushes the child's inherited copy of them, which would otherwise
 // print the runner's pending output a second time.
+//
+// Under AddressSanitizer (glibc) the child skips LeakSanitizer's check at its
+// exit: a body that ends the process on purpose (often with reader threads
+// still holding buffers) leaves its allocations behind by design, and a leak
+// report would change the exit status the test checks. An on_exit handler,
+// which runs before the sanitizer's own exit handler, flushes stdio and ends
+// the child with the status it was exiting with. Memory errors are still
+// reported where they happen, and they change the status (a CI run's
+// ASAN_OPTIONS exitcode makes that status distinct). The parent's own exit
+// check still covers every allocation the test runner makes.
 
 #ifndef BWA_TESTS_RUN_IN_CHILD_H
 #define BWA_TESTS_RUN_IN_CHILD_H
@@ -31,11 +41,31 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#if defined(__SANITIZE_ADDRESS__)
+#define BWA_TESTS_ASAN 1
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define BWA_TESTS_ASAN 1
+#endif
+#endif
+#if defined(BWA_TESTS_ASAN) && defined(__GLIBC__)
+#include <cstdlib>
+#define BWA_TESTS_CHILD_SKIP_LEAK_CHECK 1
+#endif
+
 namespace bwa_tests {
 
 /* The signals doctest's POSIX crash handler takes: `signalDefs` in
  * ext/doctest/doctest.h (2.4.11). Keep in step on a doctest upgrade. */
 constexpr int kDoctestCrashSignals[] = {SIGINT, SIGILL, SIGFPE, SIGSEGV, SIGTERM, SIGABRT};
+
+#if defined(BWA_TESTS_CHILD_SKIP_LEAK_CHECK)
+/* Ends a death-test child before LeakSanitizer's exit check (see above). */
+inline void child_exit_without_leak_check(int status, void *) {
+    fflush(NULL);
+    _exit(status);
+}
+#endif
 
 /* Run `body` in a forked child and return its wait status. A body that returns
  * ends the child with _exit(0), so any other status means it aborted or exited
@@ -45,6 +75,9 @@ int run_in_child(Body &&body, const char *stderr_path = "/dev/null") {
     fflush(NULL);
     const pid_t pid = fork();
     if (pid == 0) {
+#if defined(BWA_TESTS_CHILD_SKIP_LEAK_CHECK)
+        on_exit(child_exit_without_leak_check, nullptr);
+#endif
         for (const int sig : kDoctestCrashSignals) signal(sig, SIG_DFL);
         struct rlimit no_core = {0, 0};
         setrlimit(RLIMIT_CORE, &no_core);
