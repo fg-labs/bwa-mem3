@@ -93,18 +93,42 @@ std::string write_fastq(const std::string &dir, const std::string &name, const s
     return path;
 }
 
-// Runs the SE pipeline over `fq` and returns the SAM text it wrote.
-std::string run_se(int batch_size, const std::string &fq, const std::string &out_path)
+// Runs the SE pipeline over `fq` and returns the SAM text it wrote; *err (if given) gets what it
+// printed on stderr, captured in out_path + ".err".
+std::string run_se(int batch_size, const std::string &fq, const std::string &out_path, int share_dup_search = 1,
+                   std::string *err = nullptr)
 {
     SeIndex &ix = index_fixture();
     ba::aln_opt_t o;
     ba::aln_opt_init(&o);
     o.batch_size = batch_size;
+    o.share_dup_search = share_dup_search;
     o.gap.max_diff = 2;
     o.gap.fnr = -1.0;
     ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
     REQUIRE(out != nullptr);
-    REQUIRE(ba::aln_run_se(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, fq.c_str(), out) == 0);
+    int saved = -1;
+    FILE *ef = nullptr;
+    if (err) {
+        fflush(stderr);
+        saved = dup(fileno(stderr));
+        ef = fopen((out_path + ".err").c_str(), "w");
+        REQUIRE(saved >= 0);
+        REQUIRE(ef != nullptr);
+        REQUIRE(dup2(fileno(ef), fileno(stderr)) >= 0);
+    }
+    const int ret = ba::aln_run_se(&o, ix.bwt, ix.bns(), ix.fmi->idx->pac, fq.c_str(), out);
+    if (err) {
+        fflush(stderr);
+        REQUIRE(dup2(saved, fileno(stderr)) >= 0);
+        close(saved);
+        fclose(ef);
+        std::ifstream e(out_path + ".err");
+        std::stringstream es;
+        es << e.rdbuf();
+        *err = es.str();
+    }
+    REQUIRE(ret == 0);
     REQUIRE(ba::aln_out_close(out) == 0);
     std::ifstream in(out_path);
     std::stringstream ss;
@@ -156,6 +180,52 @@ TEST_CASE("aln_se: drand48 is seeded once per run, not per batch"
     CHECK(one.find("X0:i:2") != std::string::npos);
     // A re-run in the same process reseeds, so it reproduces the first run.
     CHECK(run_se(4, fq, scratch.path() + "/again.sam") == one);
+}
+
+TEST_CASE("aln_se: duplicated reads give the same records whether or not they share a search"
+          * doctest::test_suite("unit/aln_se")) {
+    // Copies of reads with one hit, with two equally good hits (c1[150:186] lies in the c1/c2
+    // reverse-complement copy, so its copies draw from drand48), with mismatches, and without
+    // hits, shuffled, in one batch and in batches of 7.
+    SeIndex &ix = index_fixture();
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::vector<std::string> distinct = {c1.substr(150, 36), c1.substr(40, 36), c1.substr(300, 30),
+                                         std::string(30, 'N'), "ACGTTGCAACGTTGCAACGTTGCAACGTTG"};
+    { std::string r = c1.substr(77, 40); r[20] = r[20] == 'A' ? 'C' : 'A'; distinct.push_back(r); }
+    std::vector<std::string> reads;
+    uint32_t x = 1;
+    for (int i = 0; i < 200; ++i) {
+        x = x * 1103515245u + 12345u;
+        reads.push_back(distinct[(x >> 16) % distinct.size()]);
+    }
+    bwa_tests::TempDir tmp{"aln_se_dups"}; // this case's scratch files, removed when it ends
+    const std::string fq = write_fastq(tmp.path(), "dups.fq", reads);
+    // the driver reports, per batch, how many reads shared an identical read's search
+    auto n_shared = [](const std::string &err) {
+        long n = 0;
+        std::istringstream in(err);
+        for (std::string l; std::getline(in, l);) {
+            long k = 0;
+            if (l.find("shared an identical read's search") != std::string::npos
+                && std::sscanf(l.c_str(), "[M::aln] %ld of", &k) == 1)
+                n += k;
+        }
+        return n;
+    };
+    struct RestoreVerbose { int v = bwa_verbose; ~RestoreVerbose() { bwa_verbose = v; } } restore;
+    bwa_verbose = 4;
+    for (int bs : {0x40000, 7}) {
+        INFO("batch size " << bs);
+        std::string err_on, err_off;
+        const std::string shared = run_se(bs, fq, tmp.file("dups_on.sam"), 1, &err_on);
+        CHECK(run_se(bs, fq, tmp.file("dups_off.sam"), 0, &err_off) == shared);
+        CHECK(shared.find("X0:i:2") != std::string::npos);
+        // not vacuous: copies shared a search with the switch on (any 7 of six distinct reads hold
+        // a copy), and nothing did with it off
+        CHECK(n_shared(err_on) >= (bs == 7 ? 28 : 150));
+        CHECK(n_shared(err_off) == 0);
+        CHECK(err_off.find("shared an identical read's search") != std::string::npos);
+    }
 }
 
 TEST_CASE("aln_se: a huge -l allocates no seed widths for shorter reads and matches -l 1024"

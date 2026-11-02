@@ -63,9 +63,10 @@ Each change to upstream-derived code adds a line here.
   block, the malloc wrappers and the `bwa_aln2seq` declaration (ported with the SAM
   code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
   `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch`,
-  `aln_batch_max_gapo`, `read_claim_t`/`ALN_CLAIM_CHUNK`, `ALN_GROUP`, `gap_job_t` with its option
-  copy `gap_job_const_t`, `width_walk_t`/`width_walk_init`/`width_walk_run`,
-  `gap_slot_core_t`/`GAP_SLOT_*`/`gap_slots_run`,
+  `aln_batch_max_gapo`, `read_claim_t`/`ALN_CLAIM_CHUNK`, `ALN_GROUP`, `aln_dup_state_t`, the
+  `ALN_DUP_*` constants, `detail::find_dup_reads` and the `detail::dup_sample_*` checks,
+  `gap_job_t` with its option copy `gap_job_const_t`,
+  `width_walk_t`/`width_walk_init`/`width_walk_run`, `gap_slot_core_t`/`GAP_SLOT_*`/`gap_slots_run`,
   the chunked stack
   (`gap_chunk_t`, `gap_pool_t`, `gap_bucket_t`, `gap_cstack_t` and their init, release and destroy
   functions, `ALN_POOL_KEEP`) and the out-of-line push, pop and reset wrappers the unit tests use
@@ -185,7 +186,7 @@ Each change to upstream-derived code adds a line here.
   Each read's hits are exactly what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the
   check. The search still runs on fresh pthreads per batch as upstream does (moving it onto
   `kt_for_nt` would need per-thread slot state and a fresh throughput A/B; see the comment on
-  `aln_search_batch`). Each slot's stack is the chunked stack described below. A
+  `search_reads`). Each slot's stack is the chunked stack described below. A
   slot's seed-width buffer is sized on the first read longer than `-l` (upstream's single per-thread
   `calloc` of `-l` + 1 entries is never touched for shorter reads; zero-filling one per slot up
   front cost `ALN_GROUP` x 16 bytes x `-l` per thread, gigabytes for the large `-l` used to turn
@@ -194,9 +195,9 @@ Each change to upstream-derived code adds a line here.
 - Failure handling (new code, no output change). Allocations go through `aln_alloc.h` instead of the
   bare libc calls. The three `assert`s in `bwa_refine_gapped_core` (window inside the packed reference,
   window length, a CIGAR was produced) are `xassert`, so they hold in a build with `NDEBUG` defined too.
-  If `pthread_create` fails, `aln_search_batch` runs a worker on the calling thread in place of the
-  missing threads; it claims reads from the shared counter like the others, so no read is left
-  unsearched.
+  If `pthread_create` fails, the search (`search_reads`) runs a worker on the calling thread in
+  place of the missing threads; it claims reads from the shared counter like the others, so no read
+  is left unsearched.
 - Interleaved exact-match walks (new code). When an entry has no differences left, `gap_job_run` runs
   `bwt_match_exact_alt`'s loop itself, one base per call: it prefetches the two Occ blocks of the
   next `bwt_2occ` and yields, and the next call does that lookup and updates `k`/`l` as
@@ -265,6 +266,32 @@ Each change to upstream-derived code adds a line here.
   batch unevenly. Each thread now claims `ALN_CLAIM_CHUNK` (64) consecutive reads at a time from a
   shared atomic counter (`read_claim_t`) and keeps its `ALN_GROUP` slots fed across chunks. A read's
   hits do not depend on which thread searches it, so the output is the same at any thread count.
+- Duplicate reads (new code, `bwtaln.cpp`). A read's hits depend only on its bases, its length and
+  the batch's options (the per-read `max_diff` and `seed_len` follow the length; the batch-wide
+  `max_gapo` cap is computed from every read first), so a batch with duplicates is searched once per
+  distinct read. `detail::find_dup_reads` points every read at the first read of the batch with the
+  same length and bases: a fingerprint of the length and every base, read 8 at a time as 64-bit
+  words (computed on the thread pool, `kt_for_nt`), then one table pass on the calling thread with
+  a full compare. The distinct reads are moved to the front of the batch (the duplicates set
+  aside), searched there by the unchanged search, and every read moved back to its index; every
+  later copy gets its own copy of the first one's `aln`. Duplicates are found within one batch
+  only. Everything after the search, the `drand48` pass included, still runs per read, so the
+  output is unchanged. A batch without duplicates runs the same search code as before; what it
+  pays is the check. `detail::dup_sample_check` first samples the batch twice: about 1 read in 32
+  chosen by a key of the length and three 8-base words (start, middle, end), so that every copy of
+  a read is in or out together, and every 32nd read by position, which catches a read with many
+  copies whose key is not sampled. The full pass runs when either sample has at least 1 duplicate
+  per 200 reads (`ALN_DUP_MIN_RATIO`), when the batch is under `ALN_DUP_SAMPLE_MIN` reads, or when
+  the key sample is far from its expected size. A batch the samples or the full pass find with
+  fewer duplicates than that is searched read by read, and turns the check off for the next 7
+  batches of its stream (`ALN_DUP_RECHECK`; `aln_dup_state_t`, which the driver keeps once for
+  single-end and once per file for paired-end, since one mate's batches need not look like the
+  other's); a read searched rather than copied gets the same hits. The full pass holds 8 bytes of
+  fingerprint and 8 of indexes per read, a table of 16 to 32 bytes per read, and the duplicates'
+  set-aside entries (about 200 bytes each), all freed after the batch; peak RSS measured 30-40 MB
+  higher on inputs with many duplicates. `aln_run_se`/`aln_run_pe` report at `-v
+  4` how many reads of each batch shared a search; `share_dup_search` (a test hook) turns the
+  sharing off.
 - Read-ahead (new code, `aln_main.cpp`). `aln_run_se` and `aln_run_pe` read and parse the next
   batch (for paired-end, the next R1 batch and then, if it is non-empty, the next R2 batch) on a
   helper thread, one thread on top of `-t`, while the current batch is searched, paired and
