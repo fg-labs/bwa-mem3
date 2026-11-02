@@ -243,8 +243,9 @@ class FMI_search: public indexEle
      * overridable via BWA3_LOAD_THREADS). Default 1 preserves prior behavior.
      * build_seed_jump=false skips the seed jump table (seed_jump stays NULL,
      * seed_jump_depth 0, as under BWA3_BWTSEED_JUMP=0): for a loader that never
-     * runs the lockstep seeding drivers, such as the fmi_seed_api facade. The
-     * table is built on both the disk and the shm-attach path.
+     * runs the lockstep seeding drivers, such as the fmi_seed_api facade and
+     * main_aln. With build_seed_jump=true (the default) the table is built on
+     * both the disk and the shm-attach path.
      * huge_pages: BWAMEM_HUGETLB_ON (main_mem's --huge-pages) maps the
      * occurrence table on 1 GB pages where it can, falling back to the default
      * allocation when it cannot; the SA samples always use the default
