@@ -1322,8 +1322,19 @@ TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for
     CHECK(with_hits > compared / 3); // not vacuous
 }
 
+// ALN_GROUP per target: 12 on every aarch64 target (Linux included, not only Apple), 8 elsewhere.
+// The hit-parity tests cannot catch a wrong depth, since a read's hits do not depend on it.
+TEST_CASE("aln_search: ALN_GROUP is 12 on every arm64 target and 8 elsewhere"
+          * doctest::test_suite("unit/aln_search")) {
+#if defined(__aarch64__)
+    CHECK(ba::ALN_GROUP == 12);
+#else
+    CHECK(ba::ALN_GROUP == 8);
+#endif
+}
+
 // gap_slots_run's slot states: batches smaller than, equal to and just over the group size
-// (ALN_GROUP: 8, or 12 on Apple arm64), all within one ALN_CLAIM_CHUNK, so the first thread to
+// (ALN_GROUP: 8, or 12 on arm64), all within one ALN_CLAIM_CHUNK, so the first thread to
 // claim searches the whole batch and the others get no read; some slots never fill or go empty
 // early; all-N and one-base reads end in gap_job_start,
 // before any search step, so their slot is refilled straight from GAP_SLOT_WIDTHS.

@@ -215,6 +215,29 @@ void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_o
  * the end of the batch. */
 constexpr int ALN_CLAIM_CHUNK = 64;
 
+/* Reads bwa_cal_sa_reg_gap_group (bwtaln.cpp) searches at once per thread. Only the scheduling
+ * depends on it; each read's hits do not.
+ * Measured at -t 16 (and -t 8 where noted) on hg38 (1M aDNA reads at default options and at
+ * -l 1024 -n 0.04 -o 2, 1M merged reads, 2M 20-40 bp reads, 2M 2x36 bp pairs, 1.09M real pairs)
+ * with the chunked stacks, built with clang 19:
+ * - Apple M3 Ultra: 12 was 4-11% faster in wall time than 8; 16 was faster than 12 only on the
+ *   20-40 bp reads and the pairs (1.5-3.6%) and slower on the other three.
+ * - Intel Sapphire Rapids (16 vCPU, 8 cores with SMT, AVX-512 and AVX2 tiers): 8 was 2.5-3.5%
+ *   faster than 12 on four of the six workloads and within 2.1% on the other two.
+ * - AWS Graviton4 and Graviton3 (Linux arm64, 16 cores, no SMT): 12 was faster in wall time and
+ *   CPU time than 8 on all six workloads at -t 16 and -t 8 (Graviton4 wall 5-14%, Graviton3
+ *   0.4-9%). Peak memory at -t 16 rose by up to about 0.1 GiB over 8 (on the -l 1024 run: more
+ *   stack entries in flight), and grows with the thread count.
+ * So every aarch64 target uses 12. Other arm64 cores (Neoverse N1 / Graviton2, Ampere, Cortex-A,
+ * Grace) were not measured and inherit 12 from these three. x86-64, where 12 measured slower, and
+ * any other target keep 8, the depth before the chunked stacks. Exported for the unit tests, which
+ * pin the value per target. */
+#if defined(__aarch64__)
+constexpr int ALN_GROUP = 12;
+#else
+constexpr int ALN_GROUP = 8;
+#endif
+
 /* The next unclaimed read of a batch of n_seqs reads, shared by its search threads (new code;
  * bwtaln.cpp). claim() returns the first read of the next ALN_CLAIM_CHUNK reads (fewer at the
  * end) and sets *end one past the last, or returns -1 once [0, n_seqs) is used up. The chunks of
