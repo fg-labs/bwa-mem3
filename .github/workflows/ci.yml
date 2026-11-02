@@ -436,17 +436,12 @@ jobs:
             kernel_sweep: "full"
             name: "Linux ARM64 (mimalloc)"
             artifact_slug: "linux-arm64-mimalloc"
-          - os: macos-latest
-            arch_flag: ""
-            use_mimalloc: "1"
-            run_integration: true
-            # macOS uses Apple clang (its `g++`/`clang++` are Apple clang), which
-            # is above the Apple-clang floor — no llvm.sh install needed here.
-            cxx: "clang++"
-            cc: "clang"
-            ccache_size: "100M"
-            name: "macOS ARM64 (mimalloc)"
-            artifact_slug: "macos-arm64-mimalloc"
+          # The macOS ARM64 row (os: macos-latest, Apple clang, name "macOS ARM64
+          # (mimalloc)") is removed for now: GitHub's hosted macOS arm64 runners
+          # are capacity-constrained and its jobs were cancelled unacquired, so
+          # every PR showed a failed check. Its macOS-only steps stay in place;
+          # restore the row (and warm-caches' macos-arm64-mimalloc row) by
+          # reverting this change once the runners are reliable again.
           - os: ubuntu-latest
             arch_flag: ""
             use_mimalloc: "1"
@@ -2698,16 +2693,8 @@ jobs:
             use_mimalloc: "1"
             harness: true
             chr22_fixture: true
-          - config: macos-arm64-mimalloc
-            os: macos-latest
-            kind: row
-            arch_flag: ""
-            use_mimalloc: "1"
-            harness: true
-            chr22_fixture: true
-            cxx: "clang++"
-            cc: "clang"
-            ccache_size: "100M"
+          # macos-arm64-mimalloc is removed with build-and-test's macOS row (see
+          # there); restore both together.
           - config: linux-x86_64-single-mimalloc
             os: ubuntu-latest
             kind: row
