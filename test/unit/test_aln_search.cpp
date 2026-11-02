@@ -1007,7 +1007,7 @@ TEST_CASE("aln_search: aln_search_batch gives the same hits as bwt_match_gap for
 }
 
 // gap_slots_run's slot states: batches smaller than, equal to and just over the group size
-// (ALN_GROUP: 8, or 12 on Apple arm64), all within one ALN_CLAIM_CHUNK, so the first thread to
+// (ALN_GROUP: 8, or 12 on arm64), all within one ALN_CLAIM_CHUNK, so the first thread to
 // claim searches the whole batch and the others get no read; some slots never fill or go empty
 // early; all-N and one-base reads end in gap_job_start,
 // before any search step, so their slot is refilled straight from GAP_SLOT_WIDTHS.
