@@ -94,12 +94,13 @@ std::string write_fastq(const std::string &dir, const std::string &name, const s
 }
 
 // Runs the SE pipeline over `fq` and returns the SAM text it wrote.
-std::string run_se(int batch_size, const std::string &fq, const std::string &out_path)
+std::string run_se(int batch_size, const std::string &fq, const std::string &out_path, int share_dup_search = 1)
 {
     SeIndex &ix = index_fixture();
     ba::aln_opt_t o;
     ba::aln_opt_init(&o);
     o.batch_size = batch_size;
+    o.share_dup_search = share_dup_search;
     o.gap.max_diff = 2;
     o.gap.fnr = -1.0;
     ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
@@ -155,6 +156,31 @@ TEST_CASE("aln_se: drand48 is seeded once per run, not per batch"
     CHECK(one.find("X0:i:2") != std::string::npos);
     // A re-run in the same process reseeds, so it reproduces the first run.
     CHECK(run_se(4, fq, ix.dir + "/again.sam") == one);
+}
+
+TEST_CASE("aln_se: duplicated reads give the same records whether or not they share a search"
+          * doctest::test_suite("unit/aln_se")) {
+    // Copies of reads with one hit, with two equally good hits (c1[150:186] lies in the c1/c2
+    // reverse-complement copy, so its copies draw from drand48), with mismatches, and without
+    // hits, shuffled, in one batch and in batches of 7.
+    SeIndex &ix = index_fixture();
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::vector<std::string> distinct = {c1.substr(150, 36), c1.substr(40, 36), c1.substr(300, 30),
+                                         std::string(30, 'N'), "ACGTTGCAACGTTGCAACGTTGCAACGTTG"};
+    { std::string r = c1.substr(77, 40); r[20] = r[20] == 'A' ? 'C' : 'A'; distinct.push_back(r); }
+    std::vector<std::string> reads;
+    uint32_t x = 1;
+    for (int i = 0; i < 200; ++i) {
+        x = x * 1103515245u + 12345u;
+        reads.push_back(distinct[(x >> 16) % distinct.size()]);
+    }
+    const std::string fq = write_fastq(ix.dir, "dups.fq", reads);
+    for (int bs : {0x40000, 7}) {
+        INFO("batch size " << bs);
+        const std::string shared = run_se(bs, fq, ix.dir + "/dups_on.sam", 1);
+        CHECK(run_se(bs, fq, ix.dir + "/dups_off.sam", 0) == shared);
+        CHECK(shared.find("X0:i:2") != std::string::npos);
+    }
 }
 
 TEST_CASE("aln_se: a huge -l allocates no seed widths for shorter reads and matches -l 1024"
