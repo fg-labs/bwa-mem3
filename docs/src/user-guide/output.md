@@ -21,6 +21,16 @@ value, so it differs between a serial and an explicit-thread invocation). Overri
 with `--bam-threads N` (and `--bam-threads 0` to force the old single-threaded
 deflate).
 
+When `-o` names a regular file, htslib fdatasync()s it as the writer closes. The
+multithreaded writer spreads those syncs through the run on its own; the
+single-threaded one (the default at `--bam=0`, and below `-t 8` at
+`--bam=1..9`, unless a positive `--bam-threads N` is set) now does the same.
+`--bam-threads 0` explicitly retains the serial writer. It syncs every 32 MiB
+of output from the write step, so the run
+does not end with the whole file being flushed to disk while every compute thread
+waits. The output bytes are unchanged, and writing to a pipe (`-o -`) never syncs.
+`BWA_MEM3_BAM_PERIODIC_SYNC=0` turns the periodic sync off, for A/B timing.
+
 ```bash
 # SAM (default)
 bwa-mem3 mem -t 16 ref.fa R1.fq.gz R2.fq.gz > out.sam
