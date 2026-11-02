@@ -257,6 +257,23 @@ Each change to upstream-derived code adds a line here.
   batch unevenly. Each thread now claims `ALN_CLAIM_CHUNK` (64) consecutive reads at a time from a
   shared atomic counter (`read_claim_t`) and keeps its `ALN_GROUP` slots fed across chunks. A read's
   hits do not depend on which thread searches it, so the output is the same at any thread count.
+- Read-ahead (new code, `aln_main.cpp`). `aln_run_se` and `aln_run_pe` read and parse the next
+  batch (for paired-end, the next R1 batch and then, if it is non-empty, the next R2 batch) on a
+  helper thread, one thread on top of `-t`, while the current batch is searched, paired and
+  written, so the threads no longer wait on the input between batches. The batches are processed
+  and written in input order, the `drand48` pass and the insert-size carry-over stay serial and in
+  order, and each stream is read by one thread at a time, so the output is unchanged; a run that
+  stops early (pair names that differ, one file ending first, a write error) stops at the same
+  record. A gzip read error of the input does not exit on the helper (stock's `err_gzread` exits
+  inside the read): the reader keeps it (`bwa_seq_defer_read_errors`, `bwaseqio.cpp`), and after
+  writing the current batch, where stock's read of the next batch would have failed, the driver
+  prints the same message and returns 1 (stock exits 1 there; returning lets the caller close the
+  output, so a BAM is terminated, as for a failed close of the input). The records written are
+  stock's. One extra batch is held in memory. On stderr, messages printed while reading
+  (malformed records, trimming) can come before the previous batch's progress line, and after an
+  early stop the batch already read ahead (which is never aligned) has been parsed, so its
+  messages are printed too, and the run exits only once that read is done. An allocation failure
+  while reading still exits on the helper thread.
 - Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
   walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
   block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone
