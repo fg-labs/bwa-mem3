@@ -62,8 +62,9 @@ Each change to upstream-derived code adds a line here.
   block, the malloc wrappers and the `bwa_aln2seq` declaration (ported with the SAM
   code). Added to `bwtgap.h`: declarations for `gap_init_opt`, `bwa_cal_maxdiff` and
   `bwt_cal_width` (upstream declares them in `bwtaln.h`), plus `aln_search_batch`,
-  `aln_batch_max_gapo`, `gap_job_t` with its option copy `gap_job_const_t`,
-  `width_walk_t`/`width_walk_init`/`width_walk_run`, `gap_slot_core_t`/`GAP_SLOT_*`/`gap_slots_run`,
+  `aln_batch_max_gapo`, `read_claim_t`/`ALN_CLAIM_CHUNK`, `gap_job_t` with its option copy
+  `gap_job_const_t`, `width_walk_t`/`width_walk_init`/`width_walk_run`,
+  `gap_slot_core_t`/`GAP_SLOT_*`/`gap_slots_run`,
   the chunked stack
   (`gap_chunk_t`, `gap_pool_t`, `gap_bucket_t`, `gap_cstack_t` and their init, release and destroy
   functions, `ALN_POOL_KEEP`) and the out-of-line push, pop and reset wrappers the unit tests use
@@ -76,13 +77,13 @@ Each change to upstream-derived code adds a line here.
   `max_len`, the `max_diff` derived from it and the `max_gapo` cap are computed once in
   `aln_search_batch` before the threads start (upstream repeats the same computation in
   every thread) and passed down; the per-read `max_diff` is recomputed per read as
-  upstream does. (3) The thread count is a parameter rather than `opt->n_threads`, and
-  `i % n_threads == tid` is applied for one thread too, so a count of 0 cannot divide by
-  zero. Dropped: `bwa_aln_core` (the `.sai` writer and read loop), `bwa_open_reads`,
-  `bwa_aln` (option parsing and usage) and the `HAVE_PTHREAD` conditionals (pthreads
-  are always used). Every object here is built with `-ffp-contract=off` (Makefile) so the
-  floating-point code in `bwape.cpp` (named below) rounds as a stock build without FP
-  contraction does; `bwa_cal_maxdiff` itself has no multiply-add to fuse.
+  upstream does. (3) The thread count is a parameter rather than `opt->n_threads`, and the
+  threads claim chunks of consecutive reads from a shared counter instead of taking
+  `i % n_threads == tid` (see "Dynamic read claiming" below). Dropped: `bwa_aln_core` (the
+  `.sai` writer and read loop), `bwa_open_reads`, `bwa_aln` (option parsing and usage) and the
+  `HAVE_PTHREAD` conditionals (pthreads are always used). Every object here is built with
+  `-ffp-contract=off` (Makefile) so the floating-point code in `bwape.cpp` (named below) rounds
+  as a stock build without FP contraction does; `bwa_cal_maxdiff` itself has no multiply-add to fuse.
 - `bwase.cpp`/`bwase.h`: `bwa_aln2seq_core`, `bwa_aln2seq`, `bwa_approx_mapQ`, `bwa_sa2pos` (now
   `bwt_sa` plus its split-out tail `bwa_pos_from_sa`), `bwa_cal_pac_pos_core`, `bwa_refine_gapped_core`, `bwa_cal_md1`, `bwa_correct_trimmed`,
   `pos_end`, `bwa_print_sam1` and `bwase_initialize` are upstream's bodies, in
@@ -177,9 +178,9 @@ Each change to upstream-derived code adds a line here.
   `max_diff` and `seed_len`, complemented copy) and keeps `ALN_GROUP` of the thread's reads in
   flight, each with its own stack and widths, stepping them in turn so several Occ misses overlap.
   Each read's hits are exactly what `bwt_match_gap` returns for it; `aln_sai_parity.sh` is the
-  check. Reads are still dealt to threads round-robin, on fresh pthreads per batch as upstream does
-  (moving the search onto `kt_for_nt` would need per-thread slot state and a fresh throughput A/B;
-  see the comment on `aln_search_batch`). Each slot's stack is the chunked stack described below. A
+  check. The search still runs on fresh pthreads per batch as upstream does (moving it onto
+  `kt_for_nt` would need per-thread slot state and a fresh throughput A/B; see the comment on
+  `aln_search_batch`). Each slot's stack is the chunked stack described below. A
   slot's seed-width buffer is sized on the first read longer than `-l` (upstream's single per-thread
   `calloc` of `-l` + 1 entries is never touched for shorter reads; zero-filling one per slot up
   front cost `ALN_GROUP` x 16 bytes x `-l` per thread, gigabytes for the large `-l` used to turn
@@ -188,8 +189,9 @@ Each change to upstream-derived code adds a line here.
 - Failure handling (new code, no output change). Allocations go through `aln_alloc.h` instead of the
   bare libc calls. The three `assert`s in `bwa_refine_gapped_core` (window inside the packed reference,
   window length, a CIGAR was produced) are `xassert`, so they hold in a build with `NDEBUG` defined too.
-  `aln_search_batch` runs a thread's share of the reads itself if `pthread_create` fails, instead of
-  leaving those reads unsearched.
+  If `pthread_create` fails, `aln_search_batch` runs a worker on the calling thread in place of the
+  missing threads; it claims reads from the shared counter like the others, so no read is left
+  unsearched.
 - Interleaved exact-match walks (new code). When an entry has no differences left, `gap_job_run` runs
   `bwt_match_exact_alt`'s loop itself, one base per call: it prefetches the two Occ blocks of the
   next `bwt_2occ` and yields, and the next call does that lookup and updates `k`/`l` as
@@ -250,6 +252,11 @@ Each change to upstream-derived code adds a line here.
   when a read's widths are done (the driver starts its search) or its search is done (the driver
   takes the hits and refills the slot). `width_walk_init`/`width_walk_run` move from `bwtaln.cpp` to `bwtgap.cpp` for
   this. Only the interleaving of the reads changes; each read's steps and hits are the same.
+- Dynamic read claiming (new code). Upstream deals the reads to the threads round-robin (thread `t`
+  searches reads `t`, `t + n_threads`, ...); reads differ widely in cost, so threads finished the
+  batch unevenly. Each thread now claims `ALN_CLAIM_CHUNK` (64) consecutive reads at a time from a
+  shared atomic counter (`read_claim_t`) and keeps its `ALN_GROUP` slots fed across chunks. A read's
+  hits do not depend on which thread searches it, so the output is the same at any thread count.
 - Batched SA lookups (new code). `bwt_sa_batch` (`aln_bwt.cpp`) gives `bwt_sa` for an array of rows,
   walking up to `SA_RESOLVE_LANES_DEFAULT` (`FMI_search.h`) rows at once with each lane's next Occ
   block or SA sample prefetched, as mem's SA resolver does; each result depends on its row alone
