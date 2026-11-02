@@ -2018,6 +2018,11 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
 
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
+        /* same-row lane compaction (bandedSWA_compact16_256.inc; see set_lane_compaction16) */
+        if (compact16_groups_ > 0 && numPairs > SIMD_WIDTH16) {
+            if (cpg_) smithWatermanBatchWrapper16Compact<true>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact16_groups_, compact16_rows_);
+            else      smithWatermanBatchWrapper16Compact<false>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact16_groups_, compact16_rows_);
+        } else
         if (cpg_) smithWatermanBatchWrapper16<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
         else      smithWatermanBatchWrapper16<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
@@ -2742,6 +2747,8 @@ void BandedPairWiseSW::smithWaterman256_16(uint16_t seq1SoA[],
     
     return;
 }
+
+#include "bandedSWA_compact16_256.inc"
 
 #endif // AVX2
 
@@ -4115,6 +4122,11 @@ void BandedPairWiseSW::getScores16(SeqPair *pairArray,
 
     {
         BswOvershootGuard _g(pairArray, numPairs, SIMD_WIDTH16, guard_overshoot_);
+        /* same-row lane compaction (bandedSWA_compact16_512.inc; see set_lane_compaction16) */
+        if (compact16_groups_ > 0 && numPairs > SIMD_WIDTH16) {
+            if (cpg_) smithWatermanBatchWrapper16Compact<true>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact16_groups_, compact16_rows_);
+            else      smithWatermanBatchWrapper16Compact<false>(pairArray, seqBufRef, seqBufQer, numPairs, w, compact16_groups_, compact16_rows_);
+        } else
         if (cpg_) smithWatermanBatchWrapper16<true>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
         else      smithWatermanBatchWrapper16<false>(pairArray, seqBufRef, seqBufQer, numPairs, numThreads, w);
     }
@@ -4856,6 +4868,8 @@ void BandedPairWiseSW::smithWaterman512_16(uint16_t seq1SoA[],
 
     return;
 }
+
+#include "bandedSWA_compact16_512.inc"
 #endif  //avx512
 
 
