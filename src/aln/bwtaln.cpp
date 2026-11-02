@@ -120,21 +120,6 @@ struct gap_slot_t {
 };
 }
 
-/* Reads searched at once per thread. Only the scheduling depends on it; each read's hits do not.
- * Measured at -t 16 on hg38 (1M aDNA reads at default options and at -l 1024 -n 0.04 -o 2, 1M
- * merged reads, 2M 20-40 bp reads, 2M 2x36 bp pairs, 1.09M real pairs) with the chunked stacks:
- * - Apple M3 Ultra: 12 was 4-11% faster in wall time than 8; 16 was faster than 12 only on the
- *   20-40 bp reads and the pairs (1.5-3.6%) and slower on the other three.
- * - Intel Sapphire Rapids (16 vCPU, 8 cores with SMT, AVX-512 and AVX2 tiers): 8 was 2.5-3.5%
- *   faster than 12 on four of the six workloads and within 2.1% on the other two.
- * No other host was swept. So 12 is used only on Apple arm64, and every other target, Linux
- * arm64 included, keeps 8, the depth before the chunked stacks. */
-#if defined(__APPLE__) && defined(__aarch64__)
-#define ALN_GROUP 12
-#else
-#define ALN_GROUP 8
-#endif
-
 int read_claim_t::claim(int *end)
 {
 	const int64_t st = next_.fetch_add(ALN_CLAIM_CHUNK, std::memory_order_relaxed);
