@@ -23,9 +23,14 @@
 #   CHR22_SIM_DIR  — directory containing holodeck reads.r[12].fastq.gz
 set -euo pipefail
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${CHR22_FA:?CHR22_FA must be set}"
-: "${CHR22_SIM_DIR:?CHR22_SIM_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 CHR22_FA CHR22_SIM_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 cd "$CHR22_SIM_DIR"
 "$BWA_MEM3" mem -t 1 "$CHR22_FA" \

@@ -30,9 +30,20 @@
 
 set -euo pipefail
 
-: "${BWA_MEM3_TESTING:?BWA_MEM3_TESTING must be set (a TESTING_BUILD=1 binary)}"
-: "${INJECTED_TIER:?INJECTED_TIER must be set (e.g. 'sse41')}"
-: "${PARITY_FA:?PARITY_FA must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+if [[ -z ${BWA_MEM3_TESTING:-} ]]; then
+    echo "FAIL: BWA_MEM3_TESTING must be set (a TESTING_BUILD=1 binary)" >&2
+    exit 1
+fi
+if [[ -z ${INJECTED_TIER:-} ]]; then
+    echo "FAIL: INJECTED_TIER must be set (e.g. 'sse41')" >&2
+    exit 1
+fi
+if [[ -z ${PARITY_FA:-} ]]; then
+    echo "FAIL: PARITY_FA must be set" >&2
+    exit 1
+fi
 
 OUT_DIR="$(mktemp -d -t bwamem3-enforce-XXXXXX)"
 trap 'rm -rf "$OUT_DIR"' EXIT

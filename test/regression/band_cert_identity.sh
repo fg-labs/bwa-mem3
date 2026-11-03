@@ -51,9 +51,14 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 # shellcheck disable=SC2154  # rc is assigned by `rc=$?` at the start of the trap body
 trap 'rc=$?; echo "FAIL: unexpected command failure at line $LINENO (exit $rc)" >&2; exit "$rc"' ERR
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${BAND_CERT_PHIX_FA:?BAND_CERT_PHIX_FA must be set}"
-: "${BAND_CERT_WORK_DIR:?BAND_CERT_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 BAND_CERT_PHIX_FA BAND_CERT_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 # The non-vacuity deletion-width scan below needs mawk; if it is unavailable,
 # skip (per the regression-suite SKIP convention) rather than trip the ERR trap.

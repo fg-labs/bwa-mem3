@@ -24,7 +24,12 @@
 #              PATH, or a path to the binary (a relative one is made absolute
 #              before the `cd "$WORK"` below)
 set -euo pipefail
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+if [[ -z ${BWA_MEM3:-} ]]; then
+    echo "FAIL: BWA_MEM3 must be set" >&2
+    exit 1
+fi
 case "$BWA_MEM3" in
     */*) BWA_MEM3="$(cd "$(dirname "$BWA_MEM3")" && pwd)/$(basename "$BWA_MEM3")" ;;
 esac

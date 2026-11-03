@@ -25,7 +25,12 @@ set -Eeuo pipefail
 # shellcheck disable=SC2154  # rc is assigned by `rc=$?` at the start of the trap body
 trap 'rc=$?; echo "FAIL: mem_synth_ref_check: unexpected command failure at line $LINENO (exit $rc)" >&2; exit "$rc"' ERR
 
-: "${MEM_SYNTH_REF:?MEM_SYNTH_REF must be set to the built test/mem_synth_ref}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+if [[ -z ${MEM_SYNTH_REF:-} ]]; then
+    echo "FAIL: MEM_SYNTH_REF must be set to the built test/mem_synth_ref" >&2
+    exit 1
+fi
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 fixture="$repo/test/fixtures/mem_synth.fa"
 work="$(mktemp -d "${TMPDIR:-/tmp}/mem_synth_ref_check.XXXXXX")"

@@ -13,9 +13,14 @@
 #                    and the bwamem3.sam written by chr22_parity.sh
 set -euo pipefail
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${CHR22_FA:?CHR22_FA must be set}"
-: "${CHR22_SIM_DIR:?CHR22_SIM_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 CHR22_FA CHR22_SIM_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 cd "$CHR22_SIM_DIR"
 # bwamem3.sam is produced by chr22_parity.sh and is required for the

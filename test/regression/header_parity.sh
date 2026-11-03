@@ -38,14 +38,20 @@
 
 set -euo pipefail
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${HEADER_PARITY_WORK_DIR:?HEADER_PARITY_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 HEADER_PARITY_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 mkdir -p "$HEADER_PARITY_WORK_DIR"
 cd "$HEADER_PARITY_WORK_DIR"
 # Remove only what a previous run of THIS script created. A blanket
 # `rm -rf "$HEADER_PARITY_WORK_DIR"` would obey a mistyped or over-broad value
-# of a caller-supplied variable; the `:?` guard above catches unset and empty,
+# of a caller-supplied variable; the must-be-set check above catches unset and empty,
 # but not `/` or `$HOME`.
 rm -f ref.fasta ref.fasta.* ref.dict index.log probe.sam \
     ./*.sq ./*.hdr ./*.out ./*.err r1.fq r2.fq

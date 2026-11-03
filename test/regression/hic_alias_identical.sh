@@ -40,9 +40,14 @@ set -euo pipefail
 # shellcheck source=test/framework/dna.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../framework" && pwd)/dna.sh"
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${HIC_PHIX_FA:?HIC_PHIX_FA must be set}"
-: "${HIC_WORK_DIR:?HIC_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 HIC_PHIX_FA HIC_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 mkdir -p "$HIC_WORK_DIR"
 
