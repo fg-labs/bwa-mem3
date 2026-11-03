@@ -28,7 +28,12 @@
 #   FIXTURES — directory containing phix.fa and reads.fa (default: test/fixtures)
 set -euo pipefail
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+if [[ -z ${BWA_MEM3:-} ]]; then
+    echo "FAIL: BWA_MEM3 must be set" >&2
+    exit 1
+fi
 FIXTURES="${FIXTURES:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../fixtures" && pwd)}"
 
 src_ref="$FIXTURES/phix.fa"

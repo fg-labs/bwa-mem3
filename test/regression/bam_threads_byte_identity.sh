@@ -27,9 +27,14 @@ set -E
 # shellcheck disable=SC2154  # rc is assigned by `rc=$?`, the trap body's first statement
 trap 'rc=$?; printf "FAIL: bam_threads_byte_identity.sh failed (exit %d)\n" "$rc" >&2; exit "$rc"' ERR
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${CHR22_FA:?CHR22_FA must be set}"
-: "${CHR22_SIM_DIR:?CHR22_SIM_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 CHR22_FA CHR22_SIM_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 # Resolve caller-relative inputs to absolute paths BEFORE the cd below, which
 # otherwise re-roots relative BWA_MEM3 / CHR22_FA at $CHR22_SIM_DIR and breaks a

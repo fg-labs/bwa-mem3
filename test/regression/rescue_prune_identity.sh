@@ -112,7 +112,12 @@
 #                  skip-set reuse off too, which alone keeps the copy from being built).
 #                  The reference leg must build no copy either way.
 set -euo pipefail
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+if [[ -z ${BWA_MEM3:-} ]]; then
+    echo "FAIL: BWA_MEM3 must be set" >&2
+    exit 1
+fi
 command -v python3 > /dev/null 2>&1 || {
     echo "SKIP: python3 not on PATH (it generates the fixture)"
     exit 0

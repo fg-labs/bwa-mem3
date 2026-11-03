@@ -23,9 +23,14 @@
 #   DASH_PHIX_FA    -- the committed test/fixtures/phix.fa
 #   DASH_WORK_DIR   -- scratch directory (created)
 set -euo pipefail
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${DASH_PHIX_FA:?DASH_PHIX_FA must be set}"
-: "${DASH_WORK_DIR:?DASH_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 DASH_PHIX_FA DASH_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 fail() {
     echo "FAIL: $*" >&2

@@ -30,8 +30,14 @@
 #                    CHR22_FA are not needed in this mode.
 set -euo pipefail
 
-: "${BWA_CHR22_FA:?BWA_CHR22_FA must be set}"
-: "${CHR22_SIM_DIR:?CHR22_SIM_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_CHR22_FA CHR22_SIM_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 r1="$CHR22_SIM_DIR/reads.r1.fastq.gz"
 r2="$CHR22_SIM_DIR/reads.r2.fastq.gz"
@@ -76,8 +82,12 @@ if [[ -n ${CHR22_UPSTREAM_OUT:-} ]]; then
     exit 0
 fi
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${CHR22_FA:?CHR22_FA must be set}"
+for v in BWA_MEM3 CHR22_FA; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 upstream="$CHR22_SIM_DIR/bwa.normalized.sam"
 if [[ -n ${BWA_CHR22_NORMALIZED_SAM:-} ]] && upstream_is_valid "$BWA_CHR22_NORMALIZED_SAM"; then

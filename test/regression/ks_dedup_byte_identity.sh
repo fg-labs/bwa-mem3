@@ -8,15 +8,21 @@
 set -euo pipefail
 # The tool under test is a runtime dependency, not harness config: an unset,
 # missing, or non-executable BWA_MEM3 means "cannot run here", not a failure.
-# Emit SKIP: and exit 0 so it is not misclassified (the raw `:?` expansion below
-# would print a shell error, and a nonexistent path would later report FAIL:
-# index). The fixture/work-dir vars ARE harness config, so they keep `:?`.
+# Emit SKIP: and exit 0 so it is not misclassified (a nonexistent path would
+# later report FAIL: index). The fixture/work-dir vars ARE harness config, so an
+# unset one is a FAIL: below.
 if [[ -z "${BWA_MEM3:-}" || ! -x "$BWA_MEM3" ]]; then
     echo "SKIP: BWA_MEM3 is unavailable"
     exit 0
 fi
-: "${KS_DEDUP_PHIX_FA:?KS_DEDUP_PHIX_FA must be set}"
-: "${KS_DEDUP_WORK_DIR:?KS_DEDUP_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in KS_DEDUP_PHIX_FA KS_DEDUP_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 fail() {
     echo "FAIL: $*" >&2

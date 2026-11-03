@@ -28,10 +28,14 @@
 
 set -euo pipefail
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${PARITY_FA:?PARITY_FA must be set}"
-: "${PARITY_R1:?PARITY_R1 must be set}"
-: "${PARITY_R2:?PARITY_R2 must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 PARITY_FA PARITY_R1 PARITY_R2; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 OUT_DIR="$(mktemp -d -t bwamem3-parity-XXXXXX)"
 trap 'rm -rf "$OUT_DIR"' EXIT

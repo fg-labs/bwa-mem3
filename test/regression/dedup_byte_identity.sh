@@ -5,9 +5,14 @@
 # SAM streams (modulo @PG CL, which embeds argv). Checked on a dup-rich and a
 # low-dup fixture, single- and multi-threaded.
 set -euo pipefail
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${DEDUP_PHIX_FA:?DEDUP_PHIX_FA must be set}"
-: "${DEDUP_WORK_DIR:?DEDUP_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 DEDUP_PHIX_FA DEDUP_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 HERE="$(cd "$(dirname "$0")" && pwd)"
 fail() {
     echo "FAIL: $*" >&2

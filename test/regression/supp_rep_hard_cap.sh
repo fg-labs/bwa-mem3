@@ -36,9 +36,14 @@
 
 set -euo pipefail
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${SUPP_REP_FIXTURE_AWK:?SUPP_REP_FIXTURE_AWK must be set}"
-: "${SUPP_REP_PHIX_FA:?SUPP_REP_PHIX_FA must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 SUPP_REP_FIXTURE_AWK SUPP_REP_PHIX_FA; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 OUT_DIR="$(mktemp -d -t bwamem3-supprep-XXXXXX)"
 trap 'rm -rf "$OUT_DIR"' EXIT

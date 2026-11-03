@@ -59,8 +59,14 @@ set -euo pipefail
 # individually wrapped: fixture generation and the `samtools view` decode.
 trap 'echo "FAIL: alt_pa_parity: line $LINENO: $BASH_COMMAND" >&2' ERR
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${ALT_PA_WORK_DIR:?ALT_PA_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 ALT_PA_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 command -v samtools > /dev/null 2>&1 || {
     echo "FAIL: samtools not on PATH; the SAM vs --bam pa:f: comparison cannot run" >&2

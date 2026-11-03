@@ -37,9 +37,14 @@
 
 set -euo pipefail
 
-: "${BWA_MEM3:?BWA_MEM3 must be set}"
-: "${HD_PARITY_PHIX_FA:?HD_PARITY_PHIX_FA must be set}"
-: "${HD_PARITY_WORK_DIR:?HD_PARITY_WORK_DIR must be set}"
+# Checked explicitly rather than with ${VAR:?}, which exits with a bare shell
+# error (and before any ERR trap runs), so the failure would carry no FAIL: line.
+for v in BWA_MEM3 HD_PARITY_PHIX_FA HD_PARITY_WORK_DIR; do
+    if [[ -z ${!v:-} ]]; then
+        echo "FAIL: $v must be set" >&2
+        exit 1
+    fi
+done
 
 command -v samtools > /dev/null 2>&1 || {
     echo "FAIL: samtools not on PATH; the --bam and --meth --bam @HD paths cannot be checked" >&2
