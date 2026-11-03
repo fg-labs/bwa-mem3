@@ -5,7 +5,9 @@
 instead of re-reading the index files from disk. For workloads that align many
 small samples back-to-back against the same reference — such as clinical
 panels or amplicon sequencing — this removes the dominant I/O bottleneck.
-`shm` also lists and destroys staged segments.
+`shm` also lists and destroys staged segments. [`aln`](aln.md) attaches to a
+staged index the same way, which lets several `aln` jobs on one machine share one
+copy (see [aln: memory and parallel jobs](aln.md#memory-and-parallel-jobs)).
 
 ## Synopsis
 
