@@ -12,9 +12,23 @@
 #include <string>
 #include "bwa.h"
 
+/* Ends the test if p is NULL: prints "[FAIL] <what>: allocation failed" and
+ * exits 1, which the harness reports as a non-zero exit. For buffers built
+ * outside a single case (read encoding, read strings), where there is no case
+ * to fail and return from. Returns p. */
+static inline void *alloc_or_exit(void *p, const char *what)
+{
+    if (p == NULL) {
+        fprintf(stderr, "[FAIL] %s: allocation failed\n", what);
+        exit(1);
+    }
+    return p;
+}
+
 /* Encode a vector of read strings (ACGT->0123, N->4) into the flat enc_qdb
  * + bseq1_t[] + query_cum_len_ar[] layout the seeding drivers expect. The
- * caller frees the three outputs. */
+ * caller frees the three outputs. Exits through alloc_or_exit if any of
+ * them cannot be allocated. */
 static inline void encode_reads(const char * const *reads, int32_t numReads,
                                 uint8_t **out_enc_qdb,
                                 bseq1_t **out_seq,
@@ -22,9 +36,9 @@ static inline void encode_reads(const char * const *reads, int32_t numReads,
 {
     int32_t total_len = 0;
     for (int i = 0; i < numReads; i++) total_len += (int32_t)strlen(reads[i]);
-    uint8_t *enc = (uint8_t *)calloc(total_len > 0 ? total_len : 1, 1);
-    bseq1_t *seq = (bseq1_t *)calloc(numReads, sizeof(bseq1_t));
-    int32_t *cum = (int32_t *)calloc(numReads + 1, sizeof(int32_t));
+    uint8_t *enc = (uint8_t *)alloc_or_exit(calloc(total_len > 0 ? total_len : 1, 1), "encode_reads");
+    bseq1_t *seq = (bseq1_t *)alloc_or_exit(calloc(numReads > 0 ? numReads : 1, sizeof(bseq1_t)), "encode_reads");
+    int32_t *cum = (int32_t *)alloc_or_exit(calloc(numReads + 1, sizeof(int32_t)), "encode_reads");
     int32_t off = 0;
     for (int i = 0; i < numReads; i++) {
         int32_t l = (int32_t)strlen(reads[i]);

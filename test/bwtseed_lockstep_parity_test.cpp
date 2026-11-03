@@ -214,6 +214,15 @@ static bool run_case(FMI_search *fmi,
     int32_t *mia_s = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *mia_l = (int32_t *)malloc(numReads * sizeof(int32_t));
     int32_t *mia_r = (int32_t *)malloc(numReads * sizeof(int32_t));
+    if (!scalar_out || !lockstep_out || !ref_out || !mia_s || !mia_l || !mia_r) {
+        fprintf(stderr, "[FAIL] %s: allocation failed\n", case_name);
+        _mm_free(scalar_out);
+        _mm_free(lockstep_out);
+        _mm_free(ref_out);
+        free(mia_s); free(mia_l); free(mia_r);
+        total_cases++;
+        return false;
+    }
     for (int i = 0; i < numReads; i++) { mia_s[i] = max_intv; mia_l[i] = max_intv; mia_r[i] = max_intv; }
 
     int64_t n_scalar = fmi->bwtSeedStrategyAllPosOneThread(
