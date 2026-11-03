@@ -219,30 +219,39 @@ static inline void ungapped_walk_mis(const uint64_t *mis, int N, int h0, int a, 
         return;
     }
     int cur = h0, max_sc = h0, max_i = 0;
-    int j = 0;
-    while (j < N) {
-        /* m = first mismatch at or after j, or N if none (no bit is set past N) */
-        int m = N;
-        for (int w = j >> 6; w < FP_MIS_NWORDS && (w << 6) < N; ++w) {
-            uint64_t bits = mis[w];
-            if (w == (j >> 6)) bits &= ~0ULL << (j & 63);
-            if (bits) { m = (w << 6) + __builtin_ctzll(bits); break; }
+    int j = 0;   /* first position of the current run of matches */
+    /* The words holding a position < N, capped at the bitmap's size. Mismatches
+     * are visited in increasing order by walking each word's set bits: m is the
+     * lowest set bit, then bits &= bits - 1 clears it, and the next word is
+     * loaded only when this one has none left (no bit is set past N). */
+    const int nw = N <= 0 ? 0 : (N > FP_MIS_NWORDS * 64 ? FP_MIS_NWORDS : (N + 63) >> 6);
+    for (int w = 0; w < nw; ++w) {
+        for (uint64_t bits = mis[w]; bits; bits &= bits - 1) {
+            const int m = (w << 6) + __builtin_ctzll(bits);
+            /* No `m > j` guard: for an empty run (m == j) cur is unchanged and
+             * the record test is false (cur <= max_sc holds on entry: it starts
+             * at h0 == max_sc and only a mismatch step, which never raises cur,
+             * precedes a run). Dropping the data-dependent guard lets the record
+             * update be a pair of conditional moves. */
+            cur += (m - j) * a;
+            const bool rec = cur > max_sc;
+            max_sc = rec ? cur : max_sc;
+            max_i  = rec ? m : max_i;
+            cur -= b;
+            if (cur < 0) cur = 0;
+            if (cur == 0) goto walked;
+            j = m + 1;
         }
-        /* No `m > j` guard: for an empty run (m == j) cur is unchanged and the
-         * record test is false (cur <= max_sc holds on entry: it starts at h0 ==
-         * max_sc and only a mismatch step, which never raises cur, precedes a
-         * run). Dropping the data-dependent guard lets the record update be a
-         * pair of conditional moves. */
-        cur += (m - j) * a;
+    }
+    /* The run after the last mismatch (from 0 if there is none) up to N. It is
+     * empty, and skipped, when the last mismatch is at N - 1. */
+    if (j < N) {
+        cur += (N - j) * a;
         const bool rec = cur > max_sc;
         max_sc = rec ? cur : max_sc;
-        max_i  = rec ? m : max_i;
-        if (m >= N) break;
-        cur -= b;
-        if (cur < 0) cur = 0;
-        if (cur == 0) break;
-        j = m + 1;
+        max_i  = rec ? N : max_i;
     }
+walked:
 #ifdef BWA_MEM3_DEBUG_UNGAPPED_XCHECK
     {   /* cross-check the run form against the per-base walk it replaces */
         int rmax, rmi, rc;
