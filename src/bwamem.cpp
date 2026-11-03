@@ -7030,6 +7030,16 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
       for (int l = 0; l < n_elig; l++) { int b = bucket_of(w_need_of(elig[l].tight_band)); scratch[cur[b]++] = elig[l]; }
       for (int l = 0; l < n_elig; l++) elig[l] = scratch[l]; }
 
+    /* Opt-in observations use the actual counts on both sides of the carry, so
+     * regression tests can distinguish a bypassed rung from byte-identical output. */
+    static const bool report_routing = [] {
+        const char *e = getenv("BWA3_PROBE_RUNG_STATS");
+        return e && strcmp(e, "1") == 0;
+    }();
+    int raw_cnt[NBUCK] = {0};
+    if (report_routing)
+        for (int b = 0; b < NBUCK; b++) raw_cnt[b] = cnt[b];
+
     /* Carry each bucket's partial last lane group up a ceiling. Every non-empty bucket is
      * its own bsw_run_tier call, and a call's last group runs all its rows at the cost of
      * a full group (its padding lanes leave every row of it in the kernels' masked cell
@@ -7073,6 +7083,14 @@ static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_
       bsw_run_tier(tier, opt, av_v, sym, ot, ob,
                    bkt, ref, qer, cnt[b], nthreads, Wb, scratch, scratch, hist);
       sym->set_guard_overshoot(false);
+      if (report_routing) {
+          int incoming = 0;
+          for (int j = 0; j < b; j++) incoming += raw_cnt[j] - cnt[j];
+          const int outgoing = incoming + raw_cnt[b] - cnt[b];
+          fprintf(stderr, "[probe-rung] cap=%d width=%d lanes=%d top=%d raw=%d incoming=%d outgoing=%d count=%d\n",
+                  w_cap, Wb, bsw_rung_group_lanes(tier), b == bucket_of(w_cap),
+                  raw_cnt[b], incoming, outgoing, cnt[b]);
+      }
       for (int l = 0; l < cnt[b]; l++) {
         ext_prefetch_region_ahead(av_v, bkt, l, cnt[b]);
         SeqPair *sp = &bkt[l];

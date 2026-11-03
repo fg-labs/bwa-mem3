@@ -18,6 +18,7 @@
     #include "simd_compat.h"
 #elif (__AVX512BW__ || __AVX2__)
     #include <immintrin.h>
+    #include "x86_soa_pack.h"   /* x86_soa_tail16: the analyzer's < 16-base tail */
 #else
     #include <smmintrin.h>  // for SSE4.1
 #endif
@@ -218,30 +219,39 @@ static inline void ungapped_walk_mis(const uint64_t *mis, int N, int h0, int a, 
         return;
     }
     int cur = h0, max_sc = h0, max_i = 0;
-    int j = 0;
-    while (j < N) {
-        /* m = first mismatch at or after j, or N if none (no bit is set past N) */
-        int m = N;
-        for (int w = j >> 6; w < FP_MIS_NWORDS && (w << 6) < N; ++w) {
-            uint64_t bits = mis[w];
-            if (w == (j >> 6)) bits &= ~0ULL << (j & 63);
-            if (bits) { m = (w << 6) + __builtin_ctzll(bits); break; }
+    int j = 0;   /* first position of the current run of matches */
+    /* The words holding a position < N, capped at the bitmap's size. Mismatches
+     * are visited in increasing order by walking each word's set bits: m is the
+     * lowest set bit, then bits &= bits - 1 clears it, and the next word is
+     * loaded only when this one has none left (no bit is set past N). */
+    const int nw = N <= 0 ? 0 : (N > FP_MIS_NWORDS * 64 ? FP_MIS_NWORDS : (N + 63) >> 6);
+    for (int w = 0; w < nw; ++w) {
+        for (uint64_t bits = mis[w]; bits; bits &= bits - 1) {
+            const int m = (w << 6) + __builtin_ctzll(bits);
+            /* No `m > j` guard: for an empty run (m == j) cur is unchanged and
+             * the record test is false (cur <= max_sc holds on entry: it starts
+             * at h0 == max_sc and only a mismatch step, which never raises cur,
+             * precedes a run). Dropping the data-dependent guard lets the record
+             * update be a pair of conditional moves. */
+            cur += (m - j) * a;
+            const bool rec = cur > max_sc;
+            max_sc = rec ? cur : max_sc;
+            max_i  = rec ? m : max_i;
+            cur -= b;
+            if (cur < 0) cur = 0;
+            if (cur == 0) goto walked;
+            j = m + 1;
         }
-        /* No `m > j` guard: for an empty run (m == j) cur is unchanged and the
-         * record test is false (cur <= max_sc holds on entry: it starts at h0 ==
-         * max_sc and only a mismatch step, which never raises cur, precedes a
-         * run). Dropping the data-dependent guard lets the record update be a
-         * pair of conditional moves. */
-        cur += (m - j) * a;
+    }
+    /* The run after the last mismatch (from 0 if there is none) up to N. It is
+     * empty, and skipped, when the last mismatch is at N - 1. */
+    if (j < N) {
+        cur += (N - j) * a;
         const bool rec = cur > max_sc;
         max_sc = rec ? cur : max_sc;
-        max_i  = rec ? m : max_i;
-        if (m >= N) break;
-        cur -= b;
-        if (cur < 0) cur = 0;
-        if (cur == 0) break;
-        j = m + 1;
+        max_i  = rec ? N : max_i;
     }
+walked:
 #ifdef BWA_MEM3_DEBUG_UNGAPPED_XCHECK
     {   /* cross-check the run form against the per-base walk it replaces */
         int rmax, rmi, rc;
@@ -275,16 +285,16 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
 {
     if (N <= 0 || N > FP_N_MAX || x_threshold < 0) return FP_STATUS_FALLBACK;
 
-    const __m128i v3 = _mm_set1_epi8(3);
+    const __m128i base_mask = _mm_set1_epi8(3);
     uint64_t mis[FP_MIS_NWORDS] = {0};
     int total_mis = 0;
     int i = 0;
     for (; i + 16 <= N; i += 16) {
         __m128i qv = _mm_loadu_si128((const __m128i *)(qs + i));
         __m128i rv = _mm_loadu_si128((const __m128i *)(rs + i));
-        // AMBIG (code >= 4) detected via max > 3. ACGT = 0..3.
-        __m128i mxv = _mm_max_epu8(qv, rv);
-        if ((unsigned)_mm_movemask_epi8(_mm_cmpgt_epi8(mxv, v3)))
+        // ACGT = 0..3; any higher bit marks ambiguity, including codes >= 128.
+        const __m128i hi = _mm_andnot_si128(base_mask, _mm_or_si128(qv, rv));
+        if ((unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(hi, _mm_setzero_si128())) != 0xFFFFu)
             return FP_STATUS_FALLBACK;  // ambig: give up on both paths
         __m128i eqv = _mm_cmpeq_epi8(qv, rv);
         unsigned mism_mask = (~(unsigned)_mm_movemask_epi8(eqv)) & 0xFFFFu;
@@ -294,6 +304,27 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
          * never straddles a 64-bit boundary. */
         mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
     }
+#if defined(__AVX2__)
+    /* Tail (r = N - i, 1..15 bases) in one 16-byte step. x86_soa_tail16 puts
+     * positions [i, N) in bytes [0, r) without reading outside [qs, qs + N) or
+     * [rs, rs + N) (rs holds len1 >= N bases); bytes [r, 16) are unspecified,
+     * so both tests keep only the r valid lanes. The ambiguity test is the
+     * same as the full blocks and the #else branch's scalar one (any bit
+     * outside 0x03, including codes >= 128). As in the loop above, i is
+     * 16-aligned, so the mask lands within one bitmap word. */
+    if (i < N) {
+        const int r = N - i;
+        const unsigned valid = (1u << r) - 1u;
+        const __m128i qv = x86_soa_tail16(qs, N, i);
+        const __m128i rv = x86_soa_tail16(rs, N, i);
+        const __m128i hi = _mm_and_si128(_mm_or_si128(qv, rv), _mm_set1_epi8((char)0xFC));
+        const unsigned clean = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(hi, _mm_setzero_si128()));
+        if (~clean & valid) return FP_STATUS_FALLBACK;
+        const unsigned mism_mask = ~(unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(qv, rv)) & valid;
+        total_mis += __builtin_popcount(mism_mask);
+        mis[i >> 6] |= ((uint64_t)mism_mask) << (i & 63);
+    }
+#else
     /* Tail (< 16 bases): branch-free. The per-base mismatch test is data
      * dependent and mispredicted often as a branch; accumulate it, and the
      * ambiguity test, arithmetically and decide once. Returning FALLBACK after
@@ -308,6 +339,7 @@ static inline int ungapped_analyze(const uint8_t *qs, const uint8_t *rs, int N,
         mis[i >> 6] |= ((uint64_t)ne) << (i & 63);
     }
     if (tail_ambig) return FP_STATUS_FALLBACK;
+#endif
 
     if (total_mis > x_threshold) {
         /* Only a pair within FP_TIGHT_MAX carries a tight_band (see the define);

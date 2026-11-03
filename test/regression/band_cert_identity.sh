@@ -139,16 +139,11 @@ fi
 # no awk, no per-base subprocess). read2 is sliced from the reverse complement
 # of the whole reference, computed once.
 #
-# Checked with stderr counters in a scratch build (the binary has none to assert
-# on): at default parameters the rung gets eligible pairs in all four buckets, and
-# under -d 70 / -w 30 (cap 20, below) in the 8, 16 and 24 buckets, the 24 bucket
-# run at 20 and holding the pairs that need 17..20; in both, the carry keeps whole
-# lane groups below the top ceiling on NEON (16 lanes) and AVX2 (32),
-# and the largest AVX2 call puts 75 pairs in the 8 bucket, over one AVX-512BW group.
-# What the A/Bs below can catch here is a pair the rung loses (its stale fields
-# diverge from --no-band-cert). A pair run at the wrong band, or
-# accepted without its certificate, is not reliably caught: as noted above,
-# mem_reg2aln re-aligns and masks extension differences on these short reads.
+# The capped-parameter cases below use BWA3_PROBE_RUNG_STATS to assert that these
+# pairs execute the rung and that each bucket's partial lane group is carried to
+# the next ceiling, stopping at cap 20. Output parity alone cannot detect a
+# bypassed rung or changed bucket routing: mem_reg2aln re-aligns and can mask
+# extension differences on these short reads.
 rcseq="$(printf '%s' "$seq" | rev | tr 'ACGT' 'TGCA')"
 N="${#seq}"
 SUB_STEP=7
@@ -349,13 +344,35 @@ ab_identical "combined (-d 15 -L 10)" -d 15 -L 10
 # band_cert on, the mismatch-bearing pairs run the rung at cap 20 (8 and 16
 # buckets at their ceilings, the 24 bucket at 20, carry stopping there) and the
 # pairs needing more go to the ladder, and the output must match --no-band-cert.
-# What this cannot catch: a pair run ABOVE the cap. The certificate is checked
-# at the width the pair actually ran at, so such a pair still emits the ladder's
-# record and the A/B stays identical; that bound is held by the code, not here.
+# Routing records also reject calls above the cap and non-top buckets at the
+# cap; output parity alone cannot detect this unnecessary work.
 ab_identical_certified() { # <label> <mem args...>: ab_identical, band_cert kept on
-    ab_identical "$@"
+    BWA3_PROBE_RUNG_STATS=1 ab_identical "$@"
     if grep -q 'outside the certified-band safety envelope' "$BAND_CERT_WORK_DIR/ab_def.err"; then
         echo "FAIL: band_cert fell back to the full-width ladder under '$1', so the A/B compared --no-band-cert with itself" >&2
+        exit 1
+    fi
+    # Each record describes an actual bucket call, before dedup or meth partitioning.
+    # Recompute the carry from the raw count and incoming remainder; checking only
+    # total eligible pairs would not detect a deleted carry or an over-cap call.
+    if ! mawk '
+        /^\[probe-rung\]/ {
+            delete f
+            for (i = 2; i <= NF; i++) { split($i, kv, "="); f[kv[1]] = kv[2] + 0 }
+            n += f["count"] > 0
+            total = f["raw"] + f["incoming"]
+            if (f["lanes"] <= 0) { bad = 1; next }
+            expected = f["top"] ? 0 : total % f["lanes"]
+            if ( f["cap"] != 20 || f["width"] > f["cap"] ||
+                f["outgoing"] != expected || f["count"] != total - expected || f["count"] < 0)
+                bad = 1
+            if (!f["top"] && f["width"] >= f["cap"]) bad = 1
+            if (f["incoming"] > 0) carried++
+            if (f["top"] && f["width"] == 20 && f["count"] > 0) at_cap++
+        }
+        END { if (n == 0 || carried == 0 || at_cap == 0 || bad) exit 1 }
+    ' "$BAND_CERT_WORK_DIR/ab_def.err"; then
+        echo "FAIL: probe-rung execution, widths or bucket carry was not observed correctly under '$1'" >&2
         exit 1
     fi
 }
