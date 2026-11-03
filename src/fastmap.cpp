@@ -1900,8 +1900,9 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  (run-specific); exclude it when comparing.\n");
     fprintf(stderr, "                  To stay byte-identical, --compat refuses bwa-mem3-only levers that\n");
     fprintf(stderr, "                  change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,\n");
-    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order); --fast and --meth are\n");
-    fprintf(stderr, "                  always refused. Override the forceable ones with --compat-allow-divergent.\n");
+    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order), and -u under bwa-mem2\n");
+    fprintf(stderr, "                  (no XB:Z before bwa 0.7.18); --fast and --meth are always refused.\n");
+    fprintf(stderr, "                  Override the forceable ones with --compat-allow-divergent.\n");
     fprintf(stderr, "                  Keeps every byte-identical optimization, the default contained-seed\n");
     fprintf(stderr, "                  extension skip included (--keep-contained-ext still opts out of it).\n");
     fprintf(stderr, "                  [off]\n");
@@ -3298,6 +3299,11 @@ int main_mem(int argc, char *argv[])
      * known-harmless one, rather than silently pass a run that a different -t
      * would break.
      *
+     * -u is the one row that is per-target and output-only: it changes no
+     * alignment, but a target without bwa's -u (bwa-mem2) has no XB:Z to match,
+     * so its stream cannot be byte-identical either. Under --compat=bwa-mem it
+     * is the upstream's own flag and passes.
+     *
      * To add a knob: add one row (keep it in sync with the "NOT byte-identical"
      * levers in the help above). */
     if (compat_on) {
@@ -3312,6 +3318,10 @@ int main_mem(int argc, char *argv[])
             { opt->seed_emit_order != SEED_ORDER_OFF, "--seed-order" },
             { chunk_cap_set && chunk_cap > 0,         "--chunk-cap" },
             { opt->proper_pair_from_emitted != 0,     "--proper-pair-from-emitted" },
+            /* Output, not alignment: -u's XB:Z (score + MAPQ per hit) exists
+             * only in a target that has bwa's -u (bwa 0.7.18+), so the row is
+             * per-target rather than a bwa-mem3-only lever. */
+            { (opt->flag & MEM_F_XB) && !opt->compat->has_xb, "-u" },
         };
         /* Build the flag list with a single checked allocation up front: kstring's
          * auto-grow path assigns realloc() straight back onto its buffer and then
@@ -3353,9 +3363,9 @@ int main_mem(int argc, char *argv[])
                         "--compat=%s; output is NOT byte-identical to %s\n",
                         __func__, joined.s, opt->compat->name, opt->compat->name);
             } else {
-                fprintf(stderr, "[E::%s] --compat and these bwa-mem3-only levers are mutually "
+                fprintf(stderr, "[E::%s] --compat and these levers are mutually "
                         "exclusive: %s. --compat targets byte-identical %s output, but these "
-                        "change alignments/MAPQ. Drop them, or pass --compat-allow-divergent to "
+                        "change alignments/MAPQ or emit output it cannot produce. Drop them, or pass --compat-allow-divergent to "
                         "keep --compat=%s's output conventions with them engaged (output will NOT "
                         "be byte-identical)\n",
                         __func__, joined.s, opt->compat->name, opt->compat->name);

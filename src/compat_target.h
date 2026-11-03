@@ -132,6 +132,14 @@ typedef struct compat_target_t {
      * drop, because reproducing bwa-mem2 v2.2.1's records is that target's
      * contract and this is one of its alignments (fg-labs/bwa-mem3#469). */
     int sa_sentinel_drop_offset;
+
+    /* The target has bwa's -u option: XB:Z, the alternative-hit list with each
+     * hit's alignment score and MAPQ appended. bwa added it in 0.7.18
+     * (bwamem.c:963, bwamem_extra.c:155), after bwa-mem2 forked at 0.7.17, so
+     * bwa-mem2 v2.2.1 has no -u at all. With 0 here, -u has no counterpart in
+     * the target's output, and the --compat divergence guard refuses it (or,
+     * under --compat-allow-divergent, warns and writes XB anyway). */
+    int has_xb;
 } compat_target_t;
 
 /* The `off` row: bwa-mem3's own native output. Never NULL on any mem_opt_t
