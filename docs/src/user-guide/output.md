@@ -56,7 +56,10 @@ One `@SQ` line is written per reference sequence, with the sequence name
 If a `<prefix>.hdr` or `<baseprefix>.dict` file sits next to the index and
 supplies `@SQ` records, those records are used **verbatim** instead of the
 auto-generated ones. This is deliberate: the sidecar is authoritative, so
-bwa-mem3 neither adds nor removes tags in it.
+bwa-mem3 neither adds nor removes tags in it. With `--bam`, a sidecar (or `-H`)
+`@SQ` block must name every contig of the index, each with its length: one
+that leaves a contig out, or gives one an `LN` other than its length, fails at
+startup, naming the contig (see [`-H`](../cli/mem.md)).
 
 > **Warning — a Picard/GATK `.dict` drops `AH:*`**
 >
