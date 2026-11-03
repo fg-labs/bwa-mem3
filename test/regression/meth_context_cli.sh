@@ -6,9 +6,9 @@
 # and that each accepted spelling and scoring reaches the alignment (by AS).
 #
 # Asserted here:
-#  1. Each of the four rejections prints its exact message and exits non-zero:
-#     an unknown value, cpg under em-seq/bisulfite, cpg with collapsed scoring,
-#     and --meth-context without --meth.
+#  1. Each rejection prints its exact message without a warning and exits non-zero:
+#     an unknown value, cpg under em-seq/bisulfite (including explicit neutral
+#     scoring), cpg with collapsed scoring, and --meth-context without --meth.
 #  2. `--meth=5base --meth-context all` is record-for-record identical to
 #     `--meth=5base` alone (all is the default), and the `--meth-context=cpg`
 #     spelling with '=' gives the separated spelling's records, on a read that
@@ -16,7 +16,12 @@
 #  3. cpg is accepted with taps, 5base and 5-base, and the read still maps
 #     forward at its locus; an explicit --meth-scoring genomic is honoured
 #     under cpg (a freed CpG conversion scores +A rather than neutral's 0).
-#  4. A stray `cpg` (`--meth=5base cpg ref r1`) is diagnosed by the stray-value
+#  4. --meth=emseq (also bare --meth and =bisulfite) with --meth-scoring neutral
+#     prints its warning once, verbatim, and the read still maps at its locus
+#     under neutral scoring (AS one below collapsed's); no other chemistry/scoring
+#     pairing (em-seq default or genomic, taps/5base default or neutral) prints
+#     any warning.
+#  5. A stray `cpg` (`--meth=5base cpg ref r1`) is diagnosed by the stray-value
 #     check, naming --meth-context, rather than reported as a missing index.
 #
 # Inputs:
@@ -57,7 +62,7 @@ printf '@r2\n%s\n+\n%s\n' "$read2" "$(printf 'I%.0s' $(seq 1 100))" > r2.fq
 
 records() { grep -v '^@' "$1"; }
 
-# --- 1. the four rejections, exact copy ------------------------------------
+# --- 1. rejections, exact copy and no warning -------------------------------
 expect_error() { # $1 = label, $2 = exact message, rest = mem argv
     local label="$1" want="$2"
     shift 2
@@ -66,6 +71,9 @@ expect_error() { # $1 = label, $2 = exact message, rest = mem argv
     fi
     grep -Fxq -- "$want" err.txt \
         || fail "$label: message not found verbatim; want '$want', got '$(head -3 err.txt | tr '\n' ' ')'"
+    if grep -q '^WARNING:' err.txt; then
+        fail "$label: rejected command printed a warning"
+    fi
 }
 expect_error "unknown value" \
     "ERROR: --meth-context accepts 'all' (default) or 'cpg', got 'chg'" \
@@ -111,20 +119,50 @@ diff <(records sep.sam) <(records eq.sam) > eq.diff \
     || fail "--meth-context=cpg differs from --meth-context cpg: $(head -4 eq.diff | cut -c1-200 | tr '\n' ' ')"
 # The comparison only means something if r2 tells the contexts apart: cpg charges
 # its non-CpG conversion as a mismatch, so its AS is below all's.
-as_cpg=$(as_of sep.sam)
-as_all=$(as_of all2.sam)
+as_cpg=$(as_of sep.sam) || fail "could not extract AS from sep.sam"
+as_all=$(as_of all2.sam) || fail "could not extract AS from all2.sam"
 [ -n "$as_cpg" ] && [ -n "$as_all" ] && [ "$as_cpg" -lt "$as_all" ] \
     || fail "r2 does not separate cpg from all: AS cpg='$as_cpg' all='$as_all'"
 "$BWA_MEM3" mem --meth=taps --meth-context cpg --meth-scoring genomic -t 1 ref.fa r.fq > g.sam 2> g.err \
     || fail "cpg with explicit genomic scoring rejected: $(head -2 g.err | tr '\n' ' ')"
 # r's one conversion is at a CpG, freed under cpg: genomic scores it +A (1), neutral
 # (the taps default, cpg-taps.sam above) scores it 0, so AS is exactly one higher.
-as_g=$(as_of g.sam)
-as_n=$(as_of cpg-taps.sam)
+as_g=$(as_of g.sam) || fail "could not extract AS from g.sam"
+as_n=$(as_of cpg-taps.sam) || fail "could not extract AS from cpg-taps.sam"
 [ -n "$as_g" ] && [ -n "$as_n" ] && [ "$as_g" -eq $((as_n + 1)) ] \
     || fail "cpg + genomic: want AS one above neutral's, got genomic='$as_g' neutral='$as_n'"
 
-# --- 4. a stray cpg is diagnosed ---------------------------------------------
+# --- 4. em-seq with neutral scoring warns, and still aligns ------------------
+WARN="WARNING: --meth-scoring neutral with em-seq/bisulfite chemistry (--meth, --meth=emseq, --meth=bisulfite) scores each conversion 0, and em-seq converts most cytosines, so short reads are left unmapped or misplaced and unmethylated reads are lost first, biasing methylation upward. Use the em-seq default (collapsed) or --meth-scoring genomic."
+"$BWA_MEM3" mem --meth -t 1 ref.fa r.fq > ec.sam 2> ec.err || fail "--meth (collapsed) nonzero exit"
+as_c=$(as_of ec.sam) || fail "could not extract AS from ec.sam"
+for chem in "" "=emseq" "=bisulfite"; do
+    "$BWA_MEM3" mem "--meth$chem" --meth-scoring neutral -t 1 ref.fa r.fq > en.sam 2> en.err \
+        || fail "--meth$chem --meth-scoring neutral nonzero exit: $(head -2 en.err | tr '\n' ' ')"
+    [ "$(grep -Fxc -- "$WARN" en.err)" = "1" ] \
+        || fail "--meth$chem --meth-scoring neutral: warning not printed exactly once, verbatim"
+    # r is chrA:201-300 with one converted CpG: it must still map there, scored
+    # neutral (the conversion scores 0, one below collapsed's full match).
+    loc="$(records en.sam | cut -f 2-4 | tr '\t' ' ')"
+    [ "$loc" = "0 chrA 201" ] || fail "--meth$chem --meth-scoring neutral: want FLAG 0 at chrA:201, got '$loc'"
+    as_n=$(as_of en.sam) || fail "could not extract AS from en.sam"
+    [ -n "$as_n" ] && [ -n "$as_c" ] && [ "$as_n" -eq $((as_c - 1)) ] \
+        || fail "--meth$chem --meth-scoring neutral: want AS one below collapsed's, got neutral='$as_n' collapsed='$as_c'"
+done
+for chem in "" "=emseq" "=bisulfite"; do
+    expect_error "--meth$chem + neutral + cpg" \
+        "ERROR: --meth-context cpg requires --meth=taps or --meth=5base: under EM-seq/bisulfite every unmethylated C converts, so conversions are not confined to CpG" \
+        "--meth$chem" --meth-scoring neutral --meth-context cpg
+done
+for args in "--meth" "--meth --meth-scoring genomic" "--meth=taps" "--meth=taps --meth-scoring neutral" "--meth=5base"; do
+    read -r -a argv <<< "$args"
+    "$BWA_MEM3" mem "${argv[@]}" -t 1 ref.fa r.fq > /dev/null 2> nw.err || fail "$args nonzero exit"
+    if grep -q '^WARNING:' nw.err; then
+        fail "$args: unexpected warning: $(grep '^WARNING:' nw.err | head -1 | cut -c1-120)"
+    fi
+done
+
+# --- 5. a stray cpg is diagnosed ---------------------------------------------
 if "$BWA_MEM3" mem --meth=5base cpg ref.fa r.fq > /dev/null 2> stray.txt; then
     fail "a stray 'cpg' exited 0"
 fi
@@ -135,4 +173,4 @@ grep -Fq -- "the value for --meth-context and no such file exists" stray.txt \
 grep -Fq -- "--meth-context cpg." stray.txt \
     || fail "stray cpg: advice does not name '--meth-context cpg'; got: $(tail -2 stray.txt | tr '\n' ' ')"
 
-echo "PASS: meth_context_cli (unknown value, cpg+emseq, cpg+collapsed and no --meth rejected with exact copy; all == default; --meth-context=cpg == separated; cpg accepted with taps/5base/5-base; genomic honoured under cpg; stray cpg diagnosed)"
+echo "PASS: meth_context_cli (unknown value, cpg+emseq, cpg+collapsed and no --meth rejected with exact copy and no warning; all == default; --meth-context=cpg == separated; cpg accepted with taps/5base/5-base; genomic honoured under cpg; accepted em-seq + neutral warns, rejected cpg combinations do not; other accepted modes do not warn; stray cpg diagnosed)"

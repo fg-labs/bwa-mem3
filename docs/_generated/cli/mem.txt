@@ -175,7 +175,9 @@ Methylation (--meth) options:
                  outside the conversion direction counted in NM; -B 4).
                  neutral: free only the conversion direction but score it 0
                  (tolerated, not rewarded); best for TAPS (variant-aware:
-                 variants counted in NM as in genomic; -B 4).
+                 variants counted in NM as in genomic; -B 4). Not for
+                 em-seq: its dense conversions cost short reads their
+                 placement (a warning is printed).
                  In genomic/neutral a real variant in the conversion direction
                  itself (C->T at a reference C) is indistinguishable from a
                  conversion and is not counted in NM; under --meth-context cpg

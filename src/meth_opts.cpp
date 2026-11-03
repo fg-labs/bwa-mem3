@@ -173,6 +173,12 @@ int meth_opts_parse(int opt_id, const char *optarg, mem_opt_t *opt, meth_cli_t *
     }
 }
 
+int meth_opts_emseq_neutral(const mem_opt_t *opt)
+{
+    return opt->meth_mode && opt->meth_chem == METH_CHEM_EMSEQ
+        && opt->meth_scoring == MEM_METH_SCORING_NEUTRAL;
+}
+
 void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
 {
     if (cli->set_context && !opt->meth_mode) {
@@ -224,6 +230,21 @@ void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
             exit(1);
         }
     }
+    /* NEUTRAL suits sparse conversions only. em-seq converts most cytosines, so
+     * scoring each conversion 0 instead of +A takes several points off a short
+     * read at its true locus: it falls below -T, or loses to a locus that matches
+     * it T for T. The reads lost first are the unmethylated, conversion-rich ones,
+     * which biases methylation upward (measurements: docs/src/methylation/flags.md,
+     * --meth-scoring). em-seq defaults to collapsed, so this is reachable only by an
+     * explicit --meth-scoring neutral: warn rather than refuse. After the fatal
+     * checks above, so a command rejected by these cross-option checks gets only
+     * its error. */
+    if (meth_opts_emseq_neutral(opt))
+        fprintf(stderr, "WARNING: --meth-scoring neutral with em-seq/bisulfite chemistry (--meth, "
+                        "--meth=emseq, --meth=bisulfite) scores each conversion 0, and em-seq converts "
+                        "most cytosines, so short reads are left unmapped or misplaced and unmethylated "
+                        "reads are lost first, biasing methylation upward. Use the em-seq default "
+                        "(collapsed) or --meth-scoring genomic.\n");
 }
 
 void meth_opts_usage_shared(FILE *fp)
@@ -261,7 +282,9 @@ void meth_opts_usage_shared(FILE *fp)
     fprintf(fp, "                 outside the conversion direction counted in NM; -B 4).\n");
     fprintf(fp, "                 neutral: free only the conversion direction but score it 0\n");
     fprintf(fp, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
-    fprintf(fp, "                 variants counted in NM as in genomic; -B 4).\n");
+    fprintf(fp, "                 variants counted in NM as in genomic; -B 4). Not for\n");
+    fprintf(fp, "                 em-seq: its dense conversions cost short reads their\n");
+    fprintf(fp, "                 placement (a warning is printed).\n");
     fprintf(fp, "                 In genomic/neutral a real variant in the conversion direction\n");
     fprintf(fp, "                 itself (C->T at a reference C) is indistinguishable from a\n");
     fprintf(fp, "                 conversion and is not counted in NM; under --meth-context cpg\n");
