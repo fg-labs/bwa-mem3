@@ -160,6 +160,77 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   exits 0. A failure to close an input (for example a truncated gzip stream) is
   reported and exits 1 too, after the output (BAM included) is completed.
 
+## Memory and parallel jobs
+
+On hg38 (3.2 Gbp with alternate contigs and decoys) `aln` holds about 10.5 GiB of
+index: the occurrence table (6.0 GiB), the suffix-array samples at one row in 8
+(3.75 GiB) and the packed reference (0.75 GiB). A run adds about 0.4-1 GiB to that
+with the default options at `-t 16`, and more on deep searches such as
+`-l 1024 -n 0.04 -o 2`.
+
+To run several `aln` jobs on one machine, for example one sample split into
+chunks, stage the index once in shared memory with [`shm`](shm.md) (Linux only).
+Every job then attaches to the one staged copy instead of loading its own:
+
+```bash
+sudo mount -o remount,huge=advise,size=20g /dev/shm   # room for the segment, 2 MB pages
+bwa-mem3 shm ref.fa
+bwa-mem3 aln -t 8 ref.fa chunk1.fq.gz > chunk1.sam &
+bwa-mem3 aln -t 8 ref.fa chunk2.fq.gz > chunk2.sam &
+wait
+bwa-mem3 shm -d
+```
+
+Measured on hg38 with two jobs of 5M single-end reads at `-t 8` each, on 16 vCPU
+and 32 GB (Sapphire Rapids, clang 19), with the output identical either way:
+
+| | system memory in use, peak | wall time for both jobs |
+| --- | --- | --- |
+| each job loads its own index | 23.1 GiB | 53.7 s |
+| both attach to one `shm` copy | 12.4 GiB (10.5 GiB of it the segment) | 40.3 s |
+
+Each attached job also costs no index load: a single run attached to the segment
+took the same time as one loading the index from the page cache (24.0 s against
+24.5 s wall). The private pair was slower because two copies did not fit in the
+page cache next to the jobs, so index pages were read again from disk. Each job's
+own RSS still shows about 10 GiB, because the shared pages it touches count in
+every process's RSS; the saving shows in the machine's total (`free`).
+
+The caveats are those of [`shm`](shm.md):
+
+- **Linux only.** macOS limits shared-memory names and segment sizes, and a
+  whole-genome index does not stage there.
+- **No staleness check.** A job attaches to a staged segment even if the index
+  files were rebuilt since, and then gives wrong alignments. Run `bwa-mem3 shm -d`
+  before rebuilding an index.
+- **Size and page size of `/dev/shm`.** The segment must fit in `/dev/shm`
+  (`size=`; containers often have a small one), and without `huge=advise` (or
+  `huge=within_size`) it sits on 4 KB pages, which costs CPU on every lookup.
+  Re-stage after a remount.
+- **The segment stays** until `bwa-mem3 shm -d` or a reboot.
+
+### Smaller index: sparser suffix array (opt-in)
+
+To save memory per process at a small CPU cost, `aln` can use an index whose
+suffix-array samples are one row in 16 instead of the default one in 8. Make a
+copy of the index and resample the copy with [`re-sa`](re-sa.md), which rewrites
+`<idxbase>.bwt.2bit.64` in place:
+
+```bash
+mkdir -p aln-idx
+cp -a ref.fa.* aln-idx/              # every index file of ref.fa
+bwa-mem3 re-sa -u 4 aln-idx/ref.fa   # suffix-array samples 1 in 16
+bwa-mem3 aln -t 16 aln-idx/ref.fa reads.fq.gz > out.sam
+```
+
+The rate is stored in the index file, so the index describes itself: `aln` (and
+`mem`, `shm`) read it at load, no option needed, and `bwa-mem3 re-sa aln-idx/ref.fa`
+reports it. The output is identical. Measured on hg38 at `-t 16` on 16 vCPU and
+128 GB (Sapphire Rapids, clang 19), five runs each: peak memory 1.87 GiB lower on
+every workload; CPU about 1% higher on paired-end reads (0-1.7% per run) and at
+most about 0.5% on single-end reads. Keep the copy for `aln` only: `mem` resolves
+far more suffix-array rows and slows more on a sparser index.
+
 ## Notes
 
 - **Unequal pair counts.** If the second file has fewer reads than the first,
