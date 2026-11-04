@@ -37,6 +37,7 @@
 #   CXX, CC     — the real toolchain (default clang++ / clang)
 #   EXPECT_LTO  — optional: the mode the real toolchain must resolve auto to
 #   MAKE        — make binary (default: make)
+#   AR, NM      — archive tools (defaults: ar / nm; must match the LTO compiler)
 
 set -euo pipefail
 
@@ -236,6 +237,25 @@ EOF
     if [[ -n ${EXPECT_LTO:-} ]]; then
         expect_mode "$EXPECT_LTO" "real toolchain, LTO=auto" CXX="$CXX" CC="$CC"
         expect_mode thin "real toolchain, LTO=thin" CXX="$CXX" CC="$CC" LTO=thin
+        # Test the installed archive tools with actual optimized fat objects,
+        # not the native-only wrappers below. Both languages must be extracted
+        # and run correctly by a native consumer AND an LTO consumer.
+        printf 'int archive_c(const int *p, int n){int s=0; for(int i=0;i<n;++i)s+=p[i]; return s;}\n' > "$stub_dir/member.c"
+        printf 'int archive_cpp(const int *p, int n){int s=0; for(int i=0;i<n;++i)s+=p[i]*2; return s;}\n' > "$stub_dir/member.cpp"
+        printf 'extern "C" int archive_c(const int*,int);\nint archive_cpp(const int*,int);\nint main(){int p[]={1,2,3};return archive_c(p,3)+archive_cpp(p,3)!=18;}\n' > "$stub_dir/consumer.cpp"
+        "$CXX" -O3 -c "$stub_dir/consumer.cpp" -o "$stub_dir/consumer.o"
+        for mode in full thin; do
+            "$CC" -g -O3 -fopenmp -flto="$mode" -ffat-lto-objects -c "$stub_dir/member.c" -o "$stub_dir/member-c.o"
+            "$CXX" -g -O3 -fopenmp -flto="$mode" -ffat-lto-objects -c "$stub_dir/member.cpp" -o "$stub_dir/member-cpp.o"
+            "${AR:-ar}" rcs "$stub_dir/members.a" "$stub_dir/member-c.o" "$stub_dir/member-cpp.o"
+            "${AR:-ar}" --version
+            "${NM:-nm}" --print-armap "$stub_dir/members.a"
+            "$CXX" "$stub_dir/consumer.o" "$stub_dir/members.a" -o "$stub_dir/native-consumer"
+            "$stub_dir/native-consumer"
+            "$CXX" -flto="$mode" -ffat-lto-objects -fuse-ld=lld "$stub_dir/consumer.o" "$stub_dir/members.a" -o "$stub_dir/lto-consumer"
+            "$stub_dir/lto-consumer"
+            echo "ok: real $mode fat archive: native and LTO consumers link and run"
+        done
         # The first probe succeeded, so no ld.bfd directories were added.
         resolve_vars "real toolchain: no ld.bfd directories added" "" CXX="$CXX" CC="$CC"
         if ((rc == 0)) && [[ -z $got_libdirs ]]; then
@@ -319,6 +339,22 @@ if [[ ${1:-} == -fuse-ld=lld && ${2:-} == -### ]]; then
     printf ' "ld.lld" "--sysroot=%s"\n' "${RETRY_SYSROOT:-}"
     exit 0
 fi
+if [[ ${CHECK_PRODUCTION_FLAGS:-0} == 1 ]]; then
+    for arg in "$@"; do
+        case "$arg" in
+            */a.c) language=c ;;
+            */b.cpp) language=cpp ;;
+            *) continue ;;
+        esac
+        flags=" $* "
+        for flag in -g -O3 "-DPROBE_${language}"; do
+            if [[ $flags != *" $flag "* ]]; then
+                echo "probe $language compile missing production flag $flag" >&2
+                exit 1
+            fi
+        done
+    done
+fi
 args=()
 archive=0
 lto=0
@@ -363,8 +399,11 @@ REAL_CC="$(command -v "$CC")"
 export REAL_CXX="$real_cxx" REAL_CC REAL_AR="$real_ar"
 probe_args=(CXX="$stub_dir/native-clang" CC="$stub_dir/native-clang"
     UNAME_S=Linux UNAME_M=x86_64 arch=avx2 BWA_LTO_PROBE_LIBS=
+    ARCH_FLAGS= LIBSAIS_OPENMP_CFLAGS=
     AR="$stub_dir/archive")
 expect_mode full "archive and both consumers work" "${probe_args[@]}"
+CHECK_PRODUCTION_FLAGS=1 expect_mode full "probe compiles with production flags" "${probe_args[@]}" \
+    'EXTRA_CFLAGS=-DPROBE_c' 'EXTRA_CXXFLAGS=-DPROBE_cpp' ARCH_FLAGS=
 for member in c cpp; do
     OMIT_MEMBER="$member" expect_mode off "archive omits $member entry" "${probe_args[@]}"
     expect_note "archive omits $member entry"
