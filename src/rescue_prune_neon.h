@@ -695,6 +695,15 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         np = m;
     }
     if (np == 0) return B1;
+    /* Early FULL. The gate below counts nh = np + the extra occurrences of the hit rows' codes, and
+     * every hit row's code occurs in the query at least once (its presence bit and its table entry
+     * are set together), so nh >= np and the count only grows as step 4 walks the rows. Once a
+     * count of rows seen plus their extra occurrences passes max_hits, the gate's verdict is FULL
+     * whatever the rest of the window holds, and nothing between here and the gate returns anything
+     * else: return it now. Here, with every hit row counted once; below, every 64 rows of step 4.
+     * (A running test inside step 3's row scan was measured too, on NEON: it slowed the filter by
+     * about 10% at the default gate, so the scan runs to the end.) */
+    if (np > max_hits) return FULL;
     // ---- 4+5. accumulate hits. The table value of a hit row's code is tab[code] = (off - j_last) |
     //      MULTI, where j_last is the code's latest query occurrence and MULTI (0x2000) marks a code
     //      occurring more than once. Layer 1 = every hit row with its latest occurrence: diagonal
@@ -759,7 +768,11 @@ static inline Kind lean_neon_core(const Job &jb, NeonScratch &s, int &hb, int &h
         }
         {
             int kb = 0;
-            for (; kb + 16 <= np; kb += 16) { RPN_L1(kb, true) RPN_L1(kb + 8, true) }   // two per trip
+            for (; kb + 16 <= np; kb += 16) {   // two per trip
+                RPN_L1(kb, true) RPN_L1(kb + 8, true)
+                // early FULL, every 64 rows (see above)
+                if ((kb & 63) == 48 && (long)(kb + 16) + vaddvq_u32(extra) > max_hits) return FULL;
+            }
             if (kb + 8 <= np) { RPN_L1(kb, true) kb += 8; }
             if (kb < np) RPN_L1(kb, false)
         }
