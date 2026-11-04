@@ -96,13 +96,15 @@ echo "PASS: fixed -K $K, $nb batches: -t 1 == -t 3 == -t 4 unsorted, --dedup-rea
 # batch's write step -- dropping that wait interleaves two batches' records,
 # which this catches. Also with every cohort sliced (BWA_MEM3_COHORT_SLICE_ALL),
 # which emits through mem_pair_and_emit_cohort instead of mem_process_seqs.
-# BWA_MEM3_STREAM_STATS=1 reports how many reads each batch wrote early: to a file, at least two
-# batches must have (one would pass even if only the first batch ever got its
-# turn), or the comparison proves nothing; at -t 1, which keeps its single
-# pipeline thread, none may.
+# BWA_MEM3_STREAM_STATS=1 must report every batch armed to stream, even when
+# none of its reads were written early. Early writes depend on scheduling:
+# the workers may finish before the caller runs, or before the previous write
+# step finishes. Deterministic engagement (every batch actually writes early)
+# is required separately by stream_output_order.sh with its last-item hold.
+# At -t 1, which keeps its single pipeline thread, none may write early.
 #
 # Two inputs, each with its own off run. The file runs read all of fk (8 paired,
-# 4 single-end batches at -K), which the at-least-two-batches check needs. The
+# 4 single-end batches at -K), to exercise several batches. The
 # slow pipe runs at the consumer's pace, not the aligner's -- about 5 s per
 # paired pass over fk -- so it, -t 1 and --bam read sk, the first 10000 pairs of
 # fk: the same -K and so the same batches, 3 paired and 2 single-end, and every
@@ -132,7 +134,20 @@ so() { # <tag> <sink: file|stall> <env...> -- <mem args...>
     [[ -s "so.$tag.sam" ]] || fail "empty output ($tag)"
 }
 early() { awk '/stream_output:/ { s += $3 } END { print s + 0 }' "so.$1.err"; }
-early_batches() { awk '/stream_output:/ && $3 > 0 { n++ } END { print n + 0 }' "so.$1.err"; }
+sam_armed() { # Every completed cohort has exactly one stats line, with its read count.
+    mawk '/read_chunk:/ {
+             n = $0; sub(/.*nseq: /, "", n); acc += n + 0
+             if ($0 !~ /cohort slice/) { if (acc > 0) expected[++nb] = acc; acc = 0 }
+         }
+         /stream_output:/ {
+             actual[++ns] = $5
+             if ($3 < 0 || $3 > $5) bad = 1
+         }
+         END {
+             if (nb < 2 || ns != nb || bad) exit 1
+             for (i = 1; i <= nb; i++) if (expected[i] != actual[i]) exit 1
+         }' "so.$1.err" || fail "streaming $1: batches armed to stream do not match input cohorts"
+}
 set_in() { # <input: fk|sk> <end: pe|se>; sets in=(the fastqs)
     in=("$1.r1.fq")
     [[ $2 == se ]] || in+=("$1.r2.fq")
@@ -158,11 +173,7 @@ for end in pe se; do
                 diff "so.$end.$fx.off.sam" "so.$tag.sam" | head -20 || true
                 fail "streaming $tag differs from off"
             fi
-            [[ $(early "$tag") -gt 0 ]] || fail "streaming $tag wrote nothing early"
-            if [[ $sink == file ]]; then
-                [[ $(early_batches "$tag") -ge 2 ]] \
-                    || fail "streaming $tag: only $(early_batches "$tag") batch(es) wrote early"
-            fi
+            sam_armed "$tag"
         done
     done
 done
@@ -172,7 +183,7 @@ for sink in file stall; do
     so "$tag" "$sink" BWA_MEM3_COHORT_SLICE_ALL=1 -- -t 3 "$CHR22_FA" "$fx.r1.fq" "$fx.r2.fq"
     grep -q 'slicing every' "so.$tag.err" || fail "streaming $tag: the cohorts were not sliced"
     cmp -s "so.pe.$fx.off.sam" "so.$tag.sam" || fail "streaming $tag (every cohort sliced) differs from off"
-    [[ $(early "$tag") -gt 0 ]] || fail "streaming $tag wrote nothing early"
+    sam_armed "$tag"
 done
 # --bam=0 streams the LAST batch only (the one whose read hit end of input);
 # earlier batches, and every batch at --bam>=1, are written by the write step
