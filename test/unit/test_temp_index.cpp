@@ -110,6 +110,21 @@ TEST_CASE("TempDir: makes a fresh directory per object and removes its files"
     CHECK_FALSE(exists(path));
 }
 
+TEST_CASE("TempDir: read distinguishes empty files and stream errors"
+          * doctest::test_suite("unit/test_framework")) {
+    bwa_tests::TempDir dir;
+    dir.write("empty", "");
+    CHECK(dir.read("empty").empty());
+    CHECK(dir.read("missing").empty());
+    const std::string text(5000, 'x');
+    dir.write("text", text);
+    CHECK(dir.read("text") == text);
+    // POSIX permits opening a directory for reading, but fread fails with EISDIR.
+    REQUIRE(mkdir(dir.file("subdir").c_str(), 0700) == 0);
+    CHECK_THROWS_AS(dir.read("subdir"), std::runtime_error);
+    CHECK(rmdir(dir.file("subdir").c_str()) == 0);
+}
+
 TEST_CASE("TempDir: a forked child that destroys one leaves the parent's directory"
           * doctest::test_suite("unit/test_framework")) {
     // A child of run_in_child that exits through exit() (err_fatal, say) runs
