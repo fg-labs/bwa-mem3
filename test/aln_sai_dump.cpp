@@ -139,7 +139,7 @@ int main(int argc, char *argv[])
     }
 
     FMI_search fmi(argv[optind]);
-    fmi.load_index(false, 1);
+    fmi.load_index(false, 1, /*build_seed_jump=*/false);  // as main_aln loads it
     bwa_aln::bwt_t *bwt = bwt_from_fmi(&fmi);
     bwa_seqio_t *ks = bwa_seq_open(argv[optind + 1]);
     if (!ks) { fprintf(stderr, "cannot open %s\n", argv[optind + 1]); return 1; }

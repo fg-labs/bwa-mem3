@@ -386,8 +386,9 @@ output is expected to be byte-identical. It was measured byte-identical on the
 HG00096 slice on the three hosts and SIMD tiers in the table below, and the unit
 tests check interval parity on the phiX fixture.
 
-Each process builds its own table, with the index-load threads: 33.6 MB at the
-default depth. That includes an index attached from shared memory
+Each `mem` process builds its own table, with the index-load threads: 33.6 MB
+at the default depth (`aln`, which never reads it, skips it). That includes an
+index attached from shared memory
 (`bwa-mem3 shm`), which builds its copy after the attach, because the table is
 not part of the staged segment.
 

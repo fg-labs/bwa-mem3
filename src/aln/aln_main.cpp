@@ -611,7 +611,9 @@ int main_aln(int argc, char *argv[])
 	}
 	if (!aln_output_ok(out_path)) return 1;
 	FMI_search *fmi = new FMI_search(prefix);
-	fmi->load_index(/*load_pac=*/true, opt->n_threads);
+	// aln searches with bwt_2occ4/call_one_step and never reads mem's seed jump table, so
+	// skip building it (saves its memory and build time at start-up; output unchanged).
+	fmi->load_index(/*load_pac=*/true, opt->n_threads, /*build_seed_jump=*/false);
 	const bntseq_t *bns = fmi->idx->bns;
 	bwa_aln::bwt_t *bwt = bwt_from_fmi(fmi);
 
