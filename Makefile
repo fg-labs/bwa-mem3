@@ -758,13 +758,16 @@ endif
 # code plus the bitcode the LTO link reads. So libbwa.a stays an ordinary static
 # archive for every other consumer (the standalone tests below, the doctest
 # suites in test/Makefile, out-of-tree harnesses that link it): their ordinary
-# links just use the native code, GNU ar indexes it without an LTO plugin, and
-# no test binary pays for an LTO link.
+# links just use the native code, and no test binary pays for an LTO link.
+# The probe checks that AR (default: ar) preserves this contract: an installed
+# binutils LTO plugin can be incompatible with the compiler's bitcode. Override
+# AR with a compatible archiver when necessary.
 #
 # LTO=auto turns LTO on only where it is known to work, and builds without it
 # otherwise, so a toolchain without LTO support still builds:
-#   - $(CXX) and $(CC) are clang on an ELF target, and a probe compile + link
-#     with -flto=full -ffat-lto-objects -fuse-ld=lld succeeds (clang >= 18 and
+#   - $(CXX) and $(CC) are clang on an ELF target, and a probe compiles C/C++
+#     fat objects, archives them with AR, and links both an ordinary consumer
+#     and one with -flto=full -ffat-lto-objects -fuse-ld=lld (clang >= 18 and
 #     ld.lld installed). The probe links the system libraries the real link
 #     uses (-lpthread -lm -lz -ldeflate, OpenMP, htslib's static deps once
 #     htslib is configured), because lld, unlike ld.bfd, has no built-in
@@ -820,23 +823,28 @@ ifeq ($(BWA_LTO_RESOLVE),1)
                 $(error LTO=$(LTO) is not supported on macOS (Apple clang has no -ffat-lto-objects); build with LTO=off)
             endif
         else ifeq ($(BWA_LTO_CXX_CLANG)$(BWA_LTO_CC_CLANG),clangclang)
-            # Compile a C and a C++ TU as fat LTO objects and link them with lld
-            # against the system libraries the real link uses.
+            # Both archive members must be extractable by ordinary consumers
+            # and the LTO binary link, using the selected archiver.
             BWA_LTO_PROBE_LIBS := -lpthread -lm -lz -ldeflate $(LIBSAIS_OPENMP_LIBS) $(LIBS_EXTRA) \
                 $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),,-lz-ng) $(HTSLIB_static_LIBS)
             BWA_LTO_PROBE := $(shell d=$$(mktemp -d 2>/dev/null) || exit 0; \
-                printf 'int lto_probe_c(void){return 0;}\n' > "$$d/a.c"; \
-                printf 'extern "C" int lto_probe_c(void);\nint main(){return lto_probe_c();}\n' > "$$d/m.cpp"; \
+                trap 'rm -rf "$$d"' EXIT; \
+                printf 'int lto_probe_c(void){return 3;}\n' > "$$d/a.c"; \
+                printf 'int lto_probe_cpp(){return 4;}\n' > "$$d/b.cpp"; \
+                printf 'extern "C" int lto_probe_c(void);\nint lto_probe_cpp();\nint main(){return lto_probe_c()+lto_probe_cpp()-7;}\n' > "$$d/m.cpp"; \
                 $(CC) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
-                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
-                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$d/m.o" "$$d/a.o" $(BWA_LTO_PROBE_LIBS) -o "$$d/x" >/dev/null 2>&1 && \
-                echo ok; rm -rf "$$d")
+                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/b.cpp" -o "$$d/b.o" >/dev/null 2>&1 && \
+                $(CXX) -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
+                $(AR) rcs "$$d/libprobe.a" "$$d/a.o" "$$d/b.o" >/dev/null && \
+                $(CXX) $(LDFLAGS) "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/native" >/dev/null 2>&1 && \
+                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/lto" >/dev/null 2>&1 && \
+                echo ok)
             ifeq ($(BWA_LTO_PROBE),ok)
                 BWA_LTO_MODE := $(BWA_LTO_WANT)
             else ifeq ($(LTO),auto)
-                $(warning NOTE: building without LTO: $(CXX) could not link a -flto=$(BWA_LTO_WANT) -ffat-lto-objects test with -fuse-ld=lld (install lld, or set LTO=off to silence this).)
+                $(warning NOTE: building without LTO: the fat-object archive probe with CXX=$(CXX) CC=$(CC) AR=$(AR) failed to compile, archive, or link native/LTO consumers. Use a compatible AR and clang/lld toolchain, or set LTO=off.)
             else
-                $(error LTO=$(LTO) needs clang with -ffat-lto-objects and ld.lld; the test link failed. Install lld or build with LTO=off)
+                $(error LTO=$(LTO) needs clang with -ffat-lto-objects and ld.lld plus an archive compatible with native/LTO consumers; the probe failed (CXX=$(CXX) CC=$(CC) AR=$(AR)). Set AR to a compatible archiver, install lld, or build with LTO=off)
             endif
         else ifneq ($(BWA_LTO_CXX_CLANG),)
             ifeq ($(LTO),auto)
@@ -1549,7 +1557,7 @@ test/err_fgets_eof_test.o: test/err_fgets_eof_test.cpp
 # sam_encode_*_<tier>. Dropping per-tier objects from libbwa.a breaks those
 # matrix rows. On arm64 $(KERNEL_TIER_OBJS) is empty.
 $(BWA_LIB):$(OBJS) $(KERNEL_TIER_OBJS)
-	ar rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
+	$(AR) rcs $(BWA_LIB) $(OBJS) $(KERNEL_TIER_OBJS)
 
 # htslib: minimal configure (no lzma/bz2/curl/S3/GCS/plugins), zlib only.
 # Guard on config.mk (only created by ./configure) rather than Makefile, which

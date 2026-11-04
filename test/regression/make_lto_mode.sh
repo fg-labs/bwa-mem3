@@ -3,7 +3,7 @@
 #
 # Regression: how the Makefile resolves LTO= into the mode the build uses
 # (BWA_LTO_MODE), read back with `make -s print-BWA_LTO_MODE`. That goal runs the
-# same parse-time logic as a real build but compiles nothing.
+# same parse-time logic as a real build, including its small capability probes.
 #
 # The default (LTO=auto) must never fail a build: it picks full LTO only when
 # the toolchain can do it and otherwise builds without LTO, saying so on stderr.
@@ -21,7 +21,8 @@
 #     real toolchain must resolve auto to that mode and LTO=thin to thin.
 #
 # Stub compilers stand in for gcc and for a clang without lld, so only the
-# EXPECT_LTO and clang-CXX/gcc-CC checks need a real clang.
+# EXPECT_LTO and clang-CXX/gcc-CC checks need a real clang. Archive checks use
+# the real native compilers through wrappers that strip the ELF-only LTO flags.
 #
 # Inputs:
 #   CXX, CC     — the real toolchain (default clang++ / clang)
@@ -182,6 +183,88 @@ EOF
     fi
 else
     echo "skip: CXX=$CXX is not clang; the clang-only cases need a real clang"
+fi
+
+# Exercise the archive gate on every host with real native objects. Only the
+# ELF-only LTO flags are stripped: these cases test probe control flow, not
+# whether this host supports fat objects (EXPECT_LTO covers that on Linux).
+real_cxx="$(command -v "$CXX")"
+real_ar="$(command -v ar)"
+cat > "$stub_dir/native-clang" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "${1:-}" in
+    --version) echo 'clang version 21.0.0'; exit 0 ;;
+    -dumpversion) echo 21; exit 0 ;;
+esac
+args=()
+archive=0
+lto=0
+for arg in "$@"; do
+    case "$arg" in
+        -flto=*) lto=1 ;;
+        -ffat-lto-objects | -fuse-ld=lld) ;;
+        *.a) archive=1; args+=("$arg") ;;
+        *) args+=("$arg") ;;
+    esac
+done
+if ((archive)) && [[ ${REJECT_ARCHIVE_LINK:-} == native && $lto == 0 || ${REJECT_ARCHIVE_LINK:-} == lto && $lto == 1 ]]; then
+    exit 1
+fi
+for arg in "${args[@]}"; do
+    case "$arg" in *.c) exec "$REAL_CC" "${args[@]}" ;; esac
+done
+exec "$REAL_CXX" "${args[@]}"
+EOF
+cat > "$stub_dir/archive" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Simulate an archiver that succeeds but omits one language's symbols.
+args=()
+for arg in "$@"; do
+    case "${OMIT_MEMBER:-}:$arg" in
+        c:*/a.o | cpp:*/b.o) ;;
+        *) args+=("$arg") ;;
+    esac
+done
+exec "$REAL_AR" "${args[@]}"
+EOF
+chmod +x "$stub_dir/native-clang" "$stub_dir/archive"
+REAL_CC="$(command -v "$CC")"
+export REAL_CXX="$real_cxx" REAL_CC REAL_AR="$real_ar"
+probe_args=(CXX="$stub_dir/native-clang" CC="$stub_dir/native-clang"
+    UNAME_S=Linux UNAME_M=x86_64 arch=avx2 BWA_LTO_PROBE_LIBS=
+    AR="$stub_dir/archive")
+expect_mode full "archive and both consumers work" "${probe_args[@]}"
+for member in c cpp; do
+    OMIT_MEMBER="$member" expect_mode off "archive omits $member entry" "${probe_args[@]}"
+    expect_note "archive omits $member entry"
+    OMIT_MEMBER="$member" expect_error "archive" "forced LTO with missing $member entry" "${probe_args[@]}" LTO=full
+done
+for consumer in native lto; do
+    REJECT_ARCHIVE_LINK="$consumer" expect_mode off "archive rejects $consumer consumer" "${probe_args[@]}"
+    expect_note "archive rejects $consumer consumer"
+    REJECT_ARCHIVE_LINK="$consumer" expect_error "archive" "forced LTO with rejected $consumer consumer" "${probe_args[@]}" LTO=thin
+done
+
+# The actual library recipe must honor AR, not just the capability probe.
+cat > "$stub_dir/reject-ar" << 'EOF'
+#!/bin/sh
+echo 'selected archiver invoked' >&2
+exit 19
+EOF
+chmod +x "$stub_dir/reject-ar"
+printf 'int archive_override_entry(void){return 7;}\n' > "$stub_dir/override.cpp"
+"$real_cxx" -c "$stub_dir/override.cpp" -o "$stub_dir/override.o"
+rc=0
+"$MAKE" -s "$stub_dir/override.a" LTO=off CXX="$CXX" CC="$CC" \
+    BWA_LIB="$stub_dir/override.a" OBJS="$stub_dir/override.o" KERNEL_TIER_OBJS= \
+    AR="$stub_dir/reject-ar" > "$out_file" 2> "$err_file" || rc=$?
+if ((rc == 0)) || ! grep -qF 'selected archiver invoked' "$err_file"; then
+    echo 'FAIL: libbwa archive recipe ignored AR override' >&2
+    fail=1
+else
+    echo 'ok: libbwa archive recipe honors AR override'
 fi
 
 if ((fail != 0)); then
