@@ -246,6 +246,10 @@ const Directed kDirected[] = {
      "2033000121330202100134311131204313033311103003210231113203313403303200202110231033240034233024330212414202023332003231130041112042313040302332123034331032023302300340",
      "133303012333202023401324313314244113043331101003030131330003334034020420214023103342400333",
      21, 0, 0, -1, 0, 0},
+    // A zero first row must still record the query-end score before terminating.
+    {1, 4, 6, 1, 6, 1, 100, 5, false, 20, 16, 0,
+     "0", "1",
+     0, 0, 0, 0, 1, 0},
     // 16-bit pairs that were coupled to their group; the first is the corner
     // len1=8 len2=28 h0=29 w=20 (query longer than target)
     {1, 4, 6, 1, 6, 1, 100, 5, false, 20, 16, 29,
