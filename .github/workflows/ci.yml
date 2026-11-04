@@ -2357,12 +2357,6 @@ jobs:
           make ASAN=1 arch=avx2 \
             CXX=clang++-19 cli_arg_safety_test
           ./cli_arg_safety_test
-          # mem_chain_flt frees the heap seed arrays of the chains it drops. Its
-          # unit test checks the survivors only, so a dropped free() changes no
-          # assertion; run that suite against the asan library so LeakSanitizer
-          # fails the job on the leak.
-          make -j"$(nproc)" ASAN=1 arch=avx2 CXX=clang++-19 test-binaries
-          ./test/bwa_mem3_tests_unit --test-suite=unit/chain_flt
           # The bwtSeed parity test checks output only, and a seeding walk that
           # reads one base past the end of its read changes no output (a walk
           # from there cannot step), so only asan sees the drivers' read-end
@@ -2389,6 +2383,39 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/input_fail_fast.sh
+
+      - name: Unit suite (ASAN)
+        # Every unit test against an asan libbwa.a. A test that writes past the
+        # end of its own buffer, or reads a temporary after it is destroyed,
+        # usually changes no assertion on the plain build: it corrupts the heap
+        # and crashes a later, unrelated test, so it shows up as an intermittent
+        # SIGSEGV. Here asan stops at the faulting access. LeakSanitizer is on
+        # too, so a dropped free() fails the job even where no assertion checks
+        # it (mem_chain_flt's dropped chains, for one).
+        # exitcode=86: asan's default exit status is 1, which is EXIT_FAILURE,
+        # so a memory error inside a death test's forked child (its stderr goes
+        # to /dev/null) would look like the err_fatal exit the test expects;
+        # no test expects 86. test_bam_rec_scratch.cpp requests a SIZE_MAX
+        # allocation on purpose to test its overflow guard, so only that file
+        # runs with allocator_may_return_null=1; the rest keep asan's
+        # allocation-size check. A death test's child skips LeakSanitizer at its
+        # exit (test/framework/run_in_child.h), which also skips an exit handler
+        # the parent registered before the fork, so the one test of such a
+        # handler (TempIndex's log replay) runs only in the plain unit step.
+        # Runs after the smoke step, from a clean tree, and also when that step
+        # failed, so one failure does not hide the other.
+        if: ${{ !cancelled() }}
+        env:
+          BWA_REQUIRE_COMPACTION_TIER: avx2
+        run: |
+          make clean
+          make -j"$(nproc)" ASAN=1 arch=avx2 CXX=clang++-19 test-binaries
+          ASAN_OPTIONS=exitcode=86 \
+            bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit \
+            --source-file-exclude='*test_bam_rec_scratch.cpp' \
+            --test-case-exclude='LoggedStderr*'
+          ASAN_OPTIONS=exitcode=86:allocator_may_return_null=1 \
+            ./test/bwa_mem3_tests_unit --source-file='*test_bam_rec_scratch.cpp'
 
       - name: ccache statistics
         if: always()
