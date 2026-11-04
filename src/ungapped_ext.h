@@ -35,15 +35,23 @@
 //                        and uses sp.score/qle/gscore/gtle directly.
 //
 //   FP_STATUS_TIGHT    — fast-path fails (too many mismatches) but the
-//                        ungapped score bounds the useful SW band:
-//                          tight_band = ceil((min(len1,len2)·a - ungapped_score)
-//                                            / (o_min + e_min))
+//                        floored ungapped walk score max_sc bounds the
+//                        useful SW band:
+//                          tight_band = ceil((N·a + h0 - max_sc - o_min) / e_min)
+//                        (N = min(len1,len2) = len2; the caller gates
+//                        len1 >= len2.) A gapped path at diagonal offset
+//                        d pays at least one open plus d extensions,
+//                        o_min + d·e_min, and gains at most N·a, so every
+//                        cell at offset >= tight_band scores <= max_sc and
+//                        every cell at offset > tight_band scores < max_sc.
+//                        A numerator <= 0, or a band wider than default_w
+//                        (opt->w at every call site), emits the 0 sentinel
+//                        ("no usable bound"); e_min <= 0 emits default_w.
 //                        The --adaptive-band ladder uses it to stop early
-//                        (the bound is an upper bound on any gapped
-//                        score); the certified probe rung reads the probe
-//                        band ungapped_analyze_pb returns alongside it.
-//                        The exact ladders do NOT stop on it -- see
-//                        ACCEPT_PAIR.
+//                        at w >= tight_band. The certified probe rung reads
+//                        the separate probe band ungapped_analyze_pb returns
+//                        alongside it (see FP_TIGHT_MAX). The exact ladders
+//                        do NOT stop on tight_band -- see ACCEPT_PAIR.
 //
 //   FP_STATUS_FALLBACK — ambig base, out-of-range length, the fast path off
 //                        (x_threshold < 0), a non-HIT pair longer than
@@ -101,15 +109,17 @@
 //   in test/unit/test_ungapped_fastpath.cpp and end to end against bwa in
 //   test/ungapped_hit_parity_test.sh.
 //
-// Derivation of tight_band: for any alignment with band offset B from
-// diagonal, min B gaps are required; cost ≥ B · (o_min + e_min). Max
-// alignment score (all matches) ≤ min(len1, len2) · a. For any gapped
-// alignment to beat the observed ungapped max score S:
-//   min_len·a - B·(o_min+e_min) > S
-//   B < (min_len·a - S) / (o_min + e_min)
-// So any band ≥ tight_band is sufficient; narrower bands suffice too
-// when the gapped alternative score is < min_len·a. Starting SW at
-// tight_band is strictly correct and avoids over-banded DP work.
+// Derivation of tight_band: an alignment reaching diagonal offset B needs at
+// least B gap units in at least one gap run, so it pays >= o_min + B·e_min, and
+// it gains at most min(len1, len2)·a over the h0 it starts from. With
+// S = max_sc - h0 the ungapped walk's gain, a gapped alignment at offset B can
+// beat the walk only if
+//   h0 + min_len·a - o_min - B·e_min > h0 + S
+//   B < (min_len·a - S - o_min) / e_min
+// so tight_band = ceil((min_len·a - S - o_min) / e_min) is the smallest offset
+// no gapped alternative can beat from (it may still tie there), and a band
+// w >= tight_band keeps every tying-or-better cell inside the DP. S must be the
+// FLOORED walk score so that the in-band DP provably reaches it.
 #define FP_N_MAX 512
 /* Length cap for emitting a tight_band at all (longer pairs HIT or FALLBACK).
  * tight_band feeds the --adaptive-band ladder's narrowing-tier stop. The exact ladders
