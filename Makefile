@@ -838,7 +838,9 @@ ifeq ($(BWA_LTO_RESOLVE),1)
             endif
         else ifeq ($(BWA_LTO_CXX_CLANG)$(BWA_LTO_CC_CLANG),clangclang)
             # Both archive members must be extractable by ordinary consumers
-            # and the LTO binary link, using the selected archiver.
+            # and the LTO binary link, using the selected archiver. Match the
+            # production compile flags: optimized bitcode can use attributes
+            # that an older archive plugin accepts at O0 but rejects at O3.
             BWA_LTO_PROBE_LIBS := -lpthread -lm -lz -ldeflate $(LIBSAIS_OPENMP_LIBS) $(LIBS_EXTRA) \
                 $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),,-lz-ng) $(HTSLIB_static_LIBS)
             # Prints `ok` if the plain lld link works. Otherwise, lld may only be
@@ -861,8 +863,8 @@ ifeq ($(BWA_LTO_RESOLVE),1)
                 printf 'int lto_probe_cpp(){return 4;}\n' > "$$d/b.cpp"; \
                 printf 'extern "C" int lto_probe_c(void);\nint lto_probe_cpp();\nint main(){return lto_probe_c()+lto_probe_cpp()-7;}\n' > "$$d/m.cpp"; \
                 link() { $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$@" "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/lto" >/dev/null 2>&1; }; \
-                if $(CC) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
-                   $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/b.cpp" -o "$$d/b.o" >/dev/null 2>&1 && \
+                if $(CC) $(CFLAGS) $(SRC_CFLAGS) $(CPPFLAGS) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
+                   $(CXX) $(CXXFLAGS) $(CPPFLAGS) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/b.cpp" -o "$$d/b.o" >/dev/null 2>&1 && \
                    $(CXX) -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
                    $(AR) rcs "$$d/libprobe.a" "$$d/a.o" "$$d/b.o" >/dev/null && \
                    $(CXX) $(LDFLAGS) "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/native" >/dev/null 2>&1; then \
