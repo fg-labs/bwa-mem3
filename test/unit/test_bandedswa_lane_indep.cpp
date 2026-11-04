@@ -28,10 +28,10 @@
 //      negative seed scores, N bases, small z-drop, bands 0 to 124) scored in the
 //      generated order, reversed, shuffled, split into random sub-batches and
 //      sorted the way bsw_score_batch keys its calls (8-bit by query length,
-//      len2; 16-bit by target length, len1, as the 16-bit tier does), and a
+//      len2; 16-bit by the per-call adaptive two-key order), and a
 //      sample next to wide partners. The sort mirrors production's keys rather
-//      than calling sortPairsLen, and the 8-bit tier's w > BSW8_MAX_W divert to
-//      the 16-bit kernel (keyed on max(len1, len2)) is not exercised: no band
+//      than calling sortPairsLen16, and the 8-bit tier's w > BSW8_MAX_W divert to
+//      the 16-bit kernel (the diverted two-key order) is not exercised: no band
 //      here exceeds 124. Coupled pairs are rare, so these batches are not what
 //      pins the fix; they keep the property honest on many shapes.
 
@@ -350,18 +350,26 @@ void check_generated(int width, uint64_t seed, int nbatch)
             std::vector<int> order(batch.size());
             for (size_t q = 0; q < order.size(); q++) order[q] = (int)q;
             // generated order, reversed, two shuffles, random sub-batches, then a
-            // stable sort mirroring bsw_score_batch's key for this width (len2 for
-            // 8-bit, len1 as the 16-bit tier uses; not a call to sortPairsLen, and
-            // the w > BSW8_MAX_W max-key divert is not covered, as w <= 124 here;
-            // draws nothing from rng)
+            // stable sort mirroring bsw_score_batch's order (len2 for 8-bit,
+            // adaptive two-key order for 16-bit; not a call to sortPairsLen16).
+            // The w > BSW8_MAX_W max-key divert is not covered, as w <= 124 here;
+            // this draws nothing from rng.
             for (int g = 0; g < 6; g++) {
                 if (g == 1) std::reverse(order.begin(), order.end());
                 if (g == 2 || g == 3) std::shuffle(order.begin(), order.end(), rng);
                 if (g == 5) {
                     for (size_t q = 0; q < order.size(); q++) order[q] = (int)q;
+                    const size_t shorter_ref = std::count_if(batch.begin(), batch.end(),
+                        [](const ExtPair &p) { return p.target.size() < p.query.size(); });
+                    const bool len1_major = shorter_ref > batch.size() / 2;
                     std::stable_sort(order.begin(), order.end(), [&](int x, int y) {
-                        return width == 8 ? batch[x].query.size() < batch[y].query.size()
-                                          : batch[x].target.size() < batch[y].target.size();
+                        const auto &a = batch[x], &b = batch[y];
+                        if (width == 8) return a.query.size() < b.query.size();
+                        const size_t am = len1_major ? a.target.size() : a.query.size();
+                        const size_t bm = len1_major ? b.target.size() : b.query.size();
+                        if (am != bm) return am < bm;
+                        return len1_major ? a.query.size() < b.query.size()
+                                          : a.target.size() < b.target.size();
                     });
                 }
                 size_t s = 0;

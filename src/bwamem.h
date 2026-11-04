@@ -775,6 +775,14 @@ int  bsw8_envelope_ok(int len1, int len2, int w, int score_a, int zdrop, int h0)
 void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
                      int &numPairs128, int &numPairs16,
                      int &numPairs1, int score_a, int w, int zdrop);
+/* The 16-bit kernel's pair order, chosen per call: len1-major (len2 ties) when strictly more
+ * than half of the pairs have len1 < len2, else len2-major (len1 ties); sortPairsLen16 applies
+ * it as two stable counting sorts (hist: MAX_SEQ_LEN16 + 1 slots; tempArray: count slots, not
+ * overlapping pairArray). `diverted` keys len1 as max(len1, len2), the diverted 8-bit call's
+ * key. Exposed for test/unit/test_bsw16_pair_order.cpp; see bwamem.cpp. */
+bool bsw16_len1_major_order(const SeqPair *pairArray, int32_t count);
+void sortPairsLen16(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist,
+                    bool diverted);
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 
