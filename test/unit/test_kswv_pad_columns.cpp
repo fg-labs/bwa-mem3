@@ -1,6 +1,7 @@
 // test/unit/test_kswv_pad_columns.cpp
 //
-// Two NEON kswv rescue-kernel cuts, each behind its own switch:
+// Two kswv rescue-kernel cuts, each behind its own switch (NEON u8 and 16-bit,
+// and the AVX-512BW u8 kernel):
 //   BWA3_RESCUE_PADCOLS    the u8 FScan bodies run [jzero, jsplit), the columns
 //                          past the group's longest query and short of its
 //                          narrowest quantum, with no score gather (the score is
@@ -10,7 +11,8 @@
 // Every on/off combination, in the two-row sweep and the one-row body, must give
 // the same result fields as both switches off, and that reference must match
 // scalar ksw_align2 (ksw_u8 for the 8-bit kernel, ksw_i16 for the 16-bit one).
-// The batch is laid out as explicit 16-lane groups (the runner keeps input
+// The batch is laid out as explicit lane groups of the kernel's width, 16 on
+// NEON and 64 on AVX-512BW (kGroup; the runner keeps input
 // order), so the zero range is non-empty (uniform lengths that are not a multiple
 // of 16, and ragged lengths inside one quantum), empty (a lane whose length is a
 // multiple of 16, mixed quanta), or absent (a partial final group). The rescan
@@ -37,6 +39,14 @@
 namespace {
 
 using bwa_tests::ScopedEnv;   // scoped_env.h
+
+// Lanes per u8 kernel group: a group's zero range is [max len2, min quantum), so
+// the groups below are laid out at the width of the kernel that runs them.
+#if defined(__AVX512BW__) && !defined(__ARM_NEON) && !defined(__aarch64__)
+constexpr int kGroup = 64;
+#else
+constexpr int kGroup = 16;
+#endif
 
 // A query of period `period` (random bases) against a reference holding copies
 // of it with a few substitutions, so a row's max recurs at columns `period` apart.
@@ -73,20 +83,20 @@ bwa_tests::TestPair tie_pair(std::mt19937 &rng, int qlen, int rlen, int period)
     return p;
 }
 
-// One 16-lane group whose query lengths are drawn from [qlo, qhi] and whose row
+// One group whose query lengths are drawn from [qlo, qhi] and whose row
 // maxima tie (tie_pair), with references from a quarter to a half of the query.
 void add_tie_group(std::vector<bwa_tests::TestPair> &pairs, std::mt19937 &rng, int qlo, int qhi)
 {
     std::uniform_int_distribution<int> qd(qlo, qhi);
-    for (int l = 0; l < 16; l++) {
+    for (int l = 0; l < kGroup; l++) {
         const int q = qd(rng);
         std::uniform_int_distribution<int> rd(q / 4, q / 2);
         pairs.push_back(tie_pair(rng, q, rd(rng), 1 + l % 3));
     }
 }
 
-// One 16-lane group of 150 bp queries against a 40 bp run of one base, each query
-// starting with a mismatching prefix of 7 * lane bases. Every lane improves on
+// One group of 150 bp queries against a 40 bp run of one base, each query
+// starting with a mismatching prefix of 7 * (lane mod 16) bases. Every lane improves on
 // the same rows (the reference's), and on each of them lane l first reaches the
 // row max at column 7 * l + row and ties it from there on, so the lanes' first
 // hits fall in different QE_BLK blocks while the earlier lanes still tie in the
@@ -94,9 +104,9 @@ void add_tie_group(std::vector<bwa_tests::TestPair> &pairs, std::mt19937 &rng, i
 // one that lets a later block's scan overwrite it.
 void add_offset_tie_group(std::vector<bwa_tests::TestPair> &pairs)
 {
-    for (int l = 0; l < 16; l++) {
+    for (int l = 0; l < kGroup; l++) {
         bwa_tests::TestPair p;
-        const int s = 7 * l;
+        const int s = 7 * (l % 16);
         p.qry.assign(150, 0);
         for (int j = 0; j < s; j++) p.qry[j] = 3;   // never matches the reference's 0s
         p.ref.assign(40, 0);
@@ -105,9 +115,9 @@ void add_offset_tie_group(std::vector<bwa_tests::TestPair> &pairs)
     }
 }
 
-// One 16-lane group whose query lengths are drawn from [qlo, qhi].
+// One group whose query lengths are drawn from [qlo, qhi].
 void add_group(std::vector<bwa_tests::TestPair> &pairs, std::mt19937 &rng, int qlo, int qhi,
-               int nlanes = 16)
+               int nlanes = kGroup)
 {
     std::uniform_int_distribution<int> qd(qlo, qhi);
     for (int l = 0; l < nlanes; l++) {
@@ -222,8 +232,8 @@ void check_arms(const std::vector<bwa_tests::TestPair> &pairs, bool use16)
 
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_PADCOLS and BWA3_RESCUE_QE_REVSCAN on == off, in both sweeps"
           * doctest::test_suite("unit/kswv")) {
-#if !defined(__ARM_NEON) && !defined(__aarch64__)
-    MESSAGE("skipped: both switches affect the NEON rescue kernels only");
+#if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(__AVX512BW__)
+    MESSAGE("skipped: both switches affect the NEON and AVX-512BW u8 rescue kernels only");
 #else
     check_arms(build_groups(true), false);
 #endif
@@ -232,7 +242,7 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_PADCOLS and BWA3_RESCUE_QE_REVSCAN on == 
 TEST_CASE("kswv u16 rescue: BWA3_RESCUE_QE_REVSCAN on == off, in both sweeps"
           * doctest::test_suite("unit/kswv")) {
 #if !defined(__ARM_NEON) && !defined(__aarch64__)
-    MESSAGE("skipped: the switch affects the NEON rescue kernels only");
+    MESSAGE("skipped: the switch affects the NEON 16-bit rescue kernel only");
 #else
     check_arms(build_groups(false), true);
 #endif
