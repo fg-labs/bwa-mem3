@@ -1081,27 +1081,27 @@ of M reads written early`); measurement only, the output is unchanged.
 
 ### Memory
 
-#### `--huge-pages` — back the index with 1 GB huge pages (Linux, opt-in)
+#### `--huge-pages` — put the index on 1 GB huge pages (Linux, opt-in)
 
-Reserve the FM-index / suffix-array structures on explicit **1 GB huge pages** to
-cut data-TLB misses in seeding. bwa-mem3's allocator is mimalloc, and this flag
-sizes the reservation from the index footprint and reserves it before the index
-loads. **Safe by default:** when the host has no free 1 GB hugepage pool (or too
-few pages), it prints a one-line `[M::]` note and runs on the default page size —
-it never fails or degrades a run.
+Map the FM-index occurrence table on explicit
+**1 GB huge pages** from the host's hugetlb pool, to cut data-TLB page walks in
+seeding. The suffix-array samples stay on the default pages. hg38 needs 6 free
+1 GB pages, and a `--meth` index about twice that. A table of 512 MiB or less (a
+small genome) stays on the default pages, since rounding it up to a whole 1 GB
+page would more than double it. **Safe by default:** when the pool is missing or
+has too few free pages, a process limit (`RLIMIT_AS`, `vm.max_map_count`) refuses
+the mapping, or its pages cannot be faulted in, the table uses the default pages
+and a one-line `[M::]` note says so. If the default allocation also fails, the run exits with an allocation error. No effect on an index attached from shared memory (`bwa-mem3 shm`), which
+lives in the shared segment; an `[M::]` note says so.
 
 Requires 1 GB hugepages reserved on the host
 (`echo N | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`).
-**Linux only**, needs the bundled mimalloc. The **alignment records are
+**Linux 5.14 or later** (the pages are faulted in with `MADV_POPULATE_WRITE`; on
+an older kernel the table falls back). The **alignment records are
 byte-identical** — page size does not affect alignments; only the `@PG` record
-differs, since its `CL:` field records the `--huge-pages` flag. Measured ~1.5 %
-whole-aligner wall on a 5 M-read WGS slice (HG00096, hg38), AMD Zen3, avx2 tier,
-32 threads ([PR #405](https://github.com/fg-labs/bwa-mem3/pull/405)) — a
-single-host, single-config measurement, not a cross-architecture or cross-thread
-claim. See
+differs, since its `CL:` field records the `--huge-pages` flag. On hg38 WGS (5 M pairs), `-t 16`, warm page cache, x86-64 AVX-512BW and AVX2, it measured about 0.7 % faster on Intel Sapphire Rapids and within run-to-run noise on two AMD Zen 4 instances (one other measured 0.6-1.1 % slower); measure on your own host before relying on it (see [Measured effect](../user-guide/allocator.md#measured-effect)). See
 [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever)
-for reservation, verification, the measurement conditions, and the manual
-`MIMALLOC_RESERVE_HUGE_OS_PAGES` equivalent.
+for reservation, verification and the measurement conditions.
 
 #### Transparent huge page fallback warning (Linux)
 
