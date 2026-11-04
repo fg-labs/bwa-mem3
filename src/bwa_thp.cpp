@@ -298,6 +298,24 @@ bwa_thp_verdict_t bwa_thp_step(bwa_thp_monitor_t *m, int verbose,
             }
         }
 
+        /* Every verdict needs >= BWA_THP_MIN_ANON_KB of Anonymous memory in
+         * total (bwa_thp_assess), and RssAnon is an O(1) count of the same
+         * pages, while a walk visits every page-table entry of every mapping,
+         * shared ones included: a `bwa-mem3 shm` index costs ~100 ms per walk.
+         * So when RssAnon is under half the floor, no walk can reach a verdict
+         * and none is made. The margin covers growth during a walk. -v 4 still
+         * walks, for its debug line. */
+        if (verbose < 4) {
+            const bwa_thp_status_t s0 =
+                bwa_thp_parse_status(io->read_text(io->ctx, "/proc/self/status"));
+            if (s0.rss_anon_kb >= 0 && s0.rss_anon_kb * 2 < BWA_THP_MIN_ANON_KB) {
+                r.status = s0;
+                r.complete = 1;
+                r.below_floor = 1;
+                goto out;
+            }
+        }
+
         while (r.walks < BWA_THP_MAX_WALKS && !r.complete) {
             ++r.walks;
             if (io->walk_smaps(io->ctx, &r.usage) != 0) {
