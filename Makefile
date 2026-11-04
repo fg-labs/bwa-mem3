@@ -771,10 +771,15 @@ endif
 #     ld.lld installed). The probe links the system libraries the real link
 #     uses (-lpthread -lm -lz -ldeflate, OpenMP, htslib's static deps once
 #     htslib is configured), because lld, unlike ld.bfd, has no built-in
-#     search path: a library only ld.bfd would find (e.g. one under /usr/local
-#     without LIBRARY_PATH set) fails the probe instead of the real link. A
-#     clang whose probe fails, or a clang CXX with a non-clang CC, gets a NOTE
-#     on stderr and a non-LTO build.
+#     search path: a library only ld.bfd would find (e.g. libdeflate built
+#     from source into /usr/local/lib64 on Amazon Linux 2023) would otherwise
+#     fail the real link. When the probe link fails, it is retried with
+#     ld.bfd's own search directories (SEARCH_DIR in `ld.bfd --verbose`)
+#     passed as -Wl,-L<dir>, which the driver places after every other -L,
+#     so they are searched last, as ld.bfd searches them. If that link
+#     succeeds, LTO stays on and the LTO link gets the same flags
+#     (BWA_LTO_LIBDIRS). A clang whose probe fails both ways, or a clang CXX
+#     with a non-clang CC, gets a NOTE on stderr and a non-LTO build.
 #   - GCC: off. Clang is the shipping compiler and GCC LTO is not measured here.
 #   - macOS: off. Apple clang has no -ffat-lto-objects for Mach-O.
 #   - ASAN=1, MSAN=1, COVERAGE=1: off (instrumented, non-shipping builds).
@@ -782,11 +787,14 @@ endif
 # had. LTO=off builds without it. Like the compiler floor, this resolves only
 # for goals that build: a clean-only goal leaves LTO off.
 #
-# The top-level make resolves the mode and exports it as BWA_LTO_MODE so the
-# recursive makes (single, arm64, all-single) reuse it instead of probing again;
-# a BWA_LTO_MODE inherited from the environment at the top level is ignored.
+# The top-level make resolves the mode and exports it as BWA_LTO_MODE (and the
+# -L flags the lld link needs as BWA_LTO_LIBDIRS) so the recursive makes
+# (single, arm64, all-single) reuse it instead of probing again; a BWA_LTO_MODE
+# or BWA_LTO_LIBDIRS inherited from the environment at the top level is ignored
+# (and BWA_LTO_LIBDIRS is dropped whenever BWA_LTO_MODE is on the command line).
 # lto-build sets it on its inner make's command line to turn this off.
 LTO ?= auto
+comma := ,
 # Exactly one word, and one of the four: a multi-word value ("auto off") would
 # otherwise pass a bare $(filter).
 LTO_VALID := $(if $(filter 1,$(words $(LTO))),$(filter auto thin full off,$(LTO)))
@@ -800,6 +808,11 @@ ifeq ($(LTO_VALID),)
 endif
 ifeq ($(origin BWA_LTO_MODE),command line)
     BWA_LTO_RESOLVE :=
+    # The mode is given, not resolved: an inherited BWA_LTO_LIBDIRS belongs to
+    # some other build (lto-build passes BWA_LTO_MODE=off), so drop it.
+    ifneq ($(origin BWA_LTO_LIBDIRS),command line)
+        BWA_LTO_LIBDIRS :=
+    endif
 else ifeq ($(MAKELEVEL),0)
     BWA_LTO_RESOLVE := 1
 else ifndef BWA_LTO_MODE
@@ -809,6 +822,7 @@ else
 endif
 ifeq ($(BWA_LTO_RESOLVE),1)
     BWA_LTO_MODE := off
+    BWA_LTO_LIBDIRS :=
     ifneq ($(strip $(ASAN)$(MSAN)$(COVERAGE)),)
         ifneq ($(filter thin full,$(LTO)),)
             $(warning NOTE: LTO=$(LTO) ignored: ASAN, MSAN and COVERAGE builds link without LTO.)
@@ -827,24 +841,56 @@ ifeq ($(BWA_LTO_RESOLVE),1)
             # and the LTO binary link, using the selected archiver.
             BWA_LTO_PROBE_LIBS := -lpthread -lm -lz -ldeflate $(LIBSAIS_OPENMP_LIBS) $(LIBS_EXTRA) \
                 $(if $(filter 1,$(ZLIBNG_USE_VENDORED)),,-lz-ng) $(HTSLIB_static_LIBS)
+            # Prints `ok` if the plain lld link works. Otherwise, lld may only be
+            # missing a library that ld.bfd finds on its built-in path, so the
+            # link is retried with ld.bfd's search directories (SEARCH_DIR in
+            # `ld.bfd --verbose`, falling back to `ld --verbose`; entries whose
+            # path exists and contains only letters, digits or _./+=:-) as
+            # `-Wl,-L<dir>`, and `ok` is
+            # printed followed by those flags if that works; `retried` if it was
+            # tried and failed. `-Wl,-L` rather than `-L`: the clang driver puts
+            # it after its own toolchain directories and after the link's own
+            # -L flags (-Lext/htslib), so these directories are searched last,
+            # as ld.bfd searches them, and never shadow the vendored libraries.
+            # A leading `=` is kept: lld resolves it against the sysroot, so a
+            # sysroot toolchain searches its own tree, not the build host's.
             BWA_LTO_PROBE := $(shell d=$$(mktemp -d 2>/dev/null) || exit 0; \
+                LC_ALL=C; export LC_ALL; \
                 trap 'rm -rf "$$d"' EXIT; \
                 printf 'int lto_probe_c(void){return 3;}\n' > "$$d/a.c"; \
                 printf 'int lto_probe_cpp(){return 4;}\n' > "$$d/b.cpp"; \
                 printf 'extern "C" int lto_probe_c(void);\nint lto_probe_cpp();\nint main(){return lto_probe_c()+lto_probe_cpp()-7;}\n' > "$$d/m.cpp"; \
-                $(CC) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
-                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/b.cpp" -o "$$d/b.o" >/dev/null 2>&1 && \
-                $(CXX) -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
-                $(AR) rcs "$$d/libprobe.a" "$$d/a.o" "$$d/b.o" >/dev/null && \
-                $(CXX) $(LDFLAGS) "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/native" >/dev/null 2>&1 && \
-                $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/lto" >/dev/null 2>&1 && \
-                echo ok)
-            ifeq ($(BWA_LTO_PROBE),ok)
+                link() { $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -fuse-ld=lld $(LDFLAGS) "$$@" "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/lto" >/dev/null 2>&1; }; \
+                if $(CC) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/a.c" -o "$$d/a.o" >/dev/null 2>&1 && \
+                   $(CXX) -flto=$(BWA_LTO_WANT) -ffat-lto-objects -c "$$d/b.cpp" -o "$$d/b.o" >/dev/null 2>&1 && \
+                   $(CXX) -c "$$d/m.cpp" -o "$$d/m.o" >/dev/null 2>&1 && \
+                   $(AR) rcs "$$d/libprobe.a" "$$d/a.o" "$$d/b.o" >/dev/null && \
+                   $(CXX) $(LDFLAGS) "$$d/m.o" "$$d/libprobe.a" $(BWA_LTO_PROBE_LIBS) -o "$$d/native" >/dev/null 2>&1; then \
+                    if link; then echo ok; else \
+                        sysroot=$$($(CXX) -fuse-ld=lld -\#\#\# $(LDFLAGS) "$$d/m.o" -o "$$d/lto" 2>&1 | \
+                            sed -n 's/.*"--sysroot=\([^"]*\)".*/\1/p' | tail -n 1); \
+                        dirs=$$({ ld.bfd --verbose || ld --verbose; } 2>/dev/null | \
+                            grep -o 'SEARCH_DIR("[^"]*")' | sed -e 's/^SEARCH_DIR("//' -e 's/")$$//' | \
+                            while IFS= read -r e; do \
+                                case "$$e" in (*[!A-Za-z0-9_./+=:-]*) continue ;; esac; \
+                                path=$$e; \
+                                case "$$e" in (=*) path="$$sysroot$$(printf '%s' "$$e" | cut -c 2-)" ;; esac; \
+                                [ -d "$$path" ] && printf -- '-Wl,-L%s ' "$$e"; \
+                            done); \
+                        if [ -n "$$dirs" ]; then \
+                            if link $$dirs; then echo "ok $$dirs"; else echo retried; fi; \
+                        fi; \
+                    fi; \
+                fi)
+            # Said in the NOTE/error only when the retry ran.
+            BWA_LTO_RETRIED := $(if $(filter ok retried,$(firstword $(BWA_LTO_PROBE))),$(comma) even with ld.bfd's search directories added)
+            ifeq ($(firstword $(BWA_LTO_PROBE)),ok)
                 BWA_LTO_MODE := $(BWA_LTO_WANT)
+                BWA_LTO_LIBDIRS := $(wordlist 2,$(words $(BWA_LTO_PROBE)),$(BWA_LTO_PROBE))
             else ifeq ($(LTO),auto)
-                $(warning NOTE: building without LTO: the fat-object archive probe with CXX=$(CXX) CC=$(CC) AR=$(AR) failed to compile, archive, or link native/LTO consumers. Use a compatible AR and clang/lld toolchain, or set LTO=off.)
+                $(warning NOTE: building without LTO: the fat-object archive probe with CXX=$(CXX) CC=$(CC) AR=$(AR) failed to compile, archive, or link native/LTO consumers$(BWA_LTO_RETRIED). Use a compatible AR and clang/lld toolchain; add missing library directories to LIBRARY_PATH or LDFLAGS=-L...; or set LTO=off.)
             else
-                $(error LTO=$(LTO) needs clang with -ffat-lto-objects and ld.lld plus an archive compatible with native/LTO consumers; the probe failed (CXX=$(CXX) CC=$(CC) AR=$(AR)). Set AR to a compatible archiver, install lld, or build with LTO=off)
+                $(error LTO=$(LTO) needs clang with -ffat-lto-objects and ld.lld plus an archive compatible with native/LTO consumers; the probe failed$(BWA_LTO_RETRIED) (CXX=$(CXX) CC=$(CC) AR=$(AR)). Set AR to a compatible archiver, install lld, add missing library directories to LIBRARY_PATH or LDFLAGS=-L..., or build with LTO=off)
             endif
         else ifneq ($(BWA_LTO_CXX_CLANG),)
             ifeq ($(LTO),auto)
@@ -857,11 +903,11 @@ ifeq ($(BWA_LTO_RESOLVE),1)
         endif
     endif
     endif
-    export BWA_LTO_MODE
+    export BWA_LTO_MODE BWA_LTO_LIBDIRS
 endif
 ifneq ($(BWA_LTO_MODE),off)
     LTO_CFLAGS  = -flto=$(BWA_LTO_MODE) -ffat-lto-objects
-    LTO_LDFLAGS = -flto=$(BWA_LTO_MODE) -ffat-lto-objects -fuse-ld=lld
+    LTO_LDFLAGS = -flto=$(BWA_LTO_MODE) -ffat-lto-objects -fuse-ld=lld $(BWA_LTO_LIBDIRS)
 else
     LTO_CFLAGS  =
     LTO_LDFLAGS =

@@ -18,7 +18,16 @@
 #   - BWA_LTO_MODE inherited from the environment does not override LTO=; on
 #     the command line (what lto-build passes its inner make) it does.
 #   - With EXPECT_LTO set (CI's clang-19 + lld-19 rows set it to `full`), the
-#     real toolchain must resolve auto to that mode and LTO=thin to thin.
+#     real toolchain must resolve auto to that mode and LTO=thin to thin; and
+#     a clang whose lld link only succeeds with a directory that ld.bfd (not
+#     lld) searches must still resolve auto (and LTO=full) to full, with that
+#     directory at the end of LTO_LDFLAGS as -Wl,-L=<dir> (BWA_LTO_LIBDIRS), and
+#     with no directory added when the first probe succeeds.
+#   - On every host, native archive consumers exercise retries for ordinary
+#     and sysroot-only directories, and rejection of whitespace/shell-special
+#     paths without exporting LTO flags.
+#   - A recursive make inherits BWA_LTO_MODE and BWA_LTO_LIBDIRS; BWA_LTO_MODE
+#     on the command line drops an inherited BWA_LTO_LIBDIRS.
 #
 # Stub compilers stand in for gcc and for a clang without lld, so only the
 # EXPECT_LTO and clang-CXX/gcc-CC checks need a real clang. Archive checks use
@@ -122,12 +131,32 @@ expect_note() {
     fi
 }
 
+# resolve_vars <description> <extra PATH dir or ""> <make args...>: one parse
+# printing BWA_LTO_MODE, BWA_LTO_LIBDIRS and LTO_LDFLAGS; sets rc, got_mode,
+# got_libdirs and got_ldflags (the last three lines of stdout).
+resolve_vars() {
+    local what=$1 extra_path=$2
+    shift 2
+    local path=$PATH
+    [[ -n $extra_path ]] && path="$extra_path:$PATH"
+    rc=0
+    PATH=$path "$MAKE" -s print-BWA_LTO_MODE print-BWA_LTO_LIBDIRS print-LTO_LDFLAGS ARM_TUNE= "$@" \
+        > "$out_file" 2> "$err_file" || rc=$?
+    got_mode="$(tail -n 3 "$out_file" | sed -n 1p)"
+    got_libdirs="$(tail -n 3 "$out_file" | sed -n 2p)"
+    got_ldflags="$(tail -n 3 "$out_file" | sed -n 3p)"
+    : "$what"
+}
+
+bfd_retry_checked=0
+
 gcc_args=(CXX="$stub_dir/g++" CC="$stub_dir/gcc" ALLOW_UNSUPPORTED_COMPILER=1)
 
 expect_error "LTO must be one of" "LTO=bogus" "${gcc_args[@]}" LTO=bogus
 expect_error "LTO must be one of" "LTO='auto off'" "${gcc_args[@]}" "LTO=auto off"
-LTO=1 "$MAKE" -s print-BWA_LTO_MODE ARM_TUNE= "${gcc_args[@]}" > "$out_file" 2> "$err_file" || true
-if ! grep -qF "from the environment is not auto" "$err_file" || [[ "$(tail -n 1 "$out_file")" != off ]]; then
+rc=0
+LTO=1 "$MAKE" -s print-BWA_LTO_MODE ARM_TUNE= "${gcc_args[@]}" > "$out_file" 2> "$err_file" || rc=$?
+if ((rc != 0)) || ! grep -qF "from the environment is not auto" "$err_file" || [[ "$(tail -n 1 "$out_file")" != off ]]; then
     echo "FAIL: an invalid LTO in the environment should warn and resolve, not fail" >&2
     cat "$out_file" "$err_file" >&2
     fail=1
@@ -144,12 +173,41 @@ expect_mode off "ASAN=1" CXX="$CXX" CC="$CC" ASAN=1
 # so even a forced LTO=full is not applied (or checked).
 expect_mode off "BWA_LTO_MODE=off on the command line wins over LTO=full" \
     CXX="$CXX" CC="$CC" LTO=full BWA_LTO_MODE=off
-BWA_LTO_MODE=full "$MAKE" -s print-BWA_LTO_MODE ARM_TUNE= "${gcc_args[@]}" > "$out_file" 2> "$err_file" || true
-if [[ "$(tail -n 1 "$out_file")" != off ]]; then
-    echo "FAIL: BWA_LTO_MODE=full in the environment overrode the top-level resolution (got '$(tail -n 1 "$out_file")')" >&2
+rc=0
+BWA_LTO_MODE=full "$MAKE" -s print-BWA_LTO_MODE ARM_TUNE= "${gcc_args[@]}" > "$out_file" 2> "$err_file" || rc=$?
+if ((rc != 0)) || [[ "$(tail -n 1 "$out_file")" != off ]]; then
+    echo "FAIL: top-level resolution with inherited BWA_LTO_MODE=full: expected off and exit 0, got '$(tail -n 1 "$out_file")' (exit $rc)" >&2
+    cat "$err_file" >&2
     fail=1
 else
     echo "ok: BWA_LTO_MODE in the environment is ignored at the top level"
+fi
+# A recursive make (MAKELEVEL > 0) takes the mode and the ld.bfd directories
+# from its parent's environment without probing again.
+rc=0
+MAKELEVEL=1 BWA_LTO_MODE=full BWA_LTO_LIBDIRS=-Wl,-L=/inherited "$MAKE" -s print-LTO_LDFLAGS ARM_TUNE= "${gcc_args[@]}" \
+    > "$out_file" 2> "$err_file" || rc=$?
+if ((rc != 0)) || [[ "$(tail -n 1 "$out_file")" != "-flto=full -ffat-lto-objects -fuse-ld=lld -Wl,-L=/inherited" ]]; then
+    echo "FAIL: sub-make inheritance: expected full LTO flags with the inherited directory and exit 0, got '$(tail -n 1 "$out_file")' (exit $rc)" >&2
+    cat "$err_file" >&2
+    fail=1
+else
+    echo "ok: a sub-make inherits the mode and the ld.bfd directories"
+fi
+# BWA_LTO_MODE on the command line (lto-build's inner make) drops an inherited
+# BWA_LTO_LIBDIRS.
+rc=0
+BWA_LTO_LIBDIRS=-Wl,-L=/stale "$MAKE" -s print-BWA_LTO_LIBDIRS ARM_TUNE= "${gcc_args[@]}" BWA_LTO_MODE=off \
+    > "$out_file" 2> "$err_file" || rc=$?
+if ((rc != 0)); then
+    echo "FAIL: make failed in the BWA_LTO_MODE command-line override check (exit $rc)" >&2
+    cat "$err_file" >&2
+    fail=1
+elif [[ -n "$(tail -n 1 "$out_file")" ]]; then
+    echo "FAIL: BWA_LTO_MODE on the command line kept an inherited BWA_LTO_LIBDIRS ('$(tail -n 1 "$out_file")')" >&2
+    fail=1
+else
+    echo "ok: BWA_LTO_MODE on the command line drops an inherited BWA_LTO_LIBDIRS"
 fi
 
 if [[ $OS == Darwin ]]; then
@@ -178,6 +236,66 @@ EOF
     if [[ -n ${EXPECT_LTO:-} ]]; then
         expect_mode "$EXPECT_LTO" "real toolchain, LTO=auto" CXX="$CXX" CC="$CC"
         expect_mode thin "real toolchain, LTO=thin" CXX="$CXX" CC="$CC" LTO=thin
+        # The first probe succeeded, so no ld.bfd directories were added.
+        resolve_vars "real toolchain: no ld.bfd directories added" "" CXX="$CXX" CC="$CC"
+        if ((rc == 0)) && [[ -z $got_libdirs ]]; then
+            echo "ok: real toolchain adds no ld.bfd directories"
+        else
+            echo "FAIL: real toolchain: expected an empty BWA_LTO_LIBDIRS, got '$got_libdirs' (exit $rc)" >&2
+            fail=1
+        fi
+        # A library only ld.bfd finds (libdeflate under /usr/local/lib64 on
+        # Amazon Linux 2023): a fake ld.bfd whose only existing SEARCH_DIR is
+        # $bfd_dir, and a clang whose lld link fails unless -Wl,-L=$bfd_dir is
+        # given. The probe must retry with ld.bfd's directories, keep LTO on,
+        # and put them on the LTO link as -Wl,-L (searched after every other
+        # -L, so they cannot shadow the vendored libraries), keeping the `=`.
+        bfd_dir="$stub_dir/bfd-only-lib"
+        bfd_flag="-Wl,-L=$bfd_dir"
+        mkdir -p "$bfd_dir" "$stub_dir/bin"
+        cat > "$stub_dir/bin/ld.bfd" << EOF
+#!/bin/sh
+echo 'SEARCH_DIR("=$bfd_dir"); SEARCH_DIR("=$stub_dir/no-such-dir"); SEARCH_DIR("$stub_dir/has space");'
+EOF
+        chmod +x "$stub_dir/bin/ld.bfd"
+        mkdir -p "$stub_dir/has space"
+        for pair in "clang++:$CXX" "clang:$CC"; do
+            name=${pair%%:*}
+            real=${pair#*:}
+            cat > "$stub_dir/bfdonly-$name" << EOF
+#!/bin/sh
+lld=0
+found=0
+for a in "\$@"; do
+    case "\$a" in -fuse-ld=lld) lld=1 ;; "$bfd_flag") found=1 ;; esac
+done
+if [ \$lld = 1 ] && [ \$found = 0 ]; then
+    echo "ld.lld: error: unable to find library -lstub" >&2
+    exit 1
+fi
+exec "$real" "\$@"
+EOF
+            chmod +x "$stub_dir/bfdonly-$name"
+        done
+        bfd_args=(CXX="$stub_dir/bfdonly-clang++" CC="$stub_dir/bfdonly-clang")
+        resolve_vars "a library only ld.bfd finds" "$stub_dir/bin" "${bfd_args[@]}"
+        if ((rc == 0)) && [[ $got_mode == full && $got_libdirs == "$bfd_flag" && $got_ldflags == *" $bfd_flag" ]] \
+            && ! grep -qF "NOTE" "$err_file"; then
+            echo "ok: a library only ld.bfd finds -> full, with $bfd_flag at the end of LTO_LDFLAGS"
+            bfd_retry_checked=1
+        else
+            echo "FAIL: a library only ld.bfd finds: expected 'full', BWA_LTO_LIBDIRS '$bfd_flag' and LTO_LDFLAGS ending in it, with no NOTE; got '$got_mode' / '$got_libdirs' / '$got_ldflags' (exit $rc)" >&2
+            cat "$err_file" >&2
+            fail=1
+        fi
+        resolve_vars "a library only ld.bfd finds, LTO=full" "$stub_dir/bin" "${bfd_args[@]}" LTO=full
+        if ((rc == 0)) && [[ $got_mode == full && $got_libdirs == "$bfd_flag" ]]; then
+            echo "ok: a library only ld.bfd finds, LTO=full -> full"
+        else
+            echo "FAIL: a library only ld.bfd finds, LTO=full: got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
+            cat "$err_file" >&2
+            fail=1
+        fi
     else
         echo "skip: EXPECT_LTO unset, not asserting the real toolchain's resolved mode"
     fi
@@ -197,17 +315,28 @@ case "${1:-}" in
     --version) echo 'clang version 21.0.0'; exit 0 ;;
     -dumpversion) echo 21; exit 0 ;;
 esac
+if [[ ${1:-} == -fuse-ld=lld && ${2:-} == -### ]]; then
+    printf ' "ld.lld" "--sysroot=%s"\n' "${RETRY_SYSROOT:-}"
+    exit 0
+fi
 args=()
 archive=0
 lto=0
+retry_found=0
 for arg in "$@"; do
     case "$arg" in
         -flto=*) lto=1 ;;
         -ffat-lto-objects | -fuse-ld=lld) ;;
+        -Wl,-L*)
+            [[ $arg == "${RETRY_FLAG:-}" ]] && retry_found=1
+            ;;
         *.a) archive=1; args+=("$arg") ;;
         *) args+=("$arg") ;;
     esac
 done
+if ((archive && lto)) && [[ -n ${RETRY_FLAG:-} ]] && ((retry_found == 0)); then
+    exit 1
+fi
 if ((archive)) && [[ ${REJECT_ARCHIVE_LINK:-} == native && $lto == 0 || ${REJECT_ARCHIVE_LINK:-} == lto && $lto == 1 ]]; then
     exit 1
 fi
@@ -247,6 +376,46 @@ for consumer in native lto; do
     REJECT_ARCHIVE_LINK="$consumer" expect_error "archive" "forced LTO with rejected $consumer consumer" "${probe_args[@]}" LTO=thin
 done
 
+# Retry path checks run on every host using the native archive consumer above.
+# ld.bfd output is data: unsafe entries must not become shell recipe text.
+mkdir -p "$stub_dir/retry-bin"
+cat > "$stub_dir/retry-bin/ld.bfd" << 'EOF'
+#!/bin/sh
+printf 'SEARCH_DIR("%s");\n' "$RETRY_DIR"
+EOF
+chmod +x "$stub_dir/retry-bin/ld.bfd"
+for retry_dir in "$stub_dir/plain+lib" "=$stub_dir/equal-lib"; do
+    mkdir -p "${retry_dir#=}"
+    RETRY_DIR="$retry_dir" RETRY_FLAG="-Wl,-L$retry_dir" resolve_vars "safe retry directory" "$stub_dir/retry-bin" "${probe_args[@]}"
+    if ((rc != 0)) || [[ $got_mode != full || $got_libdirs != "-Wl,-L$retry_dir" ]]; then
+        echo "FAIL: safe retry directory '$retry_dir': got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
+        fail=1
+    else
+        echo 'ok: safe retry directory retains LTO'
+    fi
+done
+sysroot="$stub_dir/sysroot"
+mkdir -p "$sysroot/bwa-retry-only/lib"
+RETRY_SYSROOT="$sysroot" RETRY_DIR='=/bwa-retry-only/lib' RETRY_FLAG='-Wl,-L=/bwa-retry-only/lib' \
+    resolve_vars 'sysroot-only retry directory' "$stub_dir/retry-bin" "${probe_args[@]}"
+if ((rc != 0)) || [[ $got_mode != full || $got_libdirs != '-Wl,-L=/bwa-retry-only/lib' ]]; then
+    echo "FAIL: sysroot-only retry directory: got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
+    fail=1
+else
+    echo 'ok: sysroot-only retry directory retains LTO'
+fi
+for suffix in "has space" "O'Reilly" "dollar\$lib" 'semi;lib' 'comma,lib' 'back`tick' 'hash#lib'; do
+    retry_dir="$stub_dir/$suffix"
+    mkdir -p "$retry_dir"
+    RETRY_DIR="$retry_dir" RETRY_FLAG="-Wl,-L$retry_dir" resolve_vars "unsafe retry directory" "$stub_dir/retry-bin" "${probe_args[@]}"
+    if ((rc != 0)) || [[ $got_mode != off || -n $got_libdirs || -n $got_ldflags ]]; then
+        echo "FAIL: unsafe retry directory '$retry_dir' did not fall back to off (exit $rc)" >&2
+        fail=1
+    else
+        echo 'ok: unsafe retry directory falls back without LTO flags'
+    fi
+done
+
 # The actual library recipe must honor AR, not just the capability probe.
 cat > "$stub_dir/reject-ar" << 'EOF'
 #!/bin/sh
@@ -271,4 +440,5 @@ if ((fail != 0)); then
     echo "FAIL: make_lto_mode"
     exit 1
 fi
-echo "PASS: make_lto_mode (LTO= validation, auto fallbacks, forced-mode errors, BWA_LTO_MODE inheritance)"
+if ((bfd_retry_checked)); then retry_note="ld.bfd search-dir retry, "; else retry_note=""; fi
+echo "PASS: make_lto_mode (LTO= validation, auto fallbacks, ${retry_note}forced-mode errors, BWA_LTO_MODE/BWA_LTO_LIBDIRS inheritance)"
