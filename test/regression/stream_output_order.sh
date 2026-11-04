@@ -16,8 +16,9 @@
 #   1. output must still equal BWA_MEM3_STREAM_OUTPUT=0 byte for byte
 #      (paired and single-end, -t 2, 3 and 4) -- writing without the turn
 #      would put a batch ahead of the one before it;
-#   2. without the delay, every batch writes early (BWA_MEM3_STREAM_STATS=1
-#      reports it per batch), so streaming is engaged and (1) is not vacuous.
+#   2. without the delay, every batch writes early (paired, single-end and sliced
+#      cohorts at -t 2, 3 and 4; BWA_MEM3_STREAM_STATS=1 reports it per batch), so
+#      streaming is engaged and (1) is not vacuous.
 #      BWAMEM3_TESTING_HOLD_LAST_ITEM keeps each pass's last item from leaving
 #      until a prefix has been written, so this does not depend on the caller
 #      running before every item has finished.
@@ -137,11 +138,28 @@ for end in pe se; do
         [[ $n -ge 4 ]] || fail "$tag: only $n batches; expected 8 paired, 4 single-end"
     done
 done
-run pe.nodelay BWAMEM3_TESTING_WRITE_DELAY_MS=0 BWAMEM3_TESTING_HOLD_LAST_ITEM=1 -- -t 4 r1.fq r2.fq
-cmp -s pe.off.sam pe.nodelay.sam || fail "pe.nodelay: streamed output differs from unstreamed"
-n=$(batches pe.nodelay)
-e=$(early_batches pe.nodelay)
-[[ $n -ge 4 && $e -eq $n ]] || fail "pe.nodelay: $e of $n batches wrote early with the last item held; streaming is not engaging"
+# Engagement is a hard gate here, not in the uncontrolled release-binary runs:
+# hold the last item until a prefix is consumed, for every thread count and path.
+for end in pe se slice; do
+    if [[ $end == se ]]; then in=(r1.fq); else in=(r1.fq r2.fq); fi
+    baseline=$end
+    slice=0
+    expected=8
+    if [[ $end == se ]]; then expected=4; fi
+    if [[ $end == slice ]]; then
+        baseline=pe
+        slice=1
+    fi
+    for t in 2 3 4; do
+        tag="$end.hold.t$t"
+        run "$tag" BWAMEM3_TESTING_HOLD_LAST_ITEM=1 BWA_MEM3_COHORT_SLICE_ALL="$slice" -- -t "$t" "${in[@]}"
+        cmp -s "$baseline.off.sam" "$tag.sam" || fail "$tag: streamed output differs from unstreamed"
+        [[ $slice -eq 0 ]] || grep -q 'slicing every' "$tag.err" || fail "$tag: cohorts were not sliced"
+        n=$(batches "$tag")
+        e=$(early_batches "$tag")
+        [[ $n -eq $expected && $e -eq $n ]] || fail "$tag: $e of $n batches wrote early with the last item held; expected $expected armed and streaming batches"
+    done
+done
 # (3) --bam=0, paired. One fixed -o name for every run so the headers match.
 # K divides the 8000 pairs exactly, and an exactly full last batch is not
 # streamed (see mem.md), so cut 7 batches with a short last one instead.
@@ -164,4 +182,4 @@ bam_run bam0.hold BWAMEM3_TESTING_HOLD_LAST_ITEM=1
 cmp -s bam0.off.bam bam0.hold.bam || fail "bam0.hold: streamed BAM differs from unstreamed"
 [[ $(batches bam0.hold) -eq 1 && $(early_batches bam0.hold) -eq 1 ]] \
     || fail "bam0.hold: the last batch did not write early with its last item held ($(early_batches bam0.hold) of $(batches bam0.hold))"
-echo "PASS: stream_output_order ($(batches pe.delay.t4) batches; output is unchanged with the write step delayed; all $e batches write early without the delay; --bam=0 last batch unchanged and streamed)"
+echo "PASS: stream_output_order (output unchanged with delayed writes; every paired, single-end and sliced batch streams with its last item held at -t 2, 3 and 4; --bam=0 last batch unchanged and streamed)"
