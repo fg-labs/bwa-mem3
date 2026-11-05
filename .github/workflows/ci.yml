@@ -1266,8 +1266,9 @@ jobs:
             bash test/regression/make_default_goal.sh
 
       - name: Makefile -O levels (reader C TUs, C++/kernel TUs, CPPFLAGS)
-        # Parse-time check (make -n -B on single objects and on the bwa-mem3
-        # link, prebuilt libraries held old), so it needs no built tree. Pins
+        # Dry-run flag checks plus native differential-reader compilation and
+        # execution (profiling off/on); requires the selected compression deps
+        # and generated headers built above. MAKE_ARGS selects compiler/mode. Pins
         # the reader's -O level: default -O3 with -g, not lowered by an
         # environment CFLAGS, -O1 under ASAN, and EXTRA_CFLAGS last. Also pins
         # that an -O in CPPFLAGS (conda-forge exports -O2 there) lowers neither
@@ -1302,9 +1303,9 @@ jobs:
         run: bash test/regression/make_lto_mode.sh
 
       - name: test/Makefile relink-on-library-change check
-        # Post-build: dry-runs test/Makefile against the standalone binaries
-        # run_unit_tests.sh built above. Compiles and links nothing, so it
-        # takes no MAKE_ARGS.
+        # Post-build: checks all standalone/doctest consumers built by
+        # make -C test all (via run_unit_tests.sh), including one real relink
+        # and execution plus isolated parent-rebuild controls. MAKE selects make.
         if: matrix.canonical == true
         run: bash test/regression/make_test_relink.sh
 

@@ -1395,7 +1395,7 @@ fast_reader_selftest: src/fast_reader.c test/fast_reader_selftest.c test/gz_test
 # Built with $(SRC_CFLAGS), the flags the aligner's reader TUs get, so it checks
 # the parser at the shipped optimization level and ISA flags.
 fr_fastq_diff_test: src/fr_fastq.c src/fast_reader.c test/fr_fastq_diff_test.c test/framework/temp_path.h $(FAST_READER_TEST_DEP) $(FLAGS_STAMP)
-	$(CC) $(SRC_CFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
+	$(CC) $(CFLAGS) $(SRC_CFLAGS) $(CPPFLAGS) -Wall -Wextra $(FAST_READER_TEST_INC) test/fr_fastq_diff_test.c src/fr_fastq.c src/fast_reader.c $(FAST_READER_TEST_LIB) -lz $(FAST_READER_TEST_ZLIBNG) -ldeflate -o $@
 
 # Read+parse microbenchmark: kseq vs fr_fastq on a real FASTQ (no index/align).
 # Usage: ./fr_fastq_bench {kseq|frfastq} reads.fq[.gz] [reps]

@@ -29,7 +29,9 @@ KSEQ_INIT(fast_reader_t *, fast_reader_read)
 
 /* fast_reader.c is instrumented with stage_prof hooks; stub them out so this
  * standalone parser test links without the bwa-mem3 object graph. sp_enabled()
- * returning 0 disables every timing path inside fast_reader.c. */
+ * returning 0 disables every timing path inside fast_reader.c. Profiling builds
+ * inline sp_enabled() as a read of sp_g_on, so supply that disabled flag too. */
+int sp_g_on = 0;
 int    sp_enabled(void) { return 0; }
 double sp_wall(void) { return 0.0; }
 void   sp_read_add(int which, double seconds) { (void)which; (void)seconds; }

@@ -1,161 +1,218 @@
 #!/usr/bin/env bash
-# test/regression/make_test_relink.sh
-#
-# Regression: every standalone binary test/Makefile builds is relinked when
-# ../libbwa.a changes.
-#
-# Was: the standalone rules depended only on their own object, so `make <test>`
-# after a src/ change said "up to date" and the test ran against the OLD
-# library. A parity test then passes or fails against code that is no longer
-# in the tree, and nothing says so.
-#
-# The check is a dry run: it first refreshes the binaries' mtimes so none is
-# older than ../libbwa.a (earlier CI probe steps can re-archive the library
-# after the binaries were linked, which is not this check's concern), then
-# `make -n <bin>` must print no link for any binary; after ../libbwa.a is
-# touched, it must print one for every binary. Nothing is compiled or linked —
-# only mtimes are moved, and the library's and every binary's mtime are put
-# back afterwards so the next real build sees no spurious change.
-#
-# Inputs:
-#   MAKE — make binary (default: make). No MAKE_ARGS: test/Makefile is driven
-#          directly and only under -n, so the flags the tree was built with do
-#          not matter here.
+# Every standalone and doctest binary must relink when a linked archive changes.
+# Requires a matching-flags vendored build: make -C test all. MAKE selects make.
+# Dry runs use -W; only the executed link touches timestamps, restored on exit.
+# System mode is dependency-tested without requiring an installed system zlib-ng.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-
 MAKE="${MAKE:-make}"
-LIB=libbwa.a
-
-if [[ ! -f "$LIB" ]]; then
-    echo "FAIL: $LIB is not built — run this against a built tree"
+libs=(libbwa.a ext/zlib-ng/build/libz-ng.a)
+# Parse-time $(info) notes (e.g. the ARM_TUNE fallback) share stdout with
+# print-%, so keep only the printed values: the last line of each capture.
+if ! bin_list=$("$MAKE" -s -C test print-EXE print-DOCTEST_BINS); then
+    echo 'FAIL: cannot enumerate all EXE and DOCTEST_BINS from test/Makefile' >&2
     exit 1
 fi
-
-# Whole-second mtime, for the same reason as make_header_deps.sh: GNU Make 3.81
-# (Apple's stock make) compares whole seconds, so the touched library has to
-# land a full second past the binaries or make sees nothing to do.
-if stat -c %Y . > /dev/null 2>&1; then
-    mtime_sec() { stat -c %Y "$1"; } # GNU coreutils
-else
-    mtime_sec() { stat -f %m "$1"; } # BSD / macOS
-fi
-
-# Enumerated from the Makefile, not from a copy of its list, so a binary added
-# to EXE without the ../libbwa.a prerequisite fails here.
-read -r -a all_bins <<< "$("$MAKE" -s -C test print-EXE)"
-if ((${#all_bins[@]} == 0)); then
-    echo "FAIL: test/Makefile EXE is empty — is print-% missing?"
+read -r -a bins <<< "$(tail -n 2 <<< "$bin_list" | tr '\n' ' ')"
+if ((${#bins[@]} == 0)); then
+    echo 'FAIL: test/Makefile has no test binaries'
     exit 1
 fi
-
-# The relink assertion only means something when it covers the COMPLETE EXE set.
-# Filtering absent entries out and asserting over the survivors would let a
-# missing binary slip through while the remaining ones report PASS, so require
-# every enumerated binary to be built and executable and fail loudly on any that
-# is not, rather than proving the dependency only for whatever happens to exist.
-missing=()
-for bin in "${all_bins[@]}"; do
-    [[ -x "test/$bin" ]] || missing+=("test/$bin")
+for file in "${libs[@]}"; do
+    if [[ ! -f $file ]]; then
+        echo "FAIL: $file is not built - run this against a vendored build"
+        exit 1
+    fi
 done
-if ((${#missing[@]} != 0)); then
-    echo "FAIL: standalone test binaries not built or not executable: ${missing[*]} — run 'make -C test' first"
-    exit 1
-fi
-# Validated above: every EXE entry exists, so every assertion loop below covers
-# the full set rather than a subset that silently dropped the missing ones.
-bins=("${all_bins[@]}")
-
-# would_link <bin>: true when a dry run of test/Makefile would link <bin>.
-would_link() {
-    "$MAKE" -n -C test "$1" 2> /dev/null | grep -qE -- "(^| )-o $1( |\$)"
-}
-
-# Snapshot the library's and every binary's mtime up front and restore them all
-# on exit, so this check leaves the tree exactly as it found it regardless of
-# where it fails.
-MTIME_REF="$(mktemp)"
-touch -r "$LIB" "$MTIME_REF"
-BIN_REFDIR="$(mktemp -d)"
 for bin in "${bins[@]}"; do
-    touch -r "test/$bin" "$BIN_REFDIR/$bin"
+    if [[ ! -x test/$bin ]]; then
+        echo "FAIL: test/$bin is not built or executable - run make -C test all with matching build flags first"
+        exit 1
+    fi
 done
+
+root=$PWD
+# Fixture timestamps are derived from the newest input (or now, if later) so
+# their ordering against real inputs holds on any date. Probe stat/date once:
+# GNU and BSD spell mtime-in-seconds and epoch formatting differently.
+if stat -c %Y . > /dev/null 2>&1; then
+    stat_mtime=(stat -c %Y) # GNU coreutils
+else
+    stat_mtime=(stat -f %m) # BSD / macOS
+fi
+if date -d @0 +%s > /dev/null 2>&1; then
+    touch_stamp() { date -d "@$1" +%Y%m%d%H%M.%S; }
+else
+    touch_stamp() { date -r "$1" +%Y%m%d%H%M.%S; }
+fi
+newest=$({
+    date +%s
+    find src test ext/htslib "${libs[@]}" -type f -exec "${stat_mtime[@]}" {} +
+} | sort -n | tail -n 1)
+# Ordered stamps, one minute apart, all newer than every current input:
+# consumers < in-parent archive rebuild < synthetic link output.
+consumer_stamp=$(touch_stamp $((newest + 60)))
+archive_stamp=$(touch_stamp $((newest + 120)))
+link_stamp=$(touch_stamp $((newest + 180)))
+export LINK_STAMP=$link_stamp
+refdir="$(mktemp -d)"
+for i in "${!libs[@]}"; do touch -r "${libs[$i]}" "$refdir/lib$i"; done
+for bin in "${bins[@]}"; do touch -r "test/$bin" "$refdir/$bin"; done
 restore_mtimes() {
-    local b
-    touch -r "$MTIME_REF" "$LIB" 2> /dev/null || true
-    for b in "${bins[@]}"; do
-        touch -r "$BIN_REFDIR/$b" "test/$b" 2> /dev/null || true
-    done
-    rm -rf "$MTIME_REF" "$BIN_REFDIR"
+    local i bin
+    for i in "${!libs[@]}"; do touch -r "$refdir/lib$i" "${libs[$i]}"; done
+    for bin in "${bins[@]}"; do touch -r "$refdir/$bin" "test/$bin"; done
+    rm -rf "$refdir"
 }
 trap restore_mtimes EXIT
 
-# --- Baseline: make every built binary newer than the library, so the
-# --- precondition below is clean no matter what order CI ran the earlier
-# --- build/probe steps in. Some of those recompile a src object and re-archive
-# --- libbwa.a after the binaries were linked, leaving the library newer than
-# --- them; a real build would relink the binaries, so that is not this check's
-# --- concern and it must not mask the dependency being verified. Whole-second
-# --- bump, for the GNU Make 3.81 reason noted above.
-lib_m="$(mtime_sec "$LIB")"
-for _ in 1 2 3; do
-    for bin in "${bins[@]}"; do touch "test/$bin"; done
-    oldest_bin=0
+# A mode switch must not dirty the test flag stamp or rebuild every object:
+# this test isolates archive dependencies, not the mode-switch rebuild gate.
+flags_sig=$("$MAKE" -s -C test print-TEST_FLAGS_SIG | tail -n 1)
+# Make the already-built consumers newer than all current inputs. -W below
+# simulates archive changes without touching archives or waiting for the clock.
+for bin in "${bins[@]}"; do touch "test/$bin"; done
+would_link() { # <mode> <binary> [what-if archive]
+    local extra=()
+    [[ -n ${3:-} ]] && extra=(-W "../$3")
+    # The existing ARM rowalt phony gate looks remade under -n; isolate it.
+    if ! "$MAKE" -n -C test -o libsais-objs -o ../src/bandedSWA.rowalt.o "${extra[@]}" "ZLIBNG_USE_VENDORED=$1" "TEST_FLAGS_SIG=$flags_sig" "$2" > "$refdir/dry-run" 2>&1; then
+        cat "$refdir/dry-run" >&2
+        echo 'FAIL: standalone relink dry run failed' >&2
+        exit 1
+    fi
+    grep -qE -- "(^| )-o $2( |\$)" "$refdir/dry-run"
+}
+for mode in 1 0; do
     for bin in "${bins[@]}"; do
-        m="$(mtime_sec "test/$bin")"
-        ((oldest_bin == 0 || m < oldest_bin)) && oldest_bin=$m
+        if would_link "$mode" "$bin"; then
+            echo "FAIL: $bin already stale before archive simulation (vendored=$mode)"
+            exit 1
+        fi
     done
-    ((oldest_bin > lib_m)) && break
-    sleep 1
 done
-if (($(mtime_sec "$LIB") >= oldest_bin)); then
-    echo "FAIL: could not make the test binaries newer than $LIB (timestamp granularity?)"
-    exit 1
-fi
+for lib in "${libs[@]}"; do
+    for mode in 1 0; do
+        want=1
+        [[ $lib != libbwa.a && $mode == 0 ]] && want=0
+        for bin in "${bins[@]}"; do
+            got=0
+            would_link "$mode" "$bin" "$lib" && got=1
+            if ((got != want)); then
+                echo "FAIL: $bin relink=$got, expected $want after only $lib changed (vendored=$mode)"
+                exit 1
+            fi
+        done
+        echo "checked: ${#bins[@]} binaries after only $lib changed (vendored=$mode, expected relink=$want)"
+    done
+done
 
-fail=0
-
-# --- Precondition: with every binary now newer than the library and its own
-# --- object, a dry run must want to link nothing. A link line here means a
-# --- prerequisite the refresh above did not cover — a genuinely out-of-date
-# --- tree — so fail loudly rather than proving nothing below.
-for bin in "${bins[@]}"; do
-    if would_link "$bin"; then
-        echo "FAIL: test/$bin is out of date even after refreshing the binaries — build test/ first"
-        fail=1
+# An archive rebuilt by the ordered parent make must be re-statted in THIS
+# invocation, not one invocation later. Use the actual test Makefile, read-only
+# existing inputs, a tiny parent builder, and a linker that records its outputs.
+fixture="$refdir/in-parent"
+mkdir -p "$fixture/test" "$fixture/ext/zlib-ng/build" "$fixture/ext/libsais/src"
+cp test/Makefile "$fixture/test/Makefile"
+ln -s "$root/src" "$fixture/src"
+ln -s "$root/libbwa.a" "$fixture/libbwa.a"
+ln -s "$root/ext/htslib" "$fixture/ext/htslib"
+for path in "$root"/test/* "$root"/test/.[!.]*; do
+    name=${path##*/}
+    [[ $name == Makefile || $name == .test-build-flags || ! -e $path ]] && continue
+    skip=0
+    for bin in "${bins[@]}"; do [[ $name == "$bin" ]] && skip=1; done
+    ((skip)) || ln -s "$path" "$fixture/test/$name"
+done
+cat > "$fixture/Makefile" << 'EOF'
+.PHONY: parent ext/libsais/src/libsais.o ext/libsais/src/libsais64.o ext/zlib-ng/build/libz-ng.a src/bandedSWA.rowalt.o
+parent:
+	@echo parent >> parent-calls
+ext/libsais/src/libsais.o ext/libsais/src/libsais64.o src/bandedSWA.rowalt.o: parent ;
+ext/zlib-ng/build/libz-ng.a: parent
+	@echo archive >> archive-calls
+	@if test "$(REBUILD_ARCHIVE)" = 1; then touch -t $(ARCHIVE_STAMP) $@; fi
+EOF
+cat > "$fixture/link" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+while (($#)); do
+    if [[ $1 == -o ]]; then
+        case $2 in *.o) echo "FAIL: fixture attempted to compile $2" >&2; exit 1 ;; esac
+        echo "$2" >> ../linked
+        touch -t "$LINK_STAMP" "$2"
+        exit 0
     fi
+    shift
 done
-((fail == 0)) || exit 1
+echo 'FAIL: synthetic linker invoked without an output' >&2
+exit 1
+EOF
+chmod +x "$fixture/link"
+hold_inputs=()
+for object in test/*.o test/framework/*.o test/unit/*.o test/integration/*.o test/framework/*.a; do
+    [[ -e $object ]] && hold_inputs+=(-o "${object#test/}")
+done
+for mode in 1 0; do
+    for changed in 0 1; do
+        printf '%s\n' "$flags_sig" > "$fixture/test/.test-build-flags"
+        touch -t 202001010000 "$fixture/test/.test-build-flags"
+        touch -t "$(touch_stamp "$newest")" "$fixture/ext/zlib-ng/build/libz-ng.a"
+        for bin in "${bins[@]}"; do touch -t "$consumer_stamp" "$fixture/test/$bin"; done
+        : > "$fixture/linked"
+        : > "$fixture/parent-calls"
+        : > "$fixture/archive-calls"
+        rc=0
+        "$MAKE" -s -C "$fixture/test" "${hold_inputs[@]}" "${bins[@]}" "CXX=$fixture/link" ARM_TUNE= UNIT_EXTRA_OBJS= \
+            "TEST_FLAGS_SIG=$flags_sig" "ZLIBNG_USE_VENDORED=$mode" "REBUILD_ARCHIVE=$changed" "ARCHIVE_STAMP=$archive_stamp" > "$refdir/in-parent.log" 2>&1 || rc=$?
+        if ((rc != 0)); then
+            cat "$refdir/in-parent.log" >&2
+            echo "FAIL: in-parent archive fixture failed (exit $rc)" >&2
+            exit "$rc"
+        fi
+        want=0
+        ((mode && changed)) && want=${#bins[@]}
+        got=$(wc -l < "$fixture/linked" | tr -d ' ')
+        parents=$(wc -l < "$fixture/parent-calls" | tr -d ' ')
+        archives=$(wc -l < "$fixture/archive-calls" | tr -d ' ')
+        if ((got != want || parents != 1 || archives != mode)); then
+            cat "$refdir/in-parent.log" "$fixture/linked" >&2
+            echo "FAIL: in-parent vendored=$mode changed=$changed: links=$got (want $want), parents=$parents (want 1), archive builds=$archives (want $mode)" >&2
+            exit 1
+        fi
+        if ((want)); then
+            for bin in "${bins[@]}"; do
+                if ! grep -qxF "$bin" "$fixture/linked"; then
+                    echo "FAIL: in-parent rebuild did not relink $bin" >&2
+                    exit 1
+                fi
+            done
+        fi
+        echo "ok: in-parent vendored=$mode changed=$changed: $got links, one ordered parent"
+    done
+done
 
-newest=0
-for bin in "${bins[@]}"; do
-    m="$(mtime_sec "test/$bin")"
-    ((m > newest)) && newest=$m
-done
-for _ in 1 2 3; do
-    touch "$LIB"
-    (($(mtime_sec "$LIB") > newest)) && break
-    sleep 1
-done
-if (($(mtime_sec "$LIB") <= newest)); then
-    echo "FAIL: could not make $LIB newer than the test binaries (timestamp granularity?)"
+# Execute a real standalone relink as well, preserving its status and logs on
+# failure before the EXIT trap removes the scratch directory.
+touch -t "$archive_stamp" ext/zlib-ng/build/libz-ng.a
+rc=0
+"$MAKE" -C test ZLIBNG_USE_VENDORED=1 "TEST_FLAGS_SIG=$flags_sig" packed_text_test > "$refdir/real-link" 2>&1 || rc=$?
+if ((rc != 0)); then
+    cat "$refdir/real-link" >&2
+    echo "FAIL: standalone archive-only relink failed (exit $rc)" >&2
+    exit "$rc"
+fi
+if ! grep -qE -- '(^| )-o packed_text_test( |$)' "$refdir/real-link"; then
+    cat "$refdir/real-link" >&2
+    echo 'FAIL: standalone make did not execute the archive-only relink'
     exit 1
 fi
-
-# --- The check: every standalone binary relinks after the library changed.
-relinked=0
-for bin in "${bins[@]}"; do
-    if would_link "$bin"; then
-        relinked=$((relinked + 1))
-    else
-        echo "FAIL: test/$bin would NOT relink after $LIB changed — its rule lacks the ../libbwa.a prerequisite"
-        fail=1
-    fi
-done
-
-if ((fail != 0)); then
-    echo "FAIL: test/Makefile standalone binaries do not all track $LIB"
-    exit 1
+rc=0
+./test/packed_text_test > "$refdir/packed-text" 2>&1 || rc=$?
+if ((rc != 0)); then
+    cat "$refdir/packed-text" >&2
+    echo "FAIL: packed_text_test failed after the archive-only relink (exit $rc)" >&2
+    exit "$rc"
 fi
-echo "PASS: all $relinked built standalone test binaries relink after $LIB changes (${#all_bins[@]} listed in EXE)"
+echo 'ok: standalone make executed archive-only relink; packed_text_test ran successfully'
+echo "PASS: make_test_relink (${#bins[@]} legacy/doctest binaries; external and in-parent archive updates; unchanged/system controls)"
