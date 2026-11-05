@@ -308,6 +308,32 @@ typedef struct {
  * lanes, so compaction would only pay its driver overhead there; they keep the plain wrapper. */
 #define BSW_COMPACT_MIN_W_DEFAULT  31
 
+/* Same-row lane compaction in getScores16 (set_lane_compaction16; the drivers are
+ * bandedSWA_compact16.inc on NEON, bandedSWA_compact16_256.inc on AVX2 and
+ * bandedSWA_compact16_512.inc on AVX-512BW): groups per superblock per tier, and rows per block.
+ * Overridable at build time for measurement. The SSE tiers do not compact the 16-bit kernel. */
+#ifndef BSW16_COMPACT_GROUPS_NEON
+#define BSW16_COMPACT_GROUPS_NEON  8    /* 8-lane groups */
+#endif
+#ifndef BSW16_COMPACT_GROUPS_AVX2
+#define BSW16_COMPACT_GROUPS_AVX2  6    /* 16-lane groups */
+#endif
+#ifndef BSW16_COMPACT_GROUPS_AVX512
+#define BSW16_COMPACT_GROUPS_AVX512 2   /* 32-lane groups */
+#endif
+#ifndef BSW16_COMPACT_ROWS_DEFAULT
+#define BSW16_COMPACT_ROWS_DEFAULT 8
+#endif
+#if defined(__aarch64__)
+#define BSW16_COMPACT_GROUPS_TIER BSW16_COMPACT_GROUPS_NEON
+#elif defined(__AVX512BW__)
+#define BSW16_COMPACT_GROUPS_TIER BSW16_COMPACT_GROUPS_AVX512
+#elif defined(__AVX2__)
+#define BSW16_COMPACT_GROUPS_TIER BSW16_COMPACT_GROUPS_AVX2
+#else
+#define BSW16_COMPACT_GROUPS_TIER 0
+#endif
+
 /* Running totals of one kernel object's compaction work (lane_compaction_counts()):
  * superblocks run, lanes moved, and groups retired by evacuation (a group whose lanes all
  * finished is not counted). Never reset. */
@@ -487,6 +513,19 @@ public:
     /* This object's 8-bit extension batches per score domain since construction (both zero
      * on tiers with a single domain). */
     virtual BswScoreDomainCounts bsw8_score_domain_counts() const = 0;
+    /* Same-row lane compaction in getScores16 (NEON, AVX2 and AVX-512BW tiers; a no-op on the
+     * SSE tiers). A batch runs in superblocks of `groups` lane groups in block lockstep, `rows` rows per block,
+     * and at block ends the live lanes of a group are moved into dead lanes of the others once
+     * they fit, so finished pairs stop costing vector rows. Every result field equals the plain
+     * wrapper's (exact by lane independence; see bandedSWA_compact16.inc). `groups` <= 0 runs
+     * the plain wrapper; larger values are capped at BSW_COMPACT_GROUPS_MAX; `rows` < 1 counts as
+     * 1. Only batches of more than one lane group compact. The default is the measured setting:
+     * BSW16_COMPACT_GROUPS_TIER groups and BSW16_COMPACT_ROWS_DEFAULT rows, off on the SSE
+     * tiers. Set at setup, before getScores; not for concurrent use. */
+    virtual void set_lane_compaction16(int groups, int rows) = 0;
+
+    /* This object's 16-bit compaction totals since construction (all zero without it). */
+    virtual BswCompactCounts lane_compaction16_counts() const = 0;
 };
 
 /* Factory: returns a per-tier concrete BandedPairWiseSW. Construction
@@ -645,6 +684,16 @@ public:
                                            int32_t numPairs,
                                            int32_t w,
                                            int K);
+    // The 16-bit kernel's: superblocks of K 8-lane groups in block lockstep, R rows per block;
+    // see bandedSWA_compact16.inc and set_lane_compaction16.
+    template <bool CPG>
+    void smithWatermanBatchWrapper16Compact(SeqPair *pairArray,
+                                            uint8_t *seqBufRef,
+                                            uint8_t *seqBufQer,
+                                            int32_t numPairs,
+                                            int32_t w,
+                                            int K,
+                                            int R);
 #endif
     // 16 bit vector code section
     void getScores16(SeqPair *pairArray,
@@ -750,6 +799,16 @@ public:
                              int32_t w,
                              uint16_t qlen[],
                              uint16_t myband[]);
+    // The 16-bit kernel's lane compaction: superblocks of K 16-lane groups in block lockstep,
+    // R rows per block; see bandedSWA_compact16_256.inc and set_lane_compaction16.
+    template <bool CPG>
+    void smithWatermanBatchWrapper16Compact(SeqPair *pairArray,
+                                            uint8_t *seqBufRef,
+                                            uint8_t *seqBufQer,
+                                            int32_t numPairs,
+                                            int32_t w,
+                                            int K,
+                                            int R);
     
 #endif  //avx2
 #endif  // !ARM guard for AVX2
@@ -814,6 +873,16 @@ public:
                              int32_t w,
                              uint16_t qlen[],
                              uint16_t myband[]);
+    // The 16-bit kernel's lane compaction: superblocks of K 32-lane groups in block lockstep,
+    // R rows per block; see bandedSWA_compact16_512.inc and set_lane_compaction16.
+    template <bool CPG>
+    void smithWatermanBatchWrapper16Compact(SeqPair *pairArray,
+                                            uint8_t *seqBufRef,
+                                            uint8_t *seqBufQer,
+                                            int32_t numPairs,
+                                            int32_t w,
+                                            int K,
+                                            int R);
 #endif  // __AVX512BW__
 #endif  // !ARM guard for AVX512
 
@@ -929,6 +998,19 @@ private:
     int64_t setupTicks;
     int64_t swTicks;
     int64_t sort2Ticks;
+
+    // Same-row lane compaction settings for getScores16 (NEON, AVX2, AVX-512BW). The
+    // tier's default is BSW16_COMPACT_GROUPS_TIER; see set_lane_compaction16. Last in the
+    // class, so every other field keeps its offset.
+    int compact16_groups_ = BSW16_COMPACT_GROUPS_TIER;
+    int compact16_rows_   = BSW16_COMPACT_ROWS_DEFAULT;
+    BswCompactCounts compact16_counts_;   // see lane_compaction16_counts
+public:
+    void set_lane_compaction16(int groups, int rows) override {
+        compact16_groups_ = groups <= 0 ? 0 : (groups > BSW_COMPACT_GROUPS_MAX ? BSW_COMPACT_GROUPS_MAX : groups);
+        compact16_rows_   = rows < 1 ? 1 : rows;
+    }
+    BswCompactCounts lane_compaction16_counts() const override { return compact16_counts_; }
 };
 
 

@@ -95,7 +95,7 @@ jobs:
   avx2-floor-lint:
     name: AVX2 floor (pre-AVX2 x86 refused)
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The pre-AVX2 x86 tiers (sse41/sse42/avx) were retired with the scalar
     # mate-rescue path: batched kswv requires AVX2+, and a sub-AVX2 build would
     # link the SSE kswv exit() stubs and abort at runtime. The Makefile must
@@ -113,7 +113,7 @@ jobs:
           set -u
           fail=0
           # This job asserts the *arch* floor in isolation, so it must not trip
-          # the *compiler* floor first. ubuntu-latest ships gcc 13, which is
+          # the *compiler* floor first. ubuntu-24.04 ships gcc 13, which is
           # below the compiler floor (gcc >= 15); that guard sits above the arch
           # guard in the Makefile, so a bare `make arch=…` would hard-error with
           # the compiler message and mask the arch refusal we are testing (the
@@ -411,9 +411,11 @@ jobs:
       # vacuity checks but reaches fewer of RB_SCORING=random's scoring
       # categories. The "Kernel sweep depth" step resolves the two into
       # KERNEL_SWEEP for the sweep steps.
+      # LLVM 19 packages are published for noble, not every release that
+      # ubuntu-latest may select. Keep build and warm-cache runners aligned.
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             arch_flag: "avx2"
             use_mimalloc: "1"
             canonical: true
@@ -422,7 +424,7 @@ jobs:
             ccache_size: "300M"
             name: "Linux x86_64 AVX2 (mimalloc)"
             artifact_slug: "linux-x86_64-avx2-mimalloc"
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             arch_flag: "avx2"
             use_mimalloc: "0"
             # Built without LTO (see `lto` under the job's env).
@@ -442,7 +444,7 @@ jobs:
           # every PR showed a failed check. Its macOS-only steps stay in place;
           # restore the row (and warm-caches' macos-arm64-mimalloc row) by
           # reverting this change once the runners are reliable again.
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             arch_flag: ""
             use_mimalloc: "1"
             run_integration: true
@@ -457,9 +459,9 @@ jobs:
             artifact_slug: "linux-x86_64-single-mimalloc"
           # gcc build-compatibility lane. The rest of the matrix builds with
           # clang-19 (the shipping/benchmarked compiler); this one row keeps the
-          # g++ build exercised. g++ on ubuntu-latest is below the compiler floor,
+          # g++ build exercised. g++ on ubuntu-24.04 is below the compiler floor,
           # so it opts out with ALLOW_UNSUPPORTED_COMPILER=1 — deliberate here.
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             arch_flag: "avx2"
             use_mimalloc: "1"
             run_integration: true
@@ -1272,7 +1274,8 @@ jobs:
         # the reader, a C++ TU, a per-tier kernel TU nor the LTO link, nor ASAN's
         # -O1 or COVERAGE_OPT, and that the rest of CPPFLAGS is kept, while its
         # -DNDEBUG is stripped (EXTRA_CXXFLAGS/EXTRA_CFLAGS=-DNDEBUG still pass,
-        # also through pgo-generate, pgo-use and lto-build).
+        # also through pgo-generate, pgo-use and lto-build). The compiler's
+        # predefined macros also pin each kernel tier under a stronger ISA default.
         if: matrix.canonical == true
         env:
           MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
@@ -1621,7 +1624,7 @@ jobs:
   canonical-regressions:
     name: Linux x86_64 AVX2 (mimalloc) — regressions
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # One build from a warm compiler cache, the chr22 fixture and index, and a
     # few minutes of regression scripts. Ceiling catches a hung runner only.
     timeout-minutes: 30
@@ -2188,7 +2191,7 @@ jobs:
   rebuild-variants:
     name: Rebuild variants (debug macros, SIMD floor, ASAN)
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Three builds plus the chr22 fixture and parity, a few minutes normally.
     # Ceiling catches a hung runner only.
     timeout-minutes: 30
@@ -2423,7 +2426,7 @@ jobs:
 
   coverage:
     name: Coverage (Linux AVX2, gcov → Codecov)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Build + tests under coverage instrumentation, ~a few minutes normally.
     timeout-minutes: 30
     # Coverage uses gcov/gcovr, which are GCC tools, so this lane must build with
@@ -2554,7 +2557,7 @@ jobs:
     name: MSan padded-lane gate (banded-SW)
     needs: ci-depth
     if: ${{ !cancelled() && github.event_name != 'push' && needs.ci-depth.outputs.depth != 'light' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # One instrumented build of the kernel + a single fast run. Ceiling catches
     # a hung runner only.
     timeout-minutes: 20
@@ -2625,7 +2628,7 @@ jobs:
   profiling-build:
     name: Profiling build (STAGE_PROF=1)
     if: github.event_name != 'push'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Single instrumented build plus a small unit test and one regression.
     timeout-minutes: 20
     # A specialized instrumentation lane exercising the STAGE_PROF=1 code path;
@@ -2725,7 +2728,7 @@ jobs:
           # warms canonical-regressions, which shares its slug and its main
           # build command, so that job needs no row of its own.
           - config: linux-x86_64-avx2-mimalloc
-            os: ubuntu-latest
+            os: ubuntu-24.04
             kind: row
             arch_flag: "avx2"
             use_mimalloc: "1"
@@ -2734,7 +2737,7 @@ jobs:
             chr22_fixture: true
             ccache_size: "300M"
           - config: linux-x86_64-avx2-no-mimalloc
-            os: ubuntu-latest
+            os: ubuntu-24.04
             kind: row
             arch_flag: "avx2"
             use_mimalloc: "0"
@@ -2750,7 +2753,7 @@ jobs:
           # macos-arm64-mimalloc is removed with build-and-test's macOS row (see
           # there); restore both together.
           - config: linux-x86_64-single-mimalloc
-            os: ubuntu-latest
+            os: ubuntu-24.04
             kind: row
             arch_flag: ""
             use_mimalloc: "1"
@@ -2759,7 +2762,7 @@ jobs:
             lto: "off"
             ccache_size: "300M"
           - config: linux-x86_64-avx2-gcc-compat
-            os: ubuntu-latest
+            os: ubuntu-24.04
             kind: row
             arch_flag: "avx2"
             use_mimalloc: "1"
@@ -2767,15 +2770,15 @@ jobs:
             cc: "gcc"
             allow_unsupported: "1"
           - config: rebuild-variants
-            os: ubuntu-latest
+            os: ubuntu-24.04
             kind: rebuild-variants
             ccache_size: "300M"
           - config: msan-padded-lane-gate
-            os: ubuntu-latest
+            os: ubuntu-24.04
             kind: msan
             apt_packages: "zlib1g-dev libdeflate-dev autoconf automake libomp-dev ccache"
           - config: profiling-build
-            os: ubuntu-latest
+            os: ubuntu-24.04
             kind: profiling
             cxx: "g++"
             cc: "gcc"
@@ -2938,7 +2941,7 @@ jobs:
       # result) are keyed on their inputs, not the commit, but a cache saved in
       # a PR or merge-queue scope is not shared, so without a main copy every
       # new PR would rebuild them. Run the action once per runner type that
-      # uses it (ubuntu-latest, ubuntu-24.04-arm, macos-latest), on the warm
+      # uses it (ubuntu-24.04, ubuntu-24.04-arm, macos-latest), on the warm
       # entry that already runs there. Its bwa comes from the same apt step and
       # package list (Linux) or brew formula (macOS) as build-and-test's, so
       # the bwa version in the cache keys matches. After the ccache save, so a

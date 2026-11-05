@@ -694,12 +694,13 @@ BASE_CXXFLAGS = -g -O3 -std=gnu++14 -fpermissive $(ASAN_FLAGS) $(LIBSAIS_OPENMP_
 # though its legacy per-binary rules still carry a hand-maintained list.
 DEPFLAGS = -MMD -MP
 
-# Per-tier ISA flag groups for kernel multi-tier compilation (x86_64 only).
-KERNEL_FLAGS_sse41    = -msse4.1
-KERNEL_FLAGS_sse42    = -msse4.2 -mpopcnt
-KERNEL_FLAGS_avx      = -mavx -mpopcnt
-KERNEL_FLAGS_avx2     = -mavx -mavx2 -mpopcnt
-KERNEL_FLAGS_avx512bw = -mavx -mavx2 -mavx512f -mavx512bw -mpopcnt
+# Reset the compiler's default ISA before enabling each tier. Some toolchains
+# default to x86-64-v3; -msse4.1 alone does not disable that baseline's AVX2.
+KERNEL_FLAGS_sse41    = -march=x86-64 -msse4.1
+KERNEL_FLAGS_sse42    = -march=x86-64 -msse4.2 -mpopcnt
+KERNEL_FLAGS_avx      = -march=x86-64 -mavx -mpopcnt
+KERNEL_FLAGS_avx2     = -march=x86-64 -mavx -mavx2 -mpopcnt
+KERNEL_FLAGS_avx512bw = -march=x86-64 -mavx -mavx2 -mavx512f -mavx512bw -mpopcnt
 
 # Source files compiled at every tier on x86_64.
 KERNEL_SRCS = src/bandedSWA.cpp src/kswv.cpp src/ksw.cpp src/sam_encode.cpp
