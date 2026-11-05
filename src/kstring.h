@@ -32,6 +32,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 
 #ifdef USE_MALLOC_WRAPPERS
 #  include "malloc_wrap.h"
@@ -197,10 +198,23 @@ static inline void kputw_u(int c, kstring_t *s) {
 }
 
 static inline void kputul_u(unsigned long c, kstring_t *s) {
-	if (c == 0) { s->s[s->l++] = '0'; return; }
+	/* SAM coordinates and template lengths usually fit the narrower formatter. */
+	if (c <= UINT_MAX) { kputuw_u((unsigned)c, s); return; }
 	char buf[24];
 	int l = 0;
-	while (c > 0) { buf[l++] = (char)(c % 10 + '0'); c /= 10; }
+	while (c >= 100) {
+		unsigned d = (unsigned)(c % 100) << 1;
+		c /= 100;
+		buf[l++] = kputuw_digits2[d + 1];
+		buf[l++] = kputuw_digits2[d];
+	}
+	if (c >= 10) {
+		unsigned d = (unsigned)c << 1;
+		buf[l++] = kputuw_digits2[d + 1];
+		buf[l++] = kputuw_digits2[d];
+	} else {
+		buf[l++] = (char)(c + '0');
+	}
 	while (l-- > 0) s->s[s->l++] = buf[l];
 }
 
