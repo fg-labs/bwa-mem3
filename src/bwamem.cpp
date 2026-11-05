@@ -5356,7 +5356,7 @@ int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a)
     sub = a->csub > sub? a->csub : sub;
     if (sub >= a->score) return 0;
     l = a->qe - a->qb > a->re - a->rb? a->qe - a->qb : a->re - a->rb;
-    identity = 1. - (double)(l * opt->a - a->score) / (opt->a + opt->b) / l;
+    identity = 1. - (double)((int64_t)l * opt->a - a->score) / (opt->a + opt->b) / l;
     if (a->score == 0) {
         mapq = 0;
     } else if (mem_want_seedcov(opt)) {  /* legacy model: the only seedcov reader */
@@ -5366,9 +5366,12 @@ int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a)
         double tmp;
         tmp = l < opt->mapQ_coef_len? 1. : opt->mapQ_coef_fac / log(l);
         tmp *= identity * identity;
-        mapq = (int)(6.02 * (a->score - sub) / opt->a * tmp * tmp + .499);
+        const double q = 6.02 * ((int64_t)a->score - sub) / opt->a * tmp * tmp + .499;
+        // Keep the multiplicity correction before final clipping, even when a
+        // synthetic high-score region exceeds the intermediate integer range.
+        mapq = q >= INT32_MAX ? INT32_MAX : (int)q;
     }
-    if (a->sub_n > 0) mapq -= (int)(4.343 * log(a->sub_n+1) + .499);
+    if (a->sub_n > 0) mapq -= (int)(4.343 * log((double)a->sub_n + 1.) + .499);
     if (mapq > 60) mapq = 60;
     if (mapq < 0) mapq = 0;
     mapq = (int)(mapq * (1. - a->frac_rep) + .499);

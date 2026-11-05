@@ -31,6 +31,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <cstdint>
 
 namespace {
 
@@ -89,6 +90,8 @@ struct PairFixture {
 };
 
 } // namespace
+
+TEST_SUITE("unit/pair") {
 
 // When no pair scores above 0, mem_pair still writes z[] for the q = 0
 // candidate; the caller ignores z[] whenever the returned score is 0, so these
@@ -193,3 +196,225 @@ TEST_CASE("mem_pair: an insert size where erfc underflows scores 0") {
     CHECK(p.sub == 0);
     CHECK(p.n_sub == 0);
 }
+
+TEST_CASE("mem_pair: finite scores saturate only after the insert-size adjustment") {
+    // Catch an unchecked out-of-range cast, or clamping the sum before applying
+    // the insert-size penalty. At the mean the fractional term is .9988;
+    // two standard deviations out it is -1.2292.
+    const struct {
+        int s0, s1;
+        int64_t pos1;
+        int want;
+    } cases[] = {
+        {1073741823, 1073741823, 1300, 2147483646},
+        {1073741823, 1073741824, 1300, INT32_MAX},
+        {1073741824, 1073741824, 1300, INT32_MAX},
+        {1100000000, 1100000000, 1300, INT32_MAX},
+        {INT32_MAX, INT32_MAX, 1300, INT32_MAX},
+        {1073741824, 1073741824, 1400, 2147483646},
+    };
+    for (const auto &c : cases) {
+        CAPTURE(c.s0); CAPTURE(c.s1); CAPTURE(c.pos1);
+        PairFixture f;
+        mem_alnreg_t r0[1] = { region(1000, c.s0) };
+        mem_alnreg_t r1[1] = { region(c.pos1, c.s1) };
+        const PairResult p = f.run(r0, 1, r1, 1);
+        CHECK(p.o == c.want);
+        CHECK(p.z[0] == 0);
+        CHECK(p.z[1] == 0);
+        CHECK(p.sub == 0);
+        CHECK(p.n_sub == 0);
+    }
+}
+
+TEST_CASE("mem_pair: a saturated pair retains its runner-up and selected indices") {
+    PairFixture f;
+    mem_alnreg_t r0[2] = { region(1000, 0), region(1000, 1100000000) };
+    mem_alnreg_t r1[1] = { region(1300, 1100000000) };
+    const PairResult p = f.run(r0, 2, r1, 1);
+    CHECK(p.o == INT32_MAX);
+    CHECK(p.z[0] == 1);
+    CHECK(p.z[1] == 0);
+    CHECK(p.sub == 1100000000);
+    CHECK(p.n_sub == 1);
+}
+
+TEST_CASE("mem_pair: saturated runner-ups count only nearby scores") {
+    PairFixture f;
+    mem_alnreg_t r0[3] = { region(1000, 0), region(1000, 1100000000), region(1000, 1100000001) };
+    mem_alnreg_t r1[1] = { region(1300, 1100000000) };
+    const PairResult p = f.run(r0, 3, r1, 1);
+    CHECK(p.o == INT32_MAX);
+    CHECK(p.sub == INT32_MAX);
+    CHECK(p.n_sub == 1); // the 1.1-billion candidate is far below the runner-up
+    CHECK(p.z[0] == 2); // larger low-32-bit hash: 2824057045 vs 1411446537
+    CHECK(p.z[1] == 0);
+}
+
+TEST_CASE("mem_pair_resolve_batch_post: high pair scores have defined MAPQ arithmetic") {
+    // Catch overflow in the unpaired score, meth margin and MAPQ conversion
+    // after mem_pair returns INT32_MAX. The single-end competitor is ten
+    // points behind, so its own MAPQ rounds to zero in the legacy model.
+    const struct {
+        int s0, s1, penalty, flag, legacy_mapq, default_mapq;
+    } cases[] = {
+        {1100000000, 1100000000, 17, 1, 0, 60},
+        {1073741823, 1073741824, 17, 3, 40, 60},
+        {INT32_MAX, 0, INT32_MAX, 3, 40, 60},
+    };
+    for (const auto &c : cases) for (int meth = 0; meth <= 1; ++meth)
+    for (int legacy = 0; legacy <= 1; ++legacy) {
+        CAPTURE(c.s0); CAPTURE(c.s1); CAPTURE(c.penalty); CAPTURE(meth); CAPTURE(legacy);
+        PairFixture f;
+        f.g.o->flag |= MEM_F_NO_RESCUE;
+        f.g.o->meth_mode = meth;
+        f.g.o->pen_unpaired = c.penalty;
+        if (legacy) f.g.o->mapQ_coef_len = 0;
+        mem_alnreg_t regs[2] = { region(1000, c.s0), region(1300, c.s1) };
+        mem_alnreg_v a[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            regs[i].sub = regs[i].csub = regs[i].score > 10 ? regs[i].score - 10 : 0;
+            regs[i].seedcov = 150;
+            a[i].n = a[i].m = 1;
+            a[i].a = &regs[i];
+        }
+        mem_cache *mmc = (mem_cache *)calloc(1, sizeof(mem_cache));
+        REQUIRE(mmc != NULL);
+        int32_t gcnt = 0;
+        int n_pri[2], z[2], q_se[2], extra_flag, paired;
+        mem_pair_resolve_batch_post(f.g.o, &f.bns, NULL, f.pes, 7, f.s, a,
+                                   NULL, mmc, gcnt, 0, n_pri, z, q_se, &extra_flag, &paired);
+        free(mmc);
+        CHECK(paired == 1);
+        CHECK(extra_flag == c.flag);
+        CHECK(z[0] == 0);
+        CHECK(z[1] == 0);
+        CHECK(n_pri[0] == 1);
+        CHECK(n_pri[1] == 1);
+        const int want = legacy ? c.legacy_mapq : c.default_mapq;
+        CHECK(q_se[0] == want);
+        CHECK(q_se[1] == (c.s1 == 0 ? 0 : want));
+    }
+}
+
+TEST_CASE("mem_pair_resolve_batch_post: meth second-best sum stays wide") {
+    PairFixture f;
+    f.g.o->flag |= MEM_F_NO_RESCUE;
+    f.g.o->meth_mode = 1;
+    f.g.o->pen_unpaired = 100000000;
+    f.g.o->mapQ_coef_len = 0;
+    mem_alnreg_t r0[2] = { region(1000, 1100000000), region(10000, 1099999990) };
+    mem_alnreg_t r1[2] = { region(1300, 1100000000), region(20000, 1099999990) };
+    for (int i = 0; i < 2; ++i) {
+        r0[i].seedcov = r1[i].seedcov = 150;
+        r0[i].csub = r1[i].csub = 1099999990;
+    }
+    const PairResult p = f.run(r0, 2, r1, 2);
+    CHECK(p.o == INT32_MAX);
+    CHECK(p.sub == 0);
+    CHECK(p.n_sub == 0);
+    CHECK(p.z[0] == 0);
+    CHECK(p.z[1] == 0);
+    mem_alnreg_v a[2] = {};
+    a[0].a = r0; a[1].a = r1;
+    for (int i = 0; i < 2; ++i) a[i].n = a[i].m = 2;
+    mem_cache *mmc = (mem_cache *)calloc(1, sizeof(mem_cache));
+    REQUIRE(mmc != NULL);
+    int32_t gcnt = 0;
+    int n_pri[2], z[2], q_se[2], flag, paired;
+    mem_pair_resolve_batch_post(f.g.o, &f.bns, NULL, f.pes, 7, f.s, a,
+                               NULL, mmc, gcnt, 0, n_pri, z, q_se, &flag, &paired);
+    free(mmc);
+    CHECK(paired == 1);
+    CHECK(flag == 3);
+    CHECK(z[0] == 0);
+    CHECK(z[1] == 0);
+    CHECK(n_pri[0] == 2);
+    CHECK(n_pri[1] == 2);
+    CHECK(a[0].n == 2);
+    CHECK(a[1].n == 2);
+    CHECK(r0[1].score == 1099999990);
+    CHECK(r1[1].score == 1099999990);
+    // INT32_MAX + 4 - 2*1099999990 < 0; a narrow sum instead raises MAPQ to 40.
+    CHECK(q_se[0] == 0);
+    CHECK(q_se[1] == 0);
+}
+
+TEST_CASE("mem_approx_mapq_se: consistent long-span match product stays wide") {
+    OptGuard g;
+    g.o->a = 127;
+    mem_alnreg_t r = region(1000, 2000000000);
+    r.qe = 20000000;
+    r.re = r.rb + 20000000;
+    r.seedcov = 20000000;
+    r.sub = r.csub = 1999000000;
+    r.sub_n = 1000;
+    // l*A = 2540000000; identity .7938931298 gives raw MAPQ 600.
+    // The 30-point multiplicity penalty still leaves MAPQ above 60.
+    CHECK(mem_approx_mapq_se(g.o, &r) == 60);
+    g.o->mapQ_coef_len = 0;
+    CHECK(mem_approx_mapq_se(g.o, &r) == 0);
+}
+
+TEST_CASE("mem_approx_mapq_se: suboptimal count correction precedes clipping") {
+    OptGuard g;
+    mem_alnreg_t r = region(1000, 100);
+    r.qe = 100; r.re = r.rb + 100; r.seedcov = 100;
+    r.sub = r.csub = 70;
+    r.sub_n = 100;
+    // Default raw MAPQ 77 minus rounded 4.343*ln(101) = 20.
+    CHECK(mem_approx_mapq_se(g.o, &r) == 57);
+    g.o->mapQ_coef_len = 0;
+    // Legacy raw MAPQ rounds to 41; same correction leaves 21.
+    CHECK(mem_approx_mapq_se(g.o, &r) == 21);
+    r.sub_n = INT32_MAX;
+    CHECK(mem_approx_mapq_se(g.o, &r) == 0);
+    g.o->mapQ_coef_len = 50;
+    CHECK(mem_approx_mapq_se(g.o, &r) == 0);
+}
+
+TEST_CASE("mem_approx_mapq_se: legacy MAPQ detects a wrapped identity numerator") {
+    OptGuard g;
+    g.o->a = 127;
+    g.o->mapQ_coef_len = 0;
+    mem_alnreg_t r = region(1000, 100000000);
+    r.qe = 20000000;
+    r.re = r.rb + 20000000;
+    r.seedcov = 20000000;
+    r.sub = r.csub = 50000000;
+    // l*A - score = 2440000000 exceeds INT32_MAX. Wide identity is about
+    // 0.0687, giving MAPQ 1; a wrapped numerator skips scaling and clips to 60.
+    CHECK(mem_approx_mapq_se(g.o, &r) == 1);
+}
+
+TEST_CASE("mem_pair_resolve_batch_post: tandem caps cannot produce negative MAPQ") {
+    for (int meth = 0; meth <= 1; ++meth) for (int capped = 0; capped < 2; ++capped)
+    for (int legacy = 0; legacy <= 1; ++legacy) {
+        CAPTURE(meth); CAPTURE(capped); CAPTURE(legacy);
+        PairFixture f;
+        f.g.o->flag |= MEM_F_NO_RESCUE;
+        f.g.o->meth_mode = meth;
+        if (legacy) f.g.o->mapQ_coef_len = 0;
+        mem_alnreg_t regs[2] = { region(1000, 100), region(1300, 100) };
+        mem_alnreg_v a[2] = {};
+        for (int i = 0; i < 2; ++i) {
+            regs[i].seedcov = 150;
+            regs[i].csub = i == capped ? 110 : 90;
+            a[i].n = a[i].m = 1;
+            a[i].a = &regs[i];
+        }
+        mem_cache *mmc = (mem_cache *)calloc(1, sizeof(mem_cache));
+        REQUIRE(mmc != NULL);
+        int32_t gcnt = 0;
+        int n_pri[2], z[2], q_se[2], flag, paired;
+        mem_pair_resolve_batch_post(f.g.o, &f.bns, NULL, f.pes, 7, f.s, a,
+                                   NULL, mmc, gcnt, 0, n_pri, z, q_se, &flag, &paired);
+        free(mmc);
+        CHECK(paired == 1);
+        CHECK(flag == 3);
+        CHECK(q_se[capped] == 0);
+        CHECK(q_se[!capped] == (legacy ? 53 : 56)); // single-end MAPQ plus the boost of 40
+    }
+}
+
+} // TEST_SUITE("unit/pair")
