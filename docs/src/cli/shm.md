@@ -105,6 +105,60 @@ near-linearly with thread count (on hg38, Graviton4, arm64/NEON tier, the
 densify pass runs ~11 min at `-t 1` and ~40 s at `-t 16`). Meaningful only with
 `-u`; a value `> 1` without `-u` warns and is ignored.
 
+### `--huge-pages[=DIR]` — stage the index on 1 GB huge pages (Linux, opt-in)
+
+Writes the packed index to a file on a `hugetlbfs` mount with 1 GB pages
+instead of into `/dev/shm`, so every `mem` that attaches maps it on 1 GB pages.
+This is the shared-memory counterpart of
+[`mem --huge-pages`](mem.md#--huge-pages--put-the-index-on-1-gb-huge-pages-linux-opt-in),
+which has no effect on an attached index: it cuts data-TLB page walks in
+seeding on hosts whose 1 GB pages reach the TLB. `/dev/shm` is a tmpfs, which
+can back a segment with 2 MB pages at most (see
+[Huge pages](#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size) below).
+
+With no `DIR`, `shm` uses the first `hugetlbfs` mount with `pagesize=1G` in
+`/proc/mounts` that it can create files in. The whole segment goes on 1 GB
+pages, rounded up to whole pages: 11 pages for hg38, about 4 more with `-u 2`.
+The pages are reserved when the file is mapped and faulted in over several
+threads before the index is written. The registry entry and the name are the
+same as for a `/dev/shm` stage, so `mem`, `shm -l` and `shm -d` need no flag:
+`/dev/shm` holds a small redirect record that points at the file, and `shm -d`
+removes the file too, which returns its pages to the pool.
+
+Set up once per boot (as root), then stage as the user who will run `mem`:
+
+```bash
+echo 12 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+sudo mkdir -p /mnt/huge-1g
+sudo mount -t hugetlbfs -o pagesize=1G,uid=$(id -u),gid=$(id -g),mode=0755 none /mnt/huge-1g
+bwa-mem3 shm --huge-pages ref.fa        # or --huge-pages=/mnt/huge-1g
+bwa-mem3 mem -t 16 ref.fa R1.fq R2.fq > out.sam
+bwa-mem3 shm -d                         # removes /mnt/huge-1g/bwaidx-ref.fa too
+```
+
+**Safe by default:** when there is no such mount, the pool has too few free
+pages, the mount's `size=` limit is reached, the pages cannot be faulted in
+(this needs Linux 5.14 or later), or the index is 512 MiB or less, `shm` stages
+into `/dev/shm` as usual and a one-line `[M::bwa_shm_stage]` note says why. The
+staged bytes are the same either way, so **alignments are byte-identical**.
+
+Notes:
+
+- The pages stay reserved, pinned and out of the page cache until `shm -d`
+  (or until the file is removed by hand). A stage that is killed before it
+  finishes is not registered, so `shm -d` does not see it: remove the file
+  `bwaidx-<name>` on the mount, and `/dev/shm/bwaidx-<name>` if present, to
+  free its pages and stage again.
+- hugetlbfs pages are not counted in a process's RSS. To check placement, a
+  running `mem`'s `/proc/<pid>/smaps` entry for the file shows
+  `KernelPageSize: 1048576 kB` and `Shared_Hugetlb` (or `Private_Hugetlb`).
+- As with `mem --huge-pages`, the gain depends on the host: it measured
+  about 0.7 % faster for a disk-loaded index on Intel Sapphire Rapids, and
+  within noise on AMD Zen 4 instances whose hypervisor backs guest memory with
+  2 MB pages. Measure on your own host.
+- A `bwa-mem3` older than this option sees the redirect record as an unknown
+  segment and loads the index from disk.
+
 ## Performance
 
 Denser SA sampling lowers alignment CPU by shortening the LF-walk each SA

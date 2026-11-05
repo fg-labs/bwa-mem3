@@ -32,6 +32,7 @@
 #include "bntseq.h"        /* bntseq_t, bns_restore, bns_destroy */
 #include "utils.h"         /* err_fread_noeof, err_fclose, xopen */
 #include "bwa_madvise.h"   /* bwamem_madv_hugepage */
+#include "bwa_hugepages.h" /* bwamem_hugetlb_round_up, bwamem_hugetlb_prefault, BWAMEM_HUGETLB_MIN_BYTES */
 
 #include <stdio.h>
 #include <cstdlib>
@@ -45,6 +46,13 @@
 #include <semaphore.h>     /* sem_open, sem_wait, sem_post, sem_close, sem_unlink */
 #include <errno.h>
 #include <limits.h>        /* PATH_MAX */
+#if defined(__linux__)
+#include <sys/vfs.h>       /* fstatfs, statfs — hugetlbfs mount check */
+#endif
+
+#ifndef HUGETLBFS_MAGIC
+#define HUGETLBFS_MAGIC 0x958458f6   /* <linux/magic.h> */
+#endif
 
 /* /bwactl layout: 16-bit n_entries, 16-bit next_write_offset, then packed
  * (int64_t l_mem, char[] basename) entries. The header is 4 bytes total
@@ -181,6 +189,241 @@ static void *idx_segment_map(int fd, size_t len, int prot)
     if (m != MAP_FAILED) bwamem_madv_hugepage(m, len);
     return m;
 }
+
+/* ---- 1 GB hugetlb staging: see bwa_shm.h ------------------------------ */
+
+static const uint64_t BWA_SHM_ONE_GIB = 1ull << 30;
+
+uint64_t bwa_shm_hugetlb_min_bytes = (uint64_t)BWAMEM_HUGETLB_MIN_BYTES;
+
+/* Whether the last component of `path` starts with BWA_SHM_HUGETLB_FILE_PREFIX.
+ * Both the attach and the destroy follow a stub only to such a file, so a
+ * stub can never make `shm -d` remove some unrelated file. */
+static bool hugetlb_path_is_index_file(const char *path)
+{
+    const char *base = prefix_basename(path);
+    return base != NULL &&
+           std::strncmp(base, BWA_SHM_HUGETLB_FILE_PREFIX,
+                        sizeof(BWA_SHM_HUGETLB_FILE_PREFIX) - 1) == 0 &&
+           base[sizeof(BWA_SHM_HUGETLB_FILE_PREFIX) - 1] != '\0';
+}
+
+/* Field checks shared by encode and decode. */
+static bool hugetlb_stub_fields_ok(const char *path, size_t path_cap,
+                                   uint64_t total_size, uint64_t file_size)
+{
+    if (path == NULL || path[0] != '/') return false;
+    if (strnlen(path, path_cap) == path_cap) return false;      /* no NUL */
+    if (!hugetlb_path_is_index_file(path)) return false;
+    if (total_size == 0 || total_size > file_size) return false;
+    if (file_size % BWA_SHM_ONE_GIB != 0) return false;
+    return true;
+}
+
+extern "C" int bwa_shm_hugetlb_stub_encode(const char *path, uint64_t total_size,
+                                           uint64_t file_size, bwa_shm_hugetlb_stub_t *out)
+{
+    if (out == NULL) return -1;
+    std::memset(out, 0, sizeof(*out));
+    if (!hugetlb_stub_fields_ok(path, PATH_MAX, total_size, file_size)) return -1;
+    out->magic      = BWA_SHM_HUGETLB_STUB_MAGIC;
+    out->version    = BWA_SHM_HUGETLB_STUB_VERSION;
+    out->total_size = total_size;
+    out->file_size  = file_size;
+    std::memcpy(out->path, path, std::strlen(path) + 1);
+    return 0;
+}
+
+extern "C" int bwa_shm_hugetlb_stub_decode(const void *buf, size_t len,
+                                           bwa_shm_hugetlb_stub_t *out)
+{
+    if (buf == NULL || out == NULL || len != sizeof(bwa_shm_hugetlb_stub_t)) return -1;
+    bwa_shm_hugetlb_stub_t stub;
+    std::memcpy(&stub, buf, sizeof(stub));
+    if (stub.magic != BWA_SHM_HUGETLB_STUB_MAGIC) return -1;
+    if (stub.version != BWA_SHM_HUGETLB_STUB_VERSION) return -1;
+    if (!hugetlb_stub_fields_ok(stub.path, sizeof(stub.path),
+                                stub.total_size, stub.file_size)) return -1;
+    *out = stub;
+    return 0;
+}
+
+/* Whether a hugetlbfs `pagesize=` value is 1 GiB. The kernel prints it in the
+ * largest of K or M that divides it (1 GiB is "1024M"); also accept the "1G"
+ * and "1048576K" spellings a mount command takes. */
+static bool hugetlb_pagesize_is_1g(const char *v, size_t n)
+{
+    static const char *const ok[] = {"1024M", "1G", "1048576K"};
+    for (const char *o : ok) {
+        if (std::strlen(o) == n && strncasecmp(v, o, n) == 0) return true;
+    }
+    return false;
+}
+
+extern "C" int bwa_shm_parse_hugetlbfs_1g_mount(const char *line, char *dir_out, size_t dir_len)
+{
+    if (line == NULL || dir_out == NULL || dir_len == 0) return 0;
+    /* Split the first four space-separated fields. */
+    const char *f[4]; size_t fl[4];
+    const char *p = line;
+    for (int i = 0; i < 4; ++i) {
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '\0' || *p == '\n') return 0;
+        f[i] = p;
+        while (*p != '\0' && *p != ' ' && *p != '\t' && *p != '\n') ++p;
+        fl[i] = (size_t)(p - f[i]);
+    }
+    if (fl[2] != 9 || std::strncmp(f[2], "hugetlbfs", 9) != 0) return 0;
+
+    /* Options: comma-separated, find pagesize=. */
+    bool is_1g = false;
+    const char *o = f[3], *oend = f[3] + fl[3];
+    while (o < oend) {
+        const char *c = o;
+        while (c < oend && *c != ',') ++c;
+        static const char key[] = "pagesize=";
+        const size_t klen = sizeof(key) - 1;
+        if ((size_t)(c - o) > klen && std::strncmp(o, key, klen) == 0)
+            is_1g = hugetlb_pagesize_is_1g(o + klen, (size_t)(c - o) - klen);
+        o = c + 1;
+    }
+    if (!is_1g) return 0;
+
+    /* Decode the directory: /proc/mounts escapes space, tab, newline and
+     * backslash as a backslash and three octal digits. */
+    size_t w = 0;
+    for (size_t i = 0; i < fl[1]; ++i) {
+        char ch = f[1][i];
+        if (ch == '\\' && i + 3 < fl[1]) {
+            const char *d = f[1] + i + 1;
+            if (d[0] >= '0' && d[0] <= '3' && d[1] >= '0' && d[1] <= '7' &&
+                d[2] >= '0' && d[2] <= '7') {
+                ch = (char)(((d[0] - '0') << 6) | ((d[1] - '0') << 3) | (d[2] - '0'));
+                i += 3;
+            }
+        }
+        if (w + 1 >= dir_len) return 0;
+        dir_out[w++] = ch;
+    }
+    dir_out[w] = '\0';
+    return dir_out[0] == '/' ? 1 : 0;
+}
+
+extern "C" void bwa_shm_hugetlb_close(bwa_shm_hugetlb_file_t *f, bool unlink_file)
+{
+    if (f == NULL) return;
+    if (f->base != NULL) munmap(f->base, f->map_len);
+    /* fd >= 0 means this process created the file (O_EXCL), so only then is
+     * it ours to remove. */
+    if (f->fd >= 0) {
+        close(f->fd);
+        if (unlink_file && f->path[0] != '\0') unlink(f->path);
+    }
+    f->fd = -1;
+    f->base = NULL;
+    f->map_len = 0;
+    f->path[0] = '\0';
+}
+
+#if defined(__linux__)
+
+/* Whether `fd` (or the directory at `path` when fd < 0) is on a hugetlbfs
+ * mount whose page size is 1 GiB. statfs reports a hugetlbfs mount's page
+ * size as f_bsize. */
+static bool hugetlbfs_1g_at(int fd, const char *path)
+{
+    struct statfs sf;
+    const int rc = fd >= 0 ? fstatfs(fd, &sf) : statfs(path, &sf);
+    return rc == 0 && (unsigned long)sf.f_type == (unsigned long)HUGETLBFS_MAGIC &&
+           (uint64_t)sf.f_bsize == BWA_SHM_ONE_GIB;
+}
+
+/* The first hugetlbfs mount in /proc/mounts with 1 GB pages that this process
+ * can create files in. Returns 0 with dir_out filled, or ENOENT. */
+static int hugetlbfs_find_1g_mount(char *dir_out, size_t dir_len)
+{
+    FILE *fp = std::fopen("/proc/mounts", "r");
+    if (fp == NULL) return ENOENT;
+    char  *line = NULL;
+    size_t cap = 0;
+    int    rc = ENOENT;
+    while (getline(&line, &cap, fp) >= 0) {
+        if (bwa_shm_parse_hugetlbfs_1g_mount(line, dir_out, dir_len) == 1 &&
+            access(dir_out, W_OK | X_OK) == 0 && hugetlbfs_1g_at(-1, dir_out)) {
+            rc = 0;
+            break;
+        }
+    }
+    std::free(line);
+    std::fclose(fp);
+    if (rc != 0 && dir_len > 0) dir_out[0] = '\0';
+    return rc;
+}
+
+extern "C" int bwa_shm_hugetlb_create(const char *dir, const char *name, uint64_t bytes,
+                                      int nthreads, bwa_shm_hugetlb_file_t *out)
+{
+    out->fd = -1; out->base = NULL; out->map_len = 0; out->path[0] = '\0';
+    if (dir == NULL || name == NULL || name[0] == '\0' || std::strchr(name, '/') != NULL)
+        return EINVAL;
+    const size_t map_len = bwamem_hugetlb_round_up((size_t)bytes);
+    if (map_len == 0) return EINVAL;
+
+    char mount_dir[PATH_MAX];
+    if (dir[0] == '\0') {
+        const int rc = hugetlbfs_find_1g_mount(mount_dir, sizeof(mount_dir));
+        if (rc != 0) return rc;
+    } else {
+        /* The stub must hold an absolute path; resolve a relative one. */
+        if (realpath(dir, mount_dir) == NULL) return errno != 0 ? errno : ENOENT;
+        if (!hugetlbfs_1g_at(-1, mount_dir)) return ENOTSUP;
+    }
+    const int n = std::snprintf(out->path, sizeof(out->path), "%s/%s%s", mount_dir,
+                                BWA_SHM_HUGETLB_FILE_PREFIX, name);
+    if (n < 0 || (size_t)n >= sizeof(out->path)) { out->path[0] = '\0'; return ENAMETOOLONG; }
+
+    out->fd = open(out->path, O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0644);
+    if (out->fd < 0) return errno;   /* path kept for the caller's message */
+    int err = 0;
+    /* Guard against a mount that changed under us since the directory check. */
+    if (!hugetlbfs_1g_at(out->fd, NULL)) err = ENOTSUP;
+    /* hugetlbfs takes a size only in whole huge pages. */
+    else if (ftruncate(out->fd, (off_t)map_len) != 0) err = errno;
+    if (err == 0) {
+        /* A shared hugetlbfs mapping reserves all its pages here (no
+         * MAP_NORESERVE), so a pool or size= limit that is too small fails
+         * now with ENOMEM instead of with SIGBUS during the fill. */
+        void *m = mmap(NULL, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, out->fd, 0);
+        if (m == MAP_FAILED) err = errno != 0 ? errno : ENOMEM;
+        else { out->base = m; out->map_len = map_len; }
+    }
+    if (err == 0) {
+        /* Fault the pages in over several threads before the (serial) fill:
+         * the kernel zeroes each 1 GB page in the fault that first touches
+         * it, so the fill alone would zero them one at a time. The prefault
+         * also turns a fault-time failure (a hugetlb cgroup limit) into an
+         * error rather than a SIGBUS. On failure it unmaps the buffer. */
+        bwamem_hugetlb_buf_t buf = {out->base, out->map_len};
+        if (bwamem_hugetlb_prefault(&buf, nthreads) != 0) {
+            out->base = NULL; out->map_len = 0;
+            err = EFAULT;
+        }
+    }
+    if (err != 0) bwa_shm_hugetlb_close(out, /*unlink_file=*/true);
+    return err;
+}
+
+#else /* not Linux */
+
+extern "C" int bwa_shm_hugetlb_create(const char *dir, const char *name, uint64_t bytes,
+                                      int nthreads, bwa_shm_hugetlb_file_t *out)
+{
+    (void)dir; (void)name; (void)bytes; (void)nthreads;
+    out->fd = -1; out->base = NULL; out->map_len = 0; out->path[0] = '\0';
+    return ENOSYS;
+}
+
+#endif
 
 /* Test-only hook: test/shm_thp_advise_test.cpp checks the stager's mapping
  * for the huge-page advice through it, since bwa_shm_stage unmaps that mapping
@@ -662,10 +905,39 @@ int bwa_shm_list(void)
     return rc < 0 ? rc : 0;
 }
 
+/* If the POSIX segment `idx_path` is a hugetlb redirect stub, remove the
+ * hugetlbfs file it points to. Only a file named bwaidx-* on a hugetlbfs
+ * mount with 1 GB pages is removed (the stub decode checks the name), so a
+ * stub cannot direct `shm -d` at any other file. Errors are ignored, like the
+ * shm_unlink beside it. */
+static void hugetlb_unlink_redirect_target(const char *idx_path)
+{
+    int fd = shm_open(idx_path, O_RDONLY, 0);
+    if (fd < 0) return;
+    struct stat st;
+    if (fstat(fd, &st) == 0 && (size_t)st.st_size == sizeof(bwa_shm_hugetlb_stub_t)) {
+        void *m = mmap(NULL, sizeof(bwa_shm_hugetlb_stub_t), PROT_READ, MAP_SHARED, fd, 0);
+        if (m != MAP_FAILED) {
+            bwa_shm_hugetlb_stub_t stub;
+            if (bwa_shm_hugetlb_stub_decode(m, sizeof(stub), &stub) == 0) {
+#if defined(__linux__)
+                struct statfs sf;
+                if (statfs(stub.path, &sf) == 0 &&
+                    (unsigned long)sf.f_type == (unsigned long)HUGETLBFS_MAGIC)
+                    unlink(stub.path);
+#endif
+            }
+            munmap(m, sizeof(bwa_shm_hugetlb_stub_t));
+        }
+    }
+    close(fd);
+}
+
 static int destroy_cb(int64_t /*l_mem*/, const char *name, void * /*ctx*/)
 {
     char idx_path[PATH_MAX];
     path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
+    hugetlb_unlink_redirect_target(idx_path);
     shm_unlink(idx_path);   /* ignore errors (entry may already be gone) */
     return 0;
 }
@@ -684,8 +956,102 @@ int bwa_shm_destroy(void)
     return 0;
 }
 
+/* /dev/shm capacity preflight for a POSIX-staged index; see bwa_shm_stage. */
+static int devshm_preflight(const char *name, uint64_t total_size)
+{
+    /* ftruncate on a tmpfs file lazily reserves space — it succeeds even
+     * when the requested size exceeds the tmpfs limit. The actual ENOSPC
+     * surfaces during pack_into's freads as SIGBUS / EFAULT when a page
+     * fault on a write to the mmap'd region cannot allocate a backing
+     * page. The user-visible failure is then a confusing
+     * `[fread] Bad address` from err_fread_noeof, with no indication
+     * that /dev/shm was the cause.
+     *
+     * statvfs("/dev/shm") tells us the tmpfs's available bytes up-front,
+     * so we can refuse cleanly with a message that points at the actual
+     * fix. Default tmpfs size on Linux is RAM/2 (e.g. 16 GB on a 32 GB
+     * c7a.4xlarge / c7i.4xlarge), so the hg38 FMI index (~17 GB
+     * total_size) doesn't fit out of the box on common AWS instance
+     * sizes. The remediation is a one-liner — `mount -o remount,size=…`
+     * — but only useful if the user knows that's the problem. */
+    struct statvfs svfs;
+    if (statvfs("/dev/shm", &svfs) == 0) {
+        /* f_bavail is in units of f_frsize (fundamental block size),
+         * not f_bsize (preferred I/O block size); on Linux tmpfs the
+         * two are equal but POSIX permits them to differ (e.g. ZFS
+         * reports f_frsize=1MiB), so use f_frsize for portability. */
+        uint64_t avail = (uint64_t)svfs.f_frsize * (uint64_t)svfs.f_bavail;
+        if (total_size > avail) {
+            std::fprintf(stderr,
+                "[E::bwa_shm_stage] /dev/shm has %llu bytes free but staging '%s' "
+                "needs %llu bytes. Remount with larger size, e.g. "
+                "`sudo mount -o remount,size=%lluG /dev/shm`.\n",
+                (unsigned long long)avail,
+                name,
+                (unsigned long long)total_size,
+                (unsigned long long)((total_size + (1ULL<<30) - 1) / (1ULL<<30) + 2));
+            return -1;
+        }
+    }
+    /* statvfs failure (e.g. /dev/shm not present, ENOSYS on exotic
+     * kernels) is non-fatal — fall through and let the existing
+     * shm_open / ftruncate / pack_into path run. The pre-existing
+     * (less helpful) error message in pack_into is still better
+     * than refusing to stage based on a missing diagnostic. */
+    return 0;
+}
+
+/* Explain why `shm --huge-pages` is staging on default pages after
+ * bwa_shm_hugetlb_create returned `err`. */
+static void report_hugetlb_fallback(int err, const char *dir,
+                                    const bwa_shm_hugetlb_file_t *hf,
+                                    uint64_t total_size)
+{
+    const double gib = (double)total_size / (double)BWA_SHM_ONE_GIB;
+    const size_t pages = bwamem_hugetlb_round_up((size_t)total_size) >> 30;
+    const char *where = dir[0] != '\0' ? dir : "the hugetlbfs mount";
+    std::fprintf(stderr, "[M::bwa_shm_stage] --huge-pages: ");
+    if (err == ENOSYS) {
+        std::fprintf(stderr, "1 GB pages are supported only on Linux");
+    } else if (err == ENOENT && dir[0] == '\0') {
+        std::fprintf(stderr, "found no hugetlbfs mount with pagesize=1G that this user can "
+                     "write in /proc/mounts (mount one, e.g. `sudo mkdir -p /mnt/huge-1g && "
+                     "sudo mount -t hugetlbfs -o pagesize=1G,uid=$(id -u) none /mnt/huge-1g`)");
+    } else if (err == ENOTSUP) {
+        std::fprintf(stderr, "'%s' is not a hugetlbfs mount with pagesize=1G", dir);
+    } else if (err == EEXIST) {
+        std::fprintf(stderr, "%s already exists, probably left by an interrupted stage "
+                     "(remove it to free its pages)", hf->path);
+    } else if (err == ENOMEM) {
+        std::fprintf(stderr, "could not reserve %zu x 1 GB pages for the index (%.2f GiB) on "
+                     "%s (the host's 1 GB pool is missing or has too few free pages, see "
+                     "free_hugepages minus resv_hugepages in "
+                     "/sys/kernel/mm/hugepages/hugepages-1048576kB; or the mount's size= limit, "
+                     "or a hugetlb cgroup reservation limit, was reached)",
+                     pages, gib, where);
+    } else if (err == EFAULT) {
+        std::fprintf(stderr, "could not fault in the 1 GB pages for the index (%.2f GiB; "
+                     "needs Linux 5.14+ for MADV_POPULATE_WRITE, or a hugetlb cgroup usage "
+                     "limit was reached)", gib);
+    } else {
+        std::fprintf(stderr, "could not put the index (%.2f GiB) on 1 GB pages in %s (%s)",
+                     gib, hf->path[0] != '\0' ? hf->path : where, std::strerror(err));
+    }
+    std::fprintf(stderr, "; staging in POSIX shared memory instead\n");
+}
+
+/* Workers for faulting in the 1 GB pages of a hugetlb-staged segment. The
+ * stage is one-off, so use the host's CPUs (capped like the index loader)
+ * unless -t asked for more. */
+static int hugetlb_prefault_threads(int n_threads)
+{
+    long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+    int nt = ncpu > 0 ? (int)(ncpu < 64 ? ncpu : 64) : 1;
+    return n_threads > nt ? n_threads : nt;
+}
+
 int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
-                  int n_threads)
+                  int n_threads, const char *hugetlb_dir)
 {
     if (prefix == NULL || prefix[0] == '\0') {
         std::fprintf(stderr, "[E::%s] empty prefix\n", __func__);
@@ -782,52 +1148,24 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         return -1;
     }
 
-    /* 4b. /dev/shm capacity preflight.
-     *
-     * ftruncate on a tmpfs file lazily reserves space — it succeeds even
-     * when the requested size exceeds the tmpfs limit. The actual ENOSPC
-     * surfaces during pack_into's freads as SIGBUS / EFAULT when a page
-     * fault on a write to the mmap'd region cannot allocate a backing
-     * page. The user-visible failure is then a confusing
-     * `[fread] Bad address` from err_fread_noeof, with no indication
-     * that /dev/shm was the cause.
-     *
-     * statvfs("/dev/shm") tells us the tmpfs's available bytes up-front,
-     * so we can refuse cleanly with a message that points at the actual
-     * fix. Default tmpfs size on Linux is RAM/2 (e.g. 16 GB on a 32 GB
-     * c7a.4xlarge / c7i.4xlarge), so the hg38 FMI index (~17 GB
-     * total_size) doesn't fit out of the box on common AWS instance
-     * sizes. The remediation is a one-liner — `mount -o remount,size=…`
-     * — but only useful if the user knows that's the problem. */
-    {
-        struct statvfs svfs;
-        if (statvfs("/dev/shm", &svfs) == 0) {
-            /* f_bavail is in units of f_frsize (fundamental block size),
-             * not f_bsize (preferred I/O block size); on Linux tmpfs the
-             * two are equal but POSIX permits them to differ (e.g. ZFS
-             * reports f_frsize=1MiB), so use f_frsize for portability. */
-            uint64_t avail = (uint64_t)svfs.f_frsize * (uint64_t)svfs.f_bavail;
-            if ((uint64_t)layout.total_size > avail) {
-                std::fprintf(stderr,
-                    "[E::%s] /dev/shm has %llu bytes free but staging '%s' "
-                    "needs %llu bytes. Remount with larger size, e.g. "
-                    "`sudo mount -o remount,size=%lluG /dev/shm`.\n",
-                    __func__,
-                    (unsigned long long)avail,
-                    name,
-                    (unsigned long long)layout.total_size,
-                    (unsigned long long)((layout.total_size + (1ULL<<30) - 1) / (1ULL<<30) + 2));
-                ctl_close(ctl_map, ctl_fd);
-                ctl_lock_release(ctl_lock);
-                bwa_shm_layout_free(&layout);
-                return -1;
-            }
-        }
-        /* statvfs failure (e.g. /dev/shm not present, ENOSYS on exotic
-         * kernels) is non-fatal — fall through and let the existing
-         * shm_open / ftruncate / pack_into path run. The pre-existing
-         * (less helpful) error message in pack_into is still better
-         * than refusing to stage based on a missing diagnostic. */
+    /* 4b. Decide where the index goes. With --huge-pages it goes to a
+     *     hugetlbfs file (step 5b) unless the index is too small for 1 GB
+     *     pages; otherwise, or when that fails, into the POSIX segment, after
+     *     the /dev/shm capacity preflight. */
+    bool want_huge = hugetlb_dir != NULL;
+    if (want_huge && layout.total_size <= bwa_shm_hugetlb_min_bytes) {
+        std::fprintf(stderr,
+            "[M::%s] --huge-pages: the index (%.2f GiB) is too small for 1 GB pages "
+            "(%llu MiB or less); staging in POSIX shared memory\n",
+            __func__, (double)layout.total_size / (double)BWA_SHM_ONE_GIB,
+            (unsigned long long)(bwa_shm_hugetlb_min_bytes >> 20));
+        want_huge = false;
+    }
+    if (!want_huge && devshm_preflight(name, layout.total_size) != 0) {
+        ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
+        bwa_shm_layout_free(&layout);
+        return -1;
     }
 
     /* 5. Create the per-index segment. EEXIST means another stager raced us
@@ -854,7 +1192,32 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         bwa_shm_layout_free(&layout);
         return -1;
     }
-    if (ftruncate(idx_fd, (off_t)layout.total_size) < 0) {
+    /* 5b. --huge-pages: the index goes to a 1 GB page hugetlbfs file, and the
+     *     POSIX segment just claimed will hold a redirect to it (step 6b). */
+    bwa_shm_hugetlb_file_t hfile = {-1, NULL, 0, {0}};
+    bool on_huge = false;
+    if (want_huge) {
+        const int err = bwa_shm_hugetlb_create(hugetlb_dir, name, layout.total_size,
+                                               hugetlb_prefault_threads(n_threads), &hfile);
+        if (err == 0) {
+            on_huge = true;
+        } else {
+            report_hugetlb_fallback(err, hugetlb_dir, &hfile, layout.total_size);
+            if (devshm_preflight(name, layout.total_size) != 0) {
+                close(idx_fd);
+                shm_unlink(idx_path);
+                ctl_close(ctl_map, ctl_fd);
+                ctl_lock_release(ctl_lock);
+                bwa_shm_layout_free(&layout);
+                return -1;
+            }
+        }
+    }
+
+    void *idx_map = NULL;
+    if (on_huge) {
+        idx_map = hfile.base;
+    } else if (ftruncate(idx_fd, (off_t)layout.total_size) < 0) {
         std::fprintf(stderr, "[E::%s] ftruncate(%s, %llu) failed: %s\n",
                      __func__, idx_path,
                      (unsigned long long)layout.total_size, std::strerror(errno));
@@ -864,9 +1227,10 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         ctl_lock_release(ctl_lock);
         bwa_shm_layout_free(&layout);
         return -1;
+    } else {
+        idx_map = idx_segment_map(idx_fd, (size_t)layout.total_size,
+                                  PROT_READ | PROT_WRITE);
     }
-    void *idx_map = idx_segment_map(idx_fd, (size_t)layout.total_size,
-                                    PROT_READ | PROT_WRITE);
     if (idx_map == MAP_FAILED) {
         std::fprintf(stderr, "[E::%s] mmap(%s) failed: %s\n",
                      __func__, idx_path, std::strerror(errno));
@@ -882,7 +1246,8 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
     /* 6. Stream-pack directly into the mmap'd region. No heap intermediate. */
     if (bwa_shm_pack_into(&layout, (uint8_t *)idx_map) != 0) {
         std::fprintf(stderr, "[E::%s] pack_into failed for %s\n", __func__, prefix);
-        munmap(idx_map, (size_t)layout.total_size);
+        if (on_huge) bwa_shm_hugetlb_close(&hfile, /*unlink_file=*/true);
+        else         munmap(idx_map, (size_t)layout.total_size);
         close(idx_fd);
         shm_unlink(idx_path);
         ctl_close(ctl_map, ctl_fd);
@@ -890,7 +1255,38 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         bwa_shm_layout_free(&layout);
         return -1;
     }
-    munmap(idx_map, (size_t)layout.total_size);
+    /* 6b. For a hugetlb-staged index, write the redirect into the POSIX
+     *     segment. The file keeps its pages after this process unmaps it. */
+    char   huge_path[PATH_MAX];
+    size_t huge_len = 0;
+    if (on_huge) {
+        std::memcpy(huge_path, hfile.path, sizeof(huge_path));
+        huge_len = hfile.map_len;
+        bwa_shm_hugetlb_stub_t stub;
+        void *stub_map = MAP_FAILED;
+        const bool ok =
+            bwa_shm_hugetlb_stub_encode(hfile.path, layout.total_size, hfile.map_len, &stub) == 0 &&
+            ftruncate(idx_fd, (off_t)sizeof(stub)) == 0 &&
+            (stub_map = mmap(NULL, sizeof(stub), PROT_READ | PROT_WRITE, MAP_SHARED,
+                             idx_fd, 0)) != MAP_FAILED;
+        if (ok) {
+            std::memcpy(stub_map, &stub, sizeof(stub));
+            munmap(stub_map, sizeof(stub));
+        }
+        bwa_shm_hugetlb_close(&hfile, /*unlink_file=*/!ok);
+        if (!ok) {
+            std::fprintf(stderr, "[E::%s] failed to write the 1 GB page redirect %s: %s\n",
+                         __func__, idx_path, std::strerror(errno));
+            close(idx_fd);
+            shm_unlink(idx_path);
+            ctl_close(ctl_map, ctl_fd);
+            ctl_lock_release(ctl_lock);
+            bwa_shm_layout_free(&layout);
+            return -1;
+        }
+    } else {
+        munmap(idx_map, (size_t)layout.total_size);
+    }
     close(idx_fd);
 
     /* 7. Append the entry to the control segment. */
@@ -906,16 +1302,23 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
     ctl_close(ctl_map, ctl_fd);
     ctl_lock_release(ctl_lock);
 
-    std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) as %s\n",
-                 __func__, name,
-                 (unsigned long long)layout.total_size, idx_path);
+    if (on_huge)
+        std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) on %zu x 1 GB pages as %s "
+                     "(redirect %s)\n",
+                     __func__, name, (unsigned long long)layout.total_size,
+                     huge_len >> 30, huge_path, idx_path);
+    else
+        std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) as %s\n",
+                     __func__, name,
+                     (unsigned long long)layout.total_size, idx_path);
     bwa_shm_layout_free(&layout);
     return 0;
 }
 
-uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
+uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out)
 {
     if (len_out != NULL) *len_out = 0;
+    if (map_len_out != NULL) *map_len_out = 0;
     if (prefix == NULL || prefix[0] == '\0') return NULL;
 
     /* Cheap pre-check: skip the open if there's no registry entry. */
@@ -955,6 +1358,44 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
         return NULL;
     }
 
+    /* A segment staged with `shm --huge-pages` is a redirect stub naming a
+     * hugetlbfs file that holds the index: map that file instead. It is
+     * already on 1 GB pages, so it gets no THP advice. */
+    uint64_t magic = 0;
+    std::memcpy(&magic, m, sizeof(magic));
+    if (magic == BWA_SHM_HUGETLB_STUB_MAGIC) {
+        bwa_shm_hugetlb_stub_t stub;
+        const int bad = bwa_shm_hugetlb_stub_decode(m, len, &stub);
+        munmap(m, len);
+        if (bad) {
+            std::fprintf(stderr, "[E::%s] malformed 1 GB page redirect in %s\n",
+                         __func__, idx_path);
+            return NULL;
+        }
+        int hfd = open(stub.path, O_RDONLY | O_CLOEXEC);
+        if (hfd < 0) {
+            std::fprintf(stderr, "[E::%s] open(%s) failed: %s\n",
+                         __func__, stub.path, std::strerror(errno));
+            return NULL;
+        }
+        if (fstat(hfd, &st) < 0 || (uint64_t)st.st_size != stub.file_size) {
+            std::fprintf(stderr, "[E::%s] %s is not the size its redirect in %s records\n",
+                         __func__, stub.path, idx_path);
+            close(hfd);
+            return NULL;
+        }
+        len = (size_t)stub.file_size;
+        m = mmap(NULL, len, PROT_READ, MAP_SHARED, hfd, 0);
+        close(hfd);
+        if (m == MAP_FAILED) {
+            std::fprintf(stderr, "[E::%s] mmap(%s, %llu) failed: %s\n",
+                         __func__, stub.path, (unsigned long long)len, std::strerror(errno));
+            return NULL;
+        }
+        std::fprintf(stderr, "[M::%s] index '%s' is on %zu x 1 GB pages (%s)\n",
+                     __func__, name, len >> 30, stub.path);
+    }
+
     /* Validate the on-segment header. */
     bwa_shm_header_t hdr;
     std::memcpy(&hdr, m, sizeof(hdr));
@@ -980,6 +1421,7 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
     }
 
     if (len_out != NULL) *len_out = (size_t)hdr.total_size;
+    if (map_len_out != NULL) *map_len_out = len;
     return (uint8_t *)m;
 }
 
@@ -1072,7 +1514,8 @@ static int hint_missing_meth_flag(const char *prefix)
 static void print_shm_usage(void)
 {
     std::fprintf(stderr,
-        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]\n\n"
+        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT]\n"
+        "                    [--huge-pages[=DIR]] [idxbase]\n\n"
         "Options:\n"
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
         "  -l        list names of indices in shared memory\n"
@@ -1090,6 +1533,15 @@ static void print_shm_usage(void)
         "            per-sample walks are independent, so this scales near-\n"
         "            linearly; has no effect unless -u actually densifies (a\n"
         "            target denser than the on-disk rate).\n"
+        "  --huge-pages[=DIR]\n"
+        "            Linux: stage the index on 1 GB huge pages, as a file on the\n"
+        "            hugetlbfs mount DIR (default: the first one with\n"
+        "            pagesize=1G this user can write, from /proc/mounts), instead\n"
+        "            of in /dev/shm. Needs 1 GB pages reserved for the whole\n"
+        "            segment (11 for hg38). `mem` attaches the same way and -d\n"
+        "            removes the file. Falls back to /dev/shm, with a note, when\n"
+        "            that is not possible or the index is 512 MiB or less.\n"
+        "            Output is byte-identical either way.\n"
         "  -h --help print this help and exit\n\n"
         "Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into\n"
         "POSIX shared memory; subsequent `bwa-mem3 mem <idxbase> ...` runs\n"
@@ -1114,6 +1566,8 @@ int main_shm(int argc, char *argv[])
     int c, to_list = 0, to_drop = 0, meth = 0, ret = 0;
     int target_sa_compx = -1;   /* -1 = stage the on-disk SA rate unchanged */
     int n_threads = 1;          /* worker count for the -u densify pass */
+    int huge_pages = 0;         /* --huge-pages: stage on 1 GB hugetlb pages */
+    const char *hugetlb_dir = "";   /* --huge-pages=DIR; "" = find a mount */
 
     /* Pre-scan for --help / -h. getopt_long would treat -h as unknown
      * (no short opt declared) and print a generic error, but the top-level
@@ -1146,12 +1600,24 @@ int main_shm(int argc, char *argv[])
     static struct option long_opts[] = {
         {"meth",    no_argument,       0, 1000},
         {"threads", required_argument, 0, 't' },
+        {"huge-pages", optional_argument, 0, 1001},
         {0,         0,                 0, 0   }
     };
     while ((c = getopt_long(argc, argv, "ldu:t:", long_opts, NULL)) >= 0) {
         if      (c == 'l')   to_list = 1;
         else if (c == 'd')   to_drop = 1;
         else if (c == 1000)  meth    = 1;
+        else if (c == 1001) {
+            huge_pages = 1;
+            if (optarg != NULL) {
+                if (optarg[0] == '\0') {
+                    std::fprintf(stderr, "[E::%s] --huge-pages= needs a directory\n",
+                                 __func__);
+                    return 1;
+                }
+                hugetlb_dir = optarg;
+            }
+        }
         else if (c == 't') {
             /* Worker count for the -u densify pass. Bare positive integer;
              * clamped to a sane upper bound so a fat-fingered value can't spin
@@ -1210,6 +1676,11 @@ int main_shm(int argc, char *argv[])
             "[W::%s] --threads only affects the -u densify pass; ignoring "
             "without -u\n", __func__);
     }
+    if (huge_pages && (to_list || to_drop)) {
+        std::fprintf(stderr,
+            "[E::%s] --huge-pages cannot be combined with -l or -d\n", __func__);
+        return 1;
+    }
     if (meth && (to_list || to_drop)) {
         std::fprintf(stderr,
             "[E::%s] --meth cannot be combined with -l or -d\n", __func__);
@@ -1235,7 +1706,7 @@ int main_shm(int argc, char *argv[])
         /* --meth stages a SEED-only segment: omit PAC + REF_STRING (.0123),
          * which `mem --meth` never reads. Saves ~14.5 GB of shm on hg38. */
         if (bwa_shm_stage(user_prefix, /*bns_only=*/meth != 0, target_sa_compx,
-                          n_threads) < 0) {
+                          n_threads, huge_pages ? hugetlb_dir : NULL) < 0) {
             std::fprintf(stderr,
                 "[E::%s] failed to stage '%s' in shared memory\n",
                 __func__, user_prefix);

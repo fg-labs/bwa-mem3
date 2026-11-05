@@ -1092,7 +1092,9 @@ page would more than double it. **Safe by default:** when the pool is missing or
 has too few free pages, a process limit (`RLIMIT_AS`, `vm.max_map_count`) refuses
 the mapping, or its pages cannot be faulted in, the table uses the default pages
 and a one-line `[M::]` note says so. If the default allocation also fails, the run exits with an allocation error. No effect on an index attached from shared memory (`bwa-mem3 shm`), which
-lives in the shared segment; an `[M::]` note says so.
+lives in the shared segment; an `[M::]` note says so. To put a staged index on
+1 GB pages, stage it with
+[`shm --huge-pages`](shm.md#--huge-pagesdir--stage-the-index-on-1-gb-huge-pages-linux-opt-in).
 
 Requires 1 GB hugepages reserved on the host
 (`echo N | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages`).
