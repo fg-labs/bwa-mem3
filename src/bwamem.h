@@ -796,17 +796,31 @@ static inline int mem_pe_alt_slot(const mem_opt_t *opt, const mem_alnreg_v *a, i
     return p->score < opt->T || p->secondary >= 0 || !p->is_alt ? -1 : n_pri;
 }
 
+/* The SE/no-pair emitter's ordered region filter. XA generation uses the same
+ * decision for its owner slots, without changing the all-hit HN counts. */
+static inline int mem_reg2sam_emits_region(const mem_opt_t *opt, const mem_alnreg_v *a, int k)
+{
+    const mem_alnreg_t *p = &a->a[k];
+    if (p->score < opt->T) return 0;
+    if (p->secondary >= 0 && (p->is_alt || !(opt->flag & MEM_F_ALL))) return 0;
+    if (p->secondary >= 0 && p->secondary < INT_MAX &&
+        p->score < a->a[p->secondary].score * opt->drop_ratio) return 0;
+    return 1;
+}
+
 /* ONLY work after mem_mark_primary_se(); out_hn may be NULL.
  * `meth_orig_query` is forwarded to mem_reg2aln for each XA sub-entry so they
  * regenerate under the same NM/MD policy as the primary record (see
  * mem_reg2aln). NULL (the default) keeps the legacy literal regen.
  * `want0`/`want1`: when want0 >= 0, only the XA strings of primaries want0 and
  * want1 are built (the others stay NULL); the hit counts in *out_hn still cover
- * every primary. -1 (the default) builds all of them. */
+ * every primary. -1 (the default) builds all of them.
+ * `emitted_only` additionally restricts strings to SE/no-pair emitted owners;
+ * it never restricts HN counts. */
 char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                    const mem_alnreg_v *a, int l_query, const char *query,
                    int **out_hn, const char *meth_orig_query = NULL,
-                   int want0 = -1, int want1 = -1);
+                   int want0 = -1, int want1 = -1, bool emitted_only = false);
 /* Per-thread count of XA hits whose global alignment mem_gen_alt took from an
  * earlier duplicate hit of the same read (mem_core_key) instead of computing it.
  * Nothing in the aligner reads it: it lets the unit tests see that reuse happened,
