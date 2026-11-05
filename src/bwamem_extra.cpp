@@ -74,10 +74,25 @@ typedef struct { mem_core_key_t key; int n_cigar, NM; size_t off; } xa_memo_t;
 
 thread_local long mem_gen_alt_n_reused = 0;
 
+#ifdef BWA_XA6_STATS
+/* Diagnostic-only builds: [SE/no-pair][retained/discarded]. Never timed. */
+struct xa6_stats_t {
+    unsigned long long entries[2][2] = {}, bytes[2][2] = {}, fresh[2][2] = {}, tags[2][2] = {};
+    ~xa6_stats_t() {
+        for (int pe = 0; pe < 2; ++pe)
+            for (int discard = 0; discard < 2; ++discard)
+                fprintf(stderr, "[xa6] pe=%d discard=%d entries=%llu bytes=%llu fresh=%llu tags=%llu\n",
+                        pe, discard, entries[pe][discard], bytes[pe][discard],
+                        fresh[pe][discard], tags[pe][discard]);
+    }
+};
+static thread_local xa6_stats_t xa6_stats;
+#endif
+
 // Okay, returning strings is bad, but this has happened a lot elsewhere. If I have time, I need serious code cleanup.
 // When out_hn is non-NULL, it is set to a newly-allocated int[a->n] of per-primary
 // hit counts (cnt[r]) so callers can emit the HN:i tag; caller owns the buffer.
-char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query, int want0, int want1) // ONLY work after mem_mark_primary_se()
+char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, const mem_alnreg_v *a, int l_query, const char *query, int **out_hn, const char *meth_orig_query, int want0, int want1, bool emitted_only) // ONLY work after mem_mark_primary_se()
 {
 	int i, k, r, *cnt, tot;
 	kstring_t *aln = 0, str = {0,0,0};
@@ -90,6 +105,13 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 	 * calloc/free round-trip on every call. */
 	enum { HAS_ALT_STACK_N = 256 };
 	char has_alt_stack[HAS_ALT_STACK_N];
+#ifdef BWA_XA6_UNRESTRICTED
+    emitted_only = false;
+#endif
+#ifdef BWA_XA6_STATS
+    const int stats_pe = !!(opt->flag & MEM_F_PE);
+    const bool stats_on = want0 < 0;
+#endif
 
 	cnt = (int *) calloc(a->n, sizeof(int));
     xassert(cnt != NULL || a->n == 0, "out of memory: cnt");  /* calloc(0) may return NULL; cnt unused when a->n==0 */
@@ -119,6 +141,7 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 		mem_aln_t t;
 		if ((r = get_pri_idx(opt->XA_drop_ratio, a->a, i)) < 0) continue;
 		if (want0 >= 0 && r != want0 && r != want1) continue; // XA[r] is never read: leave it NULL
+		if (emitted_only && !mem_reg2sam_emits_region(opt, a, r)) continue;
 		if (cnt[r] > opt->max_XA_hits_alt || (!has_alt[r] && cnt[r] > opt->max_XA_hits)) continue;
 		/* Pass meth_orig_query so each XA sub-entry regenerates under the SAME
 		 * NM/MD policy as the primary record. Omitting it silently falls back to
@@ -141,6 +164,10 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 			if (keyed)
 				for (size_t m = 0; m < t_memo.size(); ++m)
 					if (mem_core_key_equal(bns, pac, &t_memo[m].key, &key)) { hit = &t_memo[m]; break; }
+#ifdef BWA_XA6_STATS
+            if (stats_on && !hit)
+                ++xa6_stats.fresh[stats_pe][!mem_reg2sam_emits_region(opt, a, r)];
+#endif
 			if (hit) {
 				const mem_cigar_core_t core = { t_memo_ops.data() + hit->off, hit->n_cigar, hit->NM };
 				t = mem_reg2aln(opt, bns, pac, l_query, query, p, meth_orig_query, /*want_md=*/0, &core);
@@ -174,6 +201,14 @@ char **mem_gen_alt(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac
 		}
 		kputc(';', &str);
 		free(t.cigar);
+#ifdef BWA_XA6_STATS
+        if (stats_on) {
+            const int discard = !mem_reg2sam_emits_region(opt, a, r);
+            ++xa6_stats.entries[stats_pe][discard];
+            xa6_stats.bytes[stats_pe][discard] += str.l;
+            if (aln[r].l == 0) ++xa6_stats.tags[stats_pe][discard];
+        }
+#endif
 		kputsn(str.s, str.l, &aln[r]);
 	}
 	XA = (char**) calloc(a->n, sizeof(char*));

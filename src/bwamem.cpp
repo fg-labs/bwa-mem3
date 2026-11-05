@@ -5446,7 +5446,7 @@ void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8
     int *HN = 0;
 
     if (!(opt->flag & MEM_F_ALL))
-        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN, s->meth_orig_seq);
+        XA = mem_gen_alt(opt, bns, pac, a, s->l_seq, s->seq, &HN, s->meth_orig_seq, -1, -1, true);
 
     kv_init(aa);
     str.l = str.m = 0; str.s = 0;
@@ -5454,12 +5454,7 @@ void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8
     {
         mem_alnreg_t *p = &a->a[k];
         mem_aln_t *q;
-        if (p->score < opt->T) continue;
-        //fprintf(stderr, "%d %d %d %d\n", p->secondary, p->is_alt, opt->flag&MEM_F_ALL,
-        //      (p->secondary >= 0 && (p->is_alt || !(opt->flag&MEM_F_ALL))));
-        if (p->secondary >= 0 && (p->is_alt || !(opt->flag&MEM_F_ALL))) continue;
-        // assert(p->secondary < INT_MAX);
-        if (p->secondary >= 0 && p->secondary < INT_MAX && p->score < a->a[p->secondary].score * opt->drop_ratio) continue;
+        if (!mem_reg2sam_emits_region(opt, a, k)) continue;
         q = kv_pushp(mem_aln_t, aa);
 
         if (anchor && k == anchor_k) {
