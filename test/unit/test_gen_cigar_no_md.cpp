@@ -244,12 +244,67 @@ Oracle gen_cigar_oracle(const std::string &ref, const int8_t *mat, int o_del, in
 
 }  // namespace
 
+TEST_CASE("bwa_gen_cigar4: full-block lanes and scalar tails obey signed matrix cells" *
+          doctest::test_suite("unit/gen_cigar")) {
+    const std::string ref = make_reference(kRefLen);
+    meth_test::OrigRefFixture fx(ref);
+    // Signed extremes and zero detect unsigned sums and counting zero as negative.
+    int8_t mat[25];
+    for (int j = 0; j < 25; ++j) mat[j] = (int8_t)(j % 3 == 0 ? -128 : j % 3 == 1 ? 127 : 0);
+    for (int len : {1, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257}) {
+        for (bool rev : {false, true}) {
+            const int64_t rb = rev ? 2 * kRefLen - 100 - len : 100;
+            const int64_t re = rb + len;
+            for (int phase = 0; phase < 5; ++phase) {
+                std::vector<uint8_t> query(len);
+                for (int j = 0; j < len; ++j) query[j] = (uint8_t)((j + phase) % 5);
+                for (int nm_from_mat : {0, 1}) {
+                    CAPTURE(len);
+                    CAPTURE(rev);
+                    CAPTURE(phase);
+                    CAPTURE(nm_from_mat);
+                    GenCigarOut md = run_gen_cigar(fx, mat, query, rb, re, 0, nm_from_mat, 1);
+                    GenCigarOut no = run_gen_cigar(fx, mat, query, rb, re, 0, nm_from_mat, 0);
+                    REQUIRE(md.cigar != nullptr);
+                    REQUIRE(no.cigar != nullptr);
+                    REQUIRE(md.n_cigar == 1);
+                    REQUIRE(no.n_cigar == 1);
+                    CHECK(md.cigar[0] == ((uint32_t)len << 4));
+                    CHECK(no.cigar[0] == ((uint32_t)len << 4));
+                    const Oracle o = gen_cigar_oracle(ref, mat, 6, 1, 6, 1, query, rb, re,
+                                                      md.cigar, md.n_cigar, nm_from_mat);
+                    CHECK(md.score == o.score);
+                    CHECK(no.score == o.score);
+                    CHECK(md.nm == o.nm);
+                    CHECK(no.nm == o.nm);
+                    CHECK(std::string((char *)(md.cigar + md.n_cigar)) == o.md);
+                    CHECK(words(no.cigar, no.n_cigar) == words(md.cigar, md.n_cigar));
+                    CHECK(md.query_after == query);
+                    CHECK(no.query_after == query);
+                    int score = 0;
+                    std::vector<uint8_t> score_query(query);
+                    uint32_t *none = bwa_gen_cigar4(mat, 5, NULL, 6, 1, 6, 1, 0,
+                        fx.bns.l_pac, fx.orig_pac, len, score_query.data(), rb, re,
+                        &score, NULL, NULL, nm_from_mat, 1);
+                    CHECK(none == nullptr);
+                    CHECK(score == o.score);
+                    CHECK(score_query == query);
+                    free(md.cigar);
+                    free(no.cigar);
+                }
+            }
+        }
+    }
+}
+
 TEST_CASE("bwa_gen_cigar4: score, NM and MD match a naive walk of the CIGAR" *
           doctest::test_suite("unit/gen_cigar")) {
 #if defined(__AVX2__)
     MESSAGE(std::string("M-op walks: AVX2 32-column blocks"));
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+    MESSAGE(std::string("M-op walks: NEON full 16-column blocks, scalar tails"));
 #else
-    MESSAGE(std::string("M-op walks: scalar loops (no AVX2 on this target)"));
+    MESSAGE(std::string("M-op walks: scalar loops"));
 #endif
     const std::string ref = make_reference(kRefLen);
     meth_test::OrigRefFixture fx(ref);

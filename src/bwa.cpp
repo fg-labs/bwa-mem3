@@ -408,7 +408,7 @@ int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, 
 #include <immintrin.h>
 
 /* bwa_gen_cigar4's loops over an M op, 32 columns at a time (x86 at the avx2 baseline; without
- * __AVX2__, NEON included, the scalar loops run). Bit-identical to the scalar loops: the score
+ * __AVX2__, these helpers are not compiled). Bit-identical to the scalar loops: the score
  * is the integer sum of the same mat[r*5 + q] values, the mismatches are found by the same
  * `query != rseq` test and visited in ascending column order, so MD gets the same bytes, and NM
  * counts the columns bwa_nm_edit counts (through cig_nm_edits, its lane-mask form). */
@@ -460,18 +460,46 @@ static inline uint32_t cig_mismatch(__m256i q, __m256i r)
 }
 #endif
 
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include "neon_utils.h"
+
+/* M=5 only. Full blocks stay inside each M op; the existing scalar loops own
+ * the tails, so neither sequence needs padding or an overlapping load. */
+static inline int8x16x2_t cig_neon_lut_make(const int8_t mat[25])
+{
+    const int8x16_t hi = vld1q_s8(mat + 9);
+    return int8x16x2_t{{vld1q_s8(mat), vextq_s8(hi, vdupq_n_s8(0), 7)}};
+}
+
+static inline int8x16_t cig_neon_lut_get(const int8x16x2_t &lut, uint8x16_t r, uint8x16_t q)
+{
+    return vqtbl2q_s8(lut, vaddq_u8(vaddq_u8(vshlq_n_u8(r, 2), r), q));
+}
+
+static inline int32x4_t cig_neon_acc(int32x4_t acc, int8x16_t scores)
+{
+    return vpadalq_s16(acc, vpaddlq_s8(scores));
+}
+
+template <class V>
+static inline int cig_neon_nm(uint8x16_t q, uint8x16_t r, int nm_from_mat, V &&mat_v)
+{
+    uint8x16_t edits = vmvnq_u8(vceqq_u8(q, r));
+    if (nm_from_mat) edits = vandq_u8(edits, vcltq_s8(mat_v(), vdupq_n_s8(0)));
+    return vaddvq_u8(vshrq_n_u8(edits, 7));
+}
+#endif
+
 /* Whether an aligned column (reference code r, query base q) is an edit for NM: a literal
  * difference (of r's plain base), and with `nm_from_mat` only one the matrix penalises (see
  * bwa_gen_cigar4), read at r's own row, so under --meth-context cpg a conversion at a CpG
  * (C5/G6) is free and one at a plain C/G is not. The rule has two forms, which must change
  * together, or an XA hit's NM drifts from its primary's:
  *   - bwa_nm_edit, per column: the MD-building walk, the scalar remainder loops of the MD-free
- *     walks, and the whole of every walk on a target without __AVX2__ or at M = 7;
- *   - cig_nm_edits, its lane-mask form for 32 columns: the vector blocks of the MD-free walks
- *     (the fused ungapped score/NM loop and the NM-only walk) under __AVX2__, at M = 5 only (it
- *     compares raw bytes and reads a 25-entry matrix).
- * test/unit/test_gen_cigar_no_md.cpp checks NM from both walks against a naive walk of the
- * CIGAR; the lane-mask form is compiled, and so checked, only on an __AVX2__ build. */
+ *     walks, and the whole of every walk on a target without vector walks or at M = 7;
+ *   - cig_nm_edits (AVX2 lane mask) and cig_neon_nm (NEON count): the vector blocks of the
+ *     MD-free walks at M = 5 only; both compare raw bytes and read a 25-entry matrix.
+ * test/unit/test_gen_cigar_no_md.cpp checks NM from both walks against a naive CIGAR walk. */
 template <int M>
 static inline int bwa_nm_edit(const int8_t *mat, uint8_t r, uint8_t q, int nm_from_mat)
 {
@@ -684,6 +712,18 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
                     });
                     sc = cig_hsum(acc);
                 }
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+                if (M == 5 && l_query >= 16) {
+                    const int8x16x2_t lut = cig_neon_lut_make(mat);
+                    int32x4_t acc = vdupq_n_s32(0);
+                    for (; l_query - i >= 16; i += 16) {
+                        const uint8x16_t qv = vld1q_u8(query + i), rv = vld1q_u8(rseq + i);
+                        const int8x16_t v = cig_neon_lut_get(lut, rv, qv);
+                        acc = cig_neon_acc(acc, v);
+                        n_mm += cig_neon_nm(qv, rv, nm_from_mat, [&] { return v; });
+                    }
+                    sc = vaddvq_s32(acc);
+                }
 #endif
                 for (; i < l_query; ++i) {
                     sc += mat[rseq[i]*M + query[i]];
@@ -706,6 +746,14 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
                     });
                     sc = cig_hsum(acc);
                 }
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+                if (M == 5 && l_query >= 16) {
+                    const int8x16x2_t lut = cig_neon_lut_make(mat);
+                    int32x4_t acc = vdupq_n_s32(0);
+                    for (; l_query - i >= 16; i += 16)
+                        acc = cig_neon_acc(acc, cig_neon_lut_get(lut, vld1q_u8(rseq + i), vld1q_u8(query + i)));
+                    sc = vaddvq_s32(acc);
+                }
 #endif
                 for (; i < l_query; ++i)
                     sc += mat[rseq[i]*M + query[i]];
@@ -726,6 +774,9 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
 #if defined(__AVX2__)
         cig_lut_t lut = {};
         if (M == 5 && nm_from_mat) lut = cig_lut_make(mat); // read only under nm_from_mat, at M = 5
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+        int8x16x2_t lut = {};
+        if (M == 5 && nm_from_mat) lut = cig_neon_lut_make(mat);
 #endif
         for (k = 0, x = y = 0; k < *n_cigar; ++k) {
             int op = cigar[k]&0xf, len = cigar[k]>>4;
@@ -738,6 +789,12 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
                     n_mm += __builtin_popcount(cig_nm_edits(qv, rv, keep, nm_from_mat,
                                                             [&] { return cig_lut_get(lut, rv, qv); }));
                 });
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+                if (M == 5)
+                    for (; i + 16 <= len; i += 16) {
+                        const uint8x16_t qv = vld1q_u8(query + x + i), rv = vld1q_u8(rseq + y + i);
+                        n_mm += cig_neon_nm(qv, rv, nm_from_mat, [&] { return cig_neon_lut_get(lut, rv, qv); });
+                    }
 #endif
                 for (; i < len; ++i)
                     n_mm += bwa_nm_edit<M>(mat, rseq[y + i], query[x + i], nm_from_mat);
@@ -775,6 +832,13 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
                     for (uint32_t m = cig_mismatch(qv, rv) & keep; m; m &= m - 1)
                         put_mismatch(base + __builtin_ctz(m));
                 });
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+                if (M == 5)
+                    for (; i + 16 <= len; i += 16) {
+                        const uint8x16_t qv = vld1q_u8(query + x + i), rv = vld1q_u8(rseq + y + i);
+                        for (uint32_t m = neon_movemask_u8(vmvnq_u8(vceqq_u8(qv, rv))); m; m &= m - 1)
+                            put_mismatch(i + __builtin_ctz(m));
+                    }
 #endif
                 for (; i < len; ++i)
                     if (query[x + i] != bwa_ref_base<M>(rseq[y + i])) put_mismatch(i);
