@@ -109,9 +109,16 @@ extern "C" {
 	 * rebuilding the on-disk index.
 	 * n_threads: worker count for the densify pass (the per-sample LF-walks are
 	 * independent); <=0 or 1 runs it serially. Ignored when not densifying. */
+	/* hugetlb_dir: NULL (default) stages into POSIX shared memory as always.
+	 * Non-NULL asks for the segment on 1 GB hugetlb pages (Linux only, see
+	 * "1 GB hugetlb staging" below): "" finds a writable hugetlbfs mount with
+	 * pagesize=1G in /proc/mounts, any other value names such a mount. When
+	 * that is not possible the index is staged in POSIX shared memory as if
+	 * hugetlb_dir were NULL, with an [M::] line saying why. */
 	int       bwa_shm_stage(const char *prefix, bool bns_only = false,
 	                        int target_sa_compx = -1,
-	                        int n_threads = 1); /* loads from disk, packs, stages */
+	                        int n_threads = 1,
+	                        const char *hugetlb_dir = NULL); /* loads from disk, packs, stages */
 	/* Test-only hook (see bwa_shm.cpp): bwa_shm_stage calls it with its
 	 * writable index mapping right after the map and before the pack fills it,
 	 * so a unit test can inspect that mapping while it exists. NULL on every
@@ -121,8 +128,13 @@ extern "C" {
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */
 
-	/* Attach helpers used by FMI_search / indexEle / fastmap. */
-	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out);   /* NULL if not staged */
+	/* Attach helpers used by FMI_search / indexEle / fastmap.
+	 * *len_out is the packed index size (the header's total_size), the bound
+	 * for every section lookup. *map_len_out (optional) is the length of the
+	 * mapping to pass to munmap: a segment on 1 GB pages is mapped in whole
+	 * 1 GiB pages, and the kernel refuses to unmap part of one. */
+	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out,
+	                         size_t *map_len_out = NULL);            /* NULL if not staged */
 	int       bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 	                               uint64_t *offset_out, uint64_t *size_out);
 
@@ -168,6 +180,87 @@ extern "C" {
 	 * by tests. On success, *buf_out is malloc'd and *len_out is its size;
 	 * caller frees with free(). Returns 0 on success, -1 on error. */
 	int bwa_shm_pack_from_disk(const char *prefix, uint8_t **buf_out, uint64_t *len_out);
+
+	/* ---- 1 GB hugetlb staging (`bwa-mem3 shm --huge-pages`) -------------
+	 *
+	 * POSIX shared memory lives in the /dev/shm tmpfs, which can back a
+	 * segment with 2 MB pages at most. To put the staged index on 1 GB pages,
+	 * the stager writes the packed index to a file `bwaidx-<basename>` on a
+	 * hugetlbfs mount with pagesize=1G instead, and puts a small redirect
+	 * record (bwa_shm_hugetlb_stub_t) in the POSIX segment `/bwaidx-<basename>`
+	 * where the index would otherwise be. The registry (/bwactl) is unchanged,
+	 * so `shm -l`, `shm -d` and the attach in `mem` find a hugetlb-staged index
+	 * by the same name. bwa_shm_attach follows the redirect and maps the
+	 * hugetlbfs file read-only; bwa_shm_destroy removes the file as well.
+	 *
+	 * A binary that predates the redirect reads the stub as a segment with a
+	 * bad magic and loads the index from disk instead. */
+#define BWA_SHM_HUGETLB_STUB_MAGIC   0x0045475548415742ull /* "BWAHUGE\0" little-endian */
+#define BWA_SHM_HUGETLB_STUB_VERSION 1u
+#define BWA_SHM_HUGETLB_FILE_PREFIX  "bwaidx-"
+
+	typedef struct {
+		uint64_t magic;          /* BWA_SHM_HUGETLB_STUB_MAGIC */
+		uint32_t version;        /* BWA_SHM_HUGETLB_STUB_VERSION */
+		uint32_t reserved0;      /* zero */
+		uint64_t total_size;     /* packed index bytes (the target's header total_size) */
+		uint64_t file_size;      /* size of the hugetlbfs file: total_size in whole 1 GiB pages */
+		uint64_t reserved[4];    /* zero-fill for forward-compat */
+		char     path[PATH_MAX]; /* absolute path of the hugetlbfs file, NUL-terminated */
+	} bwa_shm_hugetlb_stub_t;
+
+	/* A stub for `path` holding an index of `total_size` bytes in a file of
+	 * `file_size` bytes. Returns 0, or -1 when the fields would not decode
+	 * (see bwa_shm_hugetlb_stub_decode). Pure. */
+	int bwa_shm_hugetlb_stub_encode(const char *path, uint64_t total_size,
+	                                uint64_t file_size, bwa_shm_hugetlb_stub_t *out);
+
+	/* Validate `len` bytes at `buf` as a stub and copy it to *out. Returns 0
+	 * when it is one: the length, magic and version match, the path is
+	 * absolute, NUL-terminated and its last component starts with
+	 * BWA_SHM_HUGETLB_FILE_PREFIX, and 0 < total_size <= file_size with
+	 * file_size a whole number of 1 GiB pages. Returns -1 otherwise. Pure. */
+	int bwa_shm_hugetlb_stub_decode(const void *buf, size_t len,
+	                                bwa_shm_hugetlb_stub_t *out);
+
+	/* Parse one line of /proc/mounts ("<src> <dir> <fstype> <opts> ..."). If it
+	 * is a hugetlbfs mount whose page size is 1 GiB (pagesize=1024M, 1G or
+	 * 1048576K), copy its directory, with the octal escapes of /proc/mounts
+	 * (\040 for a space, ...) decoded, into dir_out and return 1. Returns 0 for
+	 * any other line, a malformed one, or a directory that does not fit in
+	 * dir_len bytes. Pure. */
+	int bwa_shm_parse_hugetlbfs_1g_mount(const char *line, char *dir_out, size_t dir_len);
+
+	/* Packed segments this size or smaller are not put on 1 GB pages, matching
+	 * `mem --huge-pages` (BWAMEM_HUGETLB_MIN_BYTES): rounding them up to a whole
+	 * 1 GiB page would more than double them. A test may lower it. */
+	extern uint64_t bwa_shm_hugetlb_min_bytes;
+
+	/* One hugetlbfs file mapped read-write, as created by
+	 * bwa_shm_hugetlb_create. */
+	typedef struct {
+		int      fd;              /* -1 when not created */
+		void    *base;            /* NULL when not mapped */
+		size_t   map_len;         /* file size: whole 1 GiB pages */
+		char     path[PATH_MAX];
+	} bwa_shm_hugetlb_file_t;
+
+	/* Create `<dir>/bwaidx-<name>` on the hugetlbfs mount `dir` ("" finds one,
+	 * as bwa_shm_stage does), size it to `bytes` rounded up to whole 1 GiB
+	 * pages, map it shared and read-write, and fault its pages in over up to
+	 * `nthreads` threads. Returns 0 with *out filled, or an errno value with
+	 * *out cleared and no file left behind: ENOSYS off Linux, ENOENT when no
+	 * suitable mount is found, ENOTSUP when `dir` is not a hugetlbfs mount
+	 * with 1 GB pages, EEXIST when the file already exists, ENOMEM when the
+	 * pool (or the mount's size= limit) is too small, EFAULT when the pages
+	 * cannot be faulted in, or the failing call's errno. Prints nothing; the
+	 * stager reports the outcome. Used by bwa_shm_stage and the unit tests. */
+	int  bwa_shm_hugetlb_create(const char *dir, const char *name, uint64_t bytes,
+	                            int nthreads, bwa_shm_hugetlb_file_t *out);
+
+	/* Unmap and close *f. With unlink_file, also remove the file (which frees
+	 * its pages once no process maps it). Resets *f. NULL is a no-op. */
+	void bwa_shm_hugetlb_close(bwa_shm_hugetlb_file_t *f, bool unlink_file);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,6 @@
 
-Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]
+Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT]
+                    [--huge-pages[=DIR]] [idxbase]
 
 Options:
   -d        destroy all indices in shared memory (matches bwa v1 behavior)
@@ -18,6 +19,15 @@ Options:
             per-sample walks are independent, so this scales near-
             linearly; has no effect unless -u actually densifies (a
             target denser than the on-disk rate).
+  --huge-pages[=DIR]
+            Linux: stage the index on 1 GB huge pages, as a file on the
+            hugetlbfs mount DIR (default: the first one with
+            pagesize=1G this user can write, from /proc/mounts), instead
+            of in /dev/shm. Needs 1 GB pages reserved for the whole
+            segment (11 for hg38). `mem` attaches the same way and -d
+            removes the file. Falls back to /dev/shm, with a note, when
+            that is not possible or the index is 512 MiB or less.
+            Output is byte-identical either way.
   -h --help print this help and exit
 
 Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into
