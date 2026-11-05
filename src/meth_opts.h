@@ -46,6 +46,11 @@ int meth_opts_parse(int opt_id, const char *optarg, mem_opt_t *opt, meth_cli_t *
  * mem_opt_apply_meth_defaults. */
 void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli);
 
+/* 1 when the options score em-seq's dense conversions as 0 (--meth=emseq with
+ * --meth-scoring neutral), which places short reads poorly; meth_opts_finalize
+ * prints a warning for it. */
+int meth_opts_emseq_neutral(const mem_opt_t *opt);
+
 /* Help text: the options every subcommand shares, then the ones only `mem` has. */
 void meth_opts_usage_shared(FILE *fp);
 void meth_opts_usage_mem_only(FILE *fp);

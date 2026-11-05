@@ -986,7 +986,9 @@ a full match, keeping real variants as mismatches (variant-aware: variants outsi
 the conversion direction count toward `NM`, keeps `-B 4`); `neutral` (the
 `--meth=taps` / `--meth=5base` default) frees only the conversion direction but scores it `0` —
 tolerated, not rewarded — best for the sparse conversions of TAPS (keeps `-B 4`;
-variants count toward `NM` as in `genomic`). In both, a genuine variant in
+variants count toward `NM` as in `genomic`). Do not use `neutral` with EM-seq /
+bisulfite: its dense conversions cost short reads their placement, and a warning is
+printed ([why](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral)). In both, a genuine variant in
 the conversion direction itself (a C→T at a reference `C`) shares the freed cell
 with a conversion and is not counted in `NM`; under `--meth-context cpg` that holds
 only at a CpG, and a C→T at any other `C` counts

@@ -91,6 +91,38 @@ conversion (bwameth-style), keep it variant-aware, or merely tolerate it.
   a mismatch, so real variants still count toward `NM` on the same terms as
   `genomic`.
 
+> **Warning — do not use `neutral` with EM-seq / bisulfite**
+>
+> EM-seq converts most cytosines (~95 % vs ~3 % for TAPS), so scoring every
+> conversion `0` takes several points off a short read at its true locus: it
+> falls below `-T`, or loses to a locus elsewhere that matches it T for T. The
+> reads lost first are the unmethylated, conversion-rich ones, so the methylation
+> measured on the reads that remain is biased upward. `bwa-mem3` prints a warning
+> for `--meth-scoring neutral` with `--meth`, `--meth=emseq` or
+> `--meth=bisulfite`. For EM-seq use the default `collapsed`, or `genomic` for
+> variant-aware output.
+>
+> Measured on simulated EM-seq single-end reads (15,000 per read length; CpG
+> methylation from an island/shore/open-sea model, conversion 0.999, at most 1 %
+> sequencing errors) against a 12 Mb hg38 slice (chr22:20–28 Mb and
+> chr21:30–34 Mb) with `mem -k 14 -T 18` (an arm64 build; the scoring does not
+> depend on the SIMD tier). Correct means the same contig and a start within
+> 10 bp of the truth:
+>
+> | read length | `neutral` | `genomic` | `collapsed` |
+> |---|---|---|---|
+> | 20 bp | 19.8 % (70.3 % unmapped) | 73.4 % | 72.7 % |
+> | 25 bp | 63.0 % (19.1 % unmapped) | 83.3 % | 83.0 % |
+> | 36 bp | 88.7 % | 90.3 % | 90.0 % |
+> | 76 bp | 96.5 % | 96.8 % | 96.6 % |
+>
+> Lowering `-T` does not fix it: at `-T 8` no 20 bp read is left unmapped, yet
+> `neutral` places 60.4 % correctly vs 73.9 % for `genomic`, with six times as
+> many wrong placements at MAPQ ≥ 20 (0.23 % vs 0.04 %). CpG methylation over
+> the correctly placed 20 bp reads at MAPQ ≥ 20 is 0.86 under `neutral` at
+> `-T 18` (0.91 at `-T 8`) vs 0.67 under `genomic`, against 0.52 in the
+> simulated truth.
+
 > **Important — `collapsed` is a placement drop-in, not byte-identical to bwameth**
 >
 > `collapsed` *closely tracks* bwameth's placement but scores against the original
