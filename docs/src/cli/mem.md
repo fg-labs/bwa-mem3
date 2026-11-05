@@ -46,11 +46,15 @@ bwa-mem3 mem --meth -t 16 \
 stdin, a `<cmd` producer whose stdout is read, or an `http://` / `ftp://` URL.
 
 Before the index is loaded, each input named as a file is checked with
-`stat()`. If the check fails for any reason (the file is missing, a parent
-directory is not searchable, `ENOTDIR`, a name too long), or the path is a
-directory, `mem` exits with status 1 and reports `fail to open file` for the
-first input or `failed to open file` for the second. For a missing or
-unreachable path that is the same error as before, only earlier.
+`stat()`. If the check confirms a missing path (`ENOENT` or `ENOTDIR`), or
+finds a directory, `mem` exits with status 1 and reports `fail to open file`
+for the first input or `failed to open file` for the second. For a missing
+path that is the same error as before, only earlier. Other metadata errors
+are left to the existing open/read path after the load: for example,
+`EOVERFLOW` can mean an inode number does not fit in `struct stat` even
+though the file can still be opened and read. A non-searchable parent
+(`EACCES`) or an overlong name is also diagnosed after the load, not by
+preflight.
 A mistyped path then fails at once rather than after a multi-gigabyte index
 load. The check opens nothing. `-`, `<cmd`, URLs, and the second input under
 `-p` (which ignores it) are not checked. The inputs are still opened and read
@@ -61,11 +65,13 @@ no read permission) is still reported after the load.
 Because the check runs earlier, which error appears first can differ from
 bwa-mem2 ([#645](https://github.com/fg-labs/bwa-mem3/pull/645)):
 
-- An input error is now reported before an index error, including a missing
-  `--meth` seed index.
+- A confirmed missing input or directory is reported before an index error,
+  including a missing `--meth` seed index. Other metadata or open/read errors
+  do not take precedence over an index error.
 - If the first input exists but cannot be opened and the second is missing, the
   second is reported first.
-- An input that is created while the index loads is now rejected.
+- An input confirmed missing before the index load is rejected, even if it is
+  created while the index loads.
 - The check only looks at the path, so a local input that changes while the
   index loads is handled by the open after the load: a removed input fails
   there, and a replaced one is read as it is at that open.

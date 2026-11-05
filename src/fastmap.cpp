@@ -3703,10 +3703,10 @@ int main_mem(int argc, char *argv[])
         return 1;
     }
 
-    /* Report an input that cannot be read before the index load, which can take
-     * minutes on a large reference, rather than after it. Any stat() failure
-     * counts (a missing file, but also ENOTDIR, ENAMETOOLONG, or EACCES on a
-     * parent directory), and so does a directory. Only names kopen() opens as
+    /* Report confirmed missing paths and directories before the index load,
+     * which can take minutes on a large reference. Other stat() errors do not
+     * establish that open/read will fail (e.g. EOVERFLOW for an unrepresentable
+     * inode), so leave them to the real open. Only names kopen() opens as
      * paths are checked: "-", a `<cmd`, http:// and ftp:// are left to it, and
      * under -p the second positional is ignored as before. The check opens
      * nothing -- the real open and the reader's format sniff stay after the
@@ -3715,22 +3715,25 @@ int main_mem(int argc, char *argv[])
      * still reported after the load.
      *
      * The messages and exit status are the ones the opens below use, so for a
-     * missing or unreachable path only the timing changes, and with it which
-     * error can appear first: an input error now precedes an index error; if
+     * confirmed missing path only the timing changes, and with it which
+     * error can appear first: that input error precedes an index error; if
      * R1 exists but cannot be opened and R2 is missing, R2 is reported first;
-     * and an input created while the index loads, which used to be found, is
-     * now rejected (one removed while it loads still fails at the open after
-     * the load, and one replaced is read as it is at that open). A directory is the exception: it used to fail after
-     * the load with the reader's error ("read failed", or "[gzread] Is a
-     * directory" under --legacy-reader) and now gets "fail to open file"
-     * ("failed to open file" as R2) before it. */
+     * and an input confirmed missing before the load but created while the
+     * index loads, which used to be found, is now rejected (one removed while
+     * it loads still fails at the open after the load, and one replaced is
+     * read as it is at that open). A directory is the exception: it used to
+     * fail after the load with the reader's error ("read failed", or
+     * "[gzread] Is a directory" under --legacy-reader) and now gets "fail to
+     * open file" ("failed to open file" as R2) before it. */
     {
         int n_in = (optind + 2 < argc && !(opt->flag & MEM_F_PE)) ? 2 : 1;
         for (int k = 1; k <= n_in; ++k) {
             const char *fn = argv[optind + k];
             struct stat st;
             if (!kopen_is_local_path(fn)) continue;
-            if (stat(fn, &st) != 0 || S_ISDIR(st.st_mode)) {
+            int stat_rc = stat(fn, &st);
+            if ((stat_rc != 0 && (errno == ENOENT || errno == ENOTDIR)) ||
+                (stat_rc == 0 && S_ISDIR(st.st_mode))) {
                 fprintf(stderr, "[E::%s] %s to open file `%s'.\n", __func__,
                         k == 1 ? "fail" : "failed", fn);
                 free(opt);
