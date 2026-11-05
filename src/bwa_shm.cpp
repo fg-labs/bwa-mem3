@@ -782,7 +782,36 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         return -1;
     }
 
-    /* 4b. /dev/shm capacity preflight.
+    /* 5. The registry was checked under the stager lock above, so an existing
+     *    segment here is unregistered, not a successful concurrent stage. It
+     *    may contain a partial index; neither adopt nor replace its bytes. */
+    char idx_path[PATH_MAX];
+    path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
+    int idx_fd = shm_open(idx_path, O_CREAT | O_RDWR | O_EXCL, 0644);
+    if (idx_fd < 0 && errno == EEXIST) {
+        std::fprintf(stderr,
+            "[E::%s] segment %s exists without a registry entry; "
+            "it may be an incomplete stage. Remove this orphaned segment "
+            "with shm_unlink(\"%s\") after checking that no stager is active, "
+            "then retry. shm -d cannot find unregistered segments.\n",
+            __func__, idx_path, idx_path);
+        ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
+        bwa_shm_layout_free(&layout);
+        return -1;
+    }
+    if (idx_fd < 0) {
+        std::fprintf(stderr, "[E::%s] shm_open(%s) failed: %s\n",
+                     __func__, idx_path, std::strerror(errno));
+        ctl_close(ctl_map, ctl_fd);
+        ctl_lock_release(ctl_lock);
+        bwa_shm_layout_free(&layout);
+        return -1;
+    }
+
+    /* 5b. /dev/shm capacity preflight. It runs after the orphan check in
+     *     step 5 so an orphan that fills /dev/shm is named rather than
+     *     masked by a generic out-of-space error.
      *
      * ftruncate on a tmpfs file lazily reserves space — it succeeds even
      * when the requested size exceeds the tmpfs limit. The actual ENOSPC
@@ -817,6 +846,10 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
                     name,
                     (unsigned long long)layout.total_size,
                     (unsigned long long)((layout.total_size + (1ULL<<30) - 1) / (1ULL<<30) + 2));
+                /* Drop the empty segment created in step 5; the lock is
+                 * still held, so no other process can have attached. */
+                close(idx_fd);
+                shm_unlink(idx_path);
                 ctl_close(ctl_map, ctl_fd);
                 ctl_lock_release(ctl_lock);
                 bwa_shm_layout_free(&layout);
@@ -825,35 +858,11 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         }
         /* statvfs failure (e.g. /dev/shm not present, ENOSYS on exotic
          * kernels) is non-fatal — fall through and let the existing
-         * shm_open / ftruncate / pack_into path run. The pre-existing
+         * ftruncate / pack_into path run. The pre-existing
          * (less helpful) error message in pack_into is still better
          * than refusing to stage based on a missing diagnostic. */
     }
 
-    /* 5. Create the per-index segment. EEXIST means another stager raced us
-     *    to a segment with the same basename — treat that as already-staged
-     *    rather than unlinking and re-creating, which would invalidate any
-     *    process currently attached to it. */
-    char idx_path[PATH_MAX];
-    path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
-    int idx_fd = shm_open(idx_path, O_CREAT | O_RDWR | O_EXCL, 0644);
-    if (idx_fd < 0 && errno == EEXIST) {
-        std::fprintf(stderr,
-            "[M::%s] segment %s already exists; treating as already staged\n",
-            __func__, idx_path);
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
-        return 0;
-    }
-    if (idx_fd < 0) {
-        std::fprintf(stderr, "[E::%s] shm_open(%s) failed: %s\n",
-                     __func__, idx_path, std::strerror(errno));
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
-        return -1;
-    }
     if (ftruncate(idx_fd, (off_t)layout.total_size) < 0) {
         std::fprintf(stderr, "[E::%s] ftruncate(%s, %llu) failed: %s\n",
                      __func__, idx_path,

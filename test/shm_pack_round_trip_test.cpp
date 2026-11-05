@@ -3,6 +3,13 @@
  * normal disk loader produces. Run via test/shm_pack_round_trip_test.sh,
  * which builds the phix index first.
  *
+ * Calls bwa_shm_destroy before and after the orphan check. That drops every
+ * registered staged index this user can unlink, plus /bwactl and /bwactl_lock,
+ * on this host (unregistered /bwaidx-* objects are left alone). So the test
+ * first reads the registry and fails, dropping nothing, if it lists any index
+ * other than the fixture. An index staged concurrently after that check can
+ * still be dropped; run it where nothing else stages an index.
+ *
  * Usage: shm_pack_round_trip_test <prefix>
  *   <prefix> is the path passed to `bwa-mem3 index`, e.g. test/fixtures/phix.fa
  */
@@ -12,10 +19,15 @@
 #include "bntseq.h"
 #include "utils.h"
 
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define CHECK(cond) do { \
     if (!(cond)) { \
@@ -34,6 +46,38 @@
         std::abort(); \
     } \
 } while (0)
+
+/* True when the shm registry is absent or lists no index other than `fixture`.
+ * Parses /bwactl as ctl_walk does: a uint16 entry count, a uint16 next-write
+ * offset, then packed (int64 size, NUL-terminated basename) entries. Any
+ * registry this cannot read counts as holding another index, so the caller
+ * never runs bwa_shm_destroy over indexes it does not own. */
+static bool registry_holds_only(const char *fixture)
+{
+    const int fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
+    if (fd < 0) return errno == ENOENT;
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return false; }
+    if ((size_t)st.st_size < BWA_SHM_CTL_SIZE) { close(fd); return true; }
+    void *m = mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return false;
+    const uint8_t *p = (const uint8_t *)m + 4;   /* past the two uint16 fields */
+    const uint8_t *end = (const uint8_t *)m + BWA_SHM_CTL_SIZE;
+    uint16_t n_entries = 0;
+    std::memcpy(&n_entries, m, sizeof(n_entries));
+    bool only = true;
+    for (uint16_t i = 0; i < n_entries && only; i++) {
+        if ((size_t)(end - p) <= sizeof(int64_t)) { only = false; break; }
+        const char *name = (const char *)(p + sizeof(int64_t));
+        const size_t name_max = (size_t)(end - (const uint8_t *)name);
+        const size_t len = strnlen(name, name_max);
+        only = len < name_max && std::strcmp(name, fixture) == 0;
+        p = (const uint8_t *)name + len + 1;
+    }
+    munmap(m, BWA_SHM_CTL_SIZE);
+    return only;
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -206,6 +250,79 @@ int main(int argc, char *argv[]) {
                     "(shm -u staged 1/%d == index -u %lld)\n",
                     1 << (int)oracle.sa_compx, (long long)oracle.sa_compx);
     }
+
+    /* An unregistered segment is not a successful stage. Preserve it rather
+     * than adopting potentially incomplete bytes or replacing a live mapping. */
+    const char *base = std::strrchr(prefix, '/');
+    base = base ? base + 1 : prefix;
+    char segment[256];
+    CHECK(std::snprintf(segment, sizeof(segment), "%s%s", BWA_SHM_IDX_PREFIX, base)
+          < (int)sizeof(segment));
+    if (!registry_holds_only(base)) {
+        std::fprintf(stderr, "shm_pack_round_trip_test: FAIL: the shm registry %s lists an "
+                     "index other than %s, or could not be read; refusing to run "
+                     "bwa_shm_destroy, which would drop every staged index. Run "
+                     "`bwa-mem3 shm -l` to inspect it and `bwa-mem3 shm -d` to clear it, "
+                     "or use another host, then rerun.\n", BWA_SHM_CTL_NAME, base);
+        return 1;
+    }
+    CHECK_EQ(bwa_shm_destroy(), 0);
+    const int fd = shm_open(segment, O_CREAT | O_RDWR | O_EXCL, 0600);
+    CHECK(fd >= 0);
+    const char marker[] = "incomplete stage";
+    CHECK_EQ(ftruncate(fd, sizeof(marker)), 0);
+    void *orphan = mmap(NULL, sizeof(marker), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    CHECK(orphan != MAP_FAILED);
+    std::memcpy(orphan, marker, sizeof(marker));
+    const int stage_rc = bwa_shm_stage(prefix);
+    char saved[sizeof(marker)] = {};
+    std::memcpy(saved, orphan, sizeof(saved));
+    CHECK_EQ(munmap(orphan, sizeof(marker)), 0);
+    CHECK_EQ(close(fd), 0);
+    /* Reopen by name and read the bytes back: a regression that replaced the
+     * orphan with a new object of the same name must not pass. Check the size
+     * before mapping so a shorter replacement fails instead of faulting; use
+     * >= because macOS rounds a shm object's size up to the page size. */
+    const int preserved_fd = shm_open(segment, O_RDONLY, 0);
+    bool preserved = preserved_fd >= 0;
+    char reopened[sizeof(marker)] = {};
+    if (preserved) {
+        struct stat st;
+        preserved = fstat(preserved_fd, &st) == 0 && st.st_size >= (off_t)sizeof(marker);
+        if (preserved) {
+            void *view = mmap(NULL, sizeof(marker), PROT_READ, MAP_SHARED, preserved_fd, 0);
+            preserved = view != MAP_FAILED;
+            if (preserved) {
+                std::memcpy(reopened, view, sizeof(reopened));
+                CHECK_EQ(munmap(view, sizeof(marker)), 0);
+            }
+        }
+        CHECK_EQ(close(preserved_fd), 0);
+    }
+    CHECK_EQ(shm_unlink(segment), 0);
+    CHECK_EQ(bwa_shm_destroy(), 0);
+    CHECK(stage_rc != 0);
+    CHECK(preserved);
+    CHECK_EQ(std::memcmp(saved, marker, sizeof(marker)), 0);
+    CHECK_EQ(std::memcmp(reopened, marker, sizeof(marker)), 0);
+
+    /* Registered restaging still succeeds, attaches, and is removed by -d. */
+    CHECK_EQ(bwa_shm_stage(prefix), 0);
+    CHECK_EQ(bwa_shm_test(prefix), 1);
+    CHECK_EQ(bwa_shm_stage(prefix), 0);
+    size_t attached_len = 0;
+    uint8_t *attached = bwa_shm_attach(prefix, &attached_len);
+    CHECK(attached != NULL);
+    CHECK(attached_len > sizeof(bwa_shm_header_t));
+    CHECK_EQ(munmap(attached, attached_len), 0);
+    CHECK_EQ(bwa_shm_destroy(), 0);
+    errno = 0;
+    const int leftover_fd = shm_open(segment, O_RDONLY, 0);
+    const int leftover_errno = errno;
+    if (leftover_fd >= 0) close(leftover_fd);
+    CHECK(leftover_fd < 0);
+    CHECK_EQ(leftover_errno, ENOENT);
+    CHECK_EQ(bwa_shm_test(prefix), 0);
 
     std::printf("shm_pack_round_trip_test: OK\n");
     return 0;

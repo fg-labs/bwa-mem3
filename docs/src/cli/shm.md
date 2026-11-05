@@ -48,9 +48,25 @@ auto-attaches and reads from memory rather than disk.
 
 ### `-d` — destroy all segments
 
-Removes every bwa-mem3 shared-memory segment on the machine. This is the
-correct clean-up command after a batch job and the required step before
+Removes every registered bwa-mem3 shared-memory segment on the machine. This is
+the correct clean-up command after a batch job and the required step before
 re-building the index (see the footgun warning below).
+
+An interrupted stage can leave a segment without a registry entry. A later
+stage with the same basename fails and names the orphaned segment; it does not
+report success, adopt potentially incomplete data, or overwrite the segment.
+The orphan is reported before the `/dev/shm` free-space check, so an orphan
+that fills `/dev/shm` is still named. `shm -d` cannot find these unregistered
+segments. After ensuring no stager is active, remove the named object with
+`shm_unlink(3)` (on Linux, unlink its file under `/dev/shm`, for example
+`/dev/shm/bwaidx-ref.fa`), then stage again. If the interrupted stager was
+killed while holding the staging lock, a later stage blocks in `sem_wait`
+instead of reporting the orphan. Stop every stager blocked this way first:
+unlinking the semaphore does not wake a process already waiting on it. Then
+release the lock: `shm -d` unlinks the `/bwactl_lock` semaphore along with every
+registered segment (see the stuck-lock note below), or remove only the
+semaphore with `sem_unlink(3)` (on Linux, `/dev/shm/sem.bwactl_lock`). Then
+remove the orphan and start a new stage.
 
 ### `-l` — list staged indices
 
@@ -195,13 +211,16 @@ exceed the load time saved.
 >
 > **Note — `/dev/shm` capacity preflight (PR #86)**
 >
-> Before opening the segment, `bwa-mem3 shm` calls `statvfs("/dev/shm")` and
-> compares the available bytes against the index's `total_size`. If `/dev/shm`
-> is too small the stage aborts cleanly with an `[E::bwa_shm_stage]` message
-> that names `/dev/shm`, the required size, and a `mount -o remount,size=...`
-> hint. This replaces the previous failure mode where `ftruncate` succeeded
-> lazily and `pack_into` later surfaced ENOSPC as `[fread] Bad address` with
-> no indication that `/dev/shm` was the cause. The preflight is best-effort:
+> After creating the (still empty) index segment, and before sizing or
+> filling it, `bwa-mem3 shm` calls `statvfs("/dev/shm")` and compares the
+> available bytes against the index's `total_size`. Creating the segment
+> first means an orphaned segment is reported by name before this check can
+> fail. If `/dev/shm` is too small, the stage unlinks the empty segment and
+> aborts cleanly with an `[E::bwa_shm_stage]` message that names `/dev/shm`,
+> the required size, and a `mount -o remount,size=...` hint. This replaces the
+> previous failure mode where `ftruncate` succeeded lazily and `pack_into`
+> later surfaced ENOSPC as `[fread] Bad address` with no indication that
+> `/dev/shm` was the cause. The preflight is best-effort:
 > a `statvfs` failure (no `/dev/shm`, restricted sandbox, ENOSYS) is
 > non-fatal and the stage proceeds. As a rough sizing guide, hg38 stages
 > ~17 GB; AWS instances default to RAM/2 (so c7a.4xlarge / c7i.4xlarge at
@@ -215,7 +234,9 @@ exceed the load time saved.
 > semaphores have no `SEM_UNDO` equivalent: if a stager segfaults or is
 > `kill -9`'d while holding the lock, every subsequent stage will block in
 > `sem_wait` forever. Run `bwa-mem3 shm -d` to recover — it unlinks the
-> semaphore alongside the registry, freeing the next stager.
+> semaphore alongside the registry, freeing the next stager. Unlinking does not
+> wake a stager already blocked in `sem_wait`: stop any such stager before
+> running `shm -d`, then start a new stage.
 
 ---
 
