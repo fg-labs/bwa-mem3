@@ -675,16 +675,20 @@ and the shared-knob rule live in [Equivalence](equivalence.md) and [Alignment mo
 
 bwa-mem2 opens the read inputs only after loading the index, so a mistyped read
 path costs a full index load (minutes on a large reference) before
-`fail to open file` appears. `bwa-mem3 mem` checks with `stat()`, before the
-load, that each input named as a file exists and is not a directory.
+`fail to open file` appears. Before the load, `bwa-mem3 mem` uses `stat()` to
+reject confirmed missing paths (`ENOENT`/`ENOTDIR`) and directories. Other
+metadata errors, including permission errors and overflow, do not prove that
+open/read will fail and are deferred to the existing open/read path after the
+index load.
 
-For a missing or unreachable path the message and exit status are unchanged;
+For a confirmed missing path the message and exit status are unchanged;
 only the timing changes, and with it which error is reported first:
 
 - With both the index and an input missing, the input error now appears (for
-  `--meth`, the missing seed index too).
-- If R1 exists but cannot be opened and R2 is missing, R2 is now reported first.
-- An input created during the load is now rejected.
+  `--meth`, before the missing seed index too).
+- If R1 cannot be opened and R2 is confirmed missing, R2 is now reported first.
+- An input confirmed missing before the load is rejected even if it would be
+  created during the load.
 
 A directory input is the one case whose message changes. It used to fail after
 the load with the reader's error (`read failed`, or `[gzread] Is a directory`
@@ -723,7 +727,7 @@ Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#re
 | `--extend-csub` pruned-competitor `MAPQ` seed | [#269](https://github.com/fg-labs/bwa-mem3/pull/269) | — | fork-only (**forced on under `--fast`**, including `--meth --fast`; opt-in elsewhere, not byte-identical — changes emitted `MAPQ` on both the scalar SE and batched paired-end paths when the cap/gate prunes) |
 | `--huge-pages` 1 GB huge pages for the index | [#405](https://github.com/fg-labs/bwa-mem3/pull/405), [#716](https://github.com/fg-labs/bwa-mem3/pull/716) | — | fork-only (Linux, opt-in, off by default; alignment records byte-identical, `@PG` `CL:` excepted; hg38 WGS (5 M pairs), `-t 16`, warm page cache, x86-64 AVX-512BW and AVX2: ~0.7 % faster on Sapphire Rapids, within noise on two Zen 4 instances (one other measured 0.6-1.1 % slower); see [Measured effect](../user-guide/allocator.md#measured-effect)) |
 | Transparent huge page fallback warning (stderr) | [#587](https://github.com/fg-labs/bwa-mem3/pull/587) | — | fork-only (Linux, stderr-only; at most one two-line `[W::]` warning per run, suppressed at `-v 1`; alignment records byte-identical, `@PG` `CL:` excepted, on 5M-pair WGS and WES slices (hg38), default and both `--compat` targets, on AWS Graviton 4 (arm64, NEON tier) and AMD Zen 5 (x86-64, AVX-512BW tier); CI's phiX smoke test also compares the records at `-v 3` and `-v 4` on the Linux x86-64 AVX2 row) |
-| Missing read inputs reported before the index load | [#645](https://github.com/fg-labs/bwa-mem3/pull/645) | — | fork-only (error timing; same message and exit status for a missing or unreachable path; a directory input now gets `fail to open file` before the load instead of the reader's error after it; alignment output unchanged) |
+| Missing read inputs reported before the index load | [#645](https://github.com/fg-labs/bwa-mem3/pull/645) | — | fork-only (confirmed missing paths, `ENOENT`/`ENOTDIR`, retain their message and exit status but fail before the load; other metadata errors defer to open/read after the load; a directory input now gets `fail to open file` before the load instead of the reader's error after it; stdin, producers, URLs and the second input under `-p` remain exempt; alignment output unchanged) |
 | Certified adaptive extension band (`--no-band-cert` to disable) | [#420](https://github.com/fg-labs/bwa-mem3/pull/420) | — | fork-only (**default on**, alignment records byte-identical by a per-pair certificate — `@PG` `CL:` excepted; throughput measured on a 5M-read WGS slice, Apple M2 Max / arm64 NEON tier — see [the measurement](#certified-adaptive-extension-band-default-on---no-band-cert-to-disable) for full scope) |
 
 ---
