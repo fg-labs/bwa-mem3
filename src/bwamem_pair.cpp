@@ -1235,15 +1235,16 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
                  * toward *sub / *n_sub (a `continue` would change both, and with them
                  * q_pe). The pair score is converted to int only when it is finite and
                  * non-negative: a far-off insert size underflows erfc to 0, and the int
-                 * conversion of log(0) = -inf is undefined. Every other input gives the
-                 * same q as before; test/unit/test_mem_pair_negative_score.cpp has the
-                 * per-architecture history. */
+                 * conversion of log(0) = -inf is undefined. Finite overflow saturates
+                 * before conversion; in-range scores keep the same rounding.
+                 * test/unit/test_mem_pair_negative_score.cpp has the boundary cases
+                 * and per-architecture history. */
                 const int sc_i = (int32_t)(uint32_t)(v.a[i].y >> 32);
                 const int sc_k = (int32_t)(uint32_t)(v.a[k].y >> 32);
                 if (sc_i < 0 || sc_k < 0) q = 0;
                 else {
                     const double qd = (double)sc_i + sc_k + .721 * log(2. * erfc(fabs(ns) * M_SQRT1_2)) * opt->a + .499; // .721 = 1/log(4)
-                    q = qd >= 0. && std::isfinite(qd) ? (int)qd : 0;
+                    q = qd >= 0. && std::isfinite(qd) ? (qd >= INT32_MAX ? INT32_MAX : (int)qd) : 0;
                 }
                 p = kv_pushp(pair64_t, u);
                 p->y = (uint64_t)k<<32 | i;
@@ -1274,7 +1275,13 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
 
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s, int n, const mem_aln_t *list, int which, const mem_aln_t *m);
 
-#define raw_mapq(diff, a) ((int)(6.02 * (diff) / (a) + .499))
+// Preserve the integer MAPQ until after the near-pair correction, but bound
+// the conversion when a saturated pair leaves a very large score margin.
+static inline int raw_mapq(int64_t diff, int a)
+{
+    const double q = 6.02 * diff / a + .499;
+    return q >= INT32_MAX ? INT32_MAX : q <= INT32_MIN ? INT32_MIN : (int)q;
+}
 
 
 /* --extend-csub (PE): estimate the pair score of a competitor pruned before
@@ -1922,7 +1929,8 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         return n;
     }
 
-    int is_multi[2], q_pe, score_un;
+    int is_multi[2], q_pe;
+    int64_t score_un;
     // check if an end has multiple hits even after mate-SW
     for (i = 0; i < 2; ++i) {
         for (j = 1; j < n_pri[i]; ++j)
@@ -1932,26 +1940,28 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     if (is_multi[0] || is_multi[1]) { *extra_flag_out = extra_flag; return n; } // TODO: in rare cases, the true hit may be long but with low score
 
     // compute mapQ for the best SE hit
-    score_un = a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
-    subo = subo > score_un? subo : score_un;
-    if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo) subo = fl; }
+    // The unpaired alternative can exceed the saturated pair score. Keep it
+    // wide so that overflow cannot turn an inferior pair into a proper pair.
+    score_un = (int64_t)a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
+    int64_t subo_wide = subo > score_un? subo : score_un;
+    if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo_wide) subo_wide = fl; }
     {
         /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
          * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
          * either end deflates confidence even when one paired alignment looks
          * clean. Meth-gated so non-meth PE MAPQ is byte-identical. */
-        int qdiff = o - subo;
+        int64_t qdiff = (int64_t)o - subo_wide;
         if (opt->meth_mode) {
             int se2_0 = (n_pri[0] > 1) ? a[0].a[1].score : 0;
             int se2_1 = (n_pri[1] > 1) ? a[1].a[1].score : 0;
-            int cap = o + 4 * opt->a - (se2_0 + se2_1);
+            int64_t cap = (int64_t)o + 4LL * opt->a - ((int64_t)se2_0 + se2_1);
             if (qdiff > cap) qdiff = cap;
         }
         if (qdiff < 0) qdiff = 0;
         q_pe = raw_mapq(qdiff, opt->a);
     }
 
-    if (n_sub > 0) q_pe -= (int)(4.343 * log(n_sub+1) + .499);
+    if (n_sub > 0) q_pe -= (int)(4.343 * log((double)n_sub + 1.) + .499);
     if (q_pe < 0) q_pe = 0;
     if (q_pe > 60) q_pe = 60;
 
@@ -1972,8 +1982,10 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         extra_flag |= 2;
 
         // cap at the tandem repeat score
-        q_se[0] = q_se[0] < raw_mapq(c[0]->score - c[0]->csub, opt->a)? q_se[0] : raw_mapq(c[0]->score - c[0]->csub, opt->a);
-        q_se[1] = q_se[1] < raw_mapq(c[1]->score - c[1]->csub, opt->a)? q_se[1] : raw_mapq(c[1]->score - c[1]->csub, opt->a);
+        q_se[0] = q_se[0] < raw_mapq((int64_t)c[0]->score - c[0]->csub, opt->a)? q_se[0] : raw_mapq((int64_t)c[0]->score - c[0]->csub, opt->a);
+        q_se[1] = q_se[1] < raw_mapq((int64_t)c[1]->score - c[1]->csub, opt->a)? q_se[1] : raw_mapq((int64_t)c[1]->score - c[1]->csub, opt->a);
+        q_se[0] = q_se[0] > 0? q_se[0] : 0;
+        q_se[1] = q_se[1] > 0? q_se[1] : 0;
 
     } else { // the unpaired alignment is preferred
         z[0] = z[1] = 0;
