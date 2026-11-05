@@ -9,6 +9,7 @@
 #include "bam_rec_scratch.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
+#include "hts_periodic_sync.h"
 #include "meth_xm.h"
 #include "version.h"
 
@@ -20,6 +21,7 @@
 struct meth_bam_writer_s {
     htsFile   *fp;
     sam_hdr_t *hdr;
+    hts_periodic_sync_t sync; /* see hts_periodic_sync.h */
 };
 
 /* Declared in src/bwa.h (without extern "C"); match that linkage here. */
@@ -164,6 +166,7 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     else     snprintf(mode, sizeof(mode), "w");
     w->fp = hts_open(path_or_dash, mode);
     if (w->fp == NULL) { free(w); return NULL; }
+    hts_periodic_sync_init(&w->sync);
     /* BGZF compression thread pool (BAM container only; the text path does not
      * deflate). Ordered tpool -> byte-identical compressed stream vs serial.
      * Non-fatal if it fails; the writer stays serial, but warn so the user
@@ -288,7 +291,8 @@ fail:
 int meth_bam_writer_write(meth_bam_writer_t *w, bam1_t *b)
 {
     if (w == NULL || b == NULL) return -1;
-    return sam_write1(w->fp, w->hdr, b);
+    if (sam_write1(w->fp, w->hdr, b) < 0) return -1;
+    return hts_periodic_sync(&w->sync, w->fp);
 }
 
 int meth_bam_writer_close(meth_bam_writer_t *w)

@@ -8,6 +8,7 @@
 #include "bam_rec_scratch.h"
 #include "bam_writer.h"
 #include "cigar_util.h"
+#include "hts_periodic_sync.h"
 #include "sam_encode.h"
 #include "utils.h"
 
@@ -24,6 +25,7 @@ struct bam_writer_s {
      * the contigs in another order (it is taken verbatim from -H or the index
      * sidecar), so they are mapped by name when written. */
     int32_t   *tid_map;
+    hts_periodic_sync_t sync; /* see hts_periodic_sync.h */
 };
 
 /* Map every index contig to the header's @SQ record of the same name. Returns
@@ -129,6 +131,7 @@ bam_writer_t *bam_writer_open(const char *path, const bntseq_t *bns,
         bam_writer_t *w = (bam_writer_t *)calloc(1, sizeof(*w));
         if (w == NULL) { hts_close(fp); goto fail; }
         w->fp = fp; w->hdr = hdr; w->tid_map = tid_map;
+        hts_periodic_sync_init(&w->sync);
         return w;
     }
 fail:
@@ -144,7 +147,8 @@ int bam_writer_write(bam_writer_t *w, struct bam1_t *b)
         if (b->core.tid >= 0)  b->core.tid  = w->tid_map[b->core.tid];
         if (b->core.mtid >= 0) b->core.mtid = w->tid_map[b->core.mtid];
     }
-    return sam_write1(w->fp, w->hdr, b);
+    if (sam_write1(w->fp, w->hdr, b) < 0) return -1;
+    return hts_periodic_sync(&w->sync, w->fp);
 }
 
 int bam_writer_close(bam_writer_t *w)
