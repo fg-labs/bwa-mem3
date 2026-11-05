@@ -276,4 +276,43 @@ if ! grep -qE -- '(^| )-fprofile-use=' <<< "$LINE"; then
     exit 1
 fi
 
+# A distro compiler can default to x86-64-v3. Enabling SSE4.1 does not
+# disable that baseline's AVX2: verify the actual predefined ISA macros for
+# every tier under an intentionally stronger inherited baseline.
+read -r -a tier_cxx <<< "$("$MAKE" -s -o ext/htslib/htslib_static.mk "${make_args[@]}" print-CXX)"
+tier_target=()
+tier_names=(sse41 sse42 avx avx2 avx512bw)
+if [[ $(uname -m) == arm64 || $(uname -m) == aarch64 ]]; then
+    # Clang can preprocess for x86 without an SDK; native ARM GCC cannot.
+    tier_version=$("${tier_cxx[@]}" --version)
+    if [[ $tier_version == *clang* ]]; then
+        tier_target=(--target=x86_64-linux-gnu)
+    else
+        echo "SKIP: x86 kernel ISA macros require Clang when testing on ARM"
+        tier_names=()
+    fi
+fi
+for tier in "${tier_names[@]}"; do
+    read -r -a tier_flags <<< "$("$MAKE" -s -o ext/htslib/htslib_static.mk "${make_args[@]}" "print-KERNEL_FLAGS_$tier")"
+    tier_macros=$("${tier_cxx[@]}" "${tier_target[@]}" -march=x86-64-v4 \
+        "${tier_flags[@]}" -dM -E -x c++ /dev/null)
+    for feature in SSE4_1 SSE4_2 AVX AVX2 AVX512F AVX512BW; do
+        want=0
+        case "$tier:$feature" in
+            *:SSE4_1 | sse42:SSE4_2 | avx:SSE4_2 | avx2:SSE4_2 | avx512bw:SSE4_2 | \
+                avx:AVX | avx2:AVX | avx512bw:AVX | avx2:AVX2 | avx512bw:AVX2 | \
+                avx512bw:AVX512F | avx512bw:AVX512BW) want=1 ;;
+        esac
+        got=0
+        if grep -q "^#define __${feature}__ 1$" <<< "$tier_macros"; then got=1; fi
+        if [[ $got != "$want" ]]; then
+            echo "FAIL: $tier kernel: __${feature}__=$got, expected $want after resetting a stronger baseline"
+            exit 1
+        fi
+    done
+done
+if ((${#tier_names[@]} > 0)); then
+    echo "PASS: kernel tier ISA macros do not inherit a stronger compiler baseline"
+fi
+
 echo "PASS: make_c_opt_level (reader C TUs: -g -O3 by default, environment CFLAGS -O0 overridden, ASAN=1 -O1, EXTRA_CFLAGS=-O0 honoured; an -O in CPPFLAGS ignored on reader, C++ and kernel TUs and the LTO link, with ASAN/COVERAGE levels and other flags kept; -DNDEBUG in CPPFLAGS stripped, EXTRA_CXXFLAGS/EXTRA_CFLAGS=-DNDEBUG honoured and forwarded through pgo-generate, pgo-use and lto-build; a command-line CPPFLAGS reaches lto-build's sub-make filtered)"

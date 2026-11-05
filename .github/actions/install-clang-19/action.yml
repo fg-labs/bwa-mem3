@@ -11,7 +11,8 @@ description: >-
 # that keyring so a tampered mirror or a changed installer script can't run code
 # as root or slip in unsigned packages. Every job that needs clang-19 uses this
 # action, so the fingerprint pin lives in one place. Linux runners only (x86_64
-# and arm64).
+# and arm64). Callers pin Ubuntu 24.04: LLVM 19 is published for noble, not
+# every newer Ubuntu release selected by ubuntu-latest.
 #
 # Speed: this runs in every Linux clang job, so the slow parts are trimmed:
 #   - `apt-get update` refreshes only the llvm source list. The runner image
