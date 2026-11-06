@@ -13,6 +13,7 @@
  * reads' searches (gap_job_t in bwtgap.cpp). Its widths are computed by width_walk_run
  * (bwtgap.cpp), bwt_cal_width's loop as a resumable walk; gap_slots_run (bwtgap.cpp) steps the
  * slots; and each slot's search stack is a gap_cstack_t drawing chunks from a per-thread pool.
+ * The threads claim chunks of reads from a shared counter (read_claim_t), not i % n_threads == tid.
  * The BAM input, .sai writer and command-line parser are not ported. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
@@ -21,6 +22,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <atomic>
 #include <vector>
 
 namespace bwa_aln {
@@ -133,7 +135,15 @@ struct gap_slot_t {
 #define ALN_GROUP 8
 #endif
 
-static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs,
+int read_claim_t::claim(int *end)
+{
+	const int st = next_.fetch_add(ALN_CLAIM_CHUNK, std::memory_order_relaxed);
+	if (st >= n_seqs_) return -1;
+	*end = st + ALN_CLAIM_CHUNK < n_seqs_? st + ALN_CLAIM_CHUNK : n_seqs_;
+	return st;
+}
+
+static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs,
 									 const gap_opt_t *opt)
 {
 	const int G = ALN_GROUP;
@@ -148,17 +158,29 @@ static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, const bwt_t *bwt, i
 		s.c->state = GAP_SLOT_EMPTY;
 		s.p = 0; // seed_w is sized on first use: only reads longer than -l use it
 	}
-	int next = tid, n_active = 0;
+	int next = 0, chunk_end = 0, n_active = 0; // the reads [next, chunk_end) are claimed and not yet taken
+	bool claimed_all = false; // the counter is used up: no more claims (and no more traffic on it)
+	// The thread's next read (claiming a new chunk when its own is used up), or -1 when none is left.
+	auto next_read = [&]() -> int {
+		if (next == chunk_end) {
+			if (claimed_all || (next = claim->claim(&chunk_end)) < 0) {
+				claimed_all = true;
+				next = chunk_end = 0;
+				return -1;
+			}
+		}
+		return next++;
+	};
 	// Takes the thread's next read into slot s and starts its width walks; returns 0 when
 	// none is left.
 	auto fill = [&](gap_slot_t &s) -> int {
-		if (next >= n_seqs) {
+		const int r = next_read();
+		if (r < 0) {
 			s.p = 0;
 			s.c->state = GAP_SLOT_EMPTY;
 			return 0;
 		}
-		bwa_seq_t *p = seqs + next;
-		next += n_threads;
+		bwa_seq_t *p = seqs + r;
 		p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0;
 		if ((int)s.w.size() < p->len + 1) s.w.resize(p->len + 1);
 		width_walk_init(&s.c->ww, bwt, p->len, p->seq, s.w.data());
@@ -207,7 +229,7 @@ static void bwa_cal_sa_reg_gap_group(int tid, int n_threads, const bwt_t *bwt, i
 }
 
 typedef struct {
-	int tid, n_threads;
+	read_claim_t *claim;
 	const bwt_t *bwt;
 	int n_seqs;
 	bwa_seq_t *seqs;
@@ -217,23 +239,26 @@ typedef struct {
 static void *worker(void *data)
 {
 	thread_aux_t *d = (thread_aux_t*)data;
-	bwa_cal_sa_reg_gap_group(d->tid, d->n_threads, d->bwt, d->n_seqs, d->seqs, d->opt);
+	bwa_cal_sa_reg_gap_group(d->claim, d->bwt, d->n_seqs, d->seqs, d->opt);
 	return 0;
 }
 
-/* The search keeps upstream's fan-out: fresh joinable pthreads per batch, each taking reads tid,
- * tid + n_threads, ... (the thread count is a parameter). The post-search stages use kt_for_nt,
- * but the search is not moved onto it: kt_for_nt hands out item ranges of its own layout, so the
- * ALN_GROUP slots (stacks, width buffers) would have to become per-tid state, the interleave would
- * drain at every range boundary, and the group depth was tuned for this striding. Hits do not
- * depend on which thread searches a read, so either is output-identical; a change would need a
- * same-host throughput A/B on each shipped tier. One thread spawn per thread per batch of 0x40000
- * reads is small next to the search. */
+/* The search keeps upstream's fan-out of fresh joinable pthreads per batch (the thread count is a
+ * parameter), but the reads are not dealt round-robin as upstream does (thread t searching reads
+ * t, t + n_threads, ...): each thread claims ALN_CLAIM_CHUNK consecutive reads at a time from a
+ * shared counter, so a thread that drew cheap reads takes more of them and the threads finish
+ * together. Each thread keeps its ALN_GROUP slots fed across chunk boundaries. Hits do not depend
+ * on which thread searches a read, so the output is the same. The post-search stages use kt_for_nt;
+ * the search is not moved onto it: kt_for_nt hands out item ranges of its own layout, so the slots
+ * (stacks, width buffers) would have to become per-tid state and the interleave would drain at
+ * every range boundary. One thread spawn per thread per batch of 0x40000 reads is small next to
+ * the search. */
 void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads)
 {
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
-	if (n_threads <= 1) { // no multi-threading at all
-		bwa_cal_sa_reg_gap_group(0, 1, bwt, n_seqs, seqs, &bopt);
+	read_claim_t claim(n_seqs);
+	if (n_threads <= 1) { // no multi-threading at all (bwa aln's -t 0 too)
+		bwa_cal_sa_reg_gap_group(&claim, bwt, n_seqs, seqs, &bopt);
 	} else {
 		pthread_t *tid;
 		pthread_attr_t attr;
@@ -244,15 +269,17 @@ void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_o
 		data = (thread_aux_t*)aln_calloc(n_threads, sizeof(thread_aux_t));
 		tid = (pthread_t*)aln_calloc(n_threads, sizeof(pthread_t));
 		std::vector<char> started(n_threads, 0);
+		bool any_failed = false;
 		for (j = 0; j < n_threads; ++j) {
-			data[j].tid = j; data[j].n_threads = n_threads; data[j].bwt = bwt;
+			data[j].claim = &claim; data[j].bwt = bwt;
 			data[j].n_seqs = n_seqs; data[j].seqs = seqs; data[j].opt = &bopt;
 			started[j] = pthread_create(&tid[j], &attr, worker, data + j) == 0;
+			any_failed = any_failed || !started[j];
 		}
-		// A thread that could not be created leaves its share of the reads unsearched (and the
-		// join below would wait on a thread that does not exist), so the caller runs that share.
-		for (j = 0; j < n_threads; ++j)
-			if (!started[j]) worker(data + j);
+		// A thread that could not be created must not be joined. The caller runs one worker in
+		// place of the missing ones: it claims reads like the others, so it and the threads that
+		// started search every read (it alone does if none started).
+		if (any_failed) worker(data);
 		for (j = 0; j < n_threads; ++j)
 			if (started[j]) pthread_join(tid[j], 0);
 		free(data); free(tid);
