@@ -6,6 +6,10 @@ namespace bwa_aln {
 /* Original forward-reference half-open window. Query is already oriented to this strand. */
 struct aln_meth_candidate_t { int rid, strand, hyp; int64_t rb, re; };
 enum class aln_meth_eval_status { ok, invalid_input, resource_error, no_alignment };
+/* Fetch a validated forward-reference window (length <=65535), masking .amb runs to code N
+ * before CpG labelling. Used only by aln's methylation refinement, accounting and emission. */
+void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
+    int64_t rb, int len, int rid, std::vector<uint8_t> &target);
 /* Fixed-reward candidate refiner. Caller cost-ranks its raw CIGAR and owns both CIGARs.
  * Invalid/resource failures print ERROR and must not be interpreted as an absent candidate.
  * Fixed scoring uses the existing meth matrices and ksw_global; hints never certify a band.

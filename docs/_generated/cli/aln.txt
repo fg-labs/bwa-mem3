@@ -101,6 +101,10 @@ Methylation (shared with bwa-mem3 mem):
    Under --meth, converted search proposes windows; original-reference global realignment
    refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.
    Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.
+   TAPS/5base neutral breaks equal costs by fewest conversions. When this displaces an
+   equal-cost locus, MAPQ <= min(60,6*delta); delta is the smallest conversion-count gap.
+   Pair all retained loci up to --max-occ only without lookup/work cutoffs on either end.
+   Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.
    aln -B is barcode length, not mem's mismatch penalty. Records carry
    XR/XG/XM:Z instead of XM:i/XO:i/XG:i.
 

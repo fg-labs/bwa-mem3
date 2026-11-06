@@ -693,6 +693,10 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "   Under --meth, converted search proposes windows; original-reference global realignment\n");
 	fprintf(fp, "   refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.\n");
 	fprintf(fp, "   Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.\n");
+	fprintf(fp, "   TAPS/5base neutral breaks equal costs by fewest conversions. When this displaces an\n");
+	fprintf(fp, "   equal-cost locus, MAPQ <= min(60,6*delta); delta is the smallest conversion-count gap.\n");
+	fprintf(fp, "   Pair all retained loci up to --max-occ only without lookup/work cutoffs on either end.\n");
+	fprintf(fp, "   Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.\n");
 	fprintf(fp, "   aln -B is barcode length, not mem's mismatch penalty. Records carry\n");
 	fprintf(fp, "   XR/XG/XM:Z instead of XM:i/XO:i/XG:i.\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
@@ -869,9 +873,13 @@ int main_aln(int argc, char *argv[])
 	// stock does (-e -1 is the documented "no long gaps", for example).
 #define ALN_INT(flag, lo, dst) do { if (!aln_parse_int(flag, optarg, lo, INT_MAX, dst)) return 1; } while (0)
 	bwa_rg_id[0] = '\0'; // bwa_set_rg's global: a run without -r must not tag reads with an earlier run's ID
-	optind = 1; // a clean reparse (the unit tests call main_aln more than once)
+	// A clean reparse (the unit tests call main_aln more than once). getopt keeps a pointer into the
+	// previous argv when that parse ended on a flag such as -N, and the caller may have freed it.
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
-	optreset = 1; // BSD getopt also keeps a static `place` pointer
+	optind = 1;
+	optreset = 1; // BSD getopt keeps that pointer as a static `place`
+#else
+	optind = 0; // glibc and musl reinitialize on 0, dropping the stale pointer; optind=1 keeps it
 #endif
 	while ((c = getopt_long(argc, argv, "n:o:e:i:d:l:k:LR:m:t:v:NM:O:E:q:f:r:IYB:a:c:sAP", long_opts, 0)) >= 0) {
 		switch (c) {
