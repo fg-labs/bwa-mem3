@@ -47,7 +47,8 @@
 // What is compared is what `mem` reads of a result: score, te, qe, tb and qb
 // (the rescued mate's coordinates, bwamem_pair.cpp mem_matesw_batch_post) and
 // score2 (its csub, which enters the MAPQ). te2, the second-best's row, is
-// computed by the kernels but read nowhere in `mem`, so it is not compared. With
+// computed by the kernels but read nowhere in `mem`, so it is compared only in
+// the exclusion-window cases, where the counted second-best is unique. With
 // KSW_XBYTE, ksw.h documents only the reported score (255) after an overflow;
 // the other fields of an overflowed pass are not compared either.
 //
@@ -500,9 +501,20 @@ TEST_CASE("local SW oracle: the second-best score's exclusion window, at both ed
             CHECK(want.r.te2 == c.te2);
             for (const Tier &tier : tiers) {
                 CAPTURE(tier.name);
-                check_fields(run_align2(tier.align2, q, c.ref, def, xtra), want);
+                const kswr_t a2 = run_align2(tier.align2, q, c.ref, def, xtra);
+                check_fields(a2, want);
                 const std::vector<bwa_tests::TestPair> one = {{c.ref, q, ""}};
-                check_fields(run_kswv(tier.kswv, one, def, xtra, xtra == xtra16)[0], want);
+                const kswr_t kv = run_kswv(tier.kswv, one, def, xtra, xtra == xtra16)[0];
+                check_fields(kv, want);
+                // check_fields leaves te2 out (mem does not read it). Here the
+                // counted second-best is unique (one weaker copy, one row at its
+                // score, both oracle runs agree: want.all()), so the kernels'
+                // te2 is pinned too. Only where a second-best is counted: what
+                // te2 holds when none is is not part of the model.
+                if (c.score2 >= 0) {
+                    CHECK(a2.te2 == c.te2);
+                    CHECK(kv.te2 == c.te2);
+                }
             }
         }
     }

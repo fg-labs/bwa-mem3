@@ -26,8 +26,11 @@
 // consume exactly qlen and tlen, use only M/I/D, never put I next to D, and
 // score exactly the returned value. The hand-worked cases at the top pin the
 // CIGAR and the direction of each gap's price, on inputs with a single optimal
-// path. (The int32 wavefront is held to the scalar reference in
-// test_ksw_global2_wave.cpp, which the random cases here tie to the oracle.)
+// path. The int16 wavefront takes every small-score pair, so the random cases
+// reach it; a high-gap case rejects int16 and checks the int32 wavefront
+// directly against the oracle (score, full rescored CIGAR, and the wave
+// counters). Both are also held to the scalar reference in
+// test_ksw_global2_wave.cpp.
 //
 // Tiers: x86 calls the per-tier kernels by name (ksw_global2_avx2 and, where
 // the host has AVX-512BW, ksw_global2_avx512bw; libbwa.a carries every tier's
@@ -309,4 +312,91 @@ TEST_CASE("ksw_global2 oracle: random pairs score the Gotoh optimum on every run
         // the scalar path.
         if (tier.wave_wmin() > 0 || tier.wave16_wmin() > 0) CHECK(tier.wave_count() > wave_before);
     }
+}
+
+TEST_CASE("ksw_global2 oracle: high gap opens reject int16, run the int32 wavefront and score the Gotoh optimum"
+          * doctest::test_suite("unit/ksw_global2")) {
+    // A gap open of 3000 puts o + e past the int16 kernel's sentinel headroom,
+    // so ksw_g2_wave16_safe rejects the pair at any length and, at w >= the
+    // int32 crossover, the int32 wavefront runs. The other cases here use small
+    // scores, which the int16 kernel always takes, so without this case the
+    // independent oracle never checks the int32 kernel. Each pair must leave the
+    // int16 entry count alone, raise the aggregate wavefront count by one, score
+    // the oracle's optimum and return a CIGAR that rescores to that score. The
+    // hand-made pairs pin one deletion and one insertion under the first gap
+    // set. The second keeps deletions cheap under a still-rejected insertion
+    // open, so its random pairs with extra target bases align through the
+    // int32 kernel's cheap-deletion path; some must (a D op in a random pair's
+    // CIGAR), or a change to the generated pairs left that path unchecked.
+    // (With an insertion open of 3000 no optimum takes gap beyond what the
+    // length difference forces, so the floor counts D ops, not extra gap.)
+    const Scoring big = scoring(1, 4, 3000, 1, 3000, 1);
+    const Scoring cheap_del = scoring(1, 4, 5, 2, 3000, 3);
+    // ksw_g2_wave16_safe (src/ksw_global2_wave.h, which only ksw.cpp may
+    // include) rejects int16 when KSW_VMINF16 - (o_max + e_max) <= -32768 +
+    // SLACK, with KSW_VMINF16 = -30000 and SLACK = 64 there: o + e >= 2704.
+    // The wave16 counter below shows the rejection directly. These are copies
+    // of those constants, so a change there is caught by that counter, not here;
+    // the copies only document why this scoring set is rejected.
+    const int kVminf16 = -30000, kSlack = 64;
+    const int int16_reject_oe = kVminf16 + 32768 - kSlack;   // 2704
+    const std::vector<Tier> tiers = runnable_tiers();
+    if (tiers.empty()) return;  // no tier to check; runnable_tiers() reported each one skipped
+    std::mt19937 rng(6870013u);
+    struct P { std::vector<uint8_t> q, t; };
+    std::vector<P> pairs;
+    {
+        const std::vector<uint8_t> q = random_seq(rng, 64, false);
+        // Three target bases the query lacks, all c, between q[29] and q[30]:
+        // c differs from both, so the gap has one optimal placement.
+        uint8_t c = 0;
+        while (c == q[29] || c == q[30]) ++c;
+        std::vector<uint8_t> t(q.begin(), q.begin() + 30);
+        t.insert(t.end(), {c, c, c});
+        t.insert(t.end(), q.begin() + 30, q.end());
+        pairs.push_back({q, t});
+        pairs.push_back({t, q});                             // the same, as an insertion
+    }
+    for (int n = 0; n < 12; ++n) {
+        const std::vector<uint8_t> q = random_seq(rng, 60 + rng() % 60, n % 3 == 0);
+        pairs.push_back({q, mutate(rng, q)});
+    }
+    int n_cheap_del_d = 0, n_tiers = 0;
+    for (const Tier &tier : tiers) {
+        CAPTURE(tier.name);
+        if (tier.wave_wmin() == 0) {
+            MESSAGE("ksw_global2 oracle: tier " << tier.name << " has no int32 wavefront; case skipped");
+            continue;
+        }
+        ++n_tiers;
+        for (const Scoring *s : {&big, &cheap_del}) {
+            REQUIRE(s->o_ins + s->e_ins >= int16_reject_oe);   // the int16 rejection this case depends on
+            for (size_t k = 0; k < pairs.size(); ++k) {
+                const P &p = pairs[k];
+                const int w = std::max({(int)p.q.size(), (int)p.t.size(), tier.wave_wmin()});
+                CAPTURE(k);
+                CAPTURE(s->o_del);
+                CAPTURE(p.q.size());
+                CAPTURE(p.t.size());
+                const unsigned long agg0 = tier.wave_count(), w16_0 = tier.wave16_count();
+                const G2 r = run(tier.g2, p.q, p.t, *s, w);
+                CHECK(tier.wave16_count() == w16_0);    // int16 rejected
+                CHECK(tier.wave_count() == agg0 + 1);   // the int32 wavefront ran
+                CHECK(r.score == oracle_score(p.q, p.t, *s));
+                int sc = 0;
+                const bool valid = rescore(r.cigar, p.q, p.t, *s, &sc);
+                CAPTURE(cigar_string(r.cigar));
+                CHECK(valid);
+                CHECK(sc == r.score);
+                if (s == &cheap_del && k >= 2)
+                    n_cheap_del_d += std::any_of(r.cigar.begin(), r.cigar.end(),
+                                                 [](uint32_t c) { return (c & 0xf) == 2; });
+                if (s == &big && k == 0) CHECK(cigar_string(r.cigar) == "30M3D34M");
+                if (s == &big && k == 1) CHECK(cigar_string(r.cigar) == "30M3I34M");
+            }
+        }
+    }
+    // Each gap set's floor: under big, the pinned 30M3D34M / 30M3I34M above;
+    // under cheap_del, a random pair (not a hand-made one) whose CIGAR has a D.
+    if (n_tiers > 0) CHECK(n_cheap_del_d > 0);
 }

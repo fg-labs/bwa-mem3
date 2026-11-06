@@ -19,14 +19,18 @@
 //     getSMEMsOnePosOneThread_lockstep), a call at position x emits the
 //     intervals through x that are maximal under "occurs at least t times".
 //     The brute force finds, for every start i, the last end R(i) that still
-//     occurs t times; [i, R(i)] is maximal when R(i - 1) < R(i). The oracle
-//     comparisons use a minimum length of at least 2: the forward phase
-//     records the interval it extends before testing the extension against t,
-//     starting with the lone base at x, so with a minimum length of 1 a base
-//     occurring fewer than t times can be emitted, which the maximal-interval
-//     model does not describe. At minimum length 1 each emitted SMEM is
-//     checked only against the brute force's interval for its span, and every
-//     lockstep width against width 1.
+//     occurs t times; [i, R(i)] is maximal when R(i - 1) < R(i). The forward
+//     phase records the interval it extends before testing the extension
+//     against t, starting with the lone base at x, so with a minimum length of
+//     1 a base occurring fewer than t times can be emitted, which the
+//     maximal-interval model does not describe; the model holds at minimum
+//     length 1 whenever the lone base at x occurs at least t times. The
+//     round-2 case therefore uses a minimum length of at least 2 for its
+//     oracle comparisons, and at minimum length 1 checks each emitted SMEM
+//     only against the brute force's interval for its span, and every
+//     lockstep width against width 1. The mem_collect_smem case's -k 1 rows
+//     compare the complete emitted set against the oracle: oracle_collect
+//     REQUIREs that each re-seed base occurs at least s + 1 times there.
 //   - Round 3 (bwtSeedStrategyAllPosOneThread and its lockstep twin) walks x
 //     from 0: it extends [x, j] to the right until fewer than max_intv
 //     occurrences remain and the length is at least the floor, emits the
@@ -570,7 +574,14 @@ std::vector<Smem> oracle_collect(Fixture &f, const mem_opt_t *opt, int split_len
         n_round[0] += r1.size();
         for (const Smem &p : r1) {
             if ((int)(p.n + 1 - p.m) < split_len || p.s > opt->split_width) continue;
-            const std::vector<Smem> r2 = oracle_round2(f, r, (int)((p.m + p.n + 1) >> 1), p.s + 1, opt->min_seed_len);
+            const int x = (int)((p.m + p.n + 1) >> 1);
+            // At a minimum length of 1 the maximal-interval model holds only
+            // when the lone base at x occurs at least t = s + 1 times (see the
+            // header). With -s at most a few dozen and every base frequent in
+            // the fixture that always holds; check it, so a -k 1 case cannot
+            // compare against a model that does not apply.
+            if (opt->min_seed_len <= 1) REQUIRE(make_smem(f.bf, (uint32_t)r, f.reads[r], x, x).s >= p.s + 1);
+            const std::vector<Smem> r2 = oracle_round2(f, r, x, p.s + 1, opt->min_seed_len);
             all.insert(all.end(), r2.begin(), r2.end());
             n_round[1] += r2.size();
         }
@@ -915,6 +926,12 @@ TEST_CASE("mem_collect_smem: the three rounds sorted equal the oracle under -k -
         // -s 0: every round-1 SMEM occurs at least once, so none is rare enough
         // to re-seed and round 2 must contribute nothing.
         {19, 1.5f, 28, 20, 0, 0, 0, -1},
+        // -k 1: split 1 * 1.5 = 1.5 -> 1, so every round-1 SMEM with s <= -s
+        // re-seeds; round 3 runs at minimum length 2. The complete emitted
+        // set is compared against the brute force (rounds 1-3 as the header
+        // describes), not against another width, with and without
+        // --smem-dedup.
+        {1, 1.5f, 1, 20, 10, 0, 1, 1}, {1, 1.5f, 1, 20, 10, 1, 1, 1},
     };
     size_t n_dups_removed = 0, n_cross_read_equal = 0;
     for (const Case &c : cases) {

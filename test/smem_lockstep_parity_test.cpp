@@ -77,6 +77,21 @@ static int64_t smem_array_first_mismatch(const SMEM *a, const SMEM *b, int64_t n
     return -1;
 }
 
+/* Print the first (rid,m,n,k,s) difference between two equal-length SMEM
+ * streams, as run_case and run_allpos_case report it. */
+static void report_smem_mismatch(const char *case_name, const SMEM *s_out, const SMEM *l_out,
+                                 int64_t mism)
+{
+    const SMEM &a = s_out[mism];
+    const SMEM &b = l_out[mism];
+    fprintf(stderr, "[FAIL] %s: SMEM field mismatch at index %lld:\n"
+            "  scalar   rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n"
+            "  lockstep rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n",
+            case_name, (long long)mism,
+            a.rid, a.m, a.n, (long long)a.k, (long long)a.l, (long long)a.s,
+            b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s);
+}
+
 static int32_t total_cases = 0;
 static int32_t passed_cases = 0;
 
@@ -157,14 +172,7 @@ static bool run_case(FMI_search *fmi,
     } else {
         int64_t mism = smem_array_first_mismatch(scalar_out, lockstep_out, n_scalar);
         if (mism >= 0) {
-            const SMEM &a = scalar_out[mism];
-            const SMEM &b = lockstep_out[mism];
-            fprintf(stderr, "[FAIL] %s: SMEM field mismatch at index %lld:\n"
-                    "  scalar   rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n"
-                    "  lockstep rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n",
-                    case_name, (long long)mism,
-                    a.rid, a.m, a.n, (long long)a.k, (long long)a.l, (long long)a.s,
-                    b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s);
+            report_smem_mismatch(case_name, scalar_out, lockstep_out, mism);
             ok = false;
         } else if (memcmp(qpa_s, qpa_l, numReads * sizeof(int32_t)) != 0) {
             fprintf(stderr, "[FAIL] %s: query_pos_array write-back differs\n", case_name);
@@ -241,6 +249,24 @@ static const uint64_t S1_TAG = 1ULL << 63;
 static bool s1_tagged(const SMEM &a) { return (a.info & S1_TAG) != 0; }
 static int64_t s1_coord(const SMEM &a) { return ((int64_t)(a.info << 1) >> 1) + (int64_t)a.m; }
 
+/* A tagged SMEM's coordinate holds its read bases in `text` (the index's text:
+ * forward reference + reverse complement): s == 1, the coordinate in range, and
+ * read[m..n] equal to text[coord..] except where the text is not A/C/G/T (a
+ * hole, where the pac's base is random). */
+static bool tag_holds_read(const SMEM &a, const uint8_t *enc_qdb, const int32_t *query_cum_len_ar,
+                           const std::string &text)
+{
+    const int64_t coord = s1_coord(a);
+    const int64_t len = (int64_t)a.n - (int64_t)a.m + 1;
+    bool ok = a.s == 1 && coord >= 0 && coord + len <= (int64_t)text.size();
+    const uint8_t *q = enc_qdb + query_cum_len_ar[a.rid];
+    for (int64_t i = 0; ok && i < len; i++) {
+        const char t = text[(size_t)(coord + i)];
+        ok = (t != 'A' && t != 'C' && t != 'G' && t != 'T') || "ACGTN"[q[a.m + i]] == t;
+    }
+    return ok;
+}
+
 /* Every SMEM a producer does not tag must carry info 0, because SA resolution
  * with trust_s1_tag writes a coordinate for any s == 1 SMEM with bit 63 set.
  * allow_tag: the producer may tag s == 1 SMEMs (the lockstep SMEM driver). */
@@ -265,18 +291,28 @@ struct KsDedupModeGuard {
     ~KsDedupModeGuard() { ks_dedup_configure(NULL); }
 };
 
-/* The SA tags, checked against two independent oracles:
+/* The SA tags, checked against three oracles (each failing the case on the
+ * first SMEM it rejects):
  *   1. the text itself: a tagged SMEM's coordinate must hold read[m..n] in
- *      `text` (the index's text: forward reference + reverse complement);
+ *      `text` (the index's text: forward reference + reverse complement)
+ *      (tag_holds_read); fails on a coordinate that does not;
  *   2. the LF walk: get_sa_entries_prefetch with trust_s1_tag (the tag written
  *      without a walk) must return the same coordinates as with it off (every
  *      position walked), in the plain and the dedup staging paths, at
  *      max_occ 500 (the default) and 2 (so the sampled step, s / max_occ, of
  *      the SMEMs staged around the tagged ones is exercised, on extra
  *      untagged SMEMs with s >= 2 * max_occ), and must ignore the tag under a
- *      dropped sentinel offset (--compat=bwa-mem2). The case fails unless some
- *      tagged SMEM's walk reaches the sentinel row there (its dropped-offset
- *      coordinate differs from its tag), so that leg cannot pass vacuously.
+ *      dropped sentinel offset (--compat=bwa-mem2); fails on a count or a
+ *      coordinate that differs, and unless some tagged SMEM's walk reaches the
+ *      sentinel row there (its dropped-offset coordinate differs from its
+ *      tag), so that leg cannot pass vacuously;
+ *   3. a planted tag (see the block): every tagged SMEM in turn gets a tag one
+ *      base off, staged with an untagged SMEM and as a duplicate of itself, so
+ *      both staging paths see it; fails unless the trusted tag is used at
+ *      drop 0 (as representative and as duplicate) and the LF walk otherwise,
+ *      and unless some planted SMEM's drop-1 walk differs from its tag.
+ * Oracles 1 and 2 agree with production by construction on real tags, so only
+ * Oracle 3 fails when the tag is not read.
  * The SMEMs are made as mem_collect_smem makes them: round 1 (the lockstep SMEM
  * driver at min_intv 1 from each read's pivot), round 2 (the re-seed pass, from
  * the middle of each round-1 SMEM of at least split_len bases and s <= 10, at
@@ -393,19 +429,10 @@ static bool check_s1_tags(FMI_search *fmi, const char *case_name, int32_t numRea
     /* Oracle 1: the text holds read[m..n] at the tagged coordinate. */
     for (const SMEM &a : smems) {
         if (!s1_tagged(a)) continue;
-        const int64_t coord = s1_coord(a);
-        const int64_t len = (int64_t)a.n - (int64_t)a.m + 1;
-        bool ok = a.s == 1 && coord >= 0 && coord + len <= (int64_t)text.size();
-        const uint8_t *q = enc_qdb + query_cum_len_ar[a.rid];
-        for (int64_t i = 0; ok && i < len; i++) {
-            const char t = text[(size_t)(coord + i)];
-            ok = (t != 'A' && t != 'C' && t != 'G' && t != 'T') ||   /* a hole: pac's base is random */
-                 "ACGTN"[q[a.m + i]] == t;
-        }
-        if (!ok) {
+        if (!tag_holds_read(a, enc_qdb, query_cum_len_ar, text)) {
             fprintf(stderr, "[FAIL] %s: tagged SMEM rid=%u m=%u n=%u s=%lld: coordinate %lld "
                     "does not hold the read\n", case_name, a.rid, a.m, a.n, (long long)a.s,
-                    (long long)coord);
+                    (long long)s1_coord(a));
             return false;
         }
     }
@@ -471,6 +498,159 @@ static bool check_s1_tags(FMI_search *fmi, const char *case_name, int32_t numRea
         }
     }
 
+    int64_t n_planted = 0, n_planted_twin = 0;
+    /* Oracle 3: a planted tag. Oracle 2 compares trusted and walked results on
+     * real tags, which agree by construction, so it also passes if the tag is
+     * never read. Here each tagged SMEM in turn gets a tag one base off its real
+     * coordinate (still a valid text position, so nothing reads out of range)
+     * and is staged twice, after one untagged SMEM of another (k, s), in one
+     * call. Three SMEMs reach the dedup path under --ks-dedup on (it needs
+     * count >= 2): the first planted copy is the representative of its (k, s),
+     * whose tag the staging pass writes as its coordinate, and the second is
+     * its duplicate, whose slot the scatter pass copies from the
+     * representative's (FMI_search.cpp, get_sa_entries_prefetch). Under off
+     * the plain path stages all three. Expected, per staging path and sentinel
+     * mode:
+     *   - trusted at drop 0: both planted slots hold the planted coordinate;
+     *   - otherwise: the LF walk, taken from a reference call on the unplanted
+     *     SMEM alone (dedup off, untrusted, same drop). At drop 1 a walk that
+     *     meets the sentinel row reports 0, not the real coordinate, so the
+     *     real coordinate is not the expectation there;
+     *   - at drop 0 the reference walk itself must equal the real coordinate
+     *     (independent of the call under test, since the tag came from the
+     *     text compare and Oracle 1 checked it against the text);
+     *   - the untagged SMEM's slots are its reference walk in every leg.
+     * Where an untagged SMEM shares the planted one's (k, s) (the same read
+     * bases in another read, left untagged by containment), it is also staged
+     * first, as the twin: under dedup it is the representative, so the planted
+     * duplicate copies the twin's walk whether or not the tag is trusted (the
+     * dedup path keeps a tagged SMEM's duplicate role); under off the plain
+     * path still trusts the planted tag. */
+    {
+        auto ref_walk = [&](const SMEM &x, int drop, int64_t *out) {
+            SMEM c = x;
+            int64_t cnt = 0, id = 0;
+            ks_dedup_configure("off");
+            fmi->get_sa_entries_prefetch(&c, out, &cnt, 1, 500, 0, id, drop, false);
+            return cnt;
+        };
+        int64_t planted = 0, n_drop_differs = 0, n_twin = 0;
+        for (int64_t i = 0; i < n; i++) {
+            const SMEM &a0 = smems[(size_t)i];
+            if (!(a0.s == 1 && s1_tagged(a0))) continue;
+            const int64_t real = s1_coord(a0);
+            const int64_t fake = real + 1 < (int64_t)text.size() ? real + 1 : real - 1;
+            SMEM a = a0;
+            a.info = S1_TAG | ((uint64_t)(fake - (int64_t)a.m) & ~S1_TAG);
+            /* Precondition of this oracle, not a check of production code: the
+             * test's encoder above and its decoder (s1_coord) round-trip for
+             * any |fake - m| < 2^62, which a text coordinate always meets. */
+            if (s1_coord(a) != fake) {
+                fprintf(stderr, "[FAIL] %s: precondition: planted tag for rid=%u m=%u n=%u does "
+                        "not decode to %lld\n", case_name, a.rid, a.m, a.n, (long long)fake);
+                return false;
+            }
+            planted++;
+            /* The companion: an untagged SMEM of another k (so a different
+             * (k, s): dedup must not pair it with the planted one). */
+            const SMEM *other = NULL, *twin = NULL;
+            for (const SMEM &x : smems) {
+                if (s1_tagged(x) || x.s < 1 || x.s > 500) continue;
+                if (other == NULL && x.k != a0.k) other = &x;
+                if (twin == NULL && x.k == a0.k && x.s == a0.s) twin = &x;
+            }
+            if (other == NULL) {
+                fprintf(stderr, "[FAIL] %s: no untagged SMEM of another (k, s) to stage with "
+                        "planted tag rid=%u m=%u n=%u\n", case_name, a.rid, a.m, a.n);
+                return false;
+            }
+            const int64_t no = other->s;
+            int64_t walk[2] = {-1, -1};
+            std::vector<int64_t> other_walk[2];
+            for (int drop : {0, 1}) {
+                if (ref_walk(a0, drop, &walk[drop]) != 1) {
+                    fprintf(stderr, "[FAIL] %s: reference walk of tagged SMEM rid=%u m=%u n=%u "
+                            "at drop %d gave no coordinate\n", case_name, a.rid, a.m, a.n, drop);
+                    return false;
+                }
+                other_walk[drop].assign((size_t)no, -1);
+                if (ref_walk(*other, drop, other_walk[drop].data()) != no) {
+                    fprintf(stderr, "[FAIL] %s: reference walk of the untagged SMEM rid=%u m=%u "
+                            "n=%u gave the wrong count\n", case_name, other->rid, other->m,
+                            other->n);
+                    return false;
+                }
+            }
+            if (walk[0] != real) {
+                fprintf(stderr, "[FAIL] %s: tagged SMEM rid=%u m=%u n=%u: its LF walk at drop 0 "
+                        "is %lld, but its tag is %lld\n", case_name, a.rid, a.m, a.n,
+                        (long long)walk[0], (long long)real);
+                return false;
+            }
+            n_drop_differs += walk[1] != real;
+            for (const char *mode : {"off", "on"}) {
+                for (int drop : {0, 1})
+                    for (bool trust : {false, true}) {
+                        SMEM stage[3] = {*other, a, a};
+                        std::vector<int64_t> coord((size_t)no + 2, -1);
+                        int64_t cnt = 0, id = 0;
+                        ks_dedup_configure(mode);
+                        fmi->get_sa_entries_prefetch(stage, coord.data(), &cnt, 3, 500, 0, id,
+                                                     drop, trust);
+                        const int64_t want = (trust && drop == 0) ? fake : walk[drop];
+                        bool ok = cnt == no + 2 && coord[(size_t)no] == want &&
+                                  coord[(size_t)no + 1] == want;
+                        for (int64_t j = 0; ok && j < no; j++)
+                            ok = coord[(size_t)j] == other_walk[drop][(size_t)j];
+                        if (!ok) {
+                            fprintf(stderr, "[FAIL] %s: planted tag (rid=%u m=%u n=%u, real %lld, "
+                                    "planted %lld), dedup %s, drop %d, trust %d: got %lld "
+                                    "coordinate(s), planted slots %lld and %lld, expected %lld "
+                                    "(%s) in both and the untagged SMEM's %lld walked\n",
+                                    case_name, a.rid, a.m, a.n, (long long)real, (long long)fake,
+                                    mode, drop, (int)trust, (long long)cnt,
+                                    (long long)coord[(size_t)no], (long long)coord[(size_t)no + 1],
+                                    (long long)want,
+                                    want == fake ? "the trusted tag" : "the LF walk",
+                                    (long long)no);
+                            return false;
+                        }
+                        if (twin == NULL) continue;
+                        /* The twin leg: {twin, planted}. */
+                        SMEM pair[2] = {*twin, a};
+                        int64_t pc[2] = {-1, -1}, pcnt = 0, pid = 0;
+                        ks_dedup_configure(mode);
+                        fmi->get_sa_entries_prefetch(pair, pc, &pcnt, 2, 500, 0, pid, drop, trust);
+                        const bool dedup_on = mode[1] == 'n';
+                        const int64_t pwant = (trust && drop == 0 && !dedup_on) ? fake : walk[drop];
+                        if (pcnt != 2 || pc[0] != walk[drop] || pc[1] != pwant) {
+                            fprintf(stderr, "[FAIL] %s: planted tag (rid=%u m=%u n=%u) after an "
+                                    "untagged twin (rid=%u, same k and s), dedup %s, drop %d, "
+                                    "trust %d: got %lld coordinate(s), %lld and %lld, expected "
+                                    "%lld and %lld\n", case_name, a.rid, a.m, a.n, twin->rid,
+                                    mode, drop, (int)trust, (long long)pcnt, (long long)pc[0],
+                                    (long long)pc[1], (long long)walk[drop], (long long)pwant);
+                            return false;
+                        }
+                        n_twin += trust && drop == 0 && dedup_on;
+                    }
+            }
+        }
+        /* Every tagged SMEM is planted (no cap: the expectations above hold for
+         * any of them). Some must meet the sentinel row under drop 1, or the
+         * reference-walk expectation went untested against a walk that differs
+         * from the tag. */
+        if (planted == 0 || n_drop_differs == 0 || n_twin == 0) {
+            fprintf(stderr, "[FAIL] %s: planted-tag check not exercised: %lld planted, %lld "
+                    "whose drop-1 walk differs from the tag, %lld with an untagged twin "
+                    "(each must be > 0)\n", case_name, (long long)planted,
+                    (long long)n_drop_differs, (long long)n_twin);
+            return false;
+        }
+        n_planted_twin = n_twin;
+        n_planted = planted;
+    }
+
     if (n_tag_walk == 0 || n_tag_contained == 0 || n_sentinel == 0) {
         fprintf(stderr, "[FAIL] %s: shortcut not exercised: %lld SMEMs tagged by the walk, "
                 "%lld by containment, %lld whose walk meets the sentinel row under a dropped "
@@ -479,8 +659,182 @@ static bool check_s1_tags(FMI_search *fmi, const char *case_name, int32_t numRea
         return false;
     }
     fprintf(stderr, "[PASS] %s  (n_smem=%lld, tagged: %lld by the walk, %lld by containment; "
-            "%lld sentinel-row walks)\n", case_name, (long long)n, (long long)n_tag_walk,
-            (long long)n_tag_contained, (long long)n_sentinel);
+            "%lld sentinel-row walks; %lld planted tags, %lld with a twin)\n", case_name,
+            (long long)n, (long long)n_tag_walk, (long long)n_tag_contained,
+            (long long)n_sentinel, (long long)n_planted, (long long)n_planted_twin);
+    passed_cases++;
+    return true;
+}
+
+/* The outer resume loop of FMI_search::getSMEMsAllPosOneThread: compact the
+ * reads with query_pos < l_seq, call the one-position driver, repeat until
+ * every read is done. Production's do/while also makes one last call with no
+ * active read (it emits nothing); this loop stops before it, so *n_calls
+ * counts only calls that walk at least one read. Returns the SMEM count;
+ * *n_after_n is the number of resumes that start one base past a non-ACGT
+ * base (a walk that ended on an N), and *n_first the SMEMs the first call
+ * emitted (out[0, *n_first)). When trace is non-NULL, each call appends every
+ * read's query_pos after that call (indexed by read id; a read that is already
+ * done keeps its last value), so the last entry holds the final positions. The
+ * out-parameters may be NULL. Case 9 and run_allpos_case drive both paths
+ * through it. */
+static int64_t allpos_loop(FMI_search *fmi, bool lockstep, uint8_t *enc_qdb, int32_t numReads,
+                           int32_t max_readlength, int32_t minSeedLen, const bseq1_t *seq_,
+                           int32_t *cum_len, SMEM *out, int32_t *n_calls, int64_t *n_after_n,
+                           int64_t *n_first = NULL,
+                           std::vector<std::vector<int32_t>> *trace = NULL)
+{
+    std::vector<int32_t> qpa((size_t)numReads, 0), rid((size_t)numReads), mia((size_t)numReads, 1);
+    for (int32_t i = 0; i < numReads; i++) rid[(size_t)i] = i;
+    int64_t n = 0;
+    int32_t numActive = numReads;
+    int32_t calls = 0;
+    int64_t after_n = 0;
+    std::vector<int32_t> pos_by_rid((size_t)numReads, 0);
+    do {
+        int32_t tail = 0;
+        for (int32_t head = 0; head < numActive; head++) {
+            if (qpa[(size_t)head] < seq_[rid[(size_t)head]].l_seq) {
+                rid[(size_t)tail] = rid[(size_t)head];
+                qpa[(size_t)tail] = qpa[(size_t)head];
+                mia[(size_t)tail] = mia[(size_t)head];
+                tail++;
+            }
+        }
+        if (tail == 0) break;
+        for (int32_t t = 0; t < tail; t++) {
+            const int32_t q = qpa[(size_t)t];
+            if (q > 0 && enc_qdb[cum_len[rid[(size_t)t]] + q - 1] > 3) after_n++;
+        }
+        if (lockstep)
+            fmi->getSMEMsOnePosOneThread_lockstep(enc_qdb, qpa.data(), mia.data(), rid.data(),
+                                                  tail, tail, seq_, cum_len, max_readlength,
+                                                  minSeedLen, out, &n);
+        else
+            fmi->getSMEMsOnePosOneThread(enc_qdb, qpa.data(), mia.data(), rid.data(), tail,
+                                         tail, seq_, cum_len, max_readlength, minSeedLen, out,
+                                         &n);
+        if (calls == 0 && n_first != NULL) *n_first = n;
+        if (trace != NULL) {
+            for (int32_t t = 0; t < tail; t++)
+                pos_by_rid[(size_t)rid[(size_t)t]] = qpa[(size_t)t];
+            trace->push_back(pos_by_rid);
+        }
+        calls++;
+        numActive = tail;
+    } while (numActive > 0);
+    if (n_calls != NULL) *n_calls = calls;
+    if (n_after_n != NULL) *n_after_n = after_n;
+    return n;
+}
+
+/* Every read's query_pos write-back after every allpos_loop call, final
+ * positions included, must match between the scalar and lockstep drivers: a
+ * resume that lands one base off can leave the emitted SMEMs and the totals
+ * unchanged. Reports the first difference and returns false. */
+static bool resume_traces_match(const char *case_name,
+                                const std::vector<std::vector<int32_t>> &trace_s,
+                                const std::vector<std::vector<int32_t>> &trace_l)
+{
+    if (trace_s.size() != trace_l.size()) {
+        fprintf(stderr, "[FAIL] %s: resume loops differ in length: scalar %zu calls, "
+                "lockstep %zu calls\n", case_name, trace_s.size(), trace_l.size());
+        return false;
+    }
+    for (size_t c = 0; c < trace_s.size(); c++) {
+        for (size_t r = 0; r < trace_s[c].size(); r++) {
+            if (trace_s[c][r] != trace_l[c][r]) {
+                fprintf(stderr, "[FAIL] %s: query_pos of read %zu after call %zu differs: "
+                        "scalar=%d lockstep=%d\n", case_name, r, c, (int)trace_s[c][r],
+                        (int)trace_l[c][r]);
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+/* Repeated resume calls over a read set: the scalar and lockstep
+ * drivers run the full outer loop, so every walk after the first starts where
+ * the previous one left query_pos (past an N, at a text-compare exit, at a
+ * mismatch). The complete emitted sets must match in count and in order on
+ * (rid,m,n,k,s), every read's query_pos write-back must match after every
+ * call (final positions included), every lockstep SMEM that is not tagged must have info 0, and
+ * the loop must take more than one call and resume past at least one N, so
+ * the case cannot pass on single-call coverage. When the index's text is
+ * loaded, every tagged lockstep SMEM, from the first call or a resumed one,
+ * must hold its read at its tag's coordinate in `text` (Case 17's Oracle 1,
+ * which sees only the single-call walk), and some tag must come from a
+ * resumed call. */
+static bool run_allpos_case(FMI_search *fmi, const char *case_name, uint8_t *enc_qdb,
+                            int32_t numReads, int32_t max_readlength, int32_t minSeedLen,
+                            const bseq1_t *seq_, int32_t *cum_len, int64_t expect_min_smem,
+                            const std::string &text)
+{
+    total_cases++;
+    const size_t cap = (size_t)numReads * (size_t)(max_readlength + 1);
+    std::vector<SMEM> s_out(cap), l_out(cap);
+    int32_t calls_s = 0, calls_l = 0;
+    int64_t after_n_s = 0, after_n_l = 0;
+    std::vector<std::vector<int32_t>> trace_s, trace_l;
+    const int64_t n_s = allpos_loop(fmi, false, enc_qdb, numReads, max_readlength, minSeedLen,
+                                    seq_, cum_len, s_out.data(), &calls_s, &after_n_s, NULL,
+                                    &trace_s);
+    int64_t n_first = 0;   /* lockstep SMEMs from the first call: l_out[0, n_first) */
+    const int64_t n_l = allpos_loop(fmi, true, enc_qdb, numReads, max_readlength, minSeedLen,
+                                    seq_, cum_len, l_out.data(), &calls_l, &after_n_l, &n_first,
+                                    &trace_l);
+    if (n_s != n_l) {
+        fprintf(stderr, "[FAIL] %s: numTotalSmem mismatch: scalar=%lld lockstep=%lld\n",
+                case_name, (long long)n_s, (long long)n_l);
+        return false;
+    }
+    const int64_t mism = smem_array_first_mismatch(s_out.data(), l_out.data(), n_s);
+    if (mism >= 0) {
+        report_smem_mismatch(case_name, s_out.data(), l_out.data(), mism);
+        return false;
+    }
+    if (calls_s != calls_l || after_n_s != after_n_l) {
+        fprintf(stderr, "[FAIL] %s: resume schedules differ: scalar %d calls, %lld past an N; "
+                "lockstep %d calls, %lld past an N\n", case_name, (int)calls_s,
+                (long long)after_n_s, (int)calls_l, (long long)after_n_l);
+        return false;
+    }
+    if (!resume_traces_match(case_name, trace_s, trace_l)) return false;
+    if (!check_info_zero(case_name, "scalar AllPos", s_out.data(), n_s, false) ||
+        !check_info_zero(case_name, "lockstep AllPos", l_out.data(), n_l,
+                         fmi->s1_text_available()))
+        return false;
+    int64_t n_tagged = 0, n_tagged_resumed = 0;
+    if (fmi->s1_text_available()) {
+        for (int64_t j = 0; j < n_l; j++) {
+            const SMEM &x = l_out[(size_t)j];
+            if (!(x.s == 1 && s1_tagged(x))) continue;
+            n_tagged++;
+            n_tagged_resumed += j >= n_first;
+            if (!tag_holds_read(x, enc_qdb, cum_len, text)) {
+                fprintf(stderr, "[FAIL] %s: lockstep SMEM %lld (rid=%u m=%u n=%u, %s call) has "
+                        "tag coordinate %lld, which does not hold the read\n", case_name,
+                        (long long)j, x.rid, x.m, x.n, j >= n_first ? "a resumed" : "the first",
+                        (long long)s1_coord(x));
+                return false;
+            }
+        }
+        if (n_tagged_resumed == 0) {
+            fprintf(stderr, "[FAIL] %s: no tagged SMEM from a resumed call (%lld tagged in "
+                    "all), so resumed tags went unchecked\n", case_name, (long long)n_tagged);
+            return false;
+        }
+    }
+    if (calls_s < 2 || after_n_s == 0 || n_s < expect_min_smem) {
+        fprintf(stderr, "[FAIL] %s: resume path not exercised: %d calls (need >= 2), %lld "
+                "resumes past an N (need > 0), %lld SMEMs (need >= %lld)\n", case_name,
+                (int)calls_s, (long long)after_n_s, (long long)n_s, (long long)expect_min_smem);
+        return false;
+    }
+    fprintf(stderr, "[PASS] %s  (n_smem=%lld, %d calls, %lld resumes past an N; %lld tags "
+            "checked against the text, %lld from resumed calls)\n", case_name, (long long)n_s,
+            (int)calls_s, (long long)after_n_s, (long long)n_tagged, (long long)n_tagged_resumed);
     passed_cases++;
     return true;
 }
@@ -783,7 +1137,9 @@ int main(int argc, char *argv[]) {
      * active reads and re-calls the inner function with updated
      * query_pos_array[i]; a bug in the inner function's write-back of
      * next_x (slot.next_x via ls_advance_forward_step / ls_init_slot) would
-     * show up here even if Case 8 passes. We run the scalar and lockstep
+     * show up here even if Case 8 passes; each read's query_pos after every
+     * call is compared too, since a write-back one base off can leave the
+     * SMEMs unchanged. We run the scalar and lockstep
      * outer drivers locally rather than via getSMEMsAllPosOneThread, since
      * that one dispatches based on the SMEM_LOCKSTEP_N macro at compile
      * time — both sides would take the same branch. */
@@ -815,62 +1171,16 @@ int main(int argc, char *argv[]) {
          * internally (sized by MAX_READ_LEN_FOR_LOCKSTEP); no external
          * lockstep buffers are needed here. */
 
-        /* The two do/while blocks below intentionally mirror the compaction
-         * logic in FMI_search::getSMEMsAllPosOneThread (see src/FMI_search.cpp),
-         * in particular the `query_pos_array[head] < seq_[rid].l_seq` predicate
+        /* allpos_loop mirrors the compaction logic in
+         * FMI_search::getSMEMsAllPosOneThread (see src/FMI_search.cpp), in
+         * particular the `query_pos_array[head] < seq_[rid].l_seq` predicate
          * that keeps reads active. If that predicate or the surrounding loop
-         * structure changes in production, update both drivers here to match. */
-        /* Scalar outer driver. */
-        int64_t n_s = 0;
-        int32_t qpa_s[2] = {0, 0};
-        {
-            int32_t rid_work[2] = {0, 1};
-            int32_t mia_work[2] = {1, 1};
-            int32_t numActive = numReads;
-            do {
-                int32_t head = 0, tail = 0;
-                for (head = 0; head < numActive; head++) {
-                    int rl = seq_[rid_work[head]].l_seq;
-                    if (qpa_s[head] < rl) {
-                        rid_work[tail] = rid_work[head];
-                        qpa_s[tail] = qpa_s[head];
-                        mia_work[tail] = mia_work[head];
-                        tail++;
-                    }
-                }
-                fmi->getSMEMsOnePosOneThread(enc_qdb, qpa_s, mia_work, rid_work,
-                                             tail, tail, seq_, cum_len,
-                                             max_readlength, minSeedLen, scalar_out,
-                                             &n_s);
-                numActive = tail;
-            } while (numActive > 0);
-        }
-
-        /* Lockstep outer driver. */
-        int64_t n_l = 0;
-        int32_t qpa_l[2] = {0, 0};
-        {
-            int32_t rid_work[2] = {0, 1};
-            int32_t mia_work[2] = {1, 1};
-            int32_t numActive = numReads;
-            do {
-                int32_t head = 0, tail = 0;
-                for (head = 0; head < numActive; head++) {
-                    int rl = seq_[rid_work[head]].l_seq;
-                    if (qpa_l[head] < rl) {
-                        rid_work[tail] = rid_work[head];
-                        qpa_l[tail] = qpa_l[head];
-                        mia_work[tail] = mia_work[head];
-                        tail++;
-                    }
-                }
-                fmi->getSMEMsOnePosOneThread_lockstep(enc_qdb, qpa_l, mia_work, rid_work,
-                                                     tail, tail, seq_, cum_len,
-                                                     max_readlength, minSeedLen, lockstep_out,
-                                                     &n_l);
-                numActive = tail;
-            } while (numActive > 0);
-        }
+         * structure changes in production, update allpos_loop to match. */
+        std::vector<std::vector<int32_t>> trace_s, trace_l;
+        const int64_t n_s = allpos_loop(fmi, false, enc_qdb, numReads, max_readlength, minSeedLen,
+                                        seq_, cum_len, scalar_out, NULL, NULL, NULL, &trace_s);
+        const int64_t n_l = allpos_loop(fmi, true, enc_qdb, numReads, max_readlength, minSeedLen,
+                                        seq_, cum_len, lockstep_out, NULL, NULL, NULL, &trace_l);
 
         total_cases++;
         if (n_s != n_l) {
@@ -879,15 +1189,8 @@ int main(int argc, char *argv[]) {
         } else {
             int64_t mism = smem_array_first_mismatch(scalar_out, lockstep_out, n_s);
             if (mism >= 0) {
-                const SMEM &a = scalar_out[mism];
-                const SMEM &b = lockstep_out[mism];
-                fprintf(stderr, "[FAIL] Case 9 AllPos driver: SMEM mismatch at %lld:\n"
-                        "  scalar   rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n"
-                        "  lockstep rid=%d m=%u n=%u k=%lld l=%lld s=%lld\n",
-                        (long long)mism,
-                        a.rid, a.m, a.n, (long long)a.k, (long long)a.l, (long long)a.s,
-                        b.rid, b.m, b.n, (long long)b.k, (long long)b.l, (long long)b.s);
-            } else {
+                report_smem_mismatch("Case 9 AllPos driver", scalar_out, lockstep_out, mism);
+            } else if (resume_traces_match("Case 9 AllPos driver", trace_s, trace_l)) {
                 fprintf(stderr, "[PASS] Case 9 AllPos driver  (n_smem=%lld)\n", (long long)n_s);
                 passed_cases++;
             }
@@ -1374,6 +1677,17 @@ int main(int argc, char *argv[]) {
                          enc_qdb, qv.data(), mia.data(), rid.data(), seq_, cum_len,
                          /*expect_min_smem=*/n_need, need.get());
             }
+            /* Case 16r: the same reads through the full resume loop (every
+             * walk from each read's start to its end, the N-containing reads
+             * resuming past their N), not one call from one pivot. */
+            for (const int32_t w : widths) {
+                char name[112];
+                snprintf(name, sizeof name, "Case 16r: %d text-compare exit reads, resume loop, N = %d",
+                         (int)NR, (int)w);
+                g_smem_lockstep_n = w;
+                run_allpos_case(fmi, name, enc_qdb, NR, maxl, 19, seq_, cum_len,
+                                /*expect_min_smem=*/n_need, R + revcomp(R));
+            }
             for (const int32_t w : widths) {
                 char name[112];
                 snprintf(name, sizeof name, "Case 17: SA tags of %d text-compare reads, N = %d", (int)NR, (int)w);
@@ -1401,6 +1715,14 @@ int main(int argc, char *argv[]) {
                         run_case(fmi_np, name, NR, maxl, 19,
                                  enc_qdb, qv.data(), mia.data(), rid.data(), seq_, cum_len,
                                  /*expect_min_smem=*/n_need, need.get());
+                    }
+                    for (const int32_t w : widths) {
+                        char name[112];
+                        snprintf(name, sizeof name, "Case 18r: %d text-compare exit reads, resume "
+                                 "loop, no pac, N = %d", (int)NR, (int)w);
+                        g_smem_lockstep_n = w;
+                        run_allpos_case(fmi_np, name, enc_qdb, NR, maxl, 19, seq_, cum_len,
+                                        /*expect_min_smem=*/n_need, R + revcomp(R));
                     }
                 }
                 delete fmi_np;

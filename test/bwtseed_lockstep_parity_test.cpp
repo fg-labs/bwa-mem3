@@ -323,6 +323,83 @@ static bool run_case(FMI_search *fmi,
     return ok;
 }
 
+/* The SMEMs of read r in a driver's output, in emitted order (the drivers
+ * emit read by read). */
+static std::vector<SMEM> read_seeds(const SMEM *a, int64_t n, int32_t r)
+{
+    std::vector<SMEM> o;
+    for (int64_t i = 0; i < n; i++)
+        if ((int32_t)a[i].rid == r) o.push_back(a[i]);
+    return o;
+}
+
+/* Case 13h's canary scaffold: the lockstep bwtSeed pass run with hint's
+ * records replaced by `rec` (one of them tampered), and read r's seeds from
+ * it. out must hold numReads * max_readlength SMEMs. */
+static std::vector<SMEM> hinted_read_seeds(FMI_search *fmi, const BsdFirstWalkHint &hint,
+                                           std::vector<BsdFirstWalk> &rec, int32_t r,
+                                           uint8_t *enc_qdb, int32_t numReads,
+                                           const bseq1_t *seq_, int32_t *cum_len,
+                                           int32_t min_seed, int32_t max_intv,
+                                           int32_t max_readlength, std::vector<SMEM> &out)
+{
+    BsdFirstWalkHint h = hint;
+    h.rec = rec.data();
+    std::vector<int32_t> mia((size_t)numReads, max_intv);
+    const int64_t n = fmi->bwtSeedStrategyAllPosOneThread_lockstep(
+        enc_qdb, mia.data(), numReads, seq_, cum_len, min_seed, out.data(), max_readlength, &h);
+    return read_seeds(out.data(), n, r);
+}
+
+/* Case 13h's resume canary for records with s = 0. Such a record emits no seed,
+ * and walking the read from x = 0 instead of resuming at the record's x reaches
+ * the same x with the same (empty) output, so parity and the k canary cannot
+ * tell a pass that ignores it from one that uses it. Each recorded read with
+ * s = 0 whose scalar output has a seed gets its record's x moved to the read's
+ * end, one record at a time: bsd_init_slot then sees x >= x_end and finishes
+ * the read with no seed, so the read's lockstep output must be empty. A pass
+ * that ignored the record would emit the scalar's seeds; one that resumed at a
+ * wrong x, or emitted a stale seed, would emit some. The check is on output,
+ * bounded (one call per record), with no timing. Reads with no scalar seed
+ * cannot show it and are skipped. Counts one case when any record is checked,
+ * and returns the number checked (0: no case counted). */
+static int32_t s0_resume_canary(FMI_search *fmi, const char *name, const BsdFirstWalkHint &hint,
+                                const std::vector<BsdFirstWalk> &rec, const SMEM *scalar,
+                                int64_t n_scalar, uint8_t *enc_qdb, int32_t numReads,
+                                const bseq1_t *seq_, int32_t *cum_len, int32_t min_seed,
+                                int32_t max_intv, int32_t max_readlength)
+{
+    std::vector<SMEM> out((size_t)numReads * (size_t)max_readlength + 1);
+    int32_t tampered = 0, nonempty = 0, first_nonempty = -1;
+    size_t first_n = 0;
+    for (int32_t r = 0; r < numReads; r++) {
+        if (!(rec[(size_t)r].x > 0 && rec[(size_t)r].s == 0)) continue;
+        if (read_seeds(scalar, n_scalar, r).empty()) continue;
+        std::vector<BsdFirstWalk> bad(rec);
+        bad[(size_t)r].x = seq_[r].l_seq;
+        tampered++;
+        const size_t got = hinted_read_seeds(fmi, hint, bad, r, enc_qdb, numReads, seq_, cum_len,
+                                             min_seed, max_intv, max_readlength, out).size();
+        if (got != 0) {
+            nonempty++;
+            if (first_nonempty < 0) { first_nonempty = r; first_n = got; }
+        }
+    }
+    if (tampered == 0) return 0;
+    total_cases++;
+    if (nonempty > 0) {
+        fprintf(stderr, "[FAIL] %s: s = 0 resume canary: %d of %d reads still emitted seeds "
+                "after their record's x was moved to the read end (first: read %d, %zu seeds), "
+                "so an s = 0 record's x is not used as the resume point\n", name, (int)nonempty,
+                (int)tampered, (int)first_nonempty, first_n);
+    } else {
+        fprintf(stderr, "[PASS] %s: s = 0 resume canary (each of %d reads emits no seed once "
+                "its record's x is moved to the read end)\n", name, (int)tampered);
+        passed_cases++;
+    }
+    return tampered;
+}
+
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <bwa-mem3 index prefix>\n", argv[0]);
@@ -879,8 +956,12 @@ int main(int argc, char *argv[]) {
      * Each matched run that emits seeds also runs a canary that shifts k in one
      * recorded seed at a time and requires that read's output to change, so a
      * bwtSeed pass that ignored any read's record with s > 0 would fail (a
-     * record with s = 0 emits no seed). Every run repeats on the index loaded
-     * without its pac, where no record comes from the text compare. */
+     * record with s = 0 emits no seed). Each matched run also runs a resume
+     * canary for the records with s = 0 (s0_resume_canary): one at a time, the
+     * record's x moves to the read end, and that read's output must then be
+     * empty; the canary must check some record on each index. Every run
+     * repeats on the index loaded without its pac, where no record comes from
+     * the text compare. */
 #if SMEM_LOCKSTEP_N > 1
     {
         /* The last base the windows below take: R.substr(2500 + 97 * 27, 60). */
@@ -1039,6 +1120,8 @@ int main(int argc, char *argv[]) {
                 fprintf(stderr, "[FAIL] Case 13h: the index loaded without its pac still "
                         "reports s1_text_available, so the textless runs would not be textless\n");
             }
+            /* Records with s = 0 the resume canary moved, per index (see there). */
+            int32_t n_s0_checked = 0, n_s0_checked_np = 0;
             for (FMI_search *idx : {fmi, fmi_np})
             for (const HintRun &hr : runs) {
                 const bool textless = idx == fmi_np;
@@ -1127,23 +1210,24 @@ int main(int argc, char *argv[]) {
                  * expected, shift k of one recorded seed at a time: that read's
                  * lockstep output must then leave the scalar's, which it can
                  * only do by emitting that read's record. Records with s = 0
-                 * emit no seed, so this check does not cover them. */
-                if (hr.rec_intv != hr.max_intv || hr.rec_min_len_delta != 0 || hr.floor == 0 ||
-                    expect_rec == 0)
+                 * emit no seed, so this check does not cover them: the resume
+                 * canary (s0_resume_canary) does, on every run whose hint
+                 * matches the call (floor 0 included); the k canary below also
+                 * needs seeds (floor > 0). */
+                if (hr.rec_intv != hr.max_intv || hr.rec_min_len_delta != 0 || expect_rec == 0)
                     continue;
-                total_cases++;
                 std::vector<SMEM> c_scalar(smem_cap), c_lockstep(smem_cap);
                 std::vector<int32_t> mia_s((size_t)numReads, hr.max_intv);
                 const int64_t c_ns = idx->bwtSeedStrategyAllPosOneThread(
                         enc_qdb, mia_s.data(), numReads, seq_, cum_len, hr.min_seed,
                         c_scalar.data());
-                /* The scalar seeds of read r, which the driver emits in read order. */
-                auto read_seeds = [](const std::vector<SMEM> &a, int64_t n, int32_t r) {
-                    std::vector<SMEM> o;
-                    for (int64_t i = 0; i < n; i++)
-                        if ((int32_t)a[(size_t)i].rid == r) o.push_back(a[(size_t)i]);
-                    return o;
-                };
+                (textless ? n_s0_checked_np : n_s0_checked) +=
+                    s0_resume_canary(idx, name, hint, rec, c_scalar.data(), c_ns, enc_qdb,
+                                     numReads, seq_, cum_len, hr.min_seed, hr.max_intv,
+                                     max_readlength);
+
+                if (hr.floor == 0) continue;
+                total_cases++;
                 int32_t tampered = 0, unchanged = 0, first_unchanged = -1;
                 for (int32_t r = 0; r < numReads; r++) {
                     if (!(rec[(size_t)r].x > 0 && rec[(size_t)r].s > 0)) continue;
@@ -1152,12 +1236,10 @@ int main(int argc, char *argv[]) {
                     tampered++;
                     BsdFirstWalkHint bad_hint = hint;
                     bad_hint.rec = bad.data();
-                    std::vector<int32_t> mia_l((size_t)numReads, hr.max_intv);
-                    const int64_t c_nl = idx->bwtSeedStrategyAllPosOneThread_lockstep(
-                            enc_qdb, mia_l.data(), numReads, seq_, cum_len, hr.min_seed,
-                            c_lockstep.data(), max_readlength, &bad_hint);
-                    const std::vector<SMEM> s_r = read_seeds(c_scalar, c_ns, r);
-                    const std::vector<SMEM> l_r = read_seeds(c_lockstep, c_nl, r);
+                    const std::vector<SMEM> s_r = read_seeds(c_scalar.data(), c_ns, r);
+                    const std::vector<SMEM> l_r =
+                        hinted_read_seeds(idx, hint, bad, r, enc_qdb, numReads, seq_, cum_len,
+                                          hr.min_seed, hr.max_intv, max_readlength, c_lockstep);
                     bool differs = s_r.size() != l_r.size();
                     for (size_t i = 0; !differs && i < s_r.size(); i++)
                         differs = !smem_fields_equal(s_r[i], l_r[i], &bad_hint);
@@ -1177,6 +1259,22 @@ int main(int argc, char *argv[]) {
                 } else {
                     fprintf(stderr, "[PASS] %s: canary (each of %d tampered records changes "
                             "its read's output)\n", name, (int)tampered);
+                    passed_cases++;
+                }
+            }
+            /* The resume canary must have run on each index, or its coverage
+             * was lost to a change in the reads above. */
+            for (int t = 0; t < 2; t++) {
+                const int32_t n_checked = t ? n_s0_checked_np : n_s0_checked;
+                total_cases++;
+                if (n_checked == 0) {
+                    fprintf(stderr, "[FAIL] Case 13h%s: s = 0 resume canary checked no record: "
+                            "every run whose hint matches the call was skipped, or no read "
+                            "was recorded with s = 0, or no such read has a scalar seed\n",
+                            t ? " (no pac)" : "");
+                } else {
+                    fprintf(stderr, "[PASS] Case 13h%s: s = 0 resume canary checked %d records\n",
+                            t ? " (no pac)" : "", (int)n_checked);
                     passed_cases++;
                 }
             }

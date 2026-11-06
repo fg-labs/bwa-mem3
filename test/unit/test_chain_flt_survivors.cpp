@@ -166,6 +166,18 @@ std::vector<mem_chain_t> make_read(std::mt19937 &rng, int n, std::vector<mem_see
             s[j].len = len(rng);
             s[j].rbeg = 100000 + q;
             s[j].score = s[j].len;
+            // A mix of the constructor's defaults (aln 0, n_hits 1) and varied
+            // nondefault values, so a filter that reset them, or corrupted only
+            // the defaults, would fail check_same_chain. Derived from the
+            // indices, not drawn, so the rng stream (and the reads every other
+            // path counter depends on) is unchanged.
+            if ((c * 3 + j) % 4 == 0) {
+                s[j].aln = 0;
+                s[j].n_hits = 1;
+            } else {
+                s[j].aln = 1 + (c * 7 + j * 3) % 5;
+                s[j].n_hits = 2 + (c * 13 + j * 5) % 9;
+            }
             q += s[j].len / 2 + 1;
         }
         mem_chain_t ch{};
@@ -208,6 +220,7 @@ TEST_CASE("mem_chain_flt matches the naive overlap filter, shadow promotion and 
     std::vector<mem_seed_t> pool;
     Paths paths;
     long promoted = 0, overlapping = 0, ties = 0;
+    long default_meta = 0, nondefault_meta = 0;  // survivor seeds by aln/n_hits kind
     for (int round = 0; round < 1728; ++round) {
         opt->drop_ratio = drop_ratios[round % 4];
         opt->mask_level = mask_levels[(round / 4) % 3];
@@ -228,6 +241,10 @@ TEST_CASE("mem_chain_flt matches the naive overlap filter, shadow promotion and 
             if (want[t].kept == 1) ++promoted;
             if (want[t].kept == 2) ++overlapping;
             if (t > 0 && want[t].w == want[t - 1].w) ++ties;
+            for (const mem_seed_t &sd : want_seeds[t]) {
+                if (sd.aln == 0 && sd.n_hits == 1) ++default_meta;
+                else if (sd.aln != 0 && sd.n_hits != 1) ++nondefault_meta;
+            }
         }
         free_survivors(a.data(), k);
     }
@@ -237,6 +254,8 @@ TEST_CASE("mem_chain_flt matches the naive overlap filter, shadow promotion and 
     CHECK(promoted > 0);
     CHECK(overlapping > 0);
     CHECK(ties > 0);
+    CHECK(default_meta > 0);
+    CHECK(nondefault_meta > 0);
     free(opt);
 }
 
@@ -261,6 +280,7 @@ TEST_CASE("mem_chain_flt domination uses the float product w * drop_ratio"
     for (int c = 0; c < 3; ++c) {
         s[c].qbeg = qbeg[c]; s[c].len = len[c];
         s[c].rbeg = 1000 + qbeg[c]; s[c].score = len[c];
+        s[c].aln = 2 + c; s[c].n_hits = 4 + c;   // nonzero, distinct per seed
         a[c] = mem_chain_t{};
         a[c].n = 1; a[c].m = 1; a[c].seeds = &s[c]; a[c].meth_hypothesis = -1;
     }
