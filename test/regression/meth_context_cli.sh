@@ -138,8 +138,8 @@ as_n=$(as_of cpg-taps.sam) || fail "could not extract AS from cpg-taps.sam"
     || fail "cpg + genomic: want AS one above neutral's, got genomic='$as_g' neutral='$as_n'"
 
 # --- 4. em-seq with neutral scoring warns, and still aligns ------------------
-WARN="WARNING: --meth-scoring neutral with em-seq/bisulfite chemistry (--meth, --meth=emseq, --meth=bisulfite) scores each conversion 0, and em-seq converts most cytosines, so short reads are left unmapped or misplaced and unmethylated reads are lost first, biasing methylation upward. Use the em-seq default (collapsed) or --meth-scoring genomic."
-"$BWA_MEM3" mem --meth -t 1 ref.fa r.fq > ec.sam 2> ec.err || fail "--meth (collapsed) nonzero exit"
+WARN="WARNING: --meth-scoring neutral with em-seq/bisulfite chemistry (--meth, --meth=emseq, --meth=bisulfite) scores each conversion 0, and em-seq converts most cytosines, so short reads are left unmapped or misplaced and unmethylated reads are lost first, biasing methylation upward. Use the em-seq default (genomic) or --meth-scoring collapsed."
+"$BWA_MEM3" mem --meth --meth-scoring collapsed -t 1 ref.fa r.fq > ec.sam 2> ec.err || fail "--meth --meth-scoring collapsed nonzero exit"
 as_c=$(as_of ec.sam) || fail "could not extract AS from ec.sam"
 for chem in "" "=emseq" "=bisulfite"; do
     "$BWA_MEM3" mem "--meth$chem" --meth-scoring neutral -t 1 ref.fa r.fq > en.sam 2> en.err \

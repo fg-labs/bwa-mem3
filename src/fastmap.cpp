@@ -3545,7 +3545,7 @@ int main_mem(int argc, char *argv[])
         opt->band_cert = 0;
     }
 
-    /* The --meth defaults just applied scale -B (collapsed: 2 * -A, so -A 65
+    /* The --meth defaults just applied scale -B (--meth-scoring collapsed: 2 * -A, so -A 65
      * gives 130) and -U by -A as well, so check the effective scoring again
      * now that every score-derived default is final. */
     if (opt->meth_mode && check_effective_scoring(opt) != 0) {

@@ -1,6 +1,6 @@
 # bwameth.py Drop-In Mapping
 
-`bwa-mem3 --meth` is designed so that, in its **default `collapsed` mode**, read
+`bwa-mem3 --meth` is designed so that, with **`--meth-scoring collapsed`**, read
 *placement* closely tracks the bwameth.py pipeline for the standard case (with a
 small, bounded divergence — see the callout below), while emitting the Bismark
 tag set methylation callers expect. This page explains what is the same, what
@@ -47,8 +47,9 @@ samtools index out.bam
 # Step 1: build a dual index (original index + .meth seed index)
 bwa-mem3 index --meth ref.fa           # writes ref.fa.* AND ref.fa.meth.*
 
-# Step 2: align (inline seed projection + 4-letter scoring + post-processing)
-bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
+# Step 2: align (inline seed projection + 4-letter scoring + post-processing);
+# --meth-scoring collapsed for bwameth-compatible placement (the default is genomic)
+bwa-mem3 mem --meth --meth-scoring collapsed -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
 samtools index out.bam
 ```

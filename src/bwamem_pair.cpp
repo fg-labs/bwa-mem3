@@ -516,7 +516,7 @@ static bool rescue_repeat_enabled()
  * Zen 5 (AVX-512BW tier, 5 reps, with the early B1 and the chained 5-mer prefilter), whose cheaper
  * kswv leaves less to prune: -B 6 -0.8 / -1.3 %, -B 8 -0.1 / -1.2 %, -x intractg -0.7 / -1.6 %.
  * --meth takes the same cap, on converted copies and under the relation alike (the lemma for both in
- * rescue_prune.h); its genomic and neutral defaults admit K = 5 only and the collapsed default
+ * rescue_prune.h); its genomic and neutral defaults admit K = 5 only and collapsed scoring
  * (-B 2) none, so --meth -B 5 and up is where it differs. Graviton 4 (NEON), K = 5 -> up to 8, -t 16,
  * 10 interleaved reps, wall: EM-seq 5 M pairs genomic -B 6 -18.6 %, collapsed -B 6 -18.6 %; TAPS
  * 1 M pairs neutral -B 6 -12.4 %, genomic -B 6 -12.8 %; at the --meth defaults flat (K = 5 either way).
@@ -575,7 +575,7 @@ static bool rescue_meth_rel(const mem_opt_t *opt)
 
 /* Whether pruning can narrow any rescue window in this run, under p = rescue_prune_params_for(opt)
  * (the per-job caller passes the p it computed): the shortcuts are on (rescue_prune_on),
- * a scoring the lemma holds for (rescue_prune_params::valid; under --meth the default collapsed
+ * a scoring the lemma holds for (rescue_prune_params::valid; under --meth the collapsed
  * scoring is refused there), and the cost gate (rescue_prune_cost_ok in rescue_prune.h: --meth on
  * aarch64 with EM-seq chemistry or under the relation (rescue_meth_rel), and on x86 no --meth,
  * only where the SIMD filter runs, and not at the AVX-512BW tier from seed length 25, -k 25 and up

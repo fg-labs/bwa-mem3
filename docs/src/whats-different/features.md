@@ -10,11 +10,11 @@ which now read `bwa-mem3`).
 
 `--meth` adds native bisulfite/EM-seq alignment to `bwa-mem3 index` and
 `bwa-mem3 mem` in a single binary — no Python, no separate post-processing step,
-no [bwameth.py](https://github.com/brentp/bwa-meth) dependency. In the default
-`--meth-scoring collapsed` mode it reproduces bwameth.py's read *placement* (a
-placement drop-in, not a byte-for-byte clone); `--meth-scoring genomic` and
-`--meth-scoring neutral` (the `--meth=taps` / `--meth=5base` default) opt into
-variant-aware scoring bwameth cannot produce. `--meth=5base` (Illumina 5-base)
+no [bwameth.py](https://github.com/brentp/bwa-meth) dependency. The default
+`--meth-scoring genomic` (and `--meth-scoring neutral`, the `--meth=taps` /
+`--meth=5base` default) is variant-aware scoring bwameth cannot produce;
+`--meth-scoring collapsed` reproduces bwameth.py's read *placement* (a placement
+drop-in, not a byte-for-byte clone). `--meth=5base` (Illumina 5-base)
 selects the TAPS chemistry and is record-for-record identical to `--meth=taps`
 ([5-base libraries](../methylation/5base.md),
 [#650](https://github.com/fg-labs/bwa-mem3/pull/650)).
@@ -45,8 +45,10 @@ tools, optionally applies a chimera QC heuristic (longest M/=/X run < 44% of rea
 length → set `0x200`, clear proper-pair `0x2`, cap MAPQ at 1) when `--chimera-qc`
 is passed (off by default), and writes a `@PG ID:bwa-mem3-meth` entry.
 
-In the default `collapsed` mode this reproduces bwameth.py's read *placement*
-(chrom, pos) for the standard case, while scoring against the original reference
+In `--meth-scoring collapsed` mode this approximates bwameth.py's read *placement*
+(chrom, pos) for the standard case (some `POS` values still differ, so re-validate
+if you depend on bwameth's exact placement; see
+[bwameth.py drop-in mapping](../methylation/bwameth-mapping.md)), while scoring against the original reference
 rather than in collapsed space — so it is not byte-for-byte identical to bwameth
 output. Stacks on PR #12 (`--bam`). See the
 [Methylation Reference](../methylation/overview.md) for full details.

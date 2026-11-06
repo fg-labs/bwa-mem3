@@ -143,6 +143,9 @@ amplicon/panel and repetitive regions):
 | wes | −18% | −14% |
 | meth (em-seq) | −11% | −9% |
 
+The meth (em-seq) row was measured at `--meth-scoring collapsed`, the EM-seq default at the
+time. The default is now `genomic`, whose mate rescue can be pruned, so the saving there may differ.
+
 Aggregate `samtools flagstat` impact is a uniform, directional sub-0.2 pp reduction in
 mapped%/proper-pair% (≤0.02 pp on WGS/WES; ≤0.12–0.19 pp on amplicon/meth), entirely in the
 low-MAPQ deep-rescue tail: the mapped count only ever *decreases* (it never newly maps a

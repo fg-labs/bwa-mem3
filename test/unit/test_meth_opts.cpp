@@ -54,13 +54,13 @@ TEST_CASE("meth_opts: 5base + cpg + genomic -> METH_CTX_CPG, scoring GENOMIC") {
     CHECK(f.opt->meth_scoring == MEM_METH_SCORING_GENOMIC);
 }
 
-TEST_CASE("meth_opts: bare --meth + context all stays emseq/collapsed") {
+TEST_CASE("meth_opts: bare --meth + context all stays emseq/genomic") {
     Fixture f;
     f.parse(OPT_METH, nullptr);
     f.parse(OPT_METH_CONTEXT, "all");
     meth_opts_finalize(f.opt, &f.cli);
     CHECK(f.opt->meth_context == METH_CTX_ALL);
-    CHECK(f.opt->meth_scoring == MEM_METH_SCORING_COLLAPSED);
+    CHECK(f.opt->meth_scoring == MEM_METH_SCORING_GENOMIC);
 }
 
 TEST_CASE("meth_opts: em-seq with neutral scoring is flagged, every other pairing is not") {
@@ -69,7 +69,7 @@ TEST_CASE("meth_opts: em-seq with neutral scoring is flagged, every other pairin
         {nullptr, "neutral", 1},   // bare --meth is em-seq
         {"emseq", "neutral", 1},
         {"bisulfite", "neutral", 1},
-        {"emseq", nullptr, 0},     // em-seq default: collapsed
+        {"emseq", nullptr, 0},     // em-seq default: genomic
         {"emseq", "genomic", 0},
         {"emseq", "collapsed", 0},
         {"taps", nullptr, 0},      // TAPS default: neutral, sparse conversions

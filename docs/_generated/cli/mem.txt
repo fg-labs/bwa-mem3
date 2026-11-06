@@ -165,12 +165,12 @@ Methylation (--meth) options:
                  (EM-seq/bisulfite convert every unmethylated C) and a --meth-scoring
                  other than collapsed.
    --meth-scoring collapsed|genomic|neutral
-                 scoring mode. Default depends on chemistry: collapsed for
+                 scoring mode. Default depends on chemistry: genomic for
                  --meth/--meth=emseq, neutral for --meth=taps|5base (their
-                 conversions are sparse, so collapsing costs specificity it
-                 can't repay).
+                 conversions are sparse, so a full-match reward costs
+                 specificity).
                  collapsed: C/T (and G/A) interchangeable, bwameth-compatible
-                 placement (sets -B 2).
+                 placement (sets -B 2). Opt-in.
                  genomic: free only the conversion direction, scored as a full
                  match, keep variants as mismatches (variant-aware: variants
                  outside the conversion direction counted in NM; -B 4).

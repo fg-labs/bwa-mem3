@@ -486,7 +486,7 @@ occasionally the pair moving to another contig). With the fix, `--meth` output n
 depends on the dedup state, the thread count, or the SIMD tier (AVX2 matches AVX-512BW).
 Versus the previous release, `--meth` records whose extension had a negative seed score can
 change: on a 5 M-pair EM-seq panel sample, 707 of 10.37 M records under
-`--meth-scoring neutral` and 950 under `genomic`; default (collapsed) `--meth` output was
+`--meth-scoring neutral` and 950 under `genomic`; `--meth-scoring collapsed` output was
 unchanged on that sample. For `h0 >= 0` the masked update is the identity, so **non-`--meth`
 output is byte-identical by construction**, corroborated by identical md5s on 5 M-pair WGS
 and WES slices with the dedup at `auto` and forced on. Pinned by

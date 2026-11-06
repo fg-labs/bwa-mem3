@@ -22,9 +22,10 @@ bundled with the original script.
 
 ## How it relates to bwa-mem3
 
-`bwa-mem3 mem --meth` is a single-binary alignment pipeline that, in its default
-`collapsed` mode, reproduces bwameth.py's read *placement* (it is a placement
-drop-in, not a byte-for-byte clone). The key difference is *where it scores*:
+`bwa-mem3 mem --meth` is a single-binary alignment pipeline that, with
+`--meth-scoring collapsed`, approximates bwameth.py's read *placement* (it is a placement
+drop-in, not a byte-for-byte clone, and some `POS` values differ, so re-validate if you
+depend on bwameth's exact placement). The key difference is *where it scores*:
 where bwameth.py converts both reads and reference to 3-letter space and aligns
 there, bwa-mem3 uses the 3-letter projection only to **find seeds**, then extends
 and scores against the **original 4-letter reference**. That enables two further

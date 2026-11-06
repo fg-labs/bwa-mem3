@@ -1,24 +1,31 @@
 # Methylation Defaults
 
-`bwa-mem3 mem --meth` ships with scoring and filtering defaults aligned with the
-bwameth.py reference implementation (in the default `collapsed` scoring mode).
+`bwa-mem3 mem --meth` ships with filtering defaults aligned with the bwameth.py
+reference implementation (`-L 10 -U 100 -T 40 -M -C`) and, for EM-seq/bisulfite,
+the variant-aware `genomic` scoring mode.
 This page is prescriptive: when to keep those defaults and when to override them.
 For *what* the flags are and *how* the scoring modes work, see the reference:
 
 - **Scoring modes (`collapsed`, `genomic`, `neutral`) and the full `--meth` flag
   set** —
   [Methylation Reference → Flags](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral).
-- **Placement compatibility with bwameth.py** (the default `collapsed` mode is a
+- **Placement compatibility with bwameth.py** (`--meth-scoring collapsed` is a
   placement drop-in, *not* byte-identical — ~1% of records differ in
   `POS`/`CIGAR`/`MAPQ`, so **re-validate if you are pinned to a specific bwameth
   release**) — [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md).
 
 ## When to keep the defaults
 
-For standard whole-genome bisulfite sequencing (WGBS) workflows, the defaults
-(`collapsed` scoring plus `-B 2 -L 10 -U 100 -T 40 -M -C`) are appropriate as-is.
-They were derived from the bwameth.py codebase and are expected by most
-downstream methylation callers. Unless you have a specific reason to deviate, use:
+For standard whole-genome bisulfite and EM-seq workflows, the defaults
+(`genomic` scoring plus `-B 4 -L 10 -U 100 -T 40 -M -C`) are appropriate as-is.
+The filtering values come from the bwameth.py codebase. `genomic` keeps the
+mirror change (reference T read as C) a mismatch, which gives better-calibrated
+MAPQ than `collapsed`: on simulated EM-seq (chr20–22 at 2×, 2×150 bp, full hg38,
+Apple M2 Max, arm64 NEON) it puts 1.3 pp more reads at MAPQ ≥ 20 in the right place and makes
+about 20× fewer wrong placements at MAPQ 60
+([measurements](../methylation/overview.md#three-scoring-modes---meth-scoring),
+[#756](https://github.com/fg-labs/bwa-mem3/pull/756)).
+Unless you have a specific reason to deviate, use:
 
 ```bash
 bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
@@ -60,9 +67,10 @@ bwa-mem3 mem --meth --chimera-qc -t 16 ref.fa R1.fq.gz R2.fq.gz \
 > **Note — Overriding scoring defaults**
 >
 > Scoring flags supplied on the command line override the defaults set by
-> `--meth`. For example, `bwa-mem3 mem --meth -B 4 ...` uses `-B 4` (not 2).
-> Order does not matter: the defaults are applied after the whole command line
-> is parsed, so `-B 4 --meth` and `--meth -B 4` behave identically.
+> `--meth`. For example, `bwa-mem3 mem --meth -B 2 ...` uses `-B 2`, not the
+> default `-B 4`. Order does not matter: the defaults are applied after the
+> whole command line is parsed, so `-B 2 --meth` and `--meth -B 2` behave
+> identically.
 >
 > This applies to `-B`, `-L`, `-U`, and `-T`. It does **not** apply to `-M` and
 > `-C`: bwa has no option that unsets either one, so `--meth` sets them

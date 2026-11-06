@@ -84,8 +84,12 @@ done
 printf '@c\n%s\n+\n%s\n' "$CONV" "$Q" > c.fq
 
 tag() { mawk -v k="$2" '{for(i=12;i<=NF;i++) if(substr($i,1,5)==k":i:"){print substr($i,6); exit}}' <<< "$1"; }
-as_of() { # $1 = scoring mode -> echoes "AS NM" of the primary alignment
-    "$BWA_MEM3" mem --meth --meth-scoring "$1" -t 1 ref.fa r.fq > o.bam 2> /dev/null || fail "$1 mem --meth nonzero exit"
+as_of() { # $1 = scoring mode, or "default" for bare --meth -> echoes "AS NM" of the primary alignment
+    if [ "$1" = default ]; then
+        "$BWA_MEM3" mem --meth -t 1 ref.fa r.fq > o.bam 2> /dev/null || fail "$1 mem --meth nonzero exit"
+    else
+        "$BWA_MEM3" mem --meth --meth-scoring "$1" -t 1 ref.fa r.fq > o.bam 2> /dev/null || fail "$1 mem --meth nonzero exit"
+    fi
     samtools quickcheck o.bam || fail "$1 invalid BAM"
     local line
     line=$(samtools view -F 0x104 o.bam | mawk 'NR==1')
@@ -95,10 +99,15 @@ as_of() { # $1 = scoring mode -> echoes "AS NM" of the primary alignment
 
 read -r AS_G NM_G < <(as_of genomic)
 read -r AS_C NM_C < <(as_of collapsed)
+read -r AS_D NM_D < <(as_of default)
+[[ -n $AS_G && -n $NM_G && -n $AS_D && -n $NM_D ]] || fail "missing AS or NM tag"
+# Bare --meth routes to genomic scoring end to end (the default).
+[ "$AS_D" = "$AS_G" ] || fail "bare --meth AS=$AS_D differs from genomic AS=$AS_G"
+[ "$NM_D" = "$NM_G" ] || fail "bare --meth NM=$NM_D differs from genomic NM=$NM_G"
 
 echo "[meth_collapsed] genomic: AS=$AS_G NM=$NM_G   collapsed: AS=$AS_C NM=$NM_C"
 
-# a=1, b=4 (collapsed default sets b=2, but we want a fixed delta: pin -B 4 in
+# a=1, b=4 (collapsed sets b=2 by default, but we want a fixed delta: pin -B 4 in
 # BOTH so the only variable is the matrix). Re-run with explicit -B 4.
 as_of_b4() { # $1 = scoring mode, $2 = fastq -> echoes "AS NM" of the primary alignment
     "$BWA_MEM3" mem --meth --meth-scoring "$1" -B 4 -t 1 ref.fa "$2" > o.bam 2> /dev/null || fail "$1 -B4 nonzero exit on $2"
@@ -193,4 +202,4 @@ NM_LIT=$(mawk '!/^@/{for(i=12;i<=NF;i++) if(substr($i,1,5)=="NM:i:"){print subst
 # even at -B 0, which is exactly why -B 0 is harmless off the --meth path.
 [ "$NM_LIT" = "1" ] || fail "non-meth -B 0 should keep literal NM: NM=$NM_LIT, want 1"
 
-echo "PASS: meth_collapsed_scoring (collapsed-space --meth scoring, and literal NM preserved off the --meth path at -B 0)"
+echo "PASS: meth_collapsed_scoring (collapsed-space --meth scoring, bare --meth scores as genomic, and literal NM preserved off the --meth path at -B 0)"

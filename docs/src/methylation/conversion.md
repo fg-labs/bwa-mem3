@@ -58,10 +58,11 @@ After seeds are remapped to original coordinates with their OT/OB hypothesis,
 - **OT** frees ref-`C` × read-`T` (the expected unmethylated C→T conversion).
 - **OB** frees ref-`G` × read-`A` (the expected bottom-strand G→A conversion).
 
-Under `--meth-scoring collapsed` (the `--meth` / `--meth=emseq` default) the mirror
+Under `--meth-scoring collapsed` (opt-in) the mirror
 cell is freed too (ref-`T` × read-`C`, ref-`A` × read-`G`), so C/T and G/A are
-interchangeable and placement matches bwameth. Under `--meth-scoring genomic` only
-the conversion direction is freed, scored as a full match. Under
+interchangeable and placement approximates bwameth's (some `POS` values differ;
+see [bwameth.py drop-in mapping](bwameth-mapping.md)). Under `--meth-scoring genomic` (the
+`--meth` / `--meth=emseq` default) only the conversion direction is freed, scored as a full match. Under
 `--meth-scoring neutral` (the `--meth=taps` / `--meth=5base` default) only the conversion direction
 is freed as well, but it scores `0` rather than a match: a converted base is
 tolerated, not rewarded. Both `genomic` and `neutral` leave the mirror cell a real

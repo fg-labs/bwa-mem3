@@ -132,9 +132,9 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * three free the conversion cell (OT: ref-C x read-T; OB: ref-G x read-A); they
  * differ in to what value, and whether the mirror cell is freed too:
  *   COLLAPSED: conversion + mirror both freed to +a (C/T interchangeable,
- *              bwameth-compatible placement, -B 2).
+ *              bwameth-compatible placement, -B 2). Opt-in.
  *   GENOMIC:   conversion freed to +a, mirror kept as a mismatch (variant-aware,
- *              -B 4, rank-1 batched-expressible).
+ *              -B 4, rank-1 batched-expressible). The em-seq/bisulfite default.
  *   NEUTRAL:   conversion freed to 0 (tolerated but not rewarded), mirror kept a
  *              mismatch (-B 4). For TAPS, whose conversions are sparse (~3% of C),
  *              a full-match reward over-credits spurious C->T alignments; scoring
