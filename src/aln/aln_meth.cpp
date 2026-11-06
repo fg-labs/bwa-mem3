@@ -158,9 +158,10 @@ void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t
     if (!x->intervals.insert(key).second) return;
     x->pend.push_back({k, l, *e});
 }
-const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int, int keep)
+const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int, int has_copy)
 {
-    x->p = p; x->res = res; x->len = p->len; x->keep = keep || x->grp->keep_strata;
+    x->p = p; x->res = res; x->len = p->len;
+    x->keep = has_copy ? ALN_METH_KEEP_COPIES : x->grp->keep_strata ? ALN_METH_KEEP_STRATA : 0;
     *res = aln_meth_read_t();
     x->rng = aln_meth_draw_seed(x->grp->ref, x->grp->read_no, ord);
     x->vseq.resize(p->len); x->rd_fwd.resize(p->len);
@@ -324,6 +325,30 @@ void aln_meth_redraw(aln_meth_read_t *res, uint64_t rng)
     }
     res->main = held;
 }
+// Releases what the search no longer needs from a finished read whose main hit is drawn. An
+// incomplete read (flags != 0) is never paired or mate-rescued, never anchors cap rescue (which
+// reads only its main hit's cost, as a bound) and reports no X0/X1/XA, so it keeps only its
+// best-cost loci, in their order: a redraw of a duplicate copy ranges over the same loci, and
+// c1/c2 still count every retained locus. raw_cigar only ranks and accounts windows during the
+// search; no reader of a retained locus uses it. Repeating it is a no-op. Kept out of line: one
+// body shared by both callers.
+static __attribute__((noinline)) void meth_release_finished(aln_meth_read_t *res)
+{
+    if (res->main < 0) return;
+    if (res->flags) {
+        const int64_t best = res->occ[res->main].cost;
+        size_t n = 0;
+        for (size_t i = 0; i < res->occ.size(); ++i) {
+            if (res->occ[i].cost > best) continue;
+            if ((int64_t)i == res->main) res->main = (int)n;
+            if (n != i) res->occ[n] = std::move(res->occ[i]);
+            ++n;
+        }
+        res->occ.resize(n);
+    }
+    for (auto &o : res->occ) std::vector<uint32_t>().swap(o.alignment.raw_cigar);
+    res->occ.shrink_to_fit();
+}
 void aln_meth_trim(aln_meth_read_t *res, int max_xa_hits)
 {
     if (res->main < 0) return;
@@ -331,6 +356,18 @@ void aln_meth_trim(aln_meth_read_t *res, int max_xa_hits)
         aln_meth_occ_t main = std::move(res->occ[res->main]);
         res->occ.clear(); res->occ.push_back(std::move(main)); res->main = 0;
     }
+    meth_release_finished(res);
+}
+// The out-of-line tail of aln_meth_slot_finish. keep 0, and STRATA on an incomplete read (pairing
+// never reads it past its main hit): trim. STRATA on a complete read, and COPIES (copies redraw
+// over the ties; aln_meth_search_batch trims after drawing them): release only.
+// Keep this work here, not in slot_finish or aln_meth_redraw: slot_finish is inlined into the
+// search kernel, and under LTO a change to either altered the kernel's search-loop code
+// (clang 19, x86 and arm64).
+static __attribute__((noinline)) void meth_slot_finish_tail(aln_meth_read_t *res, int keep, int max_xa_hits)
+{
+    if (!keep || (keep == ALN_METH_KEEP_STRATA && res->flags)) aln_meth_trim(res, max_xa_hits);
+    else meth_release_finished(res);
 }
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
@@ -365,7 +402,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
         }
     }
     aln_meth_redraw(r, x->rng);
-    if (!x->keep) aln_meth_trim(r, x->grp->max_xa_hits);
+    meth_slot_finish_tail(r, x->keep, x->grp->max_xa_hits);
 }
 void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
 {
@@ -772,7 +809,8 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
     meth_set_main(pa,ra,opt);
     if(unchanged && ra->c1==1) {pa->mapQ=saved_q;pa->seQ=saved_se;}
     else pa->mapQ=pa->seQ=0;
-    rm->occ.clear();rm->occ.push_back(std::move(best));rm->main=0;rm->hyp=a.hyp;
+    rm->occ.clear();rm->occ.push_back(std::move(best));rm->occ.shrink_to_fit();
+    rm->main=0;rm->hyp=a.hyp;
     rm->c1=rm->c2=0;
     const auto &o=rm->occ[0];
     free(pm->cigar);pm->cigar=legacy_cigar(o.alignment.cigar,&pm->n_cigar,pm->len,pm->len,o.strand);

@@ -879,6 +879,157 @@ TEST_CASE("aln_meth: retained cost window counts all worse strata with wide arit
     free(opt);
 }
 
+TEST_CASE("aln_meth: finished reads release search capacity, raw CIGARs and an incomplete read's worse loci")
+{
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt=ba::gap_init_opt();
+    opt->s_mm=3;
+    ba::aln_meth_group_t group; group.opt=opt; group.max_xa_hits=3;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_t slot; slot.grp=&group; slot.res=&result;
+    // Three best-cost loci (pos 100, 102, 104), three worse ones, in a vector with spare capacity
+    // as the search leaves it.
+    auto populate=[&](int flags) {
+        result=ba::aln_meth_read_t();
+        result.occ.reserve(1024);
+        const int64_t costs[6]={0,3,0,3,0,3};
+        for(int k=0;k<6;++k) {
+            ba::aln_meth_occ_t o;
+            o.rid=0; o.hyp=1; o.strand=0; o.pos=100+k; o.cost=costs[k];
+            o.alignment.raw_cigar={32u<<4};
+            o.alignment.cigar={32u<<4};
+            result.occ.push_back(std::move(o));
+        }
+        result.flags=flags;
+    };
+    auto released=[&]() {
+        // shrink_to_fit is non-binding in the standard; libstdc++ and libc++ both honor it.
+        CHECK(result.occ.capacity()==result.occ.size());
+        for(const auto &o:result.occ) {
+            CHECK(o.alignment.raw_cigar.empty()); CHECK(o.alignment.raw_cigar.capacity()==0);
+            CHECK(o.alignment.cigar==std::vector<uint32_t>{32u<<4});
+        }
+    };
+    SUBCASE("paired, complete: every retained locus stays for pairing") {
+        slot.keep=ba::ALN_METH_KEEP_STRATA; populate(0); ba::aln_meth_slot_finish(&slot);
+        REQUIRE(result.occ.size()==6); CHECK(result.c1==3); CHECK(result.c2==3);
+        for(int k=0;k<6;++k) CHECK(result.occ[k].pos==(bwtint_t)(100+k));
+        released();
+    }
+    // Oracle for an incomplete read: the same read finished complete keeps all six loci; its
+    // main-hit draw over them is what the incomplete read printed before anything was dropped.
+    for (int keep : {(int)ba::ALN_METH_KEEP_COPIES, (int)ba::ALN_METH_KEEP_STRATA}) {
+        CAPTURE(keep);
+        SUBCASE("paired, incomplete: the same main hit; ties only while duplicate copies need them") {
+            slot.keep=keep;
+            std::set<bwtint_t> drawn;
+            for(uint64_t seed=0;seed<16;++seed) {
+                CAPTURE(seed);
+                slot.rng=seed;
+                populate(0); ba::aln_meth_slot_finish(&slot);
+                REQUIRE(result.main>=0);
+                const bwtint_t expect=result.occ[result.main].pos;
+                populate(ba::ALN_METH_BIND_BEST); ba::aln_meth_slot_finish(&slot);
+                CHECK(result.c1==3); CHECK(result.c2==3);
+                REQUIRE(result.main>=0);
+                CHECK(result.occ[result.main].pos==expect);
+                CHECK(result.occ[result.main].cost==0);
+                if (keep==ba::ALN_METH_KEEP_COPIES) {
+                    // Copies redraw over the best-cost loci, so all of them stay, in order.
+                    REQUIRE(result.occ.size()==3);
+                    CHECK(result.occ[0].pos==100); CHECK(result.occ[1].pos==102); CHECK(result.occ[2].pos==104);
+                    for(const auto &o:result.occ) CHECK(o.cost==0);
+                } else {
+                    // Kept only for pairing, which never reads an incomplete read past its main hit.
+                    REQUIRE(result.occ.size()==1); CHECK(result.main==0);
+                }
+                drawn.insert(expect);
+                released();
+            }
+            CHECK(drawn.size()==3); // the seeds reach every best-cost locus, so the check discriminates
+        }
+    }
+    SUBCASE("single-end: the trim to the main hit also drops the search's capacity") {
+        slot.keep=0; populate(0); ba::aln_meth_slot_finish(&slot);
+        REQUIRE(result.occ.size()==1); CHECK(result.occ[0].cost==0);
+        released();
+    }
+    SUBCASE("aln_meth_trim releases capacity on its own") {
+        populate(0); result.main=0; ba::aln_meth_trim(&result,1); // 6 loci > max_xa_hits+1
+        REQUIRE(result.occ.size()==1); released();
+    }
+    free(opt);
+}
+
+TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their own would")
+{
+    namespace ba=bwa_aln;
+    FMI_search fmi((ref().fa+".meth").c_str()); fmi.load_index(false,1);
+    auto *bwt=ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    auto *opt=ba::gap_init_opt(); opt->fnr=-1; opt->max_diff=3;
+    // read_r has 31 equally good converted loci plus worse ones; a small lookup budget caps it.
+    const int n=64;
+    const auto fq=write_fq("capped-dups.fq",std::vector<std::string>(n,ref().read_r));
+    // Budgets 32 and 40 stop the search after all 31 ties and 1 or 2 worse loci.
+    for (int keep_strata : {1,0}) for (int budget : {32,40}) {
+        CAPTURE(keep_strata); CAPTURE(budget);
+        ba::aln_meth_opt_t mo; mo.p_best=budget; mo.p_second=0; ba::aln_meth_opt_finish(&mo);
+        auto *input=ba::bwa_seq_open(fq.c_str()); int got=0;
+        auto *reads=ba::bwa_read_seq(input,n,&got,BWA_MODE_COMPREAD,0);
+        REQUIRE(got==n);
+        std::vector<ba::aln_meth_read_t> batch(n);
+        ba::aln_dup_state_t dup;
+        const int n_dups=ba::aln_meth_search_batch(bwt,&mr,&mo,n,reads,opt,2,1,0,keep_strata,3,&dup,batch.data());
+        REQUIRE(n_dups==n-1); // every copy took the duplicate path
+        REQUIRE(batch[0].flags!=0);
+        REQUIRE(batch[0].c1==31); REQUIRE(batch[0].c2>=1); // the draw matters and worse loci were dropped
+        CHECK(batch[0].occ.size()==1u); // an incomplete read keeps only its main hit once its copies are drawn
+        std::set<bwtint_t> drawn;
+        for (int i=0;i<n;++i) {
+            CAPTURE(i);
+            // Independent reference: the copy searched on its own, at its own ordinal.
+            ba::aln_meth_read_t single; ba::aln_dup_state_t single_dup;
+            ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads+i,opt,1,1,i,keep_strata,3,&single_dup,&single);
+            REQUIRE(batch[i].main>=0); REQUIRE(single.main>=0);
+            const auto &a=batch[i].occ[batch[i].main], &b=single.occ[single.main];
+            CHECK(std::make_tuple(a.rid,a.hyp,a.strand,a.pos,a.cost)==std::make_tuple(b.rid,b.hyp,b.strand,b.pos,b.cost));
+            CHECK(batch[i].c1==single.c1); CHECK(batch[i].c2==single.c2);
+            REQUIRE(batch[i].occ.size()==single.occ.size());
+            CHECK(batch[i].main==single.main);
+            for (size_t k=0;k<batch[i].occ.size();++k) {
+                const auto &x=batch[i].occ[k], &y=single.occ[k];
+                CHECK(std::make_tuple(x.rid,x.hyp,x.strand,x.pos,x.cost)==std::make_tuple(y.rid,y.hyp,y.strand,y.pos,y.cost));
+                CHECK(x.cost==a.cost);
+            }
+            drawn.insert(a.pos);
+        }
+        CHECK(drawn.size()>=2); // copies draw different loci, so a shared main would fail
+        ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
+    }
+    {
+        // A complete paired-end copy is neither trimmed nor shrunk, so only a fresh copy frees the
+        // buffer a reused result carries over from the previous batch.
+        ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+        auto *input=ba::bwa_seq_open(fq.c_str()); int got=0;
+        auto *reads=ba::bwa_read_seq(input,n,&got,BWA_MODE_COMPREAD,0);
+        REQUIRE(got==n);
+        std::vector<ba::aln_meth_read_t> batch(n);
+        for (auto &b:batch) b.occ.reserve(256);
+        ba::aln_dup_state_t dup;
+        REQUIRE(ba::aln_meth_search_batch(bwt,&mr,&mo,n,reads,opt,2,1,0,1,3,&dup,batch.data())==n-1);
+        REQUIRE(batch[0].flags==0); REQUIRE(batch[0].occ.size()>1);
+        for (int i=1;i<n;++i) {
+            CAPTURE(i);
+            CHECK(batch[i].occ.size()==batch[0].occ.size());
+            CHECK(batch[i].occ.capacity()==batch[i].occ.size());
+        }
+        ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
+    }
+    free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique strata")
 {
     namespace ba = bwa_aln;
@@ -1118,8 +1269,13 @@ TEST_CASE("aln_meth: mixed seed eligibility and caps survive real slot reuse and
                 const auto &a=actual.occ[k], &b=single.occ[k];
                 CHECK(std::make_tuple(a.rid,a.hyp,a.strand,a.pos,a.cost)==
                       std::make_tuple(b.rid,b.hyp,b.strand,b.pos,b.cost));
-                CHECK(a.alignment.raw_cigar==b.alignment.raw_cigar);
+                // slot_finish releases raw_cigar; the raw path survives in its counts.
+                CHECK(a.alignment.raw_cigar.empty()); CHECK(b.alignment.raw_cigar.empty());
+                CHECK(std::make_tuple(a.n_mm,a.n_gapo,a.n_gape,a.n_ins,a.n_del,a.n_conv)==
+                      std::make_tuple(b.n_mm,b.n_gapo,b.n_gape,b.n_ins,b.n_del,b.n_conv));
                 CHECK(a.alignment.cigar==b.alignment.cigar);
+                CHECK(std::make_tuple(a.alignment.reward,a.alignment.rb,a.alignment.re)==
+                      std::make_tuple(b.alignment.reward,b.alignment.rb,b.alignment.re));
             }
             if (budget==4596 && max_entries==2000000) {
                 CHECK(actual.flags==0);
@@ -1789,7 +1945,10 @@ TEST_CASE("aln_meth: rescue windows belong to the anchor contig at both boundari
         ba::aln_meth_occ_t o;o.rid=c.rid;o.strand=c.strand;o.hyp=1-c.strand;
         o.pos=mr.bns->anns[c.rid].offset+c.anchor;o.alignment.rb=o.pos;o.alignment.re=o.pos+50;
         o.alignment.cigar={50u<<4};result[0].occ.push_back(o);result[0].main=0;result[0].c1=1;
-        if(cap_bound) result[1].flags=ba::ALN_METH_BIND_BEST;
+        if(cap_bound) {
+            result[1].flags=ba::ALN_METH_BIND_BEST;
+            result[1].occ.reserve(64); // spare capacity, as a search leaves it
+        }
         if(conversion_guard) {result[0].n_conv_moved=1;result[0].conv_gap=3;result[0].c2=1;}
         ba::aln_meth_pe_stage1(opt,1,seqs,r);
         if(conversion_guard) CHECK((int)seqs[0]->mapQ==18);
@@ -1804,6 +1963,9 @@ TEST_CASE("aln_meth: rescue windows belong to the anchor contig at both boundari
                 CHECK((int)seqs[1]->mapQ==0);CHECK((int)seqs[1]->c1==0);CHECK((int)seqs[1]->c2==0);
                 CHECK((int)seqs[0]->mapQ==37);CHECK((seqs[0]->extra_flag&SAM_FPP)==0);
                 REQUIRE(result[1].occ.size()==1);CHECK(result[1].occ[0].cost==0);
+                // The rescue releases the old capacity (shrink_to_fit is non-binding in the
+                // standard; libstdc++ and libc++ both honor it).
+                CHECK(result[1].occ.capacity()==1);
                 CHECK(result[1].occ[0].alignment.raw_cigar==std::vector<uint32_t>{50u<<4});
             }
             if(conversion_guard) {CHECK((int)seqs[0]->mapQ==10);CHECK((int)seqs[1]->mapQ==10);}
@@ -1813,6 +1975,100 @@ TEST_CASE("aln_meth: rescue windows belong to the anchor contig at both boundari
             CHECK((int)seqs[1]->type==BWA_TYPE_NO_MATCH);
             CHECK((seqs[0]->extra_flag&SAM_FPP)==0);CHECK((seqs[1]->extra_flag&SAM_FPP)==0);
         }
+        for(int j=0;j<2;++j){ba::bwa_free_read_seq(1,seqs[j]);ba::bwa_seq_close(inputs[j]);}
+    }
+    free(pe);free(opt);ba::aln_meth_ref_free(&mr);
+}
+
+TEST_CASE("aln_meth: an incomplete end's worse-cost loci never reach paired SAM output")
+{
+    // An incomplete end kept for pairing keeps only its main hit (and, while duplicate copies are
+    // left to draw, its other best-cost loci). The records must be the same as when every locus was
+    // kept: pairing, mate rescue, cap rescue and XA must never read past the main hit. The worse
+    // locus shares the anchor's hypothesis at a proper-pair distance, so pairing takes it when the
+    // end is complete (the positive control below). Cap rescue reads only the end's main-hit cost
+    // as a bound and searches the window, where the mate aligns at 1010, not at 940.
+    namespace ba=bwa_aln;
+    FMI_search fmi((ref().fa+".meth").c_str());fmi.load_index(false,1);
+    ba::aln_meth_ref_t mr;REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    ba::aln_meth_opt_t mo;ba::aln_meth_opt_finish(&mo);
+    auto *opt=ba::gap_init_opt();auto *pe=ba::bwa_init_pe_opt();ba::bwase_initialize();
+    // Read 1 anchors on c2 (reverse, at 1110). Read 2 is c2[1010, 1060), forward: its true
+    // locus, which cap rescue finds. The worse locus at c2+940 is also a proper-pair distance
+    // away, but not where the read aligns, so only a reader of the dropped locus can report it.
+    const std::string mate=ref().c2.substr(1010,50);
+    const int64_t c1_off=mr.bns->anns[0].offset,c2_off=mr.bns->anns[1].offset;
+    auto locus=[](int rid,int strand,int64_t pos,int64_t cost) {
+        ba::aln_meth_occ_t o;o.rid=rid;o.strand=strand;o.hyp=1-strand;o.pos=pos;o.cost=cost;
+        o.alignment.rb=pos;o.alignment.re=pos+50;o.alignment.cigar={50u<<4};
+        o.n_mm=(int)(cost/3);
+        return o;
+    };
+    for(int flags:{(int)ba::ALN_METH_BIND_BEST,(int)ba::ALN_METH_BIND_M}) for(int drawn:{0,1}) {
+        CAPTURE(flags);CAPTURE(drawn);
+        // filtered: 0 keeps every locus, 1 only the best-cost ones (a read with duplicate copies
+        // left to draw), 2 only the main hit (what pairing gets).
+        std::string sam[3];
+        for(int filtered=0;filtered<3;++filtered) {
+            ba::bwa_seq_t *seqs[2];ba::bwa_seqio_t *inputs[2];int n[2];
+            for(int j=0;j<2;++j) {
+                inputs[j]=ba::bwa_seq_open(write_fq(j?"worse2.fq":"worse1.fq",{j?mate:std::string(50,'A')}).c_str());
+                seqs[j]=ba::bwa_read_seq(inputs[j],1,&n[j],BWA_MODE_COMPREAD,0);REQUIRE(n[j]==1);
+            }
+            ba::aln_meth_read_t result[2];ba::aln_meth_read_t *r[2]={result,result+1};
+            result[0].occ.push_back(locus(1,1,c2_off+1110,0));result[0].main=0;result[0].c1=1;
+            // The incomplete end, in canonical order: two best-cost loci on c1 and, unless
+            // filtered, a worse one on c2 beside the anchor. c1/c2 count all three either way.
+            auto &rm=result[1];
+            if(filtered<2 || !drawn) rm.occ.push_back(locus(0,0,c1_off+100,0));
+            if(filtered<2 || drawn) rm.occ.push_back(locus(0,0,c1_off+600,0));
+            if(!filtered) rm.occ.push_back(locus(1,0,c2_off+940,3));
+            for(auto &o:rm.occ) o.hyp=result[0].occ[0].hyp; // pairable with the anchor
+            rm.main=filtered==2?0:drawn;rm.c1=2;rm.c2=1;rm.flags=flags;
+            ba::aln_meth_pe_stage1(opt,1,seqs,r);
+            ba::isize_info_t ii={};ii.avg=190;ii.std=10;ii.ap_prior=1e-5;ii.low=100;ii.high=250;ii.high_bayesian=250;
+            uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
+            kstring_t text={0,0,nullptr};
+            ba::aln_meth_print_sam1(&text,&mr,&mo,seqs[0],result,1,seqs[1],BWA_MODE_COMPREAD,30);
+            ba::aln_meth_print_sam1(&text,&mr,&mo,seqs[1],result+1,0,seqs[0],BWA_MODE_COMPREAD,30);
+            sam[filtered].assign(text.s,text.l);free(text.s);
+            // An incomplete end is never a proper pair, and never placed at the dropped locus.
+            CHECK((seqs[1]->extra_flag&SAM_FPP)==0);
+            CHECK(seqs[1]->pos!=(bwtint_t)(c2_off+940));
+            // The test exercises what it claims: cap rescue places a BIND_BEST end at its true
+            // locus; a BIND_M end is not cap-rescued and keeps its drawn best-cost locus.
+            if(flags==ba::ALN_METH_BIND_BEST) {
+                CHECK(seqs[1]->pos==(bwtint_t)(c2_off+1010));CHECK((int)seqs[1]->type==BWA_TYPE_MATESW);
+            } else {
+                CHECK(seqs[1]->pos==(bwtint_t)(c1_off+(drawn?600:100)));
+            }
+            for(int j=0;j<2;++j){ba::bwa_free_read_seq(1,seqs[j]);ba::bwa_seq_close(inputs[j]);}
+        }
+        CHECK(sam[0]==sam[1]); CHECK(sam[0]==sam[2]);
+        CHECK(sam[0].find("XA:Z:")==std::string::npos);
+    }
+    {
+        // Positive control: the same end, complete, with every locus kept, pairs at the worse locus,
+        // so the incomplete cases above would report it if anything read past the main hit.
+        ba::bwa_seq_t *seqs[2];ba::bwa_seqio_t *inputs[2];int n[2];
+        for(int j=0;j<2;++j) {
+            inputs[j]=ba::bwa_seq_open(write_fq(j?"worse2.fq":"worse1.fq",{j?mate:std::string(50,'A')}).c_str());
+            seqs[j]=ba::bwa_read_seq(inputs[j],1,&n[j],BWA_MODE_COMPREAD,0);REQUIRE(n[j]==1);
+        }
+        ba::aln_meth_read_t result[2];ba::aln_meth_read_t *r[2]={result,result+1};
+        result[0].occ.push_back(locus(1,1,c2_off+1110,0));result[0].main=0;result[0].c1=1;
+        auto &rm=result[1];
+        rm.occ.push_back(locus(0,0,c1_off+100,0));
+        rm.occ.push_back(locus(0,0,c1_off+600,0));
+        rm.occ.push_back(locus(1,0,c2_off+940,3));
+        for(auto &o:rm.occ) o.hyp=result[0].occ[0].hyp;
+        rm.main=0;rm.c1=2;rm.c2=1;rm.flags=0;
+        ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        ba::isize_info_t ii={};ii.avg=190;ii.std=10;ii.ap_prior=1e-5;ii.low=100;ii.high=250;ii.high_bayesian=250;
+        uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
+        CAPTURE(seqs[1]->pos-c2_off);
+        CHECK(seqs[1]->pos==(bwtint_t)(c2_off+940));
+        CHECK((seqs[1]->extra_flag&SAM_FPP)!=0);
         for(int j=0;j<2;++j){ba::bwa_free_read_seq(1,seqs[j]);ba::bwa_seq_close(inputs[j]);}
     }
     free(pe);free(opt);ba::aln_meth_ref_free(&mr);
