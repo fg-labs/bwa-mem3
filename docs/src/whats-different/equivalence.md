@@ -1,5 +1,14 @@
 # Equivalence with bwa-mem2 (bit-identity)
 
+This page's bwa-mem2 comparisons concern `mem`, not the short-read `aln` command.
+Without `--meth`, [`aln`](../cli/aln.md) targets stock bwa 0.7.19
+`aln` + `samse`/`sampe` record identity, excluding program-header naming and the
+strict input/error handling documented there. Opt-in `aln --meth` changes search,
+refinement, accounting and tags and is not stock or MEM-equivalent. The MEM
+methylation accuracy/performance evidence on this site does not establish those
+properties for the rewritten `aln --meth` path. Its stock-shaped MAPQ is a heuristic
+on retained loci, not a guarantee of exhaustive discovery.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:

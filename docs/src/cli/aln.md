@@ -31,7 +31,7 @@ bwa-mem3 aln ref.fa r.fq > out.sam            # bwa aln + samse
 bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 ```
 
-**Byte-identity.** The SAM records are byte-identical to the
+**Byte-identity without `--meth`.** The SAM records are byte-identical to the
 output of stock bwa 0.7.19 `aln` + `samse`/`sampe` (the header is too, except
 the `@PG` line, which names the program that ran). This is checked against a
 stock bwa 0.7.19 binary on generated single-end and paired-end reads (a phiX plus
@@ -53,7 +53,8 @@ x86_64 stock build) at rare rounding boundaries.
 The index is the one `bwa-mem3 index` writes (bwa-mem3's own format, not a
 stock `bwa index`). An index built with `index --meth` works and gives the same
 output as a plain index; an index staged with [`shm`](shm.md) is attached
-instead of read from disk. `aln` never aligns in methylation mode.
+instead of read from disk. Without `--meth`, `aln` never aligns in methylation mode; with it,
+see [Methylation](#methylation---meth) below.
 
 ## Synopsis
 
@@ -91,6 +92,7 @@ and the name it has there when it differs.
 | `-c FLOAT` | sampe | 1e-5 | Prior of the chimeric rate (lower bound) |
 | `-s`, `-A` | sampe | off | Skip Smith-Waterman for an unmapped mate; skip the insert size estimate (which also skips that Smith-Waterman, as in stock) |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
+| `-v INT` | new | 3 | Verbosity 0-4; 4 reports lookup/window/incomplete diagnostics |
 | `--bam` | new | off | Write BAM instead of SAM |
 | `--bam-level INT` | new | 1 | BAM compression level (0-9; other values are an error) |
 
@@ -158,7 +160,8 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   text with its own `@SQ` lines replaces the index's (as in stock); SAM output
   then keeps the names as text, as stock does, but `--bam` stops with an error at
   the first record whose reference the header lacks instead of writing it as
-  unmapped.
+  unmapped. Under `--meth`, user-supplied `@SQ` lines are refused: the header must
+  describe the original reference used for alignment and methylation calls.
 - Standard input (`-`) can stand for only one input: `aln ref - -` is refused
   with an error before the index loads (the first `-` would take all of standard
   input). For paired reads from pipes, use two named files or process
@@ -168,6 +171,87 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   are stock's; `aln` names the record on standard error and exits 1, where stock
   exits 0. A failure to close an input (for example a truncated gzip stream) is
   reported and exits 1 too, after the output (BAM included) is completed.
+
+## Methylation (`--meth`)
+
+`aln --meth[=emseq|taps|5base]` aligns converted reads with the backtracking search. It takes the
+same `--meth`, `--meth-context`, `--meth-scoring` and `--meth-tags` options as
+[`mem --meth`](mem.md), with the same values, defaults and checks, plus `--set-as-failed`, for
+single-end and paired-end input. Every chemistry requires both the original and
+converted indices written by `bwa-mem3 index --meth`; give the reference prefix
+(`ref.fa`) or the converted index (`ref.fa.meth`). Read 1 is projected C->T and
+read 2 G->A for directional discovery. In `aln`, `--set-as-failed` requires
+`--meth` (MEM accepts the flag without it).
+
+### Discovery, refinement and accounting
+
+Converted-space backtracking proposes original-reference windows within the user's
+search limits (`-n`, `-o`, `-e`, seeding options, `-M/-O/-E`, `-N` and `-m`).
+Only the directional copy appropriate to the read is retained. Identical windows
+(original contig, conversion hypothesis, strand, start and end) are evaluated once.
+Search-path scores and `-R` do not prune original-reference competitors. This does
+not make discovery exhaustive or guarantee a globally optimal alignment.
+
+Each window is globally refined on the original reference with a fixed
+chemistry-aware reward model: match +1, mismatch -3, ambiguity -1 and a gap of
+length `k` costing `5+k`. Neutral conversions score 0. **`-M/-O/-E` do not change
+this refinement model.** The five-symbol model uses an actual-matrix band
+certificate when available and otherwise a full band. The existing dispatcher
+may use its SIMD global kernels when their predicates hold. CpG-only scoring
+uses seven reference symbols and full-band scalar refinement, not that certificate
+or SIMD path. CpG labels use true contig flanks and mask original reference N runs.
+`--meth-context cpg` requires TAPS/5base and non-collapsed scoring.
+
+The raw refined CIGAR is then costed using `-M/-O/-E`:
+
+```text
+cost = M * mismatches + O * gap_runs + E * gap_extensions
+```
+
+A gap run of length `k` has `k-1` extensions. Chemistry-accepted conversions,
+including neutral conversions, have mismatch cost 0. Different window spans
+compete before collapsing each final locus (original contig, hypothesis, strand
+and normalized start) to its lowest-cost refined CIGAR. Equal costs use canonical
+CIGAR/end ordering within a locus. This ranks reward-refined CIGARs by stock cost;
+it does not minimize that cost over every possible CIGAR. Stock aln instead
+cost-selects search paths before separately reward-refining its output.
+
+`X0` counts best-cost distinct loci. `X1` counts all retained worse-cost loci
+through best cost plus `-M`, or all returned worse costs with `-N`, not only the
+next distinct cost. Primary selection and MAPQ use stock aln count/cost accounting
+and its effective mismatch ceiling. Selection among best loci is seeded per read
+and independent of thread count. MAPQ is the stock heuristic, not a calibrated
+probability or a certificate that no better undiscovered locus exists. The
+fewest-conversions tie-break for equal-cost TAPS/5base neutral loci is not yet
+implemented.
+
+Primary and `XA` output use stored CIGARs without a second refinement. Ranking
+counts and reward include raw terminal gaps. Display changes terminal insertions
+to soft clips and removes terminal deletions with coordinate adjustment. Trimmed
+tails are restored for primary and alternative alignments on either strand.
+`NM`, literal `MD` and `XM` describe the normalized displayed alignment, so `NM`
+can differ from the raw ranking mismatch/gap count. Records use Bismark
+`XR:Z`, `XG:Z`, `XM:Z` tags selected by `--meth-tags`, rather than stock
+`XM:i`, `XO:i`, `XG:i`. The header includes `@PG ID:bwa-mem3-meth`.
+
+### Pairing and limits
+
+Paired input uses stock sampe cost-based pairing on retained original-reference
+loci, restricted to same-contig pairs, and the shared insert-size inference policy
+with original reference length. Mate rescue is bounded to the anchor's contig.
+Pairing currently considers at most 500 loci per end (also bounded by `--max-occ`).
+Incomplete ends cannot gain confidence through pairing or rescue. Complete-strata
+pairing beyond this limit and cap-bound rescue are not implemented.
+
+The per-read SA lookup budget is a single total of 4596 by default, not separate
+best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known
+placement when available, marks it as a repeat with MAPQ 0, and omits exact
+`X0`/`X1`/`XA` claims. `-N` does not remove these resource limits. Candidate CIGAR
+retention is capped cumulatively at 64 MiB per read. Refinement separately checks
+a conservative 64 MiB active-allocation estimate (not total process RSS or retained
+backend scratch), and query/window lengths must not exceed 65535 bases. Invalid
+or unrepresentable results and resource failures exit with an error rather than
+silently dropping competitors. `-v 4` reports lookup, window and incomplete counts.
 
 ## Notes
 
@@ -184,7 +268,7 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   trim) ends the run after that pair is written, with an error and exit 1, as
   `bwa sampe` stops.
 - **No `.sai` files.** Nothing is written between the search and the SAM stage.
-- **Header.** `@HD` (unless the `-r` text has an `@HD` line), `@SQ` (unless
+- **Header without `--meth`.** `@HD` (unless the `-r` text has an `@HD` line), `@SQ` (unless
   the `-r` text has an `@SQ` line), the `-r` line, then `@PG`.
 
 ---

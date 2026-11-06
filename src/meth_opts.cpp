@@ -300,13 +300,13 @@ void meth_opts_usage_shared(FILE *fp)
     fprintf(fp, "                 conversions are sparse, so collapsing costs specificity it\n");
     fprintf(fp, "                 can't repay).\n");
     fprintf(fp, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
-    fprintf(fp, "                 placement (mem: sets -B 2).\n");
+    fprintf(fp, "                 placement in mem (sets mem -B 2).\n");
     fprintf(fp, "                 genomic: free only the conversion direction, scored as a full\n");
     fprintf(fp, "                 match, keep variants as mismatches (variant-aware: variants\n");
-    fprintf(fp, "                 outside the conversion direction counted in NM; mem: -B 4).\n");
+    fprintf(fp, "                 outside the conversion direction counted in NM; mem -B 4).\n");
     fprintf(fp, "                 neutral: free only the conversion direction but score it 0\n");
     fprintf(fp, "                 (tolerated, not rewarded); best for TAPS (variant-aware:\n");
-    fprintf(fp, "                 variants counted in NM as in genomic; mem: -B 4). Not\n");
+    fprintf(fp, "                 variants counted in NM as in genomic; mem -B 4). Not\n");
     fprintf(fp, "                 for em-seq: its dense conversions cost short reads\n");
     fprintf(fp, "                 their placement (a warning is printed).\n");
     fprintf(fp, "                 In genomic/neutral a real variant in the conversion direction\n");

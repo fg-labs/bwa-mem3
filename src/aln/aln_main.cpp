@@ -289,8 +289,9 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	return ret;
 }
 
-int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
-			   const char *fn_fq1, const char *fn_fq2, aln_out_t *out)
+template <class Process>
+static int run_pe_batches(const aln_opt_t *o, const char *fn_fq1, const char *fn_fq2,
+                          aln_out_t *out, Process process)
 {
 	bwa_seqio_t *ks[2];
 	ks[0] = bwa_seq_open(fn_fq1);
@@ -303,7 +304,6 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		return 1;
 	}
 	bwase_initialize();
-	srand48(bns->seed); // once per run, never per batch
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
 	fmt_bufs_t fb(n_threads);
 	isize_info_t last_ii;
@@ -327,10 +327,7 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	read_batch(&cur);
 	if (bwa_seq_report_read_error(ks[0]) || bwa_seq_report_read_error(ks[1])) ret = 1;
 	background_task_t ahead;
-	// each file's own duplicate check: one mate's batches need not look like the other's
-	aln_dup_state_t dup_state[2];
-	aln_dup_state_t *dup[2] = {nullptr, nullptr};
-	if (o->share_dup_search) dup[0] = &dup_state[0], dup[1] = &dup_state[1];
+
 	while (!ret) {
 		seqs[0] = cur.seqs[0], seqs[1] = cur.seqs[1], n_in[0] = cur.n[0], n_in[1] = cur.n[1];
 		if (seqs[0] == 0) {
@@ -353,7 +350,58 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			fprintf(stderr, "[W::aln] read counts differ in this batch: R1 %d, R2 %d; using %d%s\n",
 					n_in[0], n_in[1], n_seqs, n_seqs == n_in[1]? " (as bwa sampe)" : " (the smaller count; bwa sampe would read past R1)");
 		}
-		tot += n_seqs;
+        tot += n_seqs;
+        process(n_seqs, n_in, seqs, fb, last_ii, tot - n_seqs);
+
+		int stop;
+		if (fb.write(out, &stop) != 0) ret = 1;
+		if (stop >= 0) {
+			fprintf(stderr, "[E::aln] paired reads have different names: \"%s\", \"%s\"\n", seqs[0][stop].name, seqs[1][stop].name);
+			ret = 1;
+		}
+		bwa_free_read_seq(n_in[0], seqs[0]);
+		bwa_free_read_seq(n_in[1], seqs[1]);
+		ahead.wait();
+		if (ret) {
+			for (int j = 0; j < 2; ++j)
+				if (next.seqs[j]) bwa_free_read_seq(next.n[j], next.seqs[j]);
+			break;
+		}
+		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld read pairs have been processed.\n", tot);
+		if (bwa_seq_report_read_error(ks[0]) || bwa_seq_report_read_error(ks[1])) { // where stock's read would have exited
+			for (int j = 0; j < 2; ++j)
+				if (next.seqs[j]) bwa_free_read_seq(next.n[j], next.seqs[j]);
+			ret = 1;
+			break;
+		}
+		cur = next;
+	}
+	if (r1_done && !ret) { // R1 ran out first: say so if R2 still has reads
+		int n_extra = 0;
+		bwa_seq_t *extra = bwa_read_seq(ks[1], 1, &n_extra, o->gap.mode, o->gap.trim_qual);
+		if (bwa_seq_report_read_error(ks[1])) ret = 1;
+		else if (extra) {
+			fprintf(stderr, "[W::aln] read 1 file ended before read 2 file; ignoring the remaining read(s) of read 2\n");
+			bwa_free_read_seq(n_extra, extra);
+		}
+	}
+	if (bwa_seq_n_bad(ks[0]) || bwa_seq_n_bad(ks[1])) ret = 1; // malformed records, named on stderr
+	if (bwa_seq_close(ks[0]) != 0) ret = 1;
+	if (bwa_seq_close(ks[1]) != 0) ret = 1;
+	return ret;
+}
+
+int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
+               const char *fn_fq1, const char *fn_fq2, aln_out_t *out)
+{
+    srand48(bns->seed);
+    aln_dup_state_t dup_state[2];
+    aln_dup_state_t *dup[2] = {nullptr, nullptr};
+    if (o->share_dup_search) dup[0]=&dup_state[0], dup[1]=&dup_state[1];
+    const int n_threads=o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+    return run_pe_batches(o, fn_fq1, fn_fq2, out,
+        [&](int n_seqs, const int *n_in, bwa_seq_t **seqs, fmt_bufs_t &fb,
+            isize_info_t &last_ii, int64_t) {
 		// each file is its own batch: the gap-open cap follows that file's longest read
 		for (int m = 0; m < 2; ++m) {
 			const int n_shared = aln_search_batch(bwt, n_in[m], seqs[m], &o->gap, o->gap.n_threads, dup[m]);
@@ -383,58 +431,11 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		}
 		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] changed the coordinates of %lld alignments.\n", cnt_chg);
 		if (o->pe.is_sw && ii.avg >= 0.0) bwa_paired_sw_report(n_tot, n_mapped);
-		int stop;
-		if (fb.write(out, &stop) != 0) ret = 1;
-		if (stop >= 0) {
-			fprintf(stderr, "[E::aln] paired reads have different names: \"%s\", \"%s\"\n", seqs[0][stop].name, seqs[1][stop].name);
-			ret = 1;
-		}
-		bwa_free_read_seq(n_in[0], seqs[0]);
-		bwa_free_read_seq(n_in[1], seqs[1]);
-		ahead.wait();
-		if (ret) {
-			for (int j = 0; j < 2; ++j)
-				if (next.seqs[j]) bwa_free_read_seq(next.n[j], next.seqs[j]);
-			break;
-		}
 		last_ii = ii;
-		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld read pairs have been processed.\n", tot);
-		if (bwa_seq_report_read_error(ks[0]) || bwa_seq_report_read_error(ks[1])) { // where stock's read would have exited
-			for (int j = 0; j < 2; ++j)
-				if (next.seqs[j]) bwa_free_read_seq(next.n[j], next.seqs[j]);
-			ret = 1;
-			break;
-		}
-		cur = next;
-	}
-	if (r1_done && !ret) { // R1 ran out first: say so if R2 still has reads
-		int n_extra = 0;
-		bwa_seq_t *extra = bwa_read_seq(ks[1], 1, &n_extra, o->gap.mode, o->gap.trim_qual);
-		if (bwa_seq_report_read_error(ks[1])) ret = 1;
-		else if (extra) {
-			fprintf(stderr, "[W::aln] read 1 file ended before read 2 file; ignoring the remaining read(s) of read 2\n");
-			bwa_free_read_seq(n_extra, extra);
-		}
-	}
-	if (bwa_seq_n_bad(ks[0]) || bwa_seq_n_bad(ks[1])) ret = 1; // malformed records, named on stderr
-	if (bwa_seq_close(ks[0]) != 0) ret = 1;
-	if (bwa_seq_close(ks[1]) != 0) ret = 1;
-	return ret;
+    });
 }
 
-/* What --meth runs at this stage of the stack: single-end, --meth-context all. */
-static int aln_meth_enabled(const aln_opt_t *o, int paired)
-{
-	if (paired) {
-		fprintf(stderr, "[E::aln] paired-end --meth is not yet supported by aln\n");
-		return 0;
-	}
-	if (o->meth->m.meth_context == METH_CTX_CPG) {
-		fprintf(stderr, "[E::aln] --meth-context cpg is not yet supported by aln\n");
-		return 0;
-	}
-	return 1;
-}
+
 
 namespace {
 
@@ -516,7 +517,87 @@ int aln_run_se_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq, aln
 	return ret;
 }
 
-int aln_run_pe_meth(const aln_opt_t *, const bwt_t *, const char *, const char *, aln_out_t *) { return 1; }
+namespace {
+
+struct pe_meth_ctx_t {
+	const aln_opt_t *o;
+	bwa_seq_t *seqs[2];
+	aln_meth_read_t *res[2];
+	const isize_info_t *ii;
+	fmt_bufs_t *fb;
+	std::vector<long long> cnt_chg;
+	std::vector<uint64_t> sw_cnt;
+};
+
+void pe_meth_post_worker(void *data, int st, int n, int tid)
+{
+	pe_meth_ctx_t *c = (pe_meth_ctx_t*)data;
+	const aln_opt_t *o = c->o;
+	bwa_seq_t *s[2] = {c->seqs[0] + st, c->seqs[1] + st};
+	aln_meth_read_t *r[2] = {c->res[0] + st, c->res[1] + st};
+	uint64_t *sw = &c->sw_cnt[4 * tid];
+	c->cnt_chg[tid] += aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2);
+	kstring_t *k = &c->fb->buf[tid];
+	fmt_seg_t g;
+	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
+	for (int i = 0; i < n; ++i) {
+		bwa_seq_t *p0 = s[0] + i, *p1 = s[1] + i;
+		if (p0->bc[0] || p1->bc[0]) {
+			strcat(p0->bc, p1->bc);
+			strcpy(p1->bc, p0->bc);
+		}
+		aln_meth_print_sam1(k, o->meth_ref, o->meth, p0, r[0] + i, 1, p1, o->gap.mode, o->gap.max_top2);
+		aln_meth_print_sam1(k, o->meth_ref, o->meth, p1, r[1] + i, 0, p0, o->gap.mode, o->gap.max_top2);
+		if (strcmp(p0->name, p1->name) != 0) {
+			g.stop = st + i;
+			break;
+		}
+	}
+	g.len = k->l - g.off;
+	c->fb->segs[tid].push_back(g);
+}
+
+} // namespace
+
+int aln_run_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq1, const char *fn_fq2, aln_out_t *out)
+{
+    std::vector<aln_meth_read_t> res[2];
+    aln_dup_state_t dup_state[2];
+    aln_dup_state_t *dup[2]={nullptr,nullptr};
+    if (o->share_dup_search) dup[0]=&dup_state[0], dup[1]=&dup_state[1];
+    const int n_threads=o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+    return run_pe_batches(o, fn_fq1, fn_fq2, out,
+        [&](int n_seqs, const int *n_in, bwa_seq_t **seqs, fmt_bufs_t &fb,
+            isize_info_t &last_ii, int64_t tot) {
+		for (int m = 0; m < 2; ++m) { // each file is its own batch and stream (read 1 C->T, read 2 G->A)
+			res[m].assign((size_t)n_in[m], aln_meth_read_t());
+			const int n_shared = aln_meth_search_batch(bwt, o->meth_ref, o->meth, n_in[m], seqs[m], &o->gap, o->gap.n_threads,
+													   m == 0 ? 1 : 0, tot, 1, o->max_xa_hits, dup[m], res[m].data());
+			if (bwa_verbose >= 4)
+				fprintf(stderr, "[M::aln] read %d: %d of %d reads shared an identical read's search.\n", m + 1, n_shared, n_in[m]);
+		}
+		aln_meth_read_t *r[2] = {res[0].data(), res[1].data()};
+		aln_meth_pe_stage1(&o->gap, n_seqs, seqs, r);
+		isize_info_t ii;
+		bwa_pe_isize_ref(o->meth_ref->bns->l_pac, n_seqs, seqs, &ii, &o->pe, &last_ii);
+		pe_meth_ctx_t c;
+		c.o = o, c.seqs[0] = seqs[0], c.seqs[1] = seqs[1], c.res[0] = r[0], c.res[1] = r[1], c.ii = &ii, c.fb = &fb;
+		c.cnt_chg.assign(n_threads, 0);
+		c.sw_cnt.assign(4 * n_threads, 0);
+		fb.reset();
+		kt_for_nt(pe_meth_post_worker, &c, n_seqs, n_threads);
+		long long cnt_chg = 0;
+		uint64_t n_tot[2] = {0, 0}, n_mapped[2] = {0, 0};
+		for (int t = 0; t < n_threads; ++t) {
+			cnt_chg += c.cnt_chg[t];
+			n_tot[0] += c.sw_cnt[4 * t], n_tot[1] += c.sw_cnt[4 * t + 1];
+			n_mapped[0] += c.sw_cnt[4 * t + 2], n_mapped[1] += c.sw_cnt[4 * t + 3];
+		}
+		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] changed the coordinates of %lld alignments.\n", cnt_chg);
+		if (o->pe.is_sw && ii.avg >= 0.0) bwa_paired_sw_report(n_tot, n_mapped);
+		last_ii=ii;
+    });
+}
 
 } // namespace bwa_aln
 
@@ -569,9 +650,10 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "   Under --meth, converted search proposes windows; original-reference global realignment\n");
 	fprintf(fp, "   refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.\n");
 	fprintf(fp, "   Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.\n");
-	fprintf(fp, "   the -B values above are mem's. The records carry XR/XG/XM:Z instead of\n");
-	fprintf(fp, "   XM:i/XO:i/XG:i.\n");
+	fprintf(fp, "   aln -B is barcode length, not mem's mismatch penalty. Records carry\n");
+	fprintf(fp, "   XR/XG/XM:Z instead of XM:i/XO:i/XG:i.\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
+	fprintf(fp, "  -v INT    verbosity: 0 quiet, 1 errors, 2 warnings, 3 progress, 4 diagnostics [3]\n");
 	fprintf(fp, "  --bam     write BAM instead of SAM\n");
 	fprintf(fp, "  --bam-level INT     BAM compression level 0-9 [1]\n");
 	fprintf(fp, "  --help    show this message\n");
@@ -696,7 +778,7 @@ int main_aln(int argc, char *argv[])
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 	optreset = 1; // BSD getopt also keeps a static `place` pointer
 #endif
-	while ((c = getopt_long(argc, argv, "n:o:e:i:d:l:k:LR:m:t:NM:O:E:q:f:r:IYB:a:c:sAP", long_opts, 0)) >= 0) {
+	while ((c = getopt_long(argc, argv, "n:o:e:i:d:l:k:LR:m:t:v:NM:O:E:q:f:r:IYB:a:c:sAP", long_opts, 0)) >= 0) {
 		switch (c) {
 		case 'n':
 			if (strpbrk(optarg, ".eE")) { // stock tests only for '.'; it reads `1e-2` as the integer 1
@@ -724,6 +806,7 @@ int main_aln(int argc, char *argv[])
 		case 'k': ALN_INT("-k", INT_MIN, &opt->max_seed_diff); break;
 		case 'm': ALN_INT("-m", 0, &opt->max_entries); break;
 		case 't': ALN_INT("-t", INT_MIN, &opt->n_threads); break;
+		case 'v': if (!aln_parse_int("-v", optarg, 0, 4, &bwa_verbose)) return 1; break;
 		case 'L': opt->mode |= BWA_MODE_LOGGAP; break;
 		case 'R': ALN_INT("-R", INT_MIN, &opt->max_top2); break;
 		case 'q': ALN_INT("-q", INT_MIN, &opt->trim_qual); break;
@@ -920,13 +1003,6 @@ int main_aln(int argc, char *argv[])
 			return 1;
 		}
 		meth_hdr_lines = bwa_load_hdr_from_index(meth_orig.c_str()); // the original reference's sidecar
-	}
-	if (o.meth && !aln_meth_enabled(&o, paired)) {
-		free(meth_hdr_lines);
-		aln_meth_ref_free(&meth_ref);
-		bwt_destroy(bwt);
-		delete fmi;
-		return 1;
 	}
 
 	kstring_t hdr = {0, 0, 0};

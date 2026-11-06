@@ -135,7 +135,9 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	return 0;
 }
 
-static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm, const isize_info_t *ii)
+template <bool SameContig = false>
+static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
+                   const isize_info_t *ii, const bntseq_t *bns = nullptr)
 {
 	int i, j, o_n, subo_n, cnt_chg = 0, low_bound = ii->low, max_len;
 	uint64_t o_score, subo_score;
@@ -181,8 +183,19 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	if (d->arr.n > 1) pdqsort_128(d->arr.n, d->arr.a);
 	for (j = 0; j < 2; ++j) last_pos[j][0].x = last_pos[j][0].y = last_pos[j][1].x = last_pos[j][1].y = (uint64_t)-1;
 	if (opt->type == BWA_PET_STD) {
+        int last_rid = -1;
 		for (i = 0; i < d->arr.n; ++i) {
 			pair64_t x = d->arr.a[i];
+            if (SameContig) {
+                const int rid = bns_pos2rid(bns, x.x);
+                if (rid != last_rid) {
+                    // Reset only the predecessor cache; aggregate best/runner-up counts
+                    // across every eligible contig in this one stock scoring pass.
+                    for (j = 0; j < 2; ++j)
+                        last_pos[j][0].x = last_pos[j][0].y = last_pos[j][1].x = last_pos[j][1].y = (uint64_t)-1;
+                    last_rid = rid;
+                }
+            }
 			int strand = x.y>>1&1;
 			if (strand == 1) { // reverse strand, then check
 				int y = 1 - (x.y&1);
@@ -248,6 +261,17 @@ int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm
 	return ret;
 }
 
+int bwa_pe_pairing_same_contig(const bntseq_t *bns, bwa_seq_t *p[2], pair64_v *arr,
+                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii)
+{
+    pe_data_t d;
+    d.arr = *arr;
+    d.aln[0] = p[0]->aln; d.aln[1] = p[1]->aln;
+    const int ret = pairing<true>(p, &d, opt, s_mm, ii, bns);
+    *arr = d.arr;
+    return ret;
+}
+
 /* bwa_cal_pac_pos_pe is upstream's single function cut into its stages, so that the driver can
  * run the RNG-free stages in parallel (see bwape.h). Stage bodies are upstream's, in order, apart
  * from the batched SA lookups in bwa_pe_se_pos and bwa_pe_pair (README.md, "Batched SA lookups"). */
@@ -299,8 +323,14 @@ void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t 
 void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, const pe_opt_t *opt,
 				  const isize_info_t *last_ii)
 {
-	// infer isize
-	infer_isize(n_seqs, seqs, ii, opt->ap_prior, bwt->seq_len/2);
+    bwa_pe_isize_ref(bwt->seq_len/2, n_seqs, seqs, ii, opt, last_ii);
+}
+
+void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
+                      const pe_opt_t *opt, const isize_info_t *last_ii)
+{
+	// Shared stock inference/fallback; converted indices must supply the original length.
+	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len);
 	if (ii->avg < 0.0 && last_ii->avg > 0.0) *ii = *last_ii;
 	if (opt->force_isize) {
 		fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");
