@@ -2,7 +2,10 @@
 // its emitter reads (the pair's primary and the emitted ALT record,
 // mem_pe_alt_slot). Every slot the emitter reads must equal the full build;
 // every other slot is NULL and freeing it is safe. The emitter's read rule is
-// restated here rather than taken from mem_pe_alt_slot.
+// restated here rather than taken from mem_pe_alt_slot. The emitter itself
+// (mem_sam_pe_batch_post) is also driven end to end on a pair whose chosen
+// copy is not the single-end primary, so a slot selector other than the
+// pair's primary drops or misplaces the XA tag (test_xa_pe_emit.cpp).
 
 #include "doctest/doctest.h"
 

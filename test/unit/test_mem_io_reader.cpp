@@ -40,6 +40,13 @@
 // The two readers differ in one documented way: the default reader keeps a
 // record's comment only when asked to (copy_comment, set by -C), since `mem`
 // drops comments otherwise; the legacy reader always keeps it.
+//
+// Also here, in suite unit/utils (no unit file covers src/utils.cpp): the
+// checked writer's close, err_fclose, is fatal when fclose fails. A buffered
+// stream on a pipe whose reader is gone fails at fclose's flush with EPIPE,
+// portably (unlike /dev/full), once SIGPIPE is ignored; the controls show the
+// open-reader close succeeds and that SIGPIPE at its default kills the write
+// instead, also when the runner starts with SIGPIPE blocked.
 #include "doctest/doctest.h"
 #include "run_in_child.h"
 #include "stderr_capture.h"
@@ -55,6 +62,7 @@
 #include "utils.h"
 
 #include <fcntl.h>
+#include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <zlib.h>
@@ -564,4 +572,81 @@ TEST_CASE("mem_io reader: bseq_classify pairs adjacent equal names (-p)"
     CHECK(pairs == "a0 a1 c3 c4 e6 e7 ");
     free(sep[0]);
     free(sep[1]);
+}
+
+namespace {
+
+// Writes `text` through a buffered stdio stream on the write end of a pipe and
+// closes it with err_fclose, in a forked child whose stderr goes to
+// `err_path`. With `reader_open` false the read end is closed first, so the
+// write itself (made by fclose's flush: the text stays in the stream's
+// buffer until then) fails with EPIPE; SIGPIPE is ignored unless
+// `default_sigpipe`, so that failure reaches err_fclose as fclose's return.
+int fclose_pipe_in_child(bool reader_open, bool default_sigpipe, const std::string &err_path) {
+    return bwa_tests::run_in_child([&] {
+        // Pin both the disposition and the mask: run_in_child unblocks only
+        // doctest's crash signals, and a blocked SIGPIPE survives the fork.
+        signal(SIGPIPE, default_sigpipe ? SIG_DFL : SIG_IGN);
+        sigset_t pipe_only;
+        sigemptyset(&pipe_only);
+        sigaddset(&pipe_only, SIGPIPE);
+        if (sigprocmask(SIG_UNBLOCK, &pipe_only, nullptr) != 0) _exit(8);
+        int fds[2];
+        if (pipe(fds) != 0) _exit(4);
+        if (!reader_open) close(fds[0]);
+        FILE *fp = fdopen(fds[1], "w");
+        if (fp == NULL) _exit(5);
+        if (setvbuf(fp, NULL, _IOFBF, 4096) != 0) _exit(6);
+        if (fputs("@a\nAC\n+\nII\n", fp) == EOF) _exit(7);  // buffered, not yet written
+        err_fclose(fp);
+        // reached only when fclose succeeded
+    }, err_path.c_str());
+}
+
+}  // namespace
+
+TEST_CASE("err_fclose: a failed close of a checked writer is fatal"
+          * doctest::test_suite("unit/utils")) {
+    // Portable, unlike /dev/full: a pipe whose reader has gone makes the flush
+    // inside fclose fail with EPIPE on every POSIX host.
+    bwa_tests::TempDir dir;
+    const std::string err = dir.file("err.txt");
+    // err.txt is created by the child's stderr redirect; read it only once the
+    // child has run, and require it to exist so an empty read is not vacuous.
+    auto err_text = [&] {
+        FILE *fp = fopen(err.c_str(), "rb");
+        REQUIRE(fp != NULL);
+        fclose(fp);
+        return dir.read("err.txt");
+    };
+    SUBCASE("reader gone, SIGPIPE ignored: err_fclose exits EXIT_FAILURE naming fclose") {
+        const int st = fclose_pipe_in_child(false, false, err);
+        REQUIRE(WIFEXITED(st));
+        CHECK(WEXITSTATUS(st) == EXIT_FAILURE);
+        CHECK(err_text() == std::string("[fclose] ") + strerror(EPIPE) + "\n");
+    }
+    SUBCASE("control: the reader still open, the close succeeds") {
+        const int st = fclose_pipe_in_child(true, false, err);
+        REQUIRE(WIFEXITED(st));
+        CHECK(WEXITSTATUS(st) == 0);
+        CHECK(err_text().empty());
+    }
+    SUBCASE("control: with SIGPIPE at its default the write is killed, not reported") {
+        // Shows the failure above is the close's own EPIPE path, reached only
+        // because SIGPIPE was ignored.
+        const int st = fclose_pipe_in_child(false, true, err);
+        REQUIRE(WIFSIGNALED(st));
+        CHECK(WTERMSIG(st) == SIGPIPE);
+    }
+    SUBCASE("the default-SIGPIPE control holds when the runner starts with SIGPIPE blocked") {
+        // A blocked mask is inherited across fork; the child must unblock it.
+        sigset_t pipe_only, saved;
+        sigemptyset(&pipe_only);
+        sigaddset(&pipe_only, SIGPIPE);
+        REQUIRE(sigprocmask(SIG_BLOCK, &pipe_only, &saved) == 0);
+        const int st = fclose_pipe_in_child(false, true, err);
+        REQUIRE(sigprocmask(SIG_SETMASK, &saved, nullptr) == 0);
+        REQUIRE(WIFSIGNALED(st));
+        CHECK(WTERMSIG(st) == SIGPIPE);
+    }
 }

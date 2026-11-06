@@ -251,6 +251,14 @@ Resolved resolve(mem_opt_t *opt, const Bns &B, const mem_pestat_t pes[4],
     return out;
 }
 
+// Every region's secondary_all, in the (reordered) region order: the links
+// the XA tag is built from.
+std::vector<int> links(const std::vector<mem_alnreg_t> &regs) {
+    std::vector<int> v;
+    for (const mem_alnreg_t &r : regs) v.push_back(r.secondary_all);
+    return v;
+}
+
 }  // namespace
 
 TEST_CASE("mem_pair: random hit sets agree with an all-pairs oracle"
@@ -498,6 +506,10 @@ TEST_CASE("mem_pair_resolve_batch_post: a pair no better than its ends apart is 
         CHECK(r.z[1] == 0);
         CHECK(r.q_se[0] == 60);
         CHECK(r.q_se[1] == 60);
+        // Proper or not, nothing moves: each end's one region heads its own
+        // (empty) XA tree.
+        CHECK(links(regs[0]) == std::vector<int>{-1});
+        CHECK(links(regs[1]) == std::vector<int>{-1});
     }
 }
 
@@ -519,6 +531,14 @@ TEST_CASE("mem_pair_resolve_batch_post: an end with two primary hits is left unp
     CHECK(r.n_pri[0] == 2);
     CHECK(r.paired == 0);
     CHECK(r.extra_flag == 1);
+    // No pair, so no primary switch: both of end 0's hits (disjoint read
+    // bases) stay primaries with no XA owner, in score order, and the mate's
+    // one hit too.
+    REQUIRE(regs[0].size() == 2);
+    CHECK(regs[0][0].score == 60);
+    CHECK(regs[0][1].score == 40);
+    CHECK(links(regs[0]) == std::vector<int>({-1, -1}));
+    CHECK(links(regs[1]) == std::vector<int>{-1});
 }
 
 TEST_CASE("mem_pair_resolve_batch_post: --meth caps q_pe by both ends' second hits"
@@ -546,5 +566,14 @@ TEST_CASE("mem_pair_resolve_batch_post: --meth caps q_pe by both ends' second hi
         CHECK(r.extra_flag == 3);
         CHECK(r.q_se[0] == (meth ? 36 : 40));
         CHECK(r.q_se[1] == (meth ? 36 : 40));
+        // The pair is each end's single-end primary, so nothing moves: the
+        // contig-0 hit heads, the 99-point hit over the same read bases is its
+        // XA hit, on both ends.
+        CHECK(r.z[0] == 0);
+        CHECK(r.z[1] == 0);
+        CHECK(regs[0][0].score == 100);
+        CHECK(regs[1][0].score == 100);
+        CHECK(links(regs[0]) == std::vector<int>({-1, 0}));
+        CHECK(links(regs[1]) == std::vector<int>({-1, 0}));
     }
 }

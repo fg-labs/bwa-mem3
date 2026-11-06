@@ -268,8 +268,8 @@ for tier in $(mem_cli_tiers); do
     for y in 0:0 2:0 3:45; do
         sam="$work/y${y%%:*}.$tier.sam"
         mem_cli_mem "$tier" "$sam" -k 15 -r 10 -y "${y%%:*}" "$ref" "$work/hand.fq"
-        mem_cli_expect "$tier: -k 15 -r 10 -y ${y%%:*} inS60 POS AS XS" "3001 60 ${y##*:}" \
-            "$(fields "$sam" inS60 | awk '{ print $3, $5, $6 }')"
+        mem_cli_expect "$tier: -k 15 -r 10 -y ${y%%:*} inS60 FLAG RNAME POS CIGAR AS XS" \
+            "0 ctg1 3001 60M 60 ${y##*:}" "$(fields "$sam" inS60)"
     done
 
     # --- -c ---------------------------------------------------------------

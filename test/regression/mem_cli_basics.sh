@@ -85,6 +85,8 @@ unmapped="$(printf '%s\n' "$unmapped_fwd" | rev)"
 # 60 x Q40 then 40 x Q20: reversed, it reads 40 x Q20 then 60 x Q40.
 rev_qual="$(printf 'I%.0s' $(seq 60))$(printf '5%.0s' $(seq 40))"
 rev_qual_sam="$(printf '%s\n' "$rev_qual" | rev)"
+# mem_cli_fq's default quality: 100 x Q40.
+q40="$(printf 'I%.0s' $(seq 100))"
 
 {
     mem_cli_fq exact "$exact"
@@ -153,6 +155,8 @@ for tier in $(mem_cli_tiers); do
     check_record "$tier" "$sam" exact 0 ctg1 1001 60 100M
     mem_cli_expect "$tier: exact SEQ is the forward-strand reference" "$exact" \
         "$(mem_cli_col "$(mem_cli_primary "$sam" exact)" 10)"
+    mem_cli_expect "$tier: exact QUAL is the read's" "$q40" \
+        "$(mem_cli_col "$(mem_cli_primary "$sam" exact)" 11)"
     check_tags "$tier" "$sam" exact 0 100 100 0
 
     check_record "$tier" "$sam" rev 16 ctg1 1201 60 100M
@@ -165,6 +169,8 @@ for tier in $(mem_cli_tiers); do
     check_tags "$tier" "$sam" mm 1 "49${mm_ref_base}50" 95 0
     mem_cli_expect "$tier: mm SEQ is the read with base 50 changed" "$mm" \
         "$(mem_cli_col "$(mem_cli_primary "$sam" mm)" 10)"
+    mem_cli_expect "$tier: mm QUAL is the read's" "$q40" \
+        "$(mem_cli_col "$(mem_cli_primary "$sam" mm)" 11)"
 
     check_record "$tier" "$sam" del2 0 ctg1 1401 60 50M2D50M
     check_tags "$tier" "$sam" del2 2 "50^${del_skipped}50" 92 0
@@ -189,12 +195,15 @@ for tier in $(mem_cli_tiers); do
     mem_cli_expect "$tier: -A 2 one record per read" "del2 exact inR inS mm rev unmapped " \
         "$(mem_cli_records "$a2" | awk -F '\t' '{ print $1 }' | LC_ALL=C sort | tr '\n' ' ')"
     # Scaling the scores moves none of the alignments: POS, CIGAR and NM as
-    # under the default scoring, AS scaled.
-    for e in "exact 1001 100M 0 200" "mm 1001 100M 1 190" "del2 1401 50M2D50M 2 184"; do
+    # under the default scoring, AS scaled. MAPQ stays 60: the score, the
+    # no-second-hit floor (-k 19 times -A) and the penalties all scale with
+    # -A, so (AS - floor) / A and the identity term are unchanged and the
+    # estimate stays far above the cap of 60, as in the default run.
+    for e in "exact 1001 60 100M 0 200" "mm 1001 60 100M 1 190" "del2 1401 60 50M2D50M 2 184"; do
         read -r q want_rest <<< "$e"
         rec="$(mem_cli_primary "$a2" "$q")"
-        mem_cli_expect "$tier: -A 2 $q POS CIGAR NM AS" "$want_rest" \
-            "$(mem_cli_col "$rec" 4) $(mem_cli_col "$rec" 6) $(mem_cli_tag "$rec" NM) $(mem_cli_tag "$rec" AS)"
+        mem_cli_expect "$tier: -A 2 $q POS MAPQ CIGAR NM AS" "$want_rest" \
+            "$(mem_cli_col "$rec" 4) $(mem_cli_col "$rec" 5) $(mem_cli_col "$rec" 6) $(mem_cli_tag "$rec" NM) $(mem_cli_tag "$rec" AS)"
     done
     # Every read keeps the default run's FLAG, RNAME, POS and CIGAR (and inR its
     # primary + XA set).
