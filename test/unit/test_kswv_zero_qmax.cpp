@@ -205,12 +205,12 @@ TEST_CASE("matesw_u8_qmax_for folds the --meth matrices into the 8-bit admission
     const int shift = matesw_u8_shift_for(o, o->mat);
 
     // Outside --meth the per-hypothesis matrices are not used, so they do not count.
-    o->meth_mode = 0;
+    o->meth.meth_mode = 0;
     CHECK(matesw_u8_qmax_for(o, o->mat) == 1);
     CHECK(matesw_use_u8(200, matesw_u8_qmax_for(o, o->mat), shift));
 
     // Under --meth the largest entry of any of the three matrices is the bound.
-    o->meth_mode = 1;
+    o->meth.meth_mode = 1;
     CHECK(matesw_u8_qmax_for(o, o->mat) == 5);
     // A 200-base mate can reach 1000 under OB, which the 8-bit kernels cannot hold.
     CHECK_FALSE(matesw_use_u8(200, matesw_u8_qmax_for(o, o->mat), shift));

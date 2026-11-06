@@ -31,7 +31,7 @@ mem_opt_t *opt_with_a(int a)
 {
     mem_opt_t *o = mem_opt_init();
     o->a = a;
-    o->meth_mode = 1;
+    o->meth.meth_mode = 1;
     return o;
 }
 
@@ -41,7 +41,7 @@ TEST_CASE("meth defaults at a=1 are bwameth's constants verbatim") {
     mem_opt_t *o = opt_with_a(1);
     mem_opt_t o0;                      // no sentinel set => nothing user-supplied
     memset(&o0, 0, sizeof(o0));
-    o->meth_scoring = MEM_METH_SCORING_COLLAPSED;
+    o->meth.meth_scoring = MEM_METH_SCORING_COLLAPSED;
 
     mem_opt_apply_meth_defaults(o, &o0);
 
@@ -57,7 +57,7 @@ TEST_CASE("meth defaults scale with -A so scoring stays self-consistent") {
     mem_opt_t *o = opt_with_a(2);
     mem_opt_t o0;
     memset(&o0, 0, sizeof(o0));
-    o->meth_scoring = MEM_METH_SCORING_COLLAPSED;
+    o->meth.meth_scoring = MEM_METH_SCORING_COLLAPSED;
 
     mem_opt_apply_meth_defaults(o, &o0);
 
@@ -79,7 +79,7 @@ TEST_CASE("explicit user values are never overwritten, at any match score") {
     o0.pen_clip3 = 1;    o->pen_clip3    = 8;
     o0.pen_unpaired = 1; o->pen_unpaired = 9;
     o0.b = 1;            o->b            = 6;
-    o->meth_scoring = MEM_METH_SCORING_COLLAPSED;
+    o->meth.meth_scoring = MEM_METH_SCORING_COLLAPSED;
 
     mem_opt_apply_meth_defaults(o, &o0);
 
@@ -98,7 +98,7 @@ TEST_CASE("genomic scoring keeps bwa's variant-aware mismatch, scaled") {
     mem_opt_t *o = opt_with_a(2);
     mem_opt_t o0;
     memset(&o0, 0, sizeof(o0));
-    o->meth_scoring = MEM_METH_SCORING_GENOMIC;
+    o->meth.meth_scoring = MEM_METH_SCORING_GENOMIC;
     o->b = 8;                          // as update_a would leave it (4 * 2)
 
     mem_opt_apply_meth_defaults(o, &o0);
@@ -112,7 +112,7 @@ TEST_CASE("meth defaults set -M (no multi) regardless of match score") {
     mem_opt_t *o = opt_with_a(2);
     mem_opt_t o0;
     memset(&o0, 0, sizeof(o0));
-    o->meth_scoring = MEM_METH_SCORING_COLLAPSED;
+    o->meth.meth_scoring = MEM_METH_SCORING_COLLAPSED;
 
     mem_opt_apply_meth_defaults(o, &o0);
 

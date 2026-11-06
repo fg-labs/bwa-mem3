@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include "bntseq.h"
+#include "meth_opt.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,10 +28,7 @@ extern "C" {
  * Context classification (CpG/CHG/CHH, and which base is the C of interest
  * per strand) is chemistry-INDEPENDENT -- it is a property of the reference.
  * Only the methylated/unmethylated decision flips. */
-typedef enum {
-    METH_CHEM_EMSEQ = 0,  /* default: bisulfite / em-seq */
-    METH_CHEM_TAPS  = 1
-} meth_chem_t;
+/* meth_chem_t (METH_CHEM_EMSEQ, METH_CHEM_TAPS) is in meth_opt.h. */
 
 /* Build a Bismark XM:Z payload (length l_emit, NUL-terminated). NULL on
  * alloc failure.

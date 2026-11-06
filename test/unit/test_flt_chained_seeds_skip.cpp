@@ -202,7 +202,7 @@ TEST_CASE("--meth: a skipped read is not decoded and its chains are untouched"
     // The --meth block reads seeds[0].rbeg against bns->l_pac; with bns == NULL it
     // would crash, so passing proves the length test runs before it.
     OptGuard g;
-    g.opt->meth_mode = 1;
+    g.opt->meth.meth_mode = 1;
     for (int l : {150, 724}) {
         ReadFixture f(l, 3, 2, true);
         mem_flt_chained_seeds(g.opt, nullptr, nullptr, &f.read, static_cast<int>(f.chains.size()),
