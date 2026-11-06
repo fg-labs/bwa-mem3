@@ -629,8 +629,13 @@ endif
 # named avx2/avx512bw branches are known-good and the default build floors its
 # non-kernel TUs via BASELINE_ARCH, so probe only these two escape hatches:
 # refuse any selected ARCH_FLAGS that does not define __AVX2__.
+# Probe from a plain x86-64 baseline, as KERNEL_FLAGS_* do: some toolchains
+# (e.g. Ubuntu 26.04's gcc) default to x86-64-v3, and -m flags only add to that
+# default, so `-msse4.1` alone would still define __AVX2__ and slip past the
+# guard. The last -march wins, so arch=native and a raw -march=... still select
+# their own ISA.
 ifeq ($(ARCH_CHECK_AVX2),1)
-    ARCH_DEFINES_AVX2 := $(shell $(CXX) $(ARCH_FLAGS) -dM -E -x c++ /dev/null 2>/dev/null | grep -c '__AVX2__')
+    ARCH_DEFINES_AVX2 := $(shell $(CXX) -march=x86-64 $(ARCH_FLAGS) -dM -E -x c++ /dev/null 2>/dev/null | grep -c '__AVX2__')
     ifneq ($(ARCH_DEFINES_AVX2),1)
         $(error arch=$(arch) does not enable AVX2: batched mate-rescue needs AVX2+ (the pre-AVX2 scalar path was removed); build with arch=avx2 [default], avx512bw, arm64, or a custom flag that enables AVX2)
     endif

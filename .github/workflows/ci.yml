@@ -189,6 +189,98 @@ jobs:
           fi
           exit $fail
 
+      - name: AVX2 probe under an x86-64-v3-default compiler
+        run: |
+          set -u
+          fail=0
+          export ALLOW_UNSUPPORTED_COMPILER=1
+          # Some toolchains (Ubuntu 26.04's gcc, for one) default to
+          # -march=x86-64-v3. There, -m flags only add to the AVX2 baseline, so
+          # `-msse4.1` alone still defines __AVX2__ and a probe that does not
+          # reset the baseline lets a sub-AVX2 build through. Simulate such a
+          # compiler on this runner by baking -march=x86-64-v3 into CXX.
+          v3cxx="g++ -march=x86-64-v3"
+          # Control: the simulation must reproduce the trap, or the refusal
+          # check below would pass vacuously.
+          if $v3cxx -msse4.1 -dM -E -x c++ /dev/null | grep -q '__AVX2__'; then
+            echo "OK: simulated v3-default compiler defines __AVX2__ under -msse4.1"
+          else
+            echo "FAIL: '$v3cxx -msse4.1' does not define __AVX2__; the simulation is broken"; fail=1
+          fi
+          # Positive control: a raw AVX2 flag must still pass the probe.
+          make CXX="$v3cxx" arch=-mavx2 --dry-run >/tmp/v3ok.out 2>&1 || true
+          if grep -q "does not enable AVX2" /tmp/v3ok.out; then
+            echo "FAIL: arch=-mavx2 wrongly refused under a v3-default compiler:"; cat /tmp/v3ok.out; fail=1
+          elif grep -qE ' -c |zlib-ng' /tmp/v3ok.out; then
+            echo "OK: arch=-mavx2 passes the probe under a v3-default compiler"
+          else
+            echo "FAIL: 'make arch=-mavx2' neither passed the probe nor reached build steps:"; cat /tmp/v3ok.out; fail=1
+          fi
+          # Sub-AVX2 raw selections must still be refused.
+          for a in -msse4.1 -march=nehalem; do
+            if make CXX="$v3cxx" arch=$a --dry-run >/tmp/v3.out 2>&1; then
+              echo "FAIL: 'make arch=$a' did not error under a v3-default compiler"; cat /tmp/v3.out; fail=1
+            elif grep -q "does not enable AVX2" /tmp/v3.out; then
+              echo "OK: arch=$a refused by the AVX2 probe under a v3-default compiler"
+            else
+              echo "FAIL: arch=$a errored but NOT with the AVX2-probe message:"; cat /tmp/v3.out; fail=1
+            fi
+          done
+          exit $fail
+
+  ubuntu-latest-toolchain:
+    name: ubuntu-latest toolchain (AVX2 probe + clang-19 install)
+    if: github.event_name != 'push'
+    # Most jobs pin ubuntu-24.04, but ubuntu-latest now resolves to 26.04, whose
+    # gcc defaults to -march=x86-64-v3 and for which apt.llvm.org publishes no
+    # LLVM 19. Check both on the real image: the AVX2 probe must still refuse a
+    # sub-AVX2 raw flag with the distro g++, and install-clang-19 must succeed
+    # (via its distro-package fallback). Runs on ubuntu-latest on purpose: that
+    # label is what newer images arrive through, so this job sees them first.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+
+      - name: AVX2 probe with the distro g++
+        run: |
+          set -u
+          . /etc/os-release && echo "OS: ${PRETTY_NAME}"
+          fail=0
+          export ALLOW_UNSUPPORTED_COMPILER=1
+          g++ --version | head -1
+          if g++ -msse4.1 -dM -E -x c++ /dev/null | grep -q '__AVX2__'; then
+            echo "NOTE: this g++ defaults to an AVX2 baseline (-msse4.1 defines __AVX2__)"
+          fi
+          make CXX=g++ arch=-mavx2 --dry-run >/tmp/ok.out 2>&1 || true
+          if grep -q "does not enable AVX2" /tmp/ok.out; then
+            echo "FAIL: arch=-mavx2 wrongly refused:"; cat /tmp/ok.out; fail=1
+          elif grep -qE ' -c |zlib-ng' /tmp/ok.out; then
+            echo "OK: arch=-mavx2 passes the probe"
+          else
+            echo "FAIL: 'make arch=-mavx2' neither passed the probe nor reached build steps:"; cat /tmp/ok.out; fail=1
+          fi
+          if make CXX=g++ arch=-msse4.1 --dry-run >/tmp/no.out 2>&1; then
+            echo "FAIL: 'make arch=-msse4.1' did not error"; cat /tmp/no.out; fail=1
+          elif grep -q "does not enable AVX2" /tmp/no.out; then
+            echo "OK: arch=-msse4.1 refused by the AVX2 probe"
+          else
+            echo "FAIL: arch=-msse4.1 errored but NOT with the AVX2-probe message:"; cat /tmp/no.out; fail=1
+          fi
+          exit $fail
+
+      - name: Install clang-19
+        uses: ./.github/actions/install-clang-19
+
+      - name: clang-19 is the expected major version
+        run: |
+          set -eu
+          clang++-19 --version | head -1
+          clang++-19 -dM -E -x c++ /dev/null | grep -q '__clang_major__ 19'
+
   # Same shape and rationale as the job above, kept separate so the failure
   # reads as "the opt-in macro list drifted" rather than as an NDEBUG finding.
   debug-macro-flag-lint:
