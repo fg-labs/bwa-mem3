@@ -259,6 +259,19 @@ TEST_CASE("mem_io record: split alignments with hard and soft clips and SA and -
         check_both(g.opt, ref, r, l, 1, NULL,
                    "r1\t2064\tchrB\t50\t20\t6S4M\t*\t0\t0\tAACGTNACGT\tJIHGFEDCBA\t"
                    "NM:i:0\tMD:Z:4\tAS:i:4\tXS:i:0\tSA:Z:chrA,100,+,6M4S,60,0;\tHN:i:0\n");
+        // The reverse hit of read bases 6-9 (the reverse-split case above): its
+        // clip trails the CIGAR, 4M6S, and -Y keeps it soft with the whole
+        // read, reverse-complemented (AACGTNACGT) and its QUAL reversed.
+        l[1] = alns.make(1, 49, true, "4M6S", "4", 0, 20, 4, 0);
+        l[1].HN = 0;
+        l[1].flag = 0x800;
+        check_both(g.opt, ref, r, l, 1, NULL,
+                   "r1\t2064\tchrB\t50\t20\t4M6S\t*\t0\t0\tAACGTNACGT\tJIHGFEDCBA\t"
+                   "NM:i:0\tMD:Z:4\tAS:i:4\tXS:i:0\tSA:Z:chrA,100,+,6M4S,60,0;\tHN:i:0\n");
+        // and the primary's SA names that reverse hit with its S clip
+        check_both(g.opt, ref, r, l, 0, NULL,
+                   "r1\t0\tchrA\t100\t60\t6M4S\t*\t0\t0\tACGTNACGTT\tABCDEFGHIJ\t"
+                   "NM:i:0\tMD:Z:6\tAS:i:6\tXS:i:0\tSA:Z:chrB,50,-,4M6S,20,0;\tHN:i:0\n");
     }
     SUBCASE("a supplementary hit on an ALT contig keeps S clips") {
         l[1].is_alt = 1;
@@ -341,6 +354,26 @@ TEST_CASE("mem_io record: mate fields and FLAG bits and TLEN and MC and MQ"
         check_both(g.opt, ref, r, l2, 0, &ff,
                    "r1\t81\tchrA\t100\t60\t10M\t=\t300\t192\tAACGTNACGT\tJIHGFEDCBA\t"
                    "NM:i:0\tMD:Z:10\tMC:Z:10M\tMQ:i:50\tAS:i:10\tXS:i:0\n");
+    }
+    SUBCASE("TLEN 0 when the two 5' ends are the same base") {
+        // This read forward at 100 (5' end 100); the mate reverse on 91-100
+        // (5' end 100, its last base). FLAG 0x40 | 0x1 | 0x20 = 97.
+        // This is bwa and bwa-mem2's 5'-to-5' TLEN (mem_aln2sam), kept for
+        // byte identity with them; the SAM spec's leftmost-to-rightmost span
+        // (91-109, 19) would differ here, a semantics change for every
+        // overlapping pair, not something this test should pin otherwise.
+        mem_aln_t m = alns.make(0, 90, true, "10M", "10", 0, 50, 10, 0);
+        std::vector<mem_aln_t> l1{r1};
+        l1[0].flag = 0x40;
+        check_both(g.opt, ref, r, l1, 0, &m,
+                   "r1\t97\tchrA\t100\t60\t10M\t=\t91\t0\tACGTNACGTT\tABCDEFGHIJ\t"
+                   "NM:i:0\tMD:Z:10\tMC:Z:10M\tMQ:i:50\tAS:i:10\tXS:i:0\n");
+        // And from the mate's side: 0x80 | 0x1 | 0x10 = 145.
+        std::vector<mem_aln_t> l2{m};
+        l2[0].flag = 0x80;
+        check_both(g.opt, ref, r, l2, 0, &r1,
+                   "r1\t145\tchrA\t91\t50\t10M\t=\t100\t0\tAACGTNACGT\tJIHGFEDCBA\t"
+                   "NM:i:0\tMD:Z:10\tMC:Z:10M\tMQ:i:60\tAS:i:10\tXS:i:0\n");
     }
     SUBCASE("TLEN counts reference bases: a deletion lengthens, an insertion does not") {
         // Mate 4M2D3M3I covers 300..308 (9 reference bases): 308 - 100 + 1 = 209.

@@ -26,7 +26,8 @@
 #           ctg1:101, supplementary FLAG 2048 on ctg3:2601 as 60H40M with
 #           SEQ/QUAL of the 40 aligned bases only, SA:Z naming the other hit
 #           with S clips; MAPQ 60 on both. -Y keeps S clips and the whole
-#           SEQ/QUAL on the supplementary; -M flags it 256 instead.
+#           SEQ/QUAL on the supplementary; -M flags it 256 instead, so each
+#           split read gives exactly its primary and one 256 record.
 #   -5      a read made of ctg3:2601-2640 then ctg1:4101-4160: by default the
 #           longer ctg1 hit is primary; with -5 the ctg3 hit (the read's 5'
 #           end). -5 also implies -q: a read made of block R's ctg1:2101-2140
@@ -35,11 +36,10 @@
 #           keeps MAPQ 60 instead of being capped at the primary's 0.
 #   XA HN   a read inside block R (ctg1:2101-2200): the primary hit plus the XA
 #           entries are exactly the three copies (ctg1 +2101, ctg2 +1101,
-#           ctg4 -201), each 100M NM 0, and HN:i:2; -u appends the score (100)
-#           and MAPQ (0) to each entry. Only the entries are checked, read from
-#           XA or XB: the -u help text and docs/src/cli/mem.md name the tag XB,
-#           docs/src/user-guide/output.md says it stays XA, and the tag name is
-#           left to that documentation to settle.
+#           ctg4 -201), each 100M NM 0, and HN:i:2; -u writes those entries
+#           with the score (100) and MAPQ (0) appended as XB:Z and drops XA:Z
+#           (the -u help text, docs/src/cli/mem.md and
+#           docs/src/user-guide/output.md).
 #
 # Checks of option and input wiring, run once (the tier does not matter):
 #   reader  --legacy-reader, and gzip arriving on a pipe (/dev/stdin), give the
@@ -47,8 +47,8 @@
 #           mem exit nonzero with --legacy-reader, which reads the cut as end of
 #           file, so the failure comes from main_mem closing the input.
 #   -C      appends the comment verbatim after the tags.
-#   -R -H   the @-lines of an -H file (a non-header line dropped) and the -R
-#           line reach the header.
+#   -R -H   the @-lines of an -H file and the -R line reach the header, and
+#           the file's non-header line appears nowhere in the output.
 #   --bam   --bam=6 with -C and -R, decoded with samtools, equals the SAM text.
 #   -V      against a copy of the reference whose ctg1 header carries the
 #           description "first contig<TAB>desc": XR:Z:first contig desc.
@@ -290,8 +290,15 @@ for tier in $(mem_cli_tiers); do
         "$(record_of "$(out y_opt)" chim 2048 | awk -F '\t' '{ print $1, $2, $3, $4, $6, $10, $11 }')"
 
     mem_cli_mem "$tier" "$(out m_opt)" -M "$ref" "$work/split.fq"
+    # Implied by the four-record check below, but kept: on a FLAG change it
+    # names the 256 records alone, a clearer failure than the whole list.
     mem_cli_expect "$tier: -M flags the shorter hits 256, not 2048" "chim 256 ctg3 2601|chim5 256 ctg3 2601|" \
         "$(mem_cli_records "$(out m_opt)" | awk -F '\t' '$2 >= 256 { printf "%s %s %s %s|", $1, $2, $3, $4 }')"
+    # Every record of the run: each read's primary as without -M, then its
+    # 256 record; nothing else (a second primary or a duplicate would show).
+    mem_cli_expect "$tier: -M gives four records, one primary per split read" \
+        "chim 0 ctg1 101 60 60M40S|chim 256 ctg3 2601 60 60H40M|chim5 0 ctg1 4101 60 40S60M|chim5 256 ctg3 2601 60 40M60H|" \
+        "$(mem_cli_records "$(out m_opt)" | awk -F '\t' '{ printf "%s %s %s %s %s %s|", $1, $2, $3, $4, $5, $6 }')"
 
     mem_cli_mem "$tier" "$(out p5)" -5 "$ref" "$work/split.fq"
     mem_cli_expect "$tier: -5 makes the 5' hit primary" \
@@ -313,10 +320,16 @@ for tier in $(mem_cli_tiers); do
         "$(mem_cli_tag "$(mem_cli_primary "$(out xa)" inR)" HN)"
     mem_cli_mem "$tier" "$(out u_opt)" -u "$ref" "$work/xa.fq"
     u_rec="$(mem_cli_primary "$(out u_opt)" inR)"
-    # The entries under whichever of XA or XB the record carries (see the header).
-    mem_cli_expect "$tier: -u entries are the XA entries plus score 100 and MAPQ 0" \
-        "$(mem_cli_tag "$(mem_cli_primary "$(out xa)" inR)" XA | sed 's/;/,100,0;/g')" \
-        "$(mem_cli_tag "$u_rec" XA)$(mem_cli_tag "$u_rec" XB)"
+    # All the entries in one XB:Z field and none left in XA (see the header).
+    # Every XB field is listed, type included, so a second XB or one of
+    # another type also fails.
+    mem_cli_expect "$tier: -u XB is the XA entries plus score 100 and MAPQ 0" \
+        "XB:Z:$(mem_cli_tag "$(mem_cli_primary "$(out xa)" inR)" XA | sed 's/;/,100,0;/g')" \
+        "$(printf '%s\n' "$u_rec" | awk -F '\t' '{ for (i = 12; i <= NF; i++) if (substr($i, 1, 3) == "XB:") print $i }')"
+    # A literal tag test, so an empty XA:Z: tag also fails.
+    u_has_xa=no
+    [[ $u_rec != *$'\t'XA:Z:* ]] || u_has_xa=yes
+    mem_cli_expect "$tier: -u writes no XA tag" no "$u_has_xa"
 
     if [[ -z $first_tier ]]; then
         first_tier="$tier"
@@ -355,6 +368,13 @@ mem_cli_mem "$tier" "$(out rh)" -R '@RG\tID:grp1\tSM:s1' -H "$work/hdr.txt" "$re
 mem_cli_expect "the -H file's @-lines and the -R line reach the header" \
     "@CO from file 1|@CO from file 2|@RG ID:grp1 SM:s1|" \
     "$(awk -F '\t' '$1 == "@CO" || $1 == "@RG" { $1 = $1; printf "%s|", $0 }' "$(out rh)")"
+# grep -c exits 1 on no match (count 0) and 2 on a read error, which must
+# not pass as a zero count.
+rh_line_count="$(grep -c 'not a header line' "$(out rh)")" || {
+    if [[ $? != 1 ]]; then rh_line_count=grep-error; fi
+}
+mem_cli_expect "the -H file's non-header line is nowhere in the output" 0 \
+    "$rh_line_count"
 
 # --- --bam -----------------------------------------------------------------------
 if command -v samtools > /dev/null 2>&1; then

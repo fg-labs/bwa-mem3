@@ -55,12 +55,14 @@
 #             100 - (9 + 2*1) = 89, CIGARs unchanged.
 #   -A -B     -A 2 -B 4 (an explicit -B is not scaled): mm AS 198 - 4 = 194.
 #   -d        zd3 at -d 3 stops both extensions at the mismatches: primary
-#             50M50S AS 50 and supplementary 53H47M AS 47. zd at -d 3 splits
-#             the same way, but the two regions are patched back into one
+#             50M50S AS 50 and supplementary 53H47M AS 47, its only two
+#             records. zd at -d 3 splits the same way, but the two regions
+#             are patched back into one
 #             record, 100M AS 90 (global score 90 / predicted 100 = 0.90, the
 #             patch threshold; zd3's 85 / 100 is under it).
 #   -w        -w 9: w10's seeds are 10 diagonals apart, out of one chain and out
-#             of the band: primary 60M40S AS 60 + supplementary 60H40M AS 40;
+#             of the band: primary 60M40S AS 60 + supplementary 60H40M AS 40,
+#             its only two records;
 #             -w 10: 60M10D40M AS 84. r2 at -w 8: one chain (diagonals 0, 8,
 #             16, each step 8), but the second deletion is 16 off the first
 #             seed's diagonal, outside band 8: only the band-doubling retry
@@ -72,7 +74,8 @@
 #             the one XA hit are two different copies of R.
 #   -h -z -a  inR's two other copies are not in XA at -h 1 (HN 2); inS's ctg2
 #             hit (75) is in XA at -z 0.75, not at -z 0.76; -a writes it as a
-#             secondary record, ctg2:2101 100M NM 5 AS 75, and inR's two other
+#             secondary record, ctg2:2101 100M NM 5 AS 75, beside the primary
+#             ctg1:3101 100M NM 0 AS 100, and inR's two other
 #             copies as secondaries (primary and secondaries the three copies).
 #   -x        intractg (-B 9 -O 16): mm AS 90, c5f 3S97M (97 - 9 + 2 = 90 <=
 #             92); pacbio (-B 1 -O 1 -E 1 -L 0): mm AS 98, c5f 100M AS 98.
@@ -283,6 +286,10 @@ for tier in $(mem_cli_tiers); do
     # -d: the split z-drop causes, and the patch that undoes it.
     expect_primary "$tier: -d 3" "$(s d3)" zd3 "0 ctg1 2701 50M50S 50"
     mem_cli_expect "$tier: -d 3 zd3 supplementary" "2048 ctg1 2754 53H47M 47" "$(fields "$(record "$(s d3)" zd3 2048)")"
+    # The primary and the supplementary are the read's only records: a
+    # secondary or a duplicate would add one.
+    # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
+    mem_cli_expect "$tier: -d 3 zd3 records" 2 "$(mem_cli_count "$(s d3)" '$1 == "zd3"')"
     expect_primary "$tier: -d 3 (patched)" "$(s d3)" zd "0 ctg1 2501 100M 90"
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
     mem_cli_expect "$tier: -d 3 zd records" 1 "$(mem_cli_count "$(s d3)" '$1 == "zd"')"
@@ -291,6 +298,8 @@ for tier in $(mem_cli_tiers); do
     expect_primary "$tier: -w 10" "$(s w10)" w10 "0 ctg1 1301 60M10D40M 84"
     expect_primary "$tier: -w 9" "$(s w9)" w10 "0 ctg1 1301 60M40S 60"
     mem_cli_expect "$tier: -w 9 w10 supplementary" "2048 ctg1 1371 60H40M 40" "$(fields "$(record "$(s w9)" w10 2048)")"
+    # shellcheck disable=SC2016 # an awk condition: its $n are awk fields
+    mem_cli_expect "$tier: -w 9 w10 records" 2 "$(mem_cli_count "$(s w9)" '$1 == "w10"')"
     expect_primary "$tier: -w 8 (band retry)" "$(s w8)" r2 "0 ctg1 4001 50M8D28M8D42M 92"
     rec="$(mem_cli_primary "$(s w8)" r2)"
     mem_cli_expect "$tier: -w 8 r2 MD NM" "$r2_md 16" "$(mem_cli_tag "$rec" MD) $(mem_cli_tag "$rec" NM)"
@@ -315,6 +324,8 @@ for tier in $(mem_cli_tiers); do
     mem_cli_expect "$tier: -z 0.76 inS exactly one primary" 1 \
         "$(mem_cli_count "$(s z76)" '$1 == "inS" && int($2 / 256) % 2 == 0 && int($2 / 2048) % 2 == 0')"
     mem_cli_expect "$tier: -z 0.76 inS XA" "" "$(mem_cli_tag "$(mem_cli_primary "$(s z76)" inS)" XA)"
+    expect_primary "$tier: -a" "$(s xa)" inS "0 ctg1 3101 100M 100"
+    mem_cli_expect "$tier: -a inS primary NM" 0 "$(mem_cli_tag "$(mem_cli_primary "$(s xa)" inS)" NM)"
     rec="$(record "$(s xa)" inS 256)"
     mem_cli_expect "$tier: -a inS secondary" "256 ctg2 2101 100M 75 5" "$(fields "$rec") $(mem_cli_tag "$rec" NM)"
     # shellcheck disable=SC2016 # an awk condition: its $n are awk fields

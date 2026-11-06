@@ -17,6 +17,10 @@
 //    one and regenerate differently (strand, query window, true score, band,
 //    --meth hypothesis), so a key that drops a component fails; and clipped hits
 //    whose global alignment ends in a deletion, reused and not.
+// 4. Under -u (XB) each entry also carries the hit's own score and MAPQ, which
+//    the key does not hold: duplicates reused from one memo entry but given
+//    different scores and MAPQs must each print their own, with and without
+//    --meth.
 
 #include "doctest/doctest.h"
 
@@ -410,6 +414,76 @@ void check_cpg_flank(mem_opt_t *opt) {
     check_gen_alt(opt, rd, regs, rd.seq.data(), 0, {{cpg, non_cpg}, {rev_cpg, rev_non_cpg}});
 }
 
+// -u: four exact copies of the read, all one key; reused from the first, yet
+// each with its own score, and two not secondary so that their MAPQ is not 0.
+// Expected entries are written by hand: score as set, MAPQ 0 for a secondary
+// hit; the two others get a csub (which the key does not hold) that keeps their
+// MAPQ under the cap of 60 and apart. mem_approx_mapq_se, with l = 150,
+// identity = 1 - (150 - s) / 5 / 150 and tmp = mapQ_coef_fac / ln 150 *
+// identity^2, where mapQ_coef_fac is an int (bwamem.h), so ln 50 = 3.91 is
+// stored as 3:
+//   s 127, csub 120: (int)(6.02 * 7 * tmp^2 + .499) = (int)(13.84) = 13
+//   s 121, csub 116: (int)(6.02 * 5 * tmp^2 + .499) = (int)(9.71) = 9
+// A --meth option set scored with the genomic matrix, as the cases above use.
+mem_opt_t *meth_genomic_opt() {
+    mem_opt_t *meth = mem_opt_init();
+    meth->meth_mode = 1;
+    meth->meth_scoring = MEM_METH_SCORING_GENOMIC;
+    mem_opt_fill_meth_mat(meth);
+    return meth;
+}
+
+void check_xb_scores(mem_opt_t *meth) {
+    Dups d;
+    const int kRef = Dups::kRef, seg_len = Dups::seg_len;
+    for (int at : {800, 1300, 1800, 2300}) d.ref.replace(at, seg_len, d.seg);
+    Reads rd(d.ref, d.read);  // the segment with 4 substitutions: NM 4 at every copy
+    mem_opt_t *plain = mem_opt_init();
+    mem_opt_t *opt = meth ? meth : plain;
+    const int saved_flag = opt->flag;
+    opt->flag |= MEM_F_XB;
+    opt->max_XA_hits = opt->max_XA_hits_alt = 50;
+    const char *meth_orig = meth ? rd.seq.data() : NULL;
+    const int hyp = meth ? 1 : -1;  // forward strand: OT
+    std::vector<mem_alnreg_t> regs;
+    regs.push_back(region(kRef, Dups::seg_at, Dups::seg_at + seg_len, false, 0, seg_len, 130, 130, opt->w, -1, hyp));
+    struct Hit { int at, score, secondary, csub; const char *mapq; };
+    const Hit hits[] = {{800, 130, 0, 0, "0"}, {1300, 127, -1, 120, "13"}, {1800, 124, 0, 0, "0"},
+                        {2300, 121, -1, 116, "9"}};
+    std::string want;
+    for (const Hit &h : hits) {
+        mem_alnreg_t r = region(kRef, h.at, h.at + seg_len, false, 0, seg_len, h.score, 130, opt->w, 0, hyp);
+        r.secondary = h.secondary;  // secondary_all stays 0: still an XA hit of regs[0]
+        r.csub = h.csub;
+        regs.push_back(r);
+        want += "X,+" + std::to_string(h.at + 1) + ",150M,4," + std::to_string(h.score) + "," + h.mapq + ";";
+    }
+    // the hand-written entries are a fresh regeneration of each hit, plus -u's fields
+    std::string fresh;
+    for (size_t k = 1; k < regs.size(); ++k) {
+        mem_aln_t t = mem_reg2aln(opt, rd.fx.orig_bns, rd.fx.orig_pac, (int)rd.seq.size(), rd.seq.data(), &regs[k],
+                                  meth_orig, 0);
+        fresh += std::string(rd.fx.orig_bns->anns[t.rid].name) + ",+" + std::to_string(t.pos + 1) + "," + cigar_str(t)
+                 + "," + std::to_string(t.NM) + "," + std::to_string(t.score) + "," + std::to_string(t.mapq) + ";";
+        free(t.cigar);
+    }
+    CHECK(fresh == want);
+    mem_alnreg_v a{regs.size(), regs.size(), regs.data()};
+    int *hn = nullptr;
+    const long reused0 = mem_gen_alt_n_reused;
+    char **xa = mem_gen_alt(opt, rd.fx.orig_bns, rd.fx.orig_pac, &a, (int)rd.seq.size(), rd.seq.data(), &hn, meth_orig);
+    CHECK(mem_gen_alt_n_reused - reused0 == 3);  // every copy after the first
+    REQUIRE(xa != nullptr);
+    REQUIRE(xa[0] != nullptr);
+    CHECK(std::string(xa[0]) == want);
+    CHECK(hn[0] == (int)regs.size() - 1);
+    for (size_t k = 0; k < regs.size(); ++k) free(xa[k]);
+    free(xa);
+    free(hn);
+    opt->flag = saved_flag;
+    free(plain);
+}
+
 }  // namespace
 
 TEST_CASE("mem_gen_alt: a reused duplicate hit gives the XA entry of a fresh regeneration" *
@@ -431,6 +505,16 @@ TEST_CASE("mem_gen_alt: a reused duplicate hit gives the XA entry of a fresh reg
         meth->meth_context = METH_CTX_CPG;
         mem_opt_fill_meth_mat(meth);
         check_cpg_flank(meth);
+        free(meth);
+    }
+}
+
+TEST_CASE("mem_gen_alt: -u gives each reused duplicate its own score and MAPQ" *
+          doctest::test_suite("unit/xa_regen")) {
+    SUBCASE("without --meth") { check_xb_scores(nullptr); }
+    SUBCASE("--meth") {
+        mem_opt_t *meth = meth_genomic_opt();
+        check_xb_scores(meth);
         free(meth);
     }
 }

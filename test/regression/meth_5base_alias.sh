@@ -10,7 +10,12 @@
 # strand, each mate carrying exactly one converted CpG, which must be that
 # mate's only methylated CpG call ('Z') under 5base and its only unmethylated
 # one ('z') under bare --meth. That check needs mawk and reports SKIP for itself
-# alone when mawk is missing; the identity and rejection checks always run.
+# alone when mawk is missing; the identity and rejection checks always run, and
+# so does the check that every run (5base, its spellings, the em-seq control
+# and both last-wins orders) gives the same four placed records (POS and CIGAR), so two
+# header-only outputs cannot compare equal: taps and the em-seq control are
+# pinned to them, and every other run is compared record for record with one
+# of those two.
 #
 # The retained CpGs pin it from the other side: each is unmethylated ('z')
 # under 5base and methylated ('Z') under bare --meth, mate for mate. And
@@ -80,6 +85,17 @@ align() { # $1 = output, rest = --meth spelling
         || fail "mem $* nonzero exit: $(tail -3 "$out.err" | tr '\n' ' ')"
 }
 records() { grep -v '^@' "$1"; }
+# QNAME FLAG RNAME POS CIGAR of every record, in output order, '|'-joined (no
+# awk: this must hold where mawk is missing).
+placements() { records "$1" | cut -f 1-4,6 | tr '\t' ' ' | tr '\n' '|'; }
+# Both pairs placed mate for mate: ot at 201/401, ob at 801/601, each end
+# aligned end to end (100M). Two pairs give no insert-size statistics, so
+# neither is flagged proper (no 0x2 in FLAG).
+PLACED="ot 97 chrA 201 100M|ot 145 chrA 401 100M|ob 81 chrA 801 100M|ob 161 chrA 601 100M|"
+check_placed() { # $1 = SAM, $2 = label
+    [ "$(placements "$1")" = "$PLACED" ] \
+        || fail "$2: expected records '$PLACED', got '$(placements "$1")'"
+}
 # Count of character $2 in each record's XM:Z, as "<name>/<mate>=<n>" sorted.
 cpg_calls() {
     mawk -v want="$2" '!/^@/ {
@@ -92,7 +108,7 @@ cpg_calls() {
 ONE_EACH="ob/1=1 ob/2=1 ot/1=1 ot/2=1"
 
 align taps.sam --meth=taps
-[ "$(records taps.sam | wc -l | tr -d ' ')" = "4" ] || fail "--meth=taps: expected 4 records"
+check_placed taps.sam --meth=taps
 
 # --- 1. every 5-base spelling is --meth=taps, record for record ------------
 for chem in 5base 5-base; do
@@ -106,6 +122,7 @@ diff <(records taps.sam) <(records taps-neutral.sam) > taps-neutral.diff \
     || fail "--meth=taps does not default to --meth-scoring neutral: $(head -4 taps-neutral.diff | cut -c1-200 | tr '\n' ' ')"
 
 align emseq.sam --meth
+check_placed emseq.sam "--meth (em-seq control)"
 
 # --- 1b. the last --meth wins -----------------------------------------------
 align last-bare.sam --meth=5base --meth
@@ -139,4 +156,4 @@ if "$BWA_MEM3" mem --meth=illumina ref.fa r1.fq > /dev/null 2> err.txt; then
     fail "--meth=illumina exited 0; it must not alias 5base"
 fi
 grep -q "got 'illumina'" err.txt || fail "--meth=illumina: not rejected as an unknown chemistry; got: $(head -1 err.txt)"
-echo "PASS: meth_5base_alias (5base/5-base == taps record for record; taps defaults to neutral; the last --meth wins; 5mC->T read as methylated and retained C as unmethylated: $polarity; illumina and unknown chemistries rejected)"
+echo "PASS: meth_5base_alias (every run gives the same four placed records; 5base/5-base == taps record for record; taps defaults to neutral; the last --meth wins; 5mC->T read as methylated and retained C as unmethylated: $polarity; illumina and unknown chemistries rejected)"

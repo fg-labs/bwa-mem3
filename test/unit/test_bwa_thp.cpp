@@ -536,9 +536,24 @@ TEST_CASE("thp: per-batch step" * doctest::test_suite("unit/bwa_thp")) {
         CHECK(r.sampled == 1);
         CHECK(r.complete == 1);
         CHECK(r.walks == 0);
+        // The report carries the precheck's status (bwa_thp.h), not the
+        // unread defaults (-1, -1).
+        CHECK(r.status.rss_anon_kb == BWA_THP_MIN_ANON_KB / 2 - 1);
+        CHECK(r.status.thp_enabled == 1);
         CHECK(m.done == 0);
         CHECK(m.retry_pending == 0);
         CHECK(f.n_knob_reads == 9);   // the config is still resolved on the first sample
+    }
+    SUBCASE("below the floor with THP_enabled 0, the report keeps the 0") {
+        // A copy that dropped a zero would read as -1 (absent), not disabled.
+        f.walks = { usage(1 * GiB_kB, 0, 0, 0) };
+        f.statuses = { status(BWA_THP_MIN_ANON_KB / 2 - 1, 0) };
+        CHECK(bwa_thp_step(&m, 3, &io, &r) == BWA_THP_OK);
+        CHECK(f.n_walks == 0);
+        CHECK(r.below_floor == 1);
+        CHECK(r.status.rss_anon_kb == BWA_THP_MIN_ANON_KB / 2 - 1);
+        CHECK(r.status.thp_enabled == 0);
+        CHECK(m.done == 0);
     }
     SUBCASE("at half the anonymous floor, the walk is made") {
         f.walks = { frag };
