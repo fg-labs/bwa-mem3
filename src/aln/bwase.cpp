@@ -235,7 +235,7 @@ void bwa_cal_pac_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_
 
 // bntseq.c bns_cnt_ambi. bwa-mem3's own variant counts every overlapping N run; this one
 // stops at the first, as stock does, and the XN tag must match stock's.
-static int aln_bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
+int aln_bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
 {
 	int left, mid, right, nn;
 	if (ref_id) *ref_id = bns_pos2rid(bns, pos_f);
@@ -431,7 +431,7 @@ int64_t pos_end(const bwa_seq_t *p)
 	} else return p->pos + p->len;
 }
 
-static int64_t pos_end_multi(const bwt_multi1_t *p, int len) // analogy to pos_end()
+int64_t pos_end_multi(const bwt_multi1_t *p, int len) // analogy to pos_end()
 {
 	if (p->cigar) {
 		int j;
@@ -444,14 +444,14 @@ static int64_t pos_end_multi(const bwt_multi1_t *p, int len) // analogy to pos_e
 	} else return p->pos + len;
 }
 
-static int64_t pos_5(const bwa_seq_t *p)
+int64_t pos_5(const bwa_seq_t *p)
 {
 	if (p->type != BWA_TYPE_NO_MATCH)
 		return p->strand? pos_end(p) : p->pos;
 	return -1;
 }
 
-static void bwa_print_seq(kstring_t *out, bwa_seq_t *seq)
+void bwa_print_seq(kstring_t *out, const bwa_seq_t *seq)
 {
 	int i;
 	if (seq->strand == 0) {

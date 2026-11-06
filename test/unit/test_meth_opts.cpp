@@ -6,6 +6,7 @@
 #include "doctest/doctest.h"
 #include "bwamem.h"
 #include "meth_opts.h"
+#include "aln/aln_meth.h"
 
 #include <cstdlib>
 #include <string>
@@ -114,4 +115,31 @@ TEST_CASE("meth_opts: stray-value list names cpg and every chemistry") {
     }
     CHECK(cpg);
     CHECK(taps);
+}
+
+TEST_CASE("meth_opts: aln and mem share named defaults and set-as-failed parsing"
+          * doctest::test_suite("unit/meth_opts")) {
+    Fixture f;
+    bwa_aln::aln_meth_opt_t aln;
+    CHECK(aln.m.meth_mode == f.opt->meth.meth_mode);
+    CHECK(aln.m.meth_scoring == f.opt->meth.meth_scoring);
+    CHECK(aln.m.meth_chem == f.opt->meth.meth_chem);
+    CHECK(aln.m.meth_tags == f.opt->meth.meth_tags);
+    CHECK(aln.m.meth_context == f.opt->meth.meth_context);
+    CHECK(aln.m.meth_set_as_failed == f.opt->meth.meth_set_as_failed);
+    CHECK(aln.m.meth_set_as_failed == 0);
+    for (const char *value : {"f", "r"}) {
+        meth_cli_t cli = {};
+        REQUIRE(meth_opts_parse_shared(OPT_METH, "taps", &aln.m, &cli) == 1);
+        REQUIRE(meth_opts_parse_shared(OPT_METH_SET_AS_FAILED, value, &aln.m, &cli) == 1);
+        f.parse(OPT_METH, "taps");
+        f.parse(OPT_METH_SET_AS_FAILED, value);
+        meth_opts_finalize_shared(&aln.m, &cli);
+        meth_opts_finalize(f.opt, &f.cli);
+        CHECK(cli.set_failed == 1);
+        CHECK(f.cli.set_failed == 1);
+        CHECK(aln.m.meth_set_as_failed == value[0]);
+        CHECK(aln.m.meth_set_as_failed == f.opt->meth.meth_set_as_failed);
+        CHECK(aln.m.meth_scoring == f.opt->meth.meth_scoring);
+    }
 }

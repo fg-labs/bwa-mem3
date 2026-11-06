@@ -123,6 +123,26 @@ TEST_CASE("mem_io header: the index sidecar is <prefix>.hdr or else <baseprefix>
     }
 }
 
+TEST_CASE("mem_io header: bwa_index_dict_path names the .dict fallback"
+          * doctest::test_suite("unit/mem_io")) {
+    auto dict = [](const char *prefix) {
+        char *s = bwa_index_dict_path(prefix);
+        std::string out = s ? s : "<null>";
+        free(s);
+        return out;
+    };
+    CHECK(dict(nullptr) == "<null>");
+    CHECK(dict("") == ".dict");
+    CHECK(dict("ref.fa") == "ref.dict");
+    CHECK(dict("ref.fasta.gz") == "ref.dict");
+    CHECK(dict("ref.gz") == "ref.dict");
+    CHECK(dict("ref") == "ref.dict");
+    CHECK(dict("GRCh38.p14") == "GRCh38.dict");
+    // Only the basename's suffix goes: a dotted directory is kept whole.
+    CHECK(dict("dir.v1/ref") == "dir.v1/ref.dict");
+    CHECK(dict("dir.v1/ref.fa") == "dir.v1/ref.dict");
+}
+
 TEST_CASE("mem_io header: the SAM header orders sidecar lines, then -H/-R lines, then @PG"
           * doctest::test_suite("unit/mem_io")) {
     GlobalsGuard guard;

@@ -1277,12 +1277,33 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
     return 0;
 }
 
+// The fallback header sidecar of index `prefix`: `<baseprefix>.dict`, where
+// baseprefix drops a trailing ".gz" then the final dotted suffix of the
+// basename, whatever it is (e.g. foo.fa -> foo, GRCh38.p14 -> GRCh38). A
+// newly-allocated string the caller frees, or NULL for a NULL prefix or when
+// the allocation fails.
+char *bwa_index_dict_path(const char *prefix)
+{
+    if (prefix == NULL) return NULL;
+    size_t l = strlen(prefix);
+    // Sized once for the whole prefix plus ".dict" (and its NUL): the result
+    // is never longer, so nothing below can grow the buffer.
+    char *path = (char *)malloc(l + sizeof(".dict"));
+    if (path == NULL) return NULL;
+    memcpy(path, prefix, l);
+    if (l >= 3 && strncmp(&path[l - 3], ".gz", 3) == 0)
+        l -= 3;
+    for (size_t i = l; i > 0 && path[i - 1] != '/'; --i) {
+        if (path[i - 1] == '.') { l = i - 1; break; }
+    }
+    memcpy(&path[l], ".dict", sizeof(".dict"));
+    return path;
+}
+
 // Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
-// (where baseprefix drops a trailing ".gz" then the final dotted suffix of the
-// basename, whatever it is -- e.g. foo.fa -> foo, GRCh38.p14 -> GRCh38), into
-// a newly-allocated, newline-separated but not newline-terminated string.
-// Returns NULL if neither file exists (or is empty). Caller owns the result
-// and must free() it.
+// (bwa_index_dict_path), into a newly-allocated, newline-separated but not
+// newline-terminated string. Returns NULL if neither file exists (or is
+// empty). Caller owns the result and must free() it.
 char *bwa_load_hdr_from_index(const char *prefix)
 {
     if (prefix == NULL) return NULL;
@@ -1291,19 +1312,9 @@ char *bwa_load_hdr_from_index(const char *prefix)
     ksprintf(&path, "%s.hdr", prefix);
     FILE *fp = fopen(path.s, "r");
     if (!fp) {
-        // Try <baseprefix>.dict: drop the ".hdr" we just appended, then drop
-        // a trailing ".gz" (if any) and the final dotted suffix inside the
-        // basename — e.g. foo.fa -> foo, foo.fasta.gz -> foo — before
-        // appending ".dict".
-        size_t l;
-        path.l -= 4; // drop ".hdr"
-        if (path.l >= 3 && strncmp(&path.s[path.l - 3], ".gz", 3) == 0)
-            path.l -= 3;
-        for (l = path.l; l > 0 && path.s[l - 1] != '/'; --l) {
-            if (path.s[l - 1] == '.') { path.l = l - 1; break; }
-        }
-        ksprintf(&path, ".dict");
-        fp = fopen(path.s, "r");
+        free(path.s);
+        path.s = bwa_index_dict_path(prefix);
+        fp = path.s ? fopen(path.s, "r") : NULL;
     }
 
     char *out = NULL;
