@@ -41,6 +41,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "compat_target.h"
 #include "macro.h"
 #include "bandedSWA.h"
+#include "meth_opt.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -128,23 +129,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 // src/compat_target.h.
 
 
-/* D3 (--meth): bisulfite/TAPS SW scoring model, selected by --meth-scoring. All
- * three free the conversion cell (OT: ref-C x read-T; OB: ref-G x read-A); they
- * differ in to what value, and whether the mirror cell is freed too:
- *   COLLAPSED: conversion + mirror both freed to +a (C/T interchangeable,
- *              bwameth-compatible placement, -B 2). Opt-in.
- *   GENOMIC:   conversion freed to +a, mirror kept as a mismatch (variant-aware,
- *              -B 4, rank-1 batched-expressible). The em-seq/bisulfite default.
- *   NEUTRAL:   conversion freed to 0 (tolerated but not rewarded), mirror kept a
- *              mismatch (-B 4). For TAPS, whose conversions are sparse (~3% of C),
- *              a full-match reward over-credits spurious C->T alignments; scoring
- *              the conversion neutrally measured ~+0.25 pp placement over GENOMIC
- *              at every methylation load. Not rank-1 (the freed value is neither
- *              match nor mismatch), but the generalized kswv freed-cell blend
- *              scores the cell to its matrix value, so mate rescue is batched on
- *              the freed-capable tiers (NEON/AVX2/AVX512BW) exactly like
- *              GENOMIC/COLLAPSED, and falls back to scalar ksw_align2 on the
- *              freed-less x86 tiers (sse41/sse42/avx) as all three modes do. */
 /* --md modes (mem_opt_t.md_mode): which MD:Z each mapped record carries, in SAM
  * and both BAM writers; XA/XB entries never carry MD, so it does not apply to
  * them. FULL (the default) lists every reference base the read differs from.
@@ -161,21 +145,11 @@ enum mem_md_mode { MEM_MD_NONE = 0, MEM_MD_FULL = 1, MEM_MD_SHORT = 2 };
  * position, as in bwa and bwa-mem2; NAME is a hash of the read name. */
 enum mem_tie_break_mode { MEM_TIE_BREAK_INDEX = 0, MEM_TIE_BREAK_NAME = 1 };
 
-enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
-                        MEM_METH_SCORING_NEUTRAL = 2 };
-
 /* --meth-seed-prune modes (mem_opt_t.meth_seed_prune). Shared here so the CLI
  * (fastmap.cpp) and the prune (bwamem.cpp) agree on the numeric values. */
 enum mem_meth_seed_prune { MEM_METH_PRUNE_OFF = 0, MEM_METH_PRUNE_SPEC30 = 1,
                            MEM_METH_PRUNE_BASELINE = 2 };
 
-/* Bismark tag selection under --meth (--meth-tags). XR:Z and XG:Z are two-byte
- * strand labels; XM:Z is a read-length methylation-call string and dominates the
- * BAM's aux payload, so it is the one worth being able to turn off. */
-#define MEM_METH_TAG_XR   0x1
-#define MEM_METH_TAG_XG   0x2
-#define MEM_METH_TAG_XM   0x4
-#define MEM_METH_TAGS_ALL (MEM_METH_TAG_XR | MEM_METH_TAG_XG | MEM_METH_TAG_XM)
 
 /* Parse a --meth-tags spec into a MEM_METH_TAG_* bitmask.
  *
@@ -240,7 +214,7 @@ typedef struct mem_opt_t {
     int max_XA_hits, max_XA_hits_alt; // if there are max_hits or fewer, output them all
     int8_t mat[25];         // scoring matrix; mat[0] == 0 if unset
     /* D3 (--meth): per-hypothesis substitution matrices, built from `mat` by
-     * mem_opt_fill_meth_mat() per opt->meth_scoring (target-major mat[ref*5+read],
+     * mem_opt_fill_meth_mat() per opt->meth.meth_scoring (target-major mat[ref*5+read],
      * ACGT order A,C,G,T,N). Each frees the conversion cell — mat_ot frees
      * mat[C][T]=mat[1*5+3] (top strand C→T), mat_ob frees mat[G][A]=mat[2*5+0]
      * (bottom strand G→A) — to a value that depends on the mode:
@@ -263,15 +237,13 @@ typedef struct mem_opt_t {
     int8_t mat7_ot[49];     // 7x7 OT/OB matrices over the --meth-context cpg
     int8_t mat7_ob[49];     // alphabet (meth_model.h); conversion freed at CpG only
     int    bam_mode;        // 1 = emit BAM instead of SAM text (--bam). Orthogonal
-                            // to meth_mode: --meth picks alignment semantics, --bam
+                            // to meth.meth_mode: --meth picks alignment semantics, --bam
                             // picks the container, on every mode alike.
     int    bam_level;       // 0..9, BGZF deflate level (0 = uncompressed)
     int    bam_threads;     // BGZF deflate threads for --bam output (--bam-threads).
                             // -1 = unset -> auto (n_threads/8 when bam_level>0);
                             // 0 = serial on the writer thread; N = that many.
-    int    meth_mode;       // 1 = bisulfite mode (--meth)
-    int    meth_scoring;    // bisulfite matrix mode (--meth-scoring):
-                            // MEM_METH_SCORING_{COLLAPSED,GENOMIC,NEUTRAL}
+    meth_opt_t meth;        // the --meth options every subcommand shares (meth_opt.h)
     int    meth_seed_prune; // --meth-seed-prune: prune 3-letter over-seeding before
                             // SA resolution. 0 = off, 1 = spec30 (per-read two-regime),
                             // 2 = baseline (len<25 & hits>1). mem_opt_init sets 0, but
@@ -279,22 +251,7 @@ typedef struct mem_opt_t {
                             // feature, no upstream reference to preserve); --meth-seed-prune
                             // =off|baseline (or env BWAMEM3_METH_SEED_PRUNE) overrides.
                             // ~30% faster --meth at ~0 truth accuracy cost; NOT byte-identical.
-    int    meth_chem;       // methylation chemistry (--meth=emseq|taps|5base): meth_chem_t.
-                            // Selects the XM:Z call polarity and the defaults that
-                            // follow from conversion density (--meth-scoring, the
-                            // rescue-prune mode); seeding, the converted index and
-                            // each mode's scoring matrix are shared, because every
-                            // chemistry produces the same C->T / G->A base change
-                            // as far as the aligner can see. 5base is TAPS.
-    int    meth_tags;       // bitmask of Bismark tags to emit (--meth-tags):
-                            // MEM_METH_TAG_{XR,XG,XM}. Tags not selected are
-                            // neither computed nor emitted -- clearing XM skips
-                            // the per-read meth_build_xm() pass entirely.
-    char   meth_set_as_failed;// 'f', 'r', or 0 — flag reads on that strand 0x200
     int    meth_chimera_qc; // 1 to enable bwameth.py-style longest-M <44% chimera heuristic (default off; not in Bismark)
-    int    meth_context;    // --meth-context: where a conversion is free, a meth_ctx_t
-                            // value (meth_opts.h): METH_CTX_ALL (default; every C) or
-                            // METH_CTX_CPG (only at a CpG).
     /* Derive the proper-pair FLAG bit (0x2) from the alignment actually EMITTED
      * (a[which]) instead of the top-scoring region (a[0]). Opt-in; 0 = match
      * bwa and bwa-mem2, which both use a[0] unconditionally.
@@ -665,15 +622,15 @@ typedef struct worker_t {
  * "which coordinate space" decision so every consumer is converted in one place
  * (the coordinate-cutover audit, B4). */
 static inline const bntseq_t *mem_aln_bns(const worker_t *w) {
-    return (w->opt->meth_mode && w->meth_orig_bns != NULL)
+    return (w->opt->meth.meth_mode && w->meth_orig_bns != NULL)
            ? w->meth_orig_bns : w->fmi->idx->bns;
 }
 static inline const uint8_t *mem_aln_pac(const worker_t *w) {
-    return (w->opt->meth_mode && w->meth_orig_pac != NULL)
+    return (w->opt->meth.meth_mode && w->meth_orig_pac != NULL)
            ? w->meth_orig_pac : w->fmi->idx->pac;
 }
 static inline uint8_t *mem_aln_ref_string(const worker_t *w) {
-    return (w->opt->meth_mode && w->meth_orig_ref_string != NULL)
+    return (w->opt->meth.meth_mode && w->meth_orig_ref_string != NULL)
            ? w->meth_orig_ref_string : w->ref_string;
 }
 
@@ -683,7 +640,7 @@ static inline uint8_t *mem_aln_ref_string(const worker_t *w) {
  * non-meth path is byte-for-byte identical. hypothesis: 1 = OT (mat_ot, frees
  * C→T), 0 = OB (mat_ob, frees G→A). See mem_opt_t::mat_ot/mat_ob. */
 static inline const int8_t *mem_opt_meth_mat(const mem_opt_t *opt, int meth_hypothesis) {
-    if (!opt->meth_mode || meth_hypothesis < 0) return opt->mat;
+    if (!opt->meth.meth_mode || meth_hypothesis < 0) return opt->mat;
     return (meth_hypothesis & 1) ? opt->mat_ot : opt->mat_ob;
 }
 
@@ -698,7 +655,7 @@ static inline const int8_t *mem_opt_meth_mat(const mem_opt_t *opt, int meth_hypo
  * bam_mode alone would send `--meth` (no `--bam`) down the text branch and trip
  * its `assert(str.s != 0)` on a string nothing ever wrote to. */
 static inline int mem_opt_records_are_bam(const mem_opt_t *opt) {
-    return opt->bam_mode || opt->meth_mode;
+    return opt->bam_mode || opt->meth.meth_mode;
 }
 
 

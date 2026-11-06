@@ -134,14 +134,50 @@ int read_claim_t::claim(int *end)
 
 int (*aln_thread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *), void *) = pthread_create;
 
+/* The group driver's per-policy steps. AlnStock's are the stock driver's own expressions, so its
+ * instantiation is the stock driver (test/tools/disasm_identity.sh checks it); another policy (aln
+ * --meth, added later) specialises this with its own. ctx_t is what the batch passes each
+ * thread beyond the reads (nothing for the stock search); the thread hands it to set_ctx before
+ * the group runs. scope_t is constructed for the group's lifetime, after the slots and before the
+ * reads: a policy with per-group state (aln --meth) keeps it there, its steps reach it through the
+ * thread, and its destructor releases what the policy holds when the group ends. So the driver's
+ * signature, its statements and its lambdas' captures are the stock driver's (every hook is an
+ * expression the stock driver had, or nothing). A slot is named by its core (c - cores is its
+ * index). */
+template <class P> struct gap_group;
+template <> struct gap_group<AlnStock> {
+	struct ctx_t {};
+	static inline void set_ctx(const ctx_t *) {}
+	struct scope_t {
+		scope_t(const bwt_t *, const gap_opt_t *, gap_slot_core_t *, int) {}
+	};
+	// read r (p) taken into slot c (--meth converts it here)
+	static inline void slot_start(gap_slot_core_t *, bwa_seq_t *, int) {}
+	// the bases slot c's width walks and search run on, read at each use as the stock driver does
+	static inline const ubyte_t *seq(const gap_slot_core_t *, const bwa_seq_t *p) { return p->seq; }
+	static inline int job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start(j, bwt); }
+	// steps the slots to the next one whose widths or search are done (gap_slots_run); a policy
+	// that parks slots (aln --meth) also flushes them in here, so the driver never sees a parked one
+	static inline int run(gap_slot_core_t *cores, int n, int *pos, const bwt_t *bwt)
+	{
+		return gap_slots_run(cores, n, pos, bwt);
+	}
+	// slot c's read is done and its hits were handed to the read (p->aln): a policy that keeps its
+	// results elsewhere (aln --meth) takes them back here
+	static inline void finish(gap_slot_core_t *, bwa_seq_t *) {}
+};
+
+template <class P>
 static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs,
 									 const gap_opt_t *opt)
 {
+	typedef gap_group<P> H;
 	const int G = ALN_GROUP;
 	std::vector<gap_slot_t> slots(G);
 	std::vector<gap_slot_core_t> cores(G);
 	gap_pool_t pool;
 	gap_init_pool(&pool, ALN_POOL_KEEP);
+	typename H::scope_t scope(bwt, opt, cores.data(), G);
 	for (int i = 0; i < G; ++i) {
 		gap_slot_t &s = slots[i];
 		s.c = &cores[i];
@@ -173,15 +209,16 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 		}
 		bwa_seq_t *p = seqs + r;
 		p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0;
+		H::slot_start(s.c, p, r);
 		if ((int)s.w.size() < p->len + 1) s.w.resize(p->len + 1);
-		width_walk_init(&s.c->ww, bwt, p->len, p->seq, s.w.data());
+		width_walk_init(&s.c->ww, bwt, p->len, H::seq(s.c, p), s.w.data());
 		s.c->widths_done = 0;
 		s.c->seed_done = 1;
 		if (p->len > opt->seed_len) {
 			// sized here, not per slot up front: a large -l (seeding off) would otherwise cost
 			// (-l + 1) x 16 B per slot even though no read is longer; here -l < p->len
 			if (s.seed_w.size() < (size_t)opt->seed_len + 1) s.seed_w.resize((size_t)opt->seed_len + 1);
-			width_walk_init(&s.c->sw, bwt, opt->seed_len, p->seq + (p->len - opt->seed_len), s.seed_w.data());
+			width_walk_init(&s.c->sw, bwt, opt->seed_len, H::seq(s.c, p) + (p->len - opt->seed_len), s.seed_w.data());
 			s.c->seed_done = 0;
 		}
 		s.c->state = GAP_SLOT_WIDTHS;
@@ -198,39 +235,53 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 		j->opt.seed_len = opt->seed_len < p->len? opt->seed_len : 0x7fffffff;
 		s.cseq.resize(p->len + 1);
 		for (int k = 0; k < p->len; ++k) // we need to complement
-			s.cseq[k] = p->seq[k] > 3? 4 : 3 - p->seq[k];
+			s.cseq[k] = H::seq(s.c, p)[k] > 3? 4 : 3 - H::seq(s.c, p)[k];
 		j->len = p->len;
 		j->seq = s.cseq.data();
 		j->width = s.w.data();
 		j->seed_width = p->len <= opt->seed_len? 0 : s.seed_w.data();
 		s.c->state = GAP_SLOT_SEARCH;
-		return gap_job_start(j, bwt);
+		return H::job_start(j, bwt);
 	};
 	for (gap_slot_t &s : slots)
 		if (fill(s)) ++n_active;
 	int pos = G - 1;
 	while (n_active) {
-		gap_slot_t &s = slots[gap_slots_run(cores.data(), G, &pos, bwt)];
+		gap_slot_t &s = slots[H::run(cores.data(), G, &pos, bwt)];
 		if (s.c->state == GAP_SLOT_WIDTHS && !start(s)) continue; // its search runs in the next turns
 		s.p->aln = s.c->job.aln; s.p->n_aln = s.c->job.n_aln; // the read is done
+		H::finish(s.c, s.p);
 		if (!fill(s)) --n_active;
 	}
 	for (gap_slot_t &s : slots) gap_destroy_cstack(s.c->job.stack);
 	gap_destroy_pool(&pool);
 }
 
-typedef struct {
+/* What each search thread gets: the reads and options, and the policy's context when it has one
+ * (the stock search's has none, so its threads' struct is as before). */
+template <class C> struct thread_ctx_t {
+	const C *ctx;
+	void set_ctx(const C *c) { ctx = c; }
+	const C *get_ctx() const { return ctx; }
+};
+template <> struct thread_ctx_t<gap_group<AlnStock>::ctx_t> {
+	void set_ctx(const gap_group<AlnStock>::ctx_t *) {}
+	const gap_group<AlnStock>::ctx_t *get_ctx() const { return nullptr; }
+};
+template <class P> struct thread_aux_t : thread_ctx_t<typename gap_group<P>::ctx_t> {
 	read_claim_t *claim;
 	const bwt_t *bwt;
 	int n_seqs;
 	bwa_seq_t *seqs;
 	const gap_opt_t *opt;
-} thread_aux_t;
+};
 
+template <class P>
 static void *worker(void *data)
 {
-	thread_aux_t *d = (thread_aux_t*)data;
-	bwa_cal_sa_reg_gap_group(d->claim, d->bwt, d->n_seqs, d->seqs, d->opt);
+	thread_aux_t<P> *d = (thread_aux_t<P>*)data;
+	gap_group<P>::set_ctx(d->get_ctx());
+	bwa_cal_sa_reg_gap_group<P>(d->claim, d->bwt, d->n_seqs, d->seqs, d->opt);
 	return 0;
 }
 
@@ -244,32 +295,36 @@ static void *worker(void *data)
  * (stacks, width buffers) would have to become per-tid state and the interleave would drain at
  * every range boundary. One thread spawn per thread per batch of 0x40000 reads is small next to
  * the search. */
-static void search_reads(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *bopt, int n_threads)
+template <class P>
+static void search_reads(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *bopt, int n_threads,
+						 const typename gap_group<P>::ctx_t *ctx = nullptr)
 {
 	read_claim_t claim(n_seqs);
 	if (n_threads <= 1) { // no multi-threading at all (bwa aln's -t 0 too)
-		bwa_cal_sa_reg_gap_group(&claim, bwt, n_seqs, seqs, bopt);
+		gap_group<P>::set_ctx(ctx);
+		bwa_cal_sa_reg_gap_group<P>(&claim, bwt, n_seqs, seqs, bopt);
 	} else {
 		pthread_t *tid;
 		pthread_attr_t attr;
-		thread_aux_t *data;
+		thread_aux_t<P> *data;
 		int j;
 		pthread_attr_init(&attr);
 		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-		data = (thread_aux_t*)aln_calloc(n_threads, sizeof(thread_aux_t));
+		data = (thread_aux_t<P>*)aln_calloc(n_threads, sizeof(thread_aux_t<P>));
 		tid = (pthread_t*)aln_calloc(n_threads, sizeof(pthread_t));
 		std::vector<char> started(n_threads, 0);
 		bool any_failed = false;
 		for (j = 0; j < n_threads; ++j) {
 			data[j].claim = &claim; data[j].bwt = bwt;
 			data[j].n_seqs = n_seqs; data[j].seqs = seqs; data[j].opt = bopt;
-			started[j] = aln_thread_create(&tid[j], &attr, worker, data + j) == 0;
+			data[j].set_ctx(ctx);
+			started[j] = aln_thread_create(&tid[j], &attr, worker<P>, data + j) == 0;
 			any_failed = any_failed || !started[j];
 		}
 		// A thread that could not be created must not be joined. The caller runs one worker in
 		// place of the missing ones: it claims reads like the others, so it and the threads that
 		// started search every read (it alone does if none started).
-		if (any_failed) worker(data);
+		if (any_failed) worker<P>(data);
 		for (j = 0; j < n_threads; ++j)
 			if (started[j]) pthread_join(tid[j], 0);
 		free(data); free(tid);
@@ -491,23 +546,29 @@ int dup_sample_check(int n_seqs, const bwa_seq_t *seqs)
  * turns the check off for the stream's next ALN_DUP_RECHECK - 1 batches (aln_dup_state_t; the
  * check itself is a serial pass over the batch while the search threads wait). Only the work
  * changes: a read searched instead of copied gets the same hits. */
-int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads,
-					 aln_dup_state_t *dup)
+/* The duplicate gate and compaction every batch search shares (aln_search_batch; aln --meth's, when
+ * it is added, is the second), so each caller gets the same skip window, one-read batches included.
+ * search_all() searches the whole batch; search_uniq(n_u, uniq, rep) searches its compacted front,
+ * the distinct reads (uniq[k] is the batch index of seqs[k]; rep[i] is read i's first copy); after
+ * the batch is restored, copy_dup(i, rep[i]) fills duplicate i from its first copy. Returns the
+ * number of duplicates, 0 when the batch was searched whole. */
+template <class SearchAll, class SearchUniq, class CopyDup>
+static int search_batch_dedup(int n_seqs, bwa_seq_t *seqs, int n_threads, aln_dup_state_t *dup,
+							  SearchAll search_all, SearchUniq search_uniq, CopyDup copy_dup)
 {
-	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	if (!dup || n_seqs < 2) {
 		if (dup && n_seqs == 1 && dup->skip_left > 0) --dup->skip_left; // a batch of the stream too
-		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		search_all();
 		return 0;
 	}
 	if (dup->skip_left > 0) {
 		--dup->skip_left;
-		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		search_all();
 		return 0;
 	}
 	if (!detail::dup_sample_check(n_seqs, seqs)) {
 		dup->skip_left = ALN_DUP_RECHECK - 1;
-		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		search_all();
 		return 0;
 	}
 	std::vector<int> rep(n_seqs);
@@ -515,7 +576,7 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 	if ((int64_t)n_dups * ALN_DUP_MIN_RATIO < n_seqs) {
 		// too few to be worth the compaction (the samples were wrong for this batch)
 		dup->skip_left = ALN_DUP_RECHECK - 1;
-		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		search_all();
 		return 0;
 	}
 	// Compact the batch in place: the distinct reads move to its front, in order, and the
@@ -535,23 +596,35 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 		uniq.push_back(i);
 	}
 	const int n_u = (int)uniq.size();
-	search_reads(bwt, n_u, seqs, &bopt, n_threads);
+	search_uniq(n_u, uniq.data(), rep.data());
 	for (int k = n_u - 1; k >= 0; --k) // backward: uniq[k] >= k, past every entry still to move
 		if (uniq[k] != k) seqs[uniq[k]] = seqs[k];
-	// Every duplicate gets an aln array of its own (its entry held none before the search), a copy
-	// of its first copy's, so each read's aln can be freed with the read as before.
 	for (int i = 0, j = 0; i < n_seqs; ++i) {
 		if (rep[i] == i) continue;
-		bwa_seq_t *d = seqs + i;
-		*d = dups[j++];
-		const bwa_seq_t *r = seqs + rep[i];
-		d->sa = 0; d->type = BWA_TYPE_NO_MATCH; d->c1 = d->c2 = 0;
-		const size_t n = r->n_aln > 0? r->n_aln : 1;
-		d->aln = (bwt_aln1_t*)aln_malloc(n * sizeof(bwt_aln1_t));
-		if (r->n_aln > 0) memcpy(d->aln, r->aln, r->n_aln * sizeof(bwt_aln1_t));
-		d->n_aln = r->n_aln;
+		seqs[i] = dups[j++];
+		copy_dup(i, rep[i]);
 	}
 	return n_dups;
+}
+
+int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads,
+					 aln_dup_state_t *dup)
+{
+	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
+	return search_batch_dedup(n_seqs, seqs, n_threads, dup,
+		[&]() { search_reads<AlnStock>(bwt, n_seqs, seqs, &bopt, n_threads); },
+		[&](int n_u, const int *, const int *) { search_reads<AlnStock>(bwt, n_u, seqs, &bopt, n_threads); },
+		// Every duplicate gets an aln array of its own (its entry held none before the search), a
+		// copy of its first copy's, so each read's aln can be freed with the read as before.
+		[&](int i, int r) {
+			bwa_seq_t *d = seqs + i;
+			const bwa_seq_t *q = seqs + r;
+			d->sa = 0; d->type = BWA_TYPE_NO_MATCH; d->c1 = d->c2 = 0;
+			const size_t n = q->n_aln > 0? q->n_aln : 1;
+			d->aln = (bwt_aln1_t*)aln_malloc(n * sizeof(bwt_aln1_t));
+			if (q->n_aln > 0) memcpy(d->aln, q->aln, q->n_aln * sizeof(bwt_aln1_t));
+			d->n_aln = q->n_aln;
+		});
 }
 
 } // namespace bwa_aln

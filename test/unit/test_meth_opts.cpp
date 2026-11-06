@@ -28,9 +28,9 @@ TEST_CASE("meth_opts: 5base + no context -> METH_CTX_ALL, scoring NEUTRAL") {
     Fixture f;
     f.parse(OPT_METH, "5base");
     meth_opts_finalize(f.opt, &f.cli);
-    CHECK(f.opt->meth_mode == 1);
-    CHECK(f.opt->meth_context == METH_CTX_ALL);
-    CHECK(f.opt->meth_scoring == MEM_METH_SCORING_NEUTRAL);
+    CHECK(f.opt->meth.meth_mode == 1);
+    CHECK(f.opt->meth.meth_context == METH_CTX_ALL);
+    CHECK(f.opt->meth.meth_scoring == MEM_METH_SCORING_NEUTRAL);
     CHECK(f.opt->meth_seed_prune == MEM_METH_PRUNE_SPEC30);
 }
 
@@ -40,8 +40,8 @@ TEST_CASE("meth_opts: taps + cpg -> METH_CTX_CPG") {
     f.parse(OPT_METH_CONTEXT, "cpg");
     meth_opts_finalize(f.opt, &f.cli);
     CHECK(f.cli.set_context == 1);
-    CHECK(f.opt->meth_context == METH_CTX_CPG);
-    CHECK(f.opt->meth_scoring == MEM_METH_SCORING_NEUTRAL);
+    CHECK(f.opt->meth.meth_context == METH_CTX_CPG);
+    CHECK(f.opt->meth.meth_scoring == MEM_METH_SCORING_NEUTRAL);
 }
 
 TEST_CASE("meth_opts: 5base + cpg + genomic -> METH_CTX_CPG, scoring GENOMIC") {
@@ -50,8 +50,8 @@ TEST_CASE("meth_opts: 5base + cpg + genomic -> METH_CTX_CPG, scoring GENOMIC") {
     f.parse(OPT_METH_CONTEXT, "cpg");
     f.parse(OPT_METH_SCORING, "genomic");
     meth_opts_finalize(f.opt, &f.cli);
-    CHECK(f.opt->meth_context == METH_CTX_CPG);
-    CHECK(f.opt->meth_scoring == MEM_METH_SCORING_GENOMIC);
+    CHECK(f.opt->meth.meth_context == METH_CTX_CPG);
+    CHECK(f.opt->meth.meth_scoring == MEM_METH_SCORING_GENOMIC);
 }
 
 TEST_CASE("meth_opts: bare --meth + context all stays emseq/genomic") {
@@ -59,8 +59,8 @@ TEST_CASE("meth_opts: bare --meth + context all stays emseq/genomic") {
     f.parse(OPT_METH, nullptr);
     f.parse(OPT_METH_CONTEXT, "all");
     meth_opts_finalize(f.opt, &f.cli);
-    CHECK(f.opt->meth_context == METH_CTX_ALL);
-    CHECK(f.opt->meth_scoring == MEM_METH_SCORING_GENOMIC);
+    CHECK(f.opt->meth.meth_context == METH_CTX_ALL);
+    CHECK(f.opt->meth.meth_scoring == MEM_METH_SCORING_GENOMIC);
 }
 
 TEST_CASE("meth_opts: em-seq with neutral scoring is flagged, every other pairing is not") {
@@ -83,13 +83,13 @@ TEST_CASE("meth_opts: em-seq with neutral scoring is flagged, every other pairin
         f.parse(OPT_METH, c.chem);
         if (c.scoring) f.parse(OPT_METH_SCORING, c.scoring);
         meth_opts_finalize(f.opt, &f.cli);
-        CHECK(meth_opts_emseq_neutral(f.opt) == c.want);
+        CHECK(meth_opts_emseq_neutral(&f.opt->meth) == c.want);
     }
     Fixture off;  // neutral scoring without --meth: the meth_mode term decides
     off.parse(OPT_METH_SCORING, "neutral");
     meth_opts_finalize(off.opt, &off.cli);
-    REQUIRE(off.opt->meth_scoring == MEM_METH_SCORING_NEUTRAL);
-    CHECK(meth_opts_emseq_neutral(off.opt) == 0);
+    REQUIRE(off.opt->meth.meth_scoring == MEM_METH_SCORING_NEUTRAL);
+    CHECK(meth_opts_emseq_neutral(&off.opt->meth) == 0);
 }
 
 TEST_CASE("meth_opts: explicit --meth-seed-prune=off survives finalize") {

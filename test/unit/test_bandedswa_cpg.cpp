@@ -203,7 +203,7 @@ mem_opt_t *opt_for(int scoring, int a, int b)
     mem_opt_t *o = mem_opt_init();
     o->a = a; o->b = b;
     bwa_fill_scmat(a, b, o->mat);
-    o->meth_scoring = scoring;
+    o->meth.meth_scoring = scoring;
     mem_opt_fill_meth_mat(o);
     return o;
 }

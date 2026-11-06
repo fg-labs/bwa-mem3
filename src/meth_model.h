@@ -29,14 +29,19 @@ enum { METH_A = 0, METH_C = 1, METH_G = 2, METH_T = 3, METH_N = 4,
 /* The plain base of a reference code: C5 -> C, G6 -> G, others unchanged. */
 static inline uint8_t meth_code_base(uint8_t c) { return c >= METH_C5 ? c - 4 : c; }
 
-/* Build o->mat7_ot / o->mat7_ob (row = reference code, column = read code,
- * stride 7) from o->mat and o->meth_scoring. Rows and columns 0..4 copy
- * o->mat; rows 5/6 and columns 5/6 copy those of C/G. Only C5 x read T (OT)
- * and G6 x read A (OB) hold the conversion value (0 under NEUTRAL, +a
- * otherwise); a plain C/T or G/A stays a mismatch. COLLAPSED is not combined
- * with cpg, so its mirror cell is not modelled. Called by
- * mem_opt_fill_meth_mat. */
-void meth_model_fill_mats(mem_opt_t *o);
+/* The --meth substitution matrices (row = reference code, column = read code)
+ * from a base 5x5 matrix `mat` and its match score `a`, per m->meth_scoring:
+ *   ot/ob (5x5): mat with the conversion cell freed (OT ref C / read T, OB ref
+ *     G / read A) to 0 under NEUTRAL, +a otherwise; under COLLAPSED the mirror
+ *     cell (OT ref T / read C, OB ref A / read G) is also +a.
+ *   ot7/ob7 (7x7, --meth-context cpg): rows and columns 0..4 copy mat; rows/
+ *     columns 5/6 copy those of C/G. Only C5 x read T (OT) and G6 x read A (OB)
+ *     hold the conversion value; a plain C/T or G/A stays a mismatch.
+ *     COLLAPSED is not combined with cpg, so its mirror cell is not modelled.
+ * mem builds from opt->mat at its own scale (mem_opt_fill_meth_mat); aln from
+ * its own matrix (match 1, mismatch -M). */
+void meth_fill_mats(const int8_t *mat, int a, const meth_opt_t *m,
+                    int8_t ot[25], int8_t ob[25], int8_t ot7[49], int8_t ob7[49]);
 
 /* Relabel win[0..len) in place: C -> C5 where the next frame base is G, and
  * G -> G6 where the previous frame base is C. win holds 0..3 codes in fetch
@@ -64,7 +69,7 @@ void meth_unlabel(uint8_t *win, int64_t len);
 /* Whether this run scores under --meth-context cpg. */
 static inline int meth_cpg_on(const mem_opt_t *opt)
 {
-    return opt->meth_mode && opt->meth_context == METH_CTX_CPG;
+    return opt->meth.meth_mode && opt->meth.meth_context == METH_CTX_CPG;
 }
 
 /* The substitution model for a (strand-adjusted) hypothesis: under cpg with a
