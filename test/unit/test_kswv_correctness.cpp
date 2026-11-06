@@ -19,6 +19,7 @@
 
 #include "kswr_cmp.h"
 #include "scoped_env.h"
+#include "scoped_rescue_env.h"  // ScopedKswvRescueEnv
 #include "ksw_runner.h"
 #include "kswv_runner.h"
 #include "scoring.h"
@@ -1513,19 +1514,24 @@ TEST_CASE("kswv u8 rescue: partial final groups match scalar at every batch size
           * doctest::test_suite("unit/kswv")) {
     auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
     const int sizes[] = {1, 2, 3, 5, 8, 15, 17, 23, 31, 33, 47, 63, 65, 79, 97, 127, 129};
-    struct Body { const char *name, *var, *val, *var2, *val2; };
+    // Each body sets every kswv rescue toggle (bwa_tests::ScopedKswvRescueEnv: the listed ones
+    // off, the other five on), so an off switch inherited from the caller's environment (say
+    // BWA3_RESCUE_FSCAN=0 or BWA3_RESCUE_LAZYQE=0) cannot turn "default" into another body.
+    // The caller's values are restored afterwards.
+    using Setting = bwa_tests::ScopedKswvRescueEnv::Setting;
+    struct Body { const char *name; std::vector<Setting> off; };
     const Body bodies[] = {
-        {"default", nullptr, nullptr, nullptr, nullptr},
-        {"FSCAN=0", "BWA3_RESCUE_FSCAN", "0", nullptr, nullptr},
-        {"USQADD=0", "BWA3_RESCUE_USQADD", "0", nullptr, nullptr},
-        {"FSCAN=0 USQADD=0", "BWA3_RESCUE_FSCAN", "0", "BWA3_RESCUE_USQADD", "0"},
-        {"ROWPAIR=0", "BWA3_RESCUE_ROWPAIR", "0", nullptr, nullptr},
+        {"default", {}},
+        {"FSCAN=0", {{"BWA3_RESCUE_FSCAN", "0"}}},
+        {"USQADD=0", {{"BWA3_RESCUE_USQADD", "0"}}},
+        {"FSCAN=0 USQADD=0", {{"BWA3_RESCUE_FSCAN", "0"}, {"BWA3_RESCUE_USQADD", "0"}}},
+        {"ROWPAIR=0", {{"BWA3_RESCUE_ROWPAIR", "0"}}},
     };
 
     std::mt19937 rng(20261020);
     std::uniform_int_distribution<int> qlen_d(30, 150);
     std::uniform_int_distribution<int> rlen_d(80, 260);
-    int checked = 0;
+    int checked = 0, te2_checked = 0;
     for (const int n : sizes) {
         std::vector<bwa_tests::TestPair> pairs;
         for (int i = 0; i < n; i++) {
@@ -1538,10 +1544,7 @@ TEST_CASE("kswv u8 rescue: partial final groups match scalar at every batch size
         for (const auto &p : pairs) scalar.push_back(bwa_tests::run_scalar_ksw(p, mat));
 
         for (const Body &b : bodies) {
-            std::unique_ptr<ScopedEnv> env;
-            if (b.var) env.reset(new ScopedEnv(b.var, b.val));
-            std::unique_ptr<ScopedEnv> env2;
-            if (b.var2) env2.reset(new ScopedEnv(b.var2, b.val2));
+            const bwa_tests::ScopedKswvRescueEnv env(b.off);
             auto batched = bwa_tests::run_kswv_batch(pairs, mat);
             REQUIRE(batched.size() == pairs.size());
             for (int i = 0; i < n; i++) {
@@ -1555,11 +1558,26 @@ TEST_CASE("kswv u8 rescue: partial final groups match scalar at every batch size
                 CHECK(bwa_tests::kswr_ends_eq(scalar[i], batched[i]));
                 CHECK(bwa_tests::kswr_coords_eq(scalar[i], batched[i]));
                 CHECK(bwa_tests::kswr_score2_eq(scalar[i], batched[i]));
+                // te2 only where the scalar reports a second best (score2 > 0; scalar
+                // ksw_u8 starts at score2 = te2 = -1 and only a b[] entry >= minsc > 0
+                // outside the primary window replaces it). Both sides take the first
+                // strictly-greater entry in ascending row order, so a tie keeps the lowest
+                // row on both. Where there is none, the kernel may store score2 0 or -1 and
+                // te2 carries no meaning, so it is not compared.
+                if (scalar[i].score > 0 && scalar[i].score2 > 0) {
+                    CAPTURE(scalar[i].score2);
+                    CAPTURE(scalar[i].te2);
+                    CAPTURE(batched[i].te2);
+                    CHECK(scalar[i].te2 == batched[i].te2);
+                    ++te2_checked;
+                }
                 ++checked;
             }
         }
     }
-    MESSAGE("partial-group parity: " << checked << " pair results on tier " << std::string(kKswvTier));
+    MESSAGE("partial-group parity: " << checked << " pair results (" << te2_checked
+            << " with a second best, te2 compared) on tier " << std::string(kKswvTier));
+    CHECK(te2_checked > 0);
 }
 
 #endif // BWA_TESTS_HAVE_KSWV

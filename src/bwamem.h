@@ -783,6 +783,23 @@ void sortPairsLenExt(SeqPair *pairArray, int32_t count, SeqPair *tempArray,
 bool bsw16_len1_major_order(const SeqPair *pairArray, int32_t count);
 void sortPairsLen16(SeqPair *pairArray, int32_t count, SeqPair *tempArray, int32_t *hist,
                     bool diverted);
+/* Test seam for test/unit/test_bandedswa_lane_indep.cpp and test/unit/test_bsw16_pair_order.cpp;
+ * the aligner does not call it. Runs one extension-tier kernel call on `bsw` the way the aligner
+ * does outside --meth: extension dedup (BWAMEM3_DEDUP / mem_dedup_configure) over the n pairs,
+ * then the tier's pair sort and kernel call --
+ *   BSW_EXT_CALL_SCALAR: scalarBandedSWAWrapper, input order;
+ *   BSW_EXT_CALL_16:     sortPairsLen16(.., false), then getScores16;
+ *   BSW_EXT_CALL_8:      w <= BSW_EXT_CALL_8_MAX_W: a stable len2 sort, then getScores8;
+ *                        w above it (the int8 band limit): sortPairsLen16(.., true), then
+ *                        getScores16.
+ * Results land in each pair's score/tle/qle/gscore/gtle/max_off; pa is left reordered, so read
+ * results back by (seqid, regid). Buffers: pa at least roundup(n, SIMD_WIDTH8) slots (the
+ * kernels write the padding lanes; see IBandedPairWiseSW::getScores8), sort_scratch at least as
+ * many and not overlapping pa, hist MAX_SEQ_LEN16 + 1 slots. Any other tier value is fatal. */
+enum BswExtCall : int { BSW_EXT_CALL_SCALAR = 0, BSW_EXT_CALL_16 = 1, BSW_EXT_CALL_8 = 2 };
+enum { BSW_EXT_CALL_8_MAX_W = 124 };   /* the 8-bit tier's widest band; past it the call diverts */
+void bsw_extend_tier_call(BswExtCall tier, IBandedPairWiseSW *bsw, SeqPair *pa, uint8_t *ref,
+                          uint8_t *qer, int n, int32_t w, SeqPair *sort_scratch, int32_t *hist);
 
 static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *a, int_v *z);
 

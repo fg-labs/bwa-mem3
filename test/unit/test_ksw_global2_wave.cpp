@@ -495,3 +495,67 @@ TEST_CASE("wavefront ksw_global2 zr scratch decays after a wide-band spike"
         CHECK(cap_after_flood < cap_after_spike);
     }
 }
+
+// Unequal-length calls just below the kernels' proof floor (w >= |tlen-qlen|+3) must stay on
+// the scalar path even though w clears the tier's width crossover. run_parity clamps every w up
+// to the floor, so it never reaches this branch. With d = |tlen-qlen| set to the crossover, the
+// widths d, d + 1 and d + 2 (floor - 3, floor - 2 and floor - 1) all pass the width gate; only
+// the floor test keeps them off the kernels, and d + 2 pins its exact constant (a floor of
+// d + 2 or d + 1 would admit it). Both wave counters must stay put, and score, op count and
+// every CIGAR op must equal the scalar reference. The positive control runs the same pair at
+// w = floor and requires the intended kernel's counter to advance, so the flat counters below
+// the floor are not just a pair or gap set no kernel would take. The int16 subcase sets d to the
+// int16 crossover; the int32 subcase sets d to the int32 crossover with a gap open the int16
+// range gate rejects, so it is the int32 kernel the floor keeps out (and the control checks
+// the int16 counter does not move).
+TEST_CASE("wavefront ksw_global2 leaves unequal-length calls below the proof floor to scalar"
+          * doctest::test_suite("unit/ksw_global2")) {
+    if (!tier_has_wavefront()) {
+        MESSAGE("skipped: the running tier has no wavefront ksw_global2 kernel");
+        return;
+    }
+    const auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
+    auto check_below_floor = [&](int d, const GapSet &g, bool want_int16, int seed) {
+        REQUIRE(d > 0);
+        std::mt19937 rng(seed);
+        int pairs = 0;
+        for (int qlen : {d, 2 * d + 1, 76}) {
+            for (int sign : {+1, -1}) {   // tlen > qlen and tlen < qlen
+                const int tlen = sign > 0 ? qlen + d : qlen - d;
+                if (tlen < 1) continue;
+                const TestPair p = bwa_tests::gen_random_pair(rng, qlen, tlen);
+                REQUIRE(band_floor(p) == d + 3);
+                CAPTURE(qlen); CAPTURE(tlen);
+                pairs++;
+                for (int w : {d, d + 1, d + 2}) {
+                    CAPTURE(w);
+                    const unsigned long wave_before = ksw_g2_wave_exec_count();
+                    const unsigned long wave16_before = ksw_g2_wave16_exec_count();
+                    const G2Result got = run_g2(ksw_global2, p, mat.data(), w,
+                                                g.o_del, g.e_del, g.o_ins, g.e_ins);
+                    CHECK(ksw_g2_wave_exec_count() == wave_before);
+                    CHECK(ksw_g2_wave16_exec_count() == wave16_before);
+                    const G2Result ref = run_g2(ksw_global2_scalar_ref, p, mat.data(), w,
+                                                g.o_del, g.e_del, g.o_ins, g.e_ins);
+                    CHECK(got.score == ref.score);
+                    CHECK(got.n_cigar == ref.n_cigar);
+                    CHECK(cigar_eq(got.cigar, ref.cigar));
+                }
+                // Positive control: the same pair and gaps at the floor reach the kernel.
+                const unsigned long wave_before = ksw_g2_wave_exec_count();
+                const unsigned long wave16_before = ksw_g2_wave16_exec_count();
+                run_g2(ksw_global2, p, mat.data(), band_floor(p), g.o_del, g.e_del, g.o_ins, g.e_ins);
+                CHECK(ksw_g2_wave_exec_count() > wave_before);
+                if (want_int16) CHECK(ksw_g2_wave16_exec_count() > wave16_before);
+                else            CHECK(ksw_g2_wave16_exec_count() == wave16_before);
+            }
+        }
+        CHECK(pairs >= 4);
+    };
+    SUBCASE("int16 crossover") {
+        check_below_floor(ksw_g2_wave16_wmin(), GapSet{5, 2, 5, 2}, /*want_int16=*/true, 3131);
+    }
+    SUBCASE("int32 crossover, int16 rejected by the gap open") {
+        check_below_floor(ksw_g2_wave_wmin(), GapSet{3000, 1, 3000, 1}, /*want_int16=*/false, 3132);
+    }
+}

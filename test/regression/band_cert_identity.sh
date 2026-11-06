@@ -200,8 +200,8 @@ fi
 # carries a 6 bp deletion: its long extension gets probe band 0 (no band within -w
 # is proven), so it skips the rung and only the ladder scores it.
 # The committed trace check below observes the stored band at the real selector
-# and compares certified score/truesc with the full-width ladder before
-# mem_reg2aln can mask a difference. All of these long extensions land in the
+# and compares each finalized score/truesc/qb/rb/qe/re/w with the full-width ladder
+# before mem_reg2aln can mask a difference. All of these long extensions land in the
 # 16-bit tier; long extensions in the 8-bit tier are covered by end-to-end runs.
 N_LONG=96
 n_long=0
@@ -240,8 +240,8 @@ fi
 # the rung runs at its clip slack. No pair above reaches the rung with the marker
 # (a mismatch-bearing pair's second substitution is SUB_STEP bp in).
 # Like the long pairs, these must reach the real selector with their stored
-# marker band, certify, and match the full-width ladder score/truesc in the
-# committed trace check below.
+# marker band, certify, and match the full-width ladder's finalized
+# score/truesc/qb/rb/qe/re/w in the committed trace check below.
 N_NUM0=64
 n_num0=0
 for ((j = 0; j < N_NUM0; j++)); do
@@ -285,7 +285,13 @@ BWA3_BAND_CERT_TRACE=1 "$BWA_MEM3" mem "$ref" "$r1" "$r2" > "$def_sam" 2> "$def_
 BWA3_BAND_CERT_TRACE=1 "$BWA_MEM3" mem --no-band-cert "$ref" "$r1" "$r2" > "$raw_sam" 2> "$raw_trace"
 
 # Observe the stored band at the real selector, then compare the real finalized
-# scores before mem_reg2aln can hide differences by rebuilding the alignment.
+# scores, region coordinates and band (score, truesc, qb, rb, qe, re, w) before
+# mem_reg2aln can hide differences by rebuilding the alignment. Rows are keyed by
+# (read id, region, direction). The default run must finalize each key exactly once
+# (a certified "rung" row, or a "ladder" row for a pair the rung declined), every
+# key the default run's selector saw must be among them, the full-width run must
+# finalize each key exactly once, the two key sets must be equal, and each key's
+# tuple must match, including regions that never reach the SAM.
 # Measured on the canonical Linux AVX2 CI row and macOS NEON: each side selects
 # and certifies 64 long and 128 marker extensions. These floors leave modest
 # headroom, but reject losing most of the probe work. They are extension counts,
@@ -293,11 +299,38 @@ BWA3_BAND_CERT_TRACE=1 "$BWA_MEM3" mem --no-band-cert "$ref" "$r1" "$r2" > "$raw
 mawk -F '\t' '
     BEGIN { min_long = 60; min_marker = 120 }
     $1 != "[band-cert-trace]" { next }
-    { key = $3 ":" $4 ":" $5 }
-    FNR == NR {
-        if ($2 == "ladder") wide[key] = $10 ":" $11
+    NF != 16 {
+        print "FAIL: band-cert trace row has " NF " fields, expected 16: " $0 > "/dev/stderr"
+        bad = 1
         next
     }
+    { key = $3 ":" $4 ":" $5; tuple = $10 ":" $11 ":" $12 ":" $13 ":" $14 ":" $15 ":" $16 }
+    FNR == NR {
+        if ($2 == "ladder") {
+            if (key in wide) {
+                print "FAIL: full-width ladder finalized " key " twice" > "/dev/stderr"
+                bad = 1
+            }
+            wide[key] = tuple
+        }
+        next
+    }
+    ($2 == "rung" || $2 == "ladder") {
+        final_rows++
+        if (key in done) {
+            print "FAIL: default run finalized " key " twice (" $2 ")" > "/dev/stderr"
+            bad = 1
+        }
+        done[key] = 1
+        if (!(key in wide)) {
+            print "FAIL: default run finalized " key " (" $2 ": " tuple "), which the full-width ladder never finalized" > "/dev/stderr"
+            bad = 1
+        } else if (wide[key] != tuple) {
+            print "FAIL: finalized score/truesc/qb/rb/qe/re/w differs from full-width ladder for " key " (" $2 ": " tuple ", ladder: " wide[key] ")" > "/dev/stderr"
+            bad = 1
+        }
+    }
+    $2 == "select" { selected[key] = 1 }
     $2 == "select" && $9 == 1 {
         if ($6 ~ /^long/ && $7 > 128 && $8 != 0) long_selected[$5]++
         if ($6 ~ /^num0_/ && $8 == -1) marker_selected[$5]++
@@ -305,12 +338,25 @@ mawk -F '\t' '
     $2 == "rung" && $9 == 1 {
         if ($6 ~ /^long/ && $7 > 128 && $8 != 0) long_checked[$5]++
         if ($6 ~ /^num0_/ && $8 == -1) marker_checked[$5]++
-        if (!(key in wide) || wide[key] != $10 ":" $11) {
-            print "FAIL: certified score/truesc differs from full-width ladder for " key > "/dev/stderr"
-            bad = 1
-        }
     }
     END {
+        n_wide = 0
+        for (k in wide) {
+            n_wide++
+            if (!(k in done)) {
+                print "FAIL: full-width ladder finalized " k ", which the default run never finalized" > "/dev/stderr"
+                bad = 1
+            }
+        }
+        n_sel = 0
+        for (k in selected) {
+            n_sel++
+            if (!(k in done)) {
+                print "FAIL: default run selected " k " for the probe, but never finalized it" > "/dev/stderr"
+                bad = 1
+            }
+        }
+        printf "finalization tuples compared: %d default rows, %d full-width keys, %d selected keys\n", final_rows, n_wide, n_sel
         for (side = 0; side <= 1; side++) {
             printf "probe counts: is_left=%d long_selected=%d marker_selected=%d long_certified=%d marker_certified=%d\n", side, long_selected[side], marker_selected[side], long_checked[side], marker_checked[side]
             if (long_selected[side] < min_long || marker_selected[side] < min_marker ||
@@ -320,7 +366,7 @@ mawk -F '\t' '
             }
         }
         if (bad) exit 1
-        print "PASS: stored long/marker bands reach the probe selector; certified score/truesc match the full-width ladder"
+        print "PASS: stored long/marker bands reach the probe selector; each extension finalized once, with the full-width ladder score/truesc/qb/rb/qe/re/w"
     }
 ' "$raw_trace" "$def_trace"
 
@@ -329,6 +375,41 @@ if ! grep -q '^[^@]' "$def_sam" || ! grep -q '^[^@]' "$raw_sam"; then
     echo "FAIL: one of the runs emitted no alignment records (fixture too weak?)" >&2
     exit 1
 fi
+
+# The tuple comparison above covers regions the SAM never shows (secondaries
+# dropped by -a off, regions merged or filtered after extension). This counts them
+# per read (name plus mate: the trace's read id is 2 * pair + mate, the SAM's FLAG
+# carries 0x40 / 0x80): distinct finalized (read id, region) keys minus the read's
+# mapped SAM records. It is a count-based lower bound, not a region-to-record match:
+# the trace's coordinates are pre-mem_reg2aln and in the forward/reverse
+# concatenated space, so they do not map to a SAM POS directly, and a record from a
+# mate-rescued region has no trace row at all (it only lowers the count). Each
+# mapped record comes from a distinct region, so the difference never exceeds the
+# true number of absent traced regions. Measured at 185 on macOS NEON (extension
+# results, and so this count, are byte-identical across tiers); the floor of 160
+# leaves headroom but rejects a per-name count (81 here: one mate's records absorb
+# the other mate's surplus) and a fixture whose regions all reach the SAM.
+absent_regions="$(mawk -F '\t' '
+    FNR == NR {
+        if ($1 == "[band-cert-trace]" && $2 == "ladder") {
+            k = $3 ":" $4
+            if (!(k in seen)) { seen[k] = 1; regions[$6 "/" ($3 % 2 + 1)]++ }
+        }
+        next
+    }
+    !/^@/ && $3 != "*" { mapped[$1 "/" (int($2 / 64) % 2 ? 1 : 2)]++ }
+    END {
+        n = 0
+        for (r in regions) if (regions[r] > mapped[r]) n += regions[r] - mapped[r]
+        print n + 0
+    }
+' "$raw_trace" "$def_sam")"
+min_absent=160
+if [ "$absent_regions" -lt "$min_absent" ]; then
+    echo "FAIL: only $absent_regions finalized regions are absent from the SAM (floor $min_absent) — the coordinate trace check covers little beyond the SAM diff" >&2
+    exit 1
+fi
+echo "  ok: coordinate tuples compared include $absent_regions finalized regions absent from the SAM"
 
 def_stripped="$BAND_CERT_WORK_DIR/default.stripped.sam"
 raw_stripped="$BAND_CERT_WORK_DIR/no_band_cert.stripped.sam"

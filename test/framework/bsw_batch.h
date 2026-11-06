@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "bandedSWA.h"
+#include "bwamem.h"   // bsw_extend_tier_call
 #include "ext_ladder.h"
 
 #if defined(__aarch64__)
@@ -27,49 +28,92 @@ extern "C" IBandedPairWiseSW *make_bsw_kernel_rowalt(int, int, int, int, int, in
 
 namespace bwa_tests {
 
-/// Score `pairs` as one batch through getScores8 (`width` 8) or getScores16
-/// (`width` 16) with band `w`; returns each pair's six result fields in input
-/// order. The SeqPair array has 64 slots of padding-lane slack (the widest tier's
-/// lane count; the kernel writes the pads) and both sequence buffers carry 4 KiB
-/// of zero tail. Throws if the kernel hands back a pair id out of range or twice.
-inline std::vector<ExtResult> score_bsw_batch(IBandedPairWiseSW &bsw, const std::vector<const ExtPair *> &pairs,
-                                              int width, int w)
+/// A batch of extension jobs laid out as the kernels read it: pair q has id q, and seqid
+/// 1000 + q / regid 7q + 3 (distinct, so a caller that permutes the array can be read back by
+/// them); the SeqPair array has 64 slots of padding-lane slack (the widest tier's lane count;
+/// the kernel writes the pads) and both sequence buffers carry 4 KiB of zero tail.
+struct BswBatch {
+    std::vector<uint8_t> ref, qer;
+    std::vector<SeqPair> sp;
+    explicit BswBatch(const std::vector<const ExtPair *> &pairs) : sp(pairs.size() + 64) {
+        for (size_t q = 0; q < pairs.size(); q++) {
+            SeqPair p;
+            memset(&p, 0, sizeof p);
+            p.id = (int)q; p.seqid = 1000 + (int)q; p.regid = 7 * (int)q + 3;
+            p.idr = (int)ref.size();
+            p.idq = (int)qer.size();
+            p.len1 = (int)pairs[q]->target.size();
+            p.len2 = (int)pairs[q]->query.size();
+            p.h0 = pairs[q]->h0;
+            p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
+            ref.insert(ref.end(), pairs[q]->target.begin(), pairs[q]->target.end());
+            qer.insert(qer.end(), pairs[q]->query.begin(), pairs[q]->query.end());
+            sp[q] = p;
+        }
+        ref.resize(ref.size() + 4096, 0);
+        qer.resize(qer.size() + 4096, 0);
+    }
+};
+
+/// The six result fields of slots 0..n-1 of `sp`, in input order. Each slot is identified by
+/// `slot_of(p)` (the input index it must hold); throws if any is out of range or seen twice,
+/// or if a slot's dimensions no longer match its input pair.
+template <typename SlotOf>
+inline std::vector<ExtResult> read_bsw_results(const std::vector<SeqPair> &sp,
+                                               const std::vector<const ExtPair *> &pairs,
+                                               const std::string &what, SlotOf slot_of)
 {
     const int n = (int)pairs.size();
-    std::vector<uint8_t> ref, qer;
-    std::vector<SeqPair> sp(n + 64);
-    for (int q = 0; q < n; q++) {
-        SeqPair p;
-        memset(&p, 0, sizeof p);
-        p.id = p.seqid = p.regid = q;
-        p.idr = (int)ref.size();
-        p.idq = (int)qer.size();
-        p.len1 = (int)pairs[q]->target.size();
-        p.len2 = (int)pairs[q]->query.size();
-        p.h0 = pairs[q]->h0;
-        p.score = p.tle = p.gtle = p.qle = p.gscore = p.max_off = -1;
-        ref.insert(ref.end(), pairs[q]->target.begin(), pairs[q]->target.end());
-        qer.insert(qer.end(), pairs[q]->query.begin(), pairs[q]->query.end());
-        sp[q] = p;
-    }
-    ref.resize(ref.size() + 4096, 0);
-    qer.resize(qer.size() + 4096, 0);
-    if (width == 8) bsw.getScores8(sp.data(), ref.data(), qer.data(), n, 1, w);
-    else            bsw.getScores16(sp.data(), ref.data(), qer.data(), n, 1, w);
     std::vector<ExtResult> out(n);
     std::vector<char> seen(n, 0);
     for (int q = 0; q < n; q++) {
         const SeqPair &p = sp[q];
-        if (p.id < 0 || p.id >= n || seen[p.id])   // every pair's result read exactly once
-            throw std::logic_error("getScores" + std::to_string(width) + " returned pair id " +
-                                   std::to_string(p.id) + " at slot " + std::to_string(q) + " of " +
-                                   std::to_string(n));
-        seen[p.id] = 1;
-        ExtResult &o = out[p.id];
+        const int i = slot_of(p);
+        if (i < 0 || i >= n || seen[i])   // every pair's result read exactly once
+            throw std::logic_error(what + " returned pair " + std::to_string(i) + " at slot " +
+                                   std::to_string(q) + " of " + std::to_string(n));
+        if (p.len1 != (int)pairs[i]->target.size() || p.len2 != (int)pairs[i]->query.size() ||
+            p.h0 != pairs[i]->h0)
+            throw std::logic_error(what + ": slot " + std::to_string(q) + " lost pair " +
+                                   std::to_string(i) + "'s dimensions");
+        seen[i] = 1;
+        ExtResult &o = out[i];
         o.score = p.score; o.qle = p.qle; o.tle = p.tle; o.gtle = p.gtle;
         o.gscore = p.gscore; o.max_off = p.max_off;
     }
     return out;
+}
+
+/// Score `pairs` as one batch through getScores8 (`width` 8) or getScores16
+/// (`width` 16) with band `w`; returns each pair's six result fields in input
+/// order. Throws if the kernel hands back a pair id out of range or twice.
+inline std::vector<ExtResult> score_bsw_batch(IBandedPairWiseSW &bsw, const std::vector<const ExtPair *> &pairs,
+                                              int width, int w)
+{
+    const int n = (int)pairs.size();
+    BswBatch b(pairs);
+    if (width == 8) bsw.getScores8(b.sp.data(), b.ref.data(), b.qer.data(), n, 1, w);
+    else            bsw.getScores16(b.sp.data(), b.ref.data(), b.qer.data(), n, 1, w);
+    return read_bsw_results(b.sp, pairs, "getScores" + std::to_string(width),
+                            [](const SeqPair &p) { return p.id; });
+}
+
+/// Score `pairs` through the aligner's extension tier call (bsw_extend_tier_call: dedup, the
+/// tier's sort and kernel, the 8-bit divert past its band limit) with band `w`; returns each
+/// pair's six result fields in input order, read back by (seqid, regid) since the call
+/// permutes the array. Throws on a lost, duplicated or altered pair.
+inline std::vector<ExtResult> score_bsw_tier_call(IBandedPairWiseSW &bsw, const std::vector<const ExtPair *> &pairs,
+                                                  BswExtCall tier, int w)
+{
+    const int n = (int)pairs.size();
+    BswBatch b(pairs);
+    std::vector<SeqPair> scratch(b.sp.size());
+    std::vector<int32_t> hist(MAX_SEQ_LEN16 + 1, 0);
+    bsw_extend_tier_call(tier, &bsw, b.sp.data(), b.ref.data(), b.qer.data(), n, w, scratch.data(), hist.data());
+    return read_bsw_results(b.sp, pairs, "bsw_extend_tier_call", [](const SeqPair &p) {
+        const int i = p.seqid - 1000;
+        return p.regid == 7 * i + 3 ? i : -1;
+    });
 }
 
 } // namespace bwa_tests
