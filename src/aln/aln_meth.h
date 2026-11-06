@@ -57,7 +57,11 @@ int aln_meth_header(kstring_t *out, const aln_meth_ref_t *ref, const char *rg_li
 void aln_meth_convert(int read_no, const ubyte_t *in, int len, ubyte_t *out);
 
 /* Owned original-reference alignment. Reward includes raw global terminal-gap penalties;
- * display CIGAR uses stock terminal normalization. All CIGAR vectors use BAM op codes. */
+ * display CIGAR uses stock terminal normalization. All CIGAR vectors use BAM op codes.
+ * raw_cigar is used while the search ranks and accounts windows, and by mate and cap rescue on
+ * the alignments they build. Finishing a read (aln_meth_slot_finish, aln_meth_trim) frees it on
+ * the loci the search retained, so readers of those loci use cigar; the locus cap rescue writes
+ * into a read's occ keeps it. */
 struct aln_meth_alignment_t {
     int reward = 0;
     int64_t rb = 0, re = 0;
@@ -78,7 +82,10 @@ struct aln_meth_occ_t {
 // incomplete: lookup budget, an unrepresentable competitor, CIGAR storage, -m work budget
 enum { ALN_METH_BIND_BEST = 1, ALN_METH_BIND_UNREP = 2, ALN_METH_BIND_CIGAR = 4, ALN_METH_BIND_M = 8 };
 struct aln_meth_read_t {
-    std::vector<aln_meth_occ_t> occ; // best and all retained worse-cost loci, canonical order
+    // Best and all retained worse-cost loci, canonical order. Once finished, an incomplete read
+    // (flags != 0) keeps only its best-cost loci, and only its main hit once nothing redraws over
+    // them (no duplicate copies left to draw); c1/c2 still count every retained locus.
+    std::vector<aln_meth_occ_t> occ;
     int main = -1;
     int c1 = 0, c2 = 0;
     // Equal-cost loci displaced from c1 to c2, and their nearest conversion disadvantage.
@@ -96,8 +103,9 @@ struct aln_meth_group_t;
  * threads, read claiming, interleaved slots and duplicate handling). read_no: 1 for single-end
  * and read 1, 0 for read 2. The reads' ordinals in their stream are ord0 + i (each read's main-hit
  * draw is seeded from it). res[i] gets read i's result. keep_strata: keep every locus of both
- * strata (paired-end pairs on them); otherwise a read keeps its main hit, and the other loci only
- * when they will be printed as XA (at most max_xa_hits + 1 occurrences). */
+ * strata (paired-end pairs on them; an incomplete read, which never pairs, keeps only its main
+ * hit); otherwise a read keeps its main hit, and the other loci only when they will be printed as
+ * XA (at most max_xa_hits + 1 occurrences). */
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, struct aln_dup_state_t *dup, aln_meth_read_t *res);
