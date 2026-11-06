@@ -206,13 +206,10 @@ jobs:
 
       - name: Install apt dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev samtools libomp-dev ccache
-          # clang-19 (the shipping/benchmarked compiler) from apt.llvm.org so the
-          # perf harness builds representatively; libomp-19-dev provides omp.h for
-          # clang's -fopenmp. Matches the compiler floor added in the parent PR.
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19 && sudo apt-get install -y libomp-19-dev
-          clang++-19 --version | head -1
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev samtools ccache
+
+      - name: Install clang-19 and matching archive tools
+        uses: ./.github/actions/install-clang-19
 
       - name: Detect x86 ISA (avx2 / avx512bw)
         if: matrix.arch == 'x86'
@@ -417,12 +414,10 @@ jobs:
 
       - name: Install apt dependencies
         run: |
-          sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev libomp-dev ccache
-          # clang-19 from apt.llvm.org (shipping compiler + floor minimum);
-          # libomp-19-dev provides omp.h for clang's -fopenmp.
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh && chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19 && sudo apt-get install -y libomp-19-dev
-          clang++-19 --version | head -1
+          sudo apt-get update && sudo apt-get install -y zlib1g-dev libdeflate-dev ccache
+
+      - name: Install clang-19 and matching archive tools
+        uses: ./.github/actions/install-clang-19
 
       - name: Detect x86 ISA
         if: matrix.arch == 'x86'
