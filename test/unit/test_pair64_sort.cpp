@@ -9,7 +9,10 @@
 // (many equal x -- same position, different regions -- and distinct y), and
 // asserts the distinctness the argument rests on. (Duplicate pair64_t keys are
 // byte-identical, so a permutation difference among them could not be observed
-// anyway; the uniqueness argument, not the algorithm, carries the parity.)
+// anyway; the uniqueness argument, not the algorithm, carries the parity.) A
+// second case pins that for duplicate-heavy input too, which `aln`'s pairing
+// (src/aln/bwape.cpp) sorts with pdqsort_128: its rows repeat when a read has
+// the same position and tag twice, e.g. an unplaced (uint64_t)-1 position.
 //
 // Fixtures are generated in-memory; no test data files are read.
 #include <cstdint>
@@ -98,6 +101,47 @@ TEST_CASE("pdqsort_128 equals ks_introsort_128 on distinct (x, y) keys"
             for (size_t i = 1; i < k.size(); ++i)
                 CHECK((k[i - 1].x < k[i].x || (k[i - 1].x == k[i].x && k[i - 1].y < k[i].y)));
         }
+    }
+}
+
+// Duplicates are allowed: any input sorts to the one array ks_introsort_128
+// gives, because rows equal under (x, y) are the same bytes. Small x/y pools make
+// duplicates common; a pool of 1 makes every row equal; the extreme words include
+// (uint64_t)-1, `aln`'s unplaced position.
+TEST_CASE("pdqsort_128 equals ks_introsort_128 on duplicate-heavy keys"
+          * doctest::test_suite("unit/pair64_sort")) {
+    Rng rng(0xd0b1e5ULL);
+    auto check = [](std::vector<pair64_t> in) {
+        std::vector<pair64_t> p(in), k(in);
+        p.reserve(1);  // non-null data() for n == 0
+        k.reserve(1);
+        pdqsort_128(p.size(), p.data());
+        ks_introsort_128(k.size(), k.data());
+        return same(p, k);
+    };
+    auto pooled = [&rng](int n, int x_pool, int y_pool) {
+        std::vector<pair64_t> v(static_cast<size_t>(n));
+        for (auto &r : v) {
+            r.x = static_cast<uint64_t>(rng.in(0, x_pool - 1)) * 977;
+            r.y = static_cast<uint64_t>(rng.in(0, y_pool - 1));
+        }
+        return v;
+    };
+    for (int n = 0; n <= 300; ++n) {
+        CHECK(check(pooled(n, 3, 4)));
+        CHECK(check(pooled(n, 1 + n / 8, 2)));
+        CHECK(check(pooled(n, 1, 1 + n)));
+    }
+    for (int n = 301; n <= 5000; n += 53) {
+        CHECK(check(pooled(n, 5, 8)));
+        CHECK(check(pooled(n, 1000, 3)));
+    }
+    for (int n : {0, 1, 2, 3, 23, 24, 25, 100, 5000}) CHECK(check(pooled(n, 1, 1)));
+    const uint64_t vals[] = {0, 1, 2, 0x7fffffffffffffffULL, 0xfffffffffffffffeULL, 0xffffffffffffffffULL};
+    for (int n = 0; n <= 200; ++n) {
+        std::vector<pair64_t> v(static_cast<size_t>(n));
+        for (auto &r : v) { r.x = vals[rng.in(0, 5)]; r.y = vals[rng.in(0, 5)]; }
+        CHECK(check(v));
     }
 }
 
