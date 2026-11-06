@@ -36,7 +36,7 @@ std::vector<std::string> records(const std::string &path) {
         uint8_t *xr = bam_aux_get(rec, "XR");
         REQUIRE(xr != nullptr);
         CHECK(xr[0] == 'Z');
-        CHECK(std::string(bam_aux2Z(xr)) == "CT");
+        CHECK(std::string(bam_aux2Z(xr)) == ((rec->core.flag & BAM_FREAD2) ? "GA" : "CT"));
         if (!(rec->core.flag & BAM_FUNMAP)) {
             CHECK(bam_cigar2qlen(rec->core.n_cigar, bam_get_cigar(rec)) == rec->core.l_qseq);
             if (uint8_t *xa = bam_aux_get(rec, "XA")) {
@@ -154,4 +154,43 @@ TEST_CASE("aln_meth: SAM and BAM agree for both strands unmapped and QC-fail rec
     }
     const std::string cmd = "rm -rf '" + path + "'";
     CHECK(system(cmd.c_str()) == 0);
+}
+
+TEST_CASE("aln_meth: paired trimmed mates and orphan records agree in SAM and BAM") {
+    std::string path=aln_test::tmp_template("aln_meth_pe_bam");
+    REQUIRE(mkdtemp(&path[0])!=nullptr);
+    const std::string fa=path+"/ref.fa",f1=path+"/r1.fq",f2=path+"/r2.fq";
+    uint32_t seed=918;const std::string genome=aln_test::lcg_dna(seed,4000);
+    REQUIRE(aln_test::write_test_fasta(fa,{{"one",genome}}));
+    REQUIRE(invoke({"index","--meth",fa},true)==0);
+    FILE *fp[2]={fopen(f1.c_str(),"w"),fopen(f2.c_str(),"w")};
+    REQUIRE(fp[0]!=nullptr);REQUIRE(fp[1]!=nullptr);
+    for(int i=0;i<42;++i) {
+        const int start=100+60*i,span=180+i%11;
+        for(int j=0;j<2;++j) {
+            std::string read=j?aln_test::revcomp(genome.substr(start+span-60,60)):genome.substr(start,60);
+            if(i==40&&j==1) read=std::string(60,'N');
+            if(i==41) read=std::string(60,'N');
+            const int trim=i%2?17000:5;
+            read+=std::string(trim,'A');
+            const std::string qual=std::string(60,'I')+std::string(trim,'!');
+            fprintf(fp[j],"@p%d\n%s\n+\n%s\n",i,read.c_str(),qual.c_str());
+        }
+    }
+    REQUIRE(fclose(fp[0])==0);REQUIRE(fclose(fp[1])==0);
+    const std::string sam=path+"/out.sam",bam=path+"/out.bam";
+    const std::vector<std::string> common={"aln","--meth","-q","20","-n","2","-l","1024","-s"};
+    auto run=[&](bool binary,int threads) {
+        auto args=common;args.insert(args.end(),{"-t",std::to_string(threads),"-f",binary?bam:sam});
+        if(binary) args.push_back("--bam");
+        args.insert(args.end(),{fa,f1,f2});return invoke(args);
+    };
+    REQUIRE(run(false,1)==0);const auto a=records(sam);REQUIRE(a.size()==84);
+    REQUIRE(run(true,3)==0);CHECK(records(bam)==a);
+    REQUIRE(run(false,3)==0);CHECK(records(sam)==a);
+    auto cpg=common;cpg.insert(cpg.end(),{"--meth=taps","--meth-context","cpg","-f",sam,fa,f1,f2});
+    REQUIRE(invoke(cpg)==0);const auto context=records(sam);REQUIRE(context.size()==84);
+    cpg=common;cpg.insert(cpg.end(),{"--meth=taps","--meth-context","cpg","--bam","-f",bam,fa,f1,f2});
+    REQUIRE(invoke(cpg)==0);CHECK(records(bam)==context);
+    CHECK(system(("rm -rf '"+path+"'").c_str())==0);
 }

@@ -102,8 +102,9 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 void aln_meth_finish_se(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, const gap_opt_t *opt,
 						int max_xa_hits, int n, bwa_seq_t *seqs, aln_meth_read_t *res);
 
-/* Reserved for the later paired-end integration; paired-end meth is currently rejected.
- * Pairing/rescue must use consistent cost/count accounting and preserve the selected owned CIGAR. */
+/* sampe stages: select SE cost/counts, infer insert size, then pair on retained loci.
+ * Stage2 preserves the selected owned CIGAR and applies stock pairing MAPQ and mate rescue.
+ * Caller initializes the stock MAPQ table before dispatch; explicit incomplete ends are not promoted. */
 void aln_meth_pe_stage1(const gap_opt_t *opt, int n, bwa_seq_t *seqs[2], aln_meth_read_t *res[2]);
 int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, const gap_opt_t *opt, const pe_opt_t *popt,
 					   const isize_info_t *ii, int n, bwa_seq_t *seqs[2], aln_meth_read_t *res[2],

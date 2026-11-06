@@ -1,7 +1,7 @@
 # src/aln: bwa `aln`/`samse`/`sampe` port
 
 This directory holds the code behind `bwa-mem3 aln`, a fused port of bwa's
-short-read `aln` + `samse`/`sampe` pipeline whose output is byte-identical to
+short-read `aln` + `samse`/`sampe` pipeline whose output without `--meth` is byte-identical to
 stock bwa 0.7.19.
 
 ## Provenance
@@ -28,6 +28,7 @@ contributors" line in the headers of the files derived from them was added here.
 | `bwase.h`, `bwase.cpp` | `bwase.h`/`bwase.c`: the SAM half of samse (`bwa_aln2seq_core`, `bwa_sa2pos`, `bwa_cal_pac_pos_core`, `bwa_refine_gapped`, `bwa_print_sam1`), plus `bns_cnt_ambi` from `bntseq.c`; `bwa_pos_from_sa` (new) is `bwa_sa2pos`'s tail, split out |
 | `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, and `bwa_paired_sw`'s body as `bwa_paired_sw_core`/`bwa_paired_sw_report`) |
 | `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code (MIT, as the rest of bwa-mem3; `SPDX-License-Identifier` line): the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
+| `aln_meth.h`, `aln_meth.cpp`, `aln_meth_search.h`, `aln_meth_realign.h`, `aln_meth_realign.cpp` | new code (MIT): converted candidate-window discovery, owned fixed-reward global CIGARs, stock chemistry-aware cost/count accounting, and methylation single/paired output. See the ranking and resource limits below |
 | `aln_alloc.h` | new code (MIT): `aln_malloc`/`aln_calloc`/`aln_realloc`/`aln_strdup`, which exit with a message on allocation failure; every allocation in the files above goes through them (upstream dereferences the result unchecked) |
 | `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`, plus the new `bwt_sa_batch`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
 
@@ -336,4 +337,6 @@ This is cost-ranking of reward-refined candidate CIGARs, not minimum-cost optimi
 
 The total per-read SA lookup budget is `p_best + p_second` (4596 by default), not separate rank-dependent budgets. Repeated interval/span proposals and exact windows are deduplicated. Lookup or `-m` exhaustion marks a result incomplete: retain the best-known placement if one exists, classify it as repeat, and omit exact X0/X1/XA claims. Cumulative candidate CIGAR bytes are capped at 64 MiB per read, conservatively bounding retention even when a locus is replaced; the realignment wrapper separately guards its active allocation estimate. Invalid/unrepresentable results and resource failures are fatal, not skipped competitors.
 
-MAPQ reuses stock aln's heuristic, not a new reward-gap probability model. Known best-cost ties have MAPQ 0; explicit lookup/work-incomplete reads always have MAPQ 0. No stronger search-completeness or calibration guarantee than stock is implied. Paired-end meth, CpG enabling and the TAPS/5base neutral conversion-count tie-break remain assigned to later stages. Search gap ancestry, event logs and overflow fallback are no longer used.
+MAPQ reuses stock aln's heuristic, not a new reward-gap probability model. Known best-cost ties have MAPQ 0; explicit lookup/work-incomplete reads always have MAPQ 0. No stronger search-completeness or calibration guarantee than stock is implied. Paired-end meth uses stock sampe cost-based pairing and MAPQ on retained original-reference loci, with selected CIGAR/count/hypothesis ownership preserved. The pairing lookup limit remains at most 500 loci per end; explicit incomplete ends are not promoted by pairing/rescue. Both paths share paired batch/error handling and the same insert-size inference policy, parameterized by original reference length. Under `--meth-context cpg`, private original-reference windows use the shared seven-symbol CpG labels with true contig flanks and original ambiguity-run masking. Candidate and rescue global refinement uses exact full-band scalar fallback, not the five-symbol certificate or SIMD global path. Shared option validation requires TAPS/5base and non-collapsed scoring. The TAPS/5base neutral conversion-count tie-break is not implemented.
+
+The manual stock instruction gate requires both group and batch drivers and at least four compared functions. Missing symbols, empty disassembly and tool failures are errors. Build the positive control with `make EXTRA_CXXFLAGS=-DALN_DISASM_POSITIVE_CONTROL` and require a difference. This local gate is not CI coverage or cross-platform/LTO validation.

@@ -170,13 +170,13 @@ Methylation (--meth) options:
                  conversions are sparse, so collapsing costs specificity it
                  can't repay).
                  collapsed: C/T (and G/A) interchangeable, bwameth-compatible
-                 placement (mem: sets -B 2).
+                 placement in mem (sets mem -B 2).
                  genomic: free only the conversion direction, scored as a full
                  match, keep variants as mismatches (variant-aware: variants
-                 outside the conversion direction counted in NM; mem: -B 4).
+                 outside the conversion direction counted in NM; mem -B 4).
                  neutral: free only the conversion direction but score it 0
                  (tolerated, not rewarded); best for TAPS (variant-aware:
-                 variants counted in NM as in genomic; mem: -B 4). Not
+                 variants counted in NM as in genomic; mem -B 4). Not
                  for em-seq: its dense conversions cost short reads
                  their placement (a warning is printed).
                  In genomic/neutral a real variant in the conversion direction

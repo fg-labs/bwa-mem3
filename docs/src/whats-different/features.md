@@ -6,6 +6,20 @@ bwa-mem2. None of these features change default behavior: output produced by
 corresponding bwa-mem2 output (except for the `@PG` `ID:` and `PN:` fields
 which now read `bwa-mem3`).
 
+## Short-read `aln` and opt-in methylation
+
+[`bwa-mem3 aln`](../cli/aln.md) fuses stock bwa's short-read backtracking,
+samse and sampe commands. Without `--meth`, its compatibility target is stock bwa
+0.7.19, not bwa-mem2. `aln --meth` adds directional converted-window discovery,
+fixed chemistry-aware reward refinement and stock chemistry-aware cost/strata/MAPQ
+accounting on stored CIGARs. All chemistries require both original and converted
+indices from `index --meth`. CpG-only refinement uses a full-band scalar fallback.
+The command page documents discovery/resource limits and incomplete confidence.
+
+The MEM methylation placement, performance and accuracy measurements in the
+following sections do not validate `aln --meth`. Its revised candidate-refinement
+path has synthetic correctness checks, not those empirical MEM results.
+
 ## `--meth` bisulfite alignment mode (PR #13)
 
 `--meth` adds native bisulfite/EM-seq alignment to `bwa-mem3 index` and
@@ -63,7 +77,7 @@ counts toward `NM`; `XM:Z` is unchanged. `cpg` requires `--meth=taps` or
 `--meth=5base` and a `--meth-scoring` other than `collapsed`. See
 [Flags → --meth-context](../methylation/flags.md#--meth-context-allcpg) and
 [Illumina 5-base → Choosing --meth-context cpg](../methylation/5base.md#choosing---meth-context-cpg)
-for the accuracy and run-time measurements.
+for the MEM accuracy and run-time measurements.
 
 ## `--meth-seed-prune` bisulfite seed prune
 

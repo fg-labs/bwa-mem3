@@ -51,12 +51,18 @@ void bwa_pe_aln2seq(int n_seqs, bwa_seq_t *seqs[2]);
 void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], const gap_opt_t *gopt);
 void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, const pe_opt_t *opt,
 				  const isize_info_t *last_ii);
+/* Same stock inference/fallback policy with an explicit original reference length. */
+void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
+                      const pe_opt_t *opt, const isize_info_t *last_ii);
 int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
 				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt);
 /* sampe's pairing of one pair, for the unit tests' reference: `arr` holds upstream's
  * (position, k<<2 | strand<<1 | end) array for the pair (sorted in place); the alignments are
  * p[0]->aln and p[1]->aln. Returns the number of alignments whose position changed. */
 int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
+/* Stock scoring/count aggregation, restricted to same-contig candidates before selection. */
+int bwa_pe_pairing_same_contig(const bntseq_t *bns, bwa_seq_t *p[2], pair64_v *arr,
+                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
 /* The largest weight of a group of pairs in bwa_pe_pair (see bwa_pe_pair_grouped). */
 constexpr long long ALN_PE_GROUP_ROWS = 8192;
 /* bwa_pe_pair with the group size as a parameter (bwa_pe_pair passes ALN_PE_GROUP_ROWS); the unit
