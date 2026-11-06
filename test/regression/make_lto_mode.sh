@@ -256,12 +256,15 @@ EOF
             "$stub_dir/lto-consumer"
             echo "ok: real $mode fat archive: native and LTO consumers link and run"
         done
-        # The first probe succeeded, so no ld.bfd directories were added.
-        resolve_vars "real toolchain: no ld.bfd directories added" "" CXX="$CXX" CC="$CC"
-        if ((rc == 0)) && [[ -z $got_libdirs ]]; then
+        # Isolate the first-link path from incidental production dependencies:
+        # a valid host may need ld.bfd fallback for libraries under /usr/local.
+        # The production auto/thin assertions above retain their real libraries.
+        resolve_vars "real toolchain: no ld.bfd directories added" "" CXX="$CXX" CC="$CC" BWA_LTO_PROBE_LIBS=
+        if ((rc == 0)) && [[ $got_mode == full && -z $got_libdirs ]] && ! grep -qF NOTE "$err_file"; then
             echo "ok: real toolchain adds no ld.bfd directories"
         else
-            echo "FAIL: real toolchain: expected an empty BWA_LTO_LIBDIRS, got '$got_libdirs' (exit $rc)" >&2
+            echo "FAIL: isolated real toolchain: expected full, no NOTE and empty BWA_LTO_LIBDIRS, got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
+            cat "$err_file" >&2
             fail=1
         fi
         # A library only ld.bfd finds (libdeflate under /usr/local/lib64 on
@@ -297,7 +300,9 @@ exec "$real" "\$@"
 EOF
             chmod +x "$stub_dir/bfdonly-$name"
         done
-        bfd_args=(CXX="$stub_dir/bfdonly-clang++" CC="$stub_dir/bfdonly-clang")
+        # Fake ld.bfd replaces the host search dirs; exclude unrelated libraries
+        # so missing host-only dependencies cannot defeat the synthetic retry.
+        bfd_args=(CXX="$stub_dir/bfdonly-clang++" CC="$stub_dir/bfdonly-clang" BWA_LTO_PROBE_LIBS=)
         resolve_vars "a library only ld.bfd finds" "$stub_dir/bin" "${bfd_args[@]}"
         if ((rc == 0)) && [[ $got_mode == full && $got_libdirs == "$bfd_flag" && $got_ldflags == *" $bfd_flag" ]] \
             && ! grep -qF "NOTE" "$err_file"; then
@@ -423,37 +428,193 @@ cat > "$stub_dir/retry-bin/ld.bfd" << 'EOF'
 printf 'SEARCH_DIR("%s");\n' "$RETRY_DIR"
 EOF
 chmod +x "$stub_dir/retry-bin/ld.bfd"
-for retry_dir in "$stub_dir/plain+lib" "=$stub_dir/equal-lib"; do
-    mkdir -p "${retry_dir#=}"
-    RETRY_DIR="$retry_dir" RETRY_FLAG="-Wl,-L$retry_dir" resolve_vars "safe retry directory" "$stub_dir/retry-bin" "${probe_args[@]}"
-    if ((rc != 0)) || [[ $got_mode != full || $got_libdirs != "-Wl,-L$retry_dir" ]]; then
-        echo "FAIL: safe retry directory '$retry_dir': got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
-        fail=1
-    else
-        echo 'ok: safe retry directory retains LTO'
-    fi
+# Exercise both production configurations and requested modes through the same
+# native-consumer seam, including a forced error for every rejected directory.
+for layout in single multi; do
+    layout_args=(arch=avx2)
+    [[ $layout == multi ]] && layout_args=(arch=)
+    for mode in full thin; do
+        for retry_dir in "$stub_dir/plain+lib" "=$stub_dir/equal-lib"; do
+            mkdir -p "${retry_dir#=}"
+            RETRY_DIR="$retry_dir" RETRY_FLAG="-Wl,-L$retry_dir" resolve_vars "safe retry directory" "$stub_dir/retry-bin" "${probe_args[@]}" "${layout_args[@]}" "LTO=$mode"
+            if ((rc != 0)) || [[ $got_mode != "$mode" || $got_libdirs != "-Wl,-L$retry_dir" ]]; then
+                echo "FAIL: safe retry directory '$retry_dir': got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
+                fail=1
+            else
+                echo "ok: $layout/$mode safe retry directory retains LTO"
+            fi
+        done
+        sysroot="$stub_dir/sysroot"
+        mkdir -p "$sysroot/bwa-retry-only/lib"
+        RETRY_SYSROOT="$sysroot" RETRY_DIR='=/bwa-retry-only/lib' RETRY_FLAG='-Wl,-L=/bwa-retry-only/lib' \
+            resolve_vars 'sysroot-only retry directory' "$stub_dir/retry-bin" "${probe_args[@]}" "${layout_args[@]}" "LTO=$mode"
+        if ((rc != 0)) || [[ $got_mode != "$mode" || $got_libdirs != '-Wl,-L=/bwa-retry-only/lib' ]]; then
+            echo "FAIL: sysroot-only retry directory: got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
+            fail=1
+        else
+            echo "ok: $layout/$mode sysroot-only retry directory retains LTO"
+        fi
+        for suffix in "has space" "O'Reilly" "dollar\$lib" 'semi;lib' 'comma,lib' 'back`tick' 'hash#lib'; do
+            retry_dir="$stub_dir/$suffix"
+            mkdir -p "$retry_dir"
+            RETRY_DIR="$retry_dir" RETRY_FLAG="-Wl,-L$retry_dir" resolve_vars "unsafe retry directory" "$stub_dir/retry-bin" "${probe_args[@]}" "${layout_args[@]}" LTO=auto
+            if ((rc != 0)) || [[ $got_mode != off || -n $got_libdirs || -n $got_ldflags ]]; then
+                echo "FAIL: unsafe retry directory '$retry_dir' did not fall back to off (exit $rc)" >&2
+                fail=1
+            else
+                echo "ok: $layout/$mode unsafe retry directory falls back without LTO flags"
+            fi
+            RETRY_DIR="$retry_dir" RETRY_FLAG="-Wl,-L$retry_dir" PATH="$stub_dir/retry-bin:$PATH" \
+                expect_error "archive" "$layout/$mode rejects unsafe retry directory" "${probe_args[@]}" "${layout_args[@]}" "LTO=$mode"
+        done
+    done
 done
-sysroot="$stub_dir/sysroot"
-mkdir -p "$sysroot/bwa-retry-only/lib"
-RETRY_SYSROOT="$sysroot" RETRY_DIR='=/bwa-retry-only/lib' RETRY_FLAG='-Wl,-L=/bwa-retry-only/lib' \
-    resolve_vars 'sysroot-only retry directory' "$stub_dir/retry-bin" "${probe_args[@]}"
-if ((rc != 0)) || [[ $got_mode != full || $got_libdirs != '-Wl,-L=/bwa-retry-only/lib' ]]; then
-    echo "FAIL: sysroot-only retry directory: got '$got_mode' / '$got_libdirs' (exit $rc)" >&2
-    fail=1
-else
-    echo 'ok: sysroot-only retry directory retains LTO'
+
+# Probe the selected driver, whose linker may live beside a versioned compiler
+# rather than have an unversioned name on PATH. The native wrapper exercises
+# this capability check on Darwin too; it is not an ELF collision validation.
+# The fixture compiles and links FatLTO objects in both modes, so probe exactly
+# that too: a driver whose lld links natively but rejects FatLTO input must
+# skip (or, with EXPECT_LTO, fail) here, not die mid-fixture.
+collision_driver_ready() {
+    local compiler=$1 major mode
+    : > "$stub_dir/collision-driver.log"
+    "$compiler" --version > "$stub_dir/collision-version" 2>&1 \
+        && grep -q clang "$stub_dir/collision-version" \
+        && major=$("$compiler" -dumpversion) && [[ ${major%%.*} -ge 19 ]] \
+        && "$compiler" -fuse-ld=lld "$stub_dir/collision-probe.cpp" \
+            -o "$stub_dir/collision-probe" >> "$stub_dir/collision-driver.log" 2>&1 \
+        || return 1
+    for mode in full thin; do
+        "$compiler" -flto="$mode" -ffat-lto-objects -c "$stub_dir/collision-probe.cpp" \
+            -o "$stub_dir/collision-probe-$mode.o" >> "$stub_dir/collision-driver.log" 2>&1 \
+            && "$compiler" -flto="$mode" -ffat-lto-objects -fuse-ld=lld "$stub_dir/collision-probe-$mode.o" \
+                -o "$stub_dir/collision-probe-$mode" >> "$stub_dir/collision-driver.log" 2>&1 \
+            || return 1
+    done
+}
+printf 'int main(){return 0;}\n' > "$stub_dir/collision-probe.cpp"
+if ! collision_driver_ready "$stub_dir/native-clang"; then
+    echo 'FAIL: collision fixture rejected a working compiler driver' >&2
+    exit 1
 fi
-for suffix in "has space" "O'Reilly" "dollar\$lib" 'semi;lib' 'comma,lib' 'back`tick' 'hash#lib'; do
-    retry_dir="$stub_dir/$suffix"
-    mkdir -p "$retry_dir"
-    RETRY_DIR="$retry_dir" RETRY_FLAG="-Wl,-L$retry_dir" resolve_vars "unsafe retry directory" "$stub_dir/retry-bin" "${probe_args[@]}"
-    if ((rc != 0)) || [[ $got_mode != off || -n $got_libdirs || -n $got_ldflags ]]; then
-        echo "FAIL: unsafe retry directory '$retry_dir' did not fall back to off (exit $rc)" >&2
-        fail=1
-    else
-        echo 'ok: unsafe retry directory falls back without LTO flags'
+cat > "$stub_dir/broken-link-clang" << 'EOF'
+#!/usr/bin/env bash
+case ${1:-} in
+    --version) echo 'clang version 21.0.0'; exit 0 ;;
+    -dumpversion) echo 21; exit 0 ;;
+esac
+echo 'collision linker rejected input' >&2
+exit 1
+EOF
+chmod +x "$stub_dir/broken-link-clang"
+if collision_driver_ready "$stub_dir/broken-link-clang"; then
+    echo 'FAIL: collision fixture accepted a compiler that cannot link' >&2
+    exit 1
+fi
+if ! grep -q 'collision linker rejected input' "$stub_dir/collision-driver.log"; then
+    echo 'FAIL: collision fixture lost the linker diagnostic' >&2
+    exit 1
+fi
+echo 'ok: collision readiness links through the selected driver and rejects a broken linker'
+
+# Linux-only resolution gate: use the real production link recipes with tiny
+# native inputs, real fat objects, and two archives defining the same symbol.
+# Darwin wrappers above test control flow, not ELF driver search ordering.
+if [[ $OS != Linux ]]; then
+    echo 'skip: Linux clang19+/lld collision fixture (requires native Linux; Darwin is not an ELF link validation)'
+elif ! collision_driver_ready "$CXX"; then
+    if [[ -n ${EXPECT_LTO:-} ]]; then
+        [[ ! -f $stub_dir/collision-driver.log ]] || cat "$stub_dir/collision-driver.log" >&2
+        echo 'FAIL: EXPECT_LTO requires the Linux clang19+/lld collision fixture' >&2
+        exit 1
     fi
-done
+    echo 'skip: Linux collision fixture unavailable (requires clang19+ and ld.lld with FatLTO support; set EXPECT_LTO=full to require it)'
+else
+    root=$PWD
+    # The fixture's make runs from $collision: resolve the selected tools now
+    # so a relative MAKE or compiler path does not resolve from there.
+    if ! collision_make=$(command -v "$MAKE") || [[ -z $collision_make ]]; then
+        echo "FAIL: cannot resolve MAKE='$MAKE' for the collision fixture" >&2
+        exit 1
+    fi
+    [[ $collision_make == /* ]] || collision_make="$root/$collision_make"
+    collision_cxx=$real_cxx
+    [[ $collision_cxx == /* ]] || collision_cxx="$root/$collision_cxx"
+    collision_cc=$REAL_CC
+    [[ $collision_cc == /* ]] || collision_cc="$root/$collision_cc"
+    collision="$stub_dir/collision"
+    mkdir -p "$collision/src" "$collision/project" "$collision/retry"
+    ln -s "$root/scripts" "$collision/scripts"
+    ln -s "$root/version.txt" "$collision/version.txt"
+    printf 'int collision_symbol(void){return 17;}\n' > "$collision/project.c"
+    printf 'int collision_symbol(void){return 29;}\n' > "$collision/retry.c"
+    printf 'int retry_only_symbol(void){return 5;}\n' > "$collision/retry-only.c"
+    printf 'extern "C" int collision_symbol(void); extern "C" int retry_only_symbol(void); int main(){return collision_symbol()+retry_only_symbol();}\n' > "$collision/main.cpp"
+    printf 'int tier_marker(void){return 0;}\n' > "$collision/tier.c"
+    "$CC" -c "$collision/project.c" -o "$collision/project.o"
+    "$CC" -c "$collision/retry.c" -o "$collision/retry.o"
+    "$CC" -c "$collision/retry-only.c" -o "$collision/retry-only.o"
+    "${AR:-ar}" rcs "$collision/retry/libretryonly.a" "$collision/retry-only.o"
+    "${AR:-ar}" rcs "$collision/project/libcollision.a" "$collision/project.o"
+    "${AR:-ar}" rcs "$collision/retry/libcollision.a" "$collision/retry.o"
+    "${AR:-ar}" rcs "$collision/empty.a"
+    "$CC" -c "$collision/tier.c" -o "$collision/tier.o"
+    for mode in full thin; do
+        "$CXX" -O2 -flto="$mode" -ffat-lto-objects -c "$collision/main.cpp" -o "$collision/src/main.o"
+        # A canary proves the retry archive is real and observably different.
+        "$CXX" -flto="$mode" -ffat-lto-objects -fuse-ld=lld "$collision/src/main.o" \
+            "-Wl,-L$collision/retry" -lcollision -lretryonly -o "$collision/canary"
+        selected=0
+        "$collision/canary" || selected=$?
+        if ((selected != 34)); then
+            echo "FAIL: $mode collision canary selected $selected, expected retry symbols 34" >&2
+            exit 1
+        fi
+        for layout in single multi; do
+            goal='collision-bin'
+            tier=()
+            if [[ $layout == multi ]]; then
+                goal=all-single
+                tier=("KERNEL_TIER_OBJS_LINK=$collision/tier.o")
+            fi
+            # Run outside the project so no flags stamp, version header or
+            # production object can be modified by these synthetic overrides.
+            if ! (
+                cd "$collision"
+                "$collision_make" -f "$root/Makefile" -o ext/htslib/htslib_static.mk \
+                    -o .build-flags -o src/main.o -o "$collision/empty.a" \
+                    "$goal" "CXX=$collision_cxx" "CC=$collision_cc" \
+                    UNAME_M=x86_64 UNAME_S=Linux arch=avx2 ARM_TUNE= \
+                    VERSION_STRING=collision EXE=collision-bin USE_MIMALLOC=0 ZLIBNG_USE_VENDORED=0 \
+                    "BWA_LIB=$collision/empty.a" "HTS_LIB=$collision/empty.a" OBJS= \
+                    LIBSAIS_OBJS= KERNEL_TIER_OBJS= "${tier[@]}" \
+                    CXXFLAGS=-O2 CPPFLAGS= 'LDFLAGS=-v -Wl,-t' \
+                    "LIBS=-L$collision/project -lcollision -lretryonly" \
+                    "BWA_LTO_MODE=$mode" "BWA_LTO_LIBDIRS=-Wl,-L$collision/retry"
+            ) > "$stub_dir/collision-link-$layout-$mode.log" 2>&1; then
+                cat "$stub_dir/collision-link-$layout-$mode.log" >&2
+                echo "FAIL: Linux $layout/$mode collision link failed" >&2
+                exit 1
+            fi
+            cat "$stub_dir/collision-link-$layout-$mode.log"
+            if ! grep -q 'ld.lld' "$stub_dir/collision-link-$layout-$mode.log" \
+                || ! grep -qF "$collision/project/libcollision.a" "$stub_dir/collision-link-$layout-$mode.log"; then
+                echo "FAIL: $layout/$mode collision fixture lacks real linker/archive trace" >&2
+                exit 1
+            fi
+            selected=0
+            "$collision/collision-bin" || selected=$?
+            if ((selected != 22)); then
+                echo "FAIL: $layout/$mode collision selected $selected, expected project+retry-only symbols 22" >&2
+                exit 1
+            fi
+            rm "$collision/collision-bin"
+            echo "ok: Linux $layout/$mode real link selects project+retry-only symbols 22; retry canary selects 34"
+        done
+    done
+    echo 'PASS: Linux collision fixture (both production link recipes, full/thin, driver/link trace and executed symbols)'
+fi
 
 # The actual library recipe must honor AR, not just the capability probe.
 cat > "$stub_dir/reject-ar" << 'EOF'

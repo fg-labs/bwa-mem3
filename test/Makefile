@@ -320,6 +320,12 @@ $(INTEGRATION_DIR)/placeholder.o: $(INTEGRATION_DIR)/placeholder.cpp
 # for here as well: a libbwa.a restored from a cache does not bring it along.
 ifeq ($(ZLIBNG_USE_VENDORED),1)
 PARENT_EXTRA_OBJS += ext/zlib-ng/build/libz-ng.a
+# A normal parent gate plus recipe makes make refresh the archive timestamp
+# after the sub-make; an order-only gate caches the old timestamp on make 3.81.
+# Consumers still relink only when the archive itself actually changed.
+../ext/zlib-ng/build/libz-ng.a: libsais-objs
+	@:
+$(EXE) $(UNIT_BIN) $(INTEGRATION_BIN): ../ext/zlib-ng/build/libz-ng.a
 endif
 
 libsais-objs:

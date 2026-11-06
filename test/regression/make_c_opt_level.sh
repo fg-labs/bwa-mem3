@@ -35,14 +35,19 @@
 #      the line, and pgo-generate / pgo-use (EXTRA_CXXFLAGS) and lto-build
 #      (EXTRA_CFLAGS) forward it to their sub-makes.
 #
-# Checked with `make -n -B` on single objects and on the bwa-mem3 link (with
-# the prebuilt libraries held old), so it needs no built tree. The LTO link
-# case sets BWA_LTO_MODE=full on the command line, which skips the toolchain
-# probe, so it dry-runs on any host.
+# Dry-run checks use `make -n -B` on objects and links, holding libraries old.
+# Native checks also compile/run the differential reader, profiling off/on:
+# selected compression libraries and their generated headers must already exist.
+# The LTO link check forces BWA_LTO_MODE=full, so it dry-runs on every host.
 #
 # Inputs:
 #   MAKE      — make binary (default: make)
-#   MAKE_ARGS — extra make arguments, e.g. "arch=avx2 CXX=clang++ CC=clang"
+#   MAKE_ARGS — extra make arguments, e.g. "arch=avx2 CXX=clang++ CC=clang".
+#               Native probe preserves compiler/library configuration and the
+#               include paths (-I/-isystem/-idirafter/-iquote) of CPPFLAGS from
+#               the environment or MAKE_ARGS; overrides instrumentation, native
+#               tuning, and sentinel CFLAGS/CPPFLAGS.
+#   CC, CXX   — compiler defaults, overridden by MAKE_ARGS as with make itself.
 set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
@@ -74,7 +79,7 @@ compile_line() { # <env assignments...> -- <make args...>
     # clean tree make would otherwise remake it, and so build htslib, before
     # printing the variable.
     local hold=() v w words
-    if [[ $KIND == link ]]; then
+    if [[ $KIND == link || $KIND == reader_diff ]]; then
         for v in BWA_LIB HTS_LIB LIBSAIS_OBJS MIMALLOC_LIB ZLIBNG_LIB; do
             words=$("$MAKE" -s -o ext/htslib/htslib_static.mk "${make_args[@]}" "print-$v" 2> /dev/null) || true
             # These three always name something to hold; empty means the
@@ -91,7 +96,7 @@ compile_line() { # <env assignments...> -- <make args...>
     fi
     local out
     out=$(env -u CFLAGS -u CXXFLAGS -u CPPFLAGS -u EXTRA_CFLAGS -u EXTRA_CXXFLAGS -u COVERAGE_OPT -u LDFLAGS "${envs[@]}" "$MAKE" -n -B "${hold[@]}" "${make_args[@]}" "$@" "$OBJ" 2>&1) || true
-    if [[ $KIND == link ]]; then
+    if [[ $KIND == link || $KIND == reader_diff ]]; then
         LINE=$(grep -E -- " -o $SRC( |\$)" <<< "$out" | tail -n 1) || true
     else
         LINE=$(grep -F -- "$SRC" <<< "$out" | grep -E -- ' -c ' | tail -n 1) || true
@@ -315,4 +320,113 @@ if ((${#tier_names[@]} > 0)); then
     echo "PASS: kernel tier ISA macros do not inherit a stronger compiler baseline"
 fi
 
-echo "PASS: make_c_opt_level (reader C TUs: -g -O3 by default, environment CFLAGS -O0 overridden, ASAN=1 -O1, EXTRA_CFLAGS=-O0 honoured; an -O in CPPFLAGS ignored on reader, C++ and kernel TUs and the LTO link, with ASAN/COVERAGE levels and other flags kept; -DNDEBUG in CPPFLAGS stripped, EXTRA_CXXFLAGS/EXTRA_CFLAGS=-DNDEBUG honoured and forwarded through pgo-generate, pgo-use and lto-build; a command-line CPPFLAGS reaches lto-build's sub-make filtered)"
+# The differential reader compiles C directly rather than using .c.o. Check
+# that it sees the same effective preprocessor and ARM tuning flags as production.
+OBJ=fr_fastq_diff_test SRC=fr_fastq_diff_test KIND=reader_diff
+for tuning in ARM_CPU=neoverse-n1 ARM_TUNE=neoverse-v2; do
+    check "differential reader, $tuning" -O3 'CPPFLAGS=-DREADER_FLAGS_PROBE=1' -- \
+        UNAME_M=aarch64 UNAME_S=Linux ARM_TUNE= "$tuning" LTO=off
+    # $(CFLAGS) precedes $(SRC_CFLAGS) on the reader line: an environment -O2
+    # must not replace the reader's -O3.
+    check "differential reader, $tuning, environment CFLAGS=-O2" -O3 \
+        CFLAGS=-O2 'CPPFLAGS=-DREADER_FLAGS_PROBE=1' -- \
+        UNAME_M=aarch64 UNAME_S=Linux ARM_TUNE= "$tuning" LTO=off
+    case "$tuning" in
+        ARM_CPU=*) tune_flag=-mcpu=${tuning#*=} ;;
+        ARM_TUNE=*) tune_flag=-mtune=${tuning#*=} ;;
+    esac
+    for flag in -DREADER_FLAGS_PROBE=1 "$tune_flag"; do
+        if [[ " $LINE " != *" $flag "* ]]; then
+            echo "FAIL: differential reader: $flag missing from C invocation"
+            echo "  $LINE"
+            exit 1
+        fi
+    done
+    echo "ok: differential reader flags: $LINE"
+done
+
+# Also execute the C recipe, not just its dry-run rendering. Keep its binary
+# and flags stamp in a tiny workspace; source and dependency symlinks are read-only.
+root=$PWD
+probe_dir=$(mktemp -d -t bwamem3-reader-flags-XXXXXX)
+trap 'rm -rf "$probe_dir"' EXIT
+for path in src test ext scripts version.txt; do ln -s "$root/$path" "$probe_dir/$path"; done
+cat > "$probe_dir/cc" << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf 'reader C invocation:'
+printf ' %s' "$@"
+printf '\n'
+read -r -a compiler <<< "$READER_REAL_CC"
+case ${1:-} in --version | -dumpversion) exec "${compiler[@]}" "$@" ;; esac
+for flag in -DREADER_FLAGS_PROBE=1 -DREADER_CFLAGS_PROBE=1 "$READER_NATIVE_FLAG"; do
+    found=0
+    for arg in "$@"; do [[ $arg == "$flag" ]] && found=1; done
+    if ((found == 0)); then
+        echo "FAIL: actual differential C invocation lacks $flag" >&2
+        exit 1
+    fi
+done
+exec "${compiler[@]}" "$@"
+EOF
+chmod +x "$probe_dir/cc"
+export READER_REAL_CC
+if ! compiler_output=$("$MAKE" -s -o ext/htslib/htslib_static.mk "${make_args[@]}" LTO=off print-CC); then
+    echo 'FAIL: cannot resolve C compiler for selected MAKE_ARGS' >&2
+    exit 1
+fi
+READER_REAL_CC=$(tail -n 1 <<< "$compiler_output")
+if [[ -z $READER_REAL_CC ]]; then
+    echo 'FAIL: selected make configuration has no C compiler' >&2
+    exit 1
+fi
+case $(uname -m) in
+    arm64 | aarch64)
+        native_settings=(ARM_CPU=native)
+        export READER_NATIVE_FLAG=-mcpu=native
+        ;;
+    *)
+        native_settings=(arch=native)
+        export READER_NATIVE_FLAG=-march=native
+        ;;
+esac
+# Replace the caller's CPPFLAGS (environment or MAKE_ARGS) with the probe
+# sentinels so profiling and flag checks stay isolated, but keep its include
+# paths: a system zlib-ng header may be found only through them.
+native_args=()
+caller_cppflags=${CPPFLAGS:-}
+for arg in "${make_args[@]}"; do
+    case $arg in
+        CPPFLAGS=*) caller_cppflags+=" ${arg#CPPFLAGS=}" ;;
+        CFLAGS=*) ;;
+        *) native_args+=("$arg") ;;
+    esac
+done
+read -r -a caller_cppflags_words <<< "$caller_cppflags"
+include_cppflags=()
+for ((i = 0; i < ${#caller_cppflags_words[@]}; i++)); do
+    word=${caller_cppflags_words[i]}
+    case $word in
+        -I | -isystem | -idirafter | -iquote)
+            include_cppflags+=("$word")
+            ((i + 1 < ${#caller_cppflags_words[@]})) && include_cppflags+=("${caller_cppflags_words[++i]}")
+            ;;
+        -I* | -isystem* | -idirafter* | -iquote*) include_cppflags+=("$word") ;;
+    esac
+done
+(
+    cd "$probe_dir"
+    for profiling in 0 1; do
+        rm -f fr_fastq_diff_test
+        profile_cppflags=
+        [[ $profiling == 1 ]] && profile_cppflags=-DSTAGE_PROF=1
+        CPPFLAGS="${include_cppflags[*]} -DREADER_FLAGS_PROBE=1 $profile_cppflags" "$MAKE" -s -f "$root/Makefile" "${native_args[@]}" \
+            -o ext/htslib/htslib_static.mk -o ext/zlib-ng/build/libz-ng.a \
+            fr_fastq_diff_test "CC=$probe_dir/cc" \
+            CFLAGS=-DREADER_CFLAGS_PROBE=1 \
+            VERSION_STRING=reader-flags LTO=off ARM_TUNE= "${native_settings[@]}" "STAGE_PROF=$profiling"
+        ./fr_fastq_diff_test
+        echo "ok: executed reader recipe STAGE_PROF=$profiling with selected MAKE_ARGS compiler/library mode"
+    done
+)
+echo "PASS: make_c_opt_level (production and differential reader flags, executed native C recipe, optimization levels, CPPFLAGS filtering, recursive forwarding and kernel ISA isolation)"
