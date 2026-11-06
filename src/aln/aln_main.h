@@ -16,6 +16,8 @@ struct aln_opt_t {
 	int batch_size;             // reads per batch (default 0x40000); a test hook, not a CLI option
 	int share_dup_search;       // identical reads of a batch share one search (default 1; the output
 	                            // is the same either way); a test hook, not a CLI option
+	const struct aln_meth_opt_t *meth = nullptr;     // --meth settings (null without --meth)
+	const struct aln_meth_ref_t *meth_ref = nullptr; // --meth references (null without --meth)
 };
 
 /* Stock defaults: gap_init_opt(), max_xa_hits 3, batch_size 0x40000, share_dup_search 1. */
@@ -37,6 +39,11 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
  * or 1 on an input or output error, as aln_run_se, or on mismatched pair names. */
 int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
 			   const char *fn_fq1, const char *fn_fq2, aln_out_t *out);
+
+/* aln_run_se and aln_run_pe under --meth (o->meth and o->meth_ref set): `bwt` is the converted
+ * index; positions, the header and the records use o->meth_ref's original reference. */
+int aln_run_se_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq, aln_out_t *out);
+int aln_run_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq1, const char *fn_fq2, aln_out_t *out);
 
 } // namespace bwa_aln
 

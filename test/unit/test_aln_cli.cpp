@@ -8,6 +8,8 @@
 
 #include "aln_test_ref.h"
 #include "../../src/aln/aln_main.h"
+#include "../../src/aln/aln_meth.h"
+#include "../../src/compat_target.h"
 #include "../../src/bwa.h"
 
 #include <cstdio>
@@ -219,4 +221,104 @@ TEST_CASE("aln_cli: -f naming an index file is refused and the index is left int
         CHECK(slurp(comp) == before);
     }
     CHECK(run({"-f", x.dir + "/after.sam", x.prefix, x.fq}) == 0); // the index still works
+}
+
+TEST_CASE("aln_cli: meth uses the original header and rejects user SQ records"
+          * doctest::test_suite("unit/aln_cli")) {
+    bwa_aln::aln_meth_ref_t ref;
+    bntseq_t bns = {};
+    bntann1_t ann = {};
+    char name[] = "chr1";
+    ann.name = name; ann.len = 100;
+    bns.n_seqs = 1; bns.anns = &ann;
+    ref.bns = &bns;
+    kstring_t hdr = {0, 0, nullptr};
+    REQUIRE(bwa_aln::aln_meth_header(&hdr, &ref, "@RG\tID:x", "@PG\tID:aln", nullptr) == 0);
+    const std::string text(hdr.s, hdr.l);
+    CHECK(text.find(BWAMEM3_DEFAULT_HD_LINE) == 0);
+    CHECK(text.find("@SQ\tSN:chr1\tLN:100\n") != std::string::npos);
+    CHECK(text.find("@RG\tID:x") != std::string::npos);
+    free(hdr.s);
+    hdr = {0, 0, nullptr};
+    CHECK(bwa_aln::aln_meth_header(&hdr, &ref, "@RG\tID:x\n@SQ\tSN:chr1\tLN:100", nullptr, nullptr) == -1);
+    CHECK(hdr.l == 0);
+    free(hdr.s);
+    CliIndex &x = fixture();
+    const std::string out = x.dir + "/meth-sq.sam";
+    CHECK(run({"--meth", "-r", "@RG\\tID:x\\n@SQ\\tSN:chr1\\tLN:100", "-f", out, x.prefix, x.fq}) == 1);
+    CHECK(access(out.c_str(), F_OK) != 0);
+    std::memset(bwa_rg_id, 0, sizeof bwa_rg_id);
+}
+
+TEST_CASE("aln_cli: meth reference checks contig names lengths and offsets"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex &x = fixture();
+    bntseq_t *orig = bns_restore(x.prefix.c_str());
+    REQUIRE(orig != nullptr);
+    std::vector<bntann1_t> anns(2 * orig->n_seqs);
+    std::vector<std::string> names(anns.size());
+    bntseq_t conv = {};
+    conv.n_seqs = (int)anns.size(); conv.l_pac = 2 * orig->l_pac; conv.anns = anns.data();
+    for (int i = 0; i < orig->n_seqs; ++i) {
+        for (int h = 0; h < 2; ++h) {
+            const int j = 2 * i + h;
+            names[j] = std::string(h ? "f" : "r") + orig->anns[i].name;
+            anns[j].name = &names[j][0];
+            anns[j].len = orig->anns[i].len;
+            anns[j].offset = 2 * orig->anns[i].offset + h * (int64_t)orig->anns[i].len;
+        }
+    }
+    bwa_aln::aln_meth_ref_t ref;
+    REQUIRE(bwa_aln::aln_meth_ref_load(&ref, x.prefix.c_str(), &conv, 1) == 0);
+    bwa_aln::aln_meth_ref_free(&ref);
+    for (int mutation = 0; mutation < 5; ++mutation) {
+        const bntann1_t saved = anns[0];
+        if (mutation == 0) anns[0].name = const_cast<char *>("wrong");
+        if (mutation == 1) ++anns[0].len;
+        if (mutation == 2) ++anns[0].offset;
+        if (mutation == 3) --conv.n_seqs;
+        if (mutation == 4) --conv.l_pac;
+        CHECK(bwa_aln::aln_meth_ref_load(&ref, x.prefix.c_str(), &conv, 1) == -1);
+        CHECK(ref.bns == nullptr);
+        CHECK(ref.pac == nullptr);
+        anns[0] = saved; conv.n_seqs = (int)anns.size(); conv.l_pac = 2 * orig->l_pac;
+    }
+    bns_destroy(orig);
+}
+
+TEST_CASE("aln_cli: meth record writer shares sequence helpers and QC-fail options"
+          * doctest::test_suite("unit/aln_cli")) {
+    bntann1_t ann = {};
+    char contig[] = "chr1", name[] = "read";
+    ann.name = contig; ann.len = 100;
+    bntseq_t bns = {};
+    bns.n_seqs = 1; bns.l_pac = 100; bns.anns = &ann;
+    bwa_aln::aln_meth_ref_t ref;
+    ref.bns = &bns;
+    bwa_aln::aln_meth_opt_t mo;
+    mo.m.meth_tags = MEM_METH_TAG_XR | MEM_METH_TAG_XG; // XM needs sequence context, tested separately
+    bwa_aln::aln_meth_read_t result;
+    result.hyp = 1;
+    unsigned char seq[] = {0, 1, 2, 3}, qual[] = "IIII";
+    for (int strand = 0; strand < 2; ++strand) {
+        for (char failed : {char(0), 'f', 'r'}) {
+            bwa_aln::bwa_seq_t read = {};
+            read.name = name; read.seq = seq; read.qual = qual;
+            read.len = read.full_len = read.clip_len = 4;
+            read.type = BWA_TYPE_UNIQUE; read.strand = strand;
+            read.pos = 10; read.c1 = 1; read.mapQ = 37;
+            mo.m.meth_set_as_failed = failed;
+            kstring_t out = {0, 0, nullptr};
+            bwa_aln::aln_meth_print_sam1(&out, &ref, &mo, &read, &result, 1, nullptr, BWA_MODE_COMPREAD, 30);
+            const std::string text(out.s, out.l);
+            const int flag = (strand ? 16 : 0) | (failed == 'f' ? 512 : 0);
+            CHECK(text.find("read\t" + std::to_string(flag) + "\tchr1\t11\t37\t4M") == 0);
+            CHECK(text.find("\tACGT\tIIII") != std::string::npos);
+            CHECK(text.find("\tXR:Z:CT\tXG:Z:CT\n") != std::string::npos);
+            CHECK(text.find("XM:i:") == std::string::npos);
+            CHECK(text.find("XO:i:") == std::string::npos);
+            CHECK(text.find("XG:i:") == std::string::npos);
+            free(out.s);
+        }
+    }
 }

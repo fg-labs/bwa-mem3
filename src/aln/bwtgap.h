@@ -20,6 +20,20 @@
 
 namespace bwa_aln {
 
+// info packs score into its upper 11 bits. Only actual scores must fit: a large
+// optimistic bound alone must not reject otherwise representable searches.
+static const int GAP_SCORE_LIMIT = 1 << 11;
+
+// The search stops at an entry whose score exceeds best_score + s_mm (upstream's test, made in
+// 64 bits). Entry scores are packed in 11 bits (0..GAP_SCORE_LIMIT-1), so the cut is clamped to
+// [-1, GAP_SCORE_LIMIT-1] and stored as an int: the comparison with any packable score is the same.
+// (Also used by the --meth search, whose costs are rescored, aln_meth.cpp.)
+static inline int gap_score_cut(int64_t best_score, int s_mm)
+{
+	const int64_t cut = best_score + s_mm;
+	return cut < -1 ? -1 : cut > GAP_SCORE_LIMIT - 1 ? GAP_SCORE_LIMIT - 1 : (int)cut;
+}
+
 typedef struct { // recursion stack
 	uint32_t info; // score<<21 | i
 	// n_seed_mm is never read: gap_cpush stores 0 and gap_push leaves the slot's old bits. Do not
@@ -36,10 +50,6 @@ typedef struct { // recursion stack
  * exactly (test/tools/disasm_identity.sh, a manual pre-release check, compares its instructions
  * with the build before the templates). AlnMeth's per-slot state lives in its ext_t, one per slot
  * beside the slots, never in the stock structs, so their layouts do not change. */
-typedef struct {
-	gap_entry_t base;
-	uint64_t path; // the entry's gap events (aln_meth.h)
-} gap_entry_meth_t;
 struct aln_meth_slot_t; // aln_meth.h
 struct AlnStock {
 	typedef gap_entry_t entry_t;
@@ -47,7 +57,7 @@ struct AlnStock {
 	static constexpr bool meth = false;
 };
 struct AlnMeth {
-	typedef gap_entry_meth_t entry_t;
+	typedef gap_entry_t entry_t;
 	typedef aln_meth_slot_t ext_t;
 	static constexpr bool meth = true;
 };
@@ -86,7 +96,7 @@ struct gap_chunk_s {
 };
 static_assert(sizeof(gap_chunk_t) <= GAP_CHUNK_BYTES, "a stack chunk must fit in GAP_CHUNK_BYTES");
 static_assert(GAP_CHUNK_ENTRIES == 511, "src/aln/README.md states 511 entries per chunk");
-/* A chunk of another entry type (AlnMeth's 40-byte entries): `prev` first, as in gap_chunk_t, and a
+/* A chunk of another entry type: `prev` first, as in gap_chunk_t, and a
  * capacity derived from what the pool allocates, sizeof(gap_chunk_t), so the pool and
  * gap_release_cstack serve both and a chunk of either type fits the same allocation. */
 template <class E> constexpr int gap_chunk_entries() { return (int)((sizeof(gap_chunk_t) - sizeof(void*)) / sizeof(E)); }
@@ -95,10 +105,6 @@ template <class E> struct gap_chunk_of {
 	E e[gap_chunk_entries<E>()];
 };
 static_assert(gap_chunk_entries<gap_entry_t>() == GAP_CHUNK_ENTRIES, "the stock chunk's capacity");
-static_assert(sizeof(gap_entry_meth_t) == 40 && gap_chunk_entries<gap_entry_meth_t>() == 408,
-			  "src/aln/README.md states 408 entries per --meth chunk");
-// the pool allocates sizeof(gap_chunk_t) per chunk, whatever the entry type
-static_assert(sizeof(gap_chunk_of<gap_entry_meth_t>) <= sizeof(gap_chunk_t), "a --meth chunk must fit the pool's allocation");
 static_assert(sizeof(gap_chunk_of<gap_entry_t>) == sizeof(gap_chunk_t), "the stock chunk is gap_chunk_t");
 
 typedef struct {
@@ -159,7 +165,8 @@ void gap_cstack_pop_ext(gap_cstack_t *stack, gap_entry_t *e);
  * Invariants: `c` and `score_cut` are valid only after gap_job_start, and neither opt nor len may
  * change after it (the hit path reads opt, the step reads c). score_cut tracks best_score: every
  * write of best_score (gap_job_start, gap_job_hit's first hit) updates it too. */
-enum { JOB_OCC4 = 1, JOB_EXACT = 2 }; // gap_job_t::pending: the lookup the next call resumes at
+enum { JOB_OCC4 = 1, JOB_EXACT = 2, JOB_FLUSH = 3 }; // gap_job_t::pending: the lookup the next call resumes at
+// (JOB_FLUSH: AlnMeth only, the job waits for its hits to be resolved and rescored)
 typedef struct { // the job step's copy of the options it reads (set by gap_job_start)
 	int s_mm, s_gapo, s_gape, mode;
 	int max_entries, max_gapo, max_gape, max_seed_diff;
@@ -219,6 +226,7 @@ enum {
 	GAP_SLOT_EMPTY = 0,  // no read
 	GAP_SLOT_WIDTHS = 1, // the width walks run until widths_done and seed_done are both set
 	GAP_SLOT_SEARCH = 2, // the search is started (set just before gap_job_start; stepped once it returns 0)
+	GAP_SLOT_PARKED = 3, // AlnMeth: the search waits for a flush (gap_slots_run_meth skips it)
 };
 typedef struct {
 	gap_job_t job;
@@ -234,6 +242,13 @@ typedef struct {
  * is done (GAP_SLOT_SEARCH, with job.aln/n_aln set). Sets *pos to that slot and returns it. Some
  * slot must be non-empty. */
 int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt);
+
+/* The AlnMeth instantiations (aln_meth.h): gap_slots_run with the slots' --meth state ext[0..n); it
+ * also returns when a slot parks and the group should be flushed (half the slots, or every active
+ * one, parked), with that slot's job pending JOB_FLUSH and its state GAP_SLOT_PARKED. gap_job_start
+ * for a --meth job. Meth candidate discovery applies no rank-dependent width shadow. */
+int gap_slots_run_meth(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt, aln_meth_slot_t *ext);
+int gap_job_start_meth(gap_job_t *j, const bwt_t *bwt);
 
 /* max_gapo as the search applies it to this batch: opt->max_gapo capped at the number of
  * differences allowed for the longest read of the whole batch (bwa_cal_maxdiff of that
