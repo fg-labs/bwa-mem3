@@ -1,6 +1,7 @@
 name: Install clang-19 (Linux)
 description: >-
-  Install clang-19, llvm-19, lld-19, libomp-19-dev and libclang-rt-19-dev from apt.llvm.org,
+  Install clang-19, llvm-19, lld-19, libomp-19-dev and libclang-rt-19-dev from apt.llvm.org
+  (or, where apt.llvm.org has no LLVM 19 for the release, from the distro archive),
   trusting LLVM's archive signing key only after its fingerprint matches the pinned
   value, and caching the downloaded .debs between runs.
 # clang-19 is the shipping/benchmarked compiler and the compiler-floor minimum
@@ -11,8 +12,12 @@ description: >-
 # that keyring so a tampered mirror or a changed installer script can't run code
 # as root or slip in unsigned packages. Every job that needs clang-19 uses this
 # action, so the fingerprint pin lives in one place. Linux runners only (x86_64
-# and arm64). Callers pin Ubuntu 24.04: LLVM 19 is published for noble, not
-# every newer Ubuntu release selected by ubuntu-latest.
+# and arm64). apt.llvm.org publishes LLVM 19 for noble (24.04) but not for
+# every newer Ubuntu release selected by ubuntu-latest (e.g. resolute, 26.04).
+# When it has no llvm-toolchain-<codename>-19 dist, fall back to the distro's
+# own clang-19 packages (same package names, signed by the Ubuntu archive key
+# the runner already trusts) instead of failing the job. If the distro has no
+# clang-19 either, the LLVM source is retried before the job fails.
 #
 # Speed: this runs in every Linux clang job, so the slow parts are trimmed:
 #   - `apt-get update` refreshes only the llvm source list. The runner image
@@ -44,38 +49,72 @@ runs:
         set -euo pipefail
         . /etc/os-release
         codename="${VERSION_CODENAME:-$(lsb_release -cs)}"
-        # LLVM's published apt archive signing key fingerprint.
-        expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421"
-        curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o /tmp/llvm-snapshot.gpg.key
-        got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
-          | awk -F: '/^fpr:/ {print $10; exit}')"
-        if [ "$got_fpr" != "$expected_fpr" ]; then
-          echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
-          exit 1
-        fi
-        sudo install -m 0755 -d /etc/apt/keyrings
-        sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key
         llvm_list=/etc/apt/sources.list.d/llvm-19.list
-        echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
-          | sudo tee "$llvm_list"
-        # Refresh only the llvm list; List-Cleanup=0 keeps apt from deleting the
-        # Ubuntu lists it was told not to look at. With no Ubuntu lists at all on
-        # the image, do the full update now rather than fail at install time.
-        if compgen -G '/var/lib/apt/lists/*ubuntu*_Packages*' >/dev/null; then
-          sudo apt-get update -o Dir::Etc::sourcelist="$llvm_list" \
-            -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0
+        # Add apt.llvm.org's LLVM 19 dist: fetch LLVM's archive signing key, trust
+        # it only if its fingerprint matches LLVM's published value, then refresh
+        # the new list. Returns non-zero if the key or the dist cannot be fetched;
+        # a fingerprint mismatch is always fatal.
+        add_llvm_source() {
+          local expected_fpr="6084F3CF814B57C1CF12EFD515CF4D18AF4F7421" got_fpr
+          curl --retry 3 --retry-delay 2 --retry-all-errors -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key \
+            -o /tmp/llvm-snapshot.gpg.key || return 1
+          got_fpr="$(gpg --show-keys --with-colons --with-fingerprint /tmp/llvm-snapshot.gpg.key \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$got_fpr" != "$expected_fpr" ]; then
+            echo "FATAL: LLVM archive key fingerprint mismatch: got '$got_fpr', expected '$expected_fpr'" >&2
+            exit 1
+          fi
+          sudo install -m 0755 -d /etc/apt/keyrings || return 1
+          sudo gpg --batch --yes --dearmor -o /etc/apt/keyrings/llvm-snapshot.gpg /tmp/llvm-snapshot.gpg.key || return 1
+          echo "deb [signed-by=/etc/apt/keyrings/llvm-snapshot.gpg] http://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-19 main" \
+            | sudo tee "$llvm_list" || return 1
+          # Refresh only the llvm list; List-Cleanup=0 keeps apt from deleting the
+          # Ubuntu lists it was told not to look at. With no Ubuntu lists at all on
+          # the image, do the full update now rather than fail at install time.
+          if compgen -G '/var/lib/apt/lists/*ubuntu*_Packages*' >/dev/null; then
+            sudo apt-get update -o Dir::Etc::sourcelist="$llvm_list" \
+              -o Dir::Etc::sourceparts=- -o APT::Get::List-Cleanup=0 || return 1
+          else
+            sudo apt-get update || return 1
+          fi
+        }
+        clang_candidate() {
+          local v
+          v="$(apt-cache policy clang-19 | awk '/Candidate:/ {print $2}')"
+          if [ "$v" != "(none)" ]; then echo "$v"; fi
+        }
+        # Does apt.llvm.org publish LLVM 19 for this release? A 404 on the dist's
+        # Release file means no (curl -f fails); any other failure is retried
+        # and then also treated as absent. The key is fetched only on the LLVM
+        # path, so an unreachable key endpoint does not block the distro fallback.
+        release_url="https://apt.llvm.org/${codename}/dists/llvm-toolchain-${codename}-19/Release"
+        if curl --retry 3 --retry-delay 2 -fsSI -o /dev/null "$release_url" && add_llvm_source; then
+          source=llvm
         else
+          source=distro
+          echo "::notice::apt.llvm.org has no usable LLVM 19 for '${codename}'; installing the distro's clang-19 packages"
+          sudo rm -f "$llvm_list"
           sudo apt-get update
         fi
-        version="$(apt-cache policy clang-19 | awk '/Candidate:/ {print $2}')"
-        if [ -z "$version" ] || [ "$version" = "(none)" ]; then
-          echo "FATAL: no clang-19 candidate from apt.llvm.org" >&2
+        version="$(clang_candidate)"
+        # The distro has no clang-19 (e.g. jammy) and the probe may have failed
+        # transiently: retry the verified LLVM source before giving up.
+        if [ -z "$version" ] && [ "$source" = distro ]; then
+          echo "::notice::the distro has no clang-19 candidate for '${codename}'; retrying apt.llvm.org"
+          if add_llvm_source; then
+            source=llvm
+            version="$(clang_candidate)"
+          fi
+        fi
+        if [ -z "$version" ]; then
+          echo "FATAL: no clang-19 candidate (source: ${source}, codename: ${codename})" >&2
           exit 1
         fi
-        # The key changes when apt.llvm.org publishes a new build, when this
+        echo "clang-19 ${version} from ${source}"
+        # The key changes when the package source publishes a new build, when this
         # action's package set changes (its hash), or across OS codename/arch.
         action_hash="$(sha256sum "$GITHUB_ACTION_PATH/action.yml" | cut -c1-16)"
-        prefix="install-clang-19-${codename}-$(dpkg --print-architecture)-${action_hash}-"
+        prefix="install-clang-19-${source}-${codename}-$(dpkg --print-architecture)-${action_hash}-"
         # Outside $HOME so apt's unprivileged download user (_apt) can reach it.
         debdir=/tmp/install-clang-19-debs
         mkdir -p "$debdir"
