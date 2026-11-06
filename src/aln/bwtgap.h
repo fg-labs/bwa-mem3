@@ -18,6 +18,8 @@ namespace bwa_aln {
 
 typedef struct { // recursion stack
 	uint32_t info; // score<<21 | i
+	// n_seed_mm is never read: gap_cpush stores 0 and gap_push leaves the slot's old bits. Do not
+	// start reading it without setting it in both.
 	uint32_t n_mm:8, n_gapo:8, n_gape:8, state:2, n_seed_mm:6;
 	uint32_t n_ins:16, n_del:16;
 	int last_diff_pos;
