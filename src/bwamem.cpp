@@ -30,7 +30,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "bwamem.h"
 #include "meth_opts.h"   /* METH_CTX_ALL */
-#include "meth_model.h"  /* meth_model_fill_mats */
+#include "meth_model.h"  /* meth_fill_mats */
 #include "chain_seed_pool.h"
 #include "ext_reverse_copy.h"
 #include "chain_window_prefetch.h"
@@ -73,7 +73,7 @@ namespace { struct SpEncodeScope {
 }; }
 
 /* D3 (--meth, PR-5): original-reference pac for XM:Z, set in fastmap.cpp.
- * The meth output path is gated on opt->meth_mode (the chrom map that used to
+ * The meth output path is gated on opt->meth.meth_mode (the chrom map that used to
  * gate it was retired with the f/r output layer). */
 const uint8_t *g_meth_orig_pac = NULL;
 
@@ -507,7 +507,7 @@ static int mem_band_cert_params_safe_w(const mem_opt_t *opt, int w0) {
     int pen_clip_max = max_(opt->pen_clip5, opt->pen_clip3);
     if (e_min <= 0) return 0;
     int a_max = band_cert_mat_max(opt->mat);
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         a_max = max_(a_max, max_(band_cert_mat_max(opt->mat_ot), band_cert_mat_max(opt->mat_ob)));
     }
     if (a_max > opt->a) return 0;
@@ -791,13 +791,9 @@ mem_opt_t *mem_opt_init()
     o->min_chain_weight = 0;
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
-    o->meth_scoring = MEM_METH_SCORING_GENOMIC;    /* --meth default (em-seq); collapsed is
-                                                      the bwameth-compatible opt-in */
+    meth_opt_init(&o->meth);                       /* the shared --meth defaults (meth_opt.h) */
     o->meth_seed_prune = 0;                        /* base default off; --meth turns it on
                                                       (SPEC30), set in fastmap.cpp */
-    o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
-    o->meth_context = METH_CTX_ALL;                /* --meth-context default: every C converts */
-    o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
     /* Match bwa and bwa-mem2, which both derive FLAG 0x2 from a[0]. Explicit
      * rather than left to calloc: this default is what keeps the proper-pair
@@ -820,7 +816,7 @@ mem_opt_t *mem_opt_init()
  * cell, a real variant) at the symmetric value:
  *   OT: free mat[C][T] = mat[1*5+3]  (ref C, read T = unmethylated C→T)
  *   OB: free mat[G][A] = mat[2*5+0]  (ref G, read A = bottom-strand G→A)
- * The freed VALUE and whether the mirror is freed too depend on opt->meth_scoring:
+ * The freed VALUE and whether the mirror is freed too depend on opt->meth.meth_scoring:
  * GENOMIC frees only that cell, to a MATCH (+a) ⇒ the mirror stays a real mismatch
  * and the SIMD kernel takes its rank-1 fast path. NEUTRAL frees only that cell, to
  * 0 (tolerated but not rewarded) ⇒ the mirror likewise stays a mismatch; one freed
@@ -887,22 +883,9 @@ int mem_opt_parse_meth_tags(const char *spec, int *out, const char **err)
 }
 
 void mem_opt_fill_meth_mat(mem_opt_t *o) {
-    memcpy(o->mat_ot, o->mat, sizeof(o->mat));
-    memcpy(o->mat_ob, o->mat, sizeof(o->mat));
-    /* Conversion cell: +a (rewarded) for COLLAPSED/GENOMIC, 0 (tolerated but not
-     * rewarded) for NEUTRAL. See enum mem_meth_scoring for the rationale. */
-    int8_t conv = (o->meth_scoring == MEM_METH_SCORING_NEUTRAL) ? 0 : (int8_t)o->a;
-    o->mat_ot[1 * 5 + 3] = conv;   /* OT: ref C / read T (C→T conversion)   */
-    o->mat_ob[2 * 5 + 0] = conv;   /* OB: ref G / read A (G→A conversion)   */
-    if (o->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
-        /* bwameth-compatible: free the MIRROR cell too so C/T (and G/A) are
-         * mutually interchangeable (collapsed 3-letter space). Two freed cells ⇒
-         * bandedSWA general path, not the rank-1 fast path. Loses variant vs.
-         * conversion discrimination; reproduces bwameth placement. */
-        o->mat_ot[3 * 5 + 1] = o->a;   /* OT: ref T / read C → match */
-        o->mat_ob[0 * 5 + 2] = o->a;   /* OB: ref A / read G → match */
-    }
-    meth_model_fill_mats(o);
+    /* The shared builder (meth_model.h): from o->mat (which -x presets and
+     * -A/-B may have changed) and o->a, per o->meth.meth_scoring. */
+    meth_fill_mats(o->mat, o->a, &o->meth, o->mat_ot, o->mat_ob, o->mat7_ot, o->mat7_ob);
 }
 
 /* See bwamem.h for the contract. The `* opt->a` factors are the fix for -A
@@ -915,7 +898,7 @@ void mem_opt_apply_meth_defaults(mem_opt_t *opt, const mem_opt_t *opt0)
     if (!opt0->pen_unpaired) opt->pen_unpaired = 100 * opt->a;  /* bwameth -U 100 (paired) */
     if (!opt0->T)            opt->T            = 40 * opt->a;   /* bwameth -T 40 */
     opt->flag |= MEM_F_NO_MULTI;                                /* -M */
-    if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
+    if (opt->meth.meth_scoring == MEM_METH_SCORING_COLLAPSED) {
         if (!opt0->b) opt->b = 2 * opt->a;                      /* bwameth's lenient -B 2 */
     }
     /* GENOMIC and NEUTRAL keep bwa's default b (already scaled by update_a):
@@ -2296,7 +2279,7 @@ void mem_flt_chained_seeds(const mem_opt_t *opt, const bntseq_t *bns, const uint
 
         /* D3 (--meth, PR-4): swap to the original read + per-hypothesis matrix. */
         const int8_t *mat = opt->mat;
-        if (opt->meth_mode && seq_[c->seqid].meth_orig_seq != NULL) {
+        if (opt->meth.meth_mode && seq_[c->seqid].meth_orig_seq != NULL) {
             if (l_query > meth_qbuf_cap) {
                 meth_qbuf_cap = l_query;
                 /* CodeRabbit: don't assign realloc() result back to meth_qbuf
@@ -3715,7 +3698,7 @@ void mem_chain_seeds(FMI_search *fmi, const mem_opt_t *opt,
      * --meth we remap each seed hit into ORIGINAL coordinates before chaining, so
      * the chain-side bns / l_pac (rid lookup, strand-boundary merge test) must be
      * the ORIGINAL ones. Outside --meth chain_bns == bns. */
-    const int meth_remap = (opt->meth_mode && meth_orig_bns != NULL);
+    const int meth_remap = (opt->meth.meth_mode && meth_orig_bns != NULL);
     const bntseq_t *chain_bns = meth_remap ? meth_orig_bns : bns;
     int64_t l_pac = chain_bns->l_pac;
     /* Seed-emit strategy. OFF (the default) streams each resolved seed straight
@@ -4145,9 +4128,9 @@ int mem_kernel1_core(FMI_search *fmi,
     /* D3 (--meth, PR-3): in --meth chaining/filtering run in ORIGINAL coords;
      * outside --meth (or if a handle is missing) fall back to the seed index so
      * the non-meth path is byte-for-byte unchanged. */
-    const bntseq_t *chain_bns = (opt->meth_mode && meth_orig_bns != NULL)
+    const bntseq_t *chain_bns = (opt->meth.meth_mode && meth_orig_bns != NULL)
                                 ? meth_orig_bns : fmi->idx->bns;
-    const uint8_t  *chain_pac = (opt->meth_mode && meth_orig_pac != NULL)
+    const uint8_t  *chain_pac = (opt->meth.meth_mode && meth_orig_pac != NULL)
                                 ? meth_orig_pac : fmi->idx->pac;
     int i;
     int64_t num_smem = 0, tot_len = 0;
@@ -4365,9 +4348,9 @@ int mem_kernel2_core(FMI_search *fmi,
     /* D3 (--meth, PR-3): extension/dedup must run in ORIGINAL coords. ref_string
      * is already the original .0123 (worker_aln passes mem_aln_ref_string).
      * Outside --meth these fall back to the seed/normal index unchanged. */
-    const bntseq_t *aln_bns = (opt->meth_mode && meth_orig_bns != NULL)
+    const bntseq_t *aln_bns = (opt->meth.meth_mode && meth_orig_bns != NULL)
                               ? meth_orig_bns : fmi->idx->bns;
-    const uint8_t  *aln_pac = (opt->meth_mode && meth_orig_pac != NULL)
+    const uint8_t  *aln_pac = (opt->meth.meth_mode && meth_orig_pac != NULL)
                               ? meth_orig_pac : fmi->idx->pac;
     for (int l=0; l<nseq; l++)
     {
@@ -4453,7 +4436,7 @@ int mem_kernel2_core(FMI_search *fmi,
     for (int l=0; l<nseq; l++) {
         uint8_t      *dd_query = (uint8_t*) seq_[l].seq;
         const int8_t *dd_mat   = opt->mat;
-        if (opt->meth_mode && seq_[l].meth_orig_seq != NULL) {
+        if (opt->meth.meth_mode && seq_[l].meth_orig_seq != NULL) {
             int l_query = seq_[l].l_seq;
             if (l_query > dd_qbuf_cap) {
                 dd_qbuf_cap = l_query;
@@ -5122,7 +5105,7 @@ void mem_readmemo_teardown(void)
 int mem_read_memo_prepass_eligible(const mem_opt_t *opt, int n)
 {
     return (read_memo_mode() != READMEMO_OFF || read_memo_verify()) && (opt->flag & MEM_F_PE)
-           && !opt->meth_mode && n > 0 && (n & 1) == 0;
+           && !opt->meth.meth_mode && n > 0 && (n & 1) == 0;
 }
 
 void mem_process_seqs(mem_opt_t *opt,
@@ -5658,7 +5641,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
      * writer. Either path leaves `str` untouched, so callers must branch on
      * mem_opt_records_are_bam(), not opt->bam_mode — --meth builds bam1_t even
      * when the container is SAM text. */
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         struct bam1_t *b = bam_writer_alloc();
         if (b == NULL)
             err_fatal(__func__, "out of memory allocating bam1_t for meth record");
@@ -5866,7 +5849,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     if (p->HN >= 0 && opt->compat->emit_hn) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 
     if (s->comment) { kputc_u('\t', str); kputs_u(s->comment, str); }
-    if ((opt->flag&MEM_F_REF_HDR) && !opt->meth_mode && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {
+    if ((opt->flag&MEM_F_REF_HDR) && !opt->meth.meth_mode && p->rid >= 0 && bns->anns[p->rid].anno != 0 && bns->anns[p->rid].anno[0] != 0) {
         /* Suppressed under --meth: that mode repurposes XR:Z for the Bismark
          * read-conversion direction (see docs/src/methylation/tags.md). */
         int tmp;
@@ -5900,7 +5883,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
  *     non-zero and the seed is skipped).
  *   - meth_orig_bns is NULL only if the reference prefix overflowed PATH_MAX,
  *     which warns loudly at startup.
- *   - Every mem_matesw call site passes `opt->meth_mode ? i : -1`, so a rescued
+ *   - Every mem_matesw call site passes `opt->meth.meth_mode ? i : -1`, so a rescued
  *     mate under --meth inherits 0 or 1, never -1.
  * Were it ever false, the fallback is still self-consistent rather than mixed:
  * the symmetric opt->mat has every off-diagonal at -b < 0 (--meth rejects
@@ -5908,7 +5891,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
 static int mem_use_native_regen(const mem_opt_t *opt, const mem_alnreg_t *ar,
                                 const char *meth_orig_query)
 {
-    return opt->meth_mode && meth_orig_query != NULL && ar->meth_hypothesis >= 0;
+    return opt->meth.meth_mode && meth_orig_query != NULL && ar->meth_hypothesis >= 0;
 }
 
 /* The key of a region's global alignment (mem_reg2aln_global): everything it reads
@@ -7034,7 +7017,7 @@ static inline void bsw_run_tier(BswMethTier tier, const mem_opt_t *opt,
         SeqPair *base_scratch, SeqPair *meth_scratch, int32_t *hist)
 {
     if (nump <= 0) return;
-    if (!opt->meth_mode) {
+    if (!opt->meth.meth_mode) {
         bsw_tier_kernel(tier, sym, pair_ar, ref, qer, nump, nthreads, w,
                         base_scratch, hist);
         return;
@@ -8005,7 +7988,7 @@ static inline void stage_seed_extension(
          * as a mismatch and commit a wrong a->score. Disable it under
          * --meth so all extension flows through the matrix-aware SW
          * kernel. (Perf-only fast path; correctness-neutral to skip.) */
-        if (!opt->meth_mode && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+        if (!opt->meth.meth_mode && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
             tprof[UGP_L_ATTEMPT][tid]++;
             int fp_score, fp_qle, fp_gscore, fp_gtle, fp_band, fp_pband;
             int fp_st = ungapped_analyze_pb(qs, rs, sp.len2,
@@ -8311,7 +8294,7 @@ static inline void stage_seed_extension(
         /* D3 (--meth, PR-4): disable the ungapped fast path under
          * --meth — see the LEFT-side rationale above (it can't score
          * the asymmetric OT/OB matrix). */
-        if (!opt->meth_mode && a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
+        if (!opt->meth.meth_mode && a->score != -1 && sp.len1 >= sp.len2 && sp.len2 <= FP_N_MAX) {
             sp.ugp_r_attempted = 1;
             tprof[UGP_R_ATTEMPT][tid]++;
             int fp_h0 = a->score;  // the real h0 for right ext
@@ -8569,7 +8552,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
      * a deferred seed is extended against exactly the bases Pass 1 would have
      * used. */
     auto extension_query = [&](int l, int lq) -> const uint8_t * {
-        if (!(opt->meth_mode && seq_[l].meth_orig_seq != NULL))
+        if (!(opt->meth.meth_mode && seq_[l].meth_orig_seq != NULL))
             return (const uint8_t *) seq_[l].seq;
         if (lq > meth_qbuf_cap) {
             meth_qbuf_cap = lq;
@@ -8603,7 +8586,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
     auto seed_ext_score = [&](const mem_seed_t *sd, const mem_alnreg_t *ar,
                               const uint8_t *rseq_w, const uint8_t *query_w) -> int {
         int sc = sd->len * opt->a;
-        if (opt->meth_mode && ar->meth_strand_hyp >= 0) {
+        if (opt->meth.meth_mode && ar->meth_strand_hyp >= 0) {
             /* Under --meth-context cpg the 7-code matrix: the window is labelled
              * (derive_chain_window labels every chain with a hypothesis). */
             int sm;
@@ -8996,7 +8979,7 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
      * in the clip-extension end bonus (pen_clip5 vs pen_clip3), matching the
      * symmetric objects above. */
     std::unique_ptr<IBandedPairWiseSW> bswLeftOt, bswLeftOb, bswRightOt, bswRightOb;
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         /* Under --meth-context cpg the 7-code matrices (mat_m = 7): the windows
          * of chains with a hypothesis are labelled (derive_chain_window), and the
          * objects run the kernels' CpG arm on the one gated cell of each matrix
@@ -9324,12 +9307,12 @@ void mem_chain2aln_across_reads_V2(const mem_opt_t *opt_in, const bntseq_t *bns,
             // Skip pairs already analyzed at construction time (a->score
             // was non-(-1) then; UGP_R_ATTEMPT and outcome counters fired
             // there). Without this guard, those pairs would double-count.
-            // !opt->meth_mode: ungapped_analyze hardcodes symmetric opt->a/opt->b
+            // !opt->meth.meth_mode: ungapped_analyze hardcodes symmetric opt->a/opt->b
             // and cannot honor the per-strand asymmetric matrix, so a HIT here
             // would fill a->score / qe / re from symmetric scoring and compact
             // the pair out, bypassing the asymmetric banded SW. The two
             // construction-time passes are gated the same way (see ~3397/3618).
-            if (!opt->meth_mode && !sp->ugp_r_attempted &&
+            if (!opt->meth.meth_mode && !sp->ugp_r_attempted &&
                 sp->len1 >= sp->len2 && sp->len2 > 0 && sp->len2 <= FP_N_MAX) {
                 tprof[UGP_R_ATTEMPT][tid]++;
                 const uint8_t *qs = seqBufRightQer + sp->idq;

@@ -49,7 +49,7 @@ static inline int matesw_u8_shift(const int8_t *mat, int m = 5) {
  * consistent no matter which hypothesis a pair ends up scored under. */
 static inline int matesw_u8_shift_for(const mem_opt_t *opt, const int8_t *base_mat) {
     int s = matesw_u8_shift(base_mat);
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         int so = matesw_u8_shift(opt->mat_ot);
         int sb = matesw_u8_shift(opt->mat_ob);
         if (so > s) s = so;
@@ -78,7 +78,7 @@ static inline int matesw_u8_qmax(const int8_t *mat, int m = 5) {
 
 static inline int matesw_u8_qmax_for(const mem_opt_t *opt, const int8_t *base_mat) {
     int q = matesw_u8_qmax(base_mat);
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         int qo = matesw_u8_qmax(opt->mat_ot);
         int qb = matesw_u8_qmax(opt->mat_ob);
         if (qo > q) q = qo;

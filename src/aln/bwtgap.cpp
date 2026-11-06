@@ -297,6 +297,16 @@ static GAP_HOT void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwt
 	t->k = k; t->l = l;
 }
 
+// The base fields of a stack entry (AlnMeth's entries carry their gap events beside them).
+static GAP_HOT gap_entry_t &gap_base(gap_entry_t &e) { return e; }
+static GAP_HOT const gap_entry_t &gap_base(const gap_entry_t &e) { return e; }
+static GAP_HOT gap_entry_t &gap_base(gap_entry_meth_t &e) { return e.base; }
+static GAP_HOT const gap_entry_t &gap_base(const gap_entry_meth_t &e) { return e.base; }
+
+// A new entry's gap events: none (AlnStock's entries have none to set).
+static GAP_HOT void gap_entry_clear_path(gap_entry_t *) {}
+static GAP_HOT void gap_entry_clear_path(gap_entry_meth_t *e) { e->path = 0; }
+
 // Bucket q's top chunk is full (or q has none): put a new chunk from the pool on top.
 static GAP_COLD void gap_bucket_grow(gap_cstack_t *stack, gap_bucket_t *q)
 {
@@ -307,43 +317,49 @@ static GAP_COLD void gap_bucket_grow(gap_cstack_t *stack, gap_bucket_t *q)
 }
 
 // Bucket q's top chunk has just been emptied: give it back to the pool.
+template <class E>
 static GAP_COLD void gap_bucket_shrink(gap_cstack_t *stack, gap_bucket_t *q)
 {
 	gap_chunk_t *c = q->top;
 	q->top = c->prev;
-	q->top_n = q->top? GAP_CHUNK_ENTRIES : 0;
+	q->top_n = q->top? gap_chunk_entries<E>() : 0;
 	gap_pool_put(stack->pool, c);
 }
 
-// The rest of gap_push: store entry t, whose score is `score`, on top of its bucket.
-static GAP_HOT void gap_cstore(gap_cstack_t *stack, int score, const gap_entry_t *t)
+// The rest of gap_push: store entry t, whose score is `score`, on top of its bucket. A stack holds
+// one entry type throughout (the job's policy's): its chunks are gap_chunk_of<E>.
+template <class E>
+static GAP_HOT void gap_cstore(gap_cstack_t *stack, int score, const E *t)
 {
 	gap_bucket_t *q = stack->stacks + score;
-	if (__builtin_expect(q->top == 0 || q->top_n == GAP_CHUNK_ENTRIES, 0)) // start a new chunk
+	if (__builtin_expect(q->top == 0 || q->top_n == gap_chunk_entries<E>(), 0)) // start a new chunk
 		gap_bucket_grow(stack, q);
-	q->top->e[q->top_n] = *t;
+	((gap_chunk_of<E>*)q->top)->e[q->top_n] = *t;
 	++(q->top_n);
 	++(q->n_entries);
 	++(stack->n_entries);
 	if (stack->best > score) stack->best = score;
 }
 
+template <class E = gap_entry_t>
 static GAP_HOT void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l, int n_mm, int n_gapo, int n_gape, int n_ins, int n_del,
 							 int state, int is_diff, const gap_opt_t *opt)
 {
 	int score = gap_cscore(stack, n_mm, n_gapo, n_gape, opt);
-	gap_entry_t t;
-	gap_centry(&t, score, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff);
+	E t;
+	gap_centry(&gap_base(t), score, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff);
+	gap_entry_clear_path(&t);
 	gap_cstore(stack, score, &t);
 }
 
-static GAP_HOT void gap_cpop(gap_cstack_t *stack, gap_entry_t *e)
+template <class E = gap_entry_t>
+static GAP_HOT void gap_cpop(gap_cstack_t *stack, E *e)
 {
 	gap_bucket_t *q;
 	q = stack->stacks + stack->best;
-	*e = q->top->e[q->top_n - 1];
+	*e = ((gap_chunk_of<E>*)q->top)->e[q->top_n - 1];
 	if (__builtin_expect(--(q->top_n) == 0, 0)) // the top chunk is empty: give it back
-		gap_bucket_shrink(stack, q);
+		gap_bucket_shrink<E>(stack, q);
 	--(q->n_entries);
 	--(stack->n_entries);
 	if (q->n_entries == 0 && stack->n_entries) { // reset best
@@ -576,7 +592,8 @@ bwt_aln1_t *bwt_match_gap(bwt_t *const bwt, int len, const ubyte_t *seq, bwt_wid
  * the same read.
  * --------------------------------------------------------------------------------------- */
 
-int gap_job_start(gap_job_t *j, const bwt_t *bwt)
+template <class P>
+static GAP_HOT int gap_job_start_t(gap_job_t *j, const bwt_t *bwt)
 {
 	const gap_opt_t *opt = &j->opt;
 	int jj, _j;
@@ -603,12 +620,15 @@ int gap_job_start(gap_job_t *j, const bwt_t *bwt)
 	if (_j > j->max_diff) return 1;
 
 	gap_check_len(j->len);
-	gap_cpush(j->stack, j->len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
+	gap_cpush<typename P::entry_t>(j->stack, j->len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
 	return 0;
 }
 
+int gap_job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start_t<AlnStock>(j, bwt); }
+
 /* bwt_match_gap's action for a found hit (entry e, SA interval [k, l]). Returns 1 where
  * bwt_match_gap breaks out of its loop (top2b behaviour). */
+template <class P>
 static GAP_COLD int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
 	const gap_opt_t *opt = &J->opt;
@@ -668,13 +688,14 @@ static GAP_HOT int gap_job_exact_yield(gap_job_t *J, const bwt_t *bwt, int i, bw
  * forwards it (see there). Storing each child just before the next push, rather than at its own
  * push, changes nothing another push or the next pop can see: no pop runs in between, and the
  * next push stores after it whatever bucket it goes to. */
-static GAP_HOT void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_score, int i, bwtint_t k, bwtint_t l,
+template <class E>
+static GAP_HOT void gap_cpush_defer(gap_cstack_t *stack, E *f, int *f_score, int i, bwtint_t k, bwtint_t l,
 								   int n_mm, int n_gapo, int n_gape, int n_ins, int n_del, int state, int is_diff,
 								   const gap_job_const_t *opt)
 {
 	if (*f_score >= 0) gap_cstore(stack, *f_score, f);
 	*f_score = gap_cscore(stack, n_mm, n_gapo, n_gape, opt);
-	gap_centry(f, *f_score, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff);
+	gap_centry(&gap_base(*f), *f_score, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff);
 }
 
 /* Top-of-stack forwarding. After an expansion, bwt_match_gap pops the stack's best entry: the last
@@ -689,19 +710,23 @@ static GAP_HOT void gap_cpush_defer(gap_cstack_t *stack, gap_entry_t *f, int *f_
  * bucket, or n_stacks for an empty stack). Otherwise (f_score > stack->best) the pop would return
  * an older entry, so f is stored and popped as usual. The forwarded entry is consumed by the very
  * next pass of the loop, before any yield, so nothing about it is kept in the job. */
-static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt)
+template <class P>
+static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_t *X)
 {
+	typedef typename P::entry_t E;
+	(void)X;
 	const gap_job_const_t *opt = &J->c; // the options it reads, copied by gap_job_start
 	gap_cstack_t *stack = J->stack;
 	const ubyte_t *seq = J->seq;
 	bwt_width_t *width = J->width, *seed_width = J->seed_width;
 	const int len = J->len;
 	int j;
-	gap_entry_t f; // the last child of the last expansion, while f_score >= 0 (gap_cpush_defer)
+	E f; // the last child of the last expansion, while f_score >= 0 (gap_cpush_defer)
 	int f_score = -1, fwd = 0; // fwd: f is the entry the next pop would return (forwarding, above)
 
 	for (;;) {
-		gap_entry_t e;
+		E ee; // the entry popped (AlnMeth: with its gap events)
+		gap_entry_t &e = gap_base(ee);
 		int i, m, m_seed, allow_diff, allow_M, tmp;
 		bwtint_t k, l, cnt_k[4], cnt_l[4], occ;
 
@@ -724,7 +749,7 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt)
 			}
 			// bwt_match_exact_alt returns l - k + 1 as an int; bwt_match_gap tests it for nonzero
 			if ((uint32_t)(l - k + 1) == 0) continue;
-			if (gap_job_hit(J, bwt, &J->e, k, l)) break;
+			if (gap_job_hit<P>(J, bwt, &J->e, k, l)) break;
 			continue;
 		} else {
 			const int n_entries = stack->n_entries + fwd; // with a forwarded entry counted as pushed
@@ -732,8 +757,8 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt)
 			m_seed = 0;
 			if (J->max_entries < n_entries) J->max_entries = n_entries;
 			if (n_entries > opt->max_entries) break;
-			if (fwd) { e = f; fwd = 0; } // the entry gap_cpop would return
-			else gap_cpop(stack, &e); // get the best entry
+			if (fwd) { ee = f; fwd = 0; } // the entry gap_cpop would return
+			else gap_cpop<E>(stack, &ee); // get the best entry
 			k = e.k; l = e.l; // SA interval
 			i = e.info&0xffff; // length
 			if ((int)(e.info>>21) > J->score_cut) break; // no need to proceed (score_cut: see gap_score_cut; never under NONSTOP)
@@ -749,7 +774,7 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt)
 
 			// check whether a hit is found
 			if (i == 0) { // hit found
-				if (gap_job_hit(J, bwt, &e, k, l)) break;
+				if (gap_job_hit<P>(J, bwt, &e, k, l)) break;
 				continue;
 			} else if (m == 0 && (e.state == STATE_M || (opt->mode&BWA_MODE_GAPE) || e.n_gape == opt->max_gape)) { // no diff allowed
 				// bwt_match_exact_alt(bwt, i, seq, &k, &l), one base per call (JOB_EXACT above)
@@ -835,7 +860,7 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt)
 }
 
 // gap_job_step as a call (the driver inlines it through gap_slots_run); for the unit tests.
-int gap_job_run(gap_job_t *J, const bwt_t *bwt) { return gap_job_step(J, bwt); }
+int gap_job_run(gap_job_t *J, const bwt_t *bwt) { return gap_job_step<AlnStock>(J, bwt, nullptr); }
 
 /* New code: bwt_cal_width (bwtaln.cpp) as a resumable walk, so that a read's widths can be computed
  * interleaved with other reads' work. width_walk_run runs bwt_cal_width's loop until the next base
@@ -887,14 +912,19 @@ int width_walk_run(width_walk_t *w, const bwt_t *bwt) { return width_walk_step(w
  * job and width-walk steps inlined, so a step costs no call and return, and the per-read
  * events (widths done, search done) go back to the caller. Which slot is stepped when changes
  * only the interleaving: each read's own steps run in the same order. */
-int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt)
+// Slot i's policy state: none for AlnStock (ext is null), ext[i] for AlnMeth.
+static GAP_HOT void *gap_slot_ext(void *, int) { return nullptr; }
+template <class T> static GAP_HOT T *gap_slot_ext(T *ext, int i) { return ext + i; }
+
+template <class P>
+static GAP_HOT int gap_slots_run_t(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt, typename P::ext_t *ext)
 {
 	int i = *pos;
 	for (;;) {
 		if (++i == n) i = 0;
 		gap_slot_core_t *s = &slots[i];
 		if (s->state == GAP_SLOT_SEARCH) {
-			if (gap_job_step(&s->job, bwt)) break;
+			if (gap_job_step<P>(&s->job, bwt, gap_slot_ext(ext, i))) break;
 		} else if (s->state == GAP_SLOT_WIDTHS) {
 			if (!s->widths_done) s->widths_done = width_walk_step(&s->ww, bwt);
 			if (!s->seed_done) s->seed_done = width_walk_step(&s->sw, bwt);
@@ -903,6 +933,11 @@ int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt)
 	}
 	*pos = i;
 	return i;
+}
+
+int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt)
+{
+	return gap_slots_run_t<AlnStock>(slots, n, pos, bwt, nullptr);
 }
 
 } // namespace bwa_aln

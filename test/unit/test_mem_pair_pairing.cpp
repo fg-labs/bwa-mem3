@@ -552,7 +552,7 @@ TEST_CASE("mem_pair_resolve_batch_post: --meth caps q_pe by both ends' second hi
     for (int meth = 0; meth <= 1; ++meth) {
         CAPTURE(meth);
         OptGuard g;
-        g.o->meth_mode = meth;
+        g.o->meth.meth_mode = meth;
         Bns B(3, 100000);
         mem_pestat_t pes[4];
         pes_i300(pes);

@@ -45,8 +45,8 @@ const int kRef = 6000, kLen = 100;
 
 // A --meth option set scored with the genomic matrix.
 void set_meth_genomic(mem_opt_t *opt) {
-    opt->meth_mode = 1;
-    opt->meth_scoring = MEM_METH_SCORING_GENOMIC;
+    opt->meth.meth_mode = 1;
+    opt->meth.meth_scoring = MEM_METH_SCORING_GENOMIC;
     mem_opt_fill_meth_mat(opt);
 }
 

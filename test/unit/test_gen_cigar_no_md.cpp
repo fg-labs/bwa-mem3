@@ -673,8 +673,8 @@ TEST_CASE("mem_reg2aln: want_md 0 matches the MD form in every field the XA entr
     mem_opt_t *meth[3];
     for (int m = 0; m < 3; ++m) {
         meth[m] = mem_opt_init();
-        meth[m]->meth_mode = 1;
-        meth[m]->meth_scoring = m;
+        meth[m]->meth.meth_mode = 1;
+        meth[m]->meth.meth_scoring = m;
         mem_opt_fill_meth_mat(meth[m]);
     }
     std::mt19937 rng(11);
@@ -817,8 +817,8 @@ TEST_CASE("mem_gen_alt: the XA string carries each hit's CIGAR and NM" *
                             MEM_METH_SCORING_NEUTRAL}) {
             CAPTURE(scoring);
             mem_opt_t *meth = mem_opt_init();
-            meth->meth_mode = 1;
-            meth->meth_scoring = scoring;
+            meth->meth.meth_mode = 1;
+            meth->meth.meth_scoring = scoring;
             mem_opt_fill_meth_mat(meth);
             check_xa_string(meth);
             free(meth);
