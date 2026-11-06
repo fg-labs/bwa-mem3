@@ -36,6 +36,7 @@
 #include "seed_jump_test_util.h"
 
 #include <algorithm>
+#include <exception>
 #include <string>
 #include <vector>
 #include <stdio.h>
@@ -49,6 +50,139 @@
 #include <errno.h>
 #include <semaphore.h>
 #include <limits.h>
+#include <poll.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include "framework/temp_dir.h"
+#include "framework/stderr_capture.h"
+
+// Own every IPC name before the real implementation can open it. Reserved
+// index descriptors are handed to the stager's O_EXCL open without releasing
+// their names, closing the reservation-to-stage race. Packing/mapping stay real.
+// Exactly one process owns a name, from its exclusive creation to its unlink;
+// ownership never crosses fork. A forked child inherits only a read-only view.
+#define NON_OWNER_REMOVE_EXIT 93
+class PrivateObjects;
+// The owner of the main namespace, if any. Its exit handler cleans up a plain
+// exit() in that process only; inherited copies in children do nothing.
+static PrivateObjects *exit_owner = NULL;
+class PrivateObjects {
+    struct Object { std::string name; bool semaphore; int fd; };
+    std::vector<Object> objects;
+    const pid_t owner = getpid();
+public:
+    PrivateObjects() = default;
+    PrivateObjects(const PrivateObjects &) = delete;
+    PrivateObjects &operator=(const PrivateObjects &) = delete;
+    // Unregister on destruction so the exit handler never sees a dead owner.
+    ~PrivateObjects() { clear(); if (exit_owner == this) exit_owner = NULL; }
+    pid_t owner_pid() const { return owner; }
+    bool owns(const std::string &name) const {
+        for (const auto &o : objects) if (o.name == name) return true;
+        return false;
+    }
+    int descriptor(const std::string &name) const {
+        for (const auto &o : objects) if (o.name == name && !o.semaphore) return o.fd;
+        return -1;
+    }
+    bool acquire(const std::string &name, bool semaphore = false) {
+        if (owns(name)) return false;
+        int fd = -1;
+        if (semaphore) {
+            sem_t *lock = sem_open(name.c_str(), O_CREAT | O_EXCL, 0600, 1);
+            if (lock == SEM_FAILED) return false;
+            sem_close(lock);
+        } else {
+            fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+            if (fd < 0) return false;
+        }
+        objects.push_back({name, semaphore, fd});
+        return true;
+    }
+    void remove(const std::string &name) {
+        if (getpid() != owner) {
+            // A non-owner can never unlink, so this is a test defect, not a no-op.
+            fprintf(stderr, "[FATAL] PrivateObjects::remove(%s) from pid %d; owner is pid %d\n",
+                    name.c_str(), (int)getpid(), (int)owner);
+            fflush(stderr);
+            _exit(NON_OWNER_REMOVE_EXIT);
+        }
+        for (auto it = objects.begin(); it != objects.end(); ++it) {
+            if (it->name != name) continue;
+            if (it->semaphore) sem_unlink(name.c_str());
+            else { shm_unlink(name.c_str()); close(it->fd); }
+            objects.erase(it);
+            return;
+        }
+    }
+    void clear() {
+        if (getpid() != owner) return;
+        while (!objects.empty()) remove(objects.back().name);
+    }
+    bool reserve(const std::string &control, const std::string &lock,
+                 const std::vector<std::string> &segments) {
+        if (!acquire(control) || !acquire(lock, true)) { clear(); return false; }
+        for (const auto &name : segments)
+            if (!acquire(name)) { clear(); return false; }
+        return true;
+    }
+};
+
+static void owner_exit_cleanup()
+{
+    if (exit_owner != NULL && getpid() == exit_owner->owner_pid()) exit_owner->clear();
+}
+
+static char private_control[32], private_lock[32], private_index[32];
+static PrivateObjects *stage_objects = NULL;
+static int reserved_stage_open(const char *name, int flags, mode_t mode) {
+    if (!stage_objects || !stage_objects->owns(name)) { errno = EPERM; return -1; }
+    if ((flags & O_EXCL) && stage_objects && stage_objects->owns(name)) {
+        const int fd = stage_objects->descriptor(name);
+        if (fd >= 0) return dup(fd);
+    }
+    return shm_open(name, flags, mode);
+}
+// When set, each suppressed unlink writes its name and a newline here, so a test
+// can show the guard was exercised rather than the call never being made.
+static int suppressed_unlink_fd = -1;
+// Production failure paths unlink the reserved index name from the stage child.
+// Only the owner may unlink an owned name, so a non-owner's unlink of one is a
+// no-op (the owner unlinks it later); any other name passes through.
+static bool stage_owned_elsewhere(const char *name)
+{
+    const bool suppressed = stage_objects && getpid() != stage_objects->owner_pid()
+                            && stage_objects->owns(name);
+    if (suppressed && suppressed_unlink_fd >= 0) {
+        const std::string line = std::string(name) + "\n";
+        if (write(suppressed_unlink_fd, line.data(), line.size()) != (ssize_t)line.size()) _exit(92);
+    }
+    return suppressed;
+}
+static int reserved_stage_unlink(const char *name)
+{
+    return stage_owned_elsewhere(name) ? 0 : shm_unlink(name);
+}
+static int reserved_sem_unlink(const char *name)
+{
+    return stage_owned_elsewhere(name) ? 0 : sem_unlink(name);
+}
+#undef BWA_SHM_CTL_NAME
+#undef BWA_SHM_LOCK_NAME
+#undef BWA_SHM_IDX_PREFIX
+#define BWA_SHM_CTL_NAME private_control
+#define BWA_SHM_LOCK_NAME private_lock
+#define BWA_SHM_IDX_PREFIX private_index
+#define shm_open reserved_stage_open
+#define shm_unlink reserved_stage_unlink
+#define sem_unlink reserved_sem_unlink
+#include "../src/bwa_shm.cpp"
+#undef sem_unlink
+#undef shm_unlink
+#undef shm_open
+#undef BWA_SHM_CTL_NAME
+#undef BWA_SHM_LOCK_NAME
+#undef BWA_SHM_IDX_PREFIX
 
 static int32_t total_cases = 0;
 static int32_t passed_cases = 0;
@@ -72,11 +206,13 @@ struct ShmRegistry {
     const char *control;
     const char *lock;
     const char *index_prefix;
+    PrivateObjects *owner;
 };
-static const ShmRegistry fixture_registry = {
-    BWA_SHM_CTL_NAME, BWA_SHM_LOCK_NAME, BWA_SHM_IDX_PREFIX
+static ShmRegistry fixture_registry = {
+    private_control, private_lock, private_index, NULL
 };
 typedef void *(*RegistryMap)(void *, size_t, int, int, int, off_t);
+typedef int (*RegistryTryWait)(sem_t *);
 
 enum RegistryState { REGISTRY_MISSING, REGISTRY_READABLE, REGISTRY_UNREADABLE };
 
@@ -123,7 +259,7 @@ static RegistryState read_shm_registry(std::vector<std::string> *names,
 
 /* Undo this test's staging of `prefix` without touching any other index.
  * Unlike bwa_shm_destroy, which unlinks every staged index, the registry and
- * its lock, this holds the lock the stager takes (BWA_SHM_LOCK_NAME), so no
+ * its lock, this holds the lock the stager takes (private_lock), so no
  * stage can run while it reads the registry, and drops anything only when the
  * registry holds only the fixture basenames owned by this run, or no entries
  * (an aborted stage's leftover). Then it unlinks the fixture segments and registry,
@@ -134,10 +270,20 @@ static RegistryState read_shm_registry(std::vector<std::string> *names,
 static void drop_fixture_shm(const char *prefix,
                              const ShmRegistry &registry = fixture_registry,
                              RegistryMap map_registry = mmap,
-                             const char *second_fixture = NULL)
+                             const char *second_fixture = NULL,
+                             RegistryTryWait try_wait = sem_trywait)
 {
     const char *slash = strrchr(prefix, '/');
     const char *fixture = slash != NULL ? slash + 1 : prefix;
+    const std::string first_segment = std::string(registry.index_prefix) + fixture;
+    const std::string second_segment = second_fixture ? std::string(registry.index_prefix) + second_fixture : "";
+    if (!registry.owner || !registry.owner->owns(registry.control)
+        || !registry.owner->owns(registry.lock) || !registry.owner->owns(first_segment)
+        || (second_fixture && !registry.owner->owns(second_segment))) {
+        fprintf(stderr, "[WARN] private cleanup lacks ownership: registry %s lock %s segment %s %s; dropped nothing\n",
+                registry.control, registry.lock, first_segment.c_str(), second_segment.c_str());
+        return;
+    }
     std::vector<std::string> names;
 
     sem_t *lock = sem_open(registry.lock, 0);
@@ -145,25 +291,24 @@ static void drop_fixture_shm(const char *prefix,
         /* Every stager creates the lock before the registry. */
         if (read_shm_registry(&names, registry, map_registry) != REGISTRY_MISSING)
             fprintf(stderr, "[WARN] shm registry %s exists but its lock %s does not; "
-                    "left it staged (`bwa-mem3 shm -d` removes it)\n",
+                    "left private objects for their owning fixture cleanup\n",
                     registry.control, registry.lock);
         return;
     }
-    /* Up to 10 s, polled, rather than sem_wait: a stager that crashed holding
-     * the lock leaves it taken until `bwa-mem3 shm -d`, and the test must not
-     * hang on it. */
+    /* Bounded wait: a crashed private stager may leave its semaphore held.
+     * The parent owner can unlink its own objects after the child is reaped. */
     bool locked = false;
     int err = 0;
     for (int tries = 0; tries < 1000 && !locked; tries++) {
-        locked = sem_trywait(lock) == 0;
+        locked = try_wait(lock) == 0;
         err = locked ? 0 : errno;
         if (!locked && err != EAGAIN && err != EINTR) break;
         if (!locked) usleep(10000);
     }
     if (!locked) {
         fprintf(stderr, "[WARN] could not take the shm lock %s (%s); left %s staged "
-                "(`bwa-mem3 shm -d` removes it)\n", registry.lock,
-                err == EAGAIN || err == EINTR ? "still held after 10 s" : strerror(err), fixture);
+                "(private registry %s; owning fixture retains cleanup responsibility)\n", registry.lock,
+                err == EAGAIN || err == EINTR ? "still held after 10 s" : strerror(err), fixture, registry.control);
         sem_close(lock);
         return;
     }
@@ -181,10 +326,10 @@ static void drop_fixture_shm(const char *prefix,
     });
     if (only_fixtures) {
         const std::string idx = std::string(registry.index_prefix) + fixture;
-        shm_unlink(idx.c_str());   /* absent after an aborted stage */
+        registry.owner->remove(idx);   /* absent after an aborted stage */
         if (second_fixture != NULL)
-            shm_unlink((std::string(registry.index_prefix) + second_fixture).c_str());
-        shm_unlink(registry.control);
+            registry.owner->remove(std::string(registry.index_prefix) + second_fixture);
+        registry.owner->remove(registry.control);
         sem_post(lock);
         sem_close(lock);
         return;
@@ -194,8 +339,8 @@ static void drop_fixture_shm(const char *prefix,
     std::string staged;
     for (const std::string &n : names) staged += (staged.empty() ? "" : ", ") + n;
     fprintf(stderr, "[WARN] another index was staged in shm while this test ran; dropped "
-            "nothing, so %s may still be staged (registry: %s). `bwa-mem3 shm -d` removes "
-            "every staged index\n", fixture, staged.c_str());
+            "nothing (private segment %s%s, registry %s, lock %s, entries: %s); "
+            "only the owning fixture may clean these names\n", registry.index_prefix, fixture, registry.control, registry.lock, staged.c_str());
 }
 
 /* These private names exercise cleanup even when staging a packed index is not
@@ -214,26 +359,115 @@ static void *fail_registry_map(void *, size_t, int, int, int, off_t)
     return MAP_FAILED;
 }
 
+// The child announces a real EAGAIN at the lock while the writer holds it ('r'),
+// then its acquisition after that wait ('l'), then each registry map ('m'). The
+// notification wait and the cleaner's lock acquisition are both bounded.
+static int lock_reached_fd = -1;
+static bool lock_waited = false;
+static void announce(char event)
+{
+    if (lock_reached_fd >= 0 && write(lock_reached_fd, &event, 1) != 1) _exit(91);
+}
+static bool pipe_ready(int fd)
+{
+    struct pollfd p = {fd, POLLIN, 0};
+    int rc;
+    do { rc = poll(&p, 1, 5000); } while (rc < 0 && errno == EINTR);
+    return rc == 1 && (p.revents & POLLIN) != 0;
+}
+
+static int synchronized_trywait(sem_t *lock)
+{
+    const int rc = sem_trywait(lock);
+    const int err = errno;
+    if (rc < 0 && err == EAGAIN && !lock_waited) {
+        lock_waited = true;
+        announce('r');
+    } else if (rc == 0 && lock_waited) {
+        announce('l');
+    }
+    errno = err;
+    return rc;
+}
+
+static void *announced_registry_map(void *addr, size_t len, int prot, int flags, int fd, off_t off)
+{
+    announce('m');
+    return mmap(addr, len, prot, flags, fd, off);
+}
+
+static void check_read_after_lock(void *map, sem_t *lock, const ShmRegistry &registry,
+                                  const char *fixture, const char *other)
+{
+    // Start fixture-only. While the cleaner demonstrably waits on the lock,
+    // publish the unrelated entry. A pre-lock snapshot would delete both names.
+    const uint16_t one = 1, two = 2;
+    memcpy(map, &one, sizeof one);
+    int reached[2];
+    if (pipe(reached) != 0) { report(false, "lock ordering: notification pipe"); return; }
+    if (sem_trywait(lock) != 0) {
+        close(reached[0]); close(reached[1]);
+        report(false, "lock ordering: writer takes private lock"); return;
+    }
+    fflush(NULL);
+    const pid_t child = fork();
+    if (child == 0) {
+        close(reached[0]);
+        lock_reached_fd = reached[1];
+        drop_fixture_shm(fixture, registry, announced_registry_map, NULL, synchronized_trywait);
+        _exit(0);
+    }
+    close(reached[1]);
+    const bool waiting = child > 0 && pipe_ready(reached[0]);
+    char ready;
+    const bool notified = waiting && read(reached[0], &ready, 1) == 1;
+    memcpy(map, &two, sizeof two);
+    sem_post(lock);
+    if (!notified && child > 0) kill(child, SIGKILL);
+    int status = 0;
+    const bool ended = child > 0 && waitpid(child, &status, 0) == child;
+    // After the child exits, its write end is closed: read every later event.
+    std::string events;
+    char event;
+    while (ended && read(reached[0], &event, 1) == 1) events += event;
+    close(reached[0]);
+    std::vector<std::string> names;
+    report(notified && ended && events == "lm",
+           "fixture cleanup acquires the stager lock after waiting, then maps the registry once");
+    report(notified && ended && WIFEXITED(status) && WEXITSTATUS(status) == 0
+               && read_shm_registry(&names, registry) == REGISTRY_READABLE
+               && names == std::vector<std::string>{fixture, other}
+               && shm_name_exists((std::string(registry.index_prefix) + fixture).c_str())
+               && shm_name_exists((std::string(registry.index_prefix) + other).c_str()),
+           "fixture cleanup reads the private registry after taking the stager lock");
+}
+
 static void check_fixture_cleanup()
 {
-    char unique[] = "/tmp/bwa-sj-XXXXXX";
-    char *dir = mkdtemp(unique);
-    if (dir == NULL) { report(false, "cleanup fixture: unique names allocated"); return; }
-    const std::string token = std::string("/sj") + (strrchr(dir, '-') + 1);
-    const std::string ctl = token + "c", lock_name = token + "l", idx = token + "-";
-    const ShmRegistry registry = {ctl.c_str(), lock_name.c_str(), idx.c_str()};
+    PrivateObjects owned;
+    std::string ctl, lock_name, idx;
+    bool reserved = false;
+    for (int attempt = 0; attempt < 20 && !reserved; ++attempt) {
+        bwa_tests::TempDir private_names("sj");
+        const std::string token = "/sh" + private_names.path().substr(private_names.path().rfind('.') + 1);
+        ctl = token + "c"; lock_name = token + "l"; idx = token + "-";
+        reserved = owned.reserve(ctl, lock_name, {idx + "fixture", idx + "other"});
+    }
+    report(reserved, "helper reserves complete private namespace without foreign reuse");
+    if (!reserved) return;
+    const ShmRegistry registry = {ctl.c_str(), lock_name.c_str(), idx.c_str(), &owned};
     const char *fixture = "fixture", *other = "other";
     const std::string fixture_idx = idx + fixture, other_idx = idx + other;
     std::vector<std::string> names;
-    report(read_shm_registry(&names, registry) == REGISTRY_MISSING && names.empty(),
-           "fixture registry distinguishes a missing registry");
-    sem_t *lock = sem_open(registry.lock, O_CREAT | O_EXCL, 0600, 1);
-    int fd = shm_open(registry.control, O_CREAT | O_EXCL | O_RDWR, 0600);
+    report(read_shm_registry(&names, registry) == REGISTRY_READABLE && names.empty(),
+           "fixture registry starts with an exclusively owned empty registry");
+    sem_t *lock = sem_open(registry.lock, 0);
+    int fd = dup(owned.descriptor(ctl));
     if (fd >= 0)
         report(read_shm_registry(&names, registry) == REGISTRY_READABLE && names.empty(),
                "fixture registry treats a short registry as empty");
-    int fixture_fd = shm_open(fixture_idx.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
-    int other_fd = shm_open(other_idx.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    int fixture_fd = dup(owned.descriptor(fixture_idx));
+    int other_fd = dup(owned.descriptor(other_idx));
     bool ready = lock != SEM_FAILED && fd >= 0 && fixture_fd >= 0 && other_fd >= 0;
     void *map = MAP_FAILED;
     if (ready && ftruncate(fd, BWA_SHM_CTL_SIZE) == 0)
@@ -251,6 +485,7 @@ static void check_fixture_cleanup()
             offset += strlen(name) + 1;
         }
         memcpy((char *)map + 2, &offset, sizeof(offset));
+        check_read_after_lock(map, lock, registry, fixture, other);
         std::vector<uint8_t> before((uint8_t *)map, (uint8_t *)map + BWA_SHM_CTL_SIZE);
         drop_fixture_shm(fixture, registry);
         report(read_shm_registry(&names, registry) == REGISTRY_READABLE && names.size() == 2
@@ -274,13 +509,37 @@ static void check_fixture_cleanup()
                    && shm_name_exists(registry.control) && shm_name_exists(fixture_idx.c_str())
                    && shm_name_exists(other_idx.c_str()),
                "fixture cleanup preserves a malformed registry and its segments");
-        /* Restore a fixture-only registry even when the old cleanup removed its
-         * name, so the lock-lifetime regression remains independently testable. */
-        int restored = shm_open(registry.control, O_CREAT | O_RDWR, 0600);
-        if (restored >= 0) close(restored);
-        count = 1;
-        memcpy(map, &count, sizeof(count));
-        drop_fixture_shm(fixture, registry);
+        // Restore the valid two-entry registry, then remove both owned names.
+        memcpy(map, before.data(), before.size());
+        const std::string unrelated_idx = idx + "unrelated";
+        PrivateObjects unrelated;
+        report(unrelated.acquire(unrelated_idx), "two-owned cleanup: unrelated segment created");
+        drop_fixture_shm(fixture, registry, mmap, other);
+        report(read_shm_registry(&names, registry) == REGISTRY_MISSING && names.empty()
+                   && !shm_name_exists(fixture_idx.c_str()) && !shm_name_exists(other_idx.c_str())
+                   && shm_name_exists(unrelated_idx.c_str()),
+               "two-owned cleanup removes both segments and registry entries, preserves unrelated segment");
+        unrelated.clear();
+        // Recreate a one-owned registry to check lock identity independently.
+        const int replacement = owned.acquire(ctl) ? dup(owned.descriptor(ctl)) : -1;
+        bool replaced = replacement >= 0 && ftruncate(replacement, BWA_SHM_CTL_SIZE) == 0;
+        void *replacement_map = replaced ? mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ | PROT_WRITE,
+                                                MAP_SHARED, replacement, 0) : MAP_FAILED;
+        replaced = replaced && replacement_map != MAP_FAILED;
+        report(replaced, "one-owned cleanup: replacement registry created");
+        if (replaced) {
+            memcpy(replacement_map, before.data(), before.size());
+            const uint16_t one = 1;
+            memcpy(replacement_map, &one, sizeof one);
+            munmap(replacement_map, BWA_SHM_CTL_SIZE);
+        }
+        if (replacement >= 0) close(replacement);
+        const int recreated_fixture = owned.acquire(fixture_idx) ? dup(owned.descriptor(fixture_idx)) : -1;
+        const bool recreated = recreated_fixture >= 0 && shm_name_exists(fixture_idx.c_str());
+        report(recreated, "one-owned cleanup requires an exclusively recreated existing segment");
+        if (recreated_fixture >= 0) close(recreated_fixture);
+        /* Remove only the recreated fixture; the other name is already absent. */
+        if (recreated && replaced) drop_fixture_shm(fixture, registry);
         sem_t *reopened = sem_open(registry.lock, 0);
         bool same_lock = false;
         if (reopened != SEM_FAILED) {
@@ -294,8 +553,8 @@ static void check_fixture_cleanup()
         }
         report(same_lock, "fixture cleanup keeps the same stager lock linked and released");
         report(!shm_name_exists(registry.control) && !shm_name_exists(fixture_idx.c_str())
-                   && shm_name_exists(other_idx.c_str()),
-               "fixture-only cleanup removes its registry and segment, not other segments");
+                   && !shm_name_exists(other_idx.c_str()),
+               "fixture-only cleanup removes its registry and segment");
     } else {
         fprintf(stderr, "[SKIP] fixture cleanup checks: private POSIX shm unavailable (%s)\n", strerror(errno));
     }
@@ -304,45 +563,199 @@ static void check_fixture_cleanup()
     if (fixture_fd >= 0) close(fixture_fd);
     if (other_fd >= 0) close(other_fd);
     if (lock != SEM_FAILED) sem_close(lock);
-    if (fd >= 0) shm_unlink(registry.control);
-    if (fixture_fd >= 0) shm_unlink(fixture_idx.c_str());
-    if (other_fd >= 0) shm_unlink(other_idx.c_str());
-    if (lock != SEM_FAILED) sem_unlink(registry.lock);
-    rmdir(dir);
 }
 
 /* Alias the generated disk fixture under short per-run names: POSIX staging
  * keys on basename, not content, and macOS limits shm names to 31 characters. */
 struct ShmDiskFixtures {
-    char directory[64] = "/tmp/bwa-sj-XXXXXX";
+    bwa_tests::TempDir directory{"sj"};
     std::string first, second;
-    std::vector<std::string> links;
     bool ready = false;
 
     explicit ShmDiskFixtures(const char *source)
     {
-        char resolved[PATH_MAX];
-        if (realpath(source, resolved) == NULL || mkdtemp(directory) == NULL) return;
-        const std::string token = strrchr(directory, '-') + 1;
-        first = std::string(directory) + "/sj" + token + "a";
-        second = std::string(directory) + "/sj" + token + "b";
+        const std::string source_path(source);
+        const size_t slash = source_path.rfind('/');
+        const std::string parent = slash == std::string::npos ? "." :
+                                   slash == 0 ? "/" : source_path.substr(0, slash);
+        const std::string basename = source_path.substr(slash == std::string::npos ? 0 : slash + 1);
+        char resolved_parent[PATH_MAX];
+        if (basename.empty() || realpath(parent.c_str(), resolved_parent) == NULL) return;
+        const std::string resolved = std::string(resolved_parent) + "/" + basename;
+        first = directory.file("first");
+        second = directory.file("second");
         for (const std::string &prefix : {first, second}) {
             for (const char *suffix : {".ann", ".amb", ".pac", ".bwt.2bit.64"}) {
                 const std::string dest = prefix + suffix;
                 const std::string src = std::string(resolved) + suffix;
                 if (symlink(src.c_str(), dest.c_str()) != 0) return;
-                links.push_back(dest);
             }
         }
         ready = true;
     }
 
-    ~ShmDiskFixtures()
-    {
-        for (const std::string &link : links) unlink(link.c_str());
-        if (!first.empty()) rmdir(directory);
-    }
 };
+
+/* Check the host facility before staging. After this succeeds, every stage
+ * error is unexpected and fails with the implementation's captured diagnostic. */
+static bool staging_prerequisite()
+{
+#if defined(__linux__)
+    PrivateObjects probe;
+    const std::string probe_name = std::string(private_control) + "p";
+    const int fd = probe.acquire(probe_name) ? dup(probe.descriptor(probe_name)) : -1;
+    if (fd < 0) {
+        fprintf(stderr, "[SKIP] real staging prerequisite: private control shm_open: %s\n", strerror(errno));
+        return false;
+    }
+    bool ok = ftruncate(fd, BWA_SHM_CTL_SIZE) == 0;
+    void *map = ok ? mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) : MAP_FAILED;
+    ok = ok && map != MAP_FAILED;
+    const int err = errno;
+    if (map != MAP_FAILED) munmap(map, BWA_SHM_CTL_SIZE);
+    close(fd);
+    probe.clear();
+    if (!ok) fprintf(stderr, "[SKIP] real staging prerequisite: private control mapping: %s\n", strerror(err));
+    return ok;
+#else
+    fprintf(stderr, "[SKIP] real staging prerequisite: supported Linux POSIX shm required; "
+                    "portable private-registry checks still run\n");
+    return false;
+#endif
+}
+
+#if defined(__GLIBC__) && (defined(__SANITIZE_ADDRESS__) || defined(__has_feature))
+#if defined(__SANITIZE_ADDRESS__)
+#define PRIVATE_STAGE_ASAN 1
+#elif __has_feature(address_sanitizer)
+#define PRIVATE_STAGE_ASAN 1
+#endif
+#endif
+#if defined(PRIVATE_STAGE_ASAN)
+static void stage_child_exit(int status, void *) { fflush(NULL); _exit(status); }
+#endif
+
+static bool stage_required(const char *prefix, const char *name)
+{
+    bwa_tests::StderrCapture capture;
+    fflush(NULL);
+    const pid_t child = fork();
+    if (child == 0) {
+#if defined(PRIVATE_STAGE_ASAN)
+        on_exit(stage_child_exit, NULL);
+#endif
+        const int rc = bwa_shm_stage(prefix);
+        fflush(NULL);
+        _exit(rc == 0 ? 0 : 1);
+    }
+    int status = 0;
+    pid_t ended = -1;
+    if (child > 0) do { ended = waitpid(child, &status, 0); } while (ended < 0 && errno == EINTR);
+    const bool ok = child > 0 && ended == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    const std::string diagnostic = capture.text();
+    if (!ok)
+        fprintf(stderr, "[ERROR] %s: unexpected staging child status %d:\n%s", name, status, diagnostic.c_str());
+    report(ok, name);
+    return ok;
+}
+
+// Deliberate collisions are exclusively ours, never borrowed host objects.
+static void check_namespace_collisions()
+{
+    for (const char *prefix : {"sm", "sh", "sj"}) {
+        bwa_tests::TempDir temp("collision");
+        const std::string token = temp.path().substr(temp.path().rfind('.') + 1);
+        const std::string base = std::string("/") + prefix + token;
+        const std::string ctl = base + "c", lock = base + "l";
+        const std::vector<std::string> segments = {base + "-first", base + "-second"};
+        for (int collision = 0; collision < 4; ++collision) {
+            PrivateObjects foreign;
+            const std::string target = collision == 0 ? ctl : collision == 1 ? lock : segments[collision - 2];
+            const bool created = foreign.acquire(target, collision == 1);
+            report(created, "collision sentinel exclusively created");
+            if (!created) continue;
+            {
+                PrivateObjects contender;
+                const bool reserved = contender.reserve(ctl, lock, segments);
+                bool kept = shm_name_exists(target.c_str());
+                // Close the probe without unlinking the foreign semaphore.
+                if (collision == 1) { sem_t *probe = sem_open(lock.c_str(), 0); kept = probe != SEM_FAILED; if (kept) sem_close(probe); }
+                report(!reserved && !contender.owns(target) && kept,
+                       "partial namespace collision rolls back only acquired objects");
+            }
+            bool preserved = shm_name_exists(target.c_str());
+            if (collision == 1) {
+                sem_t *probe = sem_open(lock.c_str(), 0);
+                preserved = probe != SEM_FAILED;
+                if (preserved) sem_close(probe);
+            }
+            report(preserved, "normal cleanup preserves foreign collision object");
+            for (const auto &name : {ctl, segments[0], segments[1]})
+                if (name != target) report(!shm_name_exists(name.c_str()), "partial acquisition leaves no owned segment or registry");
+        }
+    }
+    // Cleanup must reject an unowned second segment even with an owned first.
+    bwa_tests::TempDir temp("unowned_second");
+    const std::string base = "/su" + temp.path().substr(temp.path().rfind('.') + 1);
+    const std::string ctl = base + "c", lock = base + "l", idx = base + "-";
+    PrivateObjects owner, foreign;
+    const bool ready = owner.reserve(ctl, lock, {idx + "first"}) && foreign.acquire(idx + "second");
+    report(ready, "unowned second-segment sentinel prepared");
+    if (ready) {
+        const ShmRegistry registry = {ctl.c_str(), lock.c_str(), idx.c_str(), &owner};
+        drop_fixture_shm("first", registry, mmap, "second");
+        report(shm_name_exists((idx + "second").c_str()) && shm_name_exists(ctl.c_str()),
+               "cleanup refuses an unowned second segment and preserves registry");
+    }
+}
+
+static void check_fatal_stage()
+{
+    const std::string saved_control(private_control), saved_lock(private_lock), saved_index(private_index);
+    PrivateObjects *saved_owner = stage_objects;
+    for (bool truncated : {false, true}) {
+        bwa_tests::TempDir input("fatal_stage");
+        const std::string token = input.path().substr(input.path().rfind('.') + 1);
+        const std::string ctl = "/sf" + token + "c", lock = "/sf" + token + "l", idx = "/sf" + token + "-";
+        PrivateObjects owned, sentinel;
+        const bool ready = owned.reserve(ctl, lock, {idx + "first", idx + "second"})
+                           && sentinel.acquire(idx + "unrelated") && sentinel.acquire(ctl + "u")
+                           && sentinel.acquire(lock + "u", true);
+        report(ready, "fatal stage parent owns complete namespace and unrelated sentinel");
+        if (!ready) continue;
+        snprintf(private_control, sizeof private_control, "%s", ctl.c_str());
+        snprintf(private_lock, sizeof private_lock, "%s", lock.c_str());
+        snprintf(private_index, sizeof private_index, "%s", idx.c_str());
+        stage_objects = &owned;
+        if (truncated) input.write("broken.ann", "");
+        const int before_total = total_cases, before_passed = passed_cases;
+        bwa_tests::StderrCapture capture;
+        const bool staged = stage_required(input.file(truncated ? "broken" : "missing").c_str(), "fatal private stage");
+        const std::string text = capture.text();
+        const bool failed = !staged && total_cases == before_total + 1 && passed_cases == before_passed;
+        total_cases = before_total; passed_cases = before_passed;
+        report(failed && text.find("[ERROR]") != std::string::npos && text.find("[FAIL]") != std::string::npos
+                   && text.find("status 256") != std::string::npos
+                   && text.find(truncated ? "Unexpected end of file" : "fail to open file") != std::string::npos,
+               truncated ? "truncated index fatal exit reports diagnostic and FAIL in parent" :
+                           "missing index fatal exit reports diagnostic and FAIL in parent");
+        owned.clear();
+        sem_t *probe = sem_open(lock.c_str(), 0);
+        const bool missing_lock = probe == SEM_FAILED && errno == ENOENT;
+        if (probe != SEM_FAILED) sem_close(probe);
+        sem_t *sentinel_probe = sem_open((lock + "u").c_str(), 0);
+        const bool sentinel_lock = sentinel_probe != SEM_FAILED;
+        if (sentinel_lock) sem_close(sentinel_probe);
+        report(sentinel_lock && shm_name_exists((ctl + "u").c_str())
+                   && !shm_name_exists(ctl.c_str()) && missing_lock && !shm_name_exists((idx + "first").c_str())
+                   && !shm_name_exists((idx + "second").c_str()) && shm_name_exists((idx + "unrelated").c_str()),
+               "parent cleans owned objects after fatal child exit and preserves unrelated sentinel");
+    }
+    snprintf(private_control, sizeof private_control, "%s", saved_control.c_str());
+    snprintf(private_lock, sizeof private_lock, "%s", saved_lock.c_str());
+    snprintf(private_index, sizeof private_index, "%s", saved_index.c_str());
+    stage_objects = saved_owner;
+}
 
 struct Walk { int64_t k, l, s; };
 
@@ -585,14 +998,89 @@ static void poison_table(FMI_search *fmi)
  * test can reach the handle's FMI_search. */
 struct FmiSeed { FMI_search *fmi; };
 
-int main(int argc, char *argv[])
+// Reserve and initialize the main private namespace in this process. Called only
+// after every fatal-capable disk load, so an invalid index exits owning nothing.
+static bool reserve_main_namespace(PrivateObjects &owned)
 {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <bwa-mem3 index prefix>\n", argv[0]);
-        return 2;
+    bool reserved = false;
+    for (int attempt = 0; attempt < 20 && !reserved; ++attempt) {
+        bwa_tests::TempDir private_names("seed_jump");
+        const std::string token = private_names.path().substr(private_names.path().rfind('.') + 1);
+        snprintf(private_control, sizeof private_control, "/sm%sc", token.c_str());
+        snprintf(private_lock, sizeof private_lock, "/sm%sl", token.c_str());
+        snprintf(private_index, sizeof private_index, "/sm%s-", token.c_str());
+        reserved = owned.reserve(private_control, private_lock,
+                                 {std::string(private_index) + "first", std::string(private_index) + "second"});
     }
+    report(reserved, "main reserves complete private namespace after disk loads, before staging");
+    if (!reserved) return false;
+    exit_owner = &owned;
+    // A signal, _exit or abort after this point leaks these names; name them.
+    fprintf(stderr, "[INFO] private namespace reserved: %s %s %sfirst %ssecond (pid %d)\n",
+            private_control, private_lock, private_index, private_index, (int)getpid());
+    const int ctl = owned.descriptor(private_control);
+    const uint16_t header[2] = {0, 4};
+    void *control_map = ftruncate(ctl, BWA_SHM_CTL_SIZE) == 0 ?
+        mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, ctl, 0) : MAP_FAILED;
+    const bool initialized = control_map != MAP_FAILED;
+    if (initialized) { memcpy(control_map, header, sizeof header); munmap(control_map, BWA_SHM_CTL_SIZE); }
+    report(initialized, "reserved registry initialized for real staging");
+    if (!initialized) return false;
+    fixture_registry.owner = &owned;
+    stage_objects = &owned;
+    return true;
+}
+
+// The owner unlinks its whole namespace itself, then checks every name is gone.
+static bool release_main_namespace(PrivateObjects &owned)
+{
+    owned.clear();
+    exit_owner = NULL;
+    stage_objects = NULL;
+    fixture_registry.owner = NULL;
+    sem_t *lock_probe = sem_open(private_lock, 0);
+    const bool no_lock = lock_probe == SEM_FAILED && errno == ENOENT;
+    if (lock_probe != SEM_FAILED) sem_close(lock_probe);
+    const bool cleaned = no_lock && !shm_name_exists(private_control)
+                         && !shm_name_exists((std::string(private_index) + "first").c_str())
+                         && !shm_name_exists((std::string(private_index) + "second").c_str());
+    report(cleaned, "owner removes complete main namespace after full workload");
+    return cleaned;
+}
+
+static int fixture_workload(const char *prefix, bool portable_checks)
+{
+    if (portable_checks) {
+    check_namespace_collisions();
+    check_fatal_stage();
     check_fixture_cleanup();
-    const char *prefix = argv[1];
+    {
+        // An actual rejected stage must count as FAIL, not a host-unavailable SKIP.
+        const int before_total = total_cases, before_passed = passed_cases;
+        bwa_tests::StderrCapture capture;
+        const bool staged = stage_required(NULL, "second private fixture staging");
+        const std::string diagnostic = capture.text();
+        const bool failed = !staged && total_cases == before_total + 1 && passed_cases == before_passed;
+        total_cases = before_total;
+        passed_cases = before_passed;
+        report(failed && diagnostic.find("[ERROR]") != std::string::npos
+                   && diagnostic.find("[FAIL]") != std::string::npos
+                   && diagnostic.find("empty prefix") != std::string::npos
+                   && diagnostic.find("[SKIP]") == std::string::npos,
+               "unexpected second-stage errors fail with the real diagnostic, never SKIP");
+    }
+    {
+        bwa_tests::TempDir suffix_only("suffix_only");
+        for (const char *suffix : {".ann", ".amb", ".pac", ".bwt.2bit.64"})
+            suffix_only.write(std::string("index") + suffix, "fixture");
+        ShmDiskFixtures aliases(suffix_only.file("index").c_str());
+        report(aliases.ready && access(aliases.first.c_str(), F_OK) != 0
+                   && access((aliases.first + ".ann").c_str(), R_OK) == 0,
+               "suffix-only prefix resolves through directory and basename");
+    }
+    }
+    if (strcmp(prefix, "--fixtures-only") == 0)
+        return passed_cases == total_cases ? 0 : 1;
     char name[160];
 
     /* Default load: depth 10, built by load_index. */
@@ -681,19 +1169,10 @@ int main(int argc, char *argv[])
         report(np->seed_jump == NULL && np->seed_jump_depth == 0,
                "load_index(build_seed_jump=false): no table");
         delete np;
-        /* fmi_seed_open attaches to a staged segment rather than load from
-         * disk, and nothing turns that off, so with the fixture already staged
-         * on this host (e.g. by `bwa-mem3 shm`) there is no disk load to test. */
-        if (bwa_shm_test(prefix) == 1) {
-            fprintf(stderr, "[SKIP] fmi_seed_open (disk load): no table: %s is staged in shm "
-                    "on this host, so it would attach instead of loading from disk\n", prefix);
-        } else {
-            FmiSeed *h = fmi_seed_open(prefix);
-            report(h != NULL && h->fmi->shm_base == NULL && h->fmi->seed_jump == NULL
-                       && h->fmi->seed_jump_depth == 0,
-                   "fmi_seed_open (disk load): no table");
-            fmi_seed_close(h);
-        }
+        FmiSeed *h = fmi_seed_open(prefix);
+        report(h != NULL && h->fmi->seed_jump == NULL && h->fmi->seed_jump_depth == 0,
+               "fmi_seed_open (disk or already-staged attach): no table");
+        fmi_seed_close(h);
     }
 
     /* An index attached from a packed segment: load_index_from_shm builds no
@@ -727,57 +1206,294 @@ int main(int argc, char *argv[])
         free(buf);
     }
 
-    /* Use unique basenames even if another process stages an index while the
-     * test runs. Cleanup leaves the existing stager lock linked and preserves
-     * any registry containing an index not owned by this run. */
+    /* Real staging uses the exclusively reserved private namespace.
+     * Alias prefixes have only the required suffix files; .0123 is not staged.
+     * The scratch fixture is built first: if it throws, no IPC name is owned yet. */
     ShmDiskFixtures fixture(prefix);
-    int ctl_fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
-    if (ctl_fd >= 0) {
-        close(ctl_fd);
-        fprintf(stderr, "[SKIP] load_index's shm-attach path: a registry already exists; not changing it\n");
-    } else if (errno != ENOENT || !fixture.ready) {
-        fprintf(stderr, "[SKIP] load_index's shm-attach path: cannot prepare an isolated fixture\n");
-    } else if (bwa_shm_stage(fixture.first.c_str()) == 0) {
+    PrivateObjects owned;
+    if (!reserve_main_namespace(owned)) {
+        release_main_namespace(owned);
+        delete fmi;
+        return 1;
+    }
+    report(fixture.ready, "real staging: suffix-only disk aliases prepared");
+    if (fixture.ready && staging_prerequisite()) {
         const char *staged_prefix = fixture.first.c_str();
-        FMI_search *at = new FMI_search(staged_prefix);
-        at->load_index();
-        report(at->shm_base != NULL && check_table(at, 10),
-               "load_index (shm attach): builds the default table");
-        delete at;
-        at = new FMI_search(staged_prefix);
-        at->load_index(/*load_pac=*/false, /*n_threads=*/1, /*build_seed_jump=*/false);
-        report(at->shm_base != NULL && at->seed_jump == NULL && at->seed_jump_depth == 0,
-               "load_index(build_seed_jump=false) (shm attach): no table");
-        delete at;
-        FmiSeed *h = fmi_seed_open(staged_prefix);
-        report(h != NULL && h->fmi->shm_base != NULL && h->fmi->seed_jump == NULL
-                   && h->fmi->seed_jump_depth == 0,
-               "fmi_seed_open (shm attach): no table");
-        fmi_seed_close(h);
         const char *second_prefix = fixture.second.c_str();
-        if (bwa_shm_stage(second_prefix) == 0) {
-            drop_fixture_shm(staged_prefix);
-            std::vector<std::string> names;
-            const std::string first_name = strrchr(staged_prefix, '/') + 1;
-            const std::string second_name = strrchr(second_prefix, '/') + 1;
-            report(read_shm_registry(&names) == REGISTRY_READABLE
-                       && std::find(names.begin(), names.end(), first_name) != names.end()
-                       && std::find(names.begin(), names.end(), second_name) != names.end()
-                       && bwa_shm_test(staged_prefix) == 1 && bwa_shm_test(second_prefix) == 1
-                       && shm_name_exists((std::string(BWA_SHM_IDX_PREFIX) + first_name).c_str())
-                       && shm_name_exists((std::string(BWA_SHM_IDX_PREFIX) + second_name).c_str()),
-                   "fixture cleanup preserves a second staged index and its segment");
-        } else {
-            fprintf(stderr, "[SKIP] second-index preservation: staging unavailable on this host\n");
+        const std::string first_name = strrchr(staged_prefix, '/') + 1;
+        const std::string second_name = strrchr(second_prefix, '/') + 1;
+        const bool staged = stage_required(staged_prefix, "first private fixture staging");
+        if (staged) {
+            FMI_search *at = new FMI_search(staged_prefix);
+            at->load_index();
+            report(at->shm_base != NULL && check_table(at, 10),
+                   "load_index (suffix-only shm attach): builds the default table");
+            delete at;
+            at = new FMI_search(staged_prefix);
+            at->load_index(false, 1, false);
+            report(at->shm_base != NULL && at->seed_jump == NULL && at->seed_jump_depth == 0,
+                   "load_index(build_seed_jump=false) (shm attach): no table");
+            delete at;
+            FmiSeed *h = fmi_seed_open(staged_prefix);
+            report(h != NULL && h->fmi->shm_base != NULL && h->fmi->seed_jump == NULL
+                       && h->fmi->seed_jump_depth == 0,
+                   "fmi_seed_open (already-staged shm attach): no table");
+            fmi_seed_close(h);
+            if (stage_required(second_prefix, "second private fixture staging")) {
+                drop_fixture_shm(staged_prefix);
+                std::vector<std::string> names;
+                report(read_shm_registry(&names) == REGISTRY_READABLE
+                           && names == std::vector<std::string>{first_name, second_name}
+                           && bwa_shm_test(staged_prefix) == 1 && bwa_shm_test(second_prefix) == 1
+                           && shm_name_exists((std::string(private_index) + first_name).c_str())
+                           && shm_name_exists((std::string(private_index) + second_name).c_str()),
+                       "fixture cleanup preserves a second staged index and its segment");
+            }
         }
-        /* Remove both test-owned entries only if no user entry has appeared. */
-        drop_fixture_shm(staged_prefix, fixture_registry, mmap, strrchr(second_prefix, '/') + 1);
-    } else {
-        drop_fixture_shm(fixture.first.c_str());
-        fprintf(stderr, "[SKIP] load_index's shm-attach path: could not stage the unique fixture on this host\n");
+        drop_fixture_shm(staged_prefix, fixture_registry, mmap, second_name.c_str());
+        std::vector<std::string> names;
+        report(read_shm_registry(&names) == REGISTRY_MISSING && names.empty()
+                   && !shm_name_exists((std::string(private_index) + first_name).c_str())
+                   && !shm_name_exists((std::string(private_index) + second_name).c_str()),
+               "real staging cleanup removes both owned segments and their registry entries");
     }
 
+    release_main_namespace(owned);
     delete fmi;
     fprintf(stderr, "%d / %d cases passed\n", passed_cases, total_cases);
     return passed_cases == total_cases ? 0 : 1;
+}
+
+static bool lock_exists(const std::string &name)
+{
+    sem_t *probe = sem_open(name.c_str(), 0);
+    if (probe == SEM_FAILED) return false;
+    sem_close(probe);
+    return true;
+}
+
+static int wait_status(pid_t child)
+{
+    int status = 0;
+    pid_t ended;
+    do { ended = waitpid(child, &status, 0); } while (ended < 0 && errno == EINTR);
+    return ended == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// Unique private names for one regression; the test exclusively creates each.
+static std::string private_base(const char *tag, const char *prefix)
+{
+    bwa_tests::TempDir names(tag);
+    return std::string("/") + prefix + names.path().substr(names.path().rfind('.') + 1);
+}
+
+// A missing or truncated index exits from the disk loader before the main
+// namespace is reserved. The workload runs in a child here only as a harness for
+// that fatal exit: the child owns nothing when it dies, which is what is proven.
+static void check_invalid_full_workload()
+{
+    for (bool corrupt : {false, true}) {
+        bwa_tests::TempDir input("invalid_full");
+        // A valid first scalar followed by a truncated file reaches a different
+        // fatal read than the missing-file exit, without constructing an index.
+        if (corrupt) {
+            const int64_t length = 101;
+            input.write("broken.bwt.2bit.64", std::string(reinterpret_cast<const char *>(&length), sizeof length));
+        }
+        PrivateObjects unrelated;
+        const std::string base = private_base("invalid_full", "si");
+        const std::string ctl = base + "c", lock = base + "l", segment = base + "-sentinel";
+        const bool ready = unrelated.reserve(ctl, lock, {segment});
+        report(ready, "invalid full-input unrelated sentinels reserved");
+        if (!ready) continue;
+        const std::string prefix = input.file(corrupt ? "broken" : "missing");
+        bwa_tests::StderrCapture capture;
+        fflush(NULL);
+        const pid_t child = fork();
+        if (child == 0) {
+#if defined(PRIVATE_STAGE_ASAN)
+            on_exit(stage_child_exit, NULL);
+#endif
+            const int rc = fixture_workload(prefix.c_str(), false);
+            fflush(NULL);
+            _exit(rc);
+        }
+        const int rc = child > 0 ? wait_status(child) : -1;
+        const std::string diagnostic = capture.text();
+        report(rc > 0 && diagnostic.find(corrupt ? "Unexpected end of file" : "Unable to open the file") != std::string::npos
+                   && diagnostic.find("[INFO] private namespace reserved") == std::string::npos
+                   && shm_name_exists(ctl.c_str()) && lock_exists(lock) && shm_name_exists(segment.c_str()),
+               corrupt ? "corrupt full input exits with its diagnostic before reserving the main namespace" :
+                         "missing full input exits with its diagnostic before reserving the main namespace");
+    }
+}
+
+// A forked child runs the real bwa_shm_destroy over an owned private namespace:
+// its production shm_unlink/sem_unlink calls are suppressed, the owner keeps
+// every name and later removes them itself. Unrelated names are untouched.
+static void check_child_unlink_suppressed()
+{
+    const std::string base = private_base("child_unlink", "sc");
+    const std::string ctl = base + "c", lock = base + "l", idx = base + "-";
+    const std::string segment = idx + "owned", foreign_name = base + "-foreign";
+    PrivateObjects owner, foreign;
+    bool ready = owner.reserve(ctl, lock, {segment}) && foreign.acquire(foreign_name);
+    // Register the owned segment so destroy's registry walk unlinks it too.
+    void *map = ready && ftruncate(owner.descriptor(ctl), BWA_SHM_CTL_SIZE) == 0 ?
+        mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, owner.descriptor(ctl), 0) : MAP_FAILED;
+    ready = ready && map != MAP_FAILED;
+    if (ready) {
+        const uint16_t count = 1, next = (uint16_t)(4 + sizeof(int64_t) + strlen("owned") + 1);
+        const int64_t bytes = 1;
+        memset(map, 0, BWA_SHM_CTL_SIZE);
+        memcpy(map, &count, sizeof count);
+        memcpy((char *)map + 2, &next, sizeof next);
+        memcpy((char *)map + 4, &bytes, sizeof bytes);
+        memcpy((char *)map + 4 + sizeof bytes, "owned", strlen("owned") + 1);
+        munmap(map, BWA_SHM_CTL_SIZE);
+    }
+    report(ready, "child unlink: owned private namespace and foreign sentinel exclusively created");
+    if (!ready) return;
+    const std::string saved_control(private_control), saved_lock(private_lock), saved_index(private_index);
+    PrivateObjects *saved = stage_objects;
+    snprintf(private_control, sizeof private_control, "%s", ctl.c_str());
+    snprintf(private_lock, sizeof private_lock, "%s", lock.c_str());
+    snprintf(private_index, sizeof private_index, "%s", idx.c_str());
+    stage_objects = &owner;
+    int attempts[2] = {-1, -1};
+    const bool piped = pipe(attempts) == 0;
+    fflush(NULL);
+    const pid_t child = piped ? fork() : -1;
+    if (child == 0) {
+        close(attempts[0]);
+        suppressed_unlink_fd = attempts[1];
+        _exit(bwa_shm_destroy() == 0 ? 0 : 1);
+    }
+    if (piped) close(attempts[1]);
+    const int rc = child > 0 ? wait_status(child) : -1;
+    // The child has exited, so its write end is closed: read every attempt.
+    std::string attempted;
+    char buf[256];
+    ssize_t got;
+    while (piped && (got = read(attempts[0], buf, sizeof buf)) > 0) attempted.append(buf, (size_t)got);
+    if (piped) close(attempts[0]);
+    report(attempted == segment + "\n" + ctl + "\n" + lock + "\n",
+           "child destroy attempts to unlink the segment, registry and lock, in that order");
+    report(rc == 0 && shm_name_exists(segment.c_str()) && shm_name_exists(ctl.c_str()) && lock_exists(lock)
+               && owner.owns(segment) && owner.owns(ctl) && owner.owns(lock),
+           "child production unlinks of owned names are suppressed; names still exist and are owned");
+    owner.clear();
+    stage_objects = saved;
+    snprintf(private_control, sizeof private_control, "%s", saved_control.c_str());
+    snprintf(private_lock, sizeof private_lock, "%s", saved_lock.c_str());
+    snprintf(private_index, sizeof private_index, "%s", saved_index.c_str());
+    report(!shm_name_exists(segment.c_str()) && !shm_name_exists(ctl.c_str()) && !lock_exists(lock)
+               && shm_name_exists(foreign_name.c_str()),
+           "owner cleanup removes its names and preserves a foreign sentinel");
+}
+
+// remove() from a non-owner is a hard failure that unlinks nothing.
+static void check_non_owner_remove_fatal()
+{
+    const std::string segment = private_base("non_owner", "sn") + "-owned";
+    PrivateObjects owner;
+    const bool ready = owner.acquire(segment);
+    report(ready, "non-owner remove: owner segment exclusively created");
+    if (!ready) return;
+    bwa_tests::StderrCapture capture;
+    fflush(NULL);
+    const pid_t child = fork();
+    if (child == 0) { owner.remove(segment); _exit(0); }
+    const int rc = child > 0 ? wait_status(child) : -1;
+    const std::string diagnostic = capture.text();
+    report(rc == NON_OWNER_REMOVE_EXIT && diagnostic.find("[FATAL] PrivateObjects::remove") != std::string::npos
+               && shm_name_exists(segment.c_str()) && owner.owns(segment),
+           "non-owner remove exits with its distinct code and leaves the name");
+    owner.clear();
+    report(!shm_name_exists(segment.c_str()), "owner removes the name after a rejected non-owner remove");
+}
+
+// exit() in an owner runs its exit handler, which removes its names. A child of
+// that owner inherits the handler, but its plain exit must not unlink anything.
+static void check_exit_handler()
+{
+    const std::string base = private_base("exit_handler", "se");
+    const std::string ctl = base + "c", lock = base + "l", segment = base + "-first";
+    for (bool grandchild : {false, true}) {
+        int ready[2];
+        if (pipe(ready) != 0) { report(false, "exit handler: notification pipe"); return; }
+        fflush(NULL);
+        const pid_t child = fork();
+        if (child == 0) {
+            close(ready[0]);
+            // This child becomes the only owner of its own names. No destructor
+            // runs on exit(), so only main's registered handler can clean up; the
+            // global exit_owner keeps the object reachable.
+            exit_owner = new PrivateObjects();
+            if (!exit_owner->reserve(ctl, lock, {segment})) _exit(95);
+            if (!grandchild) exit(41);
+            fflush(NULL);
+            const pid_t inner = fork();
+            if (inner == 0) exit(0);   // inherited handler: PID guard must skip
+            const int inner_rc = inner > 0 ? wait_status(inner) : -1;
+            const bool kept = shm_name_exists(ctl.c_str()) && lock_exists(lock) && shm_name_exists(segment.c_str());
+            const char verdict = inner_rc == 0 && kept ? 'k' : 'x';
+            if (write(ready[1], &verdict, 1) != 1) _exit(97);
+            exit(42);
+        }
+        close(ready[1]);
+        char verdict = 0;
+        const bool notified = child > 0 && read(ready[0], &verdict, 1) == 1;
+        close(ready[0]);
+        const int rc = child > 0 ? wait_status(child) : -1;
+        const bool absent = !shm_name_exists(ctl.c_str()) && !lock_exists(lock) && !shm_name_exists(segment.c_str());
+        if (grandchild)
+            report(notified && verdict == 'k' && rc == 42 && absent,
+                   "owner's child exit(0) keeps the owner's names; owner exit then removes them");
+        else
+            report(rc == 41 && absent, "owner exit(41) runs the exit handler and leaves no names");
+    }
+}
+
+// Destroying the registered owner unregisters it, so a later exit() cannot
+// dereference it after an exception unwinds the owning frame.
+static void check_owner_destructor_unregisters()
+{
+    PrivateObjects *const saved = exit_owner;
+    {
+        PrivateObjects scoped;
+        exit_owner = &scoped;
+    }
+    report(exit_owner == NULL, "destroying the exit owner unregisters it from the exit handler");
+    exit_owner = saved;
+}
+
+static int run_checks(const char *prefix)
+{
+    check_child_unlink_suppressed();
+    check_non_owner_remove_fatal();
+    check_exit_handler();
+    check_owner_destructor_unregisters();
+    check_invalid_full_workload();
+    return fixture_workload(prefix, true);
+}
+
+int main(int argc, char *argv[])
+{
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <bwa-mem3 index prefix>\n", argv[0]);
+        return 2;
+    }
+    // Covers a plain exit() in the owner after reservation; PID-guarded.
+    if (atexit(owner_exit_cleanup) != 0) return 1;
+    // Catching here unwinds every stack owner, so its destructor unlinks its
+    // names; an uncaught exception may terminate without unwinding.
+    try {
+        return run_checks(argv[1]);
+    } catch (const std::exception &e) {
+        fprintf(stderr, "[FAIL] unexpected exception: %s\n", e.what());
+    } catch (...) {
+        fprintf(stderr, "[FAIL] unexpected non-standard exception\n");
+    }
+    return 1;
 }
