@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <string>
+#include <map>
 
 #include "../bwa.h"
 #include "../compat_target.h"
@@ -102,7 +103,6 @@ void aln_meth_convert(int read_no, const ubyte_t *in, int len, ubyte_t *out)
 }
 
 /* Original-reference model helpers for tags on the retained alignment. */
-static inline uint8_t pac_base(const uint8_t *pac, int64_t x) { return pac[x >> 2] >> ((~x & 3) << 1) & 3; }
 static inline const int8_t *meth_mat(const aln_meth_opt_t *mo, int hyp, int *m)
 {
     *m = mo->m.meth_context == METH_CTX_CPG ? METH_M : 5;
@@ -111,9 +111,7 @@ static inline const int8_t *meth_mat(const aln_meth_opt_t *mo, int hyp, int *m)
 static void fetch_window(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int64_t rb, int64_t len,
                          int rid, std::vector<uint8_t> &win)
 {
-    win.resize((size_t)len);
-    for (int64_t i = 0; i < len; ++i) win[i] = pac_base(ref->pac, rb + i);
-    if (mo->m.meth_context == METH_CTX_CPG && len) meth_label_cpg(win.data(), len, rb, rid, ref->bns, ref->pac);
+    aln_meth_fetch_window(*ref, *mo, rb, (int)len, rid, win);
 }
 static inline uint64_t splitmix64(uint64_t *x)
 {
@@ -128,6 +126,29 @@ uint64_t aln_meth_draw_seed(const aln_meth_ref_t *ref, int read_no, int64_t ord)
     splitmix64(&r);
     return r;
 }
+/* For current best B, retained cost T=B+M excludes gaps when T<O and E>=0.
+ * Its raw CIGAR then has <=floor(T/M) strict mismatches. Every such equal-span
+ * window has an ungapped converted proposal with no more mismatches: genuine
+ * matches/conversions project identically and either N counts strictly regardless
+ * of PAC fill. Unseeded discovery admitting that many differences proposes every
+ * surviving window by score M*floor(T/M). Refine the entire stratum before stopping.
+ * B can only decrease, so later flushes can only narrow the required stratum.
+ * This bounds equivalent proposals, NOT the cost of arbitrary search histories. */
+bool aln_meth_can_stop(const aln_meth_slot_t *x, int next_score)
+{
+    const gap_job_t *job=x->job;
+    const gap_opt_t &opt=job->opt;
+    if (!aln_meth_stop_eligible(x) || x->res->occ.empty()) return false;
+    int64_t best=INT64_MAX;
+    for (const auto &o : x->res->occ) best=std::min(best,o.cost);
+    // Stored costs fit INT_MAX; widen before adding penalties or multiplying.
+    if (best<0 || best>INT_MAX) return false;
+    const int64_t retained=best+(int64_t)opt.s_mm;
+    if (retained>=opt.s_gapo) return false;
+    const int64_t differences=retained/opt.s_mm;
+    return opt.max_diff>=differences && (int64_t)next_score>differences*opt.s_mm;
+}
+
 void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
     // Reaching the same interval with the same span adds no new candidate window.
@@ -148,12 +169,25 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->pend.clear(); x->windows.clear(); x->intervals.clear(); x->loci.clear();
     x->alignment_bytes = 0;
     x->final_flush = x->stop = 0;
+    x->flushed_score = -1;
     return x->vseq.data();
 }
+static bool conv_tiebreak(const aln_meth_opt_t *mo)
+{
+    return mo && mo->m.meth_chem == METH_CHEM_TAPS &&
+        mo->m.meth_scoring == MEM_METH_SCORING_NEUTRAL;
+}
+
+static int conv_mapq_cap(int gap)
+{
+    return gap < 10 ? 6 * gap : 60;
+}
+
 // Rank the fixed-refinement CIGAR by stock cost, not by its refinement reward.
-static bool alignment_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b)
+static bool alignment_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, bool conversions)
 {
     if (a.cost != b.cost) return a.cost < b.cost;
+    if (conversions && a.n_conv != b.n_conv) return a.n_conv < b.n_conv;
     if (a.alignment.cigar != b.alignment.cigar) return a.alignment.cigar < b.alignment.cigar;
     if (a.alignment.re != b.alignment.re) return a.alignment.re < b.alignment.re;
     return a.alignment.raw_cigar < b.alignment.raw_cigar;
@@ -246,7 +280,7 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
     if (it == x->loci.end()) {
         x->loci.emplace(locus, x->res->occ.size());
         x->res->occ.push_back(std::move(o));
-    } else if (alignment_better(o, x->res->occ[it->second]))
+    } else if (alignment_better(o, x->res->occ[it->second], conv_tiebreak(g->mo)))
         x->res->occ[it->second] = std::move(o);
 }
 void aln_meth_flush_parked(aln_meth_group_t *g)
@@ -278,9 +312,13 @@ void aln_meth_redraw(aln_meth_read_t *res, uint64_t rng)
     if (res->main < 0) return;
     int64_t best = INT64_MAX;
     for (const auto &o : res->occ) best = std::min(best, o.cost);
+    int fewest = INT_MAX;
+    if (res->n_conv_moved)
+        for (const auto &o : res->occ) if (o.cost == best) fewest = std::min(fewest, o.n_conv);
     int held = -1, count = 0;
     for (int i = 0; i < (int)res->occ.size(); ++i) {
-        if (res->occ[i].cost != best) continue;
+        if (res->occ[i].cost != best ||
+            (res->n_conv_moved && res->occ[i].n_conv != fewest)) continue;
         ++count;
         if (count == 1 || (splitmix64(&rng) % (uint64_t)count) == 0) held = i;
     }
@@ -313,6 +351,19 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
         return std::make_tuple(a.rid, a.hyp, a.strand, a.pos) < std::make_tuple(b.rid, b.hyp, b.strand, b.pos);
     });
     r->occ.swap(keep); r->main = 0;
+    if (conv_tiebreak(x->grp->mo) && !r->flags) {
+        int fewest = INT_MAX, gap = INT_MAX;
+        for (const auto &o : r->occ) if (o.cost == best) fewest = std::min(fewest, o.n_conv);
+        for (const auto &o : r->occ) if (o.cost == best && o.n_conv > fewest) {
+            ++r->n_conv_moved;
+            gap = std::min(gap, o.n_conv - fewest);
+        }
+        if (r->n_conv_moved) {
+            r->conv_gap = gap;
+            r->c1 -= r->n_conv_moved;
+            r->c2 += r->n_conv_moved;
+        }
+    }
     aln_meth_redraw(r, x->rng);
     if (!x->keep) aln_meth_trim(r, x->grp->max_xa_hits);
 }
@@ -371,7 +422,7 @@ static char *meth_cal_md(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, in
 			} else if (op == FROM_D) {
 				kputl(u, str);
 				kputc('^', str);
-				for (int z = 0; z < l && x + z < span; ++z) kputc("ACGT"[meth_code_base(win[x + z])], str);
+				for (int z = 0; z < l && x + z < span; ++z) kputc("ACGTN"[meth_code_base(win[x + z])], str);
 				u = 0;
 				x += l; nm += l;
 			}
@@ -445,6 +496,8 @@ static void meth_set_main(bwa_seq_t *s, aln_meth_read_t *r, const gap_opt_t *opt
     s->ref_shift = (int)(o.alignment.re - o.alignment.rb) - (int)s->len;
     const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(s->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
     s->mapQ = s->seQ = r->flags ? 0 : bwa_approx_mapQ(s, max_diff);
+    if (r->n_conv_moved && s->mapQ > conv_mapq_cap(r->conv_gap))
+        s->mapQ = s->seQ = conv_mapq_cap(r->conv_gap);
 }
 
 static void meth_emit(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
@@ -522,7 +575,8 @@ void aln_meth_pe_stage1(const gap_opt_t *opt, int n, bwa_seq_t *seqs[2], aln_met
  * reference; *_cnt's n_mm counts only the mismatches the mode does not free. */
 static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int hyp, int rid,
                                  int len, const ubyte_t *seq, int64_t *beg, int64_t end,
-                                 int *n_cigar, uint32_t *_cnt)
+                                 int *n_cigar, uint32_t *_cnt,
+                                 const gap_opt_t *account_opt = nullptr, aln_meth_occ_t *owned = nullptr)
 {
     *n_cigar = 0;
     if (len <= 0 || len > 65535 || rid < 0 || rid >= ref->bns->n_seqs) return nullptr;
@@ -586,8 +640,143 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
         if ((cigar.back()&15)==4) cigar.back() += (uint32_t)tail<<4;
         else cigar.push_back((uint32_t)tail<<4|4);
     }
+    if (owned) {
+        *owned = aln_meth_occ_t();
+        owned->rid=rid;owned->hyp=hyp;owned->pos=alignment.rb;
+        owned->alignment=alignment;
+        if (!account_alignment(ref,mo,account_opt,candidate.rb,candidate.re,seq+r.qb,r.qe-r.qb+1,owned))
+            return nullptr;
+        owned->alignment.cigar=cigar;
+    }
     *beg=alignment.rb;
     return legacy_cigar(cigar,n_cigar,len,len,0);
+}
+
+/* Bounded local evidence can improve placement, but cannot resolve omitted genomic loci. */
+static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
+                          const gap_opt_t *opt, const isize_info_t *ii,
+                          bwa_seq_t *p[2], aln_meth_read_t *r[2], int end) try
+{
+    const int mate=1-end;
+    auto *pm=p[end];auto *pa=p[mate];auto *ra=r[mate];auto *rm=r[end];
+    if (ra->flags || ra->main<0 || ra->occ.empty()) return 0;
+    if (!isfinite(ii->avg) || !isfinite(ii->std) || ii->avg<0 || ii->std<0 ||
+        ii->avg>INT_MAX || ii->std>INT_MAX) {
+        fprintf(stderr,"ERROR: --meth invalid cap-rescue insert-size range\n");exit(1);
+    }
+    const int64_t anchor_cost=ra->occ[ra->main].cost;
+    int anchors=0;
+    for(const auto &a:ra->occ) anchors+=a.cost==anchor_cost;
+    if(anchors>255) return 0; // Refuse instead of truncating the anchor competitors.
+    if(pm->len<=0 || pm->len>65535) {
+        fprintf(stderr,"ERROR: --meth cap-rescue query length out of range\n");exit(1);
+    }
+    const int64_t bound=rm->main<0?INT64_MAX:rm->occ[rm->main].cost;
+    std::map<std::tuple<int,int,int,int64_t,int64_t>,aln_meth_occ_t> windows;
+    uint64_t bytes=0;
+    int best_anchor=-1;
+    int64_t best_score=INT64_MAX;
+    std::pair<int64_t,int> best_rank={INT64_MAX,INT_MAX},runner_rank=best_rank;
+    int tied_best=0,valid_pairs=0;
+    int best_conv=INT_MAX;
+    aln_meth_occ_t best;
+    auto canonical=[&](const aln_meth_occ_t &o,const aln_meth_occ_t &a) {
+        return std::make_tuple(std::string(ref->bns->anns[o.rid].name),
+            o.pos-ref->bns->anns[o.rid].offset,o.strand,o.hyp,
+            o.alignment.cigar,o.alignment.re-o.pos,a.pos-ref->bns->anns[a.rid].offset,a.strand);
+    };
+    for(int index=0;index<(int)ra->occ.size();++index) {
+        const auto &a=ra->occ[index];if(a.cost!=anchor_cost) continue;
+        if(a.rid<0 || a.rid>=ref->bns->n_seqs || a.alignment.rb!=(int64_t)a.pos ||
+           a.alignment.re<=a.alignment.rb) {
+            fprintf(stderr,"ERROR: --meth invalid cap-rescue anchor\n");exit(1);
+        }
+        const auto &ann=ref->bns->anns[a.rid];
+        if(a.pos<(uint64_t)ann.offset || a.alignment.re>ann.offset+ann.len) {
+            fprintf(stderr,"ERROR: --meth cap-rescue anchor leaves contig\n");exit(1);
+        }
+        const double begin=a.strand ? a.alignment.re-ii->avg-3*ii->std-pm->len*.5
+                                   : a.pos+ii->avg-3*ii->std-pm->len*1.5;
+        const double finish=begin+6*ii->std+2*pm->len;
+        if(!isfinite(begin) || !isfinite(finish) || begin<INT64_MIN || finish>=INT64_MAX) {
+            fprintf(stderr,"ERROR: --meth cap-rescue window out of range\n");exit(1);
+        }
+        int64_t beg=(int64_t)begin,last=(int64_t)finish;
+        if(a.strand) last=std::min<int64_t>(last,a.pos);
+        else beg=std::max(beg,a.alignment.re);
+        beg=std::max<int64_t>(beg,ann.offset);last=std::min<int64_t>(last,ann.offset+ann.len);
+        if(last<=beg) continue;
+        const auto key=std::make_tuple(a.rid,a.hyp,1-a.strand,beg,last);
+        aln_meth_occ_t candidate;
+        const auto cached=windows.find(key);
+        if(cached!=windows.end()) {
+            if(cached->second.alignment.cigar.empty()) continue;
+            candidate=cached->second;
+        } else {
+            ubyte_t *query=a.strand?pm->seq:pm->rseq;
+            if(a.strand) seq_reverse(pm->len,query,0);
+            int nc=0;uint32_t cnt=0;
+            auto *cigar=meth_sw_core(ref,mo,a.hyp,a.rid,pm->len,query,&beg,last,&nc,&cnt,opt,&candidate);
+            if(a.strand) seq_reverse(pm->len,query,0);
+            if(!cigar) {windows.emplace(key,aln_meth_occ_t());continue;}
+            free(cigar);
+            candidate.strand=1-a.strand;
+            windows.emplace(key,candidate);
+        }
+        const auto &display=candidate.alignment.cigar;
+        const uint64_t used=(display.size()+candidate.alignment.raw_cigar.size())*sizeof(uint32_t);
+        if(used>(64ULL<<20)-bytes) {
+            fprintf(stderr,"ERROR: --meth cap-rescue CIGAR budget exceeded\n");exit(1);
+        }
+        bytes+=used;
+        if(display.empty() || (display.front()&15)==4 || (display.back()&15)==4 || candidate.cost>bound) continue;
+        const int64_t length=a.strand?a.alignment.re-candidate.alignment.rb:candidate.alignment.re-a.pos;
+        if(length<std::max(p[0]->len,p[1]->len)) continue;
+        int64_t score=(a.cost+candidate.cost)*10;
+        if(ii->high) {
+            if(ii->std<=0) {fprintf(stderr,"ERROR: --meth invalid cap-rescue insert deviation\n");exit(1);}
+            const double penalty=-4.343*log(.5*erfc(M_SQRT1_2*fabs(length-ii->avg)/ii->std));
+            if(!isfinite(penalty) || penalty>INT_MAX) {
+                fprintf(stderr,"ERROR: --meth cap-rescue pair score out of range\n");exit(1);
+            }
+            score+=(int)(penalty+.499);
+        }
+        const int conversions=conv_tiebreak(mo)?a.n_conv+candidate.n_conv:0;
+        ++valid_pairs;
+        const auto rank=std::make_pair(score,conversions);
+        if(rank<best_rank) {runner_rank=best_rank;best_rank=rank;tied_best=1;}
+        else {runner_rank=std::min(runner_rank,rank);if(rank==best_rank) ++tied_best;}
+        const bool better=best_anchor<0 || score<best_score ||
+            (score==best_score && (conversions<best_conv ||
+             (conversions==best_conv && canonical(candidate,a)<canonical(best,ra->occ[best_anchor]))));
+        if(better) {
+            best_score=score;best_conv=conversions;
+            best_anchor=index;best=std::move(candidate);
+        }
+    }
+    if(best_anchor<0) return 0;
+    if(bwa_verbose>=4) fprintf(stderr,"[M::aln] cap rescue: %d evaluated pairs, %d best ties; "
+        "best cost %lld, runner-up cost %lld; incomplete MAPQ 0\n",valid_pairs,tied_best,
+        (long long)best_rank.first,(long long)(runner_rank.first==INT64_MAX?-1:runner_rank.first));
+    const auto &a=ra->occ[best_anchor];
+    const bool unchanged=ra->main==best_anchor;
+    ra->main=best_anchor;ra->hyp=a.hyp;
+    const int saved_q=pa->mapQ,saved_se=pa->seQ;
+    meth_set_main(pa,ra,opt);
+    if(unchanged && ra->c1==1) {pa->mapQ=saved_q;pa->seQ=saved_se;}
+    else pa->mapQ=pa->seQ=0;
+    rm->occ.clear();rm->occ.push_back(std::move(best));rm->main=0;rm->hyp=a.hyp;
+    rm->c1=rm->c2=0;
+    const auto &o=rm->occ[0];
+    free(pm->cigar);pm->cigar=legacy_cigar(o.alignment.cigar,&pm->n_cigar,pm->len,pm->len,o.strand);
+    pm->pos=o.pos;pm->strand=o.strand;pm->type=BWA_TYPE_MATESW;
+    pm->score=(int)o.cost;pm->n_mm=o.n_mm;pm->n_gapo=o.n_gapo;pm->n_gape=o.n_gape;
+    pm->ref_shift=(int)(o.alignment.re-o.alignment.rb)-(int)pm->len;
+    pm->mapQ=pm->seQ=pm->c1=pm->c2=0;
+    pm->extra_flag&=~SAM_FPP;pa->extra_flag&=~SAM_FPP;
+    return 1;
+} catch(const std::bad_alloc &) {
+    fprintf(stderr,"ERROR: --meth cannot allocate cap-rescue candidates\n");exit(1);
 }
 
 int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, const gap_opt_t *gopt, const pe_opt_t *popt,
@@ -595,10 +784,13 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 					   uint64_t n_tot[2], uint64_t n_mapped[2])
 {
 	int cnt_chg = 0;
-	const int max_occ = popt->max_occ < mo->p_second ? popt->max_occ : mo->p_second;
+	// Complete means no lookup/work cutoff in configured discovery, not all genome hits.
+	const int max_occ = popt->max_occ;
 	std::vector<bwt_aln1_t> a[2];
 	std::vector<pair64_t> arr;
 	kstring_t str = {0, 0, 0};
+    std::vector<std::pair<int,int>> initial_selection(n);
+    for(int i=0;i<n;++i) initial_selection[i]={res[0][i].main,res[1][i].main};
 	for (int i = 0; i < n; ++i) {
 		bwa_seq_t *p[2] = {seqs[0] + i, seqs[1] + i};
 		aln_meth_read_t *r[2] = {res[0] + i, res[1] + i};
@@ -645,11 +837,23 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 						}
 					}
 				}
+                // Summing unchanged ends' qualities is not independent evidence for a conversion choice.
+                // Compare owned selections: an unchanged end can also start with seQ=0.
+                for (int j = 0; j < 2; ++j)
+                    if (r[j]->n_conv_moved && r[j]->main == (j ? initial_selection[i].second : initial_selection[i].first) && p[j]->mapQ > conv_mapq_cap(r[j]->conv_gap))
+                        p[j]->mapQ = conv_mapq_cap(r[j]->conv_gap);
 				xassert(!((p[0]->extra_flag & SAM_FPP) && r[0]->hyp != r[1]->hyp), "a proper pair's ends must share a hypothesis");
 			}
 		}
 
 	}
+    if(popt->is_sw && ii->avg>=0 && popt->type==BWA_PET_STD)
+        for(int i=0;i<n;++i) {
+            bwa_seq_t *p[2]={seqs[0]+i,seqs[1]+i};
+            aln_meth_read_t *r[2]={res[0]+i,res[1]+i};
+            const bool cap0=r[0]->flags&ALN_METH_BIND_BEST,cap1=r[1]->flags&ALN_METH_BIND_BEST;
+            if(cap0!=cap1) cnt_chg+=meth_cap_rescue(ref,mo,gopt,ii,p,r,cap0?0:1);
+        }
 	// mate rescue (bwa_paired_sw_core with the anchor's matrix; the rescued mate takes its hypothesis)
 	if (popt->is_sw && ii->avg >= 0.0) {
 		const int64_t l_pac = ref->bns->l_pac;
@@ -737,6 +941,10 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
         for (int j = 0; j < 2; ++j) {
             bwa_seq_t *s = seqs[j] + i;
             aln_meth_read_t *r = res[j] + i;
+            // Rescue must not inflate an unchanged conversion-selected anchor either.
+            if (r->n_conv_moved && s->type != BWA_TYPE_MATESW &&
+                r->main == (j ? initial_selection[i].second : initial_selection[i].first) &&
+                s->mapQ > conv_mapq_cap(r->conv_gap)) s->mapQ = conv_mapq_cap(r->conv_gap);
             int lim = popt->n_multi;
             if (!(s->extra_flag & SAM_FPP) && seqs[1-j][i].type != BWA_TYPE_NO_MATCH)
                 lim = (int64_t)s->c1 + s->c2 - 1 > popt->N_multi ? popt->n_multi : popt->N_multi;
