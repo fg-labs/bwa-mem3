@@ -1,7 +1,8 @@
 # src/aln: bwa `aln`/`samse`/`sampe` port
 
 This directory holds the code behind `bwa-mem3 aln`, a fused port of bwa's
-short-read `aln` + `samse`/`sampe` pipeline whose SAM records without `--meth` are byte-identical to
+short-read `aln` + `samse`/`sampe` pipeline whose SAM records without `--meth` or
+`--short-insert` are byte-identical to
 stock bwa 0.7.19's (the header is too, except the `@PG` line, which names bwa-mem3), as
 checked on the generated reads described in `docs/src/cli/aln.md`.
 
@@ -134,7 +135,16 @@ Each change to upstream-derived code adds a line here.
   the caller gives none (it is always the in-memory packed copy). `g_log_n` (bwase.cpp) is now shared with it. The
   mate alignment in `bwa_sw_core` calls bwa-mem3's `ksw_align` and `ksw_global`, which match stock's up to cosmetics;
   `aln_parity.sh` is the check. `infer_isize`'s `erfc`/`sqrt` loop, the pairing score's `log`/`erfc` and the
-  `int += double` arithmetic in `bwa_paired_sw_core` are kept verbatim; the objects are built with `-ffp-contract=off`.
+  `int += double` arithmetic in `bwa_paired_sw_core` are kept verbatim on the default path; the objects are built with `-ffp-contract=off`.
+- `bwtaln.h`, `bwape.cpp`/`bwape.h`: the default-zero `pe_opt_t::short_insert` enables
+  `--short-insert` for ordinary and methylation-aware paired alignment. `infer_isize`
+  then floors the lower interquartile fence at one base instead of the batch's longest
+  read, clears failed estimates, and rejects nonfinite mean/SD before integer conversion.
+  Previous-valid-estimate fallback is unchanged and `-A` still overrides estimation.
+  Pairing and methylation cap rescue reject insert-likelihood calculations that underflow
+  or produce unrepresentable integer penalties under this option. These opt-in changes can alter pair selection, proper-pair flags,
+  MAPQ and rescue windows; pairing geometry and the rescue algorithm are unchanged.
+  Without the option, the stock inference and scoring behavior is preserved.
 - Paired-end driver (`aln_run_pe`, new code). `bwa-mem3 aln [options] <prefix> <R1.fq> <R2.fq>` is `aln` on each
   file followed by `sampe`. Per batch of 0x40000 reads from each file: R1's reads are read, then R2's (stock
   order); each file is searched as its own batch, because stock runs `aln` on each file separately and the

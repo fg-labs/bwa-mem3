@@ -652,7 +652,8 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one\n");
 	fprintf(fp, "step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe\n");
 	fprintf(fp, "(two files), with no .sai files. On the tested inputs its records match bwa 0.7.19's\n");
-	fprintf(fp, "(@PG differs), except that `-n 1e-2` is a probability here and the integer 1 in stock.\n");
+	fprintf(fp, "(@PG differs) unless --meth or --short-insert is given; `-n 1e-2` is a probability\n");
+	fprintf(fp, "here and the integer 1 in stock.\n");
 	fprintf(fp, "<prefix> is an index made by `bwa-mem3 index` (also one made with --meth, or one staged\n");
 	fprintf(fp, "by `bwa-mem3 shm`).\n");
 	fprintf(fp, "Each option shows its default and the stock command it comes from.\n\n");
@@ -687,6 +688,8 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  -c FLOAT  prior of chimeric rate (lower bound) [%.1le]\n", o->pe.ap_prior);
 	fprintf(fp, "  -s        disable Smith-Waterman for the unmapped mate\n");
 	fprintf(fp, "  -A        disable insert size estimate (force -s)\n");
+	fprintf(fp, "  --short-insert   estimate short inserts without a batch-wide read-length floor [off]\n");
+	fprintf(fp, "                   paired only, including --meth; changes calibration, not pairing geometry or rescue algorithm; -A overrides\n");
 	fprintf(fp, "  -P        accepted and ignored (sampe -P loads the index into memory; always so here)\n");
 	fprintf(fp, "\nMethylation (shared with bwa-mem3 mem):\n");
 	meth_opts_usage_shared(fp);
@@ -843,7 +846,7 @@ static int aln_parse_double(const char *flag, const char *s, double lo, double *
 	return 1;
 }
 
-enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP };
+enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP, OPT_SHORT_INSERT };
 
 int main_aln(int argc, char *argv[])
 {
@@ -861,6 +864,7 @@ int main_aln(int argc, char *argv[])
 		{"max-xa-hits", required_argument, 0, OPT_MAX_XA},
 		{"max-xa-hits-discordant", required_argument, 0, OPT_MAX_XA_DISC},
 		{"max-occ", required_argument, 0, OPT_MAX_OCC},
+		{"short-insert", no_argument, 0, OPT_SHORT_INSERT},
 		{"bam", no_argument, 0, OPT_BAM},
 		{"bam-level", required_argument, 0, OPT_BAM_LEVEL},
 		{"help", no_argument, 0, OPT_HELP},
@@ -961,6 +965,7 @@ int main_aln(int argc, char *argv[])
 			pe_flag = 1;
 			break;
 		case OPT_MAX_OCC: ALN_INT("--max-occ", INT_MIN, &o.pe.max_occ); pe_flag = 1; break;
+		case OPT_SHORT_INSERT: o.pe.short_insert = 1; break;
 		case OPT_BAM: bam = 1; break;
 		case OPT_BAM_LEVEL:
 			if (!aln_parse_int("--bam-level", optarg, 0, 9, &bam_level)) return 1;
@@ -1024,6 +1029,10 @@ int main_aln(int argc, char *argv[])
 	if (optind + 2 > argc) return aln_usage(&o, stderr);
 	if (optind + 4 <= argc) return aln_usage(&o, stderr);
 	const int paired = optind + 3 == argc;
+	if (o.pe.short_insert && !paired) {
+		fprintf(stderr, "[E::aln] --short-insert requires paired-end input\n");
+		return 1;
+	}
 	if (pe_flag && !paired)
 		fprintf(stderr, "[W::aln] paired-end options (-a, -c, -s, -A, -P, --max-occ, --max-xa-hits-discordant) are ignored with one FASTQ\n");
 
