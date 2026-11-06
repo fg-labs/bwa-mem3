@@ -21,6 +21,64 @@
 #include <initializer_list>
 #include <string>
 
+#if defined(BWA_TESTS_CHILD_SKIP_LEAK_CHECK)
+#include <thread>
+
+namespace {
+// A terminated thread leaves no live stack roots for LSan's conservative scan.
+// The volatile access and compiler barrier keep the allocation in optimized builds.
+__attribute__((noinline)) void leak_unreachable_memory() {
+    void *p = malloc(12345);
+    if (p == nullptr) _exit(90);
+    *static_cast<volatile char *>(p) = 42;
+    asm volatile("" : : "r"(p) : "memory");
+}
+
+void make_child_leak() {
+    std::thread worker(leak_unreachable_memory);
+    worker.join();
+}
+}  // namespace
+#endif
+
+TEST_CASE("run_in_child: a leaking exit preserves 37 with glibc ASAN and enabled LSan"
+          * doctest::test_suite("unit/run_in_child")) {
+#if defined(BWA_TESTS_CHILD_SKIP_LEAK_CHECK)
+    bwa_tests::TempDir dir{"child_lsan"};
+    const std::string canary_log = dir.file("canary.err");
+    // No helper here: the unprotected canary must reach LSan's real exit check.
+    fflush(nullptr);
+    const pid_t canary = fork();
+    REQUIRE(canary >= 0);
+    if (canary == 0) {
+        if (freopen(canary_log.c_str(), "w", stderr) == nullptr) _exit(90);
+        make_child_leak();
+        exit(37);
+    }
+    int canary_status = 0;
+    REQUIRE(waitpid(canary, &canary_status, 0) == canary);
+    const std::string diagnostic = dir.read("canary.err");
+    INFO(diagnostic);
+    // LSan's exit status follows ASAN_OPTIONS=exitcode, which may itself be 37,
+    // so the report text, not the status, proves the leak check ran.
+    REQUIRE(WIFEXITED(canary_status));
+    REQUIRE(diagnostic.find("LeakSanitizer: detected memory leaks") != std::string::npos);
+    REQUIRE(diagnostic.find("12345 byte(s)") != std::string::npos);
+
+    const std::string child_log = dir.file("child.err");
+    const int status = bwa_tests::run_in_child([] {
+        make_child_leak();
+        exit(37);  // _exit would bypass the on_exit/LSan contract under test.
+    }, child_log.c_str());
+    INFO(dir.read("child.err"));
+    REQUIRE(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 37);
+    CHECK(dir.read("child.err").find("LeakSanitizer") == std::string::npos);
+#else
+    MESSAGE("SKIP: leaking exit contract requires Linux glibc ASAN with LSan");
+#endif
+}
+
 TEST_CASE("run_in_child: the body runs with every signal doctest handles at its default"
           * doctest::test_suite("unit/run_in_child")) {
     for (const int sig : {SIGINT, SIGILL, SIGFPE, SIGSEGV, SIGTERM, SIGABRT}) {

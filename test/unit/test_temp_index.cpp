@@ -166,6 +166,17 @@ TEST_CASE("TempDir: remove() deletes the directory now, and only once"
     CHECK(err == "");
 }
 
+TEST_CASE("TempDir: removed directories reject file paths, reads and writes"
+          * doctest::test_suite("unit/test_framework")) {
+    bwa_tests::TempDir dir;
+    dir.remove();
+    CHECK(dir.path().empty());
+    // Stop before any I/O if file() still produces an absolute root path.
+    REQUIRE_THROWS_AS(dir.file("removed"), std::runtime_error);
+    CHECK_THROWS_AS(dir.read("removed"), std::runtime_error);
+    CHECK_THROWS_AS(dir.write("removed", "never written"), std::runtime_error);
+}
+
 TEST_CASE("TempDir and temp_path.h: scratch paths go under $TMPDIR"
           * doctest::test_suite("unit/test_framework")) {
     bwa_tests::TempDir root("tmpdir_root");

@@ -64,7 +64,7 @@ public:
 
     // Removes the directory and its files now rather than on destruction; a
     // second call, and the destructor after it, do nothing. path() is then
-    // empty and file() names nothing.
+    // empty; file(), read() and write() then throw std::runtime_error.
     void remove() {
         if (path_.empty() || getpid() != owner_) return;
         if (bwa_test_remove_flat_dir(path_.c_str()) != 0)
@@ -75,7 +75,10 @@ public:
     TempDir &operator=(const TempDir &) = delete;
 
     const std::string &path() const { return path_; }
-    std::string file(const std::string &name) const { return path_ + "/" + name; }
+    std::string file(const std::string &name) const {
+        if (path_.empty()) throw std::runtime_error("TempDir has been removed");
+        return path_ + "/" + name;
+    }
 
     // Writes `text` to file(name), replacing it; throws on any short write.
     void write(const std::string &name, const std::string &text) const {

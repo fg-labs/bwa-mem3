@@ -476,6 +476,6 @@ bwtseed_lockstep_parity_test.o: $(FMI_TEST_HEADERS) seed_jump_test_util.h lockst
 backwardext_konly_parity_test.o: $(FMI_TEST_HEADERS)
 sa_lookup_sentinel_parity_test.o: $(FMI_TEST_HEADERS)
 backwardext_parity_test.o: $(FMI_TEST_HEADERS)
-seed_jump_table_test.o: $(FMI_TEST_HEADERS) ../src/bwa_shm.h ../src/fmi_seed_api.h seed_jump_test_util.h
+seed_jump_table_test.o: $(FMI_TEST_HEADERS) ../src/bwa_shm.h ../src/bwa_shm.cpp ../src/bwa_madvise.h ../src/fmi_seed_api.h seed_jump_test_util.h framework/temp_dir.h framework/temp_path.h framework/stderr_capture.h
 sa_resolve_parity_test.o: $(FMI_TEST_HEADERS)
 header_insert_test.o: ../src/bwa.h framework/temp_path.h
