@@ -650,6 +650,9 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "   Under --meth, converted search proposes windows; original-reference global realignment\n");
 	fprintf(fp, "   refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.\n");
 	fprintf(fp, "   Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.\n");
+	fprintf(fp, "   TAPS/5base neutral breaks equal costs by fewest conversions; MAPQ <= min(60,6*delta).\n");
+	fprintf(fp, "   Pair all retained loci up to --max-occ only without lookup/work cutoffs on either end.\n");
+	fprintf(fp, "   Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.\n");
 	fprintf(fp, "   aln -B is barcode length, not mem's mismatch penalty. Records carry\n");
 	fprintf(fp, "   XR/XG/XM:Z instead of XM:i/XO:i/XG:i.\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");

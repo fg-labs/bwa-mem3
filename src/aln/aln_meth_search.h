@@ -15,7 +15,7 @@ struct aln_meth_slot_t {
     gap_job_t *job = nullptr;
     bwa_seq_t *p = nullptr;
     aln_meth_read_t *res = nullptr;
-    int len = 0, keep = 0, final_flush = 0, stop = 0;
+    int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1;
     uint64_t rng = 0, alignment_bytes = 0;
     std::vector<ubyte_t> vseq, rd_fwd;
     std::vector<aln_meth_pend_t> pend;
@@ -34,8 +34,32 @@ struct aln_meth_group_t {
     std::vector<aln_meth_slot_t> slot;
     gap_slot_core_t *cores = nullptr;
 };
-// Flush bounded pending intervals before popping the next search entry; no rank-based pruning.
-static inline int aln_meth_needs_flush(const aln_meth_slot_t *x, int) { return x->pend.size() >= 32; }
+// These guards do not depend on candidates that the next flush might discover.
+static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
+    const gap_opt_t &opt=x->job->opt;
+    return opt.s_mm>0 && opt.s_gape>=0 && opt.s_gapo>opt.s_mm &&
+        !(opt.mode&BWA_MODE_NONSTOP) && !x->job->seed_width && !x->res->flags;
+}
+bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
+// Keep batches bounded, but only refine score boundaries when stopping is possible.
+static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
+    if (x->pend.size() >= 32) return 1;
+    if (score <= x->flushed_score) return 0;
+    if (aln_meth_stop_eligible(x)) return 1;
+    // A skipped boundary replaces a flush/resume: do not re-examine this stratum.
+    x->flushed_score=score;
+    if (x->pend.empty()) return 0;
+    // Keep lookup-cap detection ahead of later work-cap failures, as with boundary flushing.
+    int64_t remaining=(int64_t)x->grp->mo->p_best+x->grp->mo->p_second;
+    if (remaining<0) remaining=0;
+    remaining-=x->res->n_lookups;
+    for (const auto &h : x->pend) {
+        const bwtint_t width=h.l-h.k+1;
+        if (remaining<0 || width>(uint64_t)remaining) return 1;
+        remaining-=(int64_t)width;
+    }
+    return 0;
+}
 static inline int aln_meth_needs_flush(const void *, int) { return 0; }
 static inline int aln_meth_has_pending(const aln_meth_slot_t *x) { return !x->pend.empty(); }
 static inline int aln_meth_has_pending(const void *) { return 0; }
@@ -46,6 +70,9 @@ static inline void aln_meth_flag(void *, int) {}
 static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t *e) {
     if (x->final_flush || x->stop) return 1;
     *e = j->e;
+    const int score=(int)(e->info>>21);
+    x->flushed_score=score;
+    if (aln_meth_can_stop(x,score)) return 1;
     return 0;
 }
 static inline int aln_meth_resume(void *, gap_job_t *, gap_entry_t *) { return 1; }

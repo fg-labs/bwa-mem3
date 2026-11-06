@@ -189,8 +189,15 @@ Converted-space backtracking proposes original-reference windows within the user
 search limits (`-n`, `-o`, `-e`, seeding options, `-M/-O/-E`, `-N` and `-m`).
 Only the directional copy appropriate to the read is retained. Identical windows
 (original contig, conversion hypothesis, strand, start and end) are evaluated once.
-Search-path scores and `-R` do not prune original-reference competitors. This does
-not make discovery exhaustive or guarantee a globally optimal alignment.
+`-R` does not prune original-reference competitors. For an unseeded search with
+current best cost `B`, let `T = B + M` and `k = floor(T / M)`. When `M > 0`,
+`T < O`, `E >= 0`, the configured difference ceiling admits `k` differences,
+`-N` is off and discovery has not hit a cap, the search can stop after fully
+evaluating converted scores through `M*k`. Every retained raw alignment then has
+no gaps and at most `k` strict mismatches, so that stratum already proposes its
+exact window. A decreasing best cost can only narrow this bound. Other searches
+retain configured generation without a path-cost cutoff. This does not make
+discovery exhaustive or guarantee a globally optimal alignment.
 
 Each window is globally refined on the original reference with a fixed
 chemistry-aware reward model: match +1, mismatch -3, ambiguity -1 and a gap of
@@ -199,7 +206,9 @@ this refinement model.** The five-symbol model uses an actual-matrix band
 certificate when available and otherwise a full band. The existing dispatcher
 may use its SIMD global kernels when their predicates hold. CpG-only scoring
 uses seven reference symbols and full-band scalar refinement, not that certificate
-or SIMD path. CpG labels use true contig flanks and mask original reference N runs.
+or SIMD path. Original `.amb` intervals override random packed bases with N at
+alignment time, without rebuilding either index. CpG labels use true contig flanks
+and respect these ambiguity runs.
 `--meth-context cpg` requires TAPS/5base and non-collapsed scoring.
 
 The raw refined CIGAR is then costed using `-M/-O/-E`:
@@ -209,10 +218,14 @@ cost = M * mismatches + O * gap_runs + E * gap_extensions
 ```
 
 A gap run of length `k` has `k-1` extensions. Chemistry-accepted conversions,
-including neutral conversions, have mismatch cost 0. Different window spans
+including neutral conversions, have mismatch cost 0. An ambiguous original-reference
+or query base always counts as a mismatch, including N/N, although refinement keeps
+the existing ambiguity reward of -1. Literal MD reports original N bases; XM makes
+no methylation call at an ambiguous reference base. These rules affect `aln --meth`
+only, not stock aln or MEM. Different window spans
 compete before collapsing each final locus (original contig, hypothesis, strand
 and normalized start) to its lowest-cost refined CIGAR. Equal costs use canonical
-CIGAR/end ordering within a locus. This ranks reward-refined CIGARs by stock cost;
+CIGAR/end ordering within a locus, except for the neutral conversion tie-break below. This ranks reward-refined CIGARs by stock cost;
 it does not minimize that cost over every possible CIGAR. Stock aln instead
 cost-selects search paths before separately reward-refining its output.
 
@@ -221,9 +234,16 @@ through best cost plus `-M`, or all returned worse costs with `-N`, not only the
 next distinct cost. Primary selection and MAPQ use stock aln count/cost accounting
 and its effective mismatch ceiling. Selection among best loci is seeded per read
 and independent of thread count. MAPQ is the stock heuristic, not a calibrated
-probability or a certificate that no better undiscovered locus exists. The
-fewest-conversions tie-break for equal-cost TAPS/5base neutral loci is not yet
-implemented.
+probability or a certificate that no better undiscovered locus exists. For TAPS/5base neutral scoring (including CpG-only context), equal minimum-cost
+loci are ranked by conversion count from the winning raw CIGAR. Same-locus windows
+first compete by `(cost, conversions)`, then canonical CIGAR/end ties, keeping the
+selected CIGAR and counts together. Conversions still cost 0. Only the fewest-
+conversion best-cost loci remain in `X0`; displaced equal-cost loci join `X1`.
+The primary is drawn independently per read from that reduced best set. Two
+remaining best loci still have MAPQ 0. Otherwise the stock MAPQ is capped at
+`min(60, 6 * delta)`, where `delta` is the nearest displaced equal-cost locus's
+extra conversions. This is the existing heuristic ceiling, not a new calibration
+claim. EM-seq and other scoring modes retain cost-only placement ranking.
 
 Primary and `XA` output use stored CIGARs without a second refinement. Ranking
 counts and reward include raw terminal gaps. Display changes terminal insertions
@@ -239,9 +259,42 @@ can differ from the raw ranking mismatch/gap count. Records use Bismark
 Paired input uses stock sampe cost-based pairing on retained original-reference
 loci, restricted to same-contig pairs, and the shared insert-size inference policy
 with original reference length. Mate rescue is bounded to the anchor's contig.
-Pairing currently considers at most 500 loci per end (also bounded by `--max-occ`).
-Incomplete ends cannot gain confidence through pairing or rescue. Complete-strata
-pairing beyond this limit and cap-bound rescue are not implemented.
+Pairing considers every retained distinct locus when neither end has a lookup/work
+cutoff and each end has at most `--max-occ` loci (default 100000, stock sampe `-o`).
+The fused command's `-o` controls gap opens, not this pairing limit. Equality at
+`--max-occ` is eligible. A lookup or `-m` cutoff on either end prevents ordinary
+pairing and rescue confidence promotion, without discarding its best-known repeat
+placement. There is no separate 500-locus or 255-survivor stop in this path.
+
+Here, complete means that configured discovery finished without those explicit
+cutoffs. Pairing still sees only the configured retained cost strata: best through
+best plus `-M`, or all returned worse costs under `-N`, including conversion-displaced
+equal-cost loci. It does not see every genomic hit or every possible
+CIGAR, and neither the absence of cutoff flags nor `-N` proves exhaustive discovery.
+Unchanged conversion-selected ends retain that confidence ceiling through pairing
+and rescue. An end moved by stock pairing uses stock pairing-derived confidence
+(`seQ` is reset to zero), rather than treating its old single-end preference as
+support for the new locus. Incomplete ends cannot gain confidence through pairing
+or ordinary rescue.
+
+A lookup-cap-bound end can instead be searched near each resolved best-cost mate
+locus, provided the mate has no cutoff flags and at most 255 such loci. If there
+are more, this rescue is skipped rather than truncating the competitors. Windows
+are clipped at both ends to the anchor's contig and identical windows are evaluated
+once. Accepted rescue CIGARs must align the trimmed query end to end and cost no
+more than the end's best-known cost, when one exists. Raw chemistry-aware counts
+and `-M/-O/-E` costs come from the owned realigned CIGAR, with neutral TAPS/5base
+conversion ordering among equal pair scores. Pair scores include stock insert-size
+penalties, and equal choices use deterministic original-contig/coordinate ordering.
+
+This is placement recovery, not confidence recovery. The rescued end remains
+incomplete at MAPQ 0 with `XT:A:M`, no exact `X0`/`X1`/`XA`, and no proper-pair flag
+on either end. The former ceiling of 15 cannot raise incomplete MAPQ above 0.
+An unchanged unique anchor keeps its own MAPQ and neutral conversion guard; moved
+or tied anchors get MAPQ 0. Old rescue accuracy or MAPQ-threshold measurements do
+not validate this revised behavior. Rescue uses the same active-allocation and
+cumulative CIGAR budgets as candidate refinement and restores trimmed tails before
+legacy CIGAR splitting.
 
 The per-read SA lookup budget is a single total of 4596 by default, not separate
 best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known

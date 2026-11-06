@@ -6,6 +6,7 @@
 #include "../../src/aln/aln_main.h"
 #include "../../src/main.h"
 #include <cstdio>
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -192,5 +193,121 @@ TEST_CASE("aln_meth: paired trimmed mates and orphan records agree in SAM and BA
     REQUIRE(invoke(cpg)==0);const auto context=records(sam);REQUIRE(context.size()==84);
     cpg=common;cpg.insert(cpg.end(),{"--meth=taps","--meth-context","cpg","--bam","-f",bam,fa,f1,f2});
     REQUIRE(invoke(cpg)==0);CHECK(records(bam)==context);
+    CHECK(system(("rm -rf '"+path+"'").c_str())==0);
+}
+
+TEST_CASE("aln_meth: neutral conversion guards own opposite-strand CpG CIGARs in SAM and BAM") {
+    std::string path=aln_test::tmp_template("aln_meth_conv_bam");
+    REQUIRE(mkdtemp(&path[0])!=nullptr);
+    const std::string fa=path+"/ref.fa",fq=path+"/reads.fq",sam=path+"/out.sam",bam=path+"/out.bam";
+    uint32_t seed=82731;
+    std::string read=aln_test::lcg_dna(seed,50);
+    read[20]='T';read[21]='G';
+    std::string converted=read;converted[20]='C';
+    const std::string spacer=aln_test::lcg_dna(seed,100);
+    const std::string genome=spacer+read+spacer+converted+spacer;
+    bool best_tie=false;
+    SUBCASE("unique best with opposite-strand worse locus") {}
+    SUBCASE("two best on opposite strands") {best_tie=true;}
+    const std::string reverse_genome=best_tie?genome:spacer+converted+spacer;
+    REQUIRE(aln_test::write_test_fasta(fa,{{"forward",genome},{"reverse",aln_test::revcomp(reverse_genome)}}));
+    REQUIRE(invoke({"index","--meth",fa},true)==0);
+    FILE *fp=fopen(fq.c_str(),"w");REQUIRE(fp!=nullptr);
+    fprintf(fp,"@r0\n%s\n+\n%s\n",read.c_str(),std::string(50,'I').c_str());
+    REQUIRE(fclose(fp)==0);
+    // Opposite-strand alternatives must carry their own normalized alignment and tags.
+    for(const char *context : {"all","cpg"}) {
+        std::vector<std::string> args={"aln","--meth=5base","--meth-context",context,"-n","2","-l","1024","-f",sam,fa,fq};
+        REQUIRE(invoke(args)==0);const auto a=records(sam);REQUIRE(a.size()==1);
+        CHECK(a[0].find(best_tie?"\t0\t50M\t":"\t6\t50M\t")!=std::string::npos);
+        CHECK(a[0].find(best_tie?"X0:i:2":"X0:i:1")!=std::string::npos);
+        CHECK(a[0].find("X1:i:2")!=std::string::npos);
+        CHECK(a[0].find("NM:i:0")!=std::string::npos);
+        CHECK(a[0].find("MD:Z:50")!=std::string::npos);
+        args={"aln","--meth=5base","--meth-context",context,"-n","2","-l","1024","--bam","-f",bam,fa,fq};
+        REQUIRE(invoke(args)==0);CHECK(records(bam)==a);
+    }
+    CHECK(system(("rm -rf '"+path+"'").c_str())==0);
+}
+
+TEST_CASE("aln_meth: all-resolved pairing beyond 500 preserves trimmed SAM and BAM ownership") {
+    std::string path=aln_test::tmp_template("aln_meth_pair601");REQUIRE(mkdtemp(&path[0])!=nullptr);
+    const std::string fa=path+"/ref.fa",one=path+"/one.fq",two=path+"/two.fq";
+    uint32_t seed=172913;
+    const std::string read=aln_test::lcg_dna(seed,36),mate=aln_test::lcg_dna(seed,36);
+    std::string repeats=aln_test::lcg_dna(seed,50);
+    for(int k=0;k<600;++k) repeats+=read+aln_test::lcg_dna(seed,64);
+    const std::string pair=aln_test::lcg_dna(seed,100)+read+aln_test::lcg_dna(seed,150)+mate+aln_test::lcg_dna(seed,100);
+    const std::string decoy=aln_test::lcg_dna(seed,100)+mate+aln_test::lcg_dna(seed,100);
+    REQUIRE(aln_test::write_test_fasta(fa,{{"repeat",repeats},{"pair",pair},{"decoy",decoy}}));
+    REQUIRE(invoke({"index","--meth",fa},true)==0);
+    for(int j=0;j<2;++j) {
+        FILE *fp=fopen((j?two:one).c_str(),"w");REQUIRE(fp!=nullptr);
+        const std::string seq=(j?aln_test::revcomp(mate):read)+"AAAAA";
+        const std::string qual=std::string(36,'I')+"!!!!!";
+        fprintf(fp,"@r0\n%s\n+\n%s\n",seq.c_str(),qual.c_str());REQUIRE(fclose(fp)==0);
+    }
+    for(const char *chem:{"--meth","--meth=5base"}) {
+        const std::string sam=path+"/out.sam",bam=path+"/out.bam";
+        const std::vector<std::string> options={chem,"-q","20","-n","0","-o","0","-l","1024","--max-occ","601"};
+        auto args=std::vector<std::string>{"aln"};args.insert(args.end(),options.begin(),options.end());
+        args.insert(args.end(),{"-f",sam,fa,one,two});REQUIRE(invoke(args)==0);
+        const auto a=records(sam);REQUIRE(a.size()==2);
+        CHECK(a[0].find("r0\t99\tpair\t101\t") == 0);
+        CHECK(a[1].find("r0\t147\tpair\t287\t") == 0);
+        CHECK(a[0].find("\t36M5S\t")!=std::string::npos);
+        CHECK(a[1].find("\t5S36M\t")!=std::string::npos);
+        CHECK(a[0].find("X0:i:601")!=std::string::npos);
+        args={"aln"};args.insert(args.end(),options.begin(),options.end());
+        args.insert(args.end(),{"--bam","-f",bam,fa,one,two});REQUIRE(invoke(args)==0);
+        CHECK(records(bam)==a);
+    }
+    CHECK(system(("rm -rf '"+path+"'").c_str())==0);
+}
+
+TEST_CASE("aln_meth: cap-bound rescue restores 17000-base tails in paired SAM and BAM") {
+    std::string path=aln_test::tmp_template("aln_meth_cap_bam");REQUIRE(mkdtemp(&path[0])!=nullptr);
+    const std::string fa=path+"/ref.fa",one=path+"/one.fq",two=path+"/two.fq";
+    uint32_t seed=19337;const std::string genome=aln_test::lcg_dna(seed,5000);
+    std::string target=aln_test::lcg_dna(seed,50),anchor=aln_test::lcg_dna(seed,50);
+    target[20]='C';target[21]='G';
+    std::string repeats=aln_test::lcg_dna(seed,50);
+    for(int k=0;k<4800;++k) repeats+=target+aln_test::lcg_dna(seed,30);
+    const std::string pair=aln_test::lcg_dna(seed,100)+target+aln_test::lcg_dna(seed,150)+anchor+aln_test::lcg_dna(seed,100);
+    const std::string second=aln_test::lcg_dna(seed,100)+anchor+aln_test::lcg_dna(seed,100);
+    for(bool reversed_reference:{false,true}) {
+        auto contigs=std::vector<std::pair<std::string,std::string>>{{"training",genome},{"repeat",repeats},{"pair",pair},{"anchor",second}};
+        if(reversed_reference) std::reverse(contigs.begin(),contigs.end());
+        if(reversed_reference) REQUIRE(unlink((fa+".meth.fa").c_str())==0);
+        REQUIRE(aln_test::write_test_fasta(fa,contigs));REQUIRE(invoke({"index","--meth",fa},true)==0);
+        for(const char *chem:{"--meth","--meth=5base"}) for(bool reverse_fragment:{false,true}) {
+            FILE *f1=fopen(one.c_str(),"w"),*f2=fopen(two.c_str(),"w");REQUIRE(f1!=nullptr);REQUIRE(f2!=nullptr);
+            for(int k=0;k<41;++k) {
+                const int start=100+70*k,span=230+(k*7)%31;
+                std::string a=k==40?target:genome.substr(start,50);
+                std::string b=k==40?aln_test::revcomp(anchor):aln_test::revcomp(genome.substr(start+span-50,50));
+                if(reverse_fragment) std::swap(a,b);
+                const int trim=k==40?17000:0;
+                fprintf(f1,"@r%d\n%s%s\n+\n%s%s\n",k,a.c_str(),std::string(trim,'A').c_str(),std::string(50,'I').c_str(),std::string(trim,'!').c_str());
+                fprintf(f2,"@r%d\n%s%s\n+\n%s%s\n",k,b.c_str(),std::string(trim,'A').c_str(),std::string(50,'I').c_str(),std::string(trim,'!').c_str());
+            }
+            REQUIRE(fclose(f1)==0);REQUIRE(fclose(f2)==0);
+            const std::string sam=path+"/out.sam",bam=path+"/out.bam";
+            std::vector<std::string> opts={chem,"-q","20","-n","0","-o","0","-l","1024"};
+            if(std::string(chem)=="--meth=5base") opts.insert(opts.end(),{"--meth-context","cpg"});
+            auto args=std::vector<std::string>{"aln"};args.insert(args.end(),opts.begin(),opts.end());
+            args.insert(args.end(),{"-f",sam,fa,one,two});REQUIRE(invoke(args)==0);const auto a=records(sam);REQUIRE(a.size()==82);
+            const int rescued=reverse_fragment?81:80,anchored=reverse_fragment?80:81;
+            CHECK(a[rescued].find("XT:A:M")!=std::string::npos);
+            CHECK(a[rescued].find("\tpair\t101\t0\t")!=std::string::npos);
+            CHECK(a[rescued].find("X0:i:")==std::string::npos);CHECK(a[rescued].find("X1:i:")==std::string::npos);
+            CHECK(a[rescued].find("XA:Z:")==std::string::npos);
+            CHECK(a[anchored].find("XA:Z:")!=std::string::npos);
+            const int expected_flag=reverse_fragment?129:65;
+            CHECK(a[rescued].find("r40\t"+std::to_string(expected_flag+32)+"\t")==0);
+            args={"aln"};args.insert(args.end(),opts.begin(),opts.end());args.insert(args.end(),{"--bam","-f",bam,fa,one,two});
+            REQUIRE(invoke(args)==0);CHECK(records(bam)==a);
+        }
+    }
     CHECK(system(("rm -rf '"+path+"'").c_str())==0);
 }
