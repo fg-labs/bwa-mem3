@@ -120,13 +120,21 @@ about converted bases. This is controlled by `--meth-scoring`:
 
 | Mode | Default? | Matrix | `-B` | Behavior |
 |------|----------|--------|------|----------|
-| **`collapsed`** | **`--meth` / `--meth=emseq`** | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ` on typical WGBS/EM-seq ([full caveat](bwameth-mapping.md)), so re-validate if pinned to a bwameth release. |
-| **`genomic`** | no (opt-in) | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and counts toward `NM`, making the BAM usable for variant calling. A variant in the conversion direction itself is still not counted in `NM` (under `--meth-context cpg`, only at a CpG), though `MD` lists it ([why](#which-real-variants-stay-visible)). |
+| **`collapsed`** | no (opt-in) | frees C↔T *and* G↔A both ways (two cells), each scored as a full match | `2` | bwameth-compatible **placement** — C/T and G/A are interchangeable, so it closely tracks bwameth's collapsed-space mapping. A close approximation, **not** exact: ~1% of records differ in `POS`/`CIGAR`/`MAPQ` on typical WGBS/EM-seq ([full caveat](bwameth-mapping.md)), so re-validate if pinned to a bwameth release. |
+| **`genomic`** | **`--meth` / `--meth=emseq`** | frees only the conversion direction (one cell), scored as a full match | `4` | **variant-aware** — the mirror cell stays penalised, so a real C/T or G/A variant scores as a mismatch and counts toward `NM`, making the BAM usable for variant calling. A variant in the conversion direction itself is still not counted in `NM` (under `--meth-context cpg`, only at a CpG), though `MD` lists it ([why](#which-real-variants-stay-visible)). |
 | **`neutral`** | **`--meth=taps`**, **`--meth=5base`** | frees only the conversion direction (one cell), scored `0` | `4` | **variant-aware and conservative** — a conversion is tolerated but not rewarded, so a sparse TAPS conversion no longer over-credits a spurious C→T alignment. Real variants count toward `NM` on the same terms as `genomic`; +0.24–0.28 pp placement over `genomic`, measured on 4.07 M simulated TAPS reads against full hg38 across three methylation loads ([full arms and method](taps.md#what---methtaps-changes)). Not for EM-seq / bisulfite, where dense conversions cost short reads their placement ([warning](flags.md#--meth-scoring-collapsedgenomicneutral)). |
 
 The default follows the chemistry: `--meth` and `--meth=emseq` default to
-`collapsed`, so existing methylation pipelines see bwameth-compatible read
-placement unless they explicitly opt into `genomic`; `--meth=taps` (and
+`genomic`, which keeps the mirror cell a mismatch and so gives better-calibrated
+MAPQ: on simulated EM-seq (chr20–22 at 2×, 2×150 bp, fully methylated and fully
+unmethylated, 1.08 M pairs each, aligned to full hg38 on an Apple M2 Max, arm64 NEON; correct means
+the right contig within 10 bp), it places 1.3 pp more reads correctly at
+MAPQ ≥ 20 and makes about 20× fewer wrong placements at MAPQ 60 than `collapsed`.
+On real Twist EM-seq (5.18 M 2×75 bp pairs, inline UMI trimmed) it leaves 0.5 pp
+more reads unmapped and aligns 0.95% fewer bases, mostly reads `collapsed` aligns
+only by treating C/T and G/A as interchangeable
+([#756](https://github.com/fg-labs/bwa-mem3/pull/756)). Pass
+`--meth-scoring collapsed` for bwameth-compatible read placement. `--meth=taps` (and
 `--meth=5base`, which is TAPS to the aligner) defaults to `neutral`, because TAPS
 conversions are sparse (~3% of cytosines vs ~95% under
 EM-seq) and collapsing costs specificity it can no longer repay. An explicit
@@ -205,7 +213,7 @@ Steps:
 # Index once: builds the normal index at the bare prefix PLUS a .meth seed index.
 bwa-mem3 index --meth ref.fa
 
-# Align paired-end FASTQs (collapsed = bwameth-compatible placement, the default).
+# Align paired-end FASTQs (genomic scoring, the default).
 bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
 samtools index out.bam

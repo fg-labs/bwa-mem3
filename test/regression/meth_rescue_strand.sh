@@ -27,7 +27,7 @@
 #   OB fragment, anchor R2 forward, rescued R1 reverse   -> XG:Z:GA
 #   contig end,  anchor R1 forward, rescued R2 forward   -> XG:Z:GA
 #
-# Under the default (collapsed) and genomic scoring each rescued mate must land
+# Under the collapsed and default (genomic) scoring each rescued mate must land
 # at its true position on its true strand with a full-length CIGAR, NM equal to
 # the planted errors only (its conversions are scored free), and XM calling
 # exactly its converted cytosines, unmethylated. TAPS (--meth=taps) shares the
@@ -306,7 +306,7 @@ run_leg() {
     [ "$n_checked" -eq "$want_checked" ] || fail "$leg: checked $n_checked rescued mates, want $want_checked"
 }
 
-run_leg collapsed full --meth
+run_leg collapsed full --meth --meth-scoring collapsed
 run_leg genomic full --meth --meth-scoring genomic
 run_leg taps taps --meth=taps
 

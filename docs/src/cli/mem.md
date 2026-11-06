@@ -509,11 +509,11 @@ individual flags are unaffected.
 > **Note — --meth overrides scoring defaults**
 >
 > When `--meth` is active, bwa-mem3 applies `-L 10 -U 100 -T 40 -M -C` plus a
-> mode-dependent mismatch penalty: `-B 2` for `--meth-scoring collapsed` (the
-> `--meth`/`--meth=emseq` default, bwameth-compatible) and `-B 4` for
-> `--meth-scoring genomic` and `neutral` (`neutral` is the `--meth=taps` / `--meth=5base` default).
-> This mirrors bwameth's `bwa mem -T 40 -B 2 -L 10 -CM` (with `-U 100` for
-> paired-end). The scoring values (`-B`, `-L`, `-U`, `-T`) can still be overridden
+> mode-dependent mismatch penalty: `-B 4` for `--meth-scoring genomic` (the
+> `--meth`/`--meth=emseq` default) and `neutral` (the `--meth=taps` / `--meth=5base`
+> default), and `-B 2` for `--meth-scoring collapsed` (bwameth-compatible).
+> `-L`, `-U`, `-T`, `-M` and `-C` mirror bwameth's `bwa mem -T 40 -B 2 -L 10 -CM`
+> (with `-U 100` for paired-end); `collapsed` also takes its `-B 2`. The scoring values (`-B`, `-L`, `-U`, `-T`) can still be overridden
 > by passing the flag explicitly, in any position relative to `--meth`; `-M` and
 > `-C` cannot, since bwa has no option that unsets them.
 >
@@ -985,11 +985,11 @@ See [Methylation Reference](../methylation/overview.md) for the full treatment.
 
 #### `--meth-scoring {collapsed|genomic|neutral}` — bisulfite/TAPS scoring model
 
-Selects how the 4-letter matrix treats converted bases. `collapsed` (the
-`--meth`/`--meth=emseq` default) frees C↔T and G↔A both ways (bwameth-compatible
-placement, sets `-B 2`); `genomic` frees only the conversion direction scored as
+Selects how the 4-letter matrix treats converted bases. `genomic` (the
+`--meth`/`--meth=emseq` default) frees only the conversion direction scored as
 a full match, keeping real variants as mismatches (variant-aware: variants outside
-the conversion direction count toward `NM`, keeps `-B 4`); `neutral` (the
+the conversion direction count toward `NM`, keeps `-B 4`); `collapsed` (opt-in)
+frees C↔T and G↔A both ways (bwameth-compatible placement, sets `-B 2`); `neutral` (the
 `--meth=taps` / `--meth=5base` default) frees only the conversion direction but scores it `0` —
 tolerated, not rewarded — best for the sparse conversions of TAPS (keeps `-B 4`;
 variants count toward `NM` as in `genomic`). Do not use `neutral` with EM-seq /

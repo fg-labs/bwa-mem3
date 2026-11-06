@@ -116,19 +116,22 @@ print('OK')
 PY
 [ -s fixture.env ] || fail "fixture generation failed (python3 required)"
 
-run_leg() { # $1 = env value (0|1) -> writes $2.sam
-    BWAMEM3_METH_BATCHED_RESCUE="$1" "$BIN" mem --meth -t 1 ref.fa r1.fq r2.fq 2> /dev/null \
-        | samtools view - > "$2.sam" || fail "leg env=$1 nonzero exit"
-    [ -s "$2.sam" ] || fail "leg env=$1 produced empty SAM"
+run_leg() { # $1 = env value (0|1), $2 = --meth-scoring mode -> writes $2.$3.sam
+    BWAMEM3_METH_BATCHED_RESCUE="$1" "$BIN" mem --meth --meth-scoring "$2" -t 1 ref.fa r1.fq r2.fq 2> /dev/null \
+        | samtools view - > "$2.$3.sam" || fail "$2 leg env=$1 nonzero exit"
+    [ -s "$2.$3.sam" ] || fail "$2 leg env=$1 produced empty SAM"
 }
 
-run_leg 0 scalar
-run_leg 1 batched
+# genomic (the default) frees one cell per strand; collapsed frees two (the mirror
+# cell too), so each matrix shape gets its own scalar-vs-batched comparison.
+for scoring in genomic collapsed; do
+    run_leg 0 "$scoring" scalar
+    run_leg 1 "$scoring" batched
+    if ! diff -u "$scoring.scalar.sam" "$scoring.batched.sam" > "$scoring.diff.txt"; then
+        echo "FAIL: --meth-scoring $scoring: batched meth rescue (env=1) differs from scalar meth rescue (env=0):" >&2
+        cat "$scoring.diff.txt" >&2
+        exit 1
+    fi
+done
 
-if ! diff -u scalar.sam batched.sam > diff.txt; then
-    echo "FAIL: batched meth rescue (env=1) differs from scalar meth rescue (env=0):" >&2
-    cat diff.txt >&2
-    exit 1
-fi
-
-echo "PASS: meth_rescue_batched_identical (batched OT/OB-partition rescue == scalar rescue, byte-identical BAM)"
+echo "PASS: meth_rescue_batched_identical (batched OT/OB-partition rescue == scalar rescue, byte-identical BAM, genomic and collapsed)"

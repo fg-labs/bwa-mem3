@@ -4,21 +4,24 @@ bwa-mem3 supports bisulfite-converted (WGBS/RRBS/EM-seq) read alignment through 
 flag on both `index` and `mem`. No Python interpreter, no piped preprocessor, and no separate
 postprocessing step are required.
 
-> **Note — bwameth-compatible by default, variant-aware on request**
+> **Note — variant-aware by default, bwameth-compatible on request**
 >
-> By default (`--meth-scoring collapsed`) bwa-mem3 closely tracks bwameth.py's read **placement** and
-> emits the standard Bismark tags methylation callers expect (MethylDackel, Bismark, PileOMeth,
-> etc.). It is a placement drop-in — *not* a byte-for-byte reproduction of bwameth: a small fraction
-> of records (~1% on typical WGBS/EM-seq) still differ in `POS`/`CIGAR`/`MAPQ`, so re-validate if you
-> are pinned to a specific bwameth release (see
-> [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md)). Add
-> `--meth-scoring genomic` to opt into variant-aware scoring (variants outside the conversion
-> direction counted in `NM` — a genuine C→T at a reference `C` is indistinguishable from a
-> conversion and is not counted in `NM`, see
-> [which real variants stay visible](../methylation/overview.md#which-real-variants-stay-visible);
-> one BAM for both methylation and variant calling), or `--meth-scoring neutral` — the
-> `--meth=taps` / `--meth=5base` default — which is variant-aware too but scores the conversion `0` instead of a
-> match.
+> By default (`--meth-scoring genomic`) bwa-mem3 frees only the conversion direction and keeps
+> other C/T and G/A differences as mismatches, so variants outside the conversion direction count
+> in `NM` (a genuine C→T at a reference `C` is indistinguishable from a conversion and is not
+> counted, see
+> [which real variants stay visible](../methylation/overview.md#which-real-variants-stay-visible)).
+> It emits the standard Bismark tags methylation callers expect (MethylDackel, Bismark, PileOMeth,
+> etc.). Add `--meth-scoring collapsed` to closely track bwameth.py's read **placement** instead:
+> a placement drop-in, *not* a byte-for-byte reproduction (~1% of records differ in
+> `POS`/`CIGAR`/`MAPQ`; see [bwameth.py drop-in mapping](../methylation/bwameth-mapping.md)).
+> `--meth-scoring neutral`, the `--meth=taps` / `--meth=5base` default, is variant-aware too but
+> scores the conversion `0` instead of a match.
+>
+> **Trim inline UMIs first.** If your reads carry an inline UMI or spacer (unconverted synthetic
+> bases at the start of each read), extract or trim it before `--meth`. Otherwise those bases are
+> sometimes soft-clipped, but can remain aligned and receive methylation calls under either mode
+> (`collapsed` aligns them more often, since it treats C/T and G/A as interchangeable).
 
 ## Index the reference for methylation
 
@@ -41,13 +44,13 @@ Both indexes live next to `ref.fa`; `bwa-mem3 index ref.fa` (no `--meth`) builds
 ## Align bisulfite-converted reads
 
 ```bash
-# Default: collapsed (bwameth-compatible placement)
+# Default: genomic (variant-aware)
 bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
 samtools index out.bam
 
-# Opt into variant-aware scoring
-bwa-mem3 mem --meth --meth-scoring genomic -t 16 ref.fa R1.fq.gz R2.fq.gz \
+# Opt into bwameth-compatible placement
+bwa-mem3 mem --meth --meth-scoring collapsed -t 16 ref.fa R1.fq.gz R2.fq.gz \
   | samtools sort -o out.bam
 
 # Single-end (RRBS etc.): pass one FASTQ. The C→T (R1) projection is used for all reads.
@@ -67,7 +70,7 @@ In one process, `--meth` replaces what bwameth.py does with external tools:
   (R1 `C→T`, R2 `G→A`) to seed against `ref.fa.meth.*`, then extends and scores
   against the *original* reference, restoring the original bases in `SEQ`.
 - **Applies bwameth-aligned defaults** — `-L 10 -U 100 -T 40 -M -C` plus
-  mode-dependent `-B` (`2` for `collapsed`, `4` for `genomic`).
+  mode-dependent `-B` (`4` for `genomic`, the default; `2` for `collapsed`).
 - **Post-processes records inline** — writes `@SQ` from the original reference
   (the `f`/`r` seed contigs never reach the output), emits Bismark `XR`/`XG`/`XM`
   tags, and runs optional `--chimera-qc`. Output is SAM text by default and

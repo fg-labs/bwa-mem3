@@ -10,7 +10,9 @@ strand-filtering logic inside `meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
 ## `--meth[={emseq|taps|5base}]`
 
 Selects the **methylation chemistry**. Defaults to `emseq`, so a bare `--meth`
-behaves exactly as it always has. When `--meth` is given more than once, the last
+keeps the EM-seq chemistry it always had. Its scoring default is now `genomic`
+rather than `collapsed`, so scores, `MAPQ`, `NM` and placements can change on
+upgrade; pass `--meth-scoring collapsed` for the previous scoring. When `--meth` is given more than once, the last
 one wins: `--meth=taps --meth` is EM-seq, and `--meth --meth=taps` is TAPS.
 
 | Value | Chemistry | Which cytosines convert to T |
@@ -39,7 +41,9 @@ and that inverts the meaning of the observed base when **calling** methylation:
 | `C` (retained) | methylated (`Z`) | **un**methylated (`z`) |
 | `T` (converted) | **un**methylated (`z`) | methylated (`Z`) |
 
-So the flag changes the `XM:Z` call polarity, and nothing else. CpG/CHG/CHH
+So the flag changes the `XM:Z` call polarity and, unless `--meth-scoring` is
+given, the scoring default (`neutral` for `taps`/`5base`, `genomic` for `emseq`),
+which can change alignment scores and placements. CpG/CHG/CHH
 context classification is a property of the reference, not the chemistry, and is
 identical either way.
 
@@ -51,7 +55,7 @@ identical either way.
 > `XM:Z` and call with a TAPS-aware extractor such as Rastair.
 
 **Scoring default.** `--meth=taps` and `--meth=5base` default `--meth-scoring` to `neutral`
-(bare `--meth` still defaults to `collapsed`). TAPS converts only the methylated
+(bare `--meth` defaults to `genomic`). TAPS converts only the methylated
 cytosines, so conversions are far sparser than under EM-seq — 3.2 % of cytosines
 versus 94.6 % on a matched chr22 simulation — and the collapsed 3-letter alphabet
 costs specificity it no longer buys back. `neutral` goes one step past `genomic`:
@@ -72,11 +76,11 @@ conversion (bwameth-style), keep it variant-aware, or merely tolerate it.
 
 **Accepted values:**
 
-- `collapsed` (**default for `--meth`/`--meth=emseq`**) — free **both** conversion
+- `collapsed` (opt-in) — free **both** conversion
   directions: C↔T *and* G↔A are interchangeable (a two-cell matrix). Reproduces
   bwameth's collapsed-space **placement** and sets the mismatch penalty to `-B 2`.
-  Use this when you need bwameth-compatible read placement (the drop-in default).
-- `genomic` — free **only** the conversion direction (a one-cell matrix), scored
+  Use this when you need bwameth-compatible read placement.
+- `genomic` (**default for `--meth`/`--meth=emseq`**) — free **only** the conversion direction (a one-cell matrix), scored
   as a full match (`+A`), so the mirror cell stays a real mismatch. A genuine C/T
   or G/A variant on that mirror cell (ref `T` × read `C` on OT, ref `A` × read
   `G` on OB) is penalized and counts toward `NM`, making the BAM usable
@@ -99,8 +103,8 @@ conversion (bwameth-style), keep it variant-aware, or merely tolerate it.
 > reads lost first are the unmethylated, conversion-rich ones, so the methylation
 > measured on the reads that remain is biased upward. `bwa-mem3` prints a warning
 > for `--meth-scoring neutral` with `--meth`, `--meth=emseq` or
-> `--meth=bisulfite`. For EM-seq use the default `collapsed`, or `genomic` for
-> variant-aware output.
+> `--meth=bisulfite`. For EM-seq use the default `genomic`, or `collapsed` for
+> bwameth-compatible placement.
 >
 > Measured on simulated EM-seq single-end reads (15,000 per read length; CpG
 > methylation from an island/shore/open-sea model, conversion 0.999, at most 1 %

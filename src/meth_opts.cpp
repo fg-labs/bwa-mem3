@@ -235,7 +235,7 @@ void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
      * read at its true locus: it falls below -T, or loses to a locus that matches
      * it T for T. The reads lost first are the unmethylated, conversion-rich ones,
      * which biases methylation upward (measurements: docs/src/methylation/flags.md,
-     * --meth-scoring). em-seq defaults to collapsed, so this is reachable only by an
+     * --meth-scoring). em-seq defaults to genomic, so this is reachable only by an
      * explicit --meth-scoring neutral: warn rather than refuse. After the fatal
      * checks above, so a command rejected by these cross-option checks gets only
      * its error. */
@@ -244,7 +244,7 @@ void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
                         "--meth=emseq, --meth=bisulfite) scores each conversion 0, and em-seq converts "
                         "most cytosines, so short reads are left unmapped or misplaced and unmethylated "
                         "reads are lost first, biasing methylation upward. Use the em-seq default "
-                        "(collapsed) or --meth-scoring genomic.\n");
+                        "(genomic) or --meth-scoring collapsed.\n");
 }
 
 void meth_opts_usage_shared(FILE *fp)
@@ -271,12 +271,12 @@ void meth_opts_usage_shared(FILE *fp)
     fprintf(fp, "                 (EM-seq/bisulfite convert every unmethylated C) and a --meth-scoring\n");
     fprintf(fp, "                 other than collapsed.\n");
     fprintf(fp, "   --meth-scoring collapsed|genomic|neutral\n");
-    fprintf(fp, "                 scoring mode. Default depends on chemistry: collapsed for\n");
+    fprintf(fp, "                 scoring mode. Default depends on chemistry: genomic for\n");
     fprintf(fp, "                 --meth/--meth=emseq, neutral for --meth=taps|5base (their\n");
-    fprintf(fp, "                 conversions are sparse, so collapsing costs specificity it\n");
-    fprintf(fp, "                 can't repay).\n");
+    fprintf(fp, "                 conversions are sparse, so a full-match reward costs\n");
+    fprintf(fp, "                 specificity).\n");
     fprintf(fp, "                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible\n");
-    fprintf(fp, "                 placement (sets -B 2).\n");
+    fprintf(fp, "                 placement (sets -B 2). Opt-in.\n");
     fprintf(fp, "                 genomic: free only the conversion direction, scored as a full\n");
     fprintf(fp, "                 match, keep variants as mismatches (variant-aware: variants\n");
     fprintf(fp, "                 outside the conversion direction counted in NM; -B 4).\n");

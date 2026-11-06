@@ -1513,7 +1513,7 @@ jobs:
       # open-plus-extend sums differ (-O 6,8 -E 1, so the kernels' general,
       # non-Sym form) under each band kernel; run 11 draws --meth matrices
       # (RB_METH) at the default costs. Runs 12-16 cover the --meth band
-      # kernels where production reaches them: the default collapsed scoring
+      # kernels where production reaches them: the collapsed scoring
       # (b = 2a, which --meth bands on aarch64 because pruning refuses it), the
       # non-Sym form under each band kernel, and random costs with random
       # matrices. Runs 17-19 (RB_16BIT) send every job through kswv's 16-bit

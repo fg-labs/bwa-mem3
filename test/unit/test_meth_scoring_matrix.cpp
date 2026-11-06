@@ -64,13 +64,18 @@ TEST_CASE("collapsed frees both the conversion cell and its mirror"
     free(o);
 }
 
-TEST_CASE("collapsed is the default scoring mode"
+TEST_CASE("genomic is the default scoring mode"
           * doctest::test_suite("unit/meth_scoring"))
 {
     mem_opt_t *o = mem_opt_init();
-    CHECK(o->meth_scoring == MEM_METH_SCORING_COLLAPSED);
-    // The default-built matrices therefore have the mirror cell freed.
-    CHECK(o->mat_ot[3 * 5 + 1] == o->a);
+    CHECK(o->meth_scoring == MEM_METH_SCORING_GENOMIC);
+    // The default-built matrices therefore free the conversion cell only; the
+    // mirror cell (ref T x read C on OT) stays a mismatch.
+    CHECK(o->mat_ot[1 * 5 + 3] == o->a);
+    CHECK(o->mat_ot[3 * 5 + 1] == -o->b);
+    // OB likewise: ref G x read A freed, the mirror ref A x read G a mismatch.
+    CHECK(o->mat_ob[2 * 5 + 0] == o->a);
+    CHECK(o->mat_ob[0 * 5 + 2] == -o->b);
     free(o);
 }
 

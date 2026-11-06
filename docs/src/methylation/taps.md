@@ -34,7 +34,9 @@ are shared, and TAPS reads align correctly with the existing machinery.
 
 The chemistries differ only in *which* cytosines converted, which inverts the
 meaning of the observed base when **calling** methylation. `--meth=taps`
-therefore changes the `XM:Z` call polarity and nothing else. CpG/CHG/CHH
+therefore changes the `XM:Z` call polarity and, unless `--meth-scoring` is given,
+the scoring default (`neutral` instead of `genomic`; see the table below), which
+can change alignment scores and placements. CpG/CHG/CHH
 context classification is a property of the reference, so it is identical
 either way. See [SAM tags](tags.md#xmz--methylation-call-string).
 
@@ -43,7 +45,7 @@ either way. See [SAM tags](tags.md#xmz--methylation-call-string).
 | | `--meth` (em-seq) | `--meth=taps` |
 |---|---|---|
 | `XM:Z` polarity | retained `C` = methylated | retained `C` = **un**methylated |
-| `--meth-scoring` default | `collapsed` | **`neutral`** |
+| `--meth-scoring` default | `genomic` | **`neutral`** |
 | Index, seeding, `XR`/`XG` | identical | identical |
 
 The scoring default differs because TAPS conversions are far sparser — 3.2 % of

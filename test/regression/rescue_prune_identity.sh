@@ -75,12 +75,13 @@
 # decide jobs with K-mers longer than 5 there (kmer_jobs), and on no leg whose
 # scoring admits only 5; and -B 6 under the K cap BWA3_RESCUE_PRUNE_KMAX at 3, 5
 # and 99 (clamped to 5, 5 and 8) must match its reference too, with longer
-# K-mers only at 99. The same pairs as bisulfite reads, under --meth -B 4,
-# --meth-scoring genomic and the default scoring at -B 6 (whose 7-mers --meth
-# uses on aarch64, on converted copies), the default collapsed scoring and
-# --meth=taps at the
+# K-mers only at 99. The same pairs as bisulfite reads, under --meth-scoring
+# genomic (the default) and collapsed at -B 4 and at -B 6 (whose 7-mers --meth
+# uses on aarch64, on converted copies), the collapsed scoring at its own -B 2
+# and --meth=taps at the
 # collapsed scoring, must match their references too: filtered jobs on aarch64
-# at the first two, none at the collapsed ones (refused) and none on x86; and
+# at the -B 4 and -B 6 legs, none at the -B 2 collapsed ones (refused) and none
+# on x86; and
 # banded pass-1 jobs exactly where a leg does not prune (--meth bands with the
 # group's matrix only where it does not prune on converted copies). The
 # unconverted pairs, as mostly unconverted TAPS reads, under --meth=taps (whose
@@ -362,8 +363,8 @@ fi
 # hull banded); -B 3 the lemma refuses, so it prunes nowhere. The band kernels take all four, so
 # each must band pass 1 (rescue_band_runs). The --meth legs read the same pairs as bisulfite reads
 # (--meth writes SAM, as without it): with EM-seq chemistry (the default) at -B 4 and
-# --meth-scoring genomic the filter
-# matches converted copies, on aarch64 only (x86's cost gate); the default collapsed scoring
+# --meth-scoring genomic (the default) the filter
+# matches converted copies, on aarch64 only (x86's cost gate); the collapsed scoring
 # (b = 2a) the lemma refuses, with either chemistry. --meth bands pass 1 with the group's matrix
 # exactly where it does not prune on converted copies (rescue_band_meth_on). TAPS at the genomic
 # and neutral scorings (neutral is its default) filters under the exact relation on aarch64
@@ -495,13 +496,13 @@ check_scoring "-B 3" none -B 3
 # -A 2 scales the other costs with it (-B 8 -O 12 -E 2), so every rescue job is 16-bit (150 bp
 # mates score up to 300), and the seed-length cost gate lets the AVX-512BW tier prune it too.
 check_scoring "-A 2" simd16 -A 2
-check_scoring "--meth -B 4" meth --meth -B 4
+check_scoring "--meth collapsed -B 4" meth --meth --meth-scoring collapsed -B 4
 check_scoring "--meth genomic" meth --meth --meth-scoring genomic
 # -B 6 admits 7-mers, which --meth uses where it prunes (aarch64), on converted copies and under the
 # relation alike: check_scoring's kmer_jobs check fails these legs if it does not.
 check_scoring "--meth genomic -B 6" methk --meth --meth-scoring genomic -B 6
-check_scoring "--meth -B 6" methk --meth -B 6
-check_scoring "--meth collapsed" methnone --meth
+check_scoring "--meth collapsed -B 6" methk --meth --meth-scoring collapsed -B 6
+check_scoring "--meth collapsed" methnone --meth --meth-scoring collapsed
 check_scoring "--meth=taps collapsed" methnone --meth=taps --meth-scoring collapsed
 # Collapsed scoring at -B 4 passes the lemma, so only the relation's own guard (the collapsed matrix
 # frees the mirror cell, rescue_meth_rel_matrix_ok) keeps TAPS from filtering under the relation.

@@ -791,7 +791,8 @@ mem_opt_t *mem_opt_init()
     o->min_chain_weight = 0;
     o->max_chain_extend = 1<<30;
     o->mapQ_coef_len = 50; o->mapQ_coef_fac = log(o->mapQ_coef_len);
-    o->meth_scoring = MEM_METH_SCORING_COLLAPSED;  /* --meth default: bwameth-compatible */
+    o->meth_scoring = MEM_METH_SCORING_GENOMIC;    /* --meth default (em-seq); collapsed is
+                                                      the bwameth-compatible opt-in */
     o->meth_seed_prune = 0;                        /* base default off; --meth turns it on
                                                       (SPEC30), set in fastmap.cpp */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
@@ -5890,7 +5891,7 @@ static void mem_reg2aln_global(const mem_opt_t *opt, const bntseq_t *bns, const 
      *     (issue #327), while its MD lists every converted ref-C/ref-G.
      *   - `genomic` frees only the conversion direction, so a real variant in the
      *     opposite direction stays an edit and remains visible in NM.
-     *   - `collapsed` frees the mirror cell too, so C/T (and G/A) are fully
+     *   - `collapsed` (opt-in) frees the mirror cell too, so C/T (and G/A) are fully
      *     interchangeable and real variants in that class are hidden from NM as
      *     well — the documented cost of bwameth-compatible placement.
      *
