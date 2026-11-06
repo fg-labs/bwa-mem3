@@ -213,15 +213,17 @@ Each change to upstream-derived code adds a line here.
   of fixed-size chunks (`GAP_CHUNK_BYTES`, 16 KiB, 511 entries) rather than an array that doubles on
   its own. A push that finds its bucket's top chunk full (or no chunk) takes one from a per-thread
   pool; a pop that empties one gives it back; a finished read gives back all of its stack's chunks.
-  So the memory the stacks hold follows the entries in use rather
-  than every bucket's high-water mark, which lets `bwa_cal_sa_reg_gap_group` keep more reads in
-  flight per thread for less peak memory than 8 took before (`ALN_GROUP`: 12 on Apple arm64, where
-  it measured 4-11% faster than 8; 8 on every other target, including x86-64, where 12 measured
-  slower, and Linux arm64, which was not measured). The pool keeps at most 256 free chunks
-  (`ALN_POOL_KEEP`, 4 MiB) per thread and frees the rest; a 1,024-chunk pool measured no faster and
-  held about 0.2 GiB more at peak. Within a bucket the last entry pushed is popped first,
-  as in the array, and the bucket popped is chosen by the same code, so entries come off in the same
-  order and each read's hits are unchanged. `bwt_match_gap` keeps upstream's `gap_stack_t` and is the
+  So the memory the stacks hold follows the entries in use rather than every bucket's high-water
+  mark, which lets `bwa_cal_sa_reg_gap_group` keep more reads in flight per thread for less peak
+  memory than 8 took with the array stacks. `ALN_GROUP` is 12 on arm64, where it measured faster
+  than 8 on Apple M3 Ultra (4-11% wall), Graviton4 and Graviton3; on the Gravitons, against 8 with
+  the same chunked stacks, it held up to about 0.1 GiB more at peak at `-t 16` on deep searches.
+  Other arm64 cores were not measured and inherit 12. It is 8 on x86-64, where 12 measured slower,
+  and on any other target (see the comment at `ALN_GROUP` in `bwtaln.cpp`). The pool keeps at most
+  256 free chunks (`ALN_POOL_KEEP`, 4 MiB) per thread and frees the rest; a 1,024-chunk pool
+  measured no faster and held about 0.2 GiB more at peak. Within a bucket the last entry pushed
+  is popped first, as in the array, and the bucket popped is chosen by the same code, so entries
+  come off in the same order and each read's hits are unchanged. `bwt_match_gap` keeps upstream's `gap_stack_t` and is the
   unit tests' reference.
 - Whole-entry push (new code). `gap_cpush` builds the entry in a local `gap_entry_t`, sets every field
   (`n_seed_mm` to 0) and stores it in one piece. Upstream's `gap_push` assigns `n_mm`, `n_gapo`,
