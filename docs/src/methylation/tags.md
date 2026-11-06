@@ -14,6 +14,8 @@ biscuit's per-read methylation tools.
 Like Bismark's, `MD` lists every converted base. `NM` does not:
 Bismark counts every conversion as a mismatch, while `--meth` does not (see
 [how `NM`/`MD` are computed](overview.md#how-nmmd-are-computed-under---meth)).
+`--md short` and `--md none` shorten or drop `MD` (see
+[`--md`](../cli/mem.md#--md-str--which-md-tag-to-write)).
 
 ## Tag reference
 

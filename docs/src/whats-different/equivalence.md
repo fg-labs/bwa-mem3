@@ -112,6 +112,7 @@ bwa-mem3 mem --compat=bwa-mem2 -t <N> ref.fa R1.fq R2.fq > out.sam
 | `.hdr`/`.dict` sidecar `@SQ` | honored (`M5`/`AS`/`UR`/`SP`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) | ignored → bare `SN`/`LN` (+`AH:*`) | bare `SN`/`LN` (+`AH:*`) |
 | `@PG` | `ID:bwa-mem3` | `ID:bwa-mem3` | `ID:bwa-mem2` | `ID:bwa-mem3` | `ID:bwa` |
 | `-u` hit list | `XB:Z` | `-u` refused | no `-u` | `XB:Z` | `XB:Z` |
+| `MD:Z` | emitted (`--md none` drops it) | emitted (`--md none` refused) | present | emitted (`--md none` refused) | present |
 
 **The two upstreams disagree with each other on half of this table, which is why `--compat`
 takes a *target* rather than being a boolean.** `MQ:i` is not a bwa-mem3 invention — bwa
@@ -231,6 +232,10 @@ Caveats:
   `--proper-pair-from-emitted` case above) to a warning for a user who knowingly wants the target's
   output conventions with a bwa-mem3 lever engaged; the output is then not byte-identical. It does
   not relax `--fast` or `--meth`, which are category errors rather than divergences.
+- **`--compat` refuses `--md none`** ([#754](https://github.com/fg-labs/bwa-mem3/pull/754)) — it moves no alignment, but both targets always write
+  `MD:Z`, so the stream cannot match them. `--compat-allow-divergent` relaxes it like the levers
+  above. `--md short` needs no refusal: it differs from `full` only under `--meth`, which
+  `--compat` always refuses.
 - **Contained-seed extension skipping is on by default and byte-identical**, so `--compat` keeps
   it: the compat policy retains every optimization that is byte-identical by construction or
   proven inside a code-enforced envelope, and this one is proven (the envelope is a monotonicity
@@ -339,7 +344,8 @@ changed: on a 900 kb simulated EM-seq set (60,000 pairs with random SNPs and ind
 NEON tier), every other field of every record was byte-identical to the previous build under all
 three `--meth-scoring` modes, and the non-`--meth` records (`@PG` excluded) were byte-identical on
 that set and on phiX. See
-[how `NM`/`MD` are computed](../methylation/overview.md#how-nmmd-are-computed-under---meth). The
+[how `NM`/`MD` are computed](../methylation/overview.md#how-nmmd-are-computed-under---meth).
+[`--md short` or `--md none`](../cli/mem.md#--md-str--which-md-tag-to-write) opts out of the literal `MD`. The
 `FG-METH-DIVERGENCE` row in the catalog below is generated from the divergence registry and does
 not yet carry this change.
 

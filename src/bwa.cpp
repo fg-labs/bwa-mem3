@@ -604,8 +604,12 @@ extern "C" void bwa_gen_cigar_fill_rseq_scratch(size_t min_size, int byte)
 
 /* Generate CIGAR when the alignment end points are known.
  *
- * MD (built when `want_md`) lists every column whose bases differ literally
- * (`query != rseq`), so CIGAR + SEQ + MD rebuilds the real reference. `nm_from_mat` selects which
+ * MD (built when `want_md` is 1) lists every column whose bases differ literally
+ * (`query != rseq`), so CIGAR + SEQ + MD rebuilds the packed reference (the real one,
+ * except that an ambiguous base is the random A/C/G/T the index stored for it). With
+ * `want_md` 2 (--md short) it lists only the mismatches NM counts, so under
+ * `nm_from_mat` a matrix-freed conversion reads as a match; with `nm_from_mat` 0
+ * that is every mismatch, the same MD as 1. `nm_from_mat` selects which
  * of those columns NM counts:
  *   0 (default, non-meth): every one -- the historical bwa behaviour, byte-for-byte.
  *   1 (--meth): only those the SCORING MATRIX penalises (`mat[ref*5 + query] < 0`).
@@ -817,12 +821,16 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
                 // each mismatch p: the u matches since the last edit, then its reference base
                 int last = 0; // the op's columns before `last` are in u or already written
                 auto put_mismatch = [&](int p) {
+                    /* NM increment; see the nm_from_mat contract above */
+                    const int edit = bwa_nm_edit<M>(mat, rseq[y + p], query[x + p], nm_from_mat);
+                    // short MD (want_md 2) lists only the mismatches NM counts; a
+                    // skipped one stays in the run of matches, as `last` is unmoved
+                    if (want_md == 2 && !edit) return;
                     u += p - last;
                     kputw(u, &str);
                     kputc(int2base[bwa_ref_base<M>(rseq[y + p])], &str);
                     u = 0; last = p + 1;
-                    /* NM increment; see the nm_from_mat contract above */
-                    n_mm += bwa_nm_edit<M>(mat, rseq[y + p], query[x + p], nm_from_mat);
+                    n_mm += edit;
                 };
                 i = 0;
 #if defined(__AVX2__)

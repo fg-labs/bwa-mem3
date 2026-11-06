@@ -145,6 +145,17 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  *              the freed-capable tiers (NEON/AVX2/AVX512BW) exactly like
  *              GENOMIC/COLLAPSED, and falls back to scalar ksw_align2 on the
  *              freed-less x86 tiers (sse41/sse42/avx) as all three modes do. */
+/* --md modes (mem_opt_t.md_mode): which MD:Z each mapped record carries, in SAM
+ * and both BAM writers; XA/XB entries never carry MD, so it does not apply to
+ * them. FULL (the default) lists every reference base the read differs from.
+ * SHORT lists only the mismatches the scoring matrix penalises, the ones NM
+ * counts, so under --meth it leaves out the conversions the matrix frees;
+ * without --meth every mismatch is penalised and SHORT equals FULL. NONE writes
+ * no MD. The values are bwa_gen_cigar4's `want_md` (0 none, 1 literal, 2 short),
+ * so mem_reg2aln passes the mode straight through. NONE is 0, so an opt that
+ * is not built by mem_opt_init must set md_mode itself. */
+enum mem_md_mode { MEM_MD_NONE = 0, MEM_MD_FULL = 1, MEM_MD_SHORT = 2 };
+
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
 
@@ -298,6 +309,7 @@ typedef struct mem_opt_t {
      * matches both and no target needs a say in it. --compat and this option
      * are instead mutually exclusive (see main_mem). */
     int    proper_pair_from_emitted;
+    int    md_mode;         // --md: a mem_md_mode value (MEM_MD_FULL default)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
     int    alnreg_sort_fast;  // 1 = strict-total-order comparator + pdqsort at the mem_sort_dedup_patch sort sites (set by --fast); 0 = bwa-mem2's re-only comparator + ks_introsort (default, bwa-mem2-compatible)
@@ -1193,7 +1205,12 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt, int64_t n_processed,
  * `want_md` 0 builds no MD string: the returned cigar holds only the n_cigar
  * ops, so the result must not be passed to anything that reads MD after them
  * (mem_aln2sam). NM, the CIGAR and everything else are unchanged. Used for the
- * XA hits in mem_gen_alt, which read only the CIGAR and NM.
+ * XA hits in mem_gen_alt, which read only the CIGAR and NM. `want_md` 1 (the
+ * default) asks for the MD that `opt->md_mode` selects, which under --md none
+ * is no MD at all: whether MD bytes follow the ops is recorded nowhere in the
+ * returned aln, so a writer must test the same `opt->md_mode != MEM_MD_NONE`
+ * before reading them, as mem_aln2sam, mem_aln_to_bam and meth_mem_aln_to_bam
+ * do.
  *
  * `reuse` and `made` (want_md 0 only) let mem_gen_alt compute the global alignment
  * of duplicate hits once: the CIGAR ops and NM before the end-deletion squeeze and

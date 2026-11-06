@@ -149,8 +149,9 @@ extern "C" {
 							 int *n_cigar, int *NM, int nm_from_mat);
 
 	/* As bwa_gen_cigar3, plus `want_md`: 0 builds no MD string, so the returned
-	 * buffer holds only the n_cigar ops (no MD, no NUL after them). NM is the same
-	 * value either way.
+	 * buffer holds only the n_cigar ops (no MD, no NUL after them); 1 builds the
+	 * literal MD; 2 builds a short MD that lists only the mismatches NM counts
+	 * (the same as 1 when `nm_from_mat` is 0). NM is the same value in all three.
 	 *
 	 * `m` is the alphabet size of `mat` (target-major mat[ref*m + read]): 5, as
 	 * for bwa_gen_cigar3, or 7 for a --meth-context cpg matrix (meth_model.h).

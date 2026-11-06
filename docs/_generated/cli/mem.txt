@@ -75,8 +75,9 @@ Options:
                   (run-specific); exclude it when comparing.
                   To stay byte-identical, --compat refuses bwa-mem3-only levers that
                   change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,
-                  --min-ext-len, --rescue-kmer, --seed-order), and -u under bwa-mem2
-                  (no XB:Z before bwa 0.7.18); --fast and --meth are always refused.
+                  --min-ext-len, --rescue-kmer, --seed-order), --md none (the targets
+                  always write MD), and -u under bwa-mem2 (no XB:Z before bwa 0.7.18);
+                  --fast and --meth are always refused.
                   Override the forceable ones with --compat-allow-divergent.
                   Keeps every byte-identical optimization, the default contained-seed
                   extension skip included (--keep-contained-ext still opts out of it).
@@ -135,6 +136,18 @@ Input/output options:
    -a            output all alignments for SE or unpaired PE
    -C            append FASTA/FASTQ comment to SAM output
    -V            output the reference FASTA header in the XR tag
+   --md STR      MD:Z on each mapped record: full|short|none [full]
+                 full lists every reference base the read differs from, so
+                 CIGAR + SEQ + MD rebuilds the reference (except on secondary
+                 records, which omit SEQ). short lists only the mismatches NM
+                 counts: under --meth it leaves out the conversions
+                 the scoring matrix frees (only CpG ones under --meth-context cpg;
+                 under --meth-scoring collapsed also the mirror C/T and G/A
+                 variants). Each column it leaves out reads as a match, so
+                 CIGAR + SEQ + MD rebuilds the read's base there, which may be
+                 neither the real nor the converted reference, and samtools calmd
+                 may disagree with MD; without --meth it equals full. none writes
+                 no MD tag.
    -Y            use soft clipping for supplementary alignments
    -M            mark shorter split hits as secondary
    -I FLOAT[,FLOAT[,INT[,INT]]]

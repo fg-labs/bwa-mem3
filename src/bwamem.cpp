@@ -806,6 +806,7 @@ mem_opt_t *mem_opt_init()
      * away -- and a default that important should be visible where the others
      * are set. */
     o->proper_pair_from_emitted = 0;
+    o->md_mode      = MEM_MD_FULL;                 /* --md default: literal MD */
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
     return o;
@@ -5586,7 +5587,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
      * hold a real strlen here, so the cached value is byte-identical to the
      * strlen kputs_u() would have recomputed. */
     size_t md_len = 0;
-    if (p->n_cigar)
+    if (p->n_cigar && opt->md_mode != MEM_MD_NONE) // --md none: no MD after the CIGAR
         md_len = strlen((const char*)(p->cigar + p->n_cigar));
     /* RNAME/RNEXT contig names can be very long (T2T-style assemblies).
      * Mate CIGAR (MC:Z) under V17 is also written via add_cigar(). */
@@ -5697,7 +5698,9 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     // print optional tags
     if (p->n_cigar) {
         kputsn_u("\tNM:i:", 6, str); kputw_u(p->NM, str);
-        kputsn_u("\tMD:Z:", 6, str); kputsn_u((char*)(p->cigar + p->n_cigar), (int)md_len, str);
+        if (opt->md_mode != MEM_MD_NONE) {
+            kputsn_u("\tMD:Z:", 6, str); kputsn_u((char*)(p->cigar + p->n_cigar), (int)md_len, str);
+        }
     }
 #if V17
     if (m && m->n_cigar) { kputsn_u("\tMC:Z:", 6, str); add_cigar(opt, m, str, which); }
@@ -5940,6 +5943,10 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     int64_t pos, rb, re;
 
     xassert(!(reuse || made) || !want_md, "mem_reg2aln: reuse/made need want_md 0");
+    /* --md: a caller's want_md 1 asks for the record's MD, whose form opt->md_mode
+     * picks (mem_md_mode is numbered as want_md): none builds none, and the
+     * writers, which test the same opt->md_mode, then emit no MD:Z. */
+    if (want_md) want_md = opt->md_mode;
     xassert(!made == !made_NM, "mem_reg2aln: made and made_NM go together");
     xassert(!(reuse && made), "mem_reg2aln: reuse and made are exclusive");
     memset(&a, 0, sizeof(mem_aln_t));

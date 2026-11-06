@@ -367,8 +367,10 @@ int mem_aln_to_bam(struct bam1_t *b,
     if (p.n_cigar > 0) {
         int32_t nm = (int32_t)p.NM;
         if (bam_aux_append(b, "NM", 'i', sizeof(nm), (const uint8_t *)&nm) < 0) return -1;
-        const char *md = (const char *)(p.cigar + p.n_cigar);
-        if (bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md) < 0) return -1;
+        if (opt->md_mode != MEM_MD_NONE) { // --md none: no MD after the CIGAR
+            const char *md = (const char *)(p.cigar + p.n_cigar);
+            if (bam_aux_append(b, "MD", 'Z', (int)strlen(md) + 1, (const uint8_t *)md) < 0) return -1;
+        }
     }
     if (mp && mp->n_cigar > 0) {
         /* Dynamic buffer: CIGARs with >~800 ops would silently truncate a

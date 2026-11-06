@@ -1900,8 +1900,9 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  (run-specific); exclude it when comparing.\n");
     fprintf(stderr, "                  To stay byte-identical, --compat refuses bwa-mem3-only levers that\n");
     fprintf(stderr, "                  change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,\n");
-    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order), and -u under bwa-mem2\n");
-    fprintf(stderr, "                  (no XB:Z before bwa 0.7.18); --fast and --meth are always refused.\n");
+    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order), --md none (the targets\n");
+    fprintf(stderr, "                  always write MD), and -u under bwa-mem2 (no XB:Z before bwa 0.7.18);\n");
+    fprintf(stderr, "                  --fast and --meth are always refused.\n");
     fprintf(stderr, "                  Override the forceable ones with --compat-allow-divergent.\n");
     fprintf(stderr, "                  Keeps every byte-identical optimization, the default contained-seed\n");
     fprintf(stderr, "                  extension skip included (--keep-contained-ext still opts out of it).\n");
@@ -1968,6 +1969,18 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "   -a            output all alignments for SE or unpaired PE\n");
     fprintf(stderr, "   -C            append FASTA/FASTQ comment to SAM output\n");
     fprintf(stderr, "   -V            output the reference FASTA header in the XR tag\n");
+    fprintf(stderr, "   --md STR      MD:Z on each mapped record: full|short|none [full]\n");
+    fprintf(stderr, "                 full lists every reference base the read differs from, so\n");
+    fprintf(stderr, "                 CIGAR + SEQ + MD rebuilds the reference (except on secondary\n");
+    fprintf(stderr, "                 records, which omit SEQ). short lists only the mismatches NM\n");
+    fprintf(stderr, "                 counts: under --meth it leaves out the conversions\n");
+    fprintf(stderr, "                 the scoring matrix frees (only CpG ones under --meth-context cpg;\n");
+    fprintf(stderr, "                 under --meth-scoring collapsed also the mirror C/T and G/A\n");
+    fprintf(stderr, "                 variants). Each column it leaves out reads as a match, so\n");
+    fprintf(stderr, "                 CIGAR + SEQ + MD rebuilds the read's base there, which may be\n");
+    fprintf(stderr, "                 neither the real nor the converted reference, and samtools calmd\n");
+    fprintf(stderr, "                 may disagree with MD; without --meth it equals full. none writes\n");
+    fprintf(stderr, "                 no MD tag.\n");
     fprintf(stderr, "   -Y            use soft clipping for supplementary alignments\n");
     fprintf(stderr, "   -M            mark shorter split hits as secondary\n");
     fprintf(stderr, "   -I FLOAT[,FLOAT[,INT[,INT]]]\n");
@@ -2237,6 +2250,7 @@ int main_mem(int argc, char *argv[])
         OPT_BAM_THREADS,
         OPT_SUPP_REP_HARD_CAP,
         OPT_PROPER_PAIR_FROM_EMITTED,
+        OPT_MD,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
         OPT_MAX_EXTEND_CHAINS,
@@ -2302,6 +2316,7 @@ int main_mem(int argc, char *argv[])
         METH_LONG_OPTIONS_MEM_ONLY
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
+        {"md",                       required_argument, 0, OPT_MD},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
         {"compat-allow-divergent",   no_argument,       0, OPT_COMPAT_ALLOW_DIVERGENT},
@@ -2719,6 +2734,17 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_LEGACY_READER) aux.legacy_reader = 1;
         else if (c == OPT_COMPAT_ALLOW_DIVERGENT) allow_divergent = 1;
+        else if (c == OPT_MD) {
+            if (strcmp(optarg, "full") == 0) opt->md_mode = MEM_MD_FULL;
+            else if (strcmp(optarg, "short") == 0) opt->md_mode = MEM_MD_SHORT;
+            else if (strcmp(optarg, "none") == 0) opt->md_mode = MEM_MD_NONE;
+            else {
+                fprintf(stderr, "[E::%s] unknown --md '%s' (full|short|none)\n", __func__, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
         else if (c == OPT_SEED_ORDER) {
             opt->seed_emit_order = seed_order_from_str(optarg);
             if ((int)opt->seed_emit_order < 0) {
@@ -3318,6 +3344,9 @@ int main_mem(int argc, char *argv[])
             { opt->seed_emit_order != SEED_ORDER_OFF, "--seed-order" },
             { chunk_cap_set && chunk_cap > 0,         "--chunk-cap" },
             { opt->proper_pair_from_emitted != 0,     "--proper-pair-from-emitted" },
+            /* Output, not alignment: both targets always write MD. --md short
+             * needs no row: without --meth (which --compat refuses) it is full. */
+            { opt->md_mode == MEM_MD_NONE,            "--md none" },
             /* Output, not alignment: -u's XB:Z (score + MAPQ per hit) exists
              * only in a target that has bwa's -u (bwa 0.7.18+), so the row is
              * per-target rather than a bwa-mem3-only lever. */
