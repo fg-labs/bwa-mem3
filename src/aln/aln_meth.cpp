@@ -24,6 +24,7 @@
 #include "../meth_xm.h"
 #include "../utils.h"
 #include "aln_alloc.h"
+#include "bwape.h"
 #include "bwase.h"
 #include "bwaseqio.h"
 #include "bwtgap.h"
@@ -327,7 +328,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
 }
 void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
 {
-    if (bwa_verbose < 4 && !getenv("BWA_ALN_METH_STATS")) return;
+    if (bwa_verbose < 4) return;
     long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0;
     for (int i = 0; i < n; ++i) {
         lookups += res[i].n_lookups; wrong += res[i].n_wrong_copy; scored += res[i].n_rescored;
@@ -441,28 +442,36 @@ static bwa_cigar_t *legacy_cigar(const std::vector<uint32_t> &cigar, int *n,
     *n = k;
     return out;
 }
-void aln_meth_finish_se(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, const gap_opt_t *opt,
-                        int max_xa_hits, int n, bwa_seq_t *seqs, aln_meth_read_t *res)
+// Select/account first; emission can then keep a pairing decision's MAPQ unchanged.
+static void meth_set_main(bwa_seq_t *s, aln_meth_read_t *r, const gap_opt_t *opt)
+{
+    s->mapQ = s->seQ = 0;
+    if (r->main < 0) { s->type = BWA_TYPE_NO_MATCH; r->hyp = -1; return; }
+    const auto &o = r->occ[r->main];
+    s->pos = o.pos; s->strand = o.strand; s->score = (int)o.cost; r->hyp = o.hyp;
+    s->type = r->flags || r->c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
+    s->c1 = r->flags ? 0 : r->c1; s->c2 = r->flags ? 0 : r->c2;
+    s->n_mm = o.n_mm; s->n_gapo = o.n_gapo; s->n_gape = o.n_gape;
+    s->ref_shift = (int)(o.alignment.re - o.alignment.rb) - (int)s->len;
+    const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(s->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
+    s->mapQ = s->seQ = r->flags ? 0 : bwa_approx_mapQ(s, max_diff);
+}
+
+static void meth_emit(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
+                      int max_xa_hits, int n, bwa_seq_t *seqs, aln_meth_read_t *res)
 {
     kstring_t str = {0, 0, 0};
     for (int i = 0; i < n; ++i) {
         bwa_seq_t *s = seqs + i; aln_meth_read_t *r = res + i;
         seq_reverse(s->len, s->seq, 0);
-        s->mapQ = s->seQ = 0;
-        if (r->main < 0) { s->type = BWA_TYPE_NO_MATCH; r->hyp = -1; s->len = s->full_len; continue; }
+        if (s->type == BWA_TYPE_NO_MATCH) { s->len = s->full_len; continue; }
         const auto &o = r->occ[r->main];
-        s->pos = o.pos; s->strand = o.strand; s->score = (int)o.cost; r->hyp = o.hyp;
-        s->type = r->flags || r->c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
-        s->c1 = r->flags ? 0 : r->c1; s->c2 = r->flags ? 0 : r->c2;
         s->cigar = legacy_cigar(o.alignment.cigar, &s->n_cigar, s->len, s->len, s->strand);
         int nm;
         s->md = meth_cal_md(ref, mo, o.hyp, s->n_cigar, s->cigar, s->len, s->pos,
                             s->strand ? s->rseq : s->seq, &str, &nm);
         if (nm > 4095) { fprintf(stderr, "ERROR: --meth NM exceeds record capacity\n"); exit(1); }
         s->nm = nm;
-        s->n_mm = o.n_mm; s->n_gapo = o.n_gapo; s->n_gape = o.n_gape;
-        const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(s->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
-        s->mapQ = s->seQ = r->flags ? 0 : bwa_approx_mapQ(s, max_diff);
         s->n_multi = 0; s->multi = nullptr;
         if (!r->flags && r->occ.size() > 1 && (int64_t)r->occ.size() <= (int64_t)max_xa_hits + 1) {
             s->multi = (bwt_multi1_t*)aln_calloc(r->occ.size()-1, sizeof(bwt_multi1_t));
@@ -497,6 +506,278 @@ void aln_meth_finish_se(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, con
         s->len = s->full_len;
     }
     free(str.s);
+}
+
+void aln_meth_finish_se(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, const gap_opt_t *opt,
+                        int max_xa_hits, int n, bwa_seq_t *seqs, aln_meth_read_t *res)
+{
+    for (int i = 0; i < n; ++i) meth_set_main(seqs + i, res + i, opt);
+    meth_emit(ref, mo, max_xa_hits, n, seqs, res);
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * sampe under --meth
+ * ------------------------------------------------------------------------------------------- */
+
+void aln_meth_pe_stage1(const gap_opt_t *opt, int n, bwa_seq_t *seqs[2], aln_meth_read_t *res[2])
+{
+	for (int i = 0; i < n; ++i)
+		for (int j = 0; j < 2; ++j) {
+			bwa_seq_t *p = seqs[j] + i;
+			p->extra_flag |= SAM_FPD | (j == 0 ? SAM_FR1 : SAM_FR2);
+			meth_set_main(p, res[j] + i, opt);
+		}
+}
+
+#define SW_MIN_MATCH_LEN 20
+#define SW_MIN_MAPQ 17
+
+/* bwape.cpp's bwa_sw_core with the anchor's matrix (labelled window under cpg) on the original
+ * reference; *_cnt's n_mm counts only the mismatches the mode does not free. */
+static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int hyp, int rid,
+                                 int len, const ubyte_t *seq, int64_t *beg, int64_t end,
+                                 int *n_cigar, uint32_t *_cnt)
+{
+    *n_cigar = 0;
+    if (len <= 0 || len > 65535 || rid < 0 || rid >= ref->bns->n_seqs) return nullptr;
+    const auto &ann = ref->bns->anns[rid];
+    const int64_t contig_end = ann.offset + ann.len;
+    // The anchor owns the window, even when its unbounded start falls in a neighbor.
+    *beg = std::max<int64_t>(*beg, ann.offset);
+    end = std::min(end, contig_end);
+    const int64_t span = end - *beg;
+    if (span < SW_MIN_MATCH_LEN) return nullptr;
+    // The local-rescue profile and traceback must remain within a bounded evaluation window.
+    if (span > 65535 || 2ULL * len * span + 128ULL * (len + span) > (64ULL << 20)) {
+        fprintf(stderr, "ERROR: --meth rescue window exceeds allocation budget\n"); exit(1);
+    }
+    int ambiguous = 0;
+    for (int k = 0; k < len; ++k) ambiguous += seq[k] >= 4;
+    if (ambiguous * 4 >= len || len - ambiguous < SW_MIN_MATCH_LEN) return nullptr;
+    int m;
+    const int8_t *mat = meth_mat(mo, hyp, &m);
+    std::vector<uint8_t> target;
+    fetch_window(ref, mo, *beg, span, rid, target);
+    const int xtra = KSW_XSUBO | KSW_XSTART | (len < 250 ? KSW_XBYTE : 0);
+    const kswr_t r = ksw_align(len, const_cast<uint8_t*>(seq), (int)span, target.data(), m, mat, 5, 1, xtra, nullptr);
+    if (r.score < SW_MIN_MATCH_LEN || r.score2 == r.score || r.qb < 0 || r.tb < 0 ||
+        r.qe < r.qb || r.te < r.tb || r.qe >= len || r.te >= span ||
+        r.qe-r.qb+1 < SW_MIN_MATCH_LEN || r.te-r.tb+1 < SW_MIN_MATCH_LEN) return nullptr;
+    // Reuse the bounded, certified global refiner for the selected local rescue segment.
+    const aln_meth_candidate_t candidate{rid, 0, hyp, *beg+r.tb, *beg+r.te+1};
+    aln_meth_alignment_t alignment;
+    if (aln_meth_realign_window(*ref, *mo, candidate, seq+r.qb, r.qe-r.qb+1, 0, 0, &alignment)
+        != aln_meth_eval_status::ok) {
+        fprintf(stderr, "ERROR: --meth cannot evaluate mate rescue\n"); exit(1);
+    }
+    if (alignment.reward != r.score) return nullptr; // stock rejects inconsistent local/global scores
+    if (alignment.rb < ann.offset || alignment.re > contig_end || alignment.rb >= alignment.re) {
+        fprintf(stderr, "ERROR: --meth rescued interval leaves anchor contig\n"); exit(1);
+    }
+    int q = r.qb, t = r.tb, mm = 0, opens = 0, extensions = 0;
+    for (uint32_t item : alignment.raw_cigar) {
+        const int op=item&15, length=item>>4;
+        if (op==0) {
+            for (int k=0;k<length;++k) {
+                const int base=target[t++], read=seq[q++];
+                if (read>3 || mat[base*m+read]<0) ++mm;
+            }
+        } else {
+            ++opens; extensions+=length-1;
+            if(op==1) q+=length; else t+=length;
+        }
+    }
+    if (mm>255 || opens>255 || extensions>255) return nullptr; // not representable: no rescue
+    *_cnt=(uint32_t)mm<<16 | (uint32_t)opens<<8 | extensions;
+    // Local-query clipping and global terminal normalization are merged before legacy splitting.
+    auto cigar=alignment.cigar;
+    if (r.qb) {
+        if ((cigar.front()&15)==4) cigar.front() += (uint32_t)r.qb<<4;
+        else cigar.insert(cigar.begin(), (uint32_t)r.qb<<4|4);
+    }
+    const int tail=len-r.qe-1;
+    if (tail) {
+        if ((cigar.back()&15)==4) cigar.back() += (uint32_t)tail<<4;
+        else cigar.push_back((uint32_t)tail<<4|4);
+    }
+    *beg=alignment.rb;
+    return legacy_cigar(cigar,n_cigar,len,len,0);
+}
+
+int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, const gap_opt_t *gopt, const pe_opt_t *popt,
+					   const isize_info_t *ii, int n, bwa_seq_t *seqs[2], aln_meth_read_t *res[2],
+					   uint64_t n_tot[2], uint64_t n_mapped[2])
+{
+	int cnt_chg = 0;
+	const int max_occ = popt->max_occ < mo->p_second ? popt->max_occ : mo->p_second;
+	std::vector<bwt_aln1_t> a[2];
+	std::vector<pair64_t> arr;
+	kstring_t str = {0, 0, 0};
+	for (int i = 0; i < n; ++i) {
+		bwa_seq_t *p[2] = {seqs[0] + i, seqs[1] + i};
+		aln_meth_read_t *r[2] = {res[0] + i, res[1] + i};
+		// Explicitly incomplete ends cannot be promoted by pairing or rescue.
+		const bool incomplete = r[0]->flags || r[1]->flags;
+		// pairing on the retained stock-cost occurrences
+		if ((p[0]->type == BWA_TYPE_UNIQUE || p[0]->type == BWA_TYPE_REPEAT)
+			&& (p[1]->type == BWA_TYPE_UNIQUE || p[1]->type == BWA_TYPE_REPEAT)) {
+			if (!incomplete && (int)r[0]->occ.size() <= max_occ && (int)r[1]->occ.size() <= max_occ) {
+				arr.clear();
+				for (int j = 0; j < 2; ++j) {
+					a[j].assign(r[j]->occ.size(), bwt_aln1_t());
+					for (size_t x = 0; x < r[j]->occ.size(); ++x) {
+						const aln_meth_occ_t &o = r[j]->occ[x];
+						a[j][x].n_mm = o.n_mm; a[j][x].n_gapo = o.n_gapo; a[j][x].n_gape = o.n_gape;
+						if (o.cost > ((1<<20)-1)) {
+                            fprintf(stderr, "ERROR: --meth pairing cost exceeds record capacity\n"); exit(1);
+                        }
+                        a[j][x].score = o.cost;
+						pair64_t q;
+						q.x = o.pos;
+						q.y = (uint64_t)x << 2 | (uint64_t)o.strand << 1 | (uint64_t)j;
+						arr.push_back(q);
+					}
+				}
+				pair64_v v;
+				v.a = arr.data(); v.n = v.m = arr.size();
+				bwt_aln1_t *save[2] = {p[0]->aln, p[1]->aln};
+				p[0]->aln = a[0].data(); p[1]->aln = a[1].data();
+                // Stock multiplies s_mm by ten; clamp only above all representable pair-score gaps.
+                cnt_chg += bwa_pe_pairing_same_contig(ref->bns, p, &v, popt,
+                                                     std::min(gopt->s_mm, INT_MAX/10), ii);
+				p[0]->aln = save[0]; p[1]->aln = save[1];
+				// the ends' new loci (pairing may move either): their hypotheses and gaps
+				for (int j = 0; j < 2; ++j) {
+					for (size_t x = 0; x < r[j]->occ.size(); ++x) {
+						const aln_meth_occ_t &o = r[j]->occ[x];
+						if (o.pos == p[j]->pos && o.strand == (int)p[j]->strand) {
+							r[j]->main = (int)x; r[j]->hyp = o.hyp;
+                            p[j]->n_mm=o.n_mm; p[j]->n_gapo=o.n_gapo; p[j]->n_gape=o.n_gape;
+                            p[j]->score=(int)o.cost;
+                            p[j]->ref_shift=(int)(o.alignment.re-o.alignment.rb)-(int)p[j]->len;
+							break;
+						}
+					}
+				}
+				xassert(!((p[0]->extra_flag & SAM_FPP) && r[0]->hyp != r[1]->hyp), "a proper pair's ends must share a hypothesis");
+			}
+		}
+
+	}
+	// mate rescue (bwa_paired_sw_core with the anchor's matrix; the rescued mate takes its hypothesis)
+	if (popt->is_sw && ii->avg >= 0.0) {
+		const int64_t l_pac = ref->bns->l_pac;
+		for (int i = 0; i < n; ++i) {
+			bwa_seq_t *p[2] = {seqs[0] + i, seqs[1] + i};
+			aln_meth_read_t *r[2] = {res[0] + i, res[1] + i};
+			if (r[0]->flags || r[1]->flags) continue;
+			if (!((p[0]->mapQ >= SW_MIN_MAPQ || p[1]->mapQ >= SW_MIN_MAPQ) && (p[0]->extra_flag & SAM_FPP) == 0)) continue;
+			int n_cigar[2] = {0, 0}, mapQ = 0, mq_adjust[2] = {255, 255};
+			int64_t beg[2], end[2];
+			bwa_cigar_t *cigar[2] = {0, 0};
+			uint32_t cnt[2];
+			const int is_singleton = (p[0]->type == BWA_TYPE_NO_MATCH || p[1]->type == BWA_TYPE_NO_MATCH) ? 1 : 0;
+			++n_tot[is_singleton];
+			if (popt->type != BWA_PET_STD) continue;
+			for (int k = 0; k < 2; ++k) {
+				bwa_seq_t *pref = p[1 - k], *pmate = p[k];
+				if (pref->type == BWA_TYPE_NO_MATCH) continue;
+				ubyte_t *seq;
+				if (pref->strand == 0) {
+					beg[k] = (int64_t)pref->pos + ii->avg - 3 * ii->std - pmate->len * 1.5;
+					end[k] = beg[k] + 6 * ii->std + 2 * pmate->len;
+					if (beg[k] < (int64_t)pref->pos + pref->len) beg[k] = pref->pos + pref->len;
+					if (end[k] > l_pac) end[k] = l_pac;
+					seq = pmate->rseq;
+				} else {
+					beg[k] = (int64_t)pref->pos + pref->len - ii->avg - 3 * ii->std - pmate->len * 0.5;
+					end[k] = beg[k] + 6 * ii->std + 2 * pmate->len;
+					if (beg[k] < 0) beg[k] = 0;
+					if (end[k] > (int64_t)pref->pos) end[k] = pref->pos;
+					seq = pmate->seq;
+					seq_reverse(pmate->len, seq, 0);
+				}
+                const int anchor_rid = bns_pos2rid(ref->bns, pref->pos);
+                cigar[k] = meth_sw_core(ref, mo, r[1-k]->hyp, anchor_rid, pmate->len, seq,
+                                        &beg[k], end[k], &n_cigar[k], &cnt[k]);
+				if (cigar[k] && pmate->type != BWA_TYPE_NO_MATCH) {
+					int64_t s_old, s_new; int clip = 0;
+					if (__cigar_op(cigar[k][0]) == 3) clip += __cigar_len(cigar[k][0]);
+					if (__cigar_op(cigar[k][n_cigar[k] - 1]) == 3) clip += __cigar_len(cigar[k][n_cigar[k] - 1]);
+					s_old = (int64_t)(((int64_t)pmate->n_mm * gopt->s_mm + (int64_t)pmate->n_gapo * gopt->s_gapo + (int64_t)pmate->n_gape * gopt->s_gape) / 3. * 8. + .499);
+					s_new = (int64_t)(((int64_t)(cnt[k] >> 16) * gopt->s_mm + (int64_t)(cnt[k] >> 8 & 0xff) * gopt->s_gapo + (int64_t)(cnt[k] & 0xff) * gopt->s_gape + (int64_t)clip * gopt->s_mm) / 3. * 8. + .499);
+					s_old += -4.343 * log(ii->ap_prior / l_pac);
+					s_new += (int)(-4.343 * log(.5 * erfc(M_SQRT1_2 * 1.5) + .499));
+					if (s_old < s_new) {
+						mq_adjust[k] = (int)std::min<int64_t>(255, s_new - s_old);
+						free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
+					} else mq_adjust[k] = (int)std::min<int64_t>(255, s_old - s_new);
+				}
+				if (pref->strand == 1) seq_reverse(pmate->len, seq, 0);
+			}
+			int k = -1;
+			if (cigar[0] && cigar[1]) {
+				k = p[0]->mapQ < p[1]->mapQ ? 0 : 1;
+				mapQ = abs(p[1]->mapQ - p[0]->mapQ);
+			} else if (cigar[0]) k = 0, mapQ = p[1]->mapQ;
+			else if (cigar[1]) k = 1, mapQ = p[0]->mapQ;
+			// an unmapped mate's pos is 0, which is not a placement: a rescue there still installs;
+			// so does one at the mate's own start on the other strand (the rescue takes the strand
+			// opposite the anchor's, so a mate on the anchor's strand is a different placement)
+			if (k >= 0 && (p[k]->type == BWA_TYPE_NO_MATCH || p[k]->pos != (bwtint_t)beg[k] ||
+						   p[k]->strand == p[1 - k]->strand)) {
+				++n_mapped[is_singleton];
+				int tmp = (int)p[1 - k]->mapQ - p[k]->mapQ / 2 - 8;
+				if (tmp <= 0) tmp = 1;
+				if (mapQ > tmp) mapQ = tmp;
+				p[k]->mapQ = p[1 - k]->mapQ = mapQ;
+				p[k]->seQ = p[1 - k]->seQ = p[1 - k]->seQ < mapQ ? p[1 - k]->seQ : mapQ;
+				if (p[k]->mapQ > mq_adjust[k]) p[k]->mapQ = mq_adjust[k];
+				if (p[k]->seQ > mq_adjust[k]) p[k]->seQ = mq_adjust[k];
+				free(p[k]->cigar); p[k]->cigar = cigar[k]; cigar[k] = 0;
+				p[k]->n_cigar = n_cigar[k];
+				p[k]->type = BWA_TYPE_MATESW;
+				p[k]->pos = beg[k];
+				p[k]->seQ = p[1 - k]->seQ;
+				p[k]->strand = 1 - p[1 - k]->strand;
+				p[k]->n_mm = cnt[k] >> 16; p[k]->n_gapo = cnt[k] >> 8 & 0xff; p[k]->n_gape = cnt[k] & 0xff;
+                    const int64_t cost=(int64_t)p[k]->n_mm*gopt->s_mm+(int64_t)p[k]->n_gapo*gopt->s_gapo+(int64_t)p[k]->n_gape*gopt->s_gape;
+                    if(cost>INT_MAX) { fprintf(stderr,"ERROR: --meth rescued cost exceeds record capacity\n"); exit(1); }
+                    p[k]->score=(int)cost;
+				p[k]->extra_flag |= SAM_FPP;
+				p[1 - k]->extra_flag |= SAM_FPP;
+				r[k]->hyp = r[1 - k]->hyp; // the rescued mate is on the anchor's genome strand
+			}
+			free(cigar[0]); free(cigar[1]);
+		}
+	}
+    for (int i = 0; i < n; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            bwa_seq_t *s = seqs[j] + i;
+            aln_meth_read_t *r = res[j] + i;
+            int lim = popt->n_multi;
+            if (!(s->extra_flag & SAM_FPP) && seqs[1-j][i].type != BWA_TYPE_NO_MATCH)
+                lim = (int64_t)s->c1 + s->c2 - 1 > popt->N_multi ? popt->n_multi : popt->N_multi;
+            if (s->type == BWA_TYPE_MATESW) {
+                seq_reverse(s->len, s->seq, 0);
+                int nm;
+                s->md = meth_cal_md(ref, mo, r->hyp, s->n_cigar, s->cigar, s->len, s->pos,
+                                    s->strand ? s->rseq : s->seq, &str, &nm);
+                if (nm > 4095) { fprintf(stderr, "ERROR: --meth rescued NM exceeds capacity\n"); exit(1); }
+                s->nm = nm;
+                std::vector<uint32_t> cigar;
+                for (int k = 0; k < s->n_cigar; ++k) {
+                    const int op = __cigar_op(s->cigar[k]);
+                    cigar.push_back((uint32_t)__cigar_len(s->cigar[k]) << 4 | (op == FROM_S ? 4 : op));
+                }
+                free(s->cigar);
+                s->cigar = legacy_cigar(cigar, &s->n_cigar, s->len, s->full_len, s->strand);
+                s->len = s->full_len;
+            } else meth_emit(ref, mo, lim, 1, s, r);
+        }
+    }
+	free(str.s);
+	return cnt_chg;
 }
 
 /* ---------------------------------------------------------------------------------------------

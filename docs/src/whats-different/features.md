@@ -6,6 +6,20 @@ bwa-mem2. None of these features change default behavior: output produced by
 corresponding bwa-mem2 output (except for the `@PG` `ID:` and `PN:` fields
 which now read `bwa-mem3`).
 
+## Short-read `aln` and opt-in methylation
+
+[`bwa-mem3 aln`](../cli/aln.md) fuses stock bwa's short-read backtracking,
+samse and sampe commands. Without `--meth`, its compatibility target is stock bwa
+0.7.19, not bwa-mem2. `aln --meth` adds directional converted-window discovery,
+fixed chemistry-aware reward refinement and stock chemistry-aware cost/strata/MAPQ
+accounting on stored CIGARs. All chemistries require both original and converted
+indices from `index --meth`. CpG-only refinement uses a full-band scalar fallback.
+The command page documents discovery/resource limits and incomplete confidence.
+
+The MEM methylation placement, performance and accuracy measurements in the
+following sections do not validate `aln --meth`. Its revised candidate-refinement
+path has synthetic correctness checks, not those empirical MEM results.
+
 ## `--meth` bisulfite alignment mode (PR #13)
 
 `--meth` adds native bisulfite/EM-seq alignment to `bwa-mem3 index` and
@@ -65,7 +79,7 @@ counts toward `NM`; `XM:Z` is unchanged. `cpg` requires `--meth=taps` or
 `--meth=5base` and a `--meth-scoring` other than `collapsed`. See
 [Flags → --meth-context](../methylation/flags.md#--meth-context-allcpg) and
 [Illumina 5-base → Choosing --meth-context cpg](../methylation/5base.md#choosing---meth-context-cpg)
-for the accuracy and run-time measurements.
+for the MEM accuracy and run-time measurements.
 
 ## `--meth-seed-prune` bisulfite seed prune
 
@@ -269,10 +283,11 @@ rounding boundaries). `--bam` and
 `--bam-level` are new; the long options `--max-xa-hits`, `--max-occ` and
 `--max-xa-hits-discordant` stand in for samse/sampe `-n`, sampe `-o` and sampe `-N`. Option values
 on which stock crashes or drops every read (for example a negative `-l` or `-B`) are refused.
-`--meth` (new, [PR #749](https://github.com/fg-labs/bwa-mem3/pull/749)) aligns single-end
-methylation reads on an `index --meth` index, with `XR:Z`, `XG:Z` and `XM:Z` tags; stock bwa has no
-methylation mode, so those records have no stock counterpart (paired-end reads and `--meth-context
-cpg` are refused for now). See [CLI Reference → aln](../cli/aln.md).
+`--meth` (new, [PR #749](https://github.com/fg-labs/bwa-mem3/pull/749); paired-end reads and
+`--meth-context cpg` in [PR #750](https://github.com/fg-labs/bwa-mem3/pull/750)) aligns single-end
+and paired-end methylation reads on an `index --meth` index, with `XR:Z`, `XG:Z` and `XM:Z` tags,
+and takes `--meth-context cpg`; stock bwa has no methylation mode, so those records have no stock
+counterpart. See [CLI Reference → aln](../cli/aln.md).
 
 ```bash
 bwa-mem3 aln -l 1024 -n 0.04 -o 2 -t 8 ref.fa reads.fq.gz > out.sam

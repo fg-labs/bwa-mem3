@@ -669,7 +669,7 @@ jobs:
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
-        run: brew install bwa autoconf automake libomp libdeflate ccache
+        run: brew install bwa autoconf automake libomp libdeflate ccache mawk
 
       - name: Install clang-19 (Linux)
         # The matrix builds with clang-19 by default (see the action for why and
@@ -1331,6 +1331,12 @@ jobs:
         env:
           BWA_ORACLE_REQUIRED: 1
         run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_parity.sh
+
+      - name: Check live methylation help gate controls
+        run: bash test/regression/aln_meth_help_sync_test.sh
+
+      - name: aln --meth shares mem's --meth vocabulary
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_meth_help_sync.sh
 
       - name: Run integration tests
         if: matrix.run_integration == true
@@ -3070,7 +3076,7 @@ jobs:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         # bwa for the chr22 fixture step, as in build-and-test's macOS row.
-        run: brew install bwa autoconf automake libomp libdeflate ccache
+        run: brew install bwa autoconf automake libomp libdeflate ccache mawk
 
       - name: Install clang-19 (Linux)
         if: runner.os == 'Linux' && matrix.cxx != 'g++'
