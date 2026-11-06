@@ -479,14 +479,14 @@ extern "C" int bam_writer_append_generic_aux(struct bam1_t *b,
      * SAM-text aux tokens and emit each as a packed BAM aux so the BAM and
      * SAM paths carry the same tags. */
     if (s->comment != NULL && s->comment[0] != '\0') {
-        if (append_sam_aux_tokens(b, s->comment, opt->meth_mode) < 0) return -1;
+        if (append_sam_aux_tokens(b, s->comment, opt->meth.meth_mode) < 0) return -1;
     }
 
     /* Reference annotation (-V / MEM_F_REF_HDR). Mirrors mem_aln2sam: emit
      * bns->anns[rid].anno as XR:Z, replacing TAB with SPACE. Suppressed
      * under --meth because that mode repurposes XR:Z for the Bismark
      * read-conversion direction (see docs/src/methylation/tags.md). */
-    if ((opt->flag & MEM_F_REF_HDR) && !opt->meth_mode && rid >= 0 &&
+    if ((opt->flag & MEM_F_REF_HDR) && !opt->meth.meth_mode && rid >= 0 &&
         bns != NULL && bns->anns[rid].anno != NULL &&
         bns->anns[rid].anno[0] != '\0') {
         const char *anno = bns->anns[rid].anno;

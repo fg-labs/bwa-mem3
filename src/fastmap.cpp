@@ -52,6 +52,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bam_writer.h"
 #include "meth_bam.h"
 #include "meth_opts.h"
+#include "meth_ref.h"
 #include "meth_xm.h"   /* meth_chem_t for --meth=emseq|taps|5base */
 #include "stage_prof.h"
 #include "seed_order.h"
@@ -929,7 +930,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
          *     matches the previous unmatched read's name, it is R2;
          *     otherwise it starts a new pair as R1.
          *   - SE: always R1. */
-        if (aux->opt->meth_mode) {
+        if (aux->opt->meth.meth_mode) {
             int is_pe    = (aux->opt->flag & MEM_F_PE) != 0;
             int is_smart = (aux->opt->flag & MEM_F_SMARTPE) != 0;
             int prev_is_r1 = 0;
@@ -1355,13 +1356,13 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
         long sp_wbytes = 0;
 
         /* L17: hoist the chunk-constant writer/mode selectors out of the
-         * per-record loop. opt->meth_mode and opt->flag never change within a
+         * per-record loop. opt->meth.meth_mode and opt->flag never change within a
          * chunk, and neither writer pointer is reassigned during output; the
          * loop body only calls bam_writer_write/free, which touch records, not
-         * these. Without this the compiler must reload aux->opt->meth_mode (a
+         * these. Without this the compiler must reload aux->opt->meth.meth_mode (a
          * two-level deref) and the g_meth_bam_writer global after every external
          * write call. Byte-identical (same control flow, same values). */
-        const int   out_meth_mode = aux->opt->meth_mode;
+        const int   out_meth_mode = aux->opt->meth.meth_mode;
         const int   out_flag_pe   = (aux->opt->flag & MEM_F_PE);
         meth_bam_writer_t *const out_meth_bw = g_meth_bam_writer;
         struct bam_writer_s *const out_bam_bw = aux->bam_writer;
@@ -1584,7 +1585,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
         aux->stream_output = 0;
 #else
         aux->stream_output = !so_off && p_nt > 1 && aux->bam_writer == NULL
-                             && !opt->meth_mode && !(opt->flag & MEM_F_SMARTPE);
+                             && !opt->meth.meth_mode && !(opt->flag & MEM_F_SMARTPE);
 #endif
         /* --bam: the last item only (stream_bam_last); earlier items' writes
          * already overlap the next item's compute. Level 0 only (the level,
@@ -1594,7 +1595,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
          * involuntary context switches). */
         aux->stream_bam_last = !so_off && p_nt > 1 && aux->bam_writer != NULL
                                && opt->bam_level == 0
-                               && !opt->meth_mode && !(opt->flag & MEM_F_SMARTPE);
+                               && !opt->meth.meth_mode && !(opt->flag & MEM_F_SMARTPE);
         (void) so_off;
         const char *ss_env = getenv("BWA_MEM3_STREAM_STATS");
         aux->stream_stats = ss_env && *ss_env && strcmp(ss_env, "0") != 0;
@@ -1617,7 +1618,7 @@ static int process(void *shared, gzFile gfp, gzFile gfp2, int pipe_threads)
     w.meth_orig_bns        = aux->meth_orig_bns;
     w.meth_orig_pac        = aux->meth_orig_pac;
     w.meth_orig_ref_string = aux->meth_orig_ref_string;
-    if (aux->opt->meth_mode && aux->meth_orig_ref_string != NULL)
+    if (aux->opt->meth.meth_mode && aux->meth_orig_ref_string != NULL)
         w.mmc.ref_string = aux->meth_orig_ref_string;
     w.nreads  = nreads;
     // w.memSize = nreads;
@@ -2009,55 +2010,14 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "Note: Please read the man page for detailed description of the command line and options.\n");
 }
 
-/* D3 (--meth) only: load the ORIGINAL reference's bns + pac (un-converted, real
- * chrom names) from `prefix` as resident handles for the future extension/scoring
- * phase, distinct from the seed FM-index. Mirrors indexEle::bwa_idx_load_ele's
- * disk path (bns_restore then slurp the full .pac into memory and close fp_pac).
- * On a bns_restore or pac-allocation failure, frees any partial allocation,
- * leaves the out-params NULL, and returns -1. (An I/O error or short read during
- * the .pac slurp itself is fatal — pac_slurp_and_close aborts the process,
- * matching the seed-index loader.)
- * `pread_workers` is the already-resolved worker count for the parallel .pac
- * slurp (as from index_load_threads); 1 reads serially. */
-static int meth_orig_ref_load_handles(const char *prefix,
-                                      bntseq_t **bns_out, uint8_t **pac_out,
-                                      int pread_workers)
-{
-    *bns_out = NULL;
-    *pac_out = NULL;
-    bntseq_t *bns = bns_restore(prefix);
-    if (bns == NULL) {
-        fprintf(stderr,
-                "ERROR: --meth could not load the original reference bns from "
-                "'%s.{amb,ann,pac}'\n", prefix);
-        return -1;
-    }
-    int64_t pac_bytes = bns->l_pac / 4 + 1;
-    uint8_t *pac = (uint8_t*) calloc(pac_bytes, 1);
-    if (pac == NULL) {
-        fprintf(stderr, "ERROR: --meth failed to allocate %lld bytes for the "
-                "original reference pac\n", (long long)pac_bytes);
-        bns_destroy(bns);
-        return -1;
-    }
-    /* bns_restore left .pac open in bns->fp_pac; slurp it whole (in parallel,
-     * same as the seed index) and close it. Shared with bwa_idx_load_ele. */
-    char pac_path[PATH_MAX];
-    bns_pac_path(pac_path, sizeof(pac_path), prefix);
-    pac_slurp_and_close(&bns->fp_pac, pac_path, pac, pac_bytes, pread_workers);
-
-    *bns_out = bns;
-    *pac_out = pac;
-    return 0;
-}
-
-/* Free the original-reference handles loaded by meth_orig_ref_load_handles and
+/* D3 (--meth) only: the ORIGINAL reference's bns + pac, loaded by the shared
+ * module (meth_ref.h) so `aln --meth` loads them the same way. */
+/* Free the original-reference handles loaded by meth_orig_ref_load and
  * NULL them. Idempotent (NULL-safe) so it can sit on every exit path the seed
  * index is freed on without double-free risk. */
 static void meth_orig_ref_free_handles(ktp_aux_t *aux)
 {
-    if (aux->meth_orig_pac != NULL) { free(aux->meth_orig_pac); aux->meth_orig_pac = NULL; }
-    if (aux->meth_orig_bns != NULL) { bns_destroy(aux->meth_orig_bns); aux->meth_orig_bns = NULL; }
+    meth_orig_ref_free(&aux->meth_orig_bns, &aux->meth_orig_pac);
     /* D3 (--meth): meth_orig_ref_string is NULL under pac-fetch (the only path
      * now — the original reference is unpacked from `.pac` on demand, never
      * materialized). This NULL-safe free is retained defensively; if it is ever
@@ -3241,7 +3201,7 @@ int main_mem(int argc, char *argv[])
      * so "byte-identical" is undefined under --meth, which also emits
      * meth-specific tags that no target models. Reject the combination rather
      * than silently half-suppress. */
-    if (opt->meth_mode && compat_on) {
+    if (opt->meth.meth_mode && compat_on) {
         fprintf(stderr, "[E::%s] --compat is not supported with --meth: "
                 "--compat reproduces %s output, which has no methylation mode\n",
                 __func__, opt->compat->name);
@@ -3448,7 +3408,7 @@ int main_mem(int argc, char *argv[])
          * confident (MAPQ>=1) mis-placement tail 3.8x on sim-wgs-place (3,626 ->
          * 13,921 vs uncapped); cap 20 + mate-concordant lands within +827 of that
          * floor (verified --fast) while keeping ~-20% aligner CPU. */
-        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth_mode ? 10 : 20;
+        if (!opt0.max_extend_chains) opt->max_extend_chains = opt->meth.meth_mode ? 10 : 20;
         opt->smem_dedup = 1;                             /* --smem-dedup (plain on/off) */
         opt->alnreg_sort_fast = 1;                       /* strict-total-order + pdqsort dedup sort
                                                           * (~35-55% faster for n>=9; diverges from
@@ -3483,7 +3443,7 @@ int main_mem(int argc, char *argv[])
          * insert bound so only genuine pair anchors are retained. */
         if (!opt0.mate_concordant_window)
             opt->mate_concordant_window = -1;
-        if (opt->meth_mode && !opt0.split_width)
+        if (opt->meth.meth_mode && !opt0.split_width)
             opt->split_width = 2;                        /* -s 2 (meth only): light Pass-2 reseed.
                                                           * -s 0 (no reseed) inflates MAPQ on bisulfite
                                                           * reads (interior-repeat competitors go unfound);
@@ -3531,7 +3491,7 @@ int main_mem(int argc, char *argv[])
      * spec30 seed pruning); runs before the scored defaults below read the
      * resolved scoring mode. */
     meth_opts_finalize(opt, &meth_cli);
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         /* Scored defaults live in mem_opt_apply_meth_defaults so they scale with
          * -A (bwameth's constants assume a==1) and can be unit-tested. */
         mem_opt_apply_meth_defaults(opt, &opt0);
@@ -3548,7 +3508,7 @@ int main_mem(int argc, char *argv[])
     /* The --meth defaults just applied scale -B (collapsed: 2 * -A, so -A 65
      * gives 130) and -U by -A as well, so check the effective scoring again
      * now that every score-derived default is final. */
-    if (opt->meth_mode && check_effective_scoring(opt) != 0) {
+    if (opt->meth.meth_mode && check_effective_scoring(opt) != 0) {
         free(opt);
         if (out_opened) fclose(aux.fp);
         return 1;
@@ -3565,7 +3525,7 @@ int main_mem(int argc, char *argv[])
      * which hides real variants at least as thoroughly as -B 0 does).
      * The message reports the EFFECTIVE penalty, like the other scoring checks.
      * The non-meth path keeps the literal comparison and is unaffected. */
-    if (opt->meth_mode && opt->b <= 0) {
+    if (opt->meth.meth_mode && opt->b <= 0) {
         fprintf(stderr, "ERROR: --meth requires a positive mismatch penalty, but the "
                         "effective penalty is %d; a non-positive penalty makes every "
                         "substitution free or rewarded, which collapses NM to zero "
@@ -3609,7 +3569,7 @@ int main_mem(int argc, char *argv[])
      * .hdr/.dict sidecar for @SQ M5/UR enrichment. NULL outside --meth. */
     const char *meth_orig_ref_prefix = NULL;
     const char *ref_prefix = argv[optind];
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         const char *suffix = ".meth";
         size_t slen = strlen(suffix);
         size_t alen = strlen(argv[optind]);
@@ -3671,7 +3631,7 @@ int main_mem(int argc, char *argv[])
          * --fast lever, so it is not on the audit line (which records only the
          * output-changing levers --fast turns on). --adaptive-band applies under
          * --meth as well, so it stays on both branches (unless opted out). */
-        if (opt->meth_mode)
+        if (opt->meth.meth_mode)
             fprintf(stderr, "[M::%s] --fast: -m %d -y %ld --min-ext-len %d --smem-dedup --max-extend-chains %d %s -s %d --extend-mate-concordant --extend-tie-frac %g --extend-tie-floor %d%s --rescue-kmer=%d%s alnreg-sort=fast\n",
                     __func__, opt->max_matesw, (long)opt->max_mem_intv, opt->min_ext_len, opt->max_extend_chains, adaptive_band_label, opt->split_width, opt->extend_tie_frac, opt->extend_tie_floor, opt->extend_csub ? " --extend-csub" : "", opt->rescue_kmer, opt->rescue_skip ? " --rescue-skip" : "");
         else
@@ -3748,7 +3708,7 @@ int main_mem(int argc, char *argv[])
      * index (the format changed; the user must re-run `index --meth`). It runs
      * after the input check above, so a missing input is reported before a
      * missing seed index, as it is before any other index error. */
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         char probe[PATH_MAX];
         snprintf(probe, sizeof(probe), "%s%s", ref_prefix, ".bwt.2bit.64");
         if (access(probe, F_OK) != 0) {
@@ -3789,7 +3749,7 @@ int main_mem(int argc, char *argv[])
      * from the host's hugetlb pool (the SA samples stay on the default
      * allocation), falling back to the default allocation when it cannot. See
      * bwa_hugepages.{h,cpp}, issue #402. */
-    aux.fmi->load_index(/*load_pac=*/!opt->meth_mode, /*n_threads=*/opt->n_threads,
+    aux.fmi->load_index(/*load_pac=*/!opt->meth.meth_mode, /*n_threads=*/opt->n_threads,
                         /*build_seed_jump=*/true,
                         want_huge_pages ? BWAMEM_HUGETLB_ON : BWAMEM_HUGETLB_OFF);
     aux.shm_base = aux.fmi->shm_attached_base();
@@ -3851,10 +3811,9 @@ int main_mem(int argc, char *argv[])
      * (real chrom names, N contigs) that extension will score against. No
      * consumer yet (extension is behind the meth-mode checkpoint below); this is
      * a load-only building block. Freed on every exit path the seed index is. */
-    if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
-        if (meth_orig_ref_load_handles(meth_orig_ref_prefix,
-                                       &aux.meth_orig_bns, &aux.meth_orig_pac,
-                                       index_load_threads(opt->n_threads)) != 0) {
+    if (opt->meth.meth_mode && meth_orig_ref_prefix != NULL) {
+        if (meth_orig_ref_load(meth_orig_ref_prefix, &aux.meth_orig_bns, &aux.meth_orig_pac,
+                               index_load_threads(opt->n_threads)) != 0) {
             delete aux.fmi;
             free(opt);
             if (out_opened) fclose(aux.fp);
@@ -3883,7 +3842,7 @@ int main_mem(int argc, char *argv[])
      * `.0123` (~6.4 GB on hg38). This is the only reference path: `index` no
      * longer builds `.0123` and `mem` never reads it (byte-identical to the
      * historical `.0123` load, verified on plain + --meth incl. batched rescue). */
-    if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
+    if (opt->meth.meth_mode && meth_orig_ref_prefix != NULL) {
         fprintf(stderr,
                 "[bwa-mem3:--meth] pac-fetch: original reference unpacked from "
                 ".pac on demand (.0123 not loaded).\n");
@@ -3892,7 +3851,7 @@ int main_mem(int argc, char *argv[])
     // reference bases are pac-fetched from .pac on demand; no .0123 is loaded
     tim = __rdtsc();
     uint64_t timer;
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         /* D3 --meth: the SEED `.0123` is dead weight (~13 GB on hg38). Every
          * downstream consumer reads the ORIGINAL unpacked reference via
          * mem_aln_ref_string()/mmc.ref_string (= meth_orig_ref_string, loaded
@@ -3931,7 +3890,7 @@ int main_mem(int argc, char *argv[])
      * (aux.meth_orig_bns) — mirror the clear there so --ignore-alt takes effect
      * in --meth. (Original genome indexes rarely carry ALT contigs, but keep the
      * two views consistent.) */
-    if (ignore_alt && opt->meth_mode && aux.meth_orig_bns != NULL)
+    if (ignore_alt && opt->meth.meth_mode && aux.meth_orig_bns != NULL)
         for (i = 0; i < aux.meth_orig_bns->n_seqs; ++i)
             aux.meth_orig_bns->anns[i].is_alt = 0;
 
@@ -4049,7 +4008,7 @@ int main_mem(int argc, char *argv[])
      * see the function's comment), but we do say so. Not reached under a
      * compat target: idx_hdr_lines is NULL there and @SQ is regenerated from
      * bns, AH included. */
-    if (idx_hdr_lines != NULL && !opt->meth_mode)
+    if (idx_hdr_lines != NULL && !opt->meth.meth_mode)
         bwa_warn_sidecar_missing_AH(aux.fmi->idx->bns, idx_hdr_lines, ref_prefix);
     /* --meth only: the original (pre-c2t) reference's .hdr/.dict sidecar, for
      * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open.
@@ -4081,7 +4040,7 @@ int main_mem(int argc, char *argv[])
      * (or read-only fs) doesn't fail before compute begins. */
     aux.bam_writer = NULL;
     g_meth_bam_writer = NULL;
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         /* D3 (PR-5): output is native original-alphabet. RNAME/POS/XM/XG all
          * derive from the ORIGINAL bns/pac (loaded into aux.meth_orig_bns/pac
          * by PR-1) and the per-alignment hypothesis — no f/r chrom map, no
@@ -4108,7 +4067,7 @@ int main_mem(int argc, char *argv[])
     (void)meth_orig_hdr_lines;
     (void)out_path;
 #else
-    if (opt->meth_mode) {
+    if (opt->meth.meth_mode) {
         /* D3 (PR-5): native original-alphabet output. The @SQ header is built
          * straight from the ORIGINAL (un-converted) bns (aux.meth_orig_bns),
          * and the per-record path consults the original pac (g_meth_orig_pac)
@@ -4399,8 +4358,8 @@ int main_mem(int argc, char *argv[])
         sp_finish(sp_wall() - sp_t0, 0.0, rss_mb);
     }
 
-    /* Close meth BAM writer BEFORE free(opt) — opt->meth_mode is checked here. */
-    int meth_mode_local = opt->meth_mode;
+    /* Close meth BAM writer BEFORE free(opt) — opt->meth.meth_mode is checked here. */
+    int meth_mode_local = opt->meth.meth_mode;
 
     // free memory
     int32_t nt = aux.opt->n_threads;

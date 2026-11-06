@@ -170,15 +170,15 @@ Methylation (--meth) options:
                  conversions are sparse, so collapsing costs specificity it
                  can't repay).
                  collapsed: C/T (and G/A) interchangeable, bwameth-compatible
-                 placement (sets -B 2).
+                 placement (mem: sets -B 2).
                  genomic: free only the conversion direction, scored as a full
                  match, keep variants as mismatches (variant-aware: variants
-                 outside the conversion direction counted in NM; -B 4).
+                 outside the conversion direction counted in NM; mem: -B 4).
                  neutral: free only the conversion direction but score it 0
                  (tolerated, not rewarded); best for TAPS (variant-aware:
-                 variants counted in NM as in genomic; -B 4). Not for
-                 em-seq: its dense conversions cost short reads their
-                 placement (a warning is printed).
+                 variants counted in NM as in genomic; mem: -B 4). Not
+                 for em-seq: its dense conversions cost short reads
+                 their placement (a warning is printed).
                  In genomic/neutral a real variant in the conversion direction
                  itself (C->T at a reference C) is indistinguishable from a
                  conversion and is not counted in NM; under --meth-context cpg
@@ -194,6 +194,8 @@ Methylation (--meth) options:
                  that recompute calls from the reference and the read.
                  Keep XM for Bismark-family tools (bismark_methylation_extractor)
                  and other callers that read the per-base calls from XM:Z.
+   --set-as-failed f|r
+                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --meth-seed-prune[=spec30|baseline|off]
                  prune the 3-letter alphabet's short, repetitive spurious SMEMs
                  before SA resolution: ~30% faster --meth at ~0 accuracy cost
@@ -204,8 +206,6 @@ Methylation (--meth) options:
                  off: restore the un-pruned seeding (byte-identical). NOT
                  byte-identical vs off. Env BWAMEM3_METH_SEED_PRUNE (off|spec30|
                  baseline) overrides this flag for A/B testing.
-   --set-as-failed f|r
-                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
    --chimera-qc
                  enable the bwameth.py-style longest-match <44% chimera heuristic
                  (sets 0x200, clears 0x2, caps MAPQ at 1). Off by default; not in Bismark.

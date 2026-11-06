@@ -184,7 +184,7 @@ int count_cigar_gaps(const std::vector<uint32_t> &cigar)
 mem_opt_t *meth_opt(int scoring)
 {
     mem_opt_t *o = mem_opt_init();
-    o->meth_scoring = scoring;
+    o->meth.meth_scoring = scoring;
     mem_opt_fill_meth_mat(o);
     return o;
 }

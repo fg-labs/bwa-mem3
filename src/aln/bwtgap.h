@@ -30,6 +30,28 @@ typedef struct { // recursion stack
 	bwtint_t k, l; // (k,l) is the SA region of [i,n-1]
 } gap_entry_t;
 
+/* The interleaved search's policies (bwtgap.cpp): AlnStock is the stock search; AlnMeth is
+ * `aln --meth` (aln_meth.h). The job functions, the stack helpers, gap_slots_run and the batch
+ * driver's group loop are templates over the policy; AlnStock's instantiation is the stock search
+ * exactly (test/tools/disasm_identity.sh, a manual pre-release check, compares its instructions
+ * with the build before the templates). AlnMeth's per-slot state lives in its ext_t, one per slot
+ * beside the slots, never in the stock structs, so their layouts do not change. */
+typedef struct {
+	gap_entry_t base;
+	uint64_t path; // the entry's gap events (aln_meth.h)
+} gap_entry_meth_t;
+struct aln_meth_slot_t; // aln_meth.h
+struct AlnStock {
+	typedef gap_entry_t entry_t;
+	typedef void ext_t;
+	static constexpr bool meth = false;
+};
+struct AlnMeth {
+	typedef gap_entry_meth_t entry_t;
+	typedef aln_meth_slot_t ext_t;
+	static constexpr bool meth = true;
+};
+
 typedef struct {
 	int n_entries, m_entries;
 	gap_entry_t *stack;
@@ -64,6 +86,20 @@ struct gap_chunk_s {
 };
 static_assert(sizeof(gap_chunk_t) <= GAP_CHUNK_BYTES, "a stack chunk must fit in GAP_CHUNK_BYTES");
 static_assert(GAP_CHUNK_ENTRIES == 511, "src/aln/README.md states 511 entries per chunk");
+/* A chunk of another entry type (AlnMeth's 40-byte entries): `prev` first, as in gap_chunk_t, and a
+ * capacity derived from what the pool allocates, sizeof(gap_chunk_t), so the pool and
+ * gap_release_cstack serve both and a chunk of either type fits the same allocation. */
+template <class E> constexpr int gap_chunk_entries() { return (int)((sizeof(gap_chunk_t) - sizeof(void*)) / sizeof(E)); }
+template <class E> struct gap_chunk_of {
+	gap_chunk_t *prev;
+	E e[gap_chunk_entries<E>()];
+};
+static_assert(gap_chunk_entries<gap_entry_t>() == GAP_CHUNK_ENTRIES, "the stock chunk's capacity");
+static_assert(sizeof(gap_entry_meth_t) == 40 && gap_chunk_entries<gap_entry_meth_t>() == 408,
+			  "src/aln/README.md states 408 entries per --meth chunk");
+// the pool allocates sizeof(gap_chunk_t) per chunk, whatever the entry type
+static_assert(sizeof(gap_chunk_of<gap_entry_meth_t>) <= sizeof(gap_chunk_t), "a --meth chunk must fit the pool's allocation");
+static_assert(sizeof(gap_chunk_of<gap_entry_t>) == sizeof(gap_chunk_t), "the stock chunk is gap_chunk_t");
 
 typedef struct {
 	gap_chunk_t *free_list;
@@ -73,7 +109,7 @@ typedef struct {
 	long n_alloc;
 } gap_pool_t;
 
-/* Free stack chunks a thread's pool keeps for reuse (GAP_CHUNK_BYTES each, so 4 MiB); chunks
+/* Free stack chunks a thread's pool keeps for reuse (sizeof(gap_chunk_t) each, about 4 MiB); chunks
  * given back beyond this are freed. A read's stack gives its chunks back as its buckets drain and
  * when it ends, so the memory held follows the entries in use; this bounds what an idle thread
  * keeps. Output does not depend on it. */
@@ -188,6 +224,9 @@ typedef struct {
 	gap_job_t job;
 	width_walk_t ww, sw;
 	int state, widths_done, seed_done;
+#ifdef ALN_DISASM_POSITIVE_CONTROL
+	int64_t positive_control_pad[2]; // test/tools/disasm_identity.sh's positive control: must fail the gate
+#endif
 } gap_slot_core_t;
 /* Steps the n slots (an array, so a step reads no pointer to reach its slot) in turn, starting with
  * the one after *pos (one width_walk_run of each unfinished walk, or one job step), until a slot's
