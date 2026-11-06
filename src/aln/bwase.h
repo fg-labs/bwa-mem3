@@ -4,7 +4,8 @@
  *
  * MODIFIED from the original: moved into namespace bwa_aln, SAM text goes to a
  * kstring_t instead of stdout, the .sai reading is dropped, and the BWT is a
- * parameter (bwa_cal_pac_pos no longer reloads it from disk). */
+ * parameter (bwa_cal_pac_pos no longer reloads it from disk). bwa_pos_from_sa is
+ * bwa_sa2pos's tail, split out so callers can batch the SA lookups. */
 #ifndef BWA_MEM3_ALN_BWASE_H
 #define BWA_MEM3_ALN_BWASE_H
 
@@ -23,9 +24,15 @@ void bwase_initialize(void);
 void bwa_aln2seq_core(int n_aln, const bwt_aln1_t *aln, bwa_seq_t *s, int set_main, int n_multi);
 void bwa_aln2seq(int n_aln, const bwt_aln1_t *aln, bwa_seq_t *s);
 int bwa_approx_mapQ(const bwa_seq_t *p, int mm);
+/* bwa_sa2pos and bwa_cal_pac_pos_core are upstream's functions, kept as upstream's API and as the
+ * unit tests' reference; the aligner itself batches the lookups (bwt_sa_batch + bwa_pos_from_sa). */
 bwtint_t bwa_sa2pos(const bntseq_t *bns, const bwt_t *bwt, bwtint_t sapos, int ref_len, int *strand);
+/* bwa_sa2pos after its SA lookup: pos_f = bwt_sa(bwt, sapos). bwa_sa2pos is bwt_sa then this. */
+bwtint_t bwa_pos_from_sa(const bntseq_t *bns, bwtint_t pos_f, int ref_len, int *strand);
 void bwa_cal_pac_pos_core(const bntseq_t *bns, const bwt_t *bwt, bwa_seq_t *seq, int max_mm, float fnr);
-/* bwa_cal_pac_pos_core for every read, then the extra hits' positions. */
+/* bwa_cal_pac_pos_core for every read, then the extra hits' positions; the SA lookups of
+ * all n_seqs reads are made in one bwt_sa_batch call (one row per mapped read and per
+ * extra hit). */
 void bwa_cal_pac_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, int max_mm, float fnr);
 /* `pacseq` is the 2-bit packed forward reference (l_pac/4 + 1 bytes). Reverses each
  * read's seq in place, as upstream does. */
