@@ -14,9 +14,11 @@ struct aln_opt_t {
 	int max_xa_hits;            // --max-xa-hits: stock samse -n / sampe -n (default 3)
 	pe_opt_t pe;                // stock sampe's options (n_multi is kept equal to max_xa_hits)
 	int batch_size;             // reads per batch (default 0x40000); a test hook, not a CLI option
+	int share_dup_search;       // identical reads of a batch share one search (default 1; the output
+	                            // is the same either way); a test hook, not a CLI option
 };
 
-/* Stock defaults: gap_init_opt(), max_xa_hits 3, batch_size 0x40000. */
+/* Stock defaults: gap_init_opt(), max_xa_hits 3, batch_size 0x40000, share_dup_search 1. */
 void aln_opt_init(aln_opt_t *o);
 
 /* Single-end run: reads fn_fq in batches and appends each batch's SAM records to `out`

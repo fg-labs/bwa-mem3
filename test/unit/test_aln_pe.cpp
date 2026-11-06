@@ -665,12 +665,13 @@ namespace {
 // Runs aln_run_pe (the shipped driver) with batches of batch_size pairs. Returns its exit code and
 // the SAM record lines (no header) in output order; *err (if given) gets what it printed on stderr.
 int run_pe_lines(int batch_size, const std::string &f1, const std::string &f2, const std::string &out_path,
-                 std::vector<std::string> *lines, std::string *err = nullptr)
+                 std::vector<std::string> *lines, std::string *err = nullptr, int share_dup_search = 1)
 {
     PeIndex &ix = index_fixture();
     ba::aln_opt_t o;
     ba::aln_opt_init(&o);
     o.batch_size = batch_size;
+    o.share_dup_search = share_dup_search;
     ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
     REQUIRE(out != nullptr);
     const std::string err_path = out_path + ".err";
@@ -799,6 +800,41 @@ TEST_CASE("aln_pe: aln_run_pe carries the insert-size estimate into a batch too 
         CHECK(a[9] == r1[i]);
         CHECK(b[9] == ix.contig.substr(pos + frag - 36, 36)); // reverse strand: SEQ is the reference strand
     }
+}
+
+TEST_CASE("aln_pe: duplicated pairs give the same records whether or not they share a search"
+          * doctest::test_suite("unit/aln_pe")) {
+    // 200 pairs: R1 is mostly copies of a few reads, R2 has no two alike (as when one mate is
+    // more error-prone), in one batch and in batches of 7 (each file keeps its own duplicate check).
+    PeIndex &ix = index_fixture();
+    std::vector<std::string> r1, r2;
+    well_placed(ix.contig, 200, 36, 100, &r1, &r2);
+    for (size_t i = 0; i < r1.size(); ++i)
+        if (i % 4 != 0) r1[i] = r1[(i * 7) % 12];
+    const std::string f1 = write_fastq(ix.dir + "/dupl1.fq", r1), f2 = write_fastq(ix.dir + "/dupl2.fq", r2);
+    const int verbose = bwa_verbose;
+    bwa_verbose = 4; // the driver then reports how many reads of each file shared a search
+    for (int bs : {0x40000, 7}) {
+        INFO("batch size " << bs);
+        std::vector<std::string> on, off;
+        std::string err_on, err_off;
+        REQUIRE(run_pe_lines(bs, f1, f2, ix.dir + "/dupl_on.sam", &on, &err_on, 1) == 0);
+        REQUIRE(run_pe_lines(bs, f1, f2, ix.dir + "/dupl_off.sam", &off, &err_off, 0) == 0);
+        REQUIRE(on.size() == 400);
+        CHECK(on == off);
+        // not vacuous: R1's copies shared a search with the switch on, and nothing did with it off
+        auto shared = [](const std::string &err) {
+            long n = 0;
+            const std::string tag = "[M::aln] read 1: ";
+            for (size_t at = err.find(tag); at != std::string::npos; at = err.find(tag, at + 1))
+                n += std::atol(err.c_str() + at + tag.size());
+            return n;
+        };
+        if (bs > 400) CHECK(shared(err_on) > 100); // batches of 7 hold few copies of each other
+        CHECK(shared(err_off) == 0);
+        CHECK(err_off.find("shared an identical read's search") != std::string::npos);
+    }
+    bwa_verbose = verbose;
 }
 
 namespace {

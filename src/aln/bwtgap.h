@@ -8,7 +8,8 @@
  * bwtaln.c (gap_init_opt, bwa_cal_maxdiff, bwt_cal_width) are added together with
  * aln_search_batch, aln_batch_max_gapo, the gap_job_t interleaved search and its chunked
  * stack (gap_cstack_t, gap_pool_t), the width walks, gap_slots_run and the search threads' read
- * counter (read_claim_t, ALN_CLAIM_CHUNK), which are new. */
+ * counter (read_claim_t, ALN_CLAIM_CHUNK) and the duplicate-read handling (aln_dup_state_t,
+ * ALN_DUP_*, detail::find_dup_reads and the detail::dup_sample_* checks), which are new. */
 #ifndef BWA_MEM3_ALN_BWTGAP_H
 #define BWA_MEM3_ALN_BWTGAP_H
 
@@ -200,12 +201,66 @@ int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt);
  * length when opt->fnr > 0, else opt->max_diff). Computed once per batch, never per read. */
 int aln_batch_max_gapo(int n_seqs, const bwa_seq_t *seqs, const gap_opt_t *opt);
 
+/* The duplicate check's state for one input stream (one per run for single-end, one per mate for
+ * paired-end), owned by the caller: after a batch with fewer than one duplicate in
+ * ALN_DUP_MIN_RATIO reads, the stream's next ALN_DUP_RECHECK - 1 batches skip the check. A
+ * stream's batches are alike, which two mates' batches need not be. */
+struct aln_dup_state_t {
+	int skip_left = 0; // batches left before the next duplicate check
+};
+
 /* Searches every read of the batch on n_threads threads (each claims chunks of consecutive reads
- * from a shared counter, read_claim_t; the hits do not depend on the thread count).
+ * from a shared counter, read_claim_t; the hits do not depend on the thread count). When `dup` is
+ * not null and the batch has duplicates (detail::dup_sample_check), a read identical to an
+ * earlier read of the batch (detail::find_dup_reads) is not searched: it gets its own copy of
+ * that read's aln, which is what its search would return. With `dup` null every read is searched.
+ * Returns the number of reads given a copy instead of a search (0 when every read was searched).
  * On return each seqs[i] has aln/n_aln set and sa = 0, type = BWA_TYPE_NO_MATCH,
  * c1 = c2 = 0. name, seq, rseq and qual are left intact (stock bwa frees them and
  * complements seq in place; here the search complements a per-thread copy). */
-void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads);
+int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads,
+					 aln_dup_state_t *dup = nullptr);
+
+/* A batch with fewer than one duplicate in ALN_DUP_MIN_RATIO reads is searched read by read, and
+ * the stream's next ALN_DUP_RECHECK - 1 batches skip the check (aln_dup_state_t). The check
+ * samples about 1 read in 2^ALN_DUP_SAMPLE_SHIFT; a batch under ALN_DUP_SAMPLE_MIN reads gets the
+ * full pass instead. */
+constexpr int ALN_DUP_MIN_RATIO = 200;
+constexpr int ALN_DUP_RECHECK = 8;
+constexpr int ALN_DUP_SAMPLE_SHIFT = 5;
+constexpr int ALN_DUP_SAMPLE_MIN = 8192;
+
+/* Internal to aln_search_batch; declared here for the unit tests. */
+namespace detail {
+
+/* Sets rep[i] (rep has n_seqs entries) to the index of the first read in the batch with read i's
+ * length and bases, so rep[i] == i for the first copy. Returns the number of reads with
+ * rep[i] != i. Duplicates are found within one batch only. The fingerprints are computed on up to
+ * n_threads threads (kt_for_nt), the table pass on the calling thread; the result does not depend
+ * on n_threads. */
+int find_dup_reads(int n_seqs, const bwa_seq_t *seqs, int *rep, int n_threads);
+
+/* Whether read p is in the key sample (a key of its length and three 8-base words, so every copy
+ * of a read is in or out together; about 1 read in 2^ALN_DUP_SAMPLE_SHIFT). */
+bool dup_key_sampled(const bwa_seq_t *p);
+
+/* The key sample's verdict: 1 if the reads in the key sample have at least one duplicate per
+ * ALN_DUP_MIN_RATIO sampled reads, or if that sample is far from its expected size (few distinct
+ * keys, so it cannot speak for the batch); else 0. It catches duplicates of any multiplicity
+ * whose key is sampled. */
+int dup_sample_by_key(int n_seqs, const bwa_seq_t *seqs);
+
+/* The position sample's verdict: 1 if every 2^ALN_DUP_SAMPLE_SHIFT-th read (or a wider stride, to
+ * cap the sample) has at least one duplicate per ALN_DUP_MIN_RATIO sampled reads. It catches a
+ * read with many copies whatever its key, which the key sample misses when that key is not
+ * sampled. */
+int dup_sample_by_position(int n_seqs, const bwa_seq_t *seqs);
+
+/* Whether a batch is worth the full duplicate pass: 1 if it is smaller than ALN_DUP_SAMPLE_MIN, or
+ * if either sample (dup_sample_by_key, dup_sample_by_position) says so. */
+int dup_sample_check(int n_seqs, const bwa_seq_t *seqs);
+
+} // namespace detail
 
 /* Reads a search thread claims at a time from read_claim_t. A read's hits do not depend on which
  * thread searches it; the chunk size only trades the counter's traffic against the imbalance at
@@ -216,8 +271,9 @@ constexpr int ALN_CLAIM_CHUNK = 64;
  * bwtaln.cpp). claim() returns the first read of the next ALN_CLAIM_CHUNK reads (fewer at the
  * end) and sets *end one past the last, or returns -1 once [0, n_seqs) is used up. The chunks of
  * concurrent claims are disjoint and cover [0, n_seqs). Aligned to its own cache line (128 bytes
- * covers Apple arm64): the threads write it, and in aln_search_batch's frame it would otherwise
- * share a line with the options every search step reads. Exported for the unit tests. */
+ * covers Apple arm64): the threads write it, and on the stack (search_reads' frame in bwtaln.cpp,
+ * next to its caller's batch options) it would otherwise share a line with the options every
+ * search step reads. Exported for the unit tests. */
 struct alignas(128) read_claim_t {
 	explicit read_claim_t(int n_seqs) : n_seqs_(n_seqs) {}
 	int claim(int *end);

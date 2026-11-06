@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
+#include <map>
 #include <memory>
 #include <string>
 #include <thread>
@@ -1138,6 +1140,336 @@ TEST_CASE("aln_search: read_claim_t chunks cover the batch once under concurrent
         }
         CHECK(k == (n + ba::ALN_CLAIM_CHUNK - 1) / ba::ALN_CLAIM_CHUNK);
     }
+}
+
+// Reads for the duplicate tests: exact repeats of reads with and without hits, reads that share
+// their length and 16 bases at each end but differ in the middle, reads that are a prefix of
+// another, short reads (under 8 bases), and N or IUPAC runs (both code 4, so "NNNN" and "RYKM" are
+// the same read to the search).
+std::vector<std::string> dup_test_reads(int n, uint32_t seed)
+{
+    const std::string &s1 = c1();
+    uint32_t x = seed;
+    auto rnd = [&x](uint32_t m) { x = x * 1103515245u + 12345u; return (x >> 16) % m; };
+    std::vector<std::string> distinct;
+    for (int i = 0; i < 40; ++i) {
+        int len = 1 + (int)rnd(60);
+        std::string r = s1.substr(rnd((uint32_t)(s1.size() - len)), len);
+        if (i % 3 == 1) r[rnd(len)] = r[0] == 'A' ? 'C' : 'A';
+        distinct.push_back(r);
+    }
+    { std::string a = s1.substr(200, 50), b = a; b[25] = b[25] == 'G' ? 'T' : 'G'; distinct.push_back(a); distinct.push_back(b); }
+    { std::string a = s1.substr(320, 33), b = a; b[16] = b[16] == 'G' ? 'T' : 'G'; distinct.push_back(a); distinct.push_back(b); }
+    distinct.push_back(s1.substr(80, 40));
+    distinct.push_back(s1.substr(80, 41)); // the previous read plus one base
+    distinct.push_back(std::string(30, 'N'));
+    distinct.push_back("RYKMSWRYKMSWRYKMSWRYKMSWRYKMSW"); // all code 4, the same read as 30 N
+    distinct.push_back(std::string(30, 'A'));
+    // one length, the same 16 bases at each end, different middles: told apart only by the middle
+    for (int m = 0; m < 6; ++m) {
+        std::string r = s1.substr(100, 16) + s1.substr(150 + 7 * m, 18) + s1.substr(300, 16);
+        distinct.push_back(r);
+    }
+    std::vector<std::string> reads;
+    for (int i = 0; i < n; ++i) reads.push_back(distinct[rnd((uint32_t)distinct.size())]);
+    return reads;
+}
+
+// The bases of every read of a batch as the search sees them (codes, so N and IUPAC codes are one),
+// keyed with the length.
+std::string read_key(const ba::bwa_seq_t &p) { return std::string((const char*)p.seq, p.len); }
+
+TEST_CASE("aln_search: find_dup_reads points each read at the first read with its length and bases"
+          * doctest::test_suite("unit/aln_search")) {
+    // n = 17000 computes the fingerprints on the thread pool at -t 16; n = 5000 is every copy of
+    // one read, which takes one slot however many copies there are
+    struct Run { int n; int nt; };
+    const Run runs[] = {{0, 1}, {1, 4}, {2, 1}, {3, 16}, {17, 4}, {500, 1}, {500, 16},
+                        {3000, 1}, {3000, 4}, {3000, 16}, {5000, 1}, {5000, 16}, {17000, 16}};
+    for (const Run &run : runs) {
+        const int n = run.n, nt = run.nt;
+        INFO("batch of " << n << ", " << nt << " threads");
+        auto reads = dup_test_reads(n, 99 + n);
+        if (n == 5000) reads.assign(n, c1().substr(10, 45));
+        std::vector<int> rep(n, -2); // an entry left unwritten fails the check below
+        std::vector<int> first(n);
+        int n_dups = 0, expected_dups = 0;
+        {
+            Batch b(reads);
+            n_dups = ba::detail::find_dup_reads(b.n, b.seqs, rep.data(), nt);
+            std::map<std::string, int> seen; // independent of the fingerprint and the table
+            for (int i = 0; i < n; ++i) {
+                auto it = seen.emplace(read_key(b.seqs[i]), i).first;
+                first[i] = it->second;
+                expected_dups += first[i] != i;
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            INFO("read " << i << " (" << reads[i] << ")");
+            CHECK(rep[i] == first[i]);
+        }
+        CHECK(n_dups == expected_dups);
+        if (n >= 500) CHECK(n_dups > n / 2); // not vacuous
+    }
+}
+
+namespace {
+
+// Every field of a read, its name/seq/qual bytes included, except the aln pointer itself (the
+// hits are compared by value).
+void check_same_read(const ba::bwa_seq_t &a, const ba::bwa_seq_t &b)
+{
+    CHECK(std::string(a.name) == std::string(b.name));
+    CHECK((int)a.len == (int)b.len);
+    CHECK(std::string((const char*)a.seq, a.len) == std::string((const char*)b.seq, b.len));
+    CHECK(std::string((const char*)a.rseq, a.len) == std::string((const char*)b.rseq, b.len));
+    CHECK(std::string((const char*)a.qual, a.len) == std::string((const char*)b.qual, b.len));
+    CHECK((int)a.strand == (int)b.strand);
+    CHECK((int)a.type == (int)b.type);
+    CHECK((int)a.extra_flag == (int)b.extra_flag);
+    CHECK((int)a.n_mm == (int)b.n_mm);
+    CHECK((int)a.n_gapo == (int)b.n_gapo);
+    CHECK((int)a.n_gape == (int)b.n_gape);
+    CHECK((int)a.mapQ == (int)b.mapQ);
+    CHECK(a.score == b.score);
+    CHECK(a.clip_len == b.clip_len);
+    CHECK(a.n_multi == b.n_multi);
+    CHECK(a.sa == b.sa);
+    CHECK(a.pos == b.pos);
+    CHECK((uint64_t)a.c1 == (uint64_t)b.c1);
+    CHECK((uint64_t)a.c2 == (uint64_t)b.c2);
+    CHECK((int)a.seQ == (int)b.seQ);
+    CHECK(a.ref_shift == b.ref_shift);
+    CHECK(a.n_cigar == b.n_cigar);
+    CHECK(a.tid == b.tid);
+    CHECK(std::string(a.bc) == std::string(b.bc));
+    CHECK((int)a.full_len == (int)b.full_len);
+    CHECK((int)a.nm == (int)b.nm);
+    REQUIRE(a.n_aln == b.n_aln);
+    for (int k = 0; k < a.n_aln; ++k) CHECK(same_aln(a.aln[k], b.aln[k]));
+}
+
+} // namespace
+
+// Duplicated reads are searched once, as a compacted batch of the distinct reads; every read
+// still gets bwt_match_gap's hits, in an aln array of its own, and is back at its index with every
+// field as a read-by-read search leaves it.
+TEST_CASE("aln_search: aln_search_batch gives duplicated reads bwt_match_gap's hits in their own arrays"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    auto reads = dup_test_reads(300, 7);
+    long compared = 0, with_hits = 0, dups = 0;
+    for (int nt : {1, 3, 16}) {
+        for (int md : {0, 2}) {
+            ba::gap_opt_t opt = make_opt(md, 1);
+            Batch plain(reads), b(reads);
+            for (int i = 0; i < b.n; ++i) {
+                for (ba::bwa_seq_t *p : {plain.seqs + i, b.seqs + i}) {
+                    p->n_aln = -1; p->c1 = 7; p->c2 = 7; p->sa = 7; p->type = BWA_TYPE_UNIQUE;
+                }
+            }
+            std::vector<ba::bwa_seq_t> before(b.seqs, b.seqs + b.n); // the pointers each read owns
+            CHECK(ba::aln_search_batch(ix.bwt, plain.n, plain.seqs, &opt, nt) == 0);
+            ba::aln_dup_state_t st;
+            const int skipped = ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, nt, &st);
+            const int cap = ba::aln_batch_max_gapo(b.n, b.seqs, &opt);
+            std::vector<int> rep(b.n);
+            CHECK(skipped == ba::detail::find_dup_reads(b.n, b.seqs, rep.data(), nt));
+            CHECK(skipped > b.n / 2); // the duplicates were not searched
+            CHECK(st.skip_left == 0);  // a batch with duplicates leaves the check on
+            for (int i = 0; i < b.n; ++i) {
+                INFO("-t " << nt << ", -n " << md << ", read " << i << " (" << reads[i] << ")");
+                GapResult ref, job;
+                both_loops(ix.bwt, to_codes(reads[i]), opt, ref, job, cap);
+                REQUIRE(b.seqs[i].n_aln == (int)ref.aln.size());
+                for (int k = 0; k < b.seqs[i].n_aln; ++k) CHECK(same_aln(ref.aln[k], b.seqs[i].aln[k]));
+                check_same_read(b.seqs[i], plain.seqs[i]);
+                // the entry that went back to index i is read i's own
+                CHECK(b.seqs[i].name == before[i].name);
+                CHECK(b.seqs[i].seq == before[i].seq);
+                CHECK(b.seqs[i].rseq == before[i].rseq);
+                CHECK(b.seqs[i].qual == before[i].qual);
+                CHECK(b.seqs[i].aln != nullptr);
+                if (rep[i] != i) {
+                    CHECK(b.seqs[i].aln != b.seqs[rep[i]].aln);
+                    ++dups;
+                }
+                ++compared;
+                with_hits += !ref.aln.empty();
+            }
+        }
+    }
+    CHECK(compared == 6L * 300);
+    CHECK(dups > compared / 2);
+    CHECK(with_hits > compared / 4);
+}
+
+// A batch with too few duplicates turns the check off for its stream's next ALN_DUP_RECHECK - 1
+// batches, which are searched read by read (aln_search_batch returns 0) and still get the same
+// hits; the batch after them is checked again. Each stream has its own state: two streams in
+// turn (paired-end's two files) do not turn each other's check off.
+TEST_CASE("aln_search: batches that skip the duplicate check give the same hits"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    ba::gap_opt_t opt = make_opt(2, 1);
+    std::vector<std::string> distinct;
+    for (int i = 0; i < 40; ++i) distinct.push_back(c1().substr(20 + 13 * i, 30));
+    auto dup = dup_test_reads(3000, 5);
+    std::vector<std::vector<ba::bwt_aln1_t>> ref(dup.size());
+    {
+        Batch b(dup);
+        CHECK(ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, 16) == 0);
+        for (int i = 0; i < b.n; ++i) ref[i].assign(b.seqs[i].aln, b.seqs[i].aln + b.seqs[i].n_aln);
+    }
+    auto check_ref = [&](const Batch &b) {
+        for (int i = 0; i < b.n; ++i) {
+            REQUIRE(b.seqs[i].n_aln == (int)ref[i].size());
+            for (int j = 0; j < b.seqs[i].n_aln; ++j) CHECK(same_aln(ref[i][j], b.seqs[i].aln[j]));
+        }
+    };
+    ba::aln_dup_state_t st;
+    {
+        Batch b(distinct);
+        CHECK(ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, 4, &st) == 0);
+        CHECK(st.skip_left == ba::ALN_DUP_RECHECK - 1);
+    }
+    for (int k = 1; k <= ba::ALN_DUP_RECHECK; ++k) {
+        Batch b(dup);
+        const int skipped = ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, 16, &st);
+        INFO("batch " << k << " after the batch without duplicates");
+        if (k < ba::ALN_DUP_RECHECK) CHECK(skipped == 0); // every read searched
+        else CHECK(skipped > b.n / 2);                    // checked again
+        check_ref(b);
+    }
+    // two streams in turn, as paired-end searches R1 then R2: the stream without duplicates turns
+    // only its own check off, every batch of the other stream is still deduplicated
+    ba::aln_dup_state_t r1, r2;
+    for (int k = 0; k < 2 * ba::ALN_DUP_RECHECK + 1; ++k) {
+        INFO("batch pair " << k);
+        { Batch b(distinct); CHECK(ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, 4, &r1) == 0); }
+        Batch b(dup);
+        CHECK(ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, 4, &r2) > b.n / 2);
+        check_ref(b);
+    }
+}
+
+std::vector<std::string> sample_test_reads(int n, int dup_per_mille, uint32_t seed);
+
+// Batches of at least ALN_DUP_SAMPLE_MIN reads go through the samples: one without duplicates is
+// searched read by read and turns the check off, one with duplicates gets the full pass, and its
+// reads get the hits a read-by-read search gives them.
+TEST_CASE("aln_search: a sampled batch with duplicates gives every read the read-by-read hits"
+          * doctest::test_suite("unit/aln_search")) {
+    SearchIndex &ix = index_fixture();
+    ba::gap_opt_t opt = make_opt(2, 1);
+    const int n = ba::ALN_DUP_SAMPLE_MIN;
+    {
+        ba::aln_dup_state_t st;
+        Batch b(sample_test_reads(n, 0, 11));
+        CHECK(ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, 16, &st) == 0);
+        CHECK(st.skip_left == ba::ALN_DUP_RECHECK - 1); // the sample said no
+    }
+    // copies of reads from the reference (with hits) and random reads (none), 40% duplicates
+    std::vector<std::string> reads = sample_test_reads(n, 400, 12);
+    for (int i = 0; i < n; i += 3) reads[i] = c1().substr(i % 400, 36);
+    Batch plain(reads);
+    REQUIRE(ba::aln_search_batch(ix.bwt, plain.n, plain.seqs, &opt, 16) == 0);
+    for (int nt : {1, 16}) {
+        INFO("-t " << nt);
+        ba::aln_dup_state_t st;
+        Batch b(reads);
+        CHECK(ba::aln_search_batch(ix.bwt, b.n, b.seqs, &opt, nt, &st) > n / 4);
+        long with_hits = 0;
+        for (int i = 0; i < n; ++i) {
+            REQUIRE(b.seqs[i].n_aln == plain.seqs[i].n_aln);
+            for (int k = 0; k < b.seqs[i].n_aln; ++k) CHECK(same_aln(b.seqs[i].aln[k], plain.seqs[i].aln[k]));
+            with_hits += b.seqs[i].n_aln > 0;
+        }
+        CHECK(with_hits > n / 4);
+    }
+}
+
+// Random reads (no two alike) with copies of earlier reads mixed in at a given rate.
+std::vector<std::string> sample_test_reads(int n, int dup_per_mille, uint32_t seed)
+{
+    std::mt19937 gen(seed);
+    auto rnd = [&gen](uint32_t m) { return (uint32_t)(gen() % m); };
+    std::vector<std::string> reads;
+    reads.reserve(n);
+    for (int i = 0; i < n; ++i) {
+        if (i > 0 && (int)rnd(1000) < dup_per_mille) { reads.push_back(reads[rnd((uint32_t)i)]); continue; }
+        std::string r(30 + rnd(70), 'A');
+        for (char &c : r) c = "ACGT"[rnd(4)];
+        reads.push_back(r);
+    }
+    return reads;
+}
+
+namespace {
+
+// A read of c1 at some offset whose key is (or is not) sampled.
+std::string read_keyed(bool sampled, int len)
+{
+    for (int off = 0; off + len <= (int)c1().size(); ++off) {
+        Batch b({c1().substr(off, len)});
+        if (ba::detail::dup_key_sampled(b.seqs) == sampled) return c1().substr(off, len);
+    }
+    FAIL("no read of c1 with the wanted key");
+    return "";
+}
+
+} // namespace
+
+TEST_CASE("aln_search: the duplicate samples run the full pass only when the batch has duplicates"
+          * doctest::test_suite("unit/aln_search")) {
+    const int n = 2 * ba::ALN_DUP_SAMPLE_MIN;
+    { Batch b(sample_test_reads(n, 0, 1)); CHECK(ba::detail::dup_sample_check(b.n, b.seqs) == 0); }
+    { Batch b(sample_test_reads(n, 1, 2)); CHECK(ba::detail::dup_sample_check(b.n, b.seqs) == 0); }   // 0.1%
+    { Batch b(sample_test_reads(n, 50, 3)); CHECK(ba::detail::dup_sample_check(b.n, b.seqs) == 1); }  // 5%
+    { Batch b(sample_test_reads(n, 400, 4)); CHECK(ba::detail::dup_sample_check(b.n, b.seqs) == 1); } // 40%
+    // too small to sample: the full pass decides
+    { Batch b(sample_test_reads(ba::ALN_DUP_SAMPLE_MIN - 1, 0, 5)); CHECK(ba::detail::dup_sample_check(b.n, b.seqs) == 1); }
+    // reads that share their key words but differ between them, none alike: one key, so the key
+    // sample is all or none and cannot decide
+    {
+        auto reads = sample_test_reads(n, 0, 6);
+        for (auto &r : reads) { r.resize(40, 'C'); r.replace(0, 8, "ACGTACGT"); r.replace(16, 8, "TTGGCCAA"); r.replace(32, 8, "GATTACAG"); }
+        Batch b(reads);
+        CHECK(ba::detail::dup_sample_by_key(b.n, b.seqs) == 1);
+    }
+}
+
+TEST_CASE("aln_search: the key sample cannot decide when it is empty or over-full"
+          * doctest::test_suite("unit/aln_search")) {
+    // every copy of one read whose key is not sampled: an empty sample
+    {
+        Batch b(std::vector<std::string>(2 * ba::ALN_DUP_SAMPLE_MIN, read_keyed(false, 45)));
+        CHECK(ba::detail::dup_sample_by_key(b.n, b.seqs) == 1);
+    }
+    // every copy of one read whose key is sampled, more copies than the sample's buffer holds:
+    // the sample stops at its cap (an index past the buffer would overrun it)
+    {
+        Batch b(std::vector<std::string>(40000, read_keyed(true, 45)));
+        REQUIRE(ba::detail::dup_key_sampled(b.seqs));
+        CHECK(ba::detail::dup_sample_by_key(b.n, b.seqs) == 1);
+    }
+}
+
+TEST_CASE("aln_search: the position sample catches a read with many copies whose key is not sampled"
+          * doctest::test_suite("unit/aln_search")) {
+    const int n = 2 * ba::ALN_DUP_SAMPLE_MIN;
+    auto reads = sample_test_reads(n, 0, 7);
+    const std::string hot = read_keyed(false, 45);
+    std::mt19937 gen(8);
+    for (int i = 0; i < n; ++i)
+        if (gen() % 10 < 3) reads[i] = hot; // 30% of the batch, not in the key sample
+    Batch b(reads);
+    CHECK(ba::detail::dup_sample_by_key(b.n, b.seqs) == 0);
+    CHECK(ba::detail::dup_sample_by_position(b.n, b.seqs) == 1);
+    CHECK(ba::detail::dup_sample_check(b.n, b.seqs) == 1);
+    // without the copies, neither sample has duplicates
+    Batch none(sample_test_reads(n, 0, 7));
+    CHECK(ba::detail::dup_sample_by_position(none.n, none.seqs) == 0);
 }
 
 // The resumable width walk (width_walk_init/width_walk_run, which the driver interleaves) must
