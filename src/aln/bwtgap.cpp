@@ -21,6 +21,7 @@
  * integer overflow (gap_score_cut for the job's precomputed stop score). */
 #include "bwtgap.h"
 #include "aln_alloc.h"
+#include "aln_meth_search.h"
 #include "../utils.h"
 
 #include <limits.h>
@@ -36,9 +37,7 @@ namespace bwa_aln {
 
 #define aln_score(m,o,e,p) ((int64_t)(m)*(p)->s_mm + (int64_t)(o)*(p)->s_gapo + (int64_t)(e)*(p)->s_gape)
 
-// info packs score into its upper 11 bits. Only actual scores must fit: a large
-// optimistic bound alone must not reject otherwise representable searches.
-static const int GAP_SCORE_LIMIT = 1 << 11;
+// GAP_SCORE_LIMIT (bwtgap.h) bounds the score packed in info's upper 11 bits.
 static const int GAP_LEN_LIMIT = 0xffff; // info's low 16 bits hold the remaining read length
 
 static int gap_stack_bound(int max_mm, int max_gapo, int max_gape, const gap_opt_t *opt)
@@ -67,15 +66,6 @@ static int gap_stack_bound(int max_mm, int max_gapo, int max_gape, const gap_opt
 // GCC/clang only, like the __builtin_expect and __builtin_prefetch calls here.
 #define GAP_HOT inline __attribute__((always_inline))
 #define GAP_COLD __attribute__((noinline, cold))
-
-// The search stops at an entry whose score exceeds best_score + s_mm (upstream's test, made in
-// 64 bits). Entry scores are packed in 11 bits (0..GAP_SCORE_LIMIT-1), so the cut is clamped to
-// [-1, GAP_SCORE_LIMIT-1] and stored as an int: the comparison with any packable score is the same.
-static inline int gap_score_cut(int64_t best_score, int s_mm)
-{
-	const int64_t cut = best_score + s_mm;
-	return cut < -1 ? -1 : cut > GAP_SCORE_LIMIT - 1 ? GAP_SCORE_LIMIT - 1 : (int)cut;
-}
 
 gap_stack_t *gap_init_stack2(int max_score)
 {
@@ -198,7 +188,8 @@ void gap_destroy_pool(gap_pool_t *pool)
 	xassert(pool->n_alloc == 0, "a stack still holds chunks from this pool");
 }
 
-static inline gap_chunk_t *gap_pool_get(gap_pool_t *pool)
+// always inline: each cold chunk helper below keeps its own copy, as it did with a single caller
+static GAP_HOT gap_chunk_t *gap_pool_get(gap_pool_t *pool)
 {
 	gap_chunk_t *c = pool->free_list;
 	if (c) {
@@ -211,7 +202,7 @@ static inline gap_chunk_t *gap_pool_get(gap_pool_t *pool)
 	return c;
 }
 
-static inline void gap_pool_put(gap_pool_t *pool, gap_chunk_t *c)
+static GAP_HOT void gap_pool_put(gap_pool_t *pool, gap_chunk_t *c)
 {
 	if (pool->n_free < pool->max_free) {
 		c->prev = pool->free_list;
@@ -289,16 +280,9 @@ static GAP_HOT void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwt
 	t->k = k; t->l = l;
 }
 
-// The base fields of a stack entry (AlnMeth's entries carry their gap events beside them).
+// Both policies use stock-sized search entries; candidate alignments live beside the slots.
 static GAP_HOT gap_entry_t &gap_base(gap_entry_t &e) { return e; }
 static GAP_HOT const gap_entry_t &gap_base(const gap_entry_t &e) { return e; }
-static GAP_HOT gap_entry_t &gap_base(gap_entry_meth_t &e) { return e.base; }
-static GAP_HOT const gap_entry_t &gap_base(const gap_entry_meth_t &e) { return e.base; }
-
-// A new entry's gap events: none (AlnStock's entries have none to set).
-static GAP_HOT void gap_entry_clear_path(gap_entry_t *) {}
-static GAP_HOT void gap_entry_clear_path(gap_entry_meth_t *e) { e->path = 0; }
-
 // Bucket q's top chunk is full (or q has none): put a new chunk from the pool on top.
 static GAP_COLD void gap_bucket_grow(gap_cstack_t *stack, gap_bucket_t *q)
 {
@@ -340,7 +324,6 @@ static GAP_HOT void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l
 	int score = gap_cscore(stack, n_mm, n_gapo, n_gape, opt);
 	E t;
 	gap_centry(&gap_base(t), score, i, k, l, n_mm, n_gapo, n_gape, n_ins, n_del, state, is_diff);
-	gap_entry_clear_path(&t);
 	gap_cstore(stack, score, &t);
 }
 
@@ -589,7 +572,7 @@ static GAP_HOT int gap_job_start_t(gap_job_t *j, const bwt_t *bwt)
 	const gap_opt_t *opt = &j->opt;
 	int jj, _j;
 	j->best_score = gap_stack_bound(opt->max_diff, opt->max_gapo, opt->max_gape, opt);
-	j->score_cut = (opt->mode & BWA_MODE_NONSTOP)? GAP_SCORE_LIMIT - 1 : gap_score_cut(j->best_score, opt->s_mm);
+	j->score_cut = (P::meth || (opt->mode & BWA_MODE_NONSTOP))? GAP_SCORE_LIMIT - 1 : gap_score_cut(j->best_score, opt->s_mm);
 	j->best_diff = opt->max_diff == INT_MAX ? INT_MAX : opt->max_diff + 1; j->max_diff = opt->max_diff;
 	j->c.s_mm = opt->s_mm; j->c.s_gapo = opt->s_gapo; j->c.s_gape = opt->s_gape; j->c.mode = opt->mode;
 	j->c.max_entries = opt->max_entries; j->c.max_gapo = opt->max_gapo; j->c.max_gape = opt->max_gape;
@@ -597,8 +580,10 @@ static GAP_HOT int gap_job_start_t(gap_job_t *j, const bwt_t *bwt)
 	j->c.max_del_occ = opt->max_del_occ; j->c.seed_off = j->len - opt->seed_len;
 	j->best_cnt = 0;
 	j->max_entries = 0;
-	j->m_aln = 4; j->n_aln = 0;
-	j->aln = (bwt_aln1_t*)aln_calloc(j->m_aln, sizeof(bwt_aln1_t));
+	j->m_aln = P::meth ? 0 : 4; j->n_aln = 0;
+	// Stock transfers this array to the read. Meth queues hits in its slot's owned vectors,
+	// so allocating here would leak on both early completion and every slot reuse.
+	j->aln = P::meth ? nullptr : (bwt_aln1_t*)aln_calloc(j->m_aln, sizeof(bwt_aln1_t));
 	j->pending = 0;
 
 	// check whether there are too many N
@@ -737,16 +722,35 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 			}
 			// bwt_match_exact_alt returns l - k + 1 as an int; bwt_match_gap tests it for nonzero
 			if ((uint32_t)(l - k + 1) == 0) continue;
+			if (P::meth) { // AlnMeth: the hit waits for the next flush
+				aln_meth_hit(X, &J->e, k, l);
+				continue;
+			}
 			if (gap_job_hit<P>(J, bwt, &J->e, k, l)) break;
 			continue;
 		} else {
-			const int n_entries = stack->n_entries + fwd; // with a forwarded entry counted as pushed
-			if (!n_entries) break;
-			m_seed = 0;
-			if (J->max_entries < n_entries) J->max_entries = n_entries;
-			if (n_entries > opt->max_entries) break;
-			if (fwd) { ee = f; fwd = 0; } // the entry gap_cpop would return
-			else gap_cpop<E>(stack, &ee); // get the best entry
+			if (P::meth && J->pending == JOB_FLUSH) {
+				J->pending = 0;
+				if (aln_meth_resume(X, J, &ee)) break; // the flush was the last (or a bind ended the search)
+				m_seed = 0;
+			} else {
+				const int n_entries = stack->n_entries + fwd; // with a forwarded entry counted as pushed
+				if (!n_entries) break;
+				m_seed = 0;
+				if (J->max_entries < n_entries) J->max_entries = n_entries;
+				if (n_entries > opt->max_entries) {
+					if (P::meth) aln_meth_flag(X, ALN_METH_BIND_M);
+					break;
+				}
+				if (fwd) { ee = f; fwd = 0; } // the entry gap_cpop would return
+				else gap_cpop<E>(stack, &ee); // get the best entry
+				if (P::meth && aln_meth_needs_flush(X, (int)(e.info>>21))) {
+					// Candidate buffer is full: hold the next entry while resolving windows.
+					J->e = e;
+					J->pending = JOB_FLUSH;
+					return 0;
+				}
+			}
 			k = e.k; l = e.l; // SA interval
 			i = e.info&0xffff; // length
 			if ((int)(e.info>>21) > J->score_cut) break; // no need to proceed (score_cut: see gap_score_cut; never under NONSTOP)
@@ -762,6 +766,10 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 
 			// check whether a hit is found
 			if (i == 0) { // hit found
+				if (P::meth) { // AlnMeth: the hit waits for the next flush
+					aln_meth_hit(X, &e, k, l);
+					continue;
+				}
 				if (gap_job_hit<P>(J, bwt, &e, k, l)) break;
 				continue;
 			} else if (m == 0 && (e.state == STATE_M || (opt->mode&BWA_MODE_GAPE) || e.n_gape == opt->max_gape)) { // no diff allowed
@@ -843,6 +851,11 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 			else gap_cstore(stack, f_score, &f);
 		}
 	}
+	if (P::meth && aln_meth_has_pending(X)) { // AlnMeth: every way the search ends flushes its hits
+		aln_meth_set_final(X);
+		J->pending = JOB_FLUSH;
+		return 0;
+	}
 	gap_release_cstack(stack); // the read is done: its stack's chunks go back to the pool
 	return 1;
 }
@@ -900,6 +913,17 @@ int width_walk_run(width_walk_t *w, const bwt_t *bwt) { return width_walk_step(w
  * job and width-walk steps inlined, so a step costs no call and return, and the per-read
  * events (widths done, search done) go back to the caller. Which slot is stepped when changes
  * only the interleaving: each read's own steps run in the same order. */
+/* AlnMeth: slot s yielded for a flush. It is parked (skipped until the driver unparks it); returns 1
+ * when the driver should flush now: half the group's slots are parked, or every active one. */
+static GAP_HOT int gap_slot_park(gap_slot_core_t *, void *, int) { return 0; }
+static GAP_HOT int gap_slot_park(gap_slot_core_t *s, aln_meth_slot_t *ext, int i)
+{
+	aln_meth_group_t *g = ext[i].grp;
+	s->state = GAP_SLOT_PARKED;
+	++g->n_parked;
+	return g->n_parked >= g->k_park || g->n_parked >= g->n_active;
+}
+
 // Slot i's policy state: none for AlnStock (ext is null), ext[i] for AlnMeth.
 static GAP_HOT void *gap_slot_ext(void *, int) { return nullptr; }
 template <class T> static GAP_HOT T *gap_slot_ext(T *ext, int i) { return ext + i; }
@@ -913,6 +937,7 @@ static GAP_HOT int gap_slots_run_t(gap_slot_core_t *slots, int n, int *pos, cons
 		gap_slot_core_t *s = &slots[i];
 		if (s->state == GAP_SLOT_SEARCH) {
 			if (gap_job_step<P>(&s->job, bwt, gap_slot_ext(ext, i))) break;
+			if (P::meth && s->job.pending == JOB_FLUSH && gap_slot_park(s, ext, i)) break; // AlnMeth: flush the parked slots
 		} else if (s->state == GAP_SLOT_WIDTHS) {
 			if (!s->widths_done) s->widths_done = width_walk_step(&s->ww, bwt);
 			if (!s->seed_done) s->seed_done = width_walk_step(&s->sw, bwt);
@@ -927,5 +952,13 @@ int gap_slots_run(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt)
 {
 	return gap_slots_run_t<AlnStock>(slots, n, pos, bwt, nullptr);
 }
+
+int gap_slots_run_meth(gap_slot_core_t *slots, int n, int *pos, const bwt_t *bwt, aln_meth_slot_t *ext)
+{
+	return gap_slots_run_t<AlnMeth>(slots, n, pos, bwt, ext);
+}
+
+int gap_job_start_meth(gap_job_t *j, const bwt_t *bwt) { return gap_job_start_t<AlnMeth>(j, bwt); }
+
 
 } // namespace bwa_aln
