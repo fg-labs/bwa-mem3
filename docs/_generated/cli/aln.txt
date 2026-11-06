@@ -72,13 +72,13 @@ Methylation (shared with bwa-mem3 mem):
                  conversions are sparse, so a full-match reward costs
                  specificity).
                  collapsed: C/T (and G/A) interchangeable, bwameth-compatible
-                 placement (mem: sets -B 2). Opt-in.
+                 placement in mem (sets mem -B 2). Opt-in.
                  genomic: free only the conversion direction, scored as a full
                  match, keep variants as mismatches (variant-aware: variants
-                 outside the conversion direction counted in NM; mem: -B 4).
+                 outside the conversion direction counted in NM; mem -B 4).
                  neutral: free only the conversion direction but score it 0
                  (tolerated, not rewarded); best for TAPS (variant-aware:
-                 variants counted in NM as in genomic; mem: -B 4). Not
+                 variants counted in NM as in genomic; mem -B 4). Not
                  for em-seq: its dense conversions cost short reads
                  their placement (a warning is printed).
                  In genomic/neutral a real variant in the conversion direction
@@ -101,10 +101,12 @@ Methylation (shared with bwa-mem3 mem):
    Under --meth, converted search proposes windows; original-reference global realignment
    refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.
    Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.
-   the -B values above are mem's. The records carry XR/XG/XM:Z instead of
-   XM:i/XO:i/XG:i.
+   aln -B is barcode length, not mem's mismatch penalty. Records carry
+   XR/XG/XM:Z instead of XM:i/XO:i/XG:i.
 
 New in bwa-mem3 aln:
+  -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]
+            (some errors and warnings still print at 0)
   --bam     write BAM instead of SAM
   --bam-level INT     BAM compression level 0-9 [1]
   --help    show this message

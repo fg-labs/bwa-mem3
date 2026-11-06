@@ -1332,6 +1332,12 @@ jobs:
           BWA_ORACLE_REQUIRED: 1
         run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_parity.sh
 
+      - name: Check live methylation help gate controls
+        run: bash test/regression/aln_meth_help_sync_test.sh
+
+      - name: aln --meth shares mem's --meth vocabulary
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_meth_help_sync.sh
+
       - name: Run integration tests
         if: matrix.run_integration == true
         env:
