@@ -1944,6 +1944,12 @@ jobs:
           PARITY_R2=/tmp/chr22-sim/reads.r2.fastq.gz \
           bash test/regression/all_tiers_parity.sh
 
+      - name: aln --meth command-line checks (synthetic reference)
+        # Option and index errors, prefix resolution, output aliasing and
+        # single-end records on a synthetic reference; the shared-memory leg
+        # runs here (Linux) when nothing else is staged on the runner.
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_meth_cli.sh
+
       - name: mem CLI helpers still fail on bad input
         # Run before the mem CLI scripts, as on the Linux ARM64 row.
         run: bash test/regression/mem_cli_selftest.sh

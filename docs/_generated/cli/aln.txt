@@ -44,6 +44,66 @@ Paired-end options (two input files; from bwa sampe):
   -A        disable insert size estimate (force -s)
   -P        accepted and ignored (sampe -P loads the index into memory; always so here)
 
+Methylation (shared with bwa-mem3 mem):
+   --meth[=CHEM] enable inline bwameth-style C→T/G→A read conversion + meth-aware
+                 record emission (XM:Z/XG:Z/XR:Z). Output is SAM text by default,
+                 as without --meth; add --bam for BAM. Requires the reference to
+                 have been built with `bwa-mem3 index --meth` (emits the original
+                 index plus a ref.fa.meth.* converted seed index).
+                 CHEM selects the chemistry and thus the XM:Z call polarity:
+                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]
+                          (aliases: em-seq, bisulfite)
+                   taps   TET-assisted pyridine borane, METHYLATED C converts;
+                          also defaults --meth-scoring to neutral
+                   5base  Illumina 5-base, METHYLATED C (5mC) converts; same
+                          aligner semantics as taps (alias: 5-base)
+                 NOTE: use --meth=taps (with '='), not --meth taps. Running TAPS
+                 or 5-base data without =taps or =5base inverts every
+                 methylation call.
+   --meth-context all|cpg
+                 where a conversion is free. all (default): at every C, as the
+                 chemistry converts it. cpg: only at a CpG, so a C->T at a
+                 non-CpG C scores as a mismatch. Needs --meth=taps or --meth=5base
+                 (EM-seq/bisulfite convert every unmethylated C) and a --meth-scoring
+                 other than collapsed.
+   --meth-scoring collapsed|genomic|neutral
+                 scoring mode. Default depends on chemistry: genomic for
+                 --meth/--meth=emseq, neutral for --meth=taps|5base (their
+                 conversions are sparse, so a full-match reward costs
+                 specificity).
+                 collapsed: C/T (and G/A) interchangeable, bwameth-compatible
+                 placement (mem: sets -B 2). Opt-in.
+                 genomic: free only the conversion direction, scored as a full
+                 match, keep variants as mismatches (variant-aware: variants
+                 outside the conversion direction counted in NM; mem: -B 4).
+                 neutral: free only the conversion direction but score it 0
+                 (tolerated, not rewarded); best for TAPS (variant-aware:
+                 variants counted in NM as in genomic; mem: -B 4). Not
+                 for em-seq: its dense conversions cost short reads
+                 their placement (a warning is printed).
+                 In genomic/neutral a real variant in the conversion direction
+                 itself (C->T at a reference C) is indistinguishable from a
+                 conversion and is not counted in NM; under --meth-context cpg
+                 only at a CpG (a C->T at any other C counts).
+   --meth-tags SPEC
+                 which Bismark tags to emit: 'all' (default), 'none', a
+                 comma-separated list (XR,XG), or ^-prefixed exclusions (^XM).
+                 Comma-separated, NOT space-separated (a second word becomes
+                 the reference). An exclusion may be written ^XM or -XM; prefer
+                 -XM in scripts (bare ^ is a negated glob in zsh EXTENDED_GLOB).
+                 Unselected tags are not computed. XM:Z is a read-length string
+                 and dominates the BAM's aux payload; '^XM' drops it for callers
+                 that recompute calls from the reference and the read.
+                 Keep XM for Bismark-family tools (bismark_methylation_extractor)
+                 and other callers that read the per-base calls from XM:Z.
+   --set-as-failed f|r
+                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
+   Under --meth, converted search proposes windows; original-reference global realignment
+   refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.
+   Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.
+   the -B values above are mem's. The records carry XR/XG/XM:Z instead of
+   XM:i/XO:i/XG:i.
+
 New in bwa-mem3 aln:
   --bam     write BAM instead of SAM
   --bam-level INT     BAM compression level 0-9 [1]

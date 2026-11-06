@@ -268,8 +268,11 @@ without floating-point contraction (a stock build with its default flags on arm6
 rounding boundaries). `--bam` and
 `--bam-level` are new; the long options `--max-xa-hits`, `--max-occ` and
 `--max-xa-hits-discordant` stand in for samse/sampe `-n`, sampe `-o` and sampe `-N`. Option values
-on which stock crashes or drops every read (for example a negative `-l` or `-B`) are refused. See
-[CLI Reference → aln](../cli/aln.md).
+on which stock crashes or drops every read (for example a negative `-l` or `-B`) are refused.
+`--meth` (new, [PR #749](https://github.com/fg-labs/bwa-mem3/pull/749)) aligns single-end
+methylation reads on an `index --meth` index, with `XR:Z`, `XG:Z` and `XM:Z` tags; stock bwa has no
+methylation mode, so those records have no stock counterpart (paired-end reads and `--meth-context
+cpg` are refused for now). See [CLI Reference → aln](../cli/aln.md).
 
 ```bash
 bwa-mem3 aln -l 1024 -n 0.04 -o 2 -t 8 ref.fa reads.fq.gz > out.sam

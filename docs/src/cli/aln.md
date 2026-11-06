@@ -50,10 +50,19 @@ insert-size and pairing arithmetic of `sampe` and then differ from `aln` (and fr
 x86_64 stock build) at rare rounding boundaries.
 
 The index is the one `bwa-mem3 index` writes (bwa-mem3's own format, not a
-stock `bwa index`). For the generated-read workload above, an index built with
-`index --meth` gives the same output as a plain index at one thread on the two CI
-runners and SIMD tiers listed above. An index staged with [`shm`](shm.md) is
-attached instead of read from disk. `aln` never aligns in methylation mode.
+stock `bwa index`). For the generated-read workload above without `--meth`, an
+index built with `index --meth` gives the same output as a plain index at one
+thread on the two CI runners and SIMD tiers listed above. An index staged with
+[`shm`](shm.md) is attached instead of read from disk.
+
+**Methylation (`--meth`).** With `--meth`, `aln` aligns single-end bisulfite, EM-seq,
+TAPS or 5-base reads against an index built with `index --meth`: it searches the
+converted index and writes records against the original reference. Mapped records
+carry the tags selected by `--meth-tags`: `XR:Z`, `XG:Z` and `XM:Z` are all selected
+by default. Unmapped records carry only `XR:Z` when selected. Stock bwa has no
+methylation mode, so these records
+have no stock counterpart and the byte-identity above does not cover them. Paired-end
+reads and `--meth-context cpg` are refused for now.
 
 ## Synopsis
 

@@ -37,7 +37,13 @@ void bwa_cal_pac_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_
 /* `pacseq` is the 2-bit packed forward reference (l_pac/4 + 1 bytes). Reverses each
  * read's seq in place, as upstream does. */
 void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t *pacseq);
+/* Shared stock SAM helpers: first overlapping ambiguity run, reference end coordinates,
+ * strand-aware five-prime coordinate (-1 if unmapped), and original read sequence text. */
+int aln_bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id);
 int64_t pos_end(const bwa_seq_t *p);
+int64_t pos_end_multi(const bwt_multi1_t *p, int len);
+int64_t pos_5(const bwa_seq_t *p);
+void bwa_print_seq(kstring_t *out, const bwa_seq_t *seq);
 /* Appends the record(s) stock bwa samse prints for one read, newline included. */
 void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa_seq_t *mate,
 					int mode, int max_top2);

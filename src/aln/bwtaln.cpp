@@ -19,6 +19,7 @@
  * command-line parser are not ported. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
+#include "aln_meth_search.h"
 #include "../kthread.h"
 
 #include <math.h>
@@ -136,7 +137,7 @@ int (*aln_thread_create)(pthread_t *, const pthread_attr_t *, void *(*)(void *),
 
 /* The group driver's per-policy steps. AlnStock's are the stock driver's own expressions, so its
  * instantiation is the stock driver (test/tools/disasm_identity.sh checks it); another policy (aln
- * --meth, added later) specialises this with its own. ctx_t is what the batch passes each
+ * --meth) specialises this with its own. ctx_t is what the batch passes each
  * thread beyond the reads (nothing for the stock search); the thread hands it to set_ctx before
  * the group runs. scope_t is constructed for the group's lifetime, after the slots and before the
  * reads: a policy with per-group state (aln --meth) keeps it there, its steps reach it through the
@@ -166,6 +167,67 @@ template <> struct gap_group<AlnStock> {
 	// results elsewhere (aln --meth) takes them back here
 	static inline void finish(gap_slot_core_t *, bwa_seq_t *) {}
 };
+
+template <> struct gap_group<AlnMeth> {
+	struct ctx_t {
+		const aln_meth_ref_t *ref;
+		const aln_meth_opt_t *mo;
+		int read_no, keep_strata, max_xa_hits;
+		const int64_t *ord;      // per read of the (possibly compacted) batch: its ordinal in the stream
+		const uint8_t *keep;     // per read: keep both strata (others share its search), or null
+		aln_meth_read_t *res;    // per read of the (possibly compacted) batch
+	};
+
+	static thread_local const ctx_t *ctx;
+	static thread_local aln_meth_group_t *group;
+	static void set_ctx(const ctx_t *c) { ctx = c; }
+	struct scope_t {
+		aln_meth_group_t grp;
+		scope_t(const bwt_t *bwt, const gap_opt_t *opt, gap_slot_core_t *cores, int n)
+		{
+			group = &grp;
+			grp.bwt = bwt; grp.ref = ctx->ref; grp.mo = ctx->mo; grp.opt = opt; grp.read_no = ctx->read_no;
+
+			grp.keep_strata = ctx->keep_strata; grp.max_xa_hits = ctx->max_xa_hits;
+			grp.n_slots = n; grp.k_park = (n + 1) / 2;
+			grp.slot.resize(n); grp.cores = cores;
+			for (int i = 0; i < n; ++i) {
+				grp.slot[i].grp = &grp;
+				grp.slot[i].job = &cores[i].job;
+			}
+		}
+		~scope_t() { group = nullptr; ctx = nullptr; }
+	};
+	static aln_meth_slot_t *slot(const gap_slot_core_t *c) { return &group->slot[c - group->cores]; }
+	static void slot_start(gap_slot_core_t *c, bwa_seq_t *p, int r)
+	{
+		const gap_opt_t *opt = group->opt;
+		const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
+		aln_meth_slot_start(slot(c), p, ctx->res + r, ctx->ord[r], max_diff, ctx->keep ? ctx->keep[r] : 0);
+	}
+	static const ubyte_t *seq(const gap_slot_core_t *c, const bwa_seq_t *) { return slot(c)->vseq.data(); }
+	static int job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start_meth(j, bwt); }
+	static int run(gap_slot_core_t *cores, int n, int *pos, const bwt_t *bwt)
+	{
+		// Count after refill so the last active slots cannot wait forever for a larger flush.
+		group->n_active = 0;
+		for (int i = 0; i < n; ++i) group->n_active += cores[i].state != GAP_SLOT_EMPTY;
+		for (;;) {
+			if (group->n_parked && group->n_parked >= group->n_active) aln_meth_flush_parked(group);
+			const int i = gap_slots_run_meth(cores, n, pos, bwt, group->slot.data());
+			if (cores[i].state != GAP_SLOT_PARKED) return i;
+			aln_meth_flush_parked(group);
+		}
+	}
+	static void finish(gap_slot_core_t *c, bwa_seq_t *p)
+	{
+		// Meth hits belong to res, not job.aln; the meth job never allocates that stock array.
+		aln_meth_slot_finish(slot(c));
+		p->aln = nullptr; p->n_aln = 0;
+	}
+};
+thread_local const gap_group<AlnMeth>::ctx_t *gap_group<AlnMeth>::ctx = nullptr;
+thread_local aln_meth_group_t *gap_group<AlnMeth>::group = nullptr;
 
 template <class P>
 static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs,
@@ -546,8 +608,8 @@ int dup_sample_check(int n_seqs, const bwa_seq_t *seqs)
  * turns the check off for the stream's next ALN_DUP_RECHECK - 1 batches (aln_dup_state_t; the
  * check itself is a serial pass over the batch while the search threads wait). Only the work
  * changes: a read searched instead of copied gets the same hits. */
-/* The duplicate gate and compaction every batch search shares (aln_search_batch; aln --meth's, when
- * it is added, is the second), so each caller gets the same skip window, one-read batches included.
+/* The duplicate gate and compaction every batch search shares (aln_search_batch and
+ * aln --meth's), so each caller gets the same skip window, one-read batches included.
  * search_all() searches the whole batch; search_uniq(n_u, uniq, rep) searches its compacted front,
  * the distinct reads (uniq[k] is the batch index of seqs[k]; rep[i] is read i's first copy); after
  * the batch is restored, copy_dup(i, rep[i]) fills duplicate i from its first copy. Returns the
@@ -625,6 +687,50 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 			if (q->n_aln > 0) memcpy(d->aln, q->aln, q->n_aln * sizeof(bwt_aln1_t));
 			d->n_aln = q->n_aln;
 		});
+}
+
+
+int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
+						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
+						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res)
+{
+	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
+	gap_group<AlnMeth>::ctx_t mc;
+	mc.ref = ref; mc.mo = mo; mc.read_no = read_no; mc.keep_strata = keep_strata; mc.max_xa_hits = max_xa_hits;
+	mc.keep = nullptr;
+	std::vector<int64_t> ord(n_seqs);
+	std::vector<uint8_t> has_copy(n_seqs, 0);
+	for (int i = 0; i < n_seqs; ++i) ord[i] = ord0 + i;
+	// The common duplicate gate keys on original bases, before slot_start converts the read.
+	const int n_dups = search_batch_dedup(n_seqs, seqs, n_threads, dup,
+		[&]() {
+			mc.ord = ord.data(); mc.res = res;
+			search_reads<AlnMeth>(bwt, n_seqs, seqs, &bopt, n_threads, &mc);
+		},
+		[&](int n_u, const int *uniq, const int *rep) {
+			for (int i = 0; i < n_seqs; ++i) if (rep[i] != i) has_copy[rep[i]] = 1;
+			std::vector<int64_t> ord_c(n_u);
+			std::vector<uint8_t> keep_c(n_u);
+			std::vector<aln_meth_read_t> res_c(n_u);
+			for (int k = 0; k < n_u; ++k) ord_c[k] = ord0 + uniq[k], keep_c[k] = has_copy[uniq[k]];
+			mc.ord = ord_c.data(); mc.keep = keep_c.data(); mc.res = res_c.data();
+			search_reads<AlnMeth>(bwt, n_u, seqs, &bopt, n_threads, &mc);
+			for (int k = 0; k < n_u; ++k) res[uniq[k]] = std::move(res_c[k]);
+		},
+		[&](int i, int first) {
+			bwa_seq_t *d = seqs + i;
+			d->sa = 0; d->type = BWA_TYPE_NO_MATCH; d->c1 = d->c2 = 0; d->n_aln = 0; d->aln = nullptr;
+			res[i] = res[first];
+			// a copy ran no search: the work counters (aln_meth_report) stay with its first copy
+			res[i].n_lookups = res[i].n_wrong_copy = res[i].n_rescored = res[i].n_flushes = 0;
+			res[i].n_unrepresentable = 0;
+			if (res[i].main >= 0) aln_meth_redraw(&res[i], aln_meth_draw_seed(ref, read_no, ord0 + i));
+			if (!keep_strata) aln_meth_trim(&res[i], max_xa_hits);
+		});
+	if (!keep_strata)
+		for (int i = 0; i < n_seqs; ++i) if (has_copy[i]) aln_meth_trim(&res[i], max_xa_hits);
+	aln_meth_report(read_no, n_seqs, res);
+	return n_dups;
 }
 
 } // namespace bwa_aln

@@ -231,6 +231,9 @@ extern "C" {
 	 * 1, or returns 0 at end of text. */
 	int bwa_hdr_next_line(const char **p, const char **line, size_t *len);
 	char *bwa_load_hdr_from_index(const char *prefix);
+	/* The `.dict` path bwa_load_hdr_from_index falls back to for index
+	 * `prefix` (malloc'd; the caller frees it). */
+	char *bwa_index_dict_path(const char *prefix);
 	/* Warn (at bwa_verbose >= 2) when the index marks contigs ALT but the
 	 * sidecar's @SQ block carries no AH for them. The sidecar is authoritative
 	 * and is never modified; this only reports the gap and its remedy. */
