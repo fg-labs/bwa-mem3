@@ -24,8 +24,11 @@ typedef struct {
 pe_opt_t *bwa_init_pe_opt(void);
 
 /* Estimates the insert-size distribution from the pairs where both ends are unique enough.
+ * With short_insert, the lower fence is floored at 1 rather than the longest read, and failed
+ * estimates have avg/std = -1 and all bounds zero. The default preserves stock behavior.
  * Returns 0, or -1 (ii->avg = -1) when it cannot; prints its findings to stderr. */
-int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L);
+int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
+                bool short_insert = false);
 
 /* Single-end positions, then pairing, for one batch. Each read's alignments are its aln /
  * n_aln. Consumes drand48(): call serially, in read order. When the batch gives no estimate

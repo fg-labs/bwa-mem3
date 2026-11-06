@@ -133,6 +133,7 @@ typedef struct {
 	int n_multi, N_multi;
 	int type, is_sw, is_preload;
 	double ap_prior;
+	int short_insert; // opt-in: estimate below the batch's longest read length
 } pe_opt_t;
 
 struct __bwa_seqio_t;

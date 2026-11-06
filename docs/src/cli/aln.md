@@ -31,7 +31,7 @@ bwa-mem3 aln ref.fa r.fq > out.sam            # bwa aln + samse
 bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 ```
 
-**Byte-identity without `--meth`.** The SAM records are byte-identical to the
+**Byte-identity without `--meth` or `--short-insert`.** The SAM records are byte-identical to the
 output of stock bwa 0.7.19 `aln` + `samse`/`sampe` (the header is too, except
 the `@PG` line, which names the program that ran). This is checked against a
 stock bwa 0.7.19 binary on generated single-end and paired-end reads (a phiX plus
@@ -91,6 +91,7 @@ and the name it has there when it differs.
 | `--max-xa-hits-discordant INT` | sampe `-N` | 10 | Maximum hits to output for discordant pairs |
 | `-c FLOAT` | sampe | 1e-5 | Prior of the chimeric rate (lower bound) |
 | `-s`, `-A` | sampe | off | Skip Smith-Waterman for an unmapped mate; skip the insert size estimate (which also skips that Smith-Waterman, as in stock) |
+| `--short-insert` | new | off | Estimate short inserts without a batch-wide minimum set by the longest read; paired input required |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
 | `-v INT` | new | 3 | Verbosity 0-4; 4 reports lookup/window/incomplete diagnostics |
 | `--bam` | new | off | Write BAM instead of SAM |
@@ -99,8 +100,32 @@ and the name it has there when it differs.
 The long names exist because `-n` and `-o` already mean the search options.
 `--max-xa-hits` applies to single-end and paired-end output alike.
 
-The paired-end options are ignored, with a warning, when only one input file is
-given.
+The stock paired-end options are ignored, with a warning, when only one input file is
+given. `--short-insert` instead requires two input files and rejects single-end use before
+loading the index or creating output.
+
+### Short, overlapping fragments
+
+Use `--short-insert` when short fragments overlap and a longer read in the batch would
+otherwise exclude them from insert-size estimation. It works with ordinary and
+methylation-aware (`--meth`) paired alignment:
+
+```bash
+bwa-mem3 aln --short-insert ref.fa r1.fq r2.fq > out.sam
+```
+
+The option sets the estimator's lower bound to the lower interquartile fence, with a
+minimum of one base, rather than the longest read in the batch. It keeps the upper
+fence, minimum number of high-quality pairs and previous-batch fallback. Failed
+estimates use the no-estimate fallback; `-A` overrides the option and disables insert
+estimation and mate rescue.
+
+This is an opt-in departure from stock output. The inferred distribution can change
+pair selection, proper-pair flags, MAPQ and rescue windows. Pairing geometry and the
+rescue algorithm are unchanged: this option does not enable overlap-aware rescue or
+make every short pair proper. Under this option, pairing and methylation cap rescue
+reject candidates when the insert-likelihood calculation underflows or its penalty
+cannot be represented as an integer. Existing defaults are unchanged.
 
 **Option values.** Numbers must be well formed: where stock's `atoi` reads `abc` as 0 and
 `20x` as 20, `aln` stops with an error naming the option. Values that stock accepts but

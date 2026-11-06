@@ -56,7 +56,8 @@ pe_opt_t *bwa_init_pe_opt(void)
 // for normal distribution, this is about 3std
 #define OUTLIER_BOUND 2.0
 
-int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L)
+int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
+                bool short_insert)
 {
 	uint64_t x, *isizes, n_ap = 0;
 	int n, i, tot, p25, p75, p50, max_len = 1, tmp;
@@ -85,9 +86,11 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	p50 = isizes[(int)(tot*0.50 + 0.5)];
 	p75 = isizes[(int)(tot*0.75 + 0.5)];
 	tmp  = (int)(p25 - OUTLIER_BOUND * (p75 - p25) + .499);
-	ii->low = tmp > max_len? tmp : max_len; // ii->low is unsigned
+	const int floor = short_insert ? 1 : max_len;
+	ii->low = tmp > floor? tmp : floor; // ii->low is unsigned
 	ii->high = (int)(p75 + OUTLIER_BOUND * (p75 - p25) + .499);
 	if (ii->low > ii->high) {
+		if (short_insert) ii->low = ii->high = ii->high_bayesian = 0;
 		fprintf(stderr, "[infer_isize] fail to infer insert size: upper bound is smaller than read length\n");
 		free(isizes);
 		return -1;
@@ -106,6 +109,14 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	}
 	kurtosis = kurtosis/n / (ii->std / n * ii->std / n) - 3;
 	ii->std = sqrt(ii->std / n); // it would be better as n-1, but n is usually very large
+	// Short constant populations can expose the inherited negative variance accumulator.
+	// Reject before converting the derived Bayesian bound to an integer.
+	if (short_insert && (!isfinite(ii->std) || !isfinite(ii->avg))) {
+		ii->low = ii->high = ii->high_bayesian = 0; ii->avg = ii->std = -1.0;
+		free(isizes);
+		fprintf(stderr, "[infer_isize] fail to infer insert size: weird pairing\n");
+		return -1;
+	}
 	skewness = skewness / n / (ii->std * ii->std * ii->std);
 	for (y = 1.0; y < 10.0; y += 0.01)
 		if (.5 * erfc(y / M_SQRT2) < ap_prior / L * (y * ii->std + ii->avg)) break;
@@ -154,7 +165,12 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 		{ \
 			uint64_t s = d->aln[(v).y&1][(v).y>>2].score + d->aln[(u).y&1][(u).y>>2].score; \
 			s *= 10; \
-			if (ii->high) s += (int)(-4.343 * log(.5 * erfc(M_SQRT1_2 * fabs(l - ii->avg) / ii->std)) + .499); \
+			if (ii->high) { \
+				const double penalty = -4.343 * log(.5 * erfc(M_SQRT1_2 * fabs(l - ii->avg) / ii->std)) + .499; \
+				/* Narrow short-insert tails can underflow; do not score an unrepresentable candidate. */ \
+				if (opt->short_insert && (!isfinite(penalty) || penalty > INT_MAX)) break; \
+				s += (int)penalty; \
+			} \
 			s = s<<32 | (uint32_t)hash_64((u).x<<32 | (v).x); \
 			if (s>>32 == o_score>>32) ++o_n; \
 			else if (s>>32 < o_score>>32) { subo_n += o_n; o_n = 1; } \
@@ -330,7 +346,7 @@ void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isi
                       const pe_opt_t *opt, const isize_info_t *last_ii)
 {
 	// Shared stock inference/fallback; converted indices must supply the original length.
-	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len);
+	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len, opt->short_insert);
 	if (ii->avg < 0.0 && last_ii->avg > 0.0) *ii = *last_ii;
 	if (opt->force_isize) {
 		fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");
