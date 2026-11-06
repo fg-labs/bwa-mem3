@@ -1067,13 +1067,27 @@ has ended, which is all of the output for a one-batch input and is paced by
 whatever reads the output (a pipe into another tool, for example). Uncompressed
 BAM output (`--bam=0`, the default `--bam` level) streams only the last batch,
 the one whose read reached the end of the input: earlier batches' writes already
-overlap the next batch's compute. The BAM file is byte-identical either way.
-One exception: when the input ends exactly where a full, unsliced batch is
-satisfied, end of input only shows on the next (empty) read, so that last batch
-is not recognised and is written as before. With a near-full last batch on a
-4.2M-pair WGS input (HG00096, 2x150 bp, hg38), clang 19.1.7, NEON, 6 interleaved
-rounds per host, streaming cut wall time by 5.2% at `-t 64` on a 64-vCPU
-Graviton4 (m8g.16xlarge, arm64) and by 1.8% at `-t 16` on a 16-vCPU Graviton4
+overlap the next batch's compute. Streaming preserves record order and BAM
+encoding, so it changes when bytes are written, not which bytes are written;
+byte identity follows from that construction, on any host.
+`test/regression/thread_determinism.sh` compares streaming on/off output byte
+for byte, paired and single-end, including sliced cohorts and exact batch
+boundaries, on a simulated chr22 fixture; `test/regression/stream_output_order.sh`
+checks that streaming actually engages (every batch writes early) and keeps
+batch order under a delayed write step. Both run on GitHub-hosted
+`ubuntu-24.04` x86-64 runners, in CI jobs built `arch=avx2` with clang 19. The
+kernels dispatch at run time to the highest tier the runner's CPU supports
+(AVX2 or AVX-512BW), and the CI log does not record which tier ran or which
+CPU model the runner had. No CI job runs them on arm64. That is the tested
+envelope, not a limit on where byte identity holds.
+
+For uncompressed BAM, not every last batch streams (SAM text streams every
+batch, so this does not apply to it): when the input ends exactly where a full,
+unsliced batch is satisfied, end of input only shows on the next (empty) read,
+so that last batch is not recognised and is written as before. With a near-full
+last batch on a 4.2M-pair WGS input (HG00096, 2x150 bp, hg38), clang 19.1.7,
+NEON, 6 interleaved rounds per host, streaming cut wall time by 5.2% at `-t 64`
+on a 64-vCPU Graviton4 (m8g.16xlarge, arm64) and by 1.8% at `-t 16` on a 16-vCPU Graviton4
 (m8g.4xlarge). A last batch is about half full on average, so we estimate about
 half of that on a typical input (an estimate from last-batch fullness, not a
 measurement). Compressed BAM (`--bam=1..9`) is not streamed: at `--bam=6` and
