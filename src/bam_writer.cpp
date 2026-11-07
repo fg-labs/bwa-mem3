@@ -186,10 +186,10 @@ static int append_sam_aux_tokens(struct bam1_t *b, const char *s, int meth_mode)
         size_t tok_len = (size_t)(s - tok);
         /* Need at least "XX:T:" (5 chars) and a non-empty value. */
         if (tok_len < 6 || tok[2] != ':' || tok[4] != ':') continue;
-        /* Under --meth, the YS:Z and YC:Z tokens in s->comment are internal
-         * carriers only (used by meth_mem_aln_to_bam for SEQ restoration and
-         * XR:Z derivation). Suppress them here so the BAM output carries
-         * only the Bismark XR:Z/XG:Z/XM:Z tag set. */
+        /* Under --meth, YS:Z and YC:Z were once internal carriers (original
+         * bases, conversion direction). Neither is written any more, but both
+         * stay filtered so a FASTQ comment carrying one cannot appear beside
+         * the Bismark XR:Z/XG:Z/XM:Z tag set. */
         if (meth_mode
                 && ((tok[0] == 'Y' && tok[1] == 'S')
                  || (tok[0] == 'Y' && tok[1] == 'C'))) {
