@@ -908,6 +908,46 @@ jobs:
           UNIT_JUNIT_PREFIX="unit-results-${JOB_INDEX}" \
             bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit
 
+      - name: Real 1 GB hugetlb mapping (unit/huge_pages with a reserved page)
+        # The --huge-pages unit test maps the occurrence table on a real 1 GB
+        # page only when BWA_TEST_HUGETLB_POOL=1 and a page is free. Hosted
+        # runners boot with no pool, so this reserves one at runtime. A 1 GB
+        # page needs 1 GiB of contiguous memory, which a running VM may not
+        # have, and the CPU may not offer 1 GB pages at all; either way the
+        # step warns and passes rather than failing on the host. A rejected
+        # write to a kernel knob warns too, rather than failing the step, and
+        # the step exits with the test's own status. The pool is raised by one
+        # page and put back to its starting size afterwards. The test itself checks the mapping and
+        # that freeing the index unmaps it.
+        if: matrix.canonical == true
+        run: |
+          pool=/sys/kernel/mm/hugepages/hugepages-1048576kB
+          if [[ ! -d $pool ]]; then
+            echo "::warning::1 GB hugetlb mapping not tested: this runner's CPU offers no 1 GB pages"
+            exit 0
+          fi
+          # Writes a kernel knob; a rejected write warns instead of ending the step.
+          set_knob() {
+            echo "$2" | sudo tee "$1" > /dev/null ||
+              echo "::warning::could not write $2 to $1"
+          }
+          start=$(cat "$pool/nr_hugepages")
+          sync
+          set_knob /proc/sys/vm/drop_caches 3
+          set_knob /proc/sys/vm/compact_memory 1
+          set_knob "$pool/nr_hugepages" "$((start + 1))"
+          free=$(cat "$pool/free_hugepages")
+          echo "1 GB hugetlb pool: nr_hugepages=$(cat "$pool/nr_hugepages") free_hugepages=$free"
+          if (( free < 1 )); then
+            echo "::warning::1 GB hugetlb mapping not tested: could not reserve a 1 GB page on this runner"
+            set_knob "$pool/nr_hugepages" "$start"
+            exit 0
+          fi
+          status=0
+          BWA_TEST_HUGETLB_POOL=1 ./test/bwa_mem3_tests_unit -ts=unit/huge_pages || status=$?
+          set_knob "$pool/nr_hugepages" "$start"
+          exit "$status"
+
       - name: Upload unit-test results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
