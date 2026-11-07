@@ -16,6 +16,12 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
+# `shm -d` drops every index staged on the host. Refuse (SKIP) unless the
+# registry is empty or holds only this test's own phix.fa.
+# shellcheck source=test/framework/shm_registry_guard.sh
+source test/framework/shm_registry_guard.sh
+shm_registry_guard "$BIN" shm_round_trip_test phix.fa
+
 # Clean up any stale registry from a prior run (and on exit).
 "$BIN" shm -d > /dev/null 2>&1 || true
 trap '"$BIN" shm -d >/dev/null 2>&1 || true' EXIT

@@ -26,7 +26,6 @@
 *****************************************************************************************/
 
 #include "bwa_shm.h"
-#include "bwa.h"           /* BWA_CTL_SIZE — see static_assert below */
 #include "FMI_search.h"    /* CP_FILENAME_SUFFIX, CP_OCC, CP_SHIFT */
 #include "macro.h"         /* SA_COMPX */
 #include "bntseq.h"        /* bntseq_t, bns_restore, bns_destroy */
@@ -45,11 +44,49 @@
 #include <semaphore.h>     /* sem_open, sem_wait, sem_post, sem_close, sem_unlink */
 #include <errno.h>
 #include <limits.h>        /* PATH_MAX */
+#include <signal.h>        /* kill(pid, 0) liveness probe */
+#include <time.h>
 
 /* /bwactl layout: 16-bit n_entries, 16-bit next_write_offset, then packed
  * (int64_t l_mem, char[] basename) entries. The header is 4 bytes total
  * (two uint16_t fields). next_write_offset starts at 4 on a fresh segment. */
 #define BWA_SHM_CTL_HEADER_BYTES 4
+namespace {
+struct ctl_header { uint16_t n_entries, next_write; };
+static_assert(sizeof(ctl_header) == BWA_SHM_CTL_HEADER_BYTES, "registry header is 4 bytes");
+}
+
+/* The registry header is one 32-bit word, published (release) after the entry
+ * bytes, so a lockless reader never counts bytes not yet written. */
+static ctl_header ctl_header_load(const void *m)
+{
+    const uint32_t w = __atomic_load_n((const uint32_t *)m, __ATOMIC_ACQUIRE);
+    ctl_header h;
+    std::memcpy(&h, &w, sizeof(h));
+    return h;
+}
+
+static void ctl_header_store(void *m, ctl_header h)
+{
+    uint32_t w;
+    std::memcpy(&w, &h, sizeof(w));
+    __atomic_store_n((uint32_t *)m, w, __ATOMIC_RELEASE);
+}
+
+/* The /dev/shm free-space probe; a test may substitute its own. */
+#ifndef BWA_SHM_STATVFS
+#define BWA_SHM_STATVFS statvfs
+#endif
+
+/* How long `shm -d` waits for the stager lock before proceeding without it. */
+#ifndef BWA_SHM_DESTROY_LOCK_WAIT_MS
+#define BWA_SHM_DESTROY_LOCK_WAIT_MS 5000
+#endif
+
+/* How long a stage waits for another live stager of the same index. */
+#ifndef BWA_SHM_STAGE_WAIT_S
+#define BWA_SHM_STAGE_WAIT_S 3600
+#endif
 
 /* .bwt.2bit.64 prefix: int64_t reference_seq_len, int64_t count[5]. */
 #define BWA_BWT_2BIT_HEADER_BYTES (sizeof(int64_t) * 6)
@@ -64,12 +101,6 @@
  * 64-bit arithmetic can express, so overflow checks against this max are
  * effectively impossible to trip in practice but cheap to enforce. */
 #define BWA_SHM_MAX_TOTAL_SIZE (1ull << 40)
-
-/* The two constants must agree. bwa.h::BWA_CTL_SIZE is a v1-era stub that
- * we'll remove in a separate cleanup commit; until then, this assert
- * prevents silent drift if either definition is edited. */
-static_assert(BWA_SHM_CTL_SIZE == BWA_CTL_SIZE,
-              "BWA_SHM_CTL_SIZE must equal bwa.h::BWA_CTL_SIZE");
 
 /* Return a pointer to the filename component of `hint` — everything after
  * the last '/'. If `hint` has no '/', returns `hint`. */
@@ -97,19 +128,25 @@ static void path_concat2(char out[PATH_MAX], const char *a, const char *b)
  * macOS (unlike flock(2) on POSIX shm fds, which macOS rejects with
  * EOPNOTSUPP). Returns the open semaphore on success — held by us until
  * ctl_lock_release — or NULL on failure. */
-static sem_t *ctl_lock_acquire(void)
+static sem_t *ctl_lock_acquire(bool create = true)
 {
-    sem_t *s = sem_open(BWA_SHM_LOCK_NAME, O_CREAT, 0644, 1);
+    sem_t *s = create ? sem_open(BWA_SHM_LOCK_NAME, O_CREAT, 0644, 1)
+                      : sem_open(BWA_SHM_LOCK_NAME, 0);
+    if (s == SEM_FAILED && !create && errno == ENOENT) return NULL;   /* removed */
     if (s == SEM_FAILED) {
+        const int err = errno;
         std::fprintf(stderr, "[E::%s] sem_open(%s) failed: %s\n",
-                     __func__, BWA_SHM_LOCK_NAME, std::strerror(errno));
+                     __func__, BWA_SHM_LOCK_NAME, std::strerror(err));
+        errno = err;
         return NULL;
     }
     while (sem_wait(s) < 0) {
-        if (errno == EINTR) continue;
+        const int err = errno;
+        if (err == EINTR) continue;
         std::fprintf(stderr, "[E::%s] sem_wait(%s) failed: %s\n",
-                     __func__, BWA_SHM_LOCK_NAME, std::strerror(errno));
+                     __func__, BWA_SHM_LOCK_NAME, std::strerror(err));
         sem_close(s);
+        errno = err;
         return NULL;
     }
     return s;
@@ -122,38 +159,29 @@ static void ctl_lock_release(sem_t *s)
     sem_close(s);
 }
 
-/* Open `/bwactl` read-write, creating it if necessary and zero-initializing
- * a fresh segment with next-write offset = BWA_SHM_CTL_HEADER_BYTES.
- *
- * On success returns the mmap'd address (a `BWA_SHM_CTL_SIZE`-byte writable
- * mapping) and `*fd_out` holds the still-open file descriptor — caller
- * closes it after the mapping is no longer needed (typical pattern: close
- * immediately, since the mapping survives close).
- *
- * Concurrent RMW callers must hold ctl_lock_acquire across the open / read
- * / write / close cycle so the n_entries / next_write fields stay coherent
- * across processes. */
-static void *ctl_open_rw(int *fd_out)
+/* Map `/bwactl` read-write (callers hold the lock); `*fd_out` is closed with
+ * ctl_close. With create, a missing or short registry is created empty; without
+ * it, either fails with ENOENT, so a registry `shm -d` removed stays removed.
+ * On failure errno is the failing call's. */
+static void *ctl_open_rw(int *fd_out, bool create = true)
 {
     int created = 0;
-    int fd = shm_open(BWA_SHM_CTL_NAME, O_RDWR, 0);
-    if (fd < 0) {
-        if (errno != ENOENT) return NULL;
-        fd = shm_open(BWA_SHM_CTL_NAME, O_CREAT | O_RDWR | O_EXCL, 0644);
-        if (fd < 0) {
-            fd = shm_open(BWA_SHM_CTL_NAME, O_RDWR, 0);
-            if (fd < 0) return NULL;
-        } else {
-            created = 1;
-        }
+    int fd = shm_open(BWA_SHM_CTL_NAME, O_RDWR | (create ? O_CREAT : 0), 0644);
+    if (fd < 0) return NULL;
+    /* close() may clobber errno; keep the failing call's. */
+    auto fail = [fd](int err) -> void * { close(fd); errno = err; return NULL; };
+    struct stat st;
+    if (fstat(fd, &st) < 0) return fail(errno);
+    if ((size_t)st.st_size < BWA_SHM_CTL_SIZE) {   /* macOS sizes an object once */
+        if (!create) return fail(ENOENT);
+        if (ftruncate(fd, BWA_SHM_CTL_SIZE) < 0) return fail(errno);
+        created = 1;
     }
-    if (ftruncate(fd, BWA_SHM_CTL_SIZE) < 0) { close(fd); return NULL; }
     void *m = mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    if (m == MAP_FAILED) { close(fd); return NULL; }
+    if (m == MAP_FAILED) return fail(errno);
     if (created) {
         std::memset(m, 0, BWA_SHM_CTL_SIZE);
-        uint16_t next_write = BWA_SHM_CTL_HEADER_BYTES;
-        std::memcpy((uint8_t *)m + 2, &next_write, sizeof(uint16_t));
+        ctl_header_store(m, ctl_header{ 0, BWA_SHM_CTL_HEADER_BYTES });
     }
     *fd_out = fd;
     return m;
@@ -182,41 +210,22 @@ static void *idx_segment_map(int fd, size_t len, int prot)
     return m;
 }
 
-/* Test-only hook: test/shm_thp_advise_test.cpp checks the stager's mapping
- * for the huge-page advice through it, since bwa_shm_stage unmaps that mapping
- * before it returns. Not set on any production path. */
+/* Test-only hook, called after the lock is released and before the pack
+ * (shm_thp_advise_test, shm_stage_test). NULL in production. */
 void (*bwa_shm_stage_map_hook)(const void *base, size_t len) = NULL;
 
-/* Walk the registry, calling `cb(l_mem, name, ctx)` for each entry. cb may
- * return 0 to continue or non-zero to stop. Returns the cb's last return
- * value (or 0 if the registry is absent or empty), -1 on open/mmap error. */
+/* The registry's one parser: cb(l_mem, name-in-m, ctx) per entry of mapped
+ * registry `m` until cb returns non-zero; returns cb's last value (0 if none). */
 typedef int (*bwa_shm_ctl_cb_t)(int64_t l_mem, const char *name, void *ctx);
 
-static int ctl_walk(bwa_shm_ctl_cb_t cb, void *ctx)
+static int ctl_walk_map(const void *m, bwa_shm_ctl_cb_t cb, void *ctx)
 {
-    int fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
-    if (fd < 0) return errno == ENOENT ? 0 : -1;
-    /* A previous failed stage can leave a zero-sized registry; on macOS an
-     * unlinked-but-still-referenced segment also lingers at size 0. mmap
-     * rejects 0-byte mappings with EINVAL. ctl_open_rw always ftruncates
-     * the segment to the full BWA_SHM_CTL_SIZE on creation, so anything
-     * smaller is junk left behind by an aborted stage — treat as empty. */
-    struct stat st;
-    if (fstat(fd, &st) < 0 || (size_t)st.st_size < BWA_SHM_CTL_SIZE) {
-        close(fd);
-        return 0;
-    }
-    void *m = mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED) return -1;
-
     const uint8_t *base = (const uint8_t *)m;
-    uint16_t n_entries = 0;
-    std::memcpy(&n_entries, base, sizeof(uint16_t));
+    ctl_header h = ctl_header_load(base);
     const uint8_t *p   = base + BWA_SHM_CTL_HEADER_BYTES;
     const uint8_t *end = base + BWA_SHM_CTL_SIZE;
     int rc = 0;
-    for (uint16_t i = 0; i < n_entries; ++i) {
+    for (uint16_t i = 0; i < h.n_entries; ++i) {
         if (p + sizeof(int64_t) >= end) break;
         int64_t l_mem = 0;
         std::memcpy(&l_mem, p, sizeof(int64_t));
@@ -228,9 +237,147 @@ static int ctl_walk(bwa_shm_ctl_cb_t cb, void *ctx)
         if (rc != 0) break;
         p = (const uint8_t *)name + namelen + 1;
     }
+    return rc;
+}
 
+/* ctl_walk_map over the live registry, mapped read-only without taking the
+ * lock. A walk racing a locked ctl_remove can misread entries (a shifted name's
+ * suffix can read as an entry), so a caller that removes what it finds, as
+ * `-d` does, holds the lock itself. Returns 0 if the registry is absent, -1 on
+ * open/fstat/mmap error (errno kept). */
+static int ctl_walk(bwa_shm_ctl_cb_t cb, void *ctx)
+{
+    int fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
+    if (fd < 0) return errno == ENOENT ? 0 : -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0) {
+        const int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+    /* Short (aborted creation; macOS unlinked at size 0) means empty. */
+    if ((size_t)st.st_size < BWA_SHM_CTL_SIZE) {
+        close(fd);
+        return 0;
+    }
+    void *m = mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ, MAP_SHARED, fd, 0);
+    close(fd);
+    if (m == MAP_FAILED) return -1;
+    int rc = ctl_walk_map(m, cb, ctx);
     munmap(m, BWA_SHM_CTL_SIZE);
     return rc;
+}
+
+/* The name of `name`'s entry inside the mapped registry `m`, or NULL. */
+static char *ctl_find(const void *m, const char *name)
+{
+    const char *want[2] = { name, NULL };   /* [0] sought, [1] found */
+    ctl_walk_map(m, [](int64_t, const char *entry, void *ctx) {
+        const char **w = (const char **)ctx;
+        return std::strcmp(entry, w[0]) == 0 ? (w[1] = entry, 1) : 0;
+    }, want);
+    return (char *)want[1];
+}
+
+/* Delete `name`'s entry from the mapped registry `m` (held under the lock):
+ * move the later entries down and fix n_entries / next_write. */
+static void ctl_remove(void *m, const char *name)
+{
+    char *found = ctl_find(m, name);
+    if (found == NULL) return;
+    uint8_t *base = (uint8_t *)m;
+    uint8_t *entry = (uint8_t *)found - sizeof(int64_t);
+    size_t len = sizeof(int64_t) + std::strlen(found) + 1;
+    ctl_header h = ctl_header_load(base);
+    uint8_t *tail = base + h.next_write;
+    if (tail < entry + len) tail = entry + len;   /* inconsistent cursor */
+    std::memmove(entry, entry + len, (size_t)(tail - entry - len));
+    std::memset(tail - len, 0, len);
+    h.n_entries  = (uint16_t)(h.n_entries - 1);
+    h.next_write = (uint16_t)(tail - len - base);
+    ctl_header_store(base, h);
+}
+
+/* Segment states, from the header (see bwa_shm_header_t). */
+namespace { enum seg_state { SEG_ABSENT, SEG_COMPLETE, SEG_STAGING, SEG_DEAD, SEG_BAD }; }
+
+/* Probe `idx_path`; *hdr gets its header (zeroed if none could be read).
+ * SEG_BAD from a failed call sets *failed (if given) to its name, errno kept;
+ * otherwise *failed is NULL and SEG_BAD means a foreign magic or version. */
+static seg_state segment_state(const char *idx_path, bwa_shm_header_t *hdr,
+                               const char **failed = NULL)
+{
+    const char *dummy;
+    if (failed == NULL) failed = &dummy;
+    *failed = NULL;
+    std::memset(hdr, 0, sizeof(*hdr));
+    int fd = shm_open(idx_path, O_RDONLY, 0);
+    if (fd < 0 && errno != ENOENT) *failed = "shm_open";
+    if (fd < 0) return errno == ENOENT ? SEG_ABSENT : SEG_BAD;   /* keeps errno */
+    struct stat st;
+    const bool sized = fstat(fd, &st) == 0;
+    if (!sized) *failed = "fstat";
+    const bool small = sized && st.st_size < (off_t)sizeof(*hdr);   /* never written */
+    void *m = sized && !small ? mmap(NULL, sizeof(*hdr), PROT_READ, MAP_SHARED, fd, 0)
+                              : MAP_FAILED;
+    const int err = errno;
+    close(fd);
+    errno = err;
+    if (m == MAP_FAILED && sized && !small) *failed = "mmap";
+    if (m == MAP_FAILED) return small ? SEG_DEAD : SEG_BAD;
+    const uint64_t magic = __atomic_load_n((const uint64_t *)m, __ATOMIC_ACQUIRE);
+    std::memcpy(hdr, m, sizeof(*hdr));
+    munmap(m, sizeof(*hdr));
+    errno = 0;
+    /* Shorter than its header declares: bwa_shm_attach refuses it, so it is bad. */
+    if (magic == BWA_SHM_MAGIC && hdr->version == BWA_SHM_VERSION)
+        return hdr->total_size <= (uint64_t)st.st_size ? SEG_COMPLETE : SEG_BAD;
+    if (magic != 0) return SEG_BAD;
+    const uint64_t pid = hdr->reserved[0];
+    const bool alive = pid != 0 && pid <= (uint64_t)INT_MAX &&
+                       (kill((pid_t)pid, 0) == 0 || errno == EPERM);
+    return alive ? SEG_STAGING : SEG_DEAD;
+}
+
+/* segment_state of registry entry `name`'s segment. */
+static seg_state name_state(const char *name)
+{
+    char idx_path[PATH_MAX];
+    path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
+    bwa_shm_header_t hdr;
+    return segment_state(idx_path, &hdr);
+}
+
+/* Sum, over entries whose segment is still being staged, the bytes each has yet
+ * to allocate (ctx: uint64_t): l_mem less the segment's allocated blocks. Where
+ * st_blocks is unavailable (macOS reports 0) the full l_mem counts. */
+static int staging_bytes_cb(int64_t l_mem, const char *name, void *ctx)
+{
+    if (l_mem <= 0 || name_state(name) != SEG_STAGING) return 0;
+    char idx_path[PATH_MAX];
+    path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
+    uint64_t allocated = 0;
+    const int fd = shm_open(idx_path, O_RDONLY, 0);
+    if (fd >= 0) {
+        struct stat st;
+        if (fstat(fd, &st) == 0 && st.st_blocks > 0) allocated = (uint64_t)st.st_blocks * 512u;
+        close(fd);
+    }
+    if (allocated < (uint64_t)l_mem) *(uint64_t *)ctx += (uint64_t)l_mem - allocated;
+    return 0;
+}
+
+/* A per-stage token (header reserved[1]); it only has to differ between
+ * stagers, so time, PID and a splitmix finalizer suffice. Never 0. */
+static uint64_t stage_token(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t x = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec) ^
+                 ((uint64_t)getpid() << 40);
+    x ^= x >> 33; x *= 0xff51afd7ed558ccdull; x ^= x >> 33;
+    return x | 1;
 }
 
 extern "C" {
@@ -306,21 +453,11 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
         layout->count[i] += 1;
     }
 
-    /* Peek the trailing sa_compx tag (written by write_fm_index_streaming,
-     * see fm_index_writer.cpp) before sizing the SA sample arrays, via the
-     * shared detect_sa_compx() helper (FMI_search.h/.cpp). Mirrors
-     * FMI_search::load_index's disk-path detection exactly (same helper),
-     * so bwa_shm_compute (which sizes the shm segment) agrees with the
-     * loader it stages for. See detect_sa_compx()'s doc comment for why the
-     * tail-detection heuristic is safe against legacy (no-tail) indexes. */
+    /* The disk SA rate, by the same detect_sa_compx() the disk loader uses, so
+     * the segment is sized for what that loader would read. */
     {
         struct stat st;
-        /* A failed fstat() must not silently fall back to file_size=0: that
-         * would make detect_sa_compx() treat a genuinely non-default-rate
-         * index as legacy (rate 3), sizing this staged segment's SA-sample
-         * sections for the wrong rate. Fail the load instead of guessing,
-         * mirroring FMI_search::load_index's disk-path handling of the same
-         * fstat() call. */
+        /* A failed fstat must not pass size 0: that reads as a legacy rate. */
         if (fstat(fileno(cp), &st) != 0) {
             fprintf(stderr, "[E::%s] fstat(%s) failed: %s\n",
                     __func__, cp_path, strerror(errno));
@@ -331,14 +468,9 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
         layout->disk_sa_compx = detect_sa_compx(fileno(cp), (int64_t)st.st_size, layout->reference_seq_len, SA_COMPX);
     }
 
-    /* On-the-fly SA densification (bwa-mem3 shm -u INT). The SA sample table is
-     * staged at layout->sa_compx; by default that equals the disk rate. A
-     * target strictly denser than disk (and within the writer-enforced [0,6])
-     * sizes the SA sections for the denser rate here; bwa_shm_pack_into then
-     * synthesizes the added samples via an LF-walk against the disk samples.
-     * A target that is not strictly denser (>= disk, or out of range) is
-     * ignored with a warning and the disk rate is staged unchanged — a request
-     * to "densify" to an equal/coarser rate is a no-op, not an error. */
+    /* `shm -u`: a target strictly denser than disk (in [0,6]) sizes the SA
+     * sections for it, and pack_into synthesizes the extra samples. Any other
+     * target warns and stages the disk rate. */
     layout->sa_compx = layout->disk_sa_compx;
     if (target_sa_compx >= 0) {
         if (target_sa_compx < layout->disk_sa_compx && target_sa_compx <= 6) {
@@ -387,14 +519,8 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
         return -1;
     }
 
-    /* 3. REF_STRING (.0123) is NEVER staged. `mem` pac-fetches the original
-     * reference from `.pac` on demand (bns_get_seq_v2), so the unpacked `.0123`
-     * is never read from shm — for meth OR plain. Zero-length REF_STRING section
-     * for every index → −6.4 GB per staged segment on hg38, and the `.0123` need
-     * not exist on disk (commit "stop building .0123"). This is DECOUPLED from
-     * `bns_only`: that flag still gates PAC below — the seed --meth segment drops
-     * PAC too, but plain/original segments KEEP PAC (pac-fetch reads it). The
-     * `.0123` is not stat'd, so staging works on an index that doesn't have it. */
+    /* 3. REF_STRING (.0123) is never staged or stat'd: `mem` fetches bases
+     *    from `.pac`. (bns_only, below, separately drops PAC.) */
     layout->ref_string_len = 0;
 
     /* 4. BNS_NAMES section size: walk anns[]. */
@@ -458,16 +584,7 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
     const bntseq_t *bns = (const bntseq_t *)layout->bns;
     const bwa_shm_section_t *sec = layout->sections;
 
-    /* 1. Header. */
-    bwa_shm_header_t hdr;
-    memset(&hdr, 0, sizeof(hdr));
-    hdr.magic       = BWA_SHM_MAGIC;
-    hdr.version     = BWA_SHM_VERSION;
-    hdr.n_sections  = layout->n_sections;
-    hdr.total_size  = layout->total_size;
-    memcpy(dest, &hdr, sizeof(hdr));
-
-    /* 2. Section table. */
+    /* 1. Header: last (step 9). 2. Section table. */
     memcpy(dest + sizeof(bwa_shm_header_t),
            layout->sections,
            (size_t)layout->n_sections * sizeof(bwa_shm_section_t));
@@ -602,6 +719,18 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         err_fclose(fp);
     }
 
+    /* 9. Header: every field but magic, then magic with a release store, so a
+     *    reader that acquire-loads BWA_SHM_MAGIC sees all the bytes above. */
+    bwa_shm_header_t hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    hdr.version     = BWA_SHM_VERSION;
+    hdr.n_sections  = layout->n_sections;
+    hdr.total_size  = layout->total_size;
+    hdr.reserved[0] = layout->stager_pid;
+    hdr.reserved[1] = layout->stage_token;
+    memcpy(dest + sizeof(hdr.magic), (const uint8_t *)&hdr + sizeof(hdr.magic),
+           sizeof(hdr) - sizeof(hdr.magic));
+    __atomic_store_n((uint64_t *)dest, BWA_SHM_MAGIC, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -639,20 +768,20 @@ int bwa_shm_pack_from_disk(const char *prefix, uint8_t **buf_out, uint64_t *len_
     return 0;
 }
 
-static int test_cb(int64_t /*l_mem*/, const char *name, void *ctx)
-{
-    return std::strcmp(name, (const char *)ctx) == 0 ? 1 : 0;
-}
-
 int bwa_shm_test(const char *prefix)
 {
     if (prefix == NULL || prefix[0] == '\0') return -1;
-    return ctl_walk(test_cb, (void *)prefix_basename(prefix));
+    return ctl_walk([](int64_t, const char *entry, void *want) {
+        return std::strcmp(entry, (const char *)want) == 0 ? 1 : 0;
+    }, (void *)prefix_basename(prefix));
 }
 
 static int list_cb(int64_t l_mem, const char *name, void * /*ctx*/)
 {
-    std::printf("%s\t%lld\n", name, (long long)l_mem);
+    const seg_state st = name_state(name);
+    std::printf("%s\t%lld%s\n", name, (long long)l_mem,
+                st == SEG_STAGING || st == SEG_DEAD ? "\tincomplete" :
+                st == SEG_ABSENT ? "\tmissing" : st == SEG_BAD ? "\tunusable" : "");
     return 0;
 }
 
@@ -672,17 +801,94 @@ static int destroy_cb(int64_t /*l_mem*/, const char *name, void * /*ctx*/)
 
 int bwa_shm_destroy(void)
 {
-    int rc = ctl_walk(destroy_cb, NULL);
-    if (rc < 0) return rc;
-    shm_unlink(BWA_SHM_CTL_NAME);
-    /* Recover from a stuck lock: a stager that segfaulted or was kill -9'd
-     * mid-stage holds the named semaphore until it is unlinked, blocking
-     * every subsequent stager forever. POSIX has no SEM_UNDO, so unlinking
-     * alongside the registry is the operator-visible recovery path. Errors
-     * are ignored (ENOENT is the common case on a clean drop). */
-    sem_unlink(BWA_SHM_LOCK_NAME);
-    return 0;
+    /* Hold the lock across the walk, so no stager compacts the registry under
+     * it and shifts a name's suffix into place as an entry. Registry updates
+     * take milliseconds; a lock held past the wait was left by a stager killed
+     * inside one (no SEM_UNDO), so proceed without it, and unlinking it below
+     * is the recovery. A missing lock (ENOENT) is normal. */
+    sem_t *lock = sem_open(BWA_SHM_LOCK_NAME, 0);
+    bool held = false;
+    for (int waited_ms = 0; lock != SEM_FAILED; waited_ms += 10) {
+        if (sem_trywait(lock) == 0) { held = true; break; }
+        if (errno != EAGAIN && errno != EINTR) break;
+        if (waited_ms >= BWA_SHM_DESTROY_LOCK_WAIT_MS) {
+            std::fprintf(stderr, "[W::%s] stager lock %s still held after %d ms; "
+                         "removing everything without it\n", __func__, BWA_SHM_LOCK_NAME,
+                         (int)BWA_SHM_DESTROY_LOCK_WAIT_MS);
+            break;
+        }
+        usleep(10000);
+    }
+    const int rc = ctl_walk(destroy_cb, NULL);
+    if (rc >= 0) {
+        shm_unlink(BWA_SHM_CTL_NAME);
+        sem_unlink(BWA_SHM_LOCK_NAME);
+    }
+    if (lock != SEM_FAILED) {
+        if (held) sem_post(lock);
+        sem_close(lock);
+    }
+    return rc < 0 ? rc : 0;
 }
+
+/* Everything bwa_shm_stage holds, released on every return path; while
+ * `created` is set, destruction also rolls the stage back. */
+namespace {
+struct stage_guard {
+    const char *name, *idx_path;
+    bwa_shm_layout_t *layout;
+    sem_t *lock = NULL;
+    void  *ctl = NULL;
+    int    ctl_fd = -1;
+    void  *idx = MAP_FAILED;
+    int    idx_fd = -1;
+    bool   created = false, released = false;
+
+    stage_guard(const char *n, const char *p, bwa_shm_layout_t *l)
+        : name(n), idx_path(p), layout(l) {}
+
+    /* create=false (after release) recreates nothing that `shm -d` removed;
+     * a missing lock or registry then fails with errno ENOENT. */
+    bool lock_registry(bool create = true) {
+        if ((lock = ctl_lock_acquire(create)) == NULL) return false;
+        if ((ctl = ctl_open_rw(&ctl_fd, create)) != NULL) return true;
+        const int err = errno;
+        if (create || err != ENOENT)
+            std::fprintf(stderr, "[E::bwa_shm_stage] failed to open control segment %s: %s\n",
+                         BWA_SHM_CTL_NAME, std::strerror(err));
+        unlock();
+        errno = err;
+        return false;
+    }
+    void unlock() {
+        ctl_close(ctl, ctl_fd);
+        ctl_lock_release(lock);
+        ctl = NULL, ctl_fd = -1, lock = NULL;
+    }
+    /* The segment at idx_path is the one this stage created. */
+    bool still_ours() {
+        bwa_shm_header_t hdr;
+        segment_state(idx_path, &hdr);
+        return !released || hdr.reserved[1] == layout->stage_token;
+    }
+    /* Roll back an unfinished stage, touching the segment only if it still
+     * carries our token. Without the lock, leave the entry: `-l` shows it
+     * `missing` and the next stage drops it. */
+    ~stage_guard() {
+        if (idx != MAP_FAILED) munmap(idx, (size_t)layout->total_size);
+        if (idx_fd >= 0) close(idx_fd);
+        if (created) {
+            const bool locked = lock != NULL || lock_registry(/*create=*/false);
+            if (still_ours()) {
+                if (locked) ctl_remove(ctl, name);
+                shm_unlink(idx_path);
+            }
+        }
+        unlock();
+        bwa_shm_layout_free(layout);
+    }
+};
+} // namespace
 
 int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
                   int n_threads)
@@ -691,21 +897,19 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         std::fprintf(stderr, "[E::%s] empty prefix\n", __func__);
         return -1;
     }
-    int already = bwa_shm_test(prefix);
-    if (already < 0) {
-        std::fprintf(stderr, "[E::%s] failed to probe registry\n", __func__);
-        return -1;
-    }
-    if (already == 1) {
-        std::fprintf(stderr, "[M::%s] index '%s' is already in shm\n",
-                     __func__, prefix);
-        return 0;
-    }
-
     const char *name = prefix_basename(prefix);
     if (name[0] == '\0') {
         std::fprintf(stderr, "[E::%s] prefix has no basename component\n", __func__);
         return -1;
+    }
+    char idx_path[PATH_MAX];
+    path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
+
+    /* 0. Already staged: skip the disk reads and the lock. Step 2 decides. */
+    bwa_shm_header_t hdr;
+    if (bwa_shm_test(prefix) == 1 && segment_state(idx_path, &hdr) == SEG_COMPLETE) {
+        std::fprintf(stderr, "[M::%s] index '%s' is already in shm\n", __func__, prefix);
+        return 0;
     }
 
     /* 1. Compute the layout (loads BNS; peeks scalars from the FMI file). */
@@ -715,210 +919,152 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
                      __func__, prefix);
         return -1;
     }
+    layout.stager_pid  = (uint64_t)getpid();
+    layout.stage_token = stage_token();
+    stage_guard g(name, idx_path, &layout);
 
-    /* 2. Acquire the cross-process lock, then open the control segment R/W.
-     *    Holding the lock across the read-modify-write window prevents two
-     *    concurrent stagers from racing each other to append the same
-     *    basename or stomping each other's next_write cursor. The pre-stage
-     *    bwa_shm_test() above is unlocked (a cheap fast path); we re-scan
-     *    the live registry below now that the lock is held to catch the
-     *    case where another stager appended this prefix between our test
-     *    and our acquire. */
-    sem_t *ctl_lock = ctl_lock_acquire();
-    if (ctl_lock == NULL) {
-        bwa_shm_layout_free(&layout);
-        return -1;
-    }
-
-    int   ctl_fd  = -1;
-    void *ctl_map = ctl_open_rw(&ctl_fd);
-    if (ctl_map == NULL) {
-        std::fprintf(stderr, "[E::%s] failed to open control segment %s: %s\n",
-                     __func__, BWA_SHM_CTL_NAME, std::strerror(errno));
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
-        return -1;
-    }
-
-    /* 3. Re-scan the live registry for this basename. */
-    uint16_t n_entries = 0, next_write = 0;
-    std::memcpy(&n_entries,  (uint8_t *)ctl_map,     sizeof(uint16_t));
-    std::memcpy(&next_write, (uint8_t *)ctl_map + 2, sizeof(uint16_t));
-    {
-        const uint8_t *p   = (const uint8_t *)ctl_map + BWA_SHM_CTL_HEADER_BYTES;
-        const uint8_t *end = (const uint8_t *)ctl_map + BWA_SHM_CTL_SIZE;
-        for (uint16_t i = 0; i < n_entries; ++i) {
-            if (p + sizeof(int64_t) >= end) break;
-            const char *entry_name = (const char *)(p + sizeof(int64_t));
-            size_t name_max = (size_t)(end - (const uint8_t *)entry_name);
-            size_t namelen  = strnlen(entry_name, name_max);
-            if (namelen == name_max) break;
-            if (std::strcmp(entry_name, name) == 0) {
-                std::fprintf(stderr,
-                    "[M::%s] index '%s' was staged by another process\n",
-                    __func__, prefix);
-                ctl_close(ctl_map, ctl_fd);
-                ctl_lock_release(ctl_lock);
-                bwa_shm_layout_free(&layout);
-                return 0;
-            }
-            p = (const uint8_t *)entry_name + namelen + 1;
+    /* 2. Under the lock, decide from the entry and the segment header, then
+     *    create and register a staging segment. Behind a live stager of the
+     *    same index, wait without the lock: the lock must never be held long. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    const time_t deadline = now.tv_sec + BWA_SHM_STAGE_WAIT_S;
+    seg_state state;
+    unsigned long long pid;
+    const char *failed;
+    for (bool announced = false;; announced = true) {
+        if (!g.lock_registry()) return -1;
+        state = segment_state(idx_path, &hdr, &failed);
+        pid = (unsigned long long)hdr.reserved[0];
+        if (state != SEG_STAGING) break;
+        g.unlock();
+        if (!announced)
+            std::fprintf(stderr, "[M::%s] '%s' is being staged by PID %llu; waiting\n",
+                         __func__, name, pid);
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        if (now.tv_sec >= deadline) {
+            std::fprintf(stderr, "[E::%s] gave up after %d s waiting for PID %llu to stage "
+                         "'%s'; if PID %llu is not a running bwa-mem3 shm, run bwa-mem3 shm -d\n",
+                         __func__, (int)BWA_SHM_STAGE_WAIT_S, pid, name, pid);
+            return -1;
         }
+        sleep(1);
     }
+    const int probe_errno = errno;
+    if (state == SEG_COMPLETE && ctl_find(g.ctl, name) != NULL) {
+        std::fprintf(stderr, "[M::%s] index '%s' is already in shm\n", __func__, prefix);
+        return 0;
+    }
+    if (state == SEG_COMPLETE || state == SEG_BAD) {   /* never adopt or replace it */
+        if (failed != NULL)
+            std::fprintf(stderr, "[E::%s] %s(%s): %s\n", __func__, failed, idx_path,
+                         std::strerror(probe_errno));
+        else
+            std::fprintf(stderr, "[E::%s] segment %s exists %s; not replacing it. Remove "
+                         "it with shm_unlink(\"%s\") after checking that no stager is "
+                         "active, then retry\n", __func__, idx_path,
+                         state == SEG_BAD ? "with a foreign magic or version, or "
+                                            "shorter than its header declares"
+                                          : "without a registry entry", idx_path);
+        return -1;
+    }
+    if (state == SEG_DEAD) {
+        std::fprintf(stderr, "[M::%s] reclaiming '%s' left by an interrupted stage (PID %llu)\n",
+                     __func__, name, pid);
+        shm_unlink(idx_path);
+    }
+    ctl_remove(g.ctl, name);   /* a stale entry, if any */
 
-    /* 4. Bound-check the new entry. next_write is a uint16_t and
-     *    BWA_SHM_CTL_SIZE is 0x10000 (65536), which uint16_t cannot represent.
-     *    Reject the exact-fill case so the post-write cast back to uint16_t
-     *    cannot wrap to 0 and have the next stage overwrite the header. */
-    size_t name_bytes  = std::strlen(name) + 1;
-    size_t entry_bytes = sizeof(int64_t) + name_bytes;
-    if ((size_t)next_write + entry_bytes >= BWA_SHM_CTL_SIZE) {
-        std::fprintf(stderr,
-                     "[E::%s] control segment full (cannot stage '%s')\n",
+    /* Bound-check the new entry. next_write is a uint16_t and BWA_SHM_CTL_SIZE
+     * (65536) does not fit one, so reject the exact-fill case too: the cast
+     * back must not wrap to 0 and let the next stage overwrite the header. */
+    ctl_header h = ctl_header_load(g.ctl);
+    const size_t name_bytes  = std::strlen(name) + 1;
+    const size_t entry_bytes = sizeof(int64_t) + name_bytes;
+    if ((size_t)h.next_write + entry_bytes >= BWA_SHM_CTL_SIZE) {
+        std::fprintf(stderr, "[E::%s] control segment full (cannot stage '%s')\n",
                      __func__, name);
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
         return -1;
     }
-
-    /* 5. The registry was checked under the stager lock above, so an existing
-     *    segment here is unregistered, not a successful concurrent stage. It
-     *    may contain a partial index; neither adopt nor replace its bytes. */
-    char idx_path[PATH_MAX];
-    path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
-    int idx_fd = shm_open(idx_path, O_CREAT | O_RDWR | O_EXCL, 0644);
-    if (idx_fd < 0 && errno == EEXIST) {
-        std::fprintf(stderr,
-            "[E::%s] segment %s exists without a registry entry; "
-            "it may be an incomplete stage. Remove this orphaned segment "
-            "with shm_unlink(\"%s\") after checking that no stager is active, "
-            "then retry. shm -d cannot find unregistered segments.\n",
-            __func__, idx_path, idx_path);
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
-        return -1;
-    }
-    if (idx_fd < 0) {
+    g.idx_fd = shm_open(idx_path, O_CREAT | O_RDWR | O_EXCL, 0644);
+    if (g.idx_fd < 0) {
         std::fprintf(stderr, "[E::%s] shm_open(%s) failed: %s\n",
                      __func__, idx_path, std::strerror(errno));
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
         return -1;
     }
+    g.created = true;
 
-    /* 5b. /dev/shm capacity preflight. It runs after the orphan check in
-     *     step 5 so an orphan that fills /dev/shm is named rather than
-     *     masked by a generic out-of-space error.
-     *
-     * ftruncate on a tmpfs file lazily reserves space — it succeeds even
-     * when the requested size exceeds the tmpfs limit. The actual ENOSPC
-     * surfaces during pack_into's freads as SIGBUS / EFAULT when a page
-     * fault on a write to the mmap'd region cannot allocate a backing
-     * page. The user-visible failure is then a confusing
-     * `[fread] Bad address` from err_fread_noeof, with no indication
-     * that /dev/shm was the cause.
-     *
-     * statvfs("/dev/shm") tells us the tmpfs's available bytes up-front,
-     * so we can refuse cleanly with a message that points at the actual
-     * fix. Default tmpfs size on Linux is RAM/2 (e.g. 16 GB on a 32 GB
-     * c7a.4xlarge / c7i.4xlarge), so the hg38 FMI index (~17 GB
-     * total_size) doesn't fit out of the box on common AWS instance
-     * sizes. The remediation is a one-liner — `mount -o remount,size=…`
-     * — but only useful if the user knows that's the problem. */
-    {
-        struct statvfs svfs;
-        if (statvfs("/dev/shm", &svfs) == 0) {
-            /* f_bavail is in units of f_frsize (fundamental block size),
-             * not f_bsize (preferred I/O block size); on Linux tmpfs the
-             * two are equal but POSIX permits them to differ (e.g. ZFS
-             * reports f_frsize=1MiB), so use f_frsize for portability. */
-            uint64_t avail = (uint64_t)svfs.f_frsize * (uint64_t)svfs.f_bavail;
-            if ((uint64_t)layout.total_size > avail) {
-                std::fprintf(stderr,
-                    "[E::%s] /dev/shm has %llu bytes free but staging '%s' "
-                    "needs %llu bytes. Remount with larger size, e.g. "
-                    "`sudo mount -o remount,size=%lluG /dev/shm`.\n",
-                    __func__,
-                    (unsigned long long)avail,
-                    name,
-                    (unsigned long long)layout.total_size,
-                    (unsigned long long)((layout.total_size + (1ULL<<30) - 1) / (1ULL<<30) + 2));
-                /* Drop the empty segment created in step 5; the lock is
-                 * still held, so no other process can have attached. */
-                close(idx_fd);
-                shm_unlink(idx_path);
-                ctl_close(ctl_map, ctl_fd);
-                ctl_lock_release(ctl_lock);
-                bwa_shm_layout_free(&layout);
-                return -1;
-            }
+    /* /dev/shm preflight: tmpfs ftruncate succeeds past the limit and the pack
+     * would later die of SIGBUS, so refuse up front with the fix. Stages in
+     * progress allocate pages as they write, so their unallocated remainder is
+     * reserved too. Sampled before free space, so pages written in between count
+     * twice rather than not at all (conservative). f_bavail is in f_frsize units.
+     * A statvfs failure is not fatal. */
+    uint64_t staging = 0;
+    ctl_walk_map(g.ctl, staging_bytes_cb, &staging);
+    struct statvfs svfs;
+    if (BWA_SHM_STATVFS("/dev/shm", &svfs) == 0) {
+        uint64_t avail = (uint64_t)svfs.f_frsize * (uint64_t)svfs.f_bavail;
+        avail = avail > staging ? avail - staging : 0;
+        if ((uint64_t)layout.total_size > avail) {
+            std::fprintf(stderr,
+                "[E::%s] /dev/shm has %llu bytes free but staging '%s' "
+                "needs %llu bytes. Remount with larger size, e.g. "
+                "`sudo mount -o remount,size=%lluG /dev/shm`.\n",
+                __func__, (unsigned long long)avail, name,
+                (unsigned long long)layout.total_size,
+                (unsigned long long)((layout.total_size + (1ULL<<30) - 1) / (1ULL<<30) + 2));
+            return -1;
         }
-        /* statvfs failure (e.g. /dev/shm not present, ENOSYS on exotic
-         * kernels) is non-fatal — fall through and let the existing
-         * ftruncate / pack_into path run. The pre-existing
-         * (less helpful) error message in pack_into is still better
-         * than refusing to stage based on a missing diagnostic. */
     }
-
-    if (ftruncate(idx_fd, (off_t)layout.total_size) < 0) {
+    if (ftruncate(g.idx_fd, (off_t)layout.total_size) < 0) {
         std::fprintf(stderr, "[E::%s] ftruncate(%s, %llu) failed: %s\n",
                      __func__, idx_path,
                      (unsigned long long)layout.total_size, std::strerror(errno));
-        close(idx_fd);
-        shm_unlink(idx_path);
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
         return -1;
     }
-    void *idx_map = idx_segment_map(idx_fd, (size_t)layout.total_size,
-                                    PROT_READ | PROT_WRITE);
-    if (idx_map == MAP_FAILED) {
+    g.idx = idx_segment_map(g.idx_fd, (size_t)layout.total_size, PROT_READ | PROT_WRITE);
+    if (g.idx == MAP_FAILED) {
         std::fprintf(stderr, "[E::%s] mmap(%s) failed: %s\n",
                      __func__, idx_path, std::strerror(errno));
-        close(idx_fd);
-        shm_unlink(idx_path);
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
         return -1;
     }
-    if (bwa_shm_stage_map_hook) bwa_shm_stage_map_hook(idx_map, (size_t)layout.total_size);
+    ((bwa_shm_header_t *)g.idx)->reserved[0] = layout.stager_pid;   /* magic stays 0 */
+    ((bwa_shm_header_t *)g.idx)->reserved[1] = layout.stage_token;
 
-    /* 6. Stream-pack directly into the mmap'd region. No heap intermediate. */
-    if (bwa_shm_pack_into(&layout, (uint8_t *)idx_map) != 0) {
+    uint8_t *entry = (uint8_t *)g.ctl + h.next_write;
+    const int64_t l_mem = (int64_t)layout.total_size;
+    std::memcpy(entry,                   &l_mem, sizeof(int64_t));
+    std::memcpy(entry + sizeof(int64_t), name,   name_bytes);
+    h.n_entries  = (uint16_t)(h.n_entries + 1);
+    h.next_write = (uint16_t)(h.next_write + entry_bytes);
+    ctl_header_store(g.ctl, h);   /* after the entry bytes */
+    g.unlock();
+    g.released = true;
+
+    /* 3. Pack without the lock; the magic, written last, marks it complete. */
+    if (bwa_shm_stage_map_hook) bwa_shm_stage_map_hook(g.idx, (size_t)layout.total_size);
+    if (bwa_shm_pack_into(&layout, (uint8_t *)g.idx) != 0) {
         std::fprintf(stderr, "[E::%s] pack_into failed for %s\n", __func__, prefix);
-        munmap(idx_map, (size_t)layout.total_size);
-        close(idx_fd);
-        shm_unlink(idx_path);
-        ctl_close(ctl_map, ctl_fd);
-        ctl_lock_release(ctl_lock);
-        bwa_shm_layout_free(&layout);
         return -1;
     }
-    munmap(idx_map, (size_t)layout.total_size);
-    close(idx_fd);
 
-    /* 7. Append the entry to the control segment. */
-    uint8_t *entry = (uint8_t *)ctl_map + next_write;
-    int64_t l_mem = (int64_t)layout.total_size;
-    std::memcpy(entry,                       &l_mem, sizeof(int64_t));
-    std::memcpy(entry + sizeof(int64_t),     name,   name_bytes);
-    n_entries  = (uint16_t)(n_entries + 1);
-    next_write = (uint16_t)(next_write + entry_bytes);
-    std::memcpy((uint8_t *)ctl_map,     &n_entries,  sizeof(uint16_t));
-    std::memcpy((uint8_t *)ctl_map + 2, &next_write, sizeof(uint16_t));
-
-    ctl_close(ctl_map, ctl_fd);
-    ctl_lock_release(ctl_lock);
-
+    /* 4. `shm -d`, or a stager that misjudged us dead, may have removed our
+     *    entry or segment meanwhile; check without recreating anything. */
+    const bool locked = g.lock_registry(/*create=*/false);
+    if (!locked && errno != ENOENT) {
+        std::fprintf(stderr, "[E::%s] cannot retake the stager lock to finish '%s': %s\n",
+                     __func__, name, std::strerror(errno));
+        return -1;
+    }
+    if (!locked || ctl_find(g.ctl, name) == NULL || !g.still_ours()) {
+        std::fprintf(stderr, "[E::%s] '%s' was removed during staging (by bwa-mem3 shm -d "
+                     "or another stager)\n", __func__, name);
+        return -1;
+    }
+    g.created = false;
     std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) as %s\n",
-                 __func__, name,
-                 (unsigned long long)layout.total_size, idx_path);
-    bwa_shm_layout_free(&layout);
+                 __func__, name, (unsigned long long)layout.total_size, idx_path);
     return 0;
 }
 
@@ -964,11 +1110,18 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
         return NULL;
     }
 
-    /* Validate the on-segment header. */
+    /* Validate the on-segment header. Acquire-load the magic first: it is
+     * published last, so once it reads BWA_SHM_MAGIC the rest is in place. A
+     * zero magic is a stage still in progress or one that was interrupted. */
+    const uint64_t magic = __atomic_load_n((const uint64_t *)m, __ATOMIC_ACQUIRE);
     bwa_shm_header_t hdr;
     std::memcpy(&hdr, m, sizeof(hdr));
-    if (hdr.magic != BWA_SHM_MAGIC) {
-        std::fprintf(stderr, "[E::%s] bad magic in %s\n", __func__, idx_path);
+    if (magic != BWA_SHM_MAGIC) {
+        if (magic == 0)
+            std::fprintf(stderr, "[M::%s] '%s' is not fully staged (being staged or "
+                         "interrupted); loading from disk\n", __func__, name);
+        else
+            std::fprintf(stderr, "[E::%s] bad magic in %s\n", __func__, idx_path);
         munmap(m, len);
         return NULL;
     }
@@ -1084,7 +1237,8 @@ static void print_shm_usage(void)
         "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]\n\n"
         "Options:\n"
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
-        "  -l        list names of indices in shared memory\n"
+        "  -l        list indices in shared memory; a third column flags\n"
+        "            incomplete, missing or unusable entries\n"
         "  --meth    stage a `bwa-mem3 index --meth` index — auto-appends\n"
         "            `.meth` to <idxbase>, mirroring `mem --meth`\n"
         "  -u INT    densify the staged SA sample table to sample-rate shift INT\n"
@@ -1107,10 +1261,11 @@ static void print_shm_usage(void)
         "`index`, `shm`, and `mem` (the c2t suffix is auto-appended).\n\n"
         "Footgun: if you re-build the index, run `bwa-mem3 shm -d` first.\n"
         "There is no staleness check -- a stale segment will silently mis-align.\n\n"
-        "Stuck-lock recovery: concurrent stagers are serialized by a named\n"
-        "       POSIX semaphore. If a stager is kill -9'd mid-stage, the lock\n"
-        "       persists and subsequent stages block forever. `bwa-mem3 shm -d`\n"
-        "       unlinks the semaphore alongside the registry; rerun afterwards.\n\n"
+        "Interrupted stage: `shm -l` marks it `incomplete` and `mem` loads\n"
+        "       from disk; rerun `bwa-mem3 shm <idxbase>` to reclaim and restage.\n"
+        "       Stagers hold a named POSIX semaphore only for a few ms of\n"
+        "       registry update; if one is killed inside that window, later\n"
+        "       stages block, and `bwa-mem3 shm -d` unlinks the semaphore.\n\n"
         "macOS: POSIX shm has implementation-defined per-segment caps; large\n"
         "       indices may simply fail to stage. Prefer Linux for production.\n"
         "Linux: /dev/shm defaults to ~50%% of RAM on bare metal; in containers\n"

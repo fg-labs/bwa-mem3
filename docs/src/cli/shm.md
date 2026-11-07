@@ -52,26 +52,39 @@ Removes every registered bwa-mem3 shared-memory segment on the machine. This is
 the correct clean-up command after a batch job and the required step before
 re-building the index (see the footgun warning below).
 
-An interrupted stage can leave a segment without a registry entry. A later
-stage with the same basename fails and names the orphaned segment; it does not
-report success, adopt potentially incomplete data, or overwrite the segment.
-The orphan is reported before the `/dev/shm` free-space check, so an orphan
-that fills `/dev/shm` is still named. `shm -d` cannot find these unregistered
-segments. After ensuring no stager is active, remove the named object with
-`shm_unlink(3)` (on Linux, unlink its file under `/dev/shm`, for example
-`/dev/shm/bwaidx-ref.fa`), then stage again. If the interrupted stager was
-killed while holding the staging lock, a later stage blocks in `sem_wait`
-instead of reporting the orphan. Stop every stager blocked this way first:
-unlinking the semaphore does not wake a process already waiting on it. Then
-release the lock: `shm -d` unlinks the `/bwactl_lock` semaphore along with every
-registered segment (see the stuck-lock note below), or remove only the
-semaphore with `sem_unlink(3)` (on Linux, `/dev/shm/sem.bwactl_lock`). Then
-remove the orphan and start a new stage.
+A stage that is killed (Ctrl-C, `kill`, a crash) or that exits on a fatal read
+error leaves an incomplete segment: `shm -l` lists it as `incomplete`, and `mem`
+loads that index from disk instead of attaching. A stage that fails with an
+ordinary error removes its own segment and registry entry. Rerun
+`bwa-mem3 shm <idxbase>` to reclaim an incomplete segment: the new stage sees
+that the old stager is gone, removes the segment and stages again.
+
+While a stage is running, a second `shm <idxbase>` for the same basename prints
+`'<name>' is being staged by PID N; waiting` and waits, holding no lock, then
+returns as soon as the first stage finishes (or stages the index itself if the
+first stage died or failed). After an hour it gives up with
+`gave up after 3600 s waiting for PID N to stage '<name>'; if PID N is not a
+running bwa-mem3 shm, run bwa-mem3 shm -d`, for example when PID N was reused by
+an unrelated process. `shm -d` during a stage unlinks the segment and that stage
+then fails; the stager's memory is freed only when it exits.
+
+A complete segment with no registry entry is never adopted or overwritten: a
+stage with the same basename fails and names it. `shm -d` cannot find such an
+unregistered segment. Remove it with `shm_unlink(3)` (on Linux, unlink its file
+under `/dev/shm`, for example `/dev/shm/bwaidx-ref.fa`), then stage again.
 
 ### `-l` — list staged indices
 
-Prints the names of all currently staged segments. Useful to confirm that
-staging succeeded before launching alignment jobs.
+Prints the name and size in bytes of each registered segment, tab-separated,
+one per line. A third column flags an entry `mem` will not attach to:
+
+- `incomplete`: its stage is still running or was interrupted;
+- `missing`: the entry has no segment (a stage that lost its lock; the next
+  stage drops the entry);
+- `unusable`: the segment cannot be opened, is not a bwa-mem3 index of this
+  version, or is shorter than its header declares.
+
+Useful to confirm that staging succeeded before launching alignment jobs.
 
 ### `--meth` — stage a methylation index
 
@@ -217,7 +230,9 @@ exceed the load time saved.
 >
 > After creating the (still empty) index segment, and before sizing or
 > filling it, `bwa-mem3 shm` calls `statvfs("/dev/shm")` and compares the
-> available bytes against the index's `total_size`. Creating the segment
+> available bytes, less the part of each other stage still in progress that it
+> has not yet written (tmpfs allocates pages only as they are written), against
+> the index's `total_size`. Creating the segment
 > first means an orphaned segment is reported by name before this check can
 > fail. If `/dev/shm` is too small, the stage unlinks the empty segment and
 > aborts cleanly with an `[E::bwa_shm_stage]` message that names `/dev/shm`,
@@ -231,16 +246,19 @@ exceed the load time saved.
 > 32 GB get ~16 GB of `/dev/shm`, which is just under the index size — a
 > `remount,size=28g` is the documented fix).
 >
-> **Note — Stuck-lock recovery**
+> **Note — Staging lock**
 >
-> Concurrent `bwa-mem3 shm <prefix>` invocations are serialized by a named
-> POSIX semaphore (`/bwactl_lock`) so the registry stays consistent. POSIX
-> semaphores have no `SEM_UNDO` equivalent: if a stager segfaults or is
-> `kill -9`'d while holding the lock, every subsequent stage will block in
-> `sem_wait` forever. Run `bwa-mem3 shm -d` to recover — it unlinks the
-> semaphore alongside the registry, freeing the next stager. Unlinking does not
-> wake a stager already blocked in `sem_wait`: stop any such stager before
-> running `shm -d`, then start a new stage.
+> Concurrent `bwa-mem3 shm <prefix>` invocations take a named POSIX semaphore
+> (`/bwactl_lock`) while they update the registry, which takes milliseconds.
+> The index is packed without the lock, so interrupting a stage during the
+> pack leaves the lock free. POSIX semaphores have no `SEM_UNDO` equivalent:
+> only a stager killed inside the short registry update leaves the lock held,
+> and later stages then block in `sem_wait`. Run `bwa-mem3 shm -d` to recover:
+> it takes the lock for its walk of the registry, so no stage rewrites the
+> registry under it. A lock still held after 5 s is taken to be one left by a
+> killed stager: `shm -d` warns and proceeds without it, and unlinks the
+> semaphore alongside the registry. Unlinking does not wake a stager already
+> blocked in `sem_wait`, so stop any such stager first, then start a new stage.
 
 ---
 
