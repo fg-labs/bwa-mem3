@@ -86,10 +86,16 @@ static inline void aln_meth_hit(void *, const gap_entry_t *, bwtint_t, bwtint_t)
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
 void aln_meth_report(int, int, const aln_meth_read_t *);
-// Trims a finished read to its main hit (an incomplete read always; a complete one when it has more
-// than max_xa_hits + 1 loci), then releases search-only state: spare capacity and raw_cigar.
+// Finishes a read (stores its occ as hits; see aln_meth_store_loci), then trims it to its main hit
+// (an incomplete read always; a complete one when it has more than max_xa_hits + 1 loci).
 void aln_meth_trim(aln_meth_read_t *, int);
+// Moves every occ locus to hits, in order (main then indexes hits), and frees occ. No-op when occ
+// is empty, as it is once a read is finished.
+void aln_meth_store_loci(aln_meth_read_t *);
 void aln_meth_redraw(aln_meth_read_t *, uint64_t);
+// aln_meth_redraw over a finished read's hits (a duplicate copy's draw): the same draw, the same
+// rng. A copy of aln_meth_redraw's logic, whose body the search kernel's code depends on: change both.
+void aln_meth_redraw_hits(aln_meth_read_t *, uint64_t);
 uint64_t aln_meth_draw_seed(const aln_meth_ref_t *, int, int64_t);
 void aln_meth_flush_parked(aln_meth_group_t *);
 }

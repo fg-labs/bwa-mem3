@@ -7,6 +7,7 @@
 #include "aln_test_ref.h"
 #include "../framework/stderr_capture.h"
 #include "../framework/run_in_child.h"
+#include "../framework/temp_dir.h"
 #include "../../src/aln/aln_main.h"
 #include "../../src/aln/aln_meth.h"
 #include "../../src/aln/aln_meth_search.h"
@@ -34,6 +35,20 @@
 #include <limits>
 
 namespace {
+
+// A finished read's stored CIGAR, as a vector.
+std::vector<uint32_t> cigar_of(const bwa_aln::aln_meth_read_t &r, const bwa_aln::aln_meth_hit_t &h)
+{
+    const uint32_t *c = bwa_aln::aln_meth_hit_cigar(r, h);
+    return std::vector<uint32_t>(c, c + h.n_cig);
+}
+
+// Stores hand-built reads' loci as hits, as finishing does. It skips finishing's drop of an
+// incomplete read's worse-cost loci: the tests that use it pick each end's loci themselves.
+void store_pair(bwa_aln::aln_meth_read_t *r[2])
+{
+    bwa_aln::aln_meth_store_loci(r[0]); bwa_aln::aln_meth_store_loci(r[1]);
+}
 
 std::string conv(std::string s, char from, char to)
 {
@@ -931,6 +946,7 @@ TEST_CASE("aln_meth: trim merges existing terminal clips safely for primary and 
                                      : std::vector<uint32_t>{57u<<4,3u<<4|4};
             result.occ.push_back(std::move(o));
         }
+        ba::aln_meth_store_loci(&result);
         ba::aln_meth_finish_se(&mr,&mo,opt,3,1,read,&result);
         auto span=[](const ba::bwa_cigar_t *c,int count) {
             int total=0;for(int k=0;k<count;++k) if(__cigar_op(c[k])!=2) total+=__cigar_len(c[k]);
@@ -975,6 +991,7 @@ TEST_CASE("aln_meth: an XA alternative too long for the legacy edit field drops 
     alt.pos=c1_off+1000;alt.alignment.rb=alt.pos;alt.alignment.re=alt.pos+144;
     alt.alignment.cigar={72u<<4,256u<<4|1,72u<<4};
     result.occ.push_back(std::move(alt));
+    ba::aln_meth_store_loci(&result);
     ba::aln_meth_finish_se(&mr,&mo,opt,3,1,read,&result);
     CHECK((int)read->type==BWA_TYPE_UNIQUE);
     CHECK((int64_t)read->pos==c1_off+100);
@@ -1007,14 +1024,14 @@ TEST_CASE("aln_meth: retained cost window counts all worse strata with wide arit
         }
     };
     populate(0);ba::aln_meth_slot_finish(&slot);
-    CHECK(result.c1==1); CHECK(result.c2==3); CHECK(result.occ.size()==4);
-    CHECK(result.occ[result.main].pos==100);
+    CHECK(result.c1==1); CHECK(result.c2==3); CHECK(result.hits.size()==4);
+    CHECK(result.hits[result.main].pos==100);
     opt->mode|=BWA_MODE_NONSTOP;
     populate(0);ba::aln_meth_slot_finish(&slot);
-    CHECK(result.c1==1); CHECK(result.c2==4); CHECK(result.occ.size()==5);
+    CHECK(result.c1==1); CHECK(result.c2==4); CHECK(result.hits.size()==5);
     opt->mode&=~BWA_MODE_NONSTOP;opt->s_mm=INT_MAX;
     populate(INT_MAX-4);ba::aln_meth_slot_finish(&slot);
-    CHECK(result.c1==1); CHECK(result.c2==4); CHECK(result.occ.size()==5);
+    CHECK(result.c1==1); CHECK(result.c2==4); CHECK(result.hits.size()==5);
     free(opt);
 }
 
@@ -1049,7 +1066,7 @@ TEST_CASE("aln_meth: a dropped unrepresentable window that could compete marks t
     free(opt);
 }
 
-TEST_CASE("aln_meth: finished reads release search capacity, raw CIGARs and an incomplete read's worse loci")
+TEST_CASE("aln_meth: finished reads store compact loci and drop an incomplete read's worse loci")
 {
     namespace ba = bwa_aln;
     ba::gap_opt_t *opt=ba::gap_init_opt();
@@ -1066,6 +1083,7 @@ TEST_CASE("aln_meth: finished reads release search capacity, raw CIGARs and an i
         for(int k=0;k<6;++k) {
             ba::aln_meth_occ_t o;
             o.rid=0; o.hyp=1; o.strand=0; o.pos=100+k; o.cost=costs[k];
+            o.alignment.rb=o.pos; o.alignment.re=o.pos+32;
             o.alignment.raw_cigar={32u<<4};
             o.alignment.cigar={32u<<4};
             result.occ.push_back(std::move(o));
@@ -1073,17 +1091,16 @@ TEST_CASE("aln_meth: finished reads release search capacity, raw CIGARs and an i
         result.flags=flags;
     };
     auto released=[&]() {
-        // shrink_to_fit is non-binding in the standard; libstdc++ and libc++ both honor it.
-        CHECK(result.occ.capacity()==result.occ.size());
-        for(const auto &o:result.occ) {
-            CHECK(o.alignment.raw_cigar.empty()); CHECK(o.alignment.raw_cigar.capacity()==0);
-            CHECK(o.alignment.cigar==std::vector<uint32_t>{32u<<4});
-        }
+        // The search's loci are freed; the stored ones are sized exactly, one-op CIGARs inline.
+        CHECK(result.occ.empty()); CHECK(result.occ.capacity()==0);
+        CHECK(result.hits.capacity()==result.hits.size());
+        CHECK(result.cig.empty());
+        for(const auto &o:result.hits) CHECK(cigar_of(result,o)==std::vector<uint32_t>{32u<<4});
     };
     SUBCASE("paired, complete: every retained locus stays for pairing") {
         slot.keep=ba::ALN_METH_KEEP_STRATA; populate(0); ba::aln_meth_slot_finish(&slot);
-        REQUIRE(result.occ.size()==6); CHECK(result.c1==3); CHECK(result.c2==3);
-        for(int k=0;k<6;++k) CHECK(result.occ[k].pos==(bwtint_t)(100+k));
+        REQUIRE(result.hits.size()==6); CHECK(result.c1==3); CHECK(result.c2==3);
+        for(int k=0;k<6;++k) CHECK(result.hits[k].pos==(bwtint_t)(100+k));
         released();
     }
     // Oracle for an incomplete read: the same read finished complete keeps all six loci; its
@@ -1098,20 +1115,20 @@ TEST_CASE("aln_meth: finished reads release search capacity, raw CIGARs and an i
                 slot.rng=seed;
                 populate(0); ba::aln_meth_slot_finish(&slot);
                 REQUIRE(result.main>=0);
-                const bwtint_t expect=result.occ[result.main].pos;
+                const bwtint_t expect=result.hits[result.main].pos;
                 populate(ba::ALN_METH_BIND_BEST); ba::aln_meth_slot_finish(&slot);
                 CHECK(result.c1==3); CHECK(result.c2==3);
                 REQUIRE(result.main>=0);
-                CHECK(result.occ[result.main].pos==expect);
-                CHECK(result.occ[result.main].cost==0);
+                CHECK(result.hits[result.main].pos==expect);
+                CHECK(result.hits[result.main].cost==0);
                 if (keep==ba::ALN_METH_KEEP_COPIES) {
                     // Copies redraw over the best-cost loci, so all of them stay, in order.
-                    REQUIRE(result.occ.size()==3);
-                    CHECK(result.occ[0].pos==100); CHECK(result.occ[1].pos==102); CHECK(result.occ[2].pos==104);
-                    for(const auto &o:result.occ) CHECK(o.cost==0);
+                    REQUIRE(result.hits.size()==3);
+                    CHECK(result.hits[0].pos==100); CHECK(result.hits[1].pos==102); CHECK(result.hits[2].pos==104);
+                    for(const auto &o:result.hits) CHECK(o.cost==0);
                 } else {
                     // Kept only for pairing, which never reads an incomplete read past its main hit.
-                    REQUIRE(result.occ.size()==1); CHECK(result.main==0);
+                    REQUIRE(result.hits.size()==1); CHECK(result.main==0);
                 }
                 drawn.insert(expect);
                 released();
@@ -1121,14 +1138,151 @@ TEST_CASE("aln_meth: finished reads release search capacity, raw CIGARs and an i
     }
     SUBCASE("single-end: the trim to the main hit also drops the search's capacity") {
         slot.keep=0; populate(0); ba::aln_meth_slot_finish(&slot);
-        REQUIRE(result.occ.size()==1); CHECK(result.occ[0].cost==0);
+        REQUIRE(result.hits.size()==1); CHECK(result.hits[0].cost==0);
         released();
     }
     SUBCASE("aln_meth_trim releases capacity on its own") {
         populate(0); result.main=0; ba::aln_meth_trim(&result,1); // 6 loci > max_xa_hits+1
-        REQUIRE(result.occ.size()==1); released();
+        REQUIRE(result.hits.size()==1); released();
     }
     free(opt);
+}
+
+TEST_CASE("aln_meth: stored loci keep multi-op CIGARs in the read's table, through copies and trims")
+{
+    namespace ba = bwa_aln;
+    const std::vector<std::vector<uint32_t>> cigars={{50u<<4},{20u<<4,1u<<4|1,29u<<4},{50u<<4},
+        {3u<<4|4,47u<<4},{10u<<4,2u<<4|2,40u<<4}};
+    ba::aln_meth_read_t result;
+    for(int k=0;k<(int)cigars.size();++k) {
+        ba::aln_meth_occ_t o;o.rid=k%2;o.hyp=k%2;o.strand=1-k%2;o.pos=1000+100*k;o.cost=3*k;
+        o.n_mm=k;o.n_gapo=k%2;o.n_gape=2*k;o.n_conv=7+k;o.n_ins=k;o.n_del=k+1;
+        o.alignment.rb=o.pos;o.alignment.re=o.pos+48+k;o.alignment.cigar=cigars[k];
+        o.alignment.raw_cigar={9u<<4};
+        result.occ.push_back(o);
+    }
+    result.main=3;
+    ba::aln_meth_store_loci(&result);
+    CHECK(result.occ.empty());
+    REQUIRE(result.hits.size()==cigars.size());
+    CHECK(result.cig.size()==3+2+3); // only the multi-op CIGARs are in the table
+    for(int k=0;k<(int)cigars.size();++k) {
+        CAPTURE(k);
+        const auto &h=result.hits[k];
+        CHECK(std::make_tuple((int)h.rid,(int)h.hyp,(int)h.strand,h.pos,(int)h.cost,(int)h.span)==
+              std::make_tuple(k%2,k%2,1-k%2,(bwtint_t)(1000+100*k),3*k,48+k));
+        CHECK(std::make_tuple((int)h.n_mm,(int)h.n_gapo,(int)h.n_gape,(int)h.n_conv)==
+              std::make_tuple(k,k%2,2*k,7+k));
+        CHECK(cigar_of(result,h)==cigars[k]);
+    }
+    ba::aln_meth_store_loci(&result); // no-op once finished
+    CHECK(result.hits.size()==cigars.size());
+    // A copy owns its own table.
+    ba::aln_meth_read_t copy(result);
+    for(int k=0;k<(int)cigars.size();++k) CHECK(cigar_of(copy,copy.hits[k])==cigars[k]);
+    // Trimming to a multi-op main hit keeps exactly its CIGAR in a fresh table.
+    ba::aln_meth_trim(&copy,1);
+    REQUIRE(copy.hits.size()==1);CHECK(copy.main==0);CHECK(copy.hits.capacity()==1);
+    CHECK(copy.hits[0].pos==1300);CHECK(cigar_of(copy,copy.hits[0])==cigars[3]);
+    CHECK(copy.cig.size()==2);CHECK(copy.cig.capacity()==2);
+    // ... and to a one-op main hit leaves no table at all.
+    result.main=2;ba::aln_meth_trim(&result,1);
+    REQUIRE(result.hits.size()==1);CHECK(result.hits[0].pos==1200);
+    CHECK(cigar_of(result,result.hits[0])==cigars[2]);CHECK(result.cig.capacity()==0);
+}
+
+TEST_CASE("aln_meth: trimming an unstored read stores only its main locus")
+{
+    namespace ba = bwa_aln;
+    const std::vector<std::vector<uint32_t>> cigars={{20u<<4,1u<<4|1,29u<<4},{},{10u<<4,2u<<4|2,40u<<4},{50u<<4}};
+    for(int main_k=0;main_k<(int)cigars.size();++main_k) {
+        CAPTURE(main_k);
+        ba::aln_meth_read_t result;
+        for(int k=0;k<(int)cigars.size();++k) {
+            ba::aln_meth_occ_t o;o.rid=0;o.hyp=0;o.strand=0;o.pos=1000+100*k;o.cost=0;
+            o.alignment.rb=o.pos;o.alignment.re=o.pos+50;o.alignment.cigar=cigars[k];
+            result.occ.push_back(o);
+        }
+        result.main=main_k;
+        ba::aln_meth_trim(&result,1); // 4 loci > max_xa_hits+1
+        CHECK(result.occ.empty());
+        REQUIRE(result.hits.size()==1);CHECK(result.hits.capacity()==1);CHECK(result.main==0);
+        CHECK(result.hits[0].pos==(bwtint_t)(1000+100*main_k));
+        CHECK(cigar_of(result,result.hits[0])==cigars[main_k]);
+        const size_t table=cigars[main_k].size()>1?cigars[main_k].size():0;
+        CHECK(result.cig.size()==table);CHECK(result.cig.capacity()==table);
+        if(cigars[main_k].size()!=1) CHECK(result.hits[0].cig==0); // no stale table offset
+    }
+}
+
+TEST_CASE("aln_meth: a locus that does not fit its stored record is fatal, not truncated")
+{
+    namespace ba = bwa_aln;
+    bwa_tests::TempDir dir("aln_meth_fit");
+    const std::string err_path=dir.path()+"/stderr";
+    // Each case breaks one guard in meth_hit; case 0 fits.
+    for(int bad=0;bad<13;++bad) {
+        CAPTURE(bad);
+        ba::aln_meth_read_t result;
+        ba::aln_meth_occ_t o;o.rid=0;o.hyp=0;o.strand=0;o.pos=1000;o.cost=3;
+        o.alignment.rb=o.pos;o.alignment.re=o.pos+50;o.alignment.cigar={50u<<4};
+        switch(bad) {
+            case 1: o.cost=(int64_t)INT_MAX+1; break;
+            case 2: o.cost=-1; break;
+            case 3: o.n_mm=256; break;
+            case 4: o.n_mm=-1; break;
+            case 5: o.n_gapo=256; break;
+            case 6: o.n_gapo=-1; break;
+            case 7: o.n_gape=256; break;
+            case 8: o.n_gape=-1; break;
+            case 9: o.alignment.re=o.alignment.rb+(int64_t)INT32_MAX+1; break;
+            case 10: o.alignment.re=o.alignment.rb+(int64_t)INT32_MIN-1; break;
+            case 11: o.alignment.rb=o.pos+1; o.alignment.re=o.alignment.rb+50; break; // pos must be the start
+            case 12: o.alignment.rb=o.pos-1; o.alignment.re=o.alignment.rb+50; break;
+        }
+        result.occ.push_back(o);result.main=0;
+        const int status=bwa_tests::run_in_child([&result] {
+            // The fatal exit() must not run the inherited index fixture's destructor, which
+            // removes the index the later tests share.
+            std::atexit([] { _exit(1); });
+            ba::aln_meth_store_loci(&result);
+            _exit(result.hits.size()==1 && result.hits[0].cost==3 ? 0 : 2);
+        },err_path.c_str());
+        std::ifstream in(err_path);
+        const std::string err((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+        REQUIRE(WIFEXITED(status));
+        if(bad==0) { CHECK(WEXITSTATUS(status)==0); CHECK(err.empty()); }
+        else {
+            CHECK(WEXITSTATUS(status)==1);
+            CHECK(err.find("ERROR: --meth locus does not fit its stored record")!=std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("aln_meth: a finished read's redraw draws what the search-time redraw would")
+{
+    namespace ba = bwa_aln;
+    for(int moved : {0,1}) {
+        CAPTURE(moved);
+        ba::aln_meth_read_t search;
+        const int costs[7]={3,0,0,6,0,0,0}, convs[7]={0,2,1,0,1,3,1};
+        for(int k=0;k<7;++k) {
+            ba::aln_meth_occ_t o;o.rid=0;o.hyp=1;o.strand=0;o.pos=100+k;o.cost=costs[k];o.n_conv=convs[k];
+            o.alignment.rb=o.pos;o.alignment.re=o.pos+50;o.alignment.cigar={50u<<4};
+            search.occ.push_back(o);
+        }
+        search.main=0;search.n_conv_moved=moved;
+        ba::aln_meth_read_t stored(search);ba::aln_meth_store_loci(&stored);
+        std::set<int> drawn;
+        for(uint64_t seed=0;seed<64;++seed) {
+            CAPTURE(seed);
+            search.main=stored.main=0;
+            ba::aln_meth_redraw(&search,seed);ba::aln_meth_redraw_hits(&stored,seed);
+            CHECK(stored.main==search.main);
+            drawn.insert(stored.main);
+        }
+        CHECK(drawn.size()==(moved?3u:5u)); // the draw ranges over every eligible tie
+    }
 }
 
 TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their own would")
@@ -1158,7 +1312,7 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
         REQUIRE(n_dups==n-1); // every copy took the duplicate path
         REQUIRE(batch[0].flags!=0);
         REQUIRE(batch[0].c1==31); REQUIRE(batch[0].c2>=1); // the draw matters and worse loci were dropped
-        CHECK(batch[0].occ.size()==1u); // an incomplete read keeps only its main hit once its copies are drawn
+        CHECK(batch[0].hits.size()==1u); // an incomplete read keeps only its main hit once its copies are drawn
         std::set<bwtint_t> drawn;
         for (int i=0;i<n;++i) {
             CAPTURE(i);
@@ -1166,14 +1320,22 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
             ba::aln_meth_read_t single; ba::aln_dup_state_t single_dup;
             ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads+i,opt,1,1,i,keep_strata,3,&single_dup,&single);
             REQUIRE(batch[i].main>=0); REQUIRE(single.main>=0);
-            const auto &a=batch[i].occ[batch[i].main], &b=single.occ[single.main];
-            CHECK(std::make_tuple(a.rid,a.hyp,a.strand,a.pos,a.cost)==std::make_tuple(b.rid,b.hyp,b.strand,b.pos,b.cost));
+            // The whole stored record: placement, counts, span and CIGAR.
+            auto same=[&](const ba::aln_meth_hit_t &x,const ba::aln_meth_hit_t &y) {
+                CHECK(std::make_tuple(x.rid,x.hyp,x.strand,x.pos,x.cost,x.span)==
+                      std::make_tuple(y.rid,y.hyp,y.strand,y.pos,y.cost,y.span));
+                CHECK(std::make_tuple(x.n_mm,x.n_gapo,x.n_gape,x.n_conv)==
+                      std::make_tuple(y.n_mm,y.n_gapo,y.n_gape,y.n_conv));
+                CHECK(cigar_of(batch[i],x)==cigar_of(single,y));
+            };
+            const auto &a=batch[i].hits[batch[i].main], &b=single.hits[single.main];
+            same(a,b);
             CHECK(batch[i].c1==single.c1); CHECK(batch[i].c2==single.c2);
-            REQUIRE(batch[i].occ.size()==single.occ.size());
+            REQUIRE(batch[i].hits.size()==single.hits.size());
             CHECK(batch[i].main==single.main);
-            for (size_t k=0;k<batch[i].occ.size();++k) {
-                const auto &x=batch[i].occ[k], &y=single.occ[k];
-                CHECK(std::make_tuple(x.rid,x.hyp,x.strand,x.pos,x.cost)==std::make_tuple(y.rid,y.hyp,y.strand,y.pos,y.cost));
+            for (size_t k=0;k<batch[i].hits.size();++k) {
+                const auto &x=batch[i].hits[k], &y=single.hits[k];
+                same(x,y);
                 CHECK(x.cost==a.cost);
             }
             drawn.insert(a.pos);
@@ -1189,14 +1351,14 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
         auto *reads=ba::bwa_read_seq(input,n,&got,BWA_MODE_COMPREAD,0);
         REQUIRE(got==n);
         std::vector<ba::aln_meth_read_t> batch(n);
-        for (auto &b:batch) b.occ.reserve(256);
+        for (auto &b:batch) b.hits.reserve(256);
         ba::aln_dup_state_t dup;
         REQUIRE(ba::aln_meth_search_batch(bwt,&mr,&mo,n,reads,opt,2,1,0,1,3,&dup,batch.data())==n-1);
-        REQUIRE(batch[0].flags==0); REQUIRE(batch[0].occ.size()>1);
+        REQUIRE(batch[0].flags==0); REQUIRE(batch[0].hits.size()>1);
         for (int i=1;i<n;++i) {
             CAPTURE(i);
-            CHECK(batch[i].occ.size()==batch[0].occ.size());
-            CHECK(batch[i].occ.capacity()==batch[i].occ.size());
+            CHECK(batch[i].hits.size()==batch[0].hits.size());
+            CHECK(batch[i].hits.capacity()==batch[i].hits.size());
         }
         ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
     }
@@ -1248,7 +1410,7 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::aln_meth_hit(&slot,&exact,row,row); // repeated interval across flushes
     CHECK(slot.pend.empty());
     ba::aln_meth_slot_finish(&slot);
-    REQUIRE(result.occ.size()==1);CHECK(result.c1==1);
+    REQUIRE(result.hits.size()==1);CHECK(result.c1==1);
     // A terminal deletion is charged on the raw CIGAR even though display removes it.
     for (int penalty : {0, 11, INT_MAX}) {
         opt->s_gapo=penalty;
@@ -1298,9 +1460,10 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::aln_meth_hit(&slot,&longer,row,row); // lower reward evaluated first
     ba::aln_meth_hit(&slot,&exact,row,row); // better window hidden behind the cap
     core.state=ba::GAP_SLOT_PARKED;
-    ba::aln_meth_flush_parked(&group);ba::aln_meth_slot_finish(&slot);
+    ba::aln_meth_flush_parked(&group);
+    REQUIRE(result.occ.size()==1);CHECK(result.occ[0].alignment.reward < 50);
+    ba::aln_meth_slot_finish(&slot);
     REQUIRE(result.main>=0);CHECK(result.flags!=0);CHECK(result.n_rescored==1);
-    CHECK(result.occ[result.main].alignment.reward < 50);
     ba::bwase_initialize(); // standalone caller, before any finish workers
     mr.bns->n_holes=1; mr.bns->ambs=&ambiguous;
     ba::aln_meth_finish_se(&mr,&mo,opt,3,1,reads,&result);
@@ -1387,7 +1550,7 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     CHECK(slot.pend.empty());
     ba::aln_meth_slot_finish(&slot);
     CHECK((results[0].main >= 0) == retained);
-    if (retained) CHECK(results[0].occ[results[0].main].pos == 500);
+    if (retained) CHECK(results[0].hits[results[0].main].pos == 500);
     // Reuse the same slot for a later read: the cap and stop state belong to one read only.
     ba::aln_meth_slot_start(&slot, reads + 1, results + 1, 1, 3, 1);
     CHECK(slot.stop == 0);
@@ -1536,22 +1699,20 @@ TEST_CASE("aln_meth: mixed seed eligibility and caps survive real slot reuse and
             CHECK(actual.n_rescored==single.n_rescored);
             CHECK(actual.c1==single.c1); CHECK(actual.c2==single.c2);
             CHECK(actual.main==single.main);
-            REQUIRE(actual.occ.size()==single.occ.size());
-            for (size_t k=0;k<actual.occ.size();++k) {
-                const auto &a=actual.occ[k], &b=single.occ[k];
-                CHECK(std::make_tuple(a.rid,a.hyp,a.strand,a.pos,a.cost)==
-                      std::make_tuple(b.rid,b.hyp,b.strand,b.pos,b.cost));
-                // slot_finish releases raw_cigar; the raw path survives in its counts.
-                CHECK(a.alignment.raw_cigar.empty()); CHECK(b.alignment.raw_cigar.empty());
-                CHECK(std::make_tuple(a.n_mm,a.n_gapo,a.n_gape,a.n_ins,a.n_del,a.n_conv)==
-                      std::make_tuple(b.n_mm,b.n_gapo,b.n_gape,b.n_ins,b.n_del,b.n_conv));
-                CHECK(a.alignment.cigar==b.alignment.cigar);
-                CHECK(std::make_tuple(a.alignment.reward,a.alignment.rb,a.alignment.re)==
-                      std::make_tuple(b.alignment.reward,b.alignment.rb,b.alignment.re));
+            // Finishing frees the search's loci; the stored ones keep what pairing and output read.
+            CHECK(actual.occ.empty()); CHECK(single.occ.empty());
+            REQUIRE(actual.hits.size()==single.hits.size());
+            for (size_t k=0;k<actual.hits.size();++k) {
+                const auto &a=actual.hits[k], &b=single.hits[k];
+                CHECK(std::make_tuple(a.rid,a.hyp,a.strand,a.pos,a.cost,a.span)==
+                      std::make_tuple(b.rid,b.hyp,b.strand,b.pos,b.cost,b.span));
+                CHECK(std::make_tuple(a.n_mm,a.n_gapo,a.n_gape,a.n_conv)==
+                      std::make_tuple(b.n_mm,b.n_gapo,b.n_gape,b.n_conv));
+                CHECK(cigar_of(actual,a)==cigar_of(single,b));
             }
             if (budget==4596 && max_entries==2000000) {
                 CHECK(actual.flags==0);
-                CHECK_FALSE(actual.occ.empty()); // Pending exact hits must reach final refinement.
+                CHECK_FALSE(actual.hits.empty()); // Pending exact hits must reach final refinement.
             }
         }
         ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
@@ -1661,7 +1822,7 @@ TEST_CASE("aln_meth: zero-cost stopping preserves an independently enumerated ti
             ba::aln_meth_read_t result;ba::aln_dup_state_t dup;
             REQUIRE(ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads,opt,2,read_no,0,1,1000,&dup,&result)==0);
             CHECK(result.flags==0);
-            for(const auto &o:result.occ) actual.emplace(o.rid,o.hyp,o.strand,o.pos,o.cost);
+            for(const auto &o:result.hits) actual.emplace(o.rid,o.hyp,o.strand,o.pos,o.cost);
             CHECK(actual==expected);
             ba::bwa_free_read_seq(n,reads);ba::bwa_seq_close(input);
         }
@@ -1721,7 +1882,7 @@ TEST_CASE("aln_meth: nonzero stopping preserves independent candidate strata wit
             ba::aln_meth_read_t result;ba::aln_dup_state_t dup;
             REQUIRE(ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads,opt,2,read_no,0,1,1000,&dup,&result)==0);
             CHECK(result.flags==0);
-            for(const auto &o:result.occ) actual.emplace(o.rid,o.hyp,o.strand,o.pos,o.cost);
+            for(const auto &o:result.hits) actual.emplace(o.rid,o.hyp,o.strand,o.pos,o.cost);
             CHECK(actual==expected);
             const int complete_c1=result.c1,complete_c2=result.c2;
             ba::bwa_free_read_seq(n,reads);ba::bwa_seq_close(input);
@@ -1731,7 +1892,7 @@ TEST_CASE("aln_meth: nonzero stopping preserves independent candidate strata wit
             ba::aln_meth_read_t nonstop;ba::aln_dup_state_t dup_nonstop;
             REQUIRE(ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads,opt,2,read_no,0,1,1000,&dup_nonstop,&nonstop)==0);
             CHECK(nonstop.flags==0);actual.clear();int within_c2=0;
-            for(const auto &o:nonstop.occ) if(o.cost<=2*opt->s_mm) {
+            for(const auto &o:nonstop.hits) if(o.cost<=2*opt->s_mm) {
                 actual.emplace(o.rid,o.hyp,o.strand,o.pos,o.cost);
                 within_c2+=o.cost>opt->s_mm;
             }
@@ -1749,7 +1910,7 @@ TEST_CASE("aln_meth: nonzero stopping preserves independent candidate strata wit
                     input=ba::bwa_seq_open(fq.c_str());reads=ba::bwa_read_seq(input,1,&n,BWA_MODE_COMPREAD,0);
                     ba::aln_meth_read_t capped;ba::aln_dup_state_t capped_dup;
                     REQUIRE(ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads,opt,2,read_no,0,1,1000,&capped_dup,&capped)==0);
-                    actual.clear();for(const auto &o:capped.occ)actual.emplace(o.rid,o.hyp,o.strand,o.pos,o.cost);
+                    actual.clear();for(const auto &o:capped.hits)actual.emplace(o.rid,o.hyp,o.strand,o.pos,o.cost);
                     CHECK(capped.flags!=0);
                     if(!no_stop) {
                         capped_loci=actual;first_flags=capped.flags;
@@ -1862,7 +2023,7 @@ TEST_CASE("aln_meth: pairing moves to stored second-locus CIGAR and counts atomi
     }
     SUBCASE("work-incomplete end is not promoted") {incomplete=true;result[0].flags=ba::ALN_METH_BIND_M;}
     SUBCASE("incomplete end is not promoted") {incomplete=true;result[0].flags=ba::ALN_METH_BIND_BEST;}
-    ba::aln_meth_pe_stage1(opt,1,seqs,r);
+    store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
     ba::isize_info_t ii={};ii.avg=ii.std=-1;
     uint64_t total[2]={},mapped[2]={};
     ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
@@ -2234,7 +2395,7 @@ TEST_CASE("aln_meth: short-insert active estimates retain neutral ceilings and i
             result[j].occ.push_back(o); result[j].main = 0; result[j].c1 = 1;
         }
         result[0].flags = incomplete;
-        ba::aln_meth_pe_stage1(gap, 1, seqs, r);
+        store_pair(r); ba::aln_meth_pe_stage1(gap, 1, seqs, r);
         // A neutral conversion-selected main locus must not gain independent evidence from its mate.
         result[0].n_conv_moved = 1; result[0].conv_gap = 2;
         if (!incomplete) seqs[0]->mapQ = 12;
@@ -2291,10 +2452,10 @@ TEST_CASE("aln_meth: rescue windows belong to the anchor contig at both boundari
         o.alignment.cigar={50u<<4};result[0].occ.push_back(o);result[0].main=0;result[0].c1=1;
         if(cap_bound) {
             result[1].flags=ba::ALN_METH_BIND_BEST;
-            result[1].occ.reserve(64); // spare capacity, as a search leaves it
+            result[1].hits.reserve(64); // spare capacity
         }
         if(conversion_guard) {result[0].n_conv_moved=1;result[0].conv_gap=3;result[0].c2=1;}
-        ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
         if(conversion_guard) CHECK((int)seqs[0]->mapQ==18);
         ba::isize_info_t ii={};ii.avg=190;ii.std=10;ii.ap_prior=1e-5;ii.low=100;ii.high=250;ii.high_bayesian=250;
         uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
@@ -2306,11 +2467,9 @@ TEST_CASE("aln_meth: rescue windows belong to the anchor contig at both boundari
             if(cap_bound) {
                 CHECK((int)seqs[1]->mapQ==0);CHECK((int)seqs[1]->c1==0);CHECK((int)seqs[1]->c2==0);
                 CHECK((int)seqs[0]->mapQ==37);CHECK((seqs[0]->extra_flag&SAM_FPP)==0);
-                REQUIRE(result[1].occ.size()==1);CHECK(result[1].occ[0].cost==0);
-                // The rescue releases the old capacity (shrink_to_fit is non-binding in the
-                // standard; libstdc++ and libc++ both honor it).
-                CHECK(result[1].occ.capacity()==1);
-                CHECK(result[1].occ[0].alignment.raw_cigar==std::vector<uint32_t>{50u<<4});
+                REQUIRE(result[1].hits.size()==1);CHECK(result[1].hits[0].cost==0);
+                CHECK(result[1].hits.capacity()==1); // the rescue releases the old capacity
+                CHECK(cigar_of(result[1],result[1].hits[0])==std::vector<uint32_t>{50u<<4});
             }
             if(conversion_guard) {CHECK((int)seqs[0]->mapQ==10);CHECK((int)seqs[1]->mapQ==10);}
             if(seqs[1]->md) CHECK(std::string(seqs[1]->md)=="50");
@@ -2369,7 +2528,7 @@ TEST_CASE("aln_meth: an incomplete end's worse-cost loci never reach paired SAM 
             if(!filtered) rm.occ.push_back(locus(1,0,c2_off+940,3));
             for(auto &o:rm.occ) o.hyp=result[0].occ[0].hyp; // pairable with the anchor
             rm.main=filtered==2?0:drawn;rm.c1=2;rm.c2=1;rm.flags=flags;
-            ba::aln_meth_pe_stage1(opt,1,seqs,r);
+            store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
             ba::isize_info_t ii={};ii.avg=190;ii.std=10;ii.ap_prior=1e-5;ii.low=100;ii.high=250;ii.high_bayesian=250;
             uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
             kstring_t text={0,0,nullptr};
@@ -2407,7 +2566,7 @@ TEST_CASE("aln_meth: an incomplete end's worse-cost loci never reach paired SAM 
         rm.occ.push_back(locus(1,0,c2_off+940,3));
         for(auto &o:rm.occ) o.hyp=result[0].occ[0].hyp;
         rm.main=0;rm.c1=2;rm.c2=1;rm.flags=0;
-        ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
         ba::isize_info_t ii={};ii.avg=190;ii.std=10;ii.ap_prior=1e-5;ii.low=100;ii.high=250;ii.high_bayesian=250;
         uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
         CAPTURE(seqs[1]->pos-c2_off);
@@ -2471,7 +2630,7 @@ TEST_CASE("aln_meth: valid same-contig pair wins over cheaper cross-contig place
             result[0].occ.push_back(extra);
         }
         result[0].c2+=large?600:0;
-        ba::aln_meth_pe_stage1(opt,1,seqs,r);ba::isize_info_t ii={};ii.avg=ii.std=-1;
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);ba::isize_info_t ii={};ii.avg=ii.std=-1;
         uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
         CHECK(result[1].main==1);CHECK(seqs[1]->pos==2900);CHECK(seqs[1]->score==3);
         CHECK((seqs[0]->extra_flag&SAM_FPP)!=0);CHECK((seqs[1]->extra_flag&SAM_FPP)!=0);
@@ -2683,16 +2842,16 @@ TEST_CASE("aln_meth: neutral lexicographic strata honor stock cost and incomplet
         result.flags=incomplete?ba::ALN_METH_BIND_M:0;
         ba::aln_meth_slot_t slot;slot.grp=&group;slot.res=&result;slot.keep=1;
         ba::aln_meth_slot_finish(&slot);
-        CHECK(result.occ[result.main].cost==6);
+        CHECK(result.hits[result.main].cost==6);
         if(incomplete) { CHECK(result.n_conv_moved==0);CHECK(result.conv_gap==0); }
         else {
             // The third cost-6 locus has fewer conversions than both other compositions.
-            CHECK(result.occ[result.main].pos==300);
+            CHECK(result.hits[result.main].pos==300);
             CHECK(result.c1==1); CHECK(result.c2==3);
             CHECK(result.n_conv_moved==2); CHECK(result.conv_gap==1);
             for(int ordinal=0;ordinal<40;++ordinal) {
-                ba::aln_meth_redraw(&result,ordinal);
-                CHECK(result.occ[result.main].pos==300);
+                ba::aln_meth_redraw_hits(&result,ordinal);
+                CHECK(result.hits[result.main].pos==300);
             }
         }
     }
@@ -2724,7 +2883,8 @@ TEST_CASE("aln_meth: conversion-only unchanged pairs retain both guards while mo
             result[j].occ.push_back(o);result[j].main=0;result[j].c1=1;result[j].c2=1;
             result[j].n_conv_moved=1;result[j].conv_gap=j?2:1;
             if(j==0 && moved) {
-                result[j].occ[0].pos=20;
+                auto &moved_from=result[j].occ[0];
+                moved_from.pos=20;moved_from.alignment.rb=20;moved_from.alignment.re=20+40;
                 auto alternate=o;alternate.n_conv=1;alternate.n_mm=1;alternate.cost=3;
                 alternate.alignment.cigar={20u<<4,1u<<4|1,19u<<4};alternate.n_ins=1;alternate.n_gapo=1;
                 alternate.alignment.re=alternate.pos+39;result[j].occ.push_back(alternate);
@@ -2737,7 +2897,7 @@ TEST_CASE("aln_meth: conversion-only unchanged pairs retain both guards while mo
         }
         if(large) result[0].c2+=600;
         if(zero_initial) result[0].c2=300;
-        ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
         CHECK((int)seqs[0]->mapQ==((large||zero_initial)?0:6));CHECK((int)seqs[1]->mapQ==12);
         ba::isize_info_t ii={};ii.avg=ii.std=-1;
         uint64_t total[2]={},mapped[2]={};
@@ -2878,14 +3038,14 @@ TEST_CASE("aln_meth: resolved distinct loci obey max-occ and incomplete lookup e
             REQUIRE(ba::aln_meth_search_batch(bwt,&mr,&mo,1,seqs[j],opt,2,1-j,0,1,3,&dup,res[j])==0);
         }
         std::set<std::tuple<int,int,int,bwtint_t>> keys;
-        for(const auto &o:result[0].occ) keys.emplace(o.rid,o.hyp,o.strand,o.pos);
-        CHECK(keys.size()==result[0].occ.size());
+        for(const auto &o:result[0].hits) keys.emplace(o.rid,o.hyp,o.strand,o.pos);
+        CHECK(keys.size()==result[0].hits.size());
         const bool complete=budget==4596;
-        if(complete) {CHECK(result[0].flags==0);CHECK(result[0].occ.size()==601);CHECK(result[0].c1==601);}
-        else {CHECK(result[0].flags!=0);CHECK(result[0].occ.size()<=500);}
+        if(complete) {CHECK(result[0].flags==0);CHECK(result[0].hits.size()==601);CHECK(result[0].c1==601);}
+        else {CHECK(result[0].flags!=0);CHECK(result[0].hits.size()<=500);}
         // Force both single-end choices away from the sole compatible pair.
-        for(int j=0;j<2;++j) for(size_t k=0;k<result[j].occ.size();++k) {
-            const auto &o=result[j].occ[k];
+        for(int j=0;j<2;++j) for(size_t k=0;k<result[j].hits.size();++k) {
+            const auto &o=result[j].hits[k];
             if(std::string(mr.bns->anns[o.rid].name)==(j?"c7":"c5")) {result[j].main=(int)k;break;}
         }
         ba::aln_meth_pe_stage1(opt,1,seqs,res);
@@ -2897,7 +3057,7 @@ TEST_CASE("aln_meth: resolved distinct loci obey max-occ and incomplete lookup e
             CHECK(seqs[1]->pos==(bwtint_t)(mr.bns->anns[5].offset+ref().m_pos-1));
             CHECK((int)seqs[0]->mapQ==9);CHECK((int)seqs[1]->mapQ==9);
             CHECK((int)seqs[0]->seQ==0);CHECK((int)seqs[1]->seQ==0);
-            CHECK(result[0].occ[result[0].main].pos==seqs[0]->pos);
+            CHECK(result[0].hits[result[0].main].pos==seqs[0]->pos);
             CHECK(seqs[0]->n_cigar==1);CHECK(__cigar_len(seqs[0]->cigar[0])==36);
         } else {
             CHECK((seqs[0]->extra_flag&SAM_FPP)==0);CHECK((seqs[1]->extra_flag&SAM_FPP)==0);
@@ -2998,6 +3158,7 @@ TEST_CASE("aln_meth: CIGAR-capped mates retain their placement even when the loo
                 result[j].main = 0; result[j].c1 = 1;
             }
             result[end].flags = flags;
+            store_pair(r);
             ba::aln_meth_pe_stage1(opt, 1, seqs, r);
             ba::isize_info_t ii = {};
             ii.avg = 200; ii.std = 20; ii.ap_prior = 1e-5;
@@ -3063,6 +3224,7 @@ TEST_CASE("aln_meth: cap rescue skips nonfinite insert penalties without losing 
         retained.pos = 900; retained.alignment.rb = 900; retained.alignment.re = 950;
         retained.alignment.cigar = {50u << 4};
         result[1].occ.push_back(retained); result[1].main = 0; result[1].flags = ba::ALN_METH_BIND_BEST;
+        store_pair(r);
         ba::aln_meth_pe_stage1(opt, 1, seqs, r);
         ba::isize_info_t ii{};
         ii.avg = extreme ? 200 : 199.5;
@@ -3071,11 +3233,11 @@ TEST_CASE("aln_meth: cap rescue skips nonfinite insert penalties without losing 
         // The 175-base candidate underflows the Gaussian tail; the 200-base pair is safe.
         uint64_t total[2] = {}, mapped[2] = {};
         ba::aln_meth_pe_stage2(&mr, &mo, opt, pe, &ii, 1, seqs, r, total, mapped);
-        REQUIRE(result[1].occ.size() == 1);
+        REQUIRE(result[1].hits.size() == 1);
         CHECK(seqs[1]->pos == (safe_anchor ? 700 : 900));
-        CHECK(result[1].occ[0].pos == seqs[1]->pos);
-        CHECK(result[1].occ[0].alignment.cigar == std::vector<uint32_t>{50u << 4});
-        CHECK(result[1].occ[0].cost == 0);
+        CHECK(result[1].hits[0].pos == seqs[1]->pos);
+        CHECK(cigar_of(result[1], result[1].hits[0]) == std::vector<uint32_t>{50u << 4});
+        CHECK(result[1].hits[0].cost == 0);
         REQUIRE(seqs[1]->n_cigar == 1);
         CHECK(__cigar_op(seqs[1]->cigar[0]) == 0); CHECK(__cigar_len(seqs[1]->cigar[0]) == 50);
         CHECK((int)seqs[1]->type == (safe_anchor ? BWA_TYPE_MATESW : BWA_TYPE_REPEAT));
@@ -3129,17 +3291,16 @@ TEST_CASE("aln_meth: cap rescue accounts all bounded anchors and preserves uniqu
             result[0].occ.insert(result[0].occ.begin(),alternate);result[0].main=1;
         }
         result[1].flags=ba::ALN_METH_BIND_BEST;
-        ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
         ba::isize_info_t ii={};ii.avg=200;ii.std=20;ii.high=0;ii.ap_prior=1e-5;
         if(bad_range && anchors<=255) {
             if(bad_range==1) ii.std=std::numeric_limits<double>::infinity();
             if(bad_range==2) {
                 int rid=-1;for(int k=0;k<mr.bns->n_seqs;++k) if(std::string(mr.bns->anns[k].name)=="c9") rid=k;
                 REQUIRE(rid>=0);ii.std=1000000;
-                for(auto &a:result[0].occ) {a.rid=rid;a.pos=mr.bns->anns[rid].offset+100;
-                    a.alignment.rb=a.pos;a.alignment.re=a.pos+50;}
+                for(auto &a:result[0].hits) {a.rid=rid;a.pos=mr.bns->anns[rid].offset+100;a.span=50;}
             }
-            if(bad_range==3) result[0].occ[0].alignment.re=mr.bns->anns[0].len+1;
+            if(bad_range==3) result[0].hits[0].span=(int32_t)(mr.bns->anns[0].len+1-(int64_t)result[0].hits[0].pos);
             // The fatal path must exit 1; returning ends the child with 0 and fails the check.
             const int status=bwa_tests::run_in_child([&] {
                 uint64_t total[2]={},mapped[2]={};
@@ -3161,8 +3322,8 @@ TEST_CASE("aln_meth: cap rescue accounts all bounded anchors and preserves uniqu
                 CHECK(result[0].hyp==0);REQUIRE(seqs[0]->n_cigar==3);
                 CHECK(__cigar_op(seqs[0]->cigar[1])==1);
             }
-            REQUIRE(result[1].occ.size()==1);CHECK(result[1].occ[0].cost==0);
-            CHECK(result[1].occ[0].n_conv==0);CHECK(result[1].occ[0].n_mm==0);
+            REQUIRE(result[1].hits.size()==1);CHECK(result[1].hits[0].cost==0);
+            CHECK(result[1].hits[0].n_conv==0);CHECK(result[1].hits[0].n_mm==0);
         } else {
             CHECK((int)seqs[1]->type==BWA_TYPE_NO_MATCH);CHECK(result[1].main==-1);
             CHECK(result[0].main==255);CHECK((int)seqs[0]->mapQ==0);
@@ -3201,13 +3362,13 @@ TEST_CASE("aln_meth: cap rescue ranks raw chemistry cost then neutral conversion
         ba::aln_meth_occ_t known{};known.rid=rid;known.hyp=1;known.strand=1;known.pos=base;
         known.alignment.rb=base;known.alignment.re=base+50;known.alignment.cigar={50u<<4};
         result[1].occ.push_back(known);result[1].main=0;
-        ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
         ba::isize_info_t ii={};ii.avg=200;ii.std=5;ii.ap_prior=1e-5;
         uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
-        REQUIRE(result[1].occ.size()==1);const auto &o=result[1].occ[0];
+        REQUIRE(result[1].hits.size()==1);const auto &o=result[1].hits[0];
         CHECK(o.pos==(bwtint_t)(base+(neutral?650:250)));
         CHECK(o.n_conv==(neutral?0:1));CHECK(o.n_mm==0);CHECK(o.cost==0);
-        CHECK(o.alignment.raw_cigar==std::vector<uint32_t>{50u<<4});
+        CHECK(cigar_of(result[1],o)==std::vector<uint32_t>{50u<<4});
         CHECK(seqs[0]->pos==(bwtint_t)(base+(neutral?500:100)));
         CHECK((int)seqs[1]->type==BWA_TYPE_MATESW);CHECK((int)seqs[1]->mapQ==0);
         CHECK((int)seqs[0]->mapQ==0);CHECK((seqs[0]->extra_flag&SAM_FPP)==0);
@@ -3279,7 +3440,7 @@ TEST_CASE("aln_meth: mate rescue drops a candidate whose counts overflow a recor
         ba::aln_meth_occ_t o{};o.rid=0;o.strand=0;o.hyp=1;
         o.pos=mr.bns->anns[0].offset+anchor;o.alignment.rb=o.pos;o.alignment.re=o.pos+50;
         o.alignment.cigar={50u<<4};result[0].occ.push_back(o);result[0].main=0;result[0].c1=1;
-        ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
         REQUIRE((int)seqs[0]->mapQ>=17);REQUIRE((int)seqs[1]->type==BWA_TYPE_NO_MATCH);
         ba::isize_info_t ii={};ii.avg=start+span-anchor;ii.std=10;ii.ap_prior=1e-5;
         ii.low=100;ii.high=2000;ii.high_bayesian=2000;
