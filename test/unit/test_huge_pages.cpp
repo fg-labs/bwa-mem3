@@ -9,7 +9,10 @@
 // (BWAMEM_HUGETLB_TEST_PLAIN), so none of it depends on the host's pool. Set
 // BWA_TEST_HUGETLB_POOL=1 on a host with at least 1 free 1 GB page to also map
 // the test index's occurrence table on a real 1 GB page
-// (BWAMEM_HUGETLB_ON_ANY_SIZE) and check it.
+// (BWAMEM_HUGETLB_ON_ANY_SIZE), check it, and check that freeing the index
+// unmaps it. On Linux, with the variable unset or set on a host with no free
+// 1 GB page, that case does not run and the test prints why. Elsewhere no
+// mapping can succeed, so the case always runs and checks the fallback.
 
 #include "doctest/doctest.h"
 
@@ -27,11 +30,49 @@
 #include <sys/mman.h>
 #endif
 
+#include <cstdio>
+#include <fstream>
+#include <memory>
 #include <random>
 #include <string>
 #include <vector>
 
 static const long long GB = 1024LL * 1024LL * 1024LL;
+
+// Free pages in the host's 1 GB hugetlb pool, or -1 if the kernel exposes no
+// such pool (not Linux, or a CPU without 1 GB page support).
+static long hugetlb_1g_free_pages() {
+    std::ifstream f("/sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages");
+    long n = -1;
+    if (!(f >> n)) return -1;
+    return n;
+}
+
+#if defined(__linux__)
+// The KernelPageSize, in kB, of this process's mapping that contains `addr`, or
+// -1 if no mapping contains it. Reads /proc/self/smaps, so it sees only this
+// process's mappings, unlike the host-wide pool counts.
+static long kernel_page_kb_at(const void *addr) {
+    FILE *fp = std::fopen("/proc/self/smaps", "r");
+    if (fp == NULL) return -1;
+    const uintptr_t a = (uintptr_t)addr;
+    bool in_vma = false;
+    long kb = -1;
+    char line[4096];
+    while (std::fgets(line, sizeof(line), fp) != NULL) {
+        // A mapping's header line starts "lo-hi "; its field lines never parse
+        // as two hex numbers joined by '-'.
+        unsigned long lo, hi;
+        if (std::sscanf(line, "%lx-%lx ", &lo, &hi) == 2) {
+            in_vma = (a >= lo && a < hi);
+        } else if (in_vma && std::sscanf(line, "KernelPageSize: %ld kB", &kb) == 1) {
+            break;
+        }
+    }
+    std::fclose(fp);
+    return in_vma ? kb : -1;
+}
+#endif
 TEST_CASE("hugetlb_round_up: whole 1 GiB pages, 0 for empty or overflowing sizes"
           * doctest::test_suite("unit/huge_pages")) {
     const size_t G = (size_t)GB;
@@ -192,11 +233,23 @@ TEST_CASE("load_index with --huge-pages: same arrays whether or not the 1 GB map
     FMI_search *want = base.fmi();
 
     const char *pool_env = getenv("BWA_TEST_HUGETLB_POOL");
-    const bool use_pool = pool_env != NULL && strcmp(pool_env, "1") == 0;
+    const bool want_pool = pool_env != NULL && strcmp(pool_env, "1") == 0;
     std::vector<bwamem_hugetlb_mode_t> modes = {BWAMEM_HUGETLB_FORCE_FAIL, BWAMEM_HUGETLB_ON,
                                                 BWAMEM_HUGETLB_TEST_PLAIN};
+    long pool_free_before = -1;
 #if defined(__linux__)
-    if (use_pool) modes.push_back(BWAMEM_HUGETLB_ON_ANY_SIZE);
+    // The real 1 GB mapping runs only when asked for and a page is free, so a
+    // pool-less host skips it with a reason instead of failing CHECK(mapped).
+    pool_free_before = hugetlb_1g_free_pages();
+    if (!want_pool)
+        MESSAGE("SKIP: real 1 GB mapping not checked (set BWA_TEST_HUGETLB_POOL=1 on a host "
+                "with a free 1 GB hugetlb page)");
+    else if (pool_free_before < 1)
+        MESSAGE("SKIP: real 1 GB mapping not checked: BWA_TEST_HUGETLB_POOL=1 but "
+                << (pool_free_before < 0 ? "this host has no 1 GB hugetlb pool"
+                                         : "the 1 GB hugetlb pool has no free page"));
+    else
+        modes.push_back(BWAMEM_HUGETLB_ON_ANY_SIZE);
 #else
     // No mapping can succeed here: this runs the ENOSYS fallback and its line.
     modes.push_back(BWAMEM_HUGETLB_ON_ANY_SIZE);
@@ -204,7 +257,8 @@ TEST_CASE("load_index with --huge-pages: same arrays whether or not the 1 GB map
     for (bwamem_hugetlb_mode_t m : modes) {
         CAPTURE((int)m);
         std::string log;
-        FMI_search got(base.prefix().c_str());
+        std::unique_ptr<FMI_search> got_owner(new FMI_search(base.prefix().c_str()));
+        FMI_search &got = *got_owner;
         {
             bwa_tests::StderrCapture cap;
             got.load_index(/*load_pac=*/false, /*n_threads=*/2, /*build_seed_jump=*/false, m);
@@ -262,5 +316,15 @@ TEST_CASE("load_index with --huge-pages: same arrays whether or not the 1 GB map
         for (int64_t r = 0; r < want->reference_seq_len; ++r)
             bad += got.get_sa_entry_compressed(r) != want->get_sa_entry_compressed(r);
         CHECK(bad == 0);
+#if defined(__linux__)
+        // While the index is loaded its occurrence table sits on a 1 GB page of
+        // this process; the destructor unmaps it, which returns the page to the
+        // pool. Checked on this process's own mappings, not the host-wide free
+        // count, which another process could change during the test.
+        const void *occ = got.cp_occ_data();
+        if (m == BWAMEM_HUGETLB_ON_ANY_SIZE) CHECK(kernel_page_kb_at(occ) == 1048576);
+        got_owner.reset();
+        if (m == BWAMEM_HUGETLB_ON_ANY_SIZE) CHECK(kernel_page_kb_at(occ) != 1048576);
+#endif
     }
 }

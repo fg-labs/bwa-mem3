@@ -115,6 +115,15 @@ release PR** (merging it is what tags and publishes the release — see
 - [ ] `make clean && make` succeeds on an arm64 host (Apple Silicon
       or aarch64 Linux).
 - [ ] `make test` passes on both x86_64 and arm64.
+- [ ] `--huge-pages` maps a production-sized index: on a Linux x86_64 host
+      with at least 6 free 1 GB pages (and an arm64 host when one is
+      available), `BWA_TEST_HUGETLB_POOL=1 ./test/bwa_mem3_tests_unit
+      -ts=unit/huge_pages` passes, and `bwa-mem3 mem -t 4 --huge-pages` on
+      a production-sized human reference index prints the `x 1 GB pages`
+      line and writes the same records (apart from `@PG`) as a `-t 4` run
+      without it. Leave `BWA3_LOAD_THREADS` unset for both runs, so the 1 GB
+      pages are faulted in by several workers. `free_hugepages` is back to
+      its starting value afterwards. CI covers only a one-page test index.
 - [ ] `test/regression/all_tiers_parity.sh` produces byte-identical
       SAM across `BWAMEM3_FORCE_TIER=avx2 → avx512bw` on an x86_64
       AVX-512BW host, single-threaded (`-t 1`, so batch composition is
