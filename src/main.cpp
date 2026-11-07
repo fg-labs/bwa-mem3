@@ -58,6 +58,7 @@ int usage()
     fprintf(stderr, "Commands:\n");
     fprintf(stderr, "  index         create index (add --meth to build a bwameth-style doubled c2t reference)\n");
     fprintf(stderr, "  mem           alignment (add --meth for bisulfite-seq: inline c2t + BAM output)\n");
+    fprintf(stderr, "  aln           backtracking aligner for short reads (bwa aln + samse/sampe)\n");
     fprintf(stderr, "  shm           load/list/drop the index in POSIX shared memory\n");
     fprintf(stderr, "  re-sa         resample an existing index's on-disk SA table to a new rate\n");
     fprintf(stderr, "  version       print version number\n");
@@ -105,6 +106,19 @@ static void append_pg_cl_arg(kstring_t *pg, const char *arg)
 {
     kputc_checked(' ', pg);
     append_pg_cl_sanitized(pg, arg);
+}
+
+// The @PG record (newline-terminated) shared by `mem` and `aln`.
+// argv[0] is the first CL: token; sanitize it too (a tab/newline in the
+// executable path would corrupt the @PG line exactly as a -R value did,
+// issue #45) but without append_pg_cl_arg's leading space so the value
+// stays "CL:<argv0> <argv1> ..." rather than "CL: <argv0> ...".
+static void build_pg_line(kstring_t *pg, int argc, char *argv[])
+{
+    ksprintf(pg, "@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:%s\tCL:", PACKAGE_VERSION);
+    append_pg_cl_sanitized(pg, argv[0]);  // first token, no leading space
+    for (int i = 1; i < argc; ++i) append_pg_cl_arg(pg, argv[i]);
+    ksprintf(pg, "\n");
 }
 
 #ifdef USE_MIMALLOC
@@ -236,7 +250,8 @@ int main(int argc, char* argv[])
      * (`h:` in main_mem's optstring, fastmap.cpp), taking an INT value. So
      * `mem -h 5 ref r1 r2` must NOT be treated as help -- doing so skipped the
      * precheck and ran the full alignment on a below-floor host, the SIGILL the
-     * precheck exists to turn into a clean exit(2).
+     * precheck exists to turn into a clean exit(2). `aln` has no `-h` either
+     * (its help is `--help`), so `aln -h` gets the precheck too.
      * Only argv[2] is checked: matching --help / -h anywhere in argv
      * would false-positive on pathological invocations like
      * `mem -R --help ref r1 r2` (where --help is the VALUE of -R) and
@@ -244,7 +259,8 @@ int main(int argc, char* argv[])
      * invocations put --help right after the subcommand. */
     bool wants_help = (argc >= 3) &&
                       (strcmp(argv[2], "--help") == 0 ||
-                       (strcmp(argv[2], "-h") == 0 && strcmp(argv[1], "mem") != 0));
+                       (strcmp(argv[2], "-h") == 0 && strcmp(argv[1], "mem") != 0 &&
+                        strcmp(argv[1], "aln") != 0));
     if (strcmp(argv[1], "version") != 0 && !wants_help) {
         bwamem3_enforce_host_floor();
 
@@ -341,18 +357,21 @@ int main(int argc, char* argv[])
         // a `-u`-built index actually loaded at. It now prints from
         // fastmap.cpp::main_mem right after aux.fmi->load_index().
 
-        // argv[0] is the first CL: token; sanitize it too (a tab/newline in the
-        // executable path would corrupt the @PG line exactly as a -R value did,
-        // issue #45) but without append_pg_cl_arg's leading space so the value
-        // stays "CL:<argv0> <argv1> ..." rather than "CL: <argv0> ...".
-        ksprintf(&pg, "@PG\tID:bwa-mem3\tPN:bwa-mem3\tVN:%s\tCL:", PACKAGE_VERSION);
-        append_pg_cl_sanitized(&pg, argv[0]);  // first token, no leading space
-
-        for (int i = 1; i < argc; ++i) append_pg_cl_arg(&pg, argv[i]);
-        ksprintf(&pg, "\n");
+        build_pg_line(&pg, argc, argv);
         bwa_pg = pg.s;
         ret = main_mem(argc-1, argv+1);
         free(bwa_pg);
+    }
+    else if (strcmp(argv[1], "aln") == 0)
+    {
+        extern char *bwa_pg;
+        kstring_t pg = {0,0,0};
+        build_pg_line(&pg, argc, argv);
+        bwa_pg = pg.s;
+        ret = main_aln(argc-1, argv+1);
+        free(bwa_pg);
+        bwa_pg = NULL;
+        return ret; // skip the parameter banner below: it describes mem, not aln
     }
     else if (strcmp(argv[1], "version") == 0)
     {
