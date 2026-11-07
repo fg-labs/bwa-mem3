@@ -2234,6 +2234,8 @@ jobs:
         # and baseline differs from spec30); and a control byte (0, TAB) in a
         # read's sequence line, which must come out as N in SEQ and in scoring
         # without truncating the original bases or losing XR:Z and the -C tags.
+        # md_mode_cli covers --md full|short|none: full == default, none drops
+        # only MD, short lists only NM's mismatches under --meth, SAM == BAM.
         env:
           BWA_MEM3: ${{ github.workspace }}/bwa-mem3
         run: |
@@ -2251,7 +2253,7 @@ jobs:
                    meth_rescue_batched_identical meth_rescue_strand \
                    meth_collapsed_scoring \
                    meth_tags meth_flag_footguns meth_5base_alias meth_context_cli \
-                   meth_context_cpg meth_seed_prune meth_nul_base; do
+                   meth_context_cpg meth_seed_prune meth_nul_base md_mode_cli; do
             echo "::group::$t"; bash "test/regression/$t.sh"; echo "::endgroup::"
           done
 

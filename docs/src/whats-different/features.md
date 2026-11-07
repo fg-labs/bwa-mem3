@@ -169,6 +169,10 @@ The option is a deliberate deviation from both upstreams, so it is **incompatibl
 
 This is a correctness-argument item rather than a capability, so the reasoning, the measurement, and the [#17](https://github.com/fg-labs/bwa-mem3/pull/17) → [#362](https://github.com/fg-labs/bwa-mem3/issues/362) history live in [Correctness fixes → Proper-pair flag](correctness.md), with the divergence recorded in [Equivalence](equivalence.md).
 
+## `--md {full|short|none}` MD tag form (PR #754)
+
+`--md` chooses the `MD:Z` each mapped record carries. The default, `full`, is the literal `MD` bwa-mem3 has always written, so default output is byte-identical to the previous release. `short` lists only the mismatches `NM` counts: under `--meth` it leaves out the conversions the scoring matrix frees, which shortens `MD` on EM-seq and bisulfite libraries from dozens of entries to the real variants; without `--meth` it equals `full`. `none` writes no `MD`. `short` and `none` are opt-in. `--compat` refuses `--md none`, since both upstreams always write `MD` (`--compat-allow-divergent` overrides). See [CLI → mem `--md`](../cli/mem.md#--md-str--which-md-tag-to-write).
+
 ## Shared-memory index: `bwa-mem3 shm` (PR #65)
 
 `bwa-mem3 mem` reloads the FM-index from disk on every invocation. For hg38
@@ -710,6 +714,7 @@ Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#re
 | mimalloc purge delay off for `mem` | [#523](https://github.com/fg-labs/bwa-mem3/pull/523) | — | fork-only (on by default; `MIMALLOC_PURGE_DELAY` overrides; SAM byte-identical on a 5M-read-pair WGS slice, Graviton4, neon tier, and in the phix-derived CI regression, x86-64 Linux, avx2 build) |
 | `--supp-rep-hard-cap` MAPQ rescoring | [#56](https://github.com/fg-labs/bwa-mem3/pull/56) | [bwa-mem2#260](https://github.com/bwa-mem2/bwa-mem2/issues/260) | fork-only (upstream issue open) |
 | `--proper-pair-from-emitted` `FLAG` `0x2` source | [#363](https://github.com/fg-labs/bwa-mem3/pull/363) | — | fork-only (opt-in, off by default; default matches both upstreams) |
+| `--md` MD tag form | [#754](https://github.com/fg-labs/bwa-mem3/pull/754) | — | fork-only (opt-in; the default `full` is unchanged output) |
 | `--hic` Hi-C preset | [#372](https://github.com/fg-labs/bwa-mem3/pull/372) | — | fork-only spelling (opt-in, off by default; sets the same flag bits as `-5SP`, which both upstreams also accept, so identical by construction — the regression confirms byte-identity on phix-derived PE reads with `@PG` excluded, not a cross-host/cross-tier claim) |
 | `bwa-mem3 shm` shared-memory index | [#65](https://github.com/fg-labs/bwa-mem3/pull/65) | — | fork-only |
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |

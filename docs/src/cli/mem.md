@@ -245,6 +245,8 @@ Notes and caveats:
   `--min-ext-len`, `--extend-tie-frac`, `--rescue-kmer`, `--supp-rep-hard-cap`,
   `--seed-order`, `--chunk-cap`, and
   [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment).
+  [`--md none`](#--md-str--which-md-tag-to-write) is refused the same way: it
+  changes no alignment, but both upstreams always write `MD`.
   The error names the offending flags (`--compat and these levers are mutually
   exclusive: ...`). Pass **`--compat-allow-divergent`** to downgrade
   the refusal to a warning and proceed: you keep the target's *output
@@ -471,6 +473,48 @@ SAM tag.
 Under `--meth`, `XR:Z` instead carries the Bismark read-conversion direction
 (`CT`/`GA`) and this reference-annotation use of `XR` is suppressed — see
 [Methylation Reference → Flags](../methylation/flags.md).
+
+#### `--md STR` — which `MD` tag to write
+
+`full` (the default), `short` or `none`. Each mapped record carries `NM` and,
+unless `none`, `MD`; `XA`/`XB` entries never carry `MD`.
+
+- `full` lists every reference base the read differs from, so on a record that
+  carries `SEQ`, `CIGAR` + `SEQ` + `MD` rebuilds the reference and
+  `samtools calmd` agrees with it. Under `--meth` that includes every
+  bisulfite or enzymatic conversion, so a typical EM-seq read's `MD` names dozens of converted reference `C`s (or `G`s).
+  The exception is an ambiguous reference base (`N` or another IUPAC code):
+  the index stores it as a random `A`/`C`/`G`/`T` and `MD` names that stored
+  base, so across such a column the rebuilt reference and `samtools calmd`
+  run against the original FASTA can disagree. A secondary record (flag
+  `0x100`) is written without `SEQ`, so it cannot be rebuilt this way, and
+  `samtools calmd` skips it.
+- `short` lists only the mismatches `NM` counts. Under `--meth` it leaves out
+  the conversions the scoring matrix frees (under `--meth-context cpg`, only
+  those at a CpG), and `MD`'s mismatch count equals `NM` minus the gap bases.
+  An ungapped read with no mismatch `NM` counts (no real variant or
+  sequencing error) and only conversions the scoring matrix frees is
+  `MD:Z:<aligned length>`; a conversion it does not free (a non-CpG one under
+  `--meth-context cpg`) and a deletion still appear. Each
+  column it leaves out reads as a match, so `CIGAR` + `SEQ` + `MD` rebuilds the
+  read's base there. For a left-out conversion that is the converted
+  reference at that column. Where the read kept a methylated `C` (or `G`), the
+  column is a match and the rebuilt base is the real reference. A read that has
+  both is rebuilt as a mix that is neither the real nor the converted
+  reference. `samtools calmd` compares against the real reference, so it
+  reports any `MD` that leaves out a mismatch as different.
+  Under `--meth-scoring collapsed` it also leaves out the mirror-direction
+  `C`/`T` and `G`/`A` variants, exactly as `NM` does (see
+  [how `NM`/`MD` are computed](../methylation/overview.md#how-nmmd-are-computed-under---meth)).
+  Those also rebuild as the read's base, which is neither the real nor the
+  converted reference (a reference `T` read as `C` rebuilds as `C`).
+  Without `--meth`, `NM` counts every literal mismatch, so `short` is the same
+  as `full`.
+- `none` writes no `MD` tag and skips building it. `NM` is unchanged.
+
+`--md` was added in [#754](https://github.com/fg-labs/bwa-mem3/pull/754); bwa
+and bwa-mem2 always write the `full` form. `--compat` refuses `--md none`, since
+the upstreams always write `MD` (override with `--compat-allow-divergent`).
 
 #### `-Y` — soft-clip supplementary alignments
 

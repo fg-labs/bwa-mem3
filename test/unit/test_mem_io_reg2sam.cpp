@@ -382,3 +382,28 @@ TEST_CASE("mem_io reg2sam: -5 makes the hit nearest the read's 5' end primary"
                    "\tXA:Z:c2,+201,30S60M,1;\tHN:i:1\n");
     }
 }
+
+TEST_CASE("mem_io reg2sam: --md none drops MD and --md short keeps it without --meth"
+          * doctest::test_suite("unit/mem_io")) {
+    UseFixture use;
+    OptGuard g;
+    // The c2 copy as the only region: one mismatch, so a non-trivial MD.
+    std::vector<mem_alnreg_t> regs{region(g.opt, 1, 200, false, 0, 60, 55, 0)};
+    const std::string md_tag = "\tMD:Z:" + c2_md();
+
+    Read r_full("r1", fixture().read1);
+    const std::string full = emit(g.opt, r_full, regs);
+    REQUIRE(full.find(md_tag + "\t") != std::string::npos);
+
+    g.opt->md_mode = MEM_MD_SHORT;
+    Read r_short("r1", fixture().read1);
+    CHECK(emit(g.opt, r_short, regs) == full);
+
+    g.opt->md_mode = MEM_MD_NONE;
+    Read r_none("r1", fixture().read1);
+    std::string expected = full;
+    expected.erase(expected.find(md_tag), md_tag.size());
+    const std::string none = emit(g.opt, r_none, regs);
+    CHECK(none == expected);
+    CHECK(none.find("\tNM:i:1\t") != std::string::npos);
+}

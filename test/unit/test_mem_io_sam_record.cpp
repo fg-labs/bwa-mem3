@@ -668,3 +668,18 @@ TEST_CASE("mem_io record: each estimated field alone is long enough to overrun a
                       as_xs + "\tXR:Z:" + ref.annos[0]));
     }
 }
+
+TEST_CASE("mem_io record: --md none writes NM but no MD, in SAM and BAM"
+          * doctest::test_suite("unit/mem_io")) {
+    OptGuard g;
+    Ref ref;
+    Alns alns;
+    Read r("r1", kBases, kQual);
+    g.opt->md_mode = MEM_MD_NONE;
+    // A non-empty MD after the CIGAR, so a writer that ignored --md none
+    // would show it.
+    std::vector<mem_aln_t> l{alns.make(0, 9, false, "3M1I2M2D4M", "5^GA1C2", 4, 12, 0, -1)};
+    check_both(g.opt, ref, r, l, 0, NULL,
+               "r1\t0\tchrA\t10\t12\t3M1I2M2D4M\t*\t0\t0\tACGTNACGTT\tABCDEFGHIJ\t"
+               "NM:i:4\tAS:i:0\n");
+}

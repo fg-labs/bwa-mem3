@@ -50,15 +50,24 @@ perfectly converted read is `NM:i:0`. Insertions and deletions are not matrix
 cells: every inserted and every deleted base still counts toward `NM`, exactly
 as without `--meth`.
 
-`MD` stays literal. It lists every reference base the read differs from,
-conversions included, so `CIGAR` + `SEQ` + `MD` rebuilds the real reference
-(`samtools calmd` reproduces it exactly) and every converted base can be read
-off the record without the reference. A perfectly converted read's `MD` names
-each converted reference `C` (OT) or `G` (OB).
+Under the default `--md full`, `MD` stays literal. It lists every reference
+base the read differs from, conversions included. On a record that carries
+`SEQ`, `CIGAR` + `SEQ` + `MD` rebuilds the real reference (`samtools calmd`
+reproduces it exactly, except across an ambiguous reference base, which `MD`
+names as the index's random stand-in) and every converted base can be read off
+the record without the reference. A secondary record (flag `0x100`) is written
+without `SEQ`, so it cannot be rebuilt this way, and `samtools calmd` skips it.
+A perfectly converted read's `MD` names each converted reference `C`
+(OT) or `G` (OB), so on EM-seq `MD` names dozens of converted bases per read.
+The other modes give up that reconstruction: `--md short` lists only the
+mismatches `NM` counts, so an unpenalised substitution (including a real
+variant that looks like a conversion) is hidden from `MD`, and `--md none`
+drops `MD` entirely (see [`--md`](../cli/mem.md#--md-str--which-md-tag-to-write)).
 
-So under `--meth`, `NM` is smaller than the edit count `MD` and `CIGAR` imply, by
-the number of columns the matrix frees. Tools that recompute `NM` from the
-reference report it as different, and that is expected. On 60,000 simulated
+So under `--meth` with `--md full`, `NM` is smaller than the edit count `MD` and
+`CIGAR` imply by the number of columns the matrix frees; on a read where it frees
+none, the two are equal. Tools that recompute `NM` from the reference report a
+read with at least one freed column as different, and that is expected. On 60,000 simulated
 EM-seq pairs (a 900 kb reference with random SNPs and indels, `--meth-scoring
 genomic`; arm64, macOS, NEON tier), `samtools calmd` (1.23.1) and Picard
 `ValidateSamFile` (3.4.0) both flagged `NM` on the 118,922 of 120,000 records

@@ -115,7 +115,7 @@ differ:
 | Chimera QC flags | `0x200`, clear `0x2`, MAPQ ≤ 1 | Same |
 | SEQ field | Pre-conversion bases (RC-flipped when `is_rev`) | Same |
 | `NM` | Collapsed (conversions and real variants both hidden) | Conversions hidden; real variants hidden in `collapsed`, **counted in `genomic` and `neutral`**[^nmmd] |
-| `MD` | Collapsed (conversions and real variants both hidden) | Literal: lists every conversion and every real variant, in all modes |
+| `MD` | Collapsed (conversions and real variants both hidden) | Literal by default: lists every conversion and every real variant, in all modes. [`--md short`](../cli/mem.md#--md-str--which-md-tag-to-write) lists only `NM`'s mismatches (under `collapsed`, the same columns hidden as in bwameth.py, but `MD` names the real reference base); `--md none` drops it |
 
 [^nmmd]: `genomic` and `neutral` both free only the conversion direction — they
     differ solely in what that cell scores (a full match vs. `0`) and both leave

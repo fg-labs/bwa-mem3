@@ -287,7 +287,7 @@ int main(int argc, char* argv[])
             "--chunk-cap", "--cohort-slices", "--rescue-band",
             "--cohort-ramp-ratio", "--cohort-ramp-first", "--meth-scoring",
             "--meth-tags", "--set-as-failed", "--supp-rep-hard-cap",
-            "--seed-order", "--compat",
+            "--seed-order", "--compat", "--md",
 #ifdef STAGE_PROF
             "--profile",
 #endif
