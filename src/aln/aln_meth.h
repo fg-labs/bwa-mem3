@@ -59,9 +59,7 @@ void aln_meth_convert(int read_no, const ubyte_t *in, int len, ubyte_t *out);
 /* Owned original-reference alignment. Reward includes raw global terminal-gap penalties;
  * display CIGAR uses stock terminal normalization. All CIGAR vectors use BAM op codes.
  * raw_cigar is used while the search ranks and accounts windows, and by mate and cap rescue on
- * the alignments they build. Finishing a read (aln_meth_slot_finish, aln_meth_trim) frees it on
- * the loci the search retained, so readers of those loci use cigar; the locus cap rescue writes
- * into a read's occ keeps it. */
+ * the alignments they build. Finishing a read stores its loci as aln_meth_hit_t, without it. */
 struct aln_meth_alignment_t {
     int reward = 0;
     int64_t rb = 0, re = 0;
@@ -79,12 +77,24 @@ struct aln_meth_occ_t {
     int64_t cost = 0;
     aln_meth_alignment_t alignment;
 };
+/* A finished read's stored locus: what pairing, rescue and output read from an aln_meth_occ_t,
+ * packed (40 bytes, not 136 plus a CIGAR allocation). pos is the locus start, which is the
+ * alignment's start (rb); span is its reference length (re - rb). The display CIGAR is cig
+ * itself when it has one operation (nearly every locus), else n_cig operations at offset cig in
+ * the read's cig table; see aln_meth_hit_cigar. account_alignment refuses a cost or count that
+ * does not fit; storing a locus (meth_hit) is fatal on any field that does not, on pos != rb, and
+ * on a cig table past 2^32 entries. */
+struct aln_meth_hit_t {
+    bwtint_t pos;
+    int32_t span, cost, rid, n_conv;
+    uint32_t cig, n_cig;
+    uint8_t strand, hyp, n_mm, n_gapo, n_gape;
+};
+static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record");
 // incomplete: lookup budget, an unrepresentable competitor, CIGAR storage, -m work budget
 enum { ALN_METH_BIND_BEST = 1, ALN_METH_BIND_UNREP = 2, ALN_METH_BIND_CIGAR = 4, ALN_METH_BIND_M = 8 };
 struct aln_meth_read_t {
-    // Best and all retained worse-cost loci, canonical order. Once finished, an incomplete read
-    // (flags != 0) keeps only its best-cost loci, and only its main hit once nothing redraws over
-    // them (no duplicate copies left to draw); c1/c2 still count every retained locus.
+    // The search's candidate loci; finishing the read moves the retained ones to hits and frees it.
     std::vector<aln_meth_occ_t> occ;
     int main = -1;
     int c1 = 0, c2 = 0;
@@ -94,7 +104,19 @@ struct aln_meth_read_t {
     // Search work (aln_meth_report); zero on a duplicate that copied another read's search.
     long n_lookups = 0, n_wrong_copy = 0, n_rescored = 0, n_flushes = 0;
     long n_unrepresentable = 0; // refined windows whose counts do not fit a record
+    // A finished read's best and retained worse-cost loci, canonical order (main indexes these).
+    // An incomplete read (flags != 0) keeps only its best-cost loci, and only its main hit once
+    // nothing redraws over them (no duplicate copies left to draw); c1/c2 still count every
+    // retained locus. cig holds the CIGARs of more than one operation. Declared last, so the
+    // search's fields above keep their offsets.
+    std::vector<aln_meth_hit_t> hits;
+    std::vector<uint32_t> cig;
 };
+// The pointer is into h itself (one operation) or into r.cig, so it is valid while both are.
+static inline const uint32_t *aln_meth_hit_cigar(const aln_meth_read_t &r, const aln_meth_hit_t &h)
+{
+    return h.n_cig == 1 ? &h.cig : r.cig.data() + h.cig;
+}
 
 /* --meth's per-slot search state (AlnMeth::ext_t): see aln_meth.cpp. */
 struct aln_meth_group_t;

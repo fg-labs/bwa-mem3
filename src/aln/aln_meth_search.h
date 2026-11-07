@@ -87,14 +87,20 @@ static inline void aln_meth_hit(void *, const gap_entry_t *, bwtint_t, bwtint_t)
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
 void aln_meth_report(int, int, const aln_meth_read_t *);
-// Trims a finished read to its main hit (an incomplete read always; a complete one when it has more
-// than max_xa_hits + 1 loci), then releases search-only state: spare capacity and raw_cigar.
+// Finishes a read (stores its occ as hits; see aln_meth_store_loci), then trims it to its main hit
+// (an incomplete read always; a complete one when it has more than max_xa_hits + 1 loci).
 void aln_meth_trim(aln_meth_read_t *, int);
+// Moves every occ locus to hits, in order (main then indexes hits), and frees occ. No-op when occ
+// is empty, as it is once a read is finished.
+void aln_meth_store_loci(aln_meth_read_t *);
 void aln_meth_redraw(aln_meth_read_t *, uint64_t);
-/* Fills a duplicate read's result from its representative's not-yet-trimmed src: every field but
- * the work counters is copied and the main hit is redrawn with rng among src's best loci. Unless
- * keep_all, a result aln_meth_trim(max_xa_hits) would cut to its main hit gets only that locus
- * (any max_xa_hits < 0 prints no XA, so it always does). src is unchanged on return. */
+// aln_meth_redraw over a finished read's hits: the same draw (one shared body), the same rng.
+void aln_meth_redraw_hits(aln_meth_read_t *, uint64_t);
+/* Fills a duplicate read's result from its representative's finished, not-yet-trimmed src (its
+ * loci stored as hits): every field but the work counters is copied and the main hit is redrawn
+ * with rng among src's best hits. Unless keep_all, a result aln_meth_trim(max_xa_hits) would cut
+ * to its main hit gets only that hit (any max_xa_hits < 0 prints no XA, so it always does). src is
+ * unchanged on return. */
 void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng, int keep_all, int max_xa_hits);
 uint64_t aln_meth_draw_seed(const aln_meth_ref_t *, int, int64_t);
 void aln_meth_flush_parked(aln_meth_group_t *);
