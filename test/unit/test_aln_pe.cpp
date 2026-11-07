@@ -18,6 +18,8 @@
 #include "../../src/kvec.h"
 #include "../../src/read_index_ele.h"
 
+#include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -141,6 +143,255 @@ void check_same_ii(const ba::isize_info_t &a, const ba::isize_info_t &b)
 }
 
 } // namespace
+
+TEST_CASE("aln_pe: short-insert preserves the stock pairing option prefix"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Existing callers' field displacements must not change when an opt-in field is added.
+    struct StockOptions {
+        int max_isize, force_isize;
+        int max_occ;
+        int n_multi, N_multi;
+        int type, is_sw, is_preload;
+        double ap_prior;
+    };
+    CHECK(offsetof(ba::pe_opt_t,max_isize)==offsetof(StockOptions,max_isize));
+    CHECK(offsetof(ba::pe_opt_t,force_isize)==offsetof(StockOptions,force_isize));
+    CHECK(offsetof(ba::pe_opt_t,max_occ)==offsetof(StockOptions,max_occ));
+    CHECK(offsetof(ba::pe_opt_t,n_multi)==offsetof(StockOptions,n_multi));
+    CHECK(offsetof(ba::pe_opt_t,N_multi)==offsetof(StockOptions,N_multi));
+    CHECK(offsetof(ba::pe_opt_t,type)==offsetof(StockOptions,type));
+    CHECK(offsetof(ba::pe_opt_t,is_sw)==offsetof(StockOptions,is_sw));
+    CHECK(offsetof(ba::pe_opt_t,is_preload)==offsetof(StockOptions,is_preload));
+    CHECK(offsetof(ba::pe_opt_t,ap_prior)==offsetof(StockOptions,ap_prior));
+    CHECK(offsetof(ba::pe_opt_t,short_insert)>=sizeof(StockOptions));
+    auto *opt=ba::bwa_init_pe_opt();
+    REQUIRE(opt!=nullptr);
+    CHECK(opt->short_insert==0);
+    free(opt);
+}
+
+TEST_CASE("aln_pe: short-insert estimates all short spans despite a long mapped or unmapped outlier"
+          * doctest::test_suite("unit/aln_pe")) {
+    std::vector<ba::bwa_seq_t> ends[2];
+    for (auto &end : ends) end.resize(41);
+    for (int i = 0; i < 41; ++i) for (int j = 0; j < 2; ++j) {
+        auto &p = ends[j][i];
+        p.mapQ = 37;
+        p.pos = 100 + 200 * i + 5 * j;
+        p.len = p.full_len = i == 40 ? 150 : 20 + i % 16;
+    }
+    ba::bwa_seq_t *seqs[2] = {ends[0].data(), ends[1].data()};
+    for (int n : {40, 41}) for (bool mapped : {false, true}) {
+        CAPTURE(n); CAPTURE(mapped);
+        ends[0][40].mapQ = ends[1][40].mapQ = mapped ? 37 : 0;
+        ba::isize_info_t ii = {};
+        CHECK(ba::infer_isize(n, seqs, &ii, 1e-5, 100000, true) == 0);
+        CHECK(ii.low == 12);
+        CHECK(ii.high == 52);
+        CHECK(ii.avg == doctest::Approx(31.7));
+        CHECK(ii.std == doctest::Approx(std::sqrt(823.4 / 40)));
+        CHECK(ii.high_bayesian > 40);
+        CHECK(ii.high_bayesian < 155);
+    }
+}
+
+TEST_CASE("aln_pe: short-insert clamps the raw lower fence and normalizes failed estimates"
+          * doctest::test_suite("unit/aln_pe")) {
+    std::vector<ba::bwa_seq_t> ends[2];
+    for (auto &end : ends) end.resize(20);
+    ba::bwa_seq_t *seqs[2] = {ends[0].data(), ends[1].data()};
+    for (int i = 0; i < 20; ++i) for (int j = 0; j < 2; ++j) {
+        auto &p = ends[j][i];
+        p.mapQ = 37; p.len = p.full_len = 20;
+        p.pos = 100 + 100 * i + j * (i < 10 ? 1 : 30);
+    }
+    ba::isize_info_t ii = {};
+    CHECK(ba::infer_isize(20, seqs, &ii, 1e-5, 100000, true) == 0);
+    CHECK(ii.low == 1);
+    CHECK(ii.high == 108);
+    CHECK(ii.avg == doctest::Approx(35.5));
+    CHECK(ba::infer_isize(19, seqs, &ii, 1e-5, 100000, true) == -1);
+    CHECK(ii.avg == -1); CHECK(ii.std == -1);
+    CHECK(ii.low == 0); CHECK(ii.high == 0); CHECK(ii.high_bayesian == 0);
+    // Equal fences and constant spans retain the inherited invalid-variance failure.
+    for (int i = 0; i < 20; ++i) ends[1][i].pos = ends[0][i].pos + 5;
+    CHECK(ba::infer_isize(20, seqs, &ii, 1e-5, 100000, true) == -1);
+    CHECK(ii.avg == -1); CHECK(ii.std == -1);
+    CHECK(ii.low == 0); CHECK(ii.high == 0); CHECK(ii.high_bayesian == 0);
+}
+
+TEST_CASE("aln_pe: short-insert constant spans fail safely with an unmapped long outlier"
+          * doctest::test_suite("unit/aln_pe")) {
+    ba::bwa_seq_t ends[2][21] = {};
+    for (int j = 0; j < 2; ++j) for (int i = 0; i < 21; ++i) {
+        auto &p = ends[j][i];
+        p.mapQ = i < 20 ? 37 : 0;
+        p.len = p.full_len = i < 20 ? 20 : 150;
+        p.pos = 100 + 200 * i + 5 * j;
+    }
+    ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+    ba::isize_info_t ii = {};
+    CHECK(ba::infer_isize(21, seqs, &ii, 1e-5, 100000) == -1);
+    CHECK(ii.low == 150); CHECK(ii.high == 25);
+    CHECK(ba::infer_isize(21, seqs, &ii, 1e-5, 100000, true) == -1);
+    CHECK(ii.avg == -1); CHECK(ii.std == -1);
+    CHECK(ii.low == 0); CHECK(ii.high == 0); CHECK(ii.high_bayesian == 0);
+}
+
+TEST_CASE("aln_pe: short-insert zero-span failure leaves no active estimate"
+          * doctest::test_suite("unit/aln_pe")) {
+    ba::bwa_seq_t ends[2][20] = {};
+    for (auto &end : ends) for (auto &p : end) p.mapQ = 37;
+    ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+    ba::isize_info_t ii = {};
+    CHECK(ba::infer_isize(20, seqs, &ii, 1e-5, 100000, true) == -1);
+    CHECK(ii.avg == -1); CHECK(ii.std == -1);
+    CHECK(ii.low == 0); CHECK(ii.high == 0); CHECK(ii.high_bayesian == 0);
+}
+
+TEST_CASE("aln_pe: short-insert retains previous-estimate fallback and explicit -A precedence"
+          * doctest::test_suite("unit/aln_pe")) {
+    auto *pe = ba::bwa_init_pe_opt();
+    CHECK(pe->short_insert == 0);
+    pe->short_insert = 1;
+    ba::bwa_seq_t ends[2][20] = {};
+    for (int i = 0; i < 20; ++i) for (int j = 0; j < 2; ++j) {
+        auto &p = ends[j][i];
+        p.mapQ = 37; p.len = p.full_len = 20;
+        p.pos = 100 + 100 * i + j * (5 + i % 10);
+    }
+    ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+    ba::isize_info_t none = {}, prior = {}, ii = {};
+    none.avg = -1;
+    ba::bwa_pe_isize_ref(100000, 20, seqs, &prior, pe, &none);
+    REQUIRE(prior.avg > 0);
+    // One fewer qualifying pair must reuse the complete prior estimate.
+    ends[0][19].mapQ = 19;
+    ba::bwa_pe_isize_ref(100000, 20, seqs, &ii, pe, &prior);
+    check_same_ii(ii, prior); CHECK(ii.ap_prior == prior.ap_prior);
+    ba::bwa_pe_isize_ref(100000, 20, seqs, &ii, pe, &none);
+    CHECK(ii.avg == -1); CHECK(ii.std == -1);
+    CHECK(ii.low == 0); CHECK(ii.high == 0); CHECK(ii.high_bayesian == 0);
+    pe->force_isize = 1;
+    ba::bwa_pe_isize_ref(100000, 20, seqs, &ii, pe, &prior);
+    CHECK(ii.avg == -1); CHECK(ii.std == -1); CHECK(ii.low == 0); CHECK(ii.high == 0);
+    ends[0][19].mapQ = 37;
+    ba::bwa_pe_isize_ref(100000, 20, seqs, &ii, pe, &prior);
+    CHECK(ii.avg == -1); CHECK(ii.std == -1); CHECK(ii.low == 0); CHECK(ii.high == 0);
+    free(pe);
+}
+
+TEST_CASE("aln_pe: short-insert rejects underflowed pairing likelihoods without changing finite rankings"
+          * doctest::test_suite("unit/aln_pe")) {
+    ba::bwa_seq_t calibration[2][22] = {};
+    for (int j = 0; j < 2; ++j) for (int i = 0; i < 22; ++i) {
+        auto &p = calibration[j][i]; p.mapQ = i == 21 ? 0 : 37;
+        p.len = p.full_len = i == 21 ? 150 : i == 20 ? 20 : 50;
+        p.pos = 100 + 200 * i + (j ? (i == 20 ? 1 : 5 + i % 2) : 0);
+    }
+    ba::bwa_seq_t *cal[2] = {calibration[0], calibration[1]};
+    ba::isize_info_t ii = {};
+    REQUIRE(ba::infer_isize(22, cal, &ii, 1e-5, 100000, true) == 0);
+    CHECK(ii.avg == doctest::Approx(55.5)); CHECK(ii.std == doctest::Approx(std::sqrt(.2)));
+    CHECK(ii.high_bayesian == 58);
+    // Independent log-tail reference: a 21bp span is >77 standard deviations away.
+    const long double z = (ii.avg - 21) / ii.std;
+    const long double tail_score = 4.343L * (z*z/2 + std::log(z) + .5L*std::log(2*acosl(-1.L)));
+    CHECK(tail_score > 12000); CHECK(tail_score < 14000);
+    CHECK(std::erfc((double)(z / std::sqrt(2.L))) == 0);
+    auto *pe = ba::bwa_init_pe_opt(); pe->short_insert = 1; ba::bwase_initialize();
+    for (bool alternative : {false, true}) {
+        ba::bwa_seq_t ends[2] = {}; ba::bwt_aln1_t hits[2][2] = {};
+        for (int j = 0; j < 2; ++j) {
+            ends[j].aln = hits[j]; ends[j].pos = 10000 + j; ends[j].strand = j;
+            ends[j].len = ends[j].full_len = 20; ends[j].mapQ = 25;
+        }
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[3] = {{10000, 0}, {10001, 3}, {10036, 7}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = alternative ? 3 : 2;
+        ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        CHECK(ends[0].pos == 10000); CHECK(ends[1].pos == (alternative ? 10036 : 10001));
+        CHECK(((ends[0].extra_flag & SAM_FPP) != 0) == alternative);
+        CHECK(((ends[1].extra_flag & SAM_FPP) != 0) == alternative);
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: short-insert pairs a coincident start whatever the two hits' indices, unless -A"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Rows sort by (position, hit index << 2 | strand << 1 | mate), so at one position the
+    // reverse mate's hit 0 sorts before the forward mate's hit 1. The pair must still be found.
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwase_initialize();
+    ba::isize_info_t ii = {}; ii.low = 1; ii.high = ii.high_bayesian = 69; ii.avg = 32; ii.std = 7;
+    for (int option : {0, 1, 2}) { // 2: --short-insert with -A, which overrides it
+        CAPTURE(option);
+        pe->short_insert = option != 0; pe->force_isize = option == 2;
+        ba::bwa_seq_t ends[2] = {};
+        ba::bwt_aln1_t hits0[2] = {}, hits1[1] = {};
+        ends[0].aln = hits0; ends[1].aln = hits1;
+        for (int j = 0; j < 2; ++j) {
+            ends[j].type = BWA_TYPE_REPEAT; ends[j].strand = j;
+            ends[j].len = ends[j].full_len = 20; ends[j].mapQ = ends[j].seQ = 25;
+        }
+        ends[0].pos = 5000; ends[1].pos = 100;
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[3] = {{5000, 0u << 2 | 0 << 1 | 0}, {100, 1u << 2 | 0 << 1 | 0}, {100, 0u << 2 | 1 << 1 | 1}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 3;
+        ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        CHECK(ends[0].pos == (option == 1 ? 100 : 5000));
+        for (const auto &p : ends) CHECK(((p.extra_flag & SAM_FPP) != 0) == (option == 1));
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: short-insert pairs coincident starts but keeps the other geometry and same-contig requirements"
+          * doctest::test_suite("unit/aln_pe")) {
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwase_initialize();
+    ba::isize_info_t ii = {}; ii.avg = ii.std = -1;
+    bntann1_t ann[2] = {}; ann[0].len = ann[1].len = 200; ann[1].offset = 200;
+    bntseq_t bns = {}; bns.n_seqs = 2; bns.l_pac = 400; bns.anns = ann;
+    // stock_proper: without the option. proper: with it, which only adds coincident starts.
+    struct Geometry {int start, end, len0, len1, full0, full1; bool proper, stock_proper;};
+    const Geometry cases[] = {
+        {100, 100, 20, 20, 20, 20, true, false}, // coincident starts: both reads cover the fragment
+        {100, 100, 20, 19, 20, 20, false, false}, // coincident, but the forward read runs past the reverse end
+        {100, 100, 19, 20, 20, 20, true, false}, // coincident, the reverse read is the longer
+        {100, 99, 20, 20, 20, 20, false, false}, // the reverse read starts first
+        {100, 101, 20, 20, 20, 20, true, true},
+        {100, 101, 10, 19, 20, 20, true, true}, // outer span == max full_len
+        {100, 101, 10, 18, 20, 20, false, false},
+        {100, 110, 30, 20, 30, 20, true, true}, // asymmetric full lengths
+        {100, 109, 30, 20, 30, 20, false, false},
+        {190, 205, 20, 20, 20, 20, true, true} // only ordinary path may pair across contigs
+    };
+    for (int option : {0, 1}) for (bool active : {false, true}) for (bool same_contig : {false, true})
+    for (const auto &c : cases) {
+        pe->short_insert = option;
+        CAPTURE(option);
+        ii = {}; ii.avg = ii.std = -1;
+        if (active) { ii.low = 1; ii.high = ii.high_bayesian = 69; ii.avg = 32; ii.std = 7; }
+        CAPTURE(active); CAPTURE(same_contig); CAPTURE(c.start); CAPTURE(c.end); CAPTURE(c.len1);
+        ba::bwa_seq_t ends[2] = {};
+        ba::bwt_aln1_t hits[2] = {};
+        for (int j = 0; j < 2; ++j) {
+            ends[j].aln = hits + j; ends[j].type = BWA_TYPE_UNIQUE;
+            ends[j].pos = j ? c.end : c.start; ends[j].strand = j;
+            ends[j].len = j ? c.len1 : c.len0; ends[j].full_len = j ? c.full1 : c.full0;
+            ends[j].mapQ = ends[j].seQ = 25;
+        }
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[2] = {{(uint64_t)c.start, 0}, {(uint64_t)c.end, 3}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 2;
+        if (same_contig) ba::bwa_pe_pairing_same_contig(&bns, pair, &arr, pe, 3, &ii);
+        else ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        const bool want = option ? c.proper : c.stock_proper;
+        const bool proper = want && !(same_contig && c.start < 200 && c.end >= 200);
+        for (const auto &p : ends) CHECK(((p.extra_flag & SAM_FPP) != 0) == proper);
+    }
+    free(pe);
+}
 
 TEST_CASE("aln_pe: infer_isize failure falls back to the previous batch's estimate"
           * doctest::test_suite("unit/aln_pe")) {
@@ -948,4 +1199,37 @@ TEST_CASE("aln_pe: a gzip read error in the next R2 batch still lets the current
     CHECK(run_pe_lines(batch, f1, f2, ix.dir + "/gz.sam", &lines, &err) == 1);
     CHECK((int)lines.size() == 2 * expected_pairs);
     CHECK(err.find("[gzread] ") != std::string::npos);
+}
+
+TEST_CASE("aln_pe: short-insert rescue windows may cover the anchor and keep the mate inside the fragment"
+          * doctest::test_suite("unit/aln_pe")) {
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwa_seq_t anchor = {};
+    anchor.pos = 1000; anchor.len = 30; anchor.ref_shift = 2; // 32 reference bases (a deletion)
+    auto cigar = [](std::initializer_list<std::pair<int, int>> ops) {
+        std::vector<ba::bwa_cigar_t> c;
+        for (auto [op, n] : ops) c.push_back(__cigar_create(op, n));
+        return c;
+    };
+    for (int option : {0, 1}) {
+        CAPTURE(option);
+        pe->short_insert = option;
+        CHECK(ba::aln_rescue_window_floor(&anchor, pe) == (option ? 1000 : 1030));
+        CHECK(ba::aln_rescue_window_ceiling(&anchor, pe) == (option ? 1032 : 1000));
+    }
+    const auto m32 = cigar({{FROM_M, 32}}), clipped = cigar({{FROM_S, 25}, {FROM_M, 32}});
+    const auto m20 = cigar({{FROM_M, 20}}), m40 = cigar({{FROM_M, 40}});
+    anchor.strand = 0; // forward anchor [1000, 1032): a reverse mate may start at 1000 and must end at >= 1032
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, m32.data(), (int)m32.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, clipped.data(), (int)clipped.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1010, m40.data(), (int)m40.size()));
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 999, m40.data(), (int)m40.size()));  // starts first
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 1005, m20.data(), (int)m20.size())); // ends inside
+    anchor.strand = 1; // reverse anchor [1000, 1032): a forward mate must start at <= 1000 and end by 1032
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, m32.data(), (int)m32.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, clipped.data(), (int)clipped.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 980, m40.data(), (int)m40.size()));
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 1001, m20.data(), (int)m20.size())); // starts after
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 995, m40.data(), (int)m40.size()));  // ends after
+    free(pe);
 }
