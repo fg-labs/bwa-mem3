@@ -25,7 +25,7 @@ pe_opt_t *bwa_init_pe_opt(void);
 
 /* Estimates the insert-size distribution from the pairs where both ends are unique enough.
  * With short_insert, the lower fence is floored at 1 rather than the longest read, and failed
- * estimates have avg/std = -1 and all bounds zero. The default preserves stock behavior.
+ * estimates have avg/std = -1 and all bounds zero. (Pairing then also accepts coincident starts, and rescue may overlap the anchor.) The default preserves stock behavior.
  * Returns 0, or -1 (ii->avg = -1) when it cannot; prints its findings to stderr. */
 int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
                 bool short_insert = false);
@@ -66,6 +66,14 @@ int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm
 /* Stock scoring/count aggregation, restricted to same-contig candidates before selection. */
 int bwa_pe_pairing_same_contig(const bntseq_t *bns, bwa_seq_t *p[2], pair64_v *arr,
                                const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
+/* Mate rescue under --short-insert may search the anchor's own span, because both reads of a
+ * fragment shorter than the reads start (or end) where their mate does. These keep a rescued mate
+ * inside the fragment the anchor implies: the forward read may neither start nor end after the
+ * reverse read. Soft-clipped bases are not part of the alignment, so a clipped overhang passes. */
+int64_t aln_rescue_window_floor(const bwa_seq_t *anchor, const pe_opt_t *opt);
+int64_t aln_rescue_window_ceiling(const bwa_seq_t *anchor, const pe_opt_t *opt);
+bool aln_rescue_within_fragment(const bwa_seq_t *anchor, int64_t mate_beg, const bwa_cigar_t *cigar,
+                                int n_cigar);
 /* The largest weight of a group of pairs in bwa_pe_pair (see bwa_pe_pair_grouped). */
 constexpr long long ALN_PE_GROUP_ROWS = 8192;
 /* bwa_pe_pair with the group size as a parameter (bwa_pe_pair passes ALN_PE_GROUP_ROWS); the unit

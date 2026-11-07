@@ -40,8 +40,9 @@ Paired-end options (two input files; from bwa sampe):
   -c FLOAT  prior of chimeric rate (lower bound) [1.0e-05]
   -s        disable Smith-Waterman for the unmapped mate
   -A        disable insert size estimate (force -s)
-  --short-insert   estimate short inserts without a batch-wide read-length floor [off]
-                   paired only, including --meth; changes calibration, not pairing geometry or rescue algorithm; -A overrides
+  --short-insert   estimate short inserts without a batch-wide read-length floor, pair mates
+                   that start at the same base, and let mate rescue overlap the anchor [off]
+                   paired only, including --meth; -A overrides
   -P        accepted and ignored (sampe -P loads the index into memory; always so here)
 
 Methylation (shared with bwa-mem3 mem):

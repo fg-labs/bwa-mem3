@@ -18,9 +18,11 @@ The command page documents discovery/resource limits and incomplete confidence.
 
 For paired ordinary or methylation-aware alignment, `--short-insert` lets the insert
 estimator include short, overlapping fragments without the longest read in a batch
-setting its minimum. The flag defaults off and is rejected with single-end input;
-`-A` overrides it. Enabling it can change pair selection, proper-pair flags, MAPQ and
-rescue windows. It does not change pairing geometry or the rescue algorithm.
+setting its minimum, pairs mates that start at the same base (both reads covering a
+fragment shorter than the reads), and lets mate rescue search the anchor's own span, so a
+mate that runs past its anchor is rescued with the overhang soft-clipped. The flag defaults
+off and is rejected with single-end input; `-A` overrides it. Enabling it can change pair
+selection, proper-pair flags, MAPQ, rescued mates and their CIGARs.
 
 The MEM methylation placement, performance and accuracy measurements in the
 following sections do not validate `aln --meth`. Its revised candidate-refinement

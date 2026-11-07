@@ -107,7 +107,8 @@ loading the index or creating output.
 ### Short, overlapping fragments
 
 Use `--short-insert` when short fragments overlap and a longer read in the batch would
-otherwise exclude them from insert-size estimation. It works with ordinary and
+otherwise exclude them from insert-size estimation, or when both reads often cover the whole
+fragment. It works with ordinary and
 methylation-aware (`--meth`) paired alignment:
 
 ```bash
@@ -120,10 +121,23 @@ fence, minimum number of high-quality pairs and previous-batch fallback. Failed
 estimates use the no-estimate fallback; `-A` overrides the option and disables insert
 estimation and mate rescue.
 
-This is an opt-in departure from stock output. The inferred distribution can change
-pair selection, proper-pair flags, MAPQ and rescue windows. Pairing geometry and the
-rescue algorithm are unchanged: this option does not enable overlap-aware rescue or
-make every short pair proper. Under this option, pairing and methylation cap rescue
+The option also accepts a pair whose reverse read starts at the same base as its forward
+read. Stock pairing requires the reverse read to start strictly after the forward one, so
+when trimmed reads each cover a whole fragment shorter than the read length, almost no pair
+is proper and neither mate's MAPQ benefits from the other. Every other geometry requirement
+is kept: the reverse read may not start before the forward read, the outer span must be at
+least the longer read, and the insert must fit the estimate (or `-a` without one).
+
+Mate rescue (and, with `--meth`, cap rescue) may also search the anchor's own span. Stock
+rescue looks for the mate only beyond the anchor, so it can never place a mate that covers the
+same fragment. A rescued mate must stay inside the fragment the anchor implies: the forward read
+may neither start nor end after the reverse read. Rescue is a local alignment, so a mate that
+runs past its anchor (for example, read 1 starting with adapter sequence ahead of the fragment)
+is rescued with that overhang soft-clipped.
+
+This is an opt-in departure from stock output. The inferred distribution, the coincident
+starts and the wider rescue windows can change pair selection, proper-pair flags, MAPQ, rescued
+mates and their CIGARs. This option does not make every short pair proper. Under this option, pairing and methylation cap rescue
 reject candidates when the insert-likelihood calculation underflows or its penalty
 cannot be represented as an integer. Existing defaults are unchanged.
 

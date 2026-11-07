@@ -317,25 +317,59 @@ TEST_CASE("aln_pe: short-insert rejects underflowed pairing likelihoods without 
     free(pe);
 }
 
-TEST_CASE("aln_pe: short-insert does not relax pairing geometry or same-contig requirements"
+TEST_CASE("aln_pe: short-insert pairs a coincident start whatever the two hits' indices, unless -A"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Rows sort by (position, hit index << 2 | strand << 1 | mate), so at one position the
+    // reverse mate's hit 0 sorts before the forward mate's hit 1. The pair must still be found.
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwase_initialize();
+    ba::isize_info_t ii = {}; ii.low = 1; ii.high = ii.high_bayesian = 69; ii.avg = 32; ii.std = 7;
+    for (int option : {0, 1, 2}) { // 2: --short-insert with -A, which overrides it
+        CAPTURE(option);
+        pe->short_insert = option != 0; pe->force_isize = option == 2;
+        ba::bwa_seq_t ends[2] = {};
+        ba::bwt_aln1_t hits0[2] = {}, hits1[1] = {};
+        ends[0].aln = hits0; ends[1].aln = hits1;
+        for (int j = 0; j < 2; ++j) {
+            ends[j].type = BWA_TYPE_REPEAT; ends[j].strand = j;
+            ends[j].len = ends[j].full_len = 20; ends[j].mapQ = ends[j].seQ = 25;
+        }
+        ends[0].pos = 5000; ends[1].pos = 100;
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[3] = {{5000, 0u << 2 | 0 << 1 | 0}, {100, 1u << 2 | 0 << 1 | 0}, {100, 0u << 2 | 1 << 1 | 1}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 3;
+        ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        CHECK(ends[0].pos == (option == 1 ? 100 : 5000));
+        for (const auto &p : ends) CHECK(((p.extra_flag & SAM_FPP) != 0) == (option == 1));
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: short-insert pairs coincident starts but keeps the other geometry and same-contig requirements"
           * doctest::test_suite("unit/aln_pe")) {
     auto *pe = ba::bwa_init_pe_opt();
-    pe->short_insert = 1;
     ba::bwase_initialize();
     ba::isize_info_t ii = {}; ii.avg = ii.std = -1;
     bntann1_t ann[2] = {}; ann[0].len = ann[1].len = 200; ann[1].offset = 200;
     bntseq_t bns = {}; bns.n_seqs = 2; bns.l_pac = 400; bns.anns = ann;
-    struct Geometry {int start, end, len0, len1, full0, full1; bool proper;};
+    // stock_proper: without the option. proper: with it, which only adds coincident starts.
+    struct Geometry {int start, end, len0, len1, full0, full1; bool proper, stock_proper;};
     const Geometry cases[] = {
-        {100, 100, 20, 20, 20, 20, false}, // coincident starts
-        {100, 101, 20, 20, 20, 20, true},
-        {100, 101, 10, 19, 20, 20, true}, // outer span == max full_len
-        {100, 101, 10, 18, 20, 20, false},
-        {100, 110, 30, 20, 30, 20, true}, // asymmetric full lengths
-        {100, 109, 30, 20, 30, 20, false},
-        {190, 205, 20, 20, 20, 20, true} // only ordinary path may pair across contigs
+        {100, 100, 20, 20, 20, 20, true, false}, // coincident starts: both reads cover the fragment
+        {100, 100, 20, 19, 20, 20, false, false}, // coincident, but the forward read runs past the reverse end
+        {100, 100, 19, 20, 20, 20, true, false}, // coincident, the reverse read is the longer
+        {100, 99, 20, 20, 20, 20, false, false}, // the reverse read starts first
+        {100, 101, 20, 20, 20, 20, true, true},
+        {100, 101, 10, 19, 20, 20, true, true}, // outer span == max full_len
+        {100, 101, 10, 18, 20, 20, false, false},
+        {100, 110, 30, 20, 30, 20, true, true}, // asymmetric full lengths
+        {100, 109, 30, 20, 30, 20, false, false},
+        {190, 205, 20, 20, 20, 20, true, true} // only ordinary path may pair across contigs
     };
-    for (bool active : {false, true}) for (bool same_contig : {false, true}) for (const auto &c : cases) {
+    for (int option : {0, 1}) for (bool active : {false, true}) for (bool same_contig : {false, true})
+    for (const auto &c : cases) {
+        pe->short_insert = option;
+        CAPTURE(option);
         ii = {}; ii.avg = ii.std = -1;
         if (active) { ii.low = 1; ii.high = ii.high_bayesian = 69; ii.avg = 32; ii.std = 7; }
         CAPTURE(active); CAPTURE(same_contig); CAPTURE(c.start); CAPTURE(c.end); CAPTURE(c.len1);
@@ -352,7 +386,8 @@ TEST_CASE("aln_pe: short-insert does not relax pairing geometry or same-contig r
         pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 2;
         if (same_contig) ba::bwa_pe_pairing_same_contig(&bns, pair, &arr, pe, 3, &ii);
         else ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
-        const bool proper = c.proper && !(same_contig && c.start < 200 && c.end >= 200);
+        const bool want = option ? c.proper : c.stock_proper;
+        const bool proper = want && !(same_contig && c.start < 200 && c.end >= 200);
         for (const auto &p : ends) CHECK(((p.extra_flag & SAM_FPP) != 0) == proper);
     }
     free(pe);
@@ -1164,4 +1199,37 @@ TEST_CASE("aln_pe: a gzip read error in the next R2 batch still lets the current
     CHECK(run_pe_lines(batch, f1, f2, ix.dir + "/gz.sam", &lines, &err) == 1);
     CHECK((int)lines.size() == 2 * expected_pairs);
     CHECK(err.find("[gzread] ") != std::string::npos);
+}
+
+TEST_CASE("aln_pe: short-insert rescue windows may cover the anchor and keep the mate inside the fragment"
+          * doctest::test_suite("unit/aln_pe")) {
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwa_seq_t anchor = {};
+    anchor.pos = 1000; anchor.len = 30; anchor.ref_shift = 2; // 32 reference bases (a deletion)
+    auto cigar = [](std::initializer_list<std::pair<int, int>> ops) {
+        std::vector<ba::bwa_cigar_t> c;
+        for (auto [op, n] : ops) c.push_back(__cigar_create(op, n));
+        return c;
+    };
+    for (int option : {0, 1}) {
+        CAPTURE(option);
+        pe->short_insert = option;
+        CHECK(ba::aln_rescue_window_floor(&anchor, pe) == (option ? 1000 : 1030));
+        CHECK(ba::aln_rescue_window_ceiling(&anchor, pe) == (option ? 1032 : 1000));
+    }
+    const auto m32 = cigar({{FROM_M, 32}}), clipped = cigar({{FROM_S, 25}, {FROM_M, 32}});
+    const auto m20 = cigar({{FROM_M, 20}}), m40 = cigar({{FROM_M, 40}});
+    anchor.strand = 0; // forward anchor [1000, 1032): a reverse mate may start at 1000 and must end at >= 1032
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, m32.data(), (int)m32.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, clipped.data(), (int)clipped.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1010, m40.data(), (int)m40.size()));
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 999, m40.data(), (int)m40.size()));  // starts first
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 1005, m20.data(), (int)m20.size())); // ends inside
+    anchor.strand = 1; // reverse anchor [1000, 1032): a forward mate must start at <= 1000 and end by 1032
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, m32.data(), (int)m32.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 1000, clipped.data(), (int)clipped.size()));
+    CHECK(ba::aln_rescue_within_fragment(&anchor, 980, m40.data(), (int)m40.size()));
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 1001, m20.data(), (int)m20.size())); // starts after
+    CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 995, m40.data(), (int)m40.size()));  // ends after
+    free(pe);
 }
