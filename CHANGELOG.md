@@ -1,5 +1,63 @@
 # Changelog
 
+## [0.17.0](https://github.com/fg-labs/bwa-mem3/compare/v0.16.0...v0.17.0) (2026-11-07)
+
+
+### ⚠ BREAKING CHANGES
+
+* **meth:** bare --meth output changes (scores, MAPQ, NM, some placements and clipping). Pass --meth-scoring collapsed to keep the previous behaviour.
+* **mem:** under -u, the alternative-hit list is now written as XB:Z instead of XA:Z (SAM text, --bam and --meth). Output without -u is unchanged. A pipeline that ran -u and read XA:Z must read XB:Z instead.
+
+### Features
+
+* **mem:** add `--md full|short|none` to choose the MD tag ([#754](https://github.com/fg-labs/bwa-mem3/issues/754)) ([01f5f39](https://github.com/fg-labs/bwa-mem3/commit/01f5f39afa888a5ec9ebcc2350dde5164db93425))
+* **meth:** default EM-seq/bisulfite --meth-scoring to genomic ([#756](https://github.com/fg-labs/bwa-mem3/issues/756)) ([bb56c84](https://github.com/fg-labs/bwa-mem3/commit/bb56c8439c4deb7df7e34461e34fdaf2f963d76b))
+
+
+### Bug Fixes
+
+* bound finite pair scores before integer conversion ([#743](https://github.com/fg-labs/bwa-mem3/issues/743)) ([9f09cec](https://github.com/fg-labs/bwa-mem3/commit/9f09cecb1f8a1851608d69c244ac7070b3c918bf))
+* **build:** keep LTO when lld needs ld.bfd's library search directories ([#713](https://github.com/fg-labs/bwa-mem3/issues/713)) ([14272d8](https://github.com/fg-labs/bwa-mem3/commit/14272d8cdfd4097a1e55ff4063aec32f3746c478))
+* **build:** match LLVM archive tools to clang-19 ([#738](https://github.com/fg-labs/bwa-mem3/issues/738)) ([a32a987](https://github.com/fg-labs/bwa-mem3/commit/a32a987f1363dcc84e8a1ce2876ed2b70e3f251d))
+* **build:** probe the AVX2 floor from a plain x86-64 baseline ([#753](https://github.com/fg-labs/bwa-mem3/issues/753)) ([279fdc6](https://github.com/fg-labs/bwa-mem3/commit/279fdc62bf165fe6bb4dffc59ca5f66b77ac93b2))
+* **build:** validate LTO archives with native and LTO consumers ([#736](https://github.com/fg-labs/bwa-mem3/issues/736)) ([ef0216a](https://github.com/fg-labs/bwa-mem3/commit/ef0216af477d40913e93e84d31b4744d357b0044))
+* defer inconclusive input metadata errors to open ([#744](https://github.com/fg-labs/bwa-mem3/issues/744)) ([6c43e96](https://github.com/fg-labs/bwa-mem3/commit/6c43e96ea011780f1154f17c2913643648b92595))
+* **io:** give SAM text and --bam one header, and map --bam contigs by name ([#692](https://github.com/fg-labs/bwa-mem3/issues/692)) ([175984e](https://github.com/fg-labs/bwa-mem3/commit/175984ec2ad8cb9b1b65ab278fe0d706d50cb5c1))
+* **mem:** name the -u hit list XB:Z, as bwa does ([#690](https://github.com/fg-labs/bwa-mem3/issues/690)) ([19a0574](https://github.com/fg-labs/bwa-mem3/commit/19a0574f7c26e97c7736fd8b10dce89596b3b081))
+* **meth:** warn when em-seq is combined with --meth-scoring neutral ([#734](https://github.com/fg-labs/bwa-mem3/issues/734)) ([cc888bb](https://github.com/fg-labs/bwa-mem3/commit/cc888bb1714e03828a8f3f59704b9d76885a96cd))
+* **shm:** hold the stager lock only for the registry update ([#760](https://github.com/fg-labs/bwa-mem3/issues/760)) ([99ac733](https://github.com/fg-labs/bwa-mem3/commit/99ac73366fcb1ced4930c0e58582b2c15710e119))
+* **shm:** reject unregistered shared-memory segments ([#745](https://github.com/fg-labs/bwa-mem3/issues/745)) ([057b9d0](https://github.com/fg-labs/bwa-mem3/commit/057b9d0e1268f563397870e7e20df8f2f6a78c8e))
+* track test archives and match reader compile flags ([#746](https://github.com/fg-labs/bwa-mem3/issues/746)) ([07b5d7d](https://github.com/fg-labs/bwa-mem3/commit/07b5d7df068fc807616206850ec7161ea47260fd))
+
+
+### Performance
+
+* **bam:** sync the single-threaded BGZF writer every 32 MiB, not only at close ([#727](https://github.com/fg-labs/bwa-mem3/issues/727)) ([3ac3df8](https://github.com/fg-labs/bwa-mem3/commit/3ac3df87b33e778a58c94e852b88e6b49b2e8c3b))
+* **bsw:** capture the 16-bit query end in-cell and fold it once per row ([#708](https://github.com/fg-labs/bwa-mem3/issues/708)) ([62123fc](https://github.com/fg-labs/bwa-mem3/commit/62123fc7e62b8d6412958e4b6b0fa6c35b731e5c))
+* **bsw:** compact finished lanes in 16-bit NEON and x86 extension kernels ([#720](https://github.com/fg-labs/bwa-mem3/issues/720)) ([a96a22b](https://github.com/fg-labs/bwa-mem3/commit/a96a22b45e554735d5657e62a5be7297e1b5cd41))
+* **bsw:** lean per-row bookkeeping in the AVX-512BW 8-bit kernel ([#710](https://github.com/fg-labs/bwa-mem3/issues/710)) ([731e31a](https://github.com/fg-labs/bwa-mem3/commit/731e31ac1693d5973d72444b2b126dfc51891e05))
+* **bsw:** run the 128-bit 16-bit band trim as a counted loop ([#711](https://github.com/fg-labs/bwa-mem3/issues/711)) ([005dc99](https://github.com/fg-labs/bwa-mem3/commit/005dc996c4887452a943d3c456ee3ae3450fbd85))
+* **bwamem:** pick the 16-bit pair order per call from the len1 &lt; len2 majority ([#715](https://github.com/fg-labs/bwa-mem3/issues/715)) ([6a641a5](https://github.com/fg-labs/bwa-mem3/commit/6a641a5e9a023a2efb8576b59b14518aeb54e1ff))
+* **chain:** filter each read's chains at the end of chaining, while they are cached ([#719](https://github.com/fg-labs/bwa-mem3/issues/719)) ([c5b8653](https://github.com/fg-labs/bwa-mem3/commit/c5b8653470762281d79a8ce17b9d04cf909e8bf0))
+* **cigar:** vectorize five-symbol CIGAR annotation walks on NEON ([#739](https://github.com/fg-labs/bwa-mem3/issues/739)) ([67dca71](https://github.com/fg-labs/bwa-mem3/commit/67dca71612bcdf57fec05504795a389a4c41832a))
+* **ext:** probe non-HIT extensions up to 512 bases in the certified rung ([#698](https://github.com/fg-labs/bwa-mem3/issues/698)) ([ffcc9a9](https://github.com/fg-labs/bwa-mem3/commit/ffcc9a9c93c50d2bae7271cf7457679b1a30dbd1))
+* **ext:** scan the ungapped analyzer's tail in one 16-byte step on AVX2 ([#696](https://github.com/fg-labs/bwa-mem3/issues/696)) ([3773dec](https://github.com/fg-labs/bwa-mem3/commit/3773decee07e61778a0a2e90eac717df03b0d201))
+* **ext:** use probe-rung buckets 8 apart and fill their lane groups ([#695](https://github.com/fg-labs/bwa-mem3/issues/695)) ([bec55f4](https://github.com/fg-labs/bwa-mem3/commit/bec55f496059dc2d11426e037eacb9fdba1b91dd))
+* **kstring:** format unsigned longs two digits at a time ([#741](https://github.com/fg-labs/bwa-mem3/issues/741)) ([18a4df5](https://github.com/fg-labs/bwa-mem3/commit/18a4df56ced146943095348f636308c063b3b73d))
+* **kswv:** all-pad columns and backward query-end rescan in the AVX-512BW u8 kernel ([#717](https://github.com/fg-labs/bwa-mem3/issues/717)) ([43082bb](https://github.com/fg-labs/bwa-mem3/commit/43082bbd1231176610da9c70095fd1ed24c5d346))
+* **mem:** put the occurrence table on 1 GB pages under --huge-pages ([#716](https://github.com/fg-labs/bwa-mem3/issues/716)) ([2cc0550](https://github.com/fg-labs/bwa-mem3/commit/2cc0550bc04cc60fb5e37f13465fd00115279b86))
+* **rescue:** return FULL from the prune filter once the hit gate is provably exceeded ([#718](https://github.com/fg-labs/bwa-mem3/issues/718)) ([d7b745b](https://github.com/fg-labs/bwa-mem3/commit/d7b745b906b0829e2b18c5023b2cf53b216a2d09))
+* **thp:** skip the smaps walk when no THP warning is possible ([#709](https://github.com/fg-labs/bwa-mem3/issues/709)) ([a283e56](https://github.com/fg-labs/bwa-mem3/commit/a283e56d01a199930be9f609f0194351fae80f6b))
+* **xa:** generate XA slots only for single-end alignments that will be emitted ([#740](https://github.com/fg-labs/bwa-mem3/issues/740)) ([6211043](https://github.com/fg-labs/bwa-mem3/commit/6211043b469a5cb2f090fb9ad4788f7de95d79cb))
+
+
+### Documentation
+
+* HN:i is on supplementary records too, and counts shadowed hits ([#691](https://github.com/fg-labs/bwa-mem3/issues/691)) ([e3d7ad1](https://github.com/fg-labs/bwa-mem3/commit/e3d7ad1d3fae2cb7a92d6e611fb8c72e84b31030))
+* **mem,shm,ungapped_ext:** correct proof and validation-scope statements ([#759](https://github.com/fg-labs/bwa-mem3/issues/759)) ([3b6abc6](https://github.com/fg-labs/bwa-mem3/commit/3b6abc6ef0eaac97a81dffac1a80ceb12531b363))
+* **readme:** update performance tables for v0.16.0 ([#729](https://github.com/fg-labs/bwa-mem3/issues/729)) ([7185269](https://github.com/fg-labs/bwa-mem3/commit/7185269b51d9709c1099abba6fba102a90f5dba0))
+* **test:** list the ext-tier-partition unit module in TESTING.md ([#702](https://github.com/fg-labs/bwa-mem3/issues/702)) ([1e39292](https://github.com/fg-labs/bwa-mem3/commit/1e39292e29cc84ea1069a2ea009c91bed6340c88))
+
 ## [0.16.0](https://github.com/fg-labs/bwa-mem3/compare/v0.15.1...v0.16.0) (2026-11-02)
 
 
