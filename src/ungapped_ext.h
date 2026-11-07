@@ -110,10 +110,10 @@
 //   test/ungapped_hit_parity_test.sh.
 //
 // Derivation of tight_band: an alignment reaching diagonal offset B needs at
-// least B gap units in at least one gap run, so it pays >= o_min + B·e_min, and
-// it gains at most min(len1, len2)·a over the h0 it starts from. With
-// S = max_sc - h0 the ungapped walk's gain, a gapped alignment at offset B can
-// beat the walk only if
+// least B gap units in total and at least one gap open, so it pays
+// >= o_min + B·e_min across its gap runs, and it gains at most
+// min(len1, len2)·a over the h0 it starts from. With S = max_sc - h0 the
+// ungapped walk's gain, a gapped alignment at offset B can beat the walk only if
 //   h0 + min_len·a - o_min - B·e_min > h0 + S
 //   B < (min_len·a - S - o_min) / e_min
 // so tight_band = ceil((min_len·a - S - o_min) / e_min) is the smallest offset

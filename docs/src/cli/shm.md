@@ -152,11 +152,15 @@ percentages as indicative rather than a guarantee for your data.
 
 ### Huge pages: mount `/dev/shm` with `huge=advise` or `huge=within_size`
 
-An index loaded from disk sits on 2 MB transparent huge pages. A staged segment
-lives in the `/dev/shm` tmpfs, and its page size comes from that mount's `huge=`
-option, which defaults to `never`. On 4 KB pages the FM-index and SA lookups miss
-the TLB far more often, and an alignment attached from shm uses more CPU than
-one that loads the index from disk:
+On Linux, an index loaded from disk requests transparent huge pages; actual
+backing is best-effort and depends on the kernel's THP policy and available
+memory. (`mem --huge-pages` instead asks for 1 GB pages for the occurrence
+table, also best-effort; see [`--huge-pages`](mem.md#--huge-pages--put-the-index-on-1-gb-huge-pages-linux-opt-in).)
+A staged segment lives in the `/dev/shm` tmpfs, and its page size also depends
+on that mount's `huge=` option, which defaults to `never`. In the measurements
+below, disk-loaded and huge-page-backed shm indices used 2 MB pages. With 4 KB
+shm pages, FM-index and SA lookups missed the TLB more often and alignment used
+more CPU than a disk load:
 
 | hg38, 5M read pairs, `mem -t 16`, clang 19 | disk load | shm, 2 MB pages | shm, 4 KB pages (`huge=never`) |
 |---|---|---|---|

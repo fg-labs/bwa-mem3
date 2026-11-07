@@ -234,11 +234,14 @@ WGS and WES slices (150 bp paired, hg38) at the default scoring, `-A 2`, `-B 6` 
   probe. Where the B-tree's answer depends on its node layout (two chains with
   the same position) or a read has more than `BWA3_CHAIN_FLAT_CAP` chains, the
   read is replayed through the unchanged B-tree path.
-- **Per-seed chaining helpers inlined ([PR #664](https://github.com/fg-labs/bwa-mem3/pull/664)).** The three helpers each
-  resolved seed passes through (`chain_add_seed`, the flat index's insert and
-  the B-tree fallback) were declared `inline`, but clang kept them out of line,
-  so every seed paid two calls. They are now `always_inline`. On the 5M-pair WGS
-  slice at `-t 16` (clang 19, 10 interleaved rounds) the chaining stage drops
+- **Per-seed chaining helpers inlined ([PR #664](https://github.com/fg-labs/bwa-mem3/pull/664)).** A resolved
+  seed passes through `chain_add_seed`, then usually either the flat index's
+  insert or the B-tree fallback. A read the flat index declines is replayed
+  through the B-tree, so its seeds up to and including the declined one pass
+  through both. These three helpers were declared `inline`, but clang kept them
+  out of line, so a seed on the usual path paid two calls. They are now
+  `always_inline`. On the 5M-pair WGS slice at `-t 16` (clang 19, 10
+  interleaved rounds) the chaining stage drops
   7.4 % on AMD Zen 4 (AVX-512BW) and 9.1 % on Graviton 4 (NEON), and wall time
   0.56 % and 0.43 %, with identical output.
 
@@ -478,8 +481,9 @@ at 32/32.
 
 ## Huge pages for the shared-memory index ([PR #657](https://github.com/fg-labs/bwa-mem3/pull/657))
 
-An index loaded from disk is advised `MADV_HUGEPAGE`, so the FM-index and SA
-lookups run on 2 MB pages. The shared-memory segment that `bwa-mem3 shm` stages
+On Linux, an index loaded from disk is advised `MADV_HUGEPAGE`, so the FM-index
+and SA lookups can run on 2 MB pages (backing is best-effort: it depends on the kernel's
+THP policy and available memory). The shared-memory segment that `bwa-mem3 shm` stages
 was mapped with no advice, so even on a `/dev/shm` mounted `huge=advise` it sat on
 4 KB pages, and an alignment attached from it used 26–33 % more CPU (25–32 % more
 wall) than a disk load: hg38, 5M read pairs, `-t 16`, clang 19, on AMD Zen 4
@@ -494,7 +498,7 @@ mapping.
 
 ## CIGAR generation
 
-- **Certified band for equal-length regions (PR #575).** The global re-alignment that builds
+- **Certified band for equal-length regions ([PR #575](https://github.com/fg-labs/bwa-mem3/pull/575)).** The global re-alignment that builds
   each final CIGAR runs, for regions whose query and reference spans have equal length, in a
   band certified from the ungapped score, or skips the DP when that band is 0. Byte-identical
   by construction; see [Equivalence](equivalence.md#certified-cigar-band-for-equal-length-regions-default-byte-identical)
@@ -503,7 +507,7 @@ mapping.
   Graviton 3 (arm64, NEON tier) and 1.7 % / 2.1 % on AMD Zen 5 (x86-64, AVX-512BW tier), with
   record md5 identical to the previous `main`, also under both `--compat` targets. The
   timings were taken on an earlier revision of the PR whose generated hot code is unchanged.
-- **Certified band for unequal-length regions (PR #580).** The same certificate, with the best
+- **Certified band for unequal-length regions ([PR #580](https://github.com/fg-labs/bwa-mem3/pull/580)).** The same certificate, with the best
   single-gap alignment as the lower bound, narrows the band for regions whose query and
   reference spans differ in length (never below the usual `|d| + 3` floor). Byte-identical by
   construction; see [Equivalence](equivalence.md#certified-cigar-band-for-unequal-length-regions-default-byte-identical).
@@ -511,8 +515,9 @@ mapping.
   dropped 0.50 % (WGS) / 0.14 % (WES) on AWS Graviton 4 (arm64, NEON tier) and 0.82 % (WGS) on
   AMD Zen 5 (x86-64, AVX-512BW tier; WES there was within that host's rep-to-rep noise), clang
   19.1.7, with record md5 identical, also under both `--compat` targets.
-- **x86 wavefront boundary handling (PR #651).** The AVX2 and AVX-512BW wavefront kernels of that
-  global re-alignment (`ksw_global2`) now handle band-edge chunks as the NEON kernels do: a
+- **x86 wavefront boundary handling ([PR #651](https://github.com/fg-labs/bwa-mem3/pull/651)).**
+  The AVX2 and AVX-512BW wavefront kernels of that global re-alignment
+  (`ksw_global2`) now handle band-edge chunks as the NEON kernels do: a
   boundary chunk stores its direction bytes whole instead of lane by lane, the final score is
   read from the H ring once per diagonal, a band-edge chunk clear of row 0 and column 0 masks
   only its E and F edge lanes, and the ring slots are carried as loop state. The score lookup
