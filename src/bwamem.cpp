@@ -4479,6 +4479,23 @@ int mem_kernel2_core(FMI_search *fmi,
          * final (dedup done) and is_alt is not read by any later read's dedup,
          * so folding the former separate full pass in here is byte-identical. */
         regs[l].capped_w = chain_ar[l].capped_w;  /* ride the dropped-weight to worker_sam */
+        /* Paired-end: give back the slack in this read's regions now that dedup
+         * has settled their count. av->a was sized to the total seeds of the
+         * read's chains, and the regions are held until the batch's SAM pass
+         * (pestat needs the whole batch), so the unused tail would stay
+         * allocated for the whole batch. Single-end reads are emitted and freed
+         * in the same pass (worker_bwt_aln_sam_se), so they skip this copy.
+         * Capacity-only: [0, n) is unchanged, and the SAM stage's rescue
+         * kv_push grows the array again when n == m. */
+        if ((opt->flag & MEM_F_PE) && regs[l].n < regs[l].m) {
+            mem_alnreg_t *t = NULL;
+            if (regs[l].n > 0) {
+                t = (mem_alnreg_t *) malloc(regs[l].n * sizeof(mem_alnreg_t));
+                xassert(t != NULL, "out of memory: regs shrink");
+                memcpy(t, regs[l].a, regs[l].n * sizeof(mem_alnreg_t));
+            }
+            free(regs[l].a); regs[l].a = t; regs[l].m = regs[l].n;
+        }
         for (i = 0; i < regs[l].n; ++i)
         {
             mem_alnreg_t *p = &regs[l].a[i];
@@ -4687,7 +4704,7 @@ static const char *read_memo_alnreg_field_diff(const mem_alnreg_t *a, const mem_
     RM_D(rb); RM_D(re); RM_D(qb); RM_D(qe); RM_D(rid);
     RM_D(score); RM_D(truesc); RM_D(sub); RM_D(alt_sc); RM_D(csub); RM_D(sub_n);
     RM_D(w); RM_D(seedcov); RM_D(secondary); RM_D(secondary_all);
-    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep); RM_D(flg);
+    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep);
     RM_D(meth_hypothesis); RM_D(meth_strand_hyp);
 #undef RM_D
     if (a->n_comp != b->n_comp) return "n_comp";
@@ -4896,16 +4913,49 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
     }
 }
 
+/* Align a work item and emit its SAM in the same pass (single-end, or
+ * paired-end when -I fixes the insert-size distribution).
+ *
+ * A single-end read's SAM depends only on its own regions (worker_sam's SE
+ * branch reads w->regs[i] and w->seqs[i], never w->pes or another read), so
+ * nothing has to wait for the whole batch to be aligned. Running worker_sam
+ * right after worker_bwt_aln on the same item frees that item's regions
+ * before the thread takes the next item. With two passes, every read's regions
+ * stayed live from extension until the SAM pass, and on bisulfite reads (tens
+ * of regions per read) that held most of a batch's in-flight memory.
+ * Byte-identical: the same per-read calls run in the same per-read order. */
+static void worker_bwt_aln_sam_se(void *data, int seq_id, int batch_size, int tid)
+{
+    worker_bwt_aln(data, seq_id, batch_size, tid);
+    worker_sam(data, seq_id, batch_size, tid);
+}
+
+/* Run a per-item pass that writes SAM records, through kt_for_prefix when the
+ * pipeline asked to stream (w.emit_prefix) so finished records can be written
+ * while the pass runs. */
+static void mem_kt_for_emit(void (*func)(void*,int,int,int), worker_t &w, int n)
+{
+    if (w.emit_prefix)
+        kt_for_prefix(func, &w, n, w.nthreads, w.emit_prefix, w.emit_prefix_ctx);
+    else
+        kt_for(func, &w, n);
+}
+
 /* The worker_sam pass over [0, n). When the pipeline asked to stream (w.emit_prefix),
  * the calling thread hands finished items' records to it in read order while
  * the pass runs; worker_sam writes each read's sam only from the item that owns
  * the read, so a record is final once its item has returned. */
 static void mem_kt_for_sam(worker_t &w, int n)
 {
-    if (w.emit_prefix)
-        kt_for_prefix(worker_sam, &w, n, w.nthreads, w.emit_prefix, w.emit_prefix_ctx);
-    else
-        kt_for(worker_sam, &w, n);
+    mem_kt_for_emit(worker_sam, w, n);
+}
+
+/* Does a cohort slice's SAM depend only on its own reads? Single-end always;
+ * paired-end only when -I supplied the insert-size distribution, since then
+ * pairing never reads the rest of the cohort's regions. */
+static inline bool mem_cohort_emits_in_align(const mem_opt_t *opt, const mem_pestat_t *pes0)
+{
+    return !(opt->flag & MEM_F_PE) || pes0 != NULL;
 }
 
 /* Align phase for one slice of a pestat cohort: seeding + BSW only.
@@ -4926,9 +4976,12 @@ void mem_align_cohort_slice(mem_opt_t *opt,
                             int n,
                             bseq1_t *seqs,
                             mem_alnreg_v *regs,
+                            const mem_pestat_t *pes0,
                             worker_t &w)
 {
     bseq1_t      *saved_seqs = w.seqs;
+    const mem_pestat_t *saved_pes = w.pes;
+    mem_pestat_t pes[4];
     mem_alnreg_v *saved_regs = w.regs;
     int64_t       saved_np   = w.n_processed;
 
@@ -4952,9 +5005,21 @@ void mem_align_cohort_slice(mem_opt_t *opt,
     w.memo = NULL;
 
     uint64_t tim = __rdtsc();
-    kt_for(worker_bwt_aln, &w, n);
+    /* Single-end: emit each work item's SAM as soon as it is aligned (see
+     * worker_bwt_aln_sam_se); mem_pair_and_emit_cohort then has nothing left to
+     * do for this slice. w.n_processed is this slice's first global id, so the
+     * per-read hash ids match the whole-cohort SAM pass. No streaming here: the
+     * slice's records are written by the write step with the rest of the
+     * cohort, in read order. */
+    if (mem_cohort_emits_in_align(opt, pes0)) {
+        if (pes0) { memcpy(pes, pes0, 4 * sizeof(mem_pestat_t)); w.pes = pes; }
+        kt_for(worker_bwt_aln_sam_se, &w, n);
+    } else {
+        kt_for(worker_bwt_aln, &w, n);
+    }
     tprof[WORKER10][0] += __rdtsc() - tim;
 
+    w.pes = saved_pes;
     w.seqs = saved_seqs;
     w.regs = saved_regs;
     w.n_processed = saved_np;
@@ -4999,10 +5064,13 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt,
             opt->est_insert_high = pes[1].high;
     }
 
-    uint64_t tim = __rdtsc();
-    fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
-    mem_kt_for_sam(w, n);
-    tprof[WORKER20][0] += __rdtsc() - tim;
+    /* mem_align_cohort_slice already emitted every read's SAM. */
+    if (!mem_cohort_emits_in_align(opt, pes0)) {
+        uint64_t tim = __rdtsc();
+        fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
+        mem_kt_for_sam(w, n);
+        tprof[WORKER20][0] += __rdtsc() - tim;
+    }
 
     fprintf(stderr, "\t[0000][ M::%s] Processed %d reads in %.3f "
             "CPU sec, %.3f real sec\n",
@@ -5118,7 +5186,20 @@ void mem_process_seqs(mem_opt_t *opt,
      * (order of GB per chunk). Byte-identical: per-read results are independent and
      * the only tid-keyed state (w.mmc) is scratch consumed inside a single call.
      * mem_pestat's barrier below is unaffected and must stay. */
-    kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
+    /* Single-end: also emit each work item's SAM in the same pass, so its
+     * regions are freed before the thread moves on (worker_bwt_aln_sam_se).
+     * The read memo is paired-end only, so it never applies here. */
+    /* Paired-end with -I (pes0) is the same: pairing reads the given insert-size
+     * distribution, not the batch's regions, so each pair can be emitted with
+     * its own work item. kt_for items start and end on even reads
+     * (kt_item_layout), which worker_sam's PE branch already relies on. Not
+     * when the read memo runs: its copy pass needs every REP aligned first. */
+    const bool pe_known = (opt->flag & MEM_F_PE) && pes0 != NULL && !rm_run_pairs;
+    if (pe_known) memcpy(pes, pes0, 4 * sizeof(mem_pestat_t));
+    const bool se_fused = !(opt->flag & MEM_F_PE) || pe_known;
+    xassert(!se_fused || !rm_arm, "read memo armed on a fused align+SAM chunk");
+    if (se_fused) mem_kt_for_emit(worker_bwt_aln_sam_se, w, n_);
+    else          kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
     const uint64_t rm_align_ns = rm_measure
         ? (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -5144,7 +5225,7 @@ void mem_process_seqs(mem_opt_t *opt,
 
 
     // PAIRED_END
-    if (opt->flag & MEM_F_PE) { // infer insert sizes if not provided
+    if ((opt->flag & MEM_F_PE) && !pe_known) { // infer insert sizes if not provided
         if (pes0)
             memcpy(pes, pes0, 4 * sizeof(mem_pestat_t)); // if pes0 != NULL, set the insert-size
                                                          // distribution as pes0
@@ -5166,11 +5247,13 @@ void mem_process_seqs(mem_opt_t *opt,
             opt->est_insert_high = pes[1].high;
     }
 
-    tim = __rdtsc();
-    fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
+    if (!se_fused) {
+        tim = __rdtsc();
+        fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
 
-    mem_kt_for_sam(w, n_);   // SAM
-    tprof[WORKER20][0] += __rdtsc() - tim;
+        mem_kt_for_sam(w, n_);   // SAM
+        tprof[WORKER20][0] += __rdtsc() - tim;
+    }
 
     /* [dedup-reads] The memo points at g_readmemo_state or the read step's
      * pre-pass, whose role[]/rep_pair[] describe THIS chunk only (and the latter

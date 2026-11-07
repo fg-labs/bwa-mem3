@@ -599,14 +599,13 @@ static void write_bam_records(struct bam_writer_s *bw, bseq1_t *s)
 /* Free one written record's per-read allocations. PIPE-F6: name/seq/qual are
  * carved from the item's read_arena, which the write step frees once -- do NOT
  * free them here. comment stays heap-owned (see the reader / --meth notes), and
- * sam/bams are allocated during processing. meth_orig_seq is a step-0 heap copy
- * (NULL outside --meth; free() is NULL-safe). */
+ * sam/bams are allocated during processing. meth_orig_seq (--meth) is carved
+ * from the same arena as seq, so it is not freed here either. */
 static void release_read_record(bseq1_t *s)
 {
     free(s->comment);
     free(s->sam);
     free(s->bams);
-    free(s->meth_orig_seq);
 }
 
 /* Output streaming (SAM text: every item; --bam=0: the last item only, see
@@ -948,38 +947,23 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                     is_r2 = 0;
                     prev_is_r1 = 1;
                 }
-                const char *yc = is_r2 ? "GA" : "CT";
                 char from = is_r2 ? 'G' : 'C';
                 char from_lo = is_r2 ? 'g' : 'c';
                 char to   = is_r2 ? 'A' : 'T';
                 int l = s->l_seq;
                 /* The fast FASTQ reader keeps a sequence line's full parsed
                  * length even when it holds a control byte (0, TAB, CR, ...).
-                 * Everything below treats s->seq as l_seq ASCII bases, and the
-                 * YS:Z/YC:Z comment built from it is read as a tab-separated C
-                 * string, so such a byte would end that comment early (losing
-                 * YC:Z, hence XR:Z, and every -C tag) or forge a tag in it; it
-                 * would also be scored as base code 0-3 by extension while SEQ
-                 * printed N. Write each as N before any copy is taken, so
-                 * seeding, extension, SEQ and the carrier all see one base. */
+                 * Everything below treats s->seq as l_seq ASCII bases, and such
+                 * a byte would be scored as base code 0-3 by extension while
+                 * SEQ printed N. Write each as N before any copy is taken, so
+                 * seeding, extension, SEQ and meth_orig_seq all see one base. */
                 for (int j = 0; j < l; ++j)
                     if ((unsigned char)s->seq[j] < 0x20) s->seq[j] = 'N';
-                /* Build the YS:Z/YC:Z comment. Preserve any prior FASTQ
-                 * comment (e.g. -C carries barcode/UMI SAM tags) by appending
-                 * it after YC; otherwise --meth silently strips -C metadata. */
-                const char *prior = s->comment;
-                size_t prior_len = prior ? strlen(prior) : 0;
-                size_t yslen = (size_t)l + 32 + (prior_len ? prior_len + 1 : 0);
-                char *comment = (char *)malloc(yslen);
-                xassert(comment != NULL, "out of memory: comment");
-                int off = snprintf(comment, yslen, "YS:Z:");
-                memcpy(comment + off, s->seq, (size_t)l);
-                off += l;
-                off += snprintf(comment + off, yslen - off, "\tYC:Z:%s", yc);
-                if (prior_len)
-                    snprintf(comment + off, yslen - off, "\t%s", prior);
-                free(s->comment);
-                s->comment = comment;
+                /* No carrier comment: XR:Z is derived from meth_base_ot (set
+                 * below) and the original bases live in meth_orig_seq, so the
+                 * read's FASTQ comment (copy_comment is forced on under --meth,
+                 * so -C barcode/UMI tags pass through) is left as the reader
+                 * produced it. */
                 /* Retain the ORIGINAL (unconverted) read bases as a first-class
                  * field BEFORE the in-place projection below overwrites s->seq.
                  * Same orientation/order as s->seq (original read order, ASCII);
@@ -988,10 +972,13 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                  * Copy exactly l_seq bytes rather than strdup: every consumer
                  * reads l_seq bytes of this copy, and l_seq, not a terminator,
                  * is the read's length (a strdup stopped at an embedded 0 byte
-                 * before the normalization above existed). Freed in the
-                 * per-batch free loop below alongside s->seq. */
-                s->meth_orig_seq = (char *)malloc((size_t)l + 1);
-                xassert(s->meth_orig_seq != NULL, "out of memory: s->meth_orig_seq");
+                 * before the normalization above existed). Carved from the
+                 * cohort's read arena like s->seq (released with it by the
+                 * write step), so it costs no malloc of its own. While a cohort
+                 * is still being sliced the arena is held by aux, not ret. */
+                read_arena_t *orig_arena = ret->read_arena ? ret->read_arena : aux->cohort_arena;
+                xassert(orig_arena != NULL, "--meth: no read arena for meth_orig_seq");
+                s->meth_orig_seq = (char *)read_arena_alloc(orig_arena, (size_t)l + 1);
                 memcpy(s->meth_orig_seq, s->seq, (size_t)l);
                 s->meth_orig_seq[l] = '\0';
                 /* --meth: read-number chemistry (R1=OT=1, R2=OB=0) for the
@@ -1293,6 +1280,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                                    aux->cohort_n - slice_off,
                                    aux->cohort_seqs + slice_off,
                                    w.regs + slice_off,
+                                   aux->pes0,
                                    w);
 
             if (!ret->cohort_complete) {

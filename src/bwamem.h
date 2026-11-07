@@ -429,7 +429,16 @@ typedef struct mem_alnreg_t {
      * as unranked; the --dedup-reads memo copy instead carries the
      * representative's rank, which the sort validates rather than trusts. */
     int32_t dedup_re_rank;
-    mem_chain_t *c;
+    /* `c` and `hash` never live at the same time, so they share 8 bytes.
+     * c: back-pointer to the originating chain, set at alnreg creation and read
+     * only by the seedcov walks inside extension; mem_kernel2_core NULLs it at
+     * exit, after which the chain is freed. hash: the tie-break key, written
+     * first by mem_mark_primary_se in the SAM stage and read only after that.
+     * Mate rescue memsets its new records, so they start at 0 like the rest. */
+    union {
+        mem_chain_t *c;
+        uint64_t hash;
+    };
     int score;      // best local SW score
     int truesc;     // actual score corresponding to the aligned region; possibly smaller than $score
     int sub;        // 2nd best SW score
@@ -444,14 +453,14 @@ typedef struct mem_alnreg_t {
     int secondary_all;
     int seedlen0;   // length of the starting seed
     int chain_n_hits; // max SMEM SA-occurrence count across this chain's seeds (1 = no repetitive seed)
-    int n_comp:30, is_alt:2; // number of sub-alignments chained together
-    float frac_rep;
-    uint64_t hash;
-    int flg;
+    /* n_comp: number of sub-alignments chained together (count only; no output
+     * reads it). The two --meth hypotheses (-1/0/1) ride in the same word as
+     * signed 2-bit fields, so they no longer cost a word of their own. */
+    signed int n_comp:26, is_alt:2;
     /* D3 (--meth, PR-3): bisulfite hypothesis (1=OT, 0=OB, -1=non-meth),
      * propagated from the originating chain so PR-4's asymmetric extension and
      * the output (XG strand) layers can select the right matrix/strand. */
-    int8_t meth_hypothesis;
+    signed int meth_hypothesis:2;
     /* D3 (--meth, fix): STRAND-ADJUSTED extension hypothesis = meth_hypothesis
      * XOR is_rev. bwa-mem extends reverse-strand seeds against the reverse-
      * complemented reference window, so a conversion that the OT matrix frees
@@ -461,12 +470,13 @@ typedef struct mem_alnreg_t {
      * matrix, their real conversions are scored as mismatches, and the 5' end
      * soft-clips. Set at alnreg creation from the seed strand; -1 = non-meth.
      * (Output XG/XM still use the raw meth_hypothesis — the genome strand.) */
-    int8_t meth_strand_hyp;
+    signed int meth_strand_hyp:2;
+    float frac_rep;
 } mem_alnreg_t;
 #ifdef __cplusplus
-static_assert(sizeof(mem_alnreg_t) == 112,
-              "mem_alnreg_t must stay 112 bytes: dedup_re_rank fills the padding after rid; "
-              "growing the record raises the gather traffic the dedup sorts are bound by");
+static_assert(sizeof(mem_alnreg_t) == 96,
+              "mem_alnreg_t must stay 96 bytes: it is held for every region of every read in a "
+              "batch, and the dedup sorts that gather it are bound by its size");
 #endif
 
 typedef struct { size_t n, m; mem_alnreg_t *a; int capped_w; } mem_alnreg_v;
@@ -1159,11 +1169,16 @@ void mem_readmemo_teardown(void);
  * @param regs        this slice's alnreg output (cohort regs + the same offset);
  *                    must remain live until mem_pair_and_emit_cohort() runs
  *
+ * pes0 is the -I insert-size distribution (NULL when it is inferred). When
+ * the slice's SAM does not depend on the rest of the cohort (single-end, or
+ * paired-end with pes0), each read is emitted here as it is aligned and
+ * mem_pair_and_emit_cohort() skips its SAM pass.
+ *
  * w.seqs / w.regs / w.n_processed are saved and restored around the call.
  */
 void mem_align_cohort_slice(mem_opt_t *opt, int64_t n_processed,
                             int n, bseq1_t *seqs, mem_alnreg_v *regs,
-                            worker_t &w);
+                            const mem_pestat_t *pes0, worker_t &w);
 
 /**
  * Infer the insert size over a complete cohort, then pair and emit it.
