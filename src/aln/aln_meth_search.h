@@ -10,11 +10,14 @@
 namespace bwa_aln {
 struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; };
 struct aln_meth_group_t;
+enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
 struct aln_meth_slot_t {
     aln_meth_group_t *grp = nullptr;
     gap_job_t *job = nullptr;
     bwa_seq_t *p = nullptr;
     aln_meth_read_t *res = nullptr;
+    // keep (ALN_METH_KEEP_*): 0 trims a finished read to its main hit (plus XA loci); STRATA keeps
+    // a complete read's loci for pairing; COPIES keeps them for duplicate copies to redraw over.
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1;
     uint64_t rng = 0, alignment_bytes = 0;
     std::vector<ubyte_t> vseq, rd_fwd;
@@ -78,9 +81,12 @@ static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t 
 static inline int aln_meth_resume(void *, gap_job_t *, gap_entry_t *) { return 1; }
 void aln_meth_hit(aln_meth_slot_t *, const gap_entry_t *, bwtint_t, bwtint_t);
 static inline void aln_meth_hit(void *, const gap_entry_t *, bwtint_t, bwtint_t) {}
-const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int);
+// has_copy: the read has duplicate copies that will redraw over its loci.
+const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
 void aln_meth_report(int, int, const aln_meth_read_t *);
+// Trims a finished read to its main hit (an incomplete read always; a complete one when it has more
+// than max_xa_hits + 1 loci), then releases search-only state: spare capacity and raw_cigar.
 void aln_meth_trim(aln_meth_read_t *, int);
 void aln_meth_redraw(aln_meth_read_t *, uint64_t);
 uint64_t aln_meth_draw_seed(const aln_meth_ref_t *, int, int64_t);
