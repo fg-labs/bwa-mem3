@@ -67,6 +67,29 @@ Real staging/attach checks require Linux POSIX shared memory. A checked missing 
 
 `shm_pack_round_trip_test`, `shm_round_trip_test.sh` and `shm_meth_test.sh` stage into the host registry and run the global destroy (`bwa-mem3 shm -d`), which drops every index staged on the host. Each one first reads the registry and leaves it untouched unless it is empty or lists only the basenames that test stages itself. Otherwise `shm_pack_round_trip_test` fails, and the other two print `SKIP:` and exit 0. The C++ tests use `bwa_tests::shm_registry_holds_only` (`test/framework/shm_registry_guard.h`). The shell tests source `test/framework/shm_registry_guard.sh`, which reads the registry with `bwa-mem3 shm -l` only and treats a failing `shm -l` as a foreign registry. `shm_lock_destroy_test registry-guard` checks the C++ predicate against a private registry. A new test that runs the global destroy must call one of these guards before its first destroy.
 
+### Real 1 GB hugetlb mapping
+
+On Linux, `unit/huge_pages` maps the occurrence table on a real 1 GB page (`BWAMEM_HUGETLB_ON_ANY_SIZE`) only when `BWA_TEST_HUGETLB_POOL=1` is set and the host's 1 GB pool has a free page; it then also checks that freeing the index unmaps the page. Otherwise that case does not run, and the test prints a `SKIP:` message saying why. On other platforms, including macOS, no 1 GB mapping can succeed, so the `BWAMEM_HUGETLB_ON_ANY_SIZE` case always runs, whether or not the variable is set, and checks the fallback instead; it prints no `SKIP:` message.
+
+To run it on a Linux host, use a page that is already free in the 1 GB pool when there is one, and leave the pool's size alone:
+
+```bash
+pool=/sys/kernel/mm/hugepages/hugepages-1048576kB
+cat $pool/free_hugepages   # must read 1 or more
+BWA_TEST_HUGETLB_POOL=1 ./test/bwa_mem3_tests_unit -ts=unit/huge_pages
+```
+
+Resizing the pool takes pages from, or gives them back to, every workload on the host, so reserve a page only on a host you have to yourself, and put the pool back to its starting size afterwards:
+
+```bash
+start=$(cat $pool/nr_hugepages)
+echo $((start + 1)) | sudo tee $pool/nr_hugepages
+# ... check free_hugepages and run the test as above ...
+echo $start | sudo tee $pool/nr_hugepages
+```
+
+A runtime reservation can fail on a host whose memory is fragmented; a boot-time pool (`hugepagesz=1G hugepages=N` on the kernel command line) does not. CI reserves one page on the canonical x86 row and warns, rather than fails, when the runner cannot provide one. That covers a one-page mapping of a test-sized index only: a multi-page (production-sized) mapping and its multi-threaded prefault, arm64, and multi-socket (NUMA) hosts are not covered in CI and are checked before a release (see the release checklist).
+
 ### Run integration tests
 
 ```bash
