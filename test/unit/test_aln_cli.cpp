@@ -125,7 +125,7 @@ TEST_CASE("aln_cli: repeated parsing resets state when option storage is reused"
 
 TEST_CASE("aln_cli: short-insert is documented and refused before single-end I/O"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     for (bool meth : {false, true}) {
         bwa_tests::StderrCapture capture;
         const std::string out = x.dir + "/short-single.sam";

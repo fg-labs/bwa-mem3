@@ -16,6 +16,7 @@
 #include "bwape.h"
 #include "aln_alloc.h"
 
+#include <algorithm>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -152,6 +153,8 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
                    const isize_info_t *ii, const bntseq_t *bns = nullptr)
 {
 	int i, j, o_n, subo_n, cnt_chg = 0, low_bound = ii->low, max_len;
+	// --short-insert also pairs mates that start at the same base; -A overrides the option.
+	const bool coincident = opt->short_insert && !opt->force_isize;
 	uint64_t o_score, subo_score;
 	pair64_t last_pos[2][2], o_pos[2];
 	max_len = p[0]->full_len;
@@ -161,7 +164,8 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	// here v>=u. When ii is set, we check insert size with ii; otherwise with opt->max_isize
 #define __pairing_aux(u,v) do { \
 		bwtint_t l = (v).x + p[(v).y&1]->len - ((u).x); \
-		if ((u).x != (uint64_t)-1 && (v).x > (u).x && l >= max_len \
+		if ((u).x != (uint64_t)-1 && ((v).x > (u).x || (coincident && (v).x == (u).x)) \
+			&& l >= max_len \
 			&& ((ii->high && l <= ii->high_bayesian) || (ii->high == 0 && l <= opt->max_isize))) \
 		{ \
 			uint64_t s = d->aln[(v).y&1][(v).y>>2].score + d->aln[(u).y&1][(u).y>>2].score; \
@@ -198,6 +202,16 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	 * (x, y), so rows equal under it are identical bytes and the sorted array is the same
 	 * (utils.h). The guard keeps pdqsort_128 from forming a + n on an empty, null array. */
 	if (d->arr.n > 1) pdqsort_128(d->arr.n, d->arr.a);
+	/* --short-insert pairs mates that start at the same base (both reads cover the whole
+	 * fragment). The loop pairs a reverse hit only with forward hits already seen, so within a
+	 * run of equal positions put the forward hits first; the sort alone orders them by hit index. */
+	if (coincident)
+		for (size_t b = 0, e; b < d->arr.n; b = e) {
+			for (e = b + 1; e < d->arr.n && d->arr.a[e].x == d->arr.a[b].x; ++e) {}
+			if (e - b > 1)
+				std::stable_partition(d->arr.a + b, d->arr.a + e,
+				                      [](const pair64_t &q) { return (q.y >> 1 & 1) == 0; });
+		}
 	for (j = 0; j < 2; ++j) last_pos[j][0].x = last_pos[j][0].y = last_pos[j][1].x = last_pos[j][1].y = (uint64_t)-1;
 	if (opt->type == BWA_PET_STD) {
         int last_rid = -1;
@@ -616,6 +630,30 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 	return cigar;
 }
 
+int64_t aln_rescue_window_floor(const bwa_seq_t *anchor, const pe_opt_t *opt)
+{
+	// A forward anchor's reverse mate starts after the anchor ends (stock), or at its start.
+	return (int64_t)anchor->pos + (opt->short_insert ? 0 : anchor->len);
+}
+
+int64_t aln_rescue_window_ceiling(const bwa_seq_t *anchor, const pe_opt_t *opt)
+{
+	// A reverse anchor's forward mate ends before the anchor starts (stock), or at its end.
+	return (int64_t)anchor->pos + (opt->short_insert ? anchor->len + anchor->ref_shift : 0);
+}
+
+bool aln_rescue_within_fragment(const bwa_seq_t *anchor, int64_t mate_beg, const bwa_cigar_t *cigar,
+                                int n_cigar)
+{
+	int64_t span = 0;
+	for (int i = 0; i < n_cigar; ++i)
+		if (__cigar_op(cigar[i]) == FROM_M || __cigar_op(cigar[i]) == FROM_D) span += __cigar_len(cigar[i]);
+	const int64_t mate_end = mate_beg + span;
+	const int64_t anchor_beg = (int64_t)anchor->pos, anchor_end = anchor_beg + anchor->len + anchor->ref_shift;
+	if (anchor->strand == 0) return mate_beg >= anchor_beg && mate_end >= anchor_end; // reverse mate
+	return mate_beg <= anchor_beg && mate_end <= anchor_end;                          // forward mate
+}
+
 void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,
 						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2])
 {
@@ -641,7 +679,7 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 #define __set_rght_coor(_a, _b, _pref, _pmate) do {						\
 				(_a) = (int64_t)_pref->pos + ii->avg - 3 * ii->std - _pmate->len * 1.5; \
 				(_b) = (_a) + 6 * ii->std + 2 * _pmate->len;			\
-				if ((_a) < (int64_t)_pref->pos + _pref->len) (_a) = _pref->pos + _pref->len; \
+				if ((_a) < aln_rescue_window_floor(_pref, popt)) (_a) = aln_rescue_window_floor(_pref, popt); \
 				if ((_b) > bns->l_pac) (_b) = bns->l_pac;				\
 			} while (0)
 
@@ -649,7 +687,7 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 				(_a) = (int64_t)_pref->pos + _pref->len - ii->avg - 3 * ii->std - _pmate->len * 0.5; \
 				(_b) = (_a) + 6 * ii->std + 2 * _pmate->len;			\
 				if ((_a) < 0) (_a) = 0;									\
-				if ((_b) > _pref->pos) (_b) = _pref->pos;				\
+				if ((_b) > aln_rescue_window_ceiling(_pref, popt)) (_b) = aln_rescue_window_ceiling(_pref, popt); \
 			} while (0)
 			
 #define __set_fixed(_pref, _pmate, _beg, _cnt) do {						\
@@ -684,6 +722,9 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 				}
 				// perform SW alignment
 				cigar[k] = bwa_sw_core(bns->l_pac, pacseq, p[k]->len, seq, &beg[k], end[k] - beg[k], &n_cigar[k], &cnt[k]);
+				if (cigar[k] && popt->short_insert && !aln_rescue_within_fragment(p[1-k], beg[k], cigar[k], n_cigar[k])) {
+					free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
+				}
 				if (cigar[k] && p[k]->type != BWA_TYPE_NO_MATCH) { // re-evaluate cigar[k]
 					int s_old, clip = 0, s_new;
 					if (__cigar_op(cigar[k][0]) == 3) clip += __cigar_len(cigar[k][0]);

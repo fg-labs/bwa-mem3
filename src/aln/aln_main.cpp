@@ -688,8 +688,9 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  -c FLOAT  prior of chimeric rate (lower bound) [%.1le]\n", o->pe.ap_prior);
 	fprintf(fp, "  -s        disable Smith-Waterman for the unmapped mate\n");
 	fprintf(fp, "  -A        disable insert size estimate (force -s)\n");
-	fprintf(fp, "  --short-insert   estimate short inserts without a batch-wide read-length floor [off]\n");
-	fprintf(fp, "                   paired only, including --meth; changes calibration, not pairing geometry or rescue algorithm; -A overrides\n");
+	fprintf(fp, "  --short-insert   estimate short inserts without a batch-wide read-length floor, pair mates\n"
+	            "                   that start at the same base, and let mate rescue overlap the anchor [off]\n");
+	fprintf(fp, "                   paired only, including --meth; -A overrides\n");
 	fprintf(fp, "  -P        accepted and ignored (sampe -P loads the index into memory; always so here)\n");
 	fprintf(fp, "\nMethylation (shared with bwa-mem3 mem):\n");
 	meth_opts_usage_shared(fp);

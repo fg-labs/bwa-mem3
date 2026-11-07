@@ -4,8 +4,9 @@ This page's bwa-mem2 comparisons concern `mem`, not the short-read `aln` command
 Without `--meth` or `--short-insert`, [`aln`](../cli/aln.md) targets stock bwa 0.7.19
 `aln` + `samse`/`sampe` record identity, excluding program-header naming and the
 strict input/error handling documented there. Opt-in `aln --short-insert` changes
-paired insert-size calibration and can change pair selection, proper-pair flags and
-MAPQ, with or without `--meth`. Opt-in `aln --meth` changes search,
+paired insert-size calibration, pairs mates with coincident starts and widens mate rescue
+to overlap the anchor, and can change pair selection, proper-pair flags, MAPQ and rescued
+mates, with or without `--meth`. Opt-in `aln --meth` changes search,
 refinement, accounting and tags and is not stock or MEM-equivalent. The MEM
 methylation accuracy/performance evidence on this site does not establish those
 properties for the rewritten `aln --meth` path. Its stock-shaped MAPQ is a heuristic

@@ -1950,6 +1950,48 @@ TEST_CASE("aln_meth: short-insert successfully rescues a singleton within unchan
     CHECK(disabled[83].cigar == "*"); CHECK(disabled[83].mapq == 0);
 }
 
+TEST_CASE("aln_meth: short-insert rescues a mate whose 5' overhang runs past its anchor"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // Read 1 starts with adapter and then covers the whole fragment, which read 2 also covers.
+    // End-to-end search cannot place read 1; rescue can, once its window may cover the anchor's
+    // own span, and the clipped adapter leaves the alignment inside the fragment.
+    bool meth = false, converted = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth exact") { meth = true; }
+    SUBCASE("meth converted") { meth = converted = true; }
+    const std::string adapter = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT";
+    std::vector<std::string> reads[2];
+    for (int i = 0; i < 41; ++i) {
+        const int start = 100 + 50 * i, len = 30 + i % 11;
+        std::string insert = ref().c1.substr(start, len);
+        std::string one = converted ? conv(insert, 'C', 'T') : insert;
+        std::string two = aln_test::revcomp(insert);
+        if (converted) two = conv(two, 'G', 'A');
+        if (i == 40) one = adapter + one;
+        reads[0].push_back(one); reads[1].push_back(two);
+    }
+    const std::vector<std::string> input = {write_fq("overhang1.fq", reads[0]), write_fq("overhang2.fq", reads[1])};
+    std::vector<std::string> args = {"-n", "0", "-l", "1024"};
+    if (meth) args.push_back("--meth");
+    const auto stock = run_aln(args, input);
+    REQUIRE(stock.size() == 82);
+    CHECK((stock[80].flag & 4) != 0); // read 1 of the adapter pair stays unmapped without the option
+    args.push_back("--short-insert");
+    const auto rescued = run_aln(args, input);
+    REQUIRE(rescued.size() == 82);
+    const auto &a = rescued[80], &b = rescued[81];
+    const int pos = 100 + 50 * 40 + 1, len = 30 + 40 % 11;
+    CHECK(b.rname == "c1"); CHECK(b.pos == pos); CHECK(b.cigar == std::to_string(len) + "M");
+    CHECK((a.flag & 4) == 0); CHECK(a.rname == "c1"); CHECK(a.pos == pos);
+    CHECK(a.cigar == std::to_string(adapter.size()) + "S" + std::to_string(len) + "M");
+    CHECK((a.flag & 2) != 0); CHECK((b.flag & 2) != 0);
+    CHECK(tag_value(a, "XT:A") == "M");
+    for (int i = 0; i < 40; ++i) { // the coincident starts of the other pairs are proper too
+        CHECK((rescued[2 * i].flag & 2) != 0); CHECK((rescued[2 * i + 1].flag & 2) != 0);
+    }
+}
+
 TEST_CASE("aln_meth: short-insert cap rescue skips nonrepresentable likelihoods without losing the batch"
           * doctest::test_suite("unit/aln_meth"))
 {
@@ -2045,7 +2087,9 @@ TEST_CASE("aln_meth: short-insert active estimates retain neutral ceilings and i
             CHECK((int)seqs[0]->mapQ == 0); CHECK((int)seqs[0]->c1 == 0);
             CHECK((seqs[0]->extra_flag & SAM_FPP) == 0);
             CHECK((seqs[1]->extra_flag & SAM_FPP) == 0);
-            CHECK((int)seqs[0]->type != BWA_TYPE_MATESW);
+            // Cap rescue may now search the overlapping mate's span and re-place a best-capped end
+            // there, still at MAPQ 0 and unpaired; an end capped by -m is never rescued.
+            CHECK(((int)seqs[0]->type == BWA_TYPE_MATESW) == (incomplete == (int)ba::ALN_METH_BIND_BEST));
         } else {
             CHECK((int)seqs[0]->mapQ == 12);
             CHECK((seqs[0]->extra_flag & SAM_FPP) != 0);
