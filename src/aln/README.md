@@ -151,7 +151,7 @@ Each change to upstream-derived code adds a line here.
   Previous-valid-estimate fallback is unchanged and `-A` still overrides estimation.
   Pairing and methylation cap rescue reject insert-likelihood calculations that underflow
   or produce unrepresentable integer penalties under this option. These opt-in changes can alter pair selection, proper-pair flags,
-  MAPQ and rescue windows; pairing geometry and the rescue algorithm are unchanged.
+  MAPQ and rescue windows. Pairing also accepts a reverse read that starts at the same base as its forward read; every other geometry requirement is unchanged (the reverse read may not start before the forward read, the outer span must be at least the longer read, and the insert must fit the estimate). Mate rescue (and `--meth` cap rescue) may also search the anchor's own span, keeping a rescued mate inside the fragment the anchor implies and soft-clipping an overhang.
   Without the option, the stock inference and scoring behavior is preserved.
 - Paired-end driver (`aln_run_pe`, new code). `bwa-mem3 aln [options] <prefix> <R1.fq> <R2.fq>` is `aln` on each
   file followed by `sampe`. Per batch of 0x40000 reads from each file: R1's reads are read, then R2's (stock

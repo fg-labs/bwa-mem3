@@ -2083,6 +2083,38 @@ TEST_CASE("aln_meth: short-insert restores short overlap calibration in ordinary
     for (const auto &r : forced) CHECK((r.flag & 2) != 0);
 }
 
+TEST_CASE("aln_meth: short-insert installs a mate rescued at reference offset 0"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // c1 is the first contig, so its first base is reference offset 0. The last pair's forward
+    // read starts there and its mate covers the same 30 bases; with one strict mismatch the mate
+    // is found only by rescue, at offset 0. An unmapped mate also has pos 0, so the rescue must
+    // not be mistaken for "no change".
+    bool meth = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth") { meth = true; }
+    std::vector<std::string> reads[2];
+    for (int i = 0; i < 41; ++i) {
+        const int start = 100 + 50 * i, len = 30 + i % 16;
+        reads[0].push_back(ref().c1.substr(start, len));
+        reads[1].push_back(aln_test::revcomp(ref().c1.substr(start + 5, len)));
+    }
+    reads[0].push_back(ref().c1.substr(0, 30));
+    std::string mate = aln_test::revcomp(ref().c1.substr(0, 30));
+    mate[15] = mate[15] == 'T' ? 'C' : 'T'; // strict under both ordinary and CT chemistry
+    reads[1].push_back(mate);
+    const std::vector<std::string> input = {write_fq("offset0-1.fq", reads[0]), write_fq("offset0-2.fq", reads[1])};
+    std::vector<std::string> args = {"--short-insert", "-n", "0", "-l", "1024"};
+    if (meth) args.push_back("--meth");
+    const auto v = run_aln(args, input);
+    REQUIRE(v.size() == 84);
+    const auto &a = v[82], &b = v[83];
+    CHECK(a.rname == "c1"); CHECK(a.pos == 1); CHECK(a.cigar == "30M"); CHECK((a.flag & 4) == 0);
+    CHECK(b.rname == "c1"); CHECK(b.pos == 1); CHECK(b.cigar == "30M");
+    CHECK((b.flag & 4) == 0); CHECK((b.flag & 16) != 0);
+    CHECK(tag_value(b, "XT:A") == "M");
+}
+
 TEST_CASE("aln_meth: short-insert successfully rescues a singleton within unchanged rescue geometry"
           * doctest::test_suite("unit/aln_meth"))
 {
@@ -2123,6 +2155,140 @@ TEST_CASE("aln_meth: short-insert successfully rescues a singleton within unchan
     REQUIRE(disabled.size() == 84);
     CHECK((disabled[83].flag & 4) != 0); CHECK((disabled[83].flag & 2) == 0);
     CHECK(disabled[83].cigar == "*"); CHECK(disabled[83].mapq == 0);
+}
+
+TEST_CASE("aln_meth: short-insert rescues a reverse mate whose overhang runs past the reference end"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // The reverse-mate counterpart of the 5' overhang case: the last pair's fragment is the final
+    // 35 bases of the reference (one contig, so its end is the reference end), and read 2 starts
+    // with adapter, so in reference orientation its overhang runs past that end. Read 1 anchors
+    // there; the rescue window from the anchor holds only the 35 fragment bases, fewer than read 2,
+    // and local alignment clips the adapter.
+    bool meth = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth") { meth = true; }
+    bwa_tests::TempDir tmp{"aln_meth_ref_end"};
+    const std::string fa = tmp.path() + "/end.fa";
+    uint32_t seed = 752;
+    const std::string contig = aln_test::lcg_dna(seed, 3000);
+    REQUIRE(aln_test::write_test_fasta(fa, {{"end", contig}}));
+    {
+        std::vector<std::string> cmd = {"index", "--meth", fa};
+        std::vector<char *> argv;
+        for (auto &x : cmd) argv.push_back(&x[0]);
+        argv.push_back(nullptr);
+        optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        optreset = 1;
+#endif
+        REQUIRE(bwa_index((int)cmd.size(), argv.data()) == 0);
+    }
+    const std::string adapter = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT"; // 33 bases
+    const int frag = 35, pos = (int)contig.size() - frag + 1;
+    std::vector<std::string> reads[2];
+    for (int i = 0; i < 40; ++i) {
+        const std::string insert = contig.substr(100 + 60 * i, 30 + i % 11);
+        reads[0].push_back(insert); reads[1].push_back(aln_test::revcomp(insert));
+    }
+    const std::string fragment = contig.substr(pos - 1, frag);
+    reads[0].push_back(fragment);
+    reads[1].push_back(adapter + aln_test::revcomp(fragment)); // 68 bases
+    const std::vector<std::string> input = {write_fq_in(tmp.path(), "refend1.fq", reads[0]),
+                                            write_fq_in(tmp.path(), "refend2.fq", reads[1])};
+    std::vector<std::string> args = {"-n", "0", "-l", "1024"};
+    if (meth) args.push_back("--meth");
+    const auto stock = run_aln(args, input, fa, tmp.path());
+    REQUIRE(stock.size() == 82);
+    CHECK((stock[81].flag & 4) != 0); // read 2 of the end pair stays unmapped without the option
+    args.push_back("--short-insert");
+    const auto rescued = run_aln(args, input, fa, tmp.path());
+    REQUIRE(rescued.size() == 82);
+    const auto &a = rescued[80], &b = rescued[81];
+    CHECK(a.rname == "end"); CHECK(a.pos == pos); CHECK(a.cigar == std::to_string(frag) + "M");
+    CHECK((b.flag & 4) == 0); CHECK((b.flag & 16) != 0);
+    CHECK(b.rname == "end"); CHECK(b.pos == pos);
+    CHECK(b.cigar == std::to_string(frag) + "M" + std::to_string(adapter.size()) + "S");
+    CHECK((a.flag & 2) != 0); CHECK((b.flag & 2) != 0);
+    CHECK(tag_value(b, "XT:A") == "M");
+    // Mate fields: both start at pos and span the fragment, so the insert is frag.
+    CHECK(a.rnext == "="); CHECK(b.rnext == "="); CHECK(a.pnext == pos); CHECK(b.pnext == pos);
+    CHECK(a.tlen == frag); CHECK(b.tlen == -frag);
+    CHECK(a.mapq > 0); CHECK(b.mapq > 0); // a unique fragment: the rescue keeps both ends confident
+    // Tags: the aligned bases match the reference, so NM is 0 and MD/XM follow from the reference.
+    CHECK(tag_value(a, "NM:i") == "0"); CHECK(tag_value(b, "NM:i") == "0");
+    CHECK(tag_value(a, "MD:Z") == expected_md(contig, pos - 1, fragment));
+    CHECK(tag_value(b, "MD:Z") == expected_md(contig, pos - 1, fragment));
+    if (meth) {
+        CHECK(tag_value(a, "XR:Z") == "CT"); CHECK(tag_value(a, "XG:Z") == "CT");
+        CHECK(tag_value(b, "XR:Z") == "GA"); CHECK(tag_value(b, "XG:Z") == "CT");
+        CHECK(tag_value(a, "XM:Z") == expected_xm(contig, pos - 1, fragment, true, false));
+        const std::string xm_b = tag_value(b, "XM:Z"); // the clipped adapter makes no calls
+        REQUIRE(xm_b.size() == fragment.size() + adapter.size());
+        CHECK(xm_b.substr(0, fragment.size()) == expected_xm(contig, pos - 1, fragment, true, false));
+        CHECK(xm_b.substr(fragment.size()) == std::string(adapter.size(), '.'));
+    }
+}
+
+TEST_CASE("aln_meth: short-insert rescues a mate whose 5' overhang runs past its anchor"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // Read 1 starts with adapter and then covers the whole fragment, which read 2 also covers.
+    // End-to-end search cannot place read 1; rescue can, once its window may cover the anchor's
+    // own span, and the clipped adapter leaves the alignment inside the fragment.
+    bool meth = false, converted = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth exact") { meth = true; }
+    SUBCASE("meth converted") { meth = converted = true; }
+    const std::string adapter = "ACACTCTTTCCCTACACGACGCTCTTCCGATCT";
+    std::vector<std::string> reads[2];
+    for (int i = 0; i < 41; ++i) {
+        const int start = 100 + 50 * i, len = 30 + i % 11;
+        std::string insert = ref().c1.substr(start, len);
+        std::string one = converted ? conv(insert, 'C', 'T') : insert;
+        std::string two = aln_test::revcomp(insert);
+        if (converted) two = conv(two, 'G', 'A');
+        if (i == 40) one = adapter + one;
+        reads[0].push_back(one); reads[1].push_back(two);
+    }
+    const std::vector<std::string> input = {write_fq("overhang1.fq", reads[0]), write_fq("overhang2.fq", reads[1])};
+    std::vector<std::string> args = {"-n", "0", "-l", "1024"};
+    if (meth) args.push_back("--meth");
+    const auto stock = run_aln(args, input);
+    REQUIRE(stock.size() == 82);
+    CHECK((stock[80].flag & 4) != 0); // read 1 of the adapter pair stays unmapped without the option
+    args.push_back("--short-insert");
+    const auto rescued = run_aln(args, input);
+    REQUIRE(rescued.size() == 82);
+    const auto &a = rescued[80], &b = rescued[81];
+    const int pos = 100 + 50 * 40 + 1, len = 30 + 40 % 11;
+    CHECK(b.rname == "c1"); CHECK(b.pos == pos); CHECK(b.cigar == std::to_string(len) + "M");
+    CHECK((a.flag & 4) == 0); CHECK(a.rname == "c1"); CHECK(a.pos == pos);
+    CHECK(a.cigar == std::to_string(adapter.size()) + "S" + std::to_string(len) + "M");
+    CHECK((a.flag & 2) != 0); CHECK((b.flag & 2) != 0);
+    CHECK(tag_value(a, "XT:A") == "M");
+    // Mate fields: both start at pos and span len reference bases, so the insert is len.
+    CHECK(a.rnext == "="); CHECK(b.rnext == "="); CHECK(a.pnext == pos); CHECK(b.pnext == pos);
+    CHECK(a.tlen == len); CHECK(b.tlen == -len);
+    CHECK(a.mapq > 0); CHECK(b.mapq > 0); // a unique fragment: the rescue keeps both ends confident
+    // Tags: the aligned bases match the reference (conversions are free under --meth), so NM is 0
+    // and MD/XM follow from the reference and the aligned segment of each read.
+    const std::string aligned_a = reads[0].back().substr(adapter.size()), aligned_b = aln_test::revcomp(reads[1].back());
+    CHECK(tag_value(a, "NM:i") == "0"); CHECK(tag_value(b, "NM:i") == "0");
+    CHECK(tag_value(a, "MD:Z") == expected_md(ref().c1, pos - 1, aligned_a));
+    CHECK(tag_value(b, "MD:Z") == expected_md(ref().c1, pos - 1, aligned_b));
+    if (meth) {
+        CHECK(tag_value(a, "XR:Z") == "CT"); CHECK(tag_value(a, "XG:Z") == "CT");
+        CHECK(tag_value(b, "XR:Z") == "GA"); CHECK(tag_value(b, "XG:Z") == "CT");
+        CHECK(tag_value(b, "XM:Z") == expected_xm(ref().c1, pos - 1, aligned_b, true, false));
+        const std::string xm_a = tag_value(a, "XM:Z"); // the clipped adapter makes no calls
+        REQUIRE(xm_a.size() == adapter.size() + aligned_a.size());
+        CHECK(xm_a.substr(0, adapter.size()) == std::string(adapter.size(), '.'));
+        CHECK(xm_a.substr(adapter.size()) == expected_xm(ref().c1, pos - 1, aligned_a, true, false));
+    }
+    for (int i = 0; i < 40; ++i) { // the coincident starts of the other pairs are proper too
+        CHECK((rescued[2 * i].flag & 2) != 0); CHECK((rescued[2 * i + 1].flag & 2) != 0);
+    }
 }
 
 TEST_CASE("aln_meth: short-insert cap rescue skips nonrepresentable likelihoods without losing the batch"
@@ -2239,7 +2405,9 @@ TEST_CASE("aln_meth: short-insert active estimates retain neutral ceilings and i
             CHECK((int)seqs[0]->mapQ == 0); CHECK((int)seqs[0]->c1 == 0);
             CHECK((seqs[0]->extra_flag & SAM_FPP) == 0);
             CHECK((seqs[1]->extra_flag & SAM_FPP) == 0);
-            CHECK((int)seqs[0]->type != BWA_TYPE_MATESW);
+            // Cap rescue may now search the overlapping mate's span and re-place a best-capped end
+            // there, still at MAPQ 0 and unpaired; an end capped by -m is never rescued.
+            CHECK(((int)seqs[0]->type == BWA_TYPE_MATESW) == (incomplete == (int)ba::ALN_METH_BIND_BEST));
         } else {
             CHECK((int)seqs[0]->mapQ == 12);
             CHECK((seqs[0]->extra_flag & SAM_FPP) != 0);
