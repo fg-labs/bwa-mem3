@@ -1169,11 +1169,16 @@ void mem_readmemo_teardown(void);
  * @param regs        this slice's alnreg output (cohort regs + the same offset);
  *                    must remain live until mem_pair_and_emit_cohort() runs
  *
+ * pes0 is the -I insert-size distribution (NULL when it is inferred). When
+ * the slice's SAM does not depend on the rest of the cohort (single-end, or
+ * paired-end with pes0), each read is emitted here as it is aligned and
+ * mem_pair_and_emit_cohort() skips its SAM pass.
+ *
  * w.seqs / w.regs / w.n_processed are saved and restored around the call.
  */
 void mem_align_cohort_slice(mem_opt_t *opt, int64_t n_processed,
                             int n, bseq1_t *seqs, mem_alnreg_v *regs,
-                            worker_t &w);
+                            const mem_pestat_t *pes0, worker_t &w);
 
 /**
  * Infer the insert size over a complete cohort, then pair and emit it.

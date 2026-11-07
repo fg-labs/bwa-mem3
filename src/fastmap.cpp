@@ -1280,6 +1280,7 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                                    aux->cohort_n - slice_off,
                                    aux->cohort_seqs + slice_off,
                                    w.regs + slice_off,
+                                   aux->pes0,
                                    w);
 
             if (!ret->cohort_complete) {

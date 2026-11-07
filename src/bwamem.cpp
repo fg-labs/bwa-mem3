@@ -4913,7 +4913,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
     }
 }
 
-/* Single-end: align a work item and emit its SAM in the same pass.
+/* Align a work item and emit its SAM in the same pass (single-end, or
+ * paired-end when -I fixes the insert-size distribution).
  *
  * A single-end read's SAM depends only on its own regions (worker_sam's SE
  * branch reads w->regs[i] and w->seqs[i], never w->pes or another read), so
@@ -4949,6 +4950,14 @@ static void mem_kt_for_sam(worker_t &w, int n)
     mem_kt_for_emit(worker_sam, w, n);
 }
 
+/* Does a cohort slice's SAM depend only on its own reads? Single-end always;
+ * paired-end only when -I supplied the insert-size distribution, since then
+ * pairing never reads the rest of the cohort's regions. */
+static inline bool mem_cohort_emits_in_align(const mem_opt_t *opt, const mem_pestat_t *pes0)
+{
+    return !(opt->flag & MEM_F_PE) || pes0 != NULL;
+}
+
 /* Align phase for one slice of a pestat cohort: seeding + BSW only.
  *
  * Split out of mem_process_seqs so the pipeline can align a cohort in several
@@ -4967,9 +4976,12 @@ void mem_align_cohort_slice(mem_opt_t *opt,
                             int n,
                             bseq1_t *seqs,
                             mem_alnreg_v *regs,
+                            const mem_pestat_t *pes0,
                             worker_t &w)
 {
     bseq1_t      *saved_seqs = w.seqs;
+    const mem_pestat_t *saved_pes = w.pes;
+    mem_pestat_t pes[4];
     mem_alnreg_v *saved_regs = w.regs;
     int64_t       saved_np   = w.n_processed;
 
@@ -4999,10 +5011,15 @@ void mem_align_cohort_slice(mem_opt_t *opt,
      * per-read hash ids match the whole-cohort SAM pass. No streaming here: the
      * slice's records are written by the write step with the rest of the
      * cohort, in read order. */
-    if (!(opt->flag & MEM_F_PE)) kt_for(worker_bwt_aln_sam_se, &w, n);
-    else                         kt_for(worker_bwt_aln, &w, n);
+    if (mem_cohort_emits_in_align(opt, pes0)) {
+        if (pes0) { memcpy(pes, pes0, 4 * sizeof(mem_pestat_t)); w.pes = pes; }
+        kt_for(worker_bwt_aln_sam_se, &w, n);
+    } else {
+        kt_for(worker_bwt_aln, &w, n);
+    }
     tprof[WORKER10][0] += __rdtsc() - tim;
 
+    w.pes = saved_pes;
     w.seqs = saved_seqs;
     w.regs = saved_regs;
     w.n_processed = saved_np;
@@ -5047,8 +5064,8 @@ void mem_pair_and_emit_cohort(mem_opt_t *opt,
             opt->est_insert_high = pes[1].high;
     }
 
-    /* Single-end: mem_align_cohort_slice already emitted every read's SAM. */
-    if (opt->flag & MEM_F_PE) {
+    /* mem_align_cohort_slice already emitted every read's SAM. */
+    if (!mem_cohort_emits_in_align(opt, pes0)) {
         uint64_t tim = __rdtsc();
         fprintf(stderr, "[0000] 3. Calling kt_for - worker_sam\n");
         mem_kt_for_sam(w, n);
@@ -5172,8 +5189,15 @@ void mem_process_seqs(mem_opt_t *opt,
     /* Single-end: also emit each work item's SAM in the same pass, so its
      * regions are freed before the thread moves on (worker_bwt_aln_sam_se).
      * The read memo is paired-end only, so it never applies here. */
-    const bool se_fused = !(opt->flag & MEM_F_PE);
-    xassert(!se_fused || !rm_arm, "read memo armed on a single-end chunk");
+    /* Paired-end with -I (pes0) is the same: pairing reads the given insert-size
+     * distribution, not the batch's regions, so each pair can be emitted with
+     * its own work item. kt_for items start and end on even reads
+     * (kt_item_layout), which worker_sam's PE branch already relies on. Not
+     * when the read memo runs: its copy pass needs every REP aligned first. */
+    const bool pe_known = (opt->flag & MEM_F_PE) && pes0 != NULL && !rm_run_pairs;
+    if (pe_known) memcpy(pes, pes0, 4 * sizeof(mem_pestat_t));
+    const bool se_fused = !(opt->flag & MEM_F_PE) || pe_known;
+    xassert(!se_fused || !rm_arm, "read memo armed on a fused align+SAM chunk");
     if (se_fused) mem_kt_for_emit(worker_bwt_aln_sam_se, w, n_);
     else          kt_for(worker_bwt_aln, &w, n_); // SMEMs (+SAL) then BSW, fused
     tprof[WORKER10][0] += __rdtsc() - tim;
@@ -5201,7 +5225,7 @@ void mem_process_seqs(mem_opt_t *opt,
 
 
     // PAIRED_END
-    if (opt->flag & MEM_F_PE) { // infer insert sizes if not provided
+    if ((opt->flag & MEM_F_PE) && !pe_known) { // infer insert sizes if not provided
         if (pes0)
             memcpy(pes, pes0, 4 * sizeof(mem_pestat_t)); // if pes0 != NULL, set the insert-size
                                                          // distribution as pes0
