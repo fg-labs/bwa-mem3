@@ -508,8 +508,19 @@ extern "C" int bam_writer_append_generic_aux(struct bam1_t *b,
 extern "C" void bam_writer_bseq_push(bseq1_t *s, struct bam1_t *b)
 {
     if (s == NULL || b == NULL) return;
+    /* The record is complete here and is held until the batch is written.
+     * htslib sized b->data to the next power of two plus 32 as it grew, which
+     * leaves ~100 bytes unused per short read; give that back. Only the
+     * capacity changes (m_data = l_data), so the record's bytes do not, and a
+     * failed shrink just keeps the larger buffer. */
+    if (b->data != NULL && b->m_data - b->l_data >= 64
+            && !(b->mempolicy & BAM_USER_OWNS_DATA)) {
+        uint8_t *nd = (uint8_t *)realloc(b->data, (size_t)b->l_data);
+        if (nd != NULL) { b->data = nd; b->m_data = (uint32_t)b->l_data; }
+    }
     if (s->n_bams == s->cap_bams) {
-        int new_cap = s->cap_bams ? s->cap_bams * 2 : 4;
+        /* Most reads carry exactly one record, so start at one slot. */
+        int new_cap = s->cap_bams ? s->cap_bams * 2 : 1;
         void **nb = (void **)realloc(s->bams, (size_t)new_cap * sizeof(void *));
         if (nb == NULL) {
             bam_destroy1(b);
