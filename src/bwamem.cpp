@@ -6885,6 +6885,23 @@ static inline void bsw_tier_kernel(BswMethTier tier, IBandedPairWiseSW *bsw,
     }
 }
 
+/* Test seam (bwamem.h): one tier call as bsw_run_tier makes it outside --meth, through the
+ * dedup wrapper, the per-call sort and the 8-to-16 divert. Not called by the aligner. It
+ * passes nthreads = 1, the only value the aligner's tier calls pass (mem_chain2aln_across_reads_V2);
+ * with that constant this second caller of bsw_tier_kernel leaves the aligner's code for
+ * bsw_run_tier, bsw_tier_kernel and bsw_score_batch as it was without the seam. */
+static_assert(BSW_EXT_CALL_8_MAX_W == BSW8_MAX_W, "bwamem.h's BSW_EXT_CALL_8_MAX_W must track BSW8_MAX_W");
+void bsw_extend_tier_call(BswExtCall tier, IBandedPairWiseSW *bsw, SeqPair *pa, uint8_t *ref,
+                          uint8_t *qer, int n, int32_t w, SeqPair *sort_scratch, int32_t *hist)
+{
+    xassert(tier == BSW_EXT_CALL_SCALAR || tier == BSW_EXT_CALL_16 || tier == BSW_EXT_CALL_8,
+            "bsw_extend_tier_call: unknown tier");
+    const BswMethTier t = tier == BSW_EXT_CALL_8  ? BSW_TIER_8
+                        : tier == BSW_EXT_CALL_16 ? BSW_TIER_16
+                        :                           BSW_TIER_SCALAR;
+    bsw_tier_kernel(t, bsw, pa, ref, qer, n, /*nthreads=*/1, w, sort_scratch, hist);
+}
+
 /* Dispatch one tier of `nump` pairs. Non-meth: a single call on `sym` with the
  * original `base_scratch` (= seqPairArrayAux). Meth: 3-way in-place partition by
  * hypothesis, then one call per non-empty run on the matching object, using
@@ -7002,8 +7019,10 @@ static int bsw_rung_group_lanes(BswMethTier tier)
 #endif
 }
 
-/* Opt-in regression seam: inspect extension scores before CIGAR reconstruction can
- * mask a difference. One fprintf keeps each row intact across worker threads. */
+/* Opt-in regression seam: inspect extension scores and region coordinates before CIGAR
+ * reconstruction can mask a difference. One fprintf keeps each row intact across worker
+ * threads. Columns after the tag: stage, read id, regid, is_left, read name, len2,
+ * probe_band, eligible, score, truesc, qb, rb, qe, re (rb and re are int64), w. */
 static inline bool band_cert_trace_enabled()
 {
     static const bool enabled = [] {
@@ -7017,9 +7036,11 @@ static inline void band_cert_trace(const char *stage, const SeqPair *sp,
         const bseq1_t *seq, int is_left, int eligible, const mem_alnreg_t *a)
 {
     if (!band_cert_trace_enabled()) return;
-    fprintf(stderr, "[band-cert-trace]\t%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%d\n",
+    fprintf(stderr, "[band-cert-trace]\t%s\t%d\t%d\t%d\t%s\t%d\t%d\t%d\t%d\t%d"
+            "\t%d\t%" PRId64 "\t%d\t%" PRId64 "\t%d\n",
             stage, seq[sp->seqid].id, sp->regid, is_left, seq[sp->seqid].name,
-            sp->len2, (int)sp->probe_band, eligible, a->score, a->truesc);
+            sp->len2, (int)sp->probe_band, eligible, a->score, a->truesc,
+            a->qb, a->rb, a->qe, a->re, a->w);
 }
 
 static inline int bsw_tb_probe_rung(BswMethTier tier, const mem_opt_t *opt, mem_alnreg_v *av_v,

@@ -46,7 +46,7 @@
 
 #include "ksw_runner.h"
 #include "kswr_cmp.h"
-#include "scoped_env.h"
+#include "scoped_rescue_env.h"  // ScopedKswvRescueEnv
 #include "kswv_runner.h"  // BWA_TESTS_HAVE_KSWV
 #include "scoring.h"
 #include "seqpair_gen.h"
@@ -73,7 +73,6 @@ bool rowpair_tier() {
     return tier == BWAMEM3_TIER_AVX512BW || tier == BWAMEM3_TIER_NEON;
 }
 
-using bwa_tests::ScopedEnv;   // scoped_env.h
 
 // Phase 0 then phase 1 on the u8 kernel at the runtime tier; returns the
 // kswr_t of every pair, indexed by pair.
@@ -109,6 +108,37 @@ std::vector<bwa_tests::TestPair> ragged_batch(std::mt19937 &rng, int n_pairs, in
         add_ambiguous(rng, pairs.back());
     }
     return pairs;
+}
+
+// The same batch with every query code 5 mapped to 4 (N), so it is valid input for scalar
+// ksw_align2 with its 5x5 matrix (m = 5): a raw 5 there would index past the matrix's
+// ambiguity row. The kernel arms get the normalized batch too, so the oracle compares the
+// same input; the raw-5 batch keeps its strict one-row vs two-row check above.
+std::vector<bwa_tests::TestPair> normalized(std::vector<bwa_tests::TestPair> pairs) {
+    int mapped = 0, n_bases = 0;
+    for (auto &p : pairs) {
+        for (auto &b : p.qry) {
+            if (b == kDash) { b = 4; ++mapped; }
+            n_bases += b == 4;
+        }
+        for (auto b : p.ref) { REQUIRE(b <= 4); n_bases += b == 4; }
+    }
+    REQUIRE(mapped > 0);    // the legacy batch did carry code 5, so this differs from it
+    REQUIRE(n_bases > 0);   // and N stays next to the pad blend
+    return pairs;
+}
+
+// Scalar ksw_align2 (u8 path, the kernel's xtra plus KSW_XBYTE) for each pair. The input
+// must already be in 0..4.
+std::vector<kswr_t> scalar_oracle(const std::vector<bwa_tests::TestPair> &pairs, int xtra) {
+    std::vector<kswr_t> out;
+    for (const auto &p : pairs) {
+        for (auto b : p.qry) REQUIRE(b <= 4);
+        out.push_back(bwa_tests::run_scalar_ksw(p, bwa_tests::default_scoring_matrix(),
+                                                bwa_tests::DEFAULT_GAP_OPEN,
+                                                bwa_tests::DEFAULT_GAP_EXTEND, xtra | KSW_XBYTE));
+    }
+    return out;
 }
 
 constexpr int kStopQlen = 100;
@@ -175,18 +205,18 @@ int compare_results(const std::vector<kswr_t> &ref, const std::vector<kswr_t> &a
 void check_rowpair(const std::vector<bwa_tests::TestPair> &pairs, int xtra, const char *what,
                    const std::vector<kswr_t> *oracle = nullptr) {
     const auto mat = bwa_tests::default_scoring_matrix();
-    // The AVX-512BW two-row sweep lives in the FScan body, so an inherited
-    // BWA3_RESCUE_FSCAN=0 would run the one-row body in both arms.
-    ScopedEnv fs("BWA3_RESCUE_FSCAN", "1");
+    // Every kswv rescue toggle is set for each arm (bwa_tests::ScopedKswvRescueEnv), so an off
+    // switch inherited from the caller cannot change either arm: an inherited
+    // BWA3_RESCUE_FSCAN=0, say, would run the one-row body in both (the AVX-512BW two-row
+    // sweep lives in the FScan body), and BWA3_RESCUE_LAZYQE=0 would change the NEON two-row arm.
     for (const char *usq : {"1", "0"}) {
-        ScopedEnv uq("BWA3_RESCUE_USQADD", usq);
         std::vector<kswr_t> one_row, two_row;
         {
-            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "0");
+            const bwa_tests::ScopedKswvRescueEnv env({{"BWA3_RESCUE_USQADD", usq}, {"BWA3_RESCUE_ROWPAIR", "0"}});
             one_row = run_u8(pairs, mat, xtra);
         }
         {
-            ScopedEnv rp("BWA3_RESCUE_ROWPAIR", "1");
+            const bwa_tests::ScopedKswvRescueEnv env({{"BWA3_RESCUE_USQADD", usq}, {"BWA3_RESCUE_ROWPAIR", "1"}});
             two_row = run_u8(pairs, mat, xtra);
         }
         const std::string label = std::string(what) + " usqadd=" + usq;
@@ -213,6 +243,21 @@ TEST_CASE("kswv u8 rescue at the runtime tier: BWA3_RESCUE_ROWPAIR off == on"
         std::mt19937 rng(20261027u);
         check_rowpair(ragged_batch(rng, 129, 461), xtra, "ragged odd");
     }
+    // The same shapes (seeds, odd pair count, partial last group, ragged lengths, N in both
+    // sequences) with query code 5 normalized to 4 for both kernel arms and the oracle, so
+    // each arm is also checked against independent scalar ksw_align2.
+    SUBCASE("ragged, even maxLen1, normalized 0..4, scalar oracle") {
+        std::mt19937 rng(20261026u);
+        const auto pairs = normalized(ragged_batch(rng, 129, 460));
+        const auto scalar = scalar_oracle(pairs, xtra);
+        check_rowpair(pairs, xtra, "ragged even normalized", &scalar);
+    }
+    SUBCASE("ragged, odd maxLen1, normalized 0..4, scalar oracle") {
+        std::mt19937 rng(20261027u);
+        const auto pairs = normalized(ragged_batch(rng, 129, 461));
+        const auto scalar = scalar_oracle(pairs, xtra);
+        check_rowpair(pairs, xtra, "ragged odd normalized", &scalar);
+    }
     SUBCASE("batch exit on row i and on row i+1 of a pair") {
         std::mt19937 rng(20261028u);
         const auto pairs = exit_batch(rng);
@@ -224,6 +269,7 @@ TEST_CASE("kswv u8 rescue at the runtime tier: BWA3_RESCUE_ROWPAIR off == on"
         // way. The subcase runs both exit branches for crash, indexing and
         // ordering safety; it cannot detect an exit that never fires.
         {
+            const bwa_tests::ScopedKswvRescueEnv env;   // the default bodies, whatever the caller set
             const auto res = run_u8(pairs, bwa_tests::default_scoring_matrix(), stop_xtra);
             int max_te[2] = {-1, -1};
             for (size_t i = 0; i < pairs.size(); i++) {
@@ -237,12 +283,7 @@ TEST_CASE("kswv u8 rescue at the runtime tier: BWA3_RESCUE_ROWPAIR off == on"
         }
         // Independent oracle: scalar ksw_align2 under the same stop flags, on
         // its u8 path (KSW_XBYTE) like the kernel under test.
-        std::vector<kswr_t> scalar;
-        for (const auto &p : pairs)
-            scalar.push_back(bwa_tests::run_scalar_ksw(p, bwa_tests::default_scoring_matrix(),
-                                                       bwa_tests::DEFAULT_GAP_OPEN,
-                                                       bwa_tests::DEFAULT_GAP_EXTEND,
-                                                       stop_xtra | KSW_XBYTE));
+        const auto scalar = scalar_oracle(pairs, stop_xtra);
         check_rowpair(pairs, stop_xtra, "exit rows", &scalar);
     }
 }

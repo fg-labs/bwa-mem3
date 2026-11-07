@@ -34,6 +34,11 @@
 //      the 16-bit kernel (the diverted two-key order) is not exercised: no band
 //      here exceeds 124. Coupled pairs are rare, so these batches are not what
 //      pins the fix; they keep the property honest on many shapes.
+//   3. The real 8-bit tier dispatch (bsw_extend_tier_call, the aligner's tier call
+//      outside --meth) at the int8 band limit and past it, where it diverts to the
+//      16-bit kernel: every pair, read back by (seqid, regid), carries its scalar
+//      result, with extension dedup off and on (with it on, only the distinct jobs are
+//      handed to the kernel).
 
 #include <algorithm>
 #include <cstdint>
@@ -44,7 +49,10 @@
 
 #include "doctest/doctest.h"
 #include "bandedSWA.h"
+#include <cstdlib>
+#include "bwamem.h"   // bsw_extend_tier_call, bsw8_envelope_ok, BSW_EXT_CALL_8_MAX_W
 #include "bsw_batch.h"
+#include "scoped_rescue_env.h"   // ScopedDedupMode
 #include "ext_ladder.h"
 
 #if HAVE_BSW_VECTOR_8_16
@@ -503,6 +511,144 @@ TEST_CASE("bandedSWA lane independence: 8-bit lanes on opposite diagonals score 
 TEST_CASE("bandedSWA lane independence: generated 16-bit batches in any grouping"
           * doctest::test_suite("unit/bandedswa")) {
     check_generated(16, 0x1A9E0016ull, 10);
+}
+
+/// A kernel copy that counts the pairs each batched entry point is handed, then forwards to
+/// the real kernel: how many jobs the tier call actually scores (dedup scores each distinct
+/// job once).
+class CountingBsw final : public IBandedPairWiseSW {
+public:
+    explicit CountingBsw(std::unique_ptr<IBandedPairWiseSW> inner) : inner_(std::move(inner)) {}
+    long scored = 0;   // pairs handed to getScores8 / getScores16 / scalarBandedSWAWrapper
+    int calls = 0;
+
+    int scalarBandedSWA(int qlen, const uint8_t *query, int tlen, const uint8_t *target, int32_t w, int h0,
+                        int *qle, int *tle, int *gtle, int *gscore, int *max_off) override {
+        return inner_->scalarBandedSWA(qlen, query, tlen, target, w, h0, qle, tle, gtle, gscore, max_off);
+    }
+    void scalarBandedSWAWrapper(SeqPair *pa, uint8_t *ref, uint8_t *qer, int n, int nt, int32_t w) override {
+        scored += n; calls++;
+        inner_->scalarBandedSWAWrapper(pa, ref, qer, n, nt, w);
+    }
+    void getScores8(SeqPair *pa, uint8_t *ref, uint8_t *qer, int32_t n, uint16_t nt, int32_t w) override {
+        scored += n; calls++;
+        inner_->getScores8(pa, ref, qer, n, nt, w);
+    }
+    void getScores16(SeqPair *pa, uint8_t *ref, uint8_t *qer, int32_t n, uint16_t nt, int32_t w) override {
+        scored += n; calls++;
+        inner_->getScores16(pa, ref, qer, n, nt, w);
+    }
+    uint64_t sw_cells() const override { return inner_->sw_cells(); }
+    void set_guard_overshoot(bool on) override { inner_->set_guard_overshoot(on); }
+    void set_meth_cpg(int a, int b, int c) override { inner_->set_meth_cpg(a, b, c); }
+    void set_lane_compaction(int g, int m) override { inner_->set_lane_compaction(g, m); }
+    BswCompactCounts lane_compaction_counts() const override { return inner_->lane_compaction_counts(); }
+    BswScoreDomainCounts bsw8_score_domain_counts() const override { return inner_->bsw8_score_domain_counts(); }
+    void set_lane_compaction16(int g, int r) override { inner_->set_lane_compaction16(g, r); }
+    BswCompactCounts lane_compaction16_counts() const override { return inner_->lane_compaction16_counts(); }
+
+private:
+    std::unique_ptr<IBandedPairWiseSW> inner_;
+};
+
+/// The 8-bit tier's real dispatch at and past the int8 band limit (BSW_EXT_CALL_8_MAX_W). Pairs
+/// the 8-bit routing envelope admits at that limit go through bsw_extend_tier_call: at the
+/// limit it runs getScores8; past it, it diverts to getScores16 after the diverted two-key
+/// sort. The widths past the limit are the boundary probes limit + 1, limit + 3 and
+/// limit + 4 (125, 127, 128: the first widths the divert takes, and the last int8 wrap
+/// points), and 200, the ladder's first width past the limit at the default -w 100
+/// (opt->w << 1). Every pair, read back by its (seqid, regid), must carry scalarBandedSWA's six
+/// fields at that w, with extension dedup off and on. With dedup on, about one job in five
+/// repeats an earlier job under a new (seqid, regid), so the copy-to-repeat path runs on the
+/// n > 1 batches (a one-pair batch takes the dedup wrapper's n < 2 bypass); a counting
+/// wrapper on the kernel checks that such a batch scores only its distinct jobs. getScores8 is
+/// never called directly past the limit, where its int8 offsets cannot hold the band.
+TEST_CASE("bandedSWA 8-bit tier dispatch past the int8 band limit gives the scalar result"
+          * doctest::test_suite("unit/bandedswa")) {
+    const ExtScoring sc = scoring(1, 4, 6, 1, 6, 1, 100, 5, false);
+    const int lim = BSW_EXT_CALL_8_MAX_W;
+    // The routing envelope must admit some pair at the limit, or the generator below finds
+    // none. Only the dev A/B hook BWAMEM3_DISABLE_BSW8=1 (read once per process) may close
+    // it: skip, visibly, then. Any other rejection is a routing regression, so fail.
+    if (!bsw8_envelope_ok(40, 20, lim, sc.a, sc.zdrop, 10)) {
+        const char *off = getenv("BWAMEM3_DISABLE_BSW8");
+        REQUIRE_MESSAGE((off != nullptr && atoi(off) != 0),
+                        "the 8-bit routing envelope rejects a pair it must admit at w = " << lim);
+        MESSAGE("skipped: BWAMEM3_DISABLE_BSW8 closes the 8-bit routing envelope");
+        return;
+    }
+    const std::vector<Kernel> kernels = host_kernels();
+    REQUIRE(!kernels.empty());
+    long checked = 0, dups = 0, dedup_batches = 0;
+    std::mt19937_64 rng(0xD1BE7124ull);
+    for (const char *dedup : {"off", "on"}) {
+        const bwa_tests::ScopedDedupMode dedup_mode(dedup);
+        for (int w : {lim, lim + 1, lim + 3, lim + 4, 200}) {
+            for (int n : {1, 17, 63}) {   // one pair, a group plus one, several groups and a tail
+                // 8-bit-admissible pairs (len1 >= len2, h0 + len2 * a in range), every
+                // fifth a repeat of an earlier job under a new (seqid, regid). Lengths and
+                // seeds are drawn inside the envelope at default scoring, so a rejection is
+                // rare; the attempt bound keeps a closed envelope from looping.
+                std::vector<ExtPair> jobs;
+                std::vector<int> job_of;
+                int attempts = 0;
+                while ((int)job_of.size() < n) {
+                    REQUIRE(++attempts < 100 * n);
+                    if (!jobs.empty() && rng() % 5 == 0) {
+                        job_of.push_back((int)(rng() % jobs.size()));
+                        dups++;
+                        continue;
+                    }
+                    ExtPair p;
+                    const int len2 = 1 + (int)(rng() % 150), len1 = len2 + (int)(rng() % 140);
+                    p.h0 = 1 + (int)(rng() % 90);
+                    if (!bsw8_envelope_ok(len1, len2, lim, sc.a, sc.zdrop, p.h0)) continue;
+                    p.target.resize(len1);
+                    for (auto &c : p.target) c = (uint8_t)(rng() % 4);
+                    p.query.resize(len2);
+                    const unsigned mm = (unsigned)(rng() % 40);
+                    for (int q = 0; q < len2; q++) {
+                        p.query[q] = rng() % 100 < mm ? (uint8_t)(rng() % 4) : p.target[q];
+                        if (rng() % 50 == 0) p.query[q] = 4;
+                    }
+                    job_of.push_back((int)jobs.size());
+                    jobs.push_back(std::move(p));
+                }
+                std::vector<const ExtPair *> batch;
+                for (int q = 0; q < n; q++) batch.push_back(&jobs[job_of[q]]);
+                // The scalar oracle depends only on the job and w, not the kernel: score each
+                // distinct job once and compare every kernel against the same results.
+                std::vector<ExtResult> want_job;
+                for (const ExtPair &p : jobs) want_job.push_back(bwa_tests::run_mem3_scalar(sc, p, w));
+                for (const Kernel &k : kernels) {
+                    CountingBsw bsw(k.make(sc));
+                    const std::vector<ExtResult> got = bwa_tests::score_bsw_tier_call(bsw, batch, BSW_EXT_CALL_8, w);
+                    // One kernel call; with dedup on (and n >= 2) it scores only the distinct
+                    // jobs, so the scalar comparison below also covers each repeat's copied
+                    // result. At this seed no two generated jobs coincide (random bases, lengths, h0).
+                    const bool dedups = std::string(dedup) == "on" && n >= 2;
+                    CHECK(bsw.calls == 1);
+                    CHECK(bsw.scored == (dedups ? (long)jobs.size() : (long)n));
+                    if (bsw.scored < n) dedup_batches++;
+                    int bad = 0;
+                    for (int q = 0; q < n; q++) {
+                        const ExtResult &want = want_job[job_of[q]];
+                        checked++;
+                        if (got[q] == want) continue;
+                        if (bad++ < 3)
+                            MESSAGE(k.name << " dedup=" << std::string(dedup) << " w=" << w << " n=" << n << " pair " << q
+                                           << ": " << show(got[q]) << " vs scalar " << show(want));
+                    }
+                    INFO("kernel " << k.name << " dedup=" << std::string(dedup) << " w=" << w << " n=" << n);
+                    CHECK(bad == 0);
+                }
+            }
+        }
+    }
+    MESSAGE("8-bit tier dispatch past the int8 limit: " << checked << " pair results, " << dups
+            << " repeated jobs, " << dedup_batches << " batches scoring fewer jobs than pairs");
+    CHECK(dups > 0);
+    CHECK(dedup_batches > 0);
 }
 
 #endif // HAVE_BSW_VECTOR_8_16
