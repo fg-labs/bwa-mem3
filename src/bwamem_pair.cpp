@@ -1805,11 +1805,6 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 if (a[i].a[j].score >= a[i].a[0].score  - opt->pen_unpaired)
                     kv_push(mem_alnreg_t, b[i], a[i].a[j]);
 
-        for (int l=0; l<a[0].n; l++)
-            a[0].a[l].flg = 0;
-        for (int l=0; l<a[1].n; l++)
-            a[1].a[l].flg = 0;
-
         #if MATE_SORT
         for (i = 0; i < 2; ++i) {
             sort_alnreg_re(a[!i].n, a[!i].a);

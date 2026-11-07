@@ -4704,7 +4704,7 @@ static const char *read_memo_alnreg_field_diff(const mem_alnreg_t *a, const mem_
     RM_D(rb); RM_D(re); RM_D(qb); RM_D(qe); RM_D(rid);
     RM_D(score); RM_D(truesc); RM_D(sub); RM_D(alt_sc); RM_D(csub); RM_D(sub_n);
     RM_D(w); RM_D(seedcov); RM_D(secondary); RM_D(secondary_all);
-    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep); RM_D(flg);
+    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep);
     RM_D(meth_hypothesis); RM_D(meth_strand_hyp);
 #undef RM_D
     if (a->n_comp != b->n_comp) return "n_comp";
