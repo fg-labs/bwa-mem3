@@ -21,6 +21,12 @@ if [[ ! -x "$BIN" ]]; then
     exit 2
 fi
 
+# `shm -d` drops every index staged on the host. Refuse (SKIP) unless the
+# registry is empty or holds only the two basenames this test stages.
+# shellcheck source=test/framework/shm_registry_guard.sh
+source test/framework/shm_registry_guard.sh
+shm_registry_guard "$BIN" shm_meth_test ref.fa ref.fa.meth
+
 # Isolated dir so the staged segments are unambiguous.
 WORKDIR="$(mktemp -d -t shm_meth.XXXXXX)"
 cp test/fixtures/phix.fa "$WORKDIR/ref.fa"

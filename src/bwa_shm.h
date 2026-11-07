@@ -48,16 +48,15 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_SHM_VERSION        2u
 #define BWA_SHM_CTL_NAME       "/bwactl"
 /* Named POSIX semaphore guarding read-modify-write sequences against
- * /bwactl. Created on first use and unlinked by bwa_shm_destroy alongside
- * the registry, so `bwa-mem3 shm -d` is the recovery path if a stager
- * crashes while holding the lock (POSIX semaphores have no SEM_UNDO).
- * Public so a test that cleans up its own staged index takes the same lock. */
+ * /bwactl. A stager holds it only for the few milliseconds of registry and
+ * segment bookkeeping, never while packing the index. Created on first use and
+ * unlinked by bwa_shm_destroy alongside the registry, so `bwa-mem3 shm -d`
+ * recovers from a stager killed inside that window (POSIX semaphores have no
+ * SEM_UNDO). Public so a test that cleans up its own staged index takes the
+ * same lock. */
 #define BWA_SHM_LOCK_NAME      "/bwactl_lock"
 #define BWA_SHM_IDX_PREFIX     "/bwaidx-"
-#define BWA_SHM_CTL_SIZE       0x10000   /* 64 KiB. Must equal bwa.h::BWA_CTL_SIZE
-                                          * (the legacy v1 stub); a static_assert in
-                                          * bwa_shm.cpp will enforce equality once
-                                          * that translation unit is added. */
+#define BWA_SHM_CTL_SIZE       0x10000   /* 64 KiB registry segment */
 
 /* FMI_SCALARS section: int64_t reference_seq_len, count[5], sentinel_index,
  * sa_compx. sa_compx (the SA sample-rate shift) is carried so a non-default
@@ -77,12 +76,19 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_SHM_SEC_PAC          9u
 #define BWA_SHM_SEC_REF_STRING   10u
 
+/* A segment is complete once `magic` is BWA_SHM_MAGIC. The stager writes the
+ * header last and publishes `magic` with a release store, so a reader that
+ * loads it with acquire ordering and sees BWA_SHM_MAGIC sees the whole index.
+ * While staging, `magic` is 0, reserved[0] holds the stager's PID and
+ * reserved[1] a random per-stage token; the stager keeps both in the final
+ * header. A segment with magic 0 whose stager is no longer alive was left by
+ * an interrupted stage. */
 typedef struct {
-	uint64_t magic;          /* BWA_SHM_MAGIC */
+	uint64_t magic;          /* BWA_SHM_MAGIC, or 0 while staging */
 	uint32_t version;        /* BWA_SHM_VERSION */
 	uint32_t n_sections;
 	uint64_t total_size;     /* bytes including this header */
-	uint64_t reserved[5];    /* zero-fill for forward-compat */
+	uint64_t reserved[5];    /* [0] stager PID, [1] stage token; rest zero */
 } bwa_shm_header_t;           /* 64 bytes; first object in every segment */
 
 typedef struct {
@@ -97,7 +103,9 @@ typedef struct {
 extern "C" {
 #endif
 
-	int       bwa_shm_test(const char *prefix);                      /* 1 if staged, 0 if not, -1 on error */
+	/* 1 if `prefix`'s basename is registered (which includes a stage still in
+	 * progress or one that was interrupted), 0 if not, -1 on error. */
+	int       bwa_shm_test(const char *prefix);
 	/* bns_only=true stages a SEED-only segment (D3 --meth): the FM-index + BNS
 	 * are packed, but PAC and REF_STRING (.0123) are omitted (zero-length
 	 * sections) because `mem --meth` never reads the seed pac/.0123. The seed
@@ -113,8 +121,9 @@ extern "C" {
 	                        int target_sa_compx = -1,
 	                        int n_threads = 1); /* loads from disk, packs, stages */
 	/* Test-only hook (see bwa_shm.cpp): bwa_shm_stage calls it with its
-	 * writable index mapping right after the map and before the pack fills it,
-	 * so a unit test can inspect that mapping while it exists. NULL on every
+	 * writable index mapping after it has registered the segment and released
+	 * the stager lock, before the pack fills it, so a unit test can inspect
+	 * that mapping or act while the stage is in progress. NULL on every
 	 * production path. */
 	extern void (*bwa_shm_stage_map_hook)(const void *base, size_t len);
 	int       bwa_shm_destroy(void);                                 /* drops all (matches v1 -d) */
@@ -146,6 +155,8 @@ extern "C" {
 		uint64_t total_size;
 		uint32_t n_sections;
 		bwa_shm_section_t sections[16];  /* 10 used today; spare for forward-compat */
+		uint64_t stager_pid;             /* header reserved[0]; 0 outside bwa_shm_stage */
+		uint64_t stage_token;            /* header reserved[1]; 0 outside bwa_shm_stage */
 	} bwa_shm_layout_t;
 
 	/* Compute layout and load BNS. Returns 0 on success, -1 on error. When

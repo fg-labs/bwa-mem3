@@ -3,7 +3,8 @@ Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]
 
 Options:
   -d        destroy all indices in shared memory (matches bwa v1 behavior)
-  -l        list names of indices in shared memory
+  -l        list indices in shared memory; a third column flags
+            incomplete, missing or unusable entries
   --meth    stage a `bwa-mem3 index --meth` index — auto-appends
             `.meth` to <idxbase>, mirroring `mem --meth`
   -u INT    densify the staged SA sample table to sample-rate shift INT
@@ -29,10 +30,11 @@ the same plain `<idxbase>` to all three commands plus `--meth` on
 Footgun: if you re-build the index, run `bwa-mem3 shm -d` first.
 There is no staleness check -- a stale segment will silently mis-align.
 
-Stuck-lock recovery: concurrent stagers are serialized by a named
-       POSIX semaphore. If a stager is kill -9'd mid-stage, the lock
-       persists and subsequent stages block forever. `bwa-mem3 shm -d`
-       unlinks the semaphore alongside the registry; rerun afterwards.
+Interrupted stage: `shm -l` marks it `incomplete` and `mem` loads
+       from disk; rerun `bwa-mem3 shm <idxbase>` to reclaim and restage.
+       Stagers hold a named POSIX semaphore only for a few ms of
+       registry update; if one is killed inside that window, later
+       stages block, and `bwa-mem3 shm -d` unlinks the semaphore.
 
 macOS: POSIX shm has implementation-defined per-segment caps; large
        indices may simply fail to stage. Prefer Linux for production.

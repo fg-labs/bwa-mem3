@@ -57,6 +57,16 @@ The `run_in_child` leaking-exit case runs only under glibc AddressSanitizer. It 
 
 Real staging/attach checks require Linux POSIX shared memory. A checked missing control-mapping prerequisite produces SKIP; an error after that check, including second-index staging, produces ERROR/FAIL with the staging diagnostic. On other platforms, portable checks still run but do not establish native Linux staging correctness. The facade no-table contract runs regardless of whether loading uses disk or an already-staged private segment.
 
+`shm_lock_destroy_test` compiles `src/bwa_shm.cpp` with private registry, lock and segment names too. It checks destroy (including that it waits for the stager lock before walking the registry, and proceeds without a lock that stays held), and the registry guard described below, including its refusal of malformed registries. Pass `destroy` or `registry-guard` to run one check.
+
+`shm_stage_test <indexed-prefix>` also compiles `src/bwa_shm.cpp` with private names, and stages the index in forked children. It checks that the stager lock is free while a stage packs (a second stage of the same basename waits for it, holding no lock, then succeeds; attach falls back; `shm -l` shows `incomplete`), that a stage killed mid-pack is reclaimed by the next stage, that a failed pack removes its entry and segment, that `shm -d` during a stage makes it fail cleanly, that a waiting stage gives up at its deadline, that a foreign or truncated segment is refused (`shm -l` shows `unusable`), that the free-space preflight reserves only the unwritten part of other in-progress stages, and that restaging a complete index is a no-op. Each child runs under `alarm()`, so a regression fails instead of hanging.
+
+`shm_thp_advise_test <indexed-prefix>` compiles `src/bwa_shm.cpp` with private names as well, and checks that the stager's and the attached mapping of a staged segment are advised `MADV_HUGEPAGE`.
+
+### Tests that use the host shared-memory registry
+
+`shm_pack_round_trip_test`, `shm_round_trip_test.sh` and `shm_meth_test.sh` stage into the host registry and run the global destroy (`bwa-mem3 shm -d`), which drops every index staged on the host. Each one first reads the registry and leaves it untouched unless it is empty or lists only the basenames that test stages itself. Otherwise `shm_pack_round_trip_test` fails, and the other two print `SKIP:` and exit 0. The C++ tests use `bwa_tests::shm_registry_holds_only` (`test/framework/shm_registry_guard.h`). The shell tests source `test/framework/shm_registry_guard.sh`, which reads the registry with `bwa-mem3 shm -l` only and treats a failing `shm -l` as a foreign registry. `shm_lock_destroy_test registry-guard` checks the C++ predicate against a private registry. A new test that runs the global destroy must call one of these guards before its first destroy.
+
 ### Run integration tests
 
 ```bash

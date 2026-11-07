@@ -46,8 +46,6 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_IDX_PAC 0x4
 #define BWA_IDX_ALL 0x7
 
-#define BWA_CTL_SIZE 0x10000
-
 /* Buffer size for bwa_format_pa_value(). The widest "%.3f" of an int/int
  * ratio is "-2147483648.000" (15 chars + NUL), so this cannot truncate. */
 #define BWA_PA_TEXT_MAX 20

@@ -16,24 +16,47 @@
  * depend on the runner's mount. Off Linux, or on a kernel built without
  * transparent huge pages (where madvise rejects the advice), it prints SKIP.
  *
- * Like the other shm tests (shm_lock_destroy_test, shm_round_trip_test.sh),
- * it calls bwa_shm_destroy before and after, which drops every index this user
- * has staged on the host, not just its own. Run it where nothing else needs a
- * staged index.
+ * It compiles src/bwa_shm.cpp with private per-run registry, lock and segment
+ * names, as shm_stage_test does, so it never reads, stages into or destroys the
+ * host registry.
  *
  * Usage: shm_thp_advise_test <indexed-prefix>
  */
 
+// Distinct stage/destroy symbols, so an accidental archive fallback cannot
+// satisfy those calls with the global-name implementation (see shm_stage_test).
+#define bwa_shm_stage   test_private_shm_stage
+#define bwa_shm_destroy test_private_shm_destroy
 #include "bwa_shm.h"
+#include "framework/temp_dir.h"
 
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <semaphore.h>
 #include <string>
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
+
+static char private_control[32], private_lock[32], private_index[32];
+#undef BWA_SHM_CTL_NAME
+#undef BWA_SHM_LOCK_NAME
+#undef BWA_SHM_IDX_PREFIX
+#define BWA_SHM_CTL_NAME private_control
+#define BWA_SHM_LOCK_NAME private_lock
+#define BWA_SHM_IDX_PREFIX private_index
+#include "../src/bwa_shm.cpp"
+#undef BWA_SHM_CTL_NAME
+#undef BWA_SHM_LOCK_NAME
+#undef BWA_SHM_IDX_PREFIX
+#undef bwa_shm_stage
+#undef bwa_shm_destroy
+
+#define bwa_shm_stage   test_private_shm_stage
+#define bwa_shm_destroy test_private_shm_destroy
 
 #define CHECK(cond) do { \
     if (!(cond)) { \
@@ -140,7 +163,20 @@ int main(int argc, char *argv[])
         return 1;
     }
     const char *prefix = argv[1];
-    CHECK(bwa_shm_destroy() == 0);
+    /* A fresh per-run namespace, the registry and lock reserved by O_EXCL; the
+     * destroy calls below touch only it. */
+    bwa_tests::TempDir names("thp");
+    const std::string token = names.path().substr(names.path().rfind('.') + 1);
+    CHECK(token.size() == 6);
+    std::snprintf(private_control, sizeof private_control, "/th%sc", token.c_str());
+    std::snprintf(private_lock, sizeof private_lock, "/th%sl", token.c_str());
+    std::snprintf(private_index, sizeof private_index, "/th%s-", token.c_str());
+    const int ctl_fd = shm_open(private_control, O_CREAT | O_EXCL | O_RDWR, 0600);
+    CHECK(ctl_fd >= 0);
+    close(ctl_fd);
+    sem_t *lock = sem_open(private_lock, O_CREAT | O_EXCL, 0600, 1);
+    CHECK(lock != SEM_FAILED);
+    sem_close(lock);
     bwa_shm_stage_map_hook = stage_map_hook;
     CHECK(bwa_shm_stage(prefix) == 0);
     bwa_shm_stage_map_hook = NULL;

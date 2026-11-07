@@ -18,6 +18,7 @@
 #include "FMI_search.h"
 #include "bntseq.h"
 #include "utils.h"
+#include "framework/shm_registry_guard.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -46,38 +47,6 @@
         std::abort(); \
     } \
 } while (0)
-
-/* True when the shm registry is absent or lists no index other than `fixture`.
- * Parses /bwactl as ctl_walk does: a uint16 entry count, a uint16 next-write
- * offset, then packed (int64 size, NUL-terminated basename) entries. Any
- * registry this cannot read counts as holding another index, so the caller
- * never runs bwa_shm_destroy over indexes it does not own. */
-static bool registry_holds_only(const char *fixture)
-{
-    const int fd = shm_open(BWA_SHM_CTL_NAME, O_RDONLY, 0);
-    if (fd < 0) return errno == ENOENT;
-    struct stat st;
-    if (fstat(fd, &st) < 0) { close(fd); return false; }
-    if ((size_t)st.st_size < BWA_SHM_CTL_SIZE) { close(fd); return true; }
-    void *m = mmap(NULL, BWA_SHM_CTL_SIZE, PROT_READ, MAP_SHARED, fd, 0);
-    close(fd);
-    if (m == MAP_FAILED) return false;
-    const uint8_t *p = (const uint8_t *)m + 4;   /* past the two uint16 fields */
-    const uint8_t *end = (const uint8_t *)m + BWA_SHM_CTL_SIZE;
-    uint16_t n_entries = 0;
-    std::memcpy(&n_entries, m, sizeof(n_entries));
-    bool only = true;
-    for (uint16_t i = 0; i < n_entries && only; i++) {
-        if ((size_t)(end - p) <= sizeof(int64_t)) { only = false; break; }
-        const char *name = (const char *)(p + sizeof(int64_t));
-        const size_t name_max = (size_t)(end - (const uint8_t *)name);
-        const size_t len = strnlen(name, name_max);
-        only = len < name_max && std::strcmp(name, fixture) == 0;
-        p = (const uint8_t *)name + len + 1;
-    }
-    munmap(m, BWA_SHM_CTL_SIZE);
-    return only;
-}
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -251,14 +220,16 @@ int main(int argc, char *argv[]) {
                     1 << (int)oracle.sa_compx, (long long)oracle.sa_compx);
     }
 
-    /* An unregistered segment is not a successful stage. Preserve it rather
-     * than adopting potentially incomplete bytes or replacing a live mapping. */
+    /* A complete-looking segment without a registry entry is not a successful
+     * stage. Preserve it rather than adopting it or replacing a live mapping.
+     * (A segment whose magic is still 0 is an interrupted stage; the stager
+     * reclaims that one, which test/shm_stage_test.cpp covers.) */
     const char *base = std::strrchr(prefix, '/');
     base = base ? base + 1 : prefix;
     char segment[256];
     CHECK(std::snprintf(segment, sizeof(segment), "%s%s", BWA_SHM_IDX_PREFIX, base)
           < (int)sizeof(segment));
-    if (!registry_holds_only(base)) {
+    if (!bwa_tests::shm_registry_holds_only(BWA_SHM_CTL_NAME, base)) {
         std::fprintf(stderr, "shm_pack_round_trip_test: FAIL: the shm registry %s lists an "
                      "index other than %s, or could not be read; refusing to run "
                      "bwa_shm_destroy, which would drop every staged index. Run "
@@ -269,7 +240,14 @@ int main(int argc, char *argv[]) {
     CHECK_EQ(bwa_shm_destroy(), 0);
     const int fd = shm_open(segment, O_CREAT | O_RDWR | O_EXCL, 0600);
     CHECK(fd >= 0);
-    const char marker[] = "incomplete stage";
+    bwa_shm_header_t orphan_hdr;
+    std::memset(&orphan_hdr, 0, sizeof(orphan_hdr));
+    orphan_hdr.magic      = BWA_SHM_MAGIC;
+    orphan_hdr.version    = BWA_SHM_VERSION;
+    orphan_hdr.total_size = sizeof(orphan_hdr);
+    std::memcpy(&orphan_hdr.reserved[2], "unregistered", sizeof("unregistered"));
+    char marker[sizeof(orphan_hdr)];
+    std::memcpy(marker, &orphan_hdr, sizeof(marker));
     CHECK_EQ(ftruncate(fd, sizeof(marker)), 0);
     void *orphan = mmap(NULL, sizeof(marker), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     CHECK(orphan != MAP_FAILED);

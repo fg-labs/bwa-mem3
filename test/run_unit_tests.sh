@@ -40,7 +40,7 @@ fi
 
 # Build any test binaries that live outside test/Makefile (MAKE_ARGS: see the header).
 read -r -a make_args <<< "${MAKE_ARGS:-}"
-(cd "$ROOT" && make -j4 ${make_args[@]+"${make_args[@]}"} shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test shm_thp_advise_test fmi_seed_api_guards_test) > /dev/null \
+(cd "$ROOT" && make -j4 ${make_args[@]+"${make_args[@]}"} shm_section_find_test shm_pack_round_trip_test shm_lock_destroy_test shm_stage_test shm_thp_advise_test fmi_seed_api_guards_test) > /dev/null \
     || fail "top-level make of the shm/fmi test binaries failed (MAKE_ARGS='${MAKE_ARGS:-}')"
 
 # synthetic_1mb.fa is checked in alongside its committed baselines so the
@@ -560,6 +560,11 @@ echo "==> shm_lock_destroy_test"
 (cd "$ROOT" && ./shm_lock_destroy_test)
 echo "OK:   shm_lock_destroy_test"
 
+# --- shm_stage_test (unit: short stager lock, interrupted/failed stage) ------
+echo "==> shm_stage_test"
+(cd "$ROOT" && ./shm_stage_test "$FIXTURES/phix.fa")
+echo "OK:   shm_stage_test"
+
 # --- fmi_seed_api_guards_test (unit: fmi_seed_sa_prefetch max_occ guard) -----
 echo "==> fmi_seed_api_guards_test"
 (cd "$ROOT" && ./fmi_seed_api_guards_test "$FIXTURES/phix.fa")
@@ -569,27 +574,33 @@ echo "OK:   fmi_seed_api_guards_test"
 (cd "$HERE" && ./shm_pack_round_trip_test.sh) || fail "shm_pack_round_trip_test"
 ok "shm_pack_round_trip_test"
 
-# --- shm THP advice (unit: the attached segment is advised MADV_HUGEPAGE) ----
-# Needs the phiX index the round-trip script above builds.
-# The binary prints SKIP: and exits 0 off Linux or without THP; report that as a skip.
-thp_out=$(cd "$ROOT" && ./shm_thp_advise_test "$FIXTURES/phix.fa") \
-    || {
-        printf '%s\n' "$thp_out"
-        fail "shm_thp_advise_test"
+# --- host-registry shm tests ---------------------------------------------------
+# Each prints a `SKIP:` line and exits 0 when it cannot run here (off Linux, no
+# THP, or a registry holding another index); report that as a skip with its
+# reason rather than as OK.
+# run_or_skip <name> <cmd>...: run cmd, echo its output, then ok/skip/fail.
+run_or_skip() {
+    local name=$1 out reason
+    shift
+    out=$("$@" 2>&1) || {
+        printf '%s\n' "$out"
+        fail "$name"
     }
-printf '%s\n' "$thp_out"
-if grep -q '^SKIP:' <<< "$thp_out"; then
-    skip "shm_thp_advise_test (no THP advice to check on this host)"
-else
-    ok "shm_thp_advise_test"
-fi
+    printf '%s\n' "$out"
+    reason=$(grep '^SKIP:' <<< "$out" | tail -n 1 || true)
+    if [[ -n "$reason" ]]; then
+        skip "${reason#SKIP: }"
+    else
+        ok "$name"
+    fi
+}
 
-# --- shm end-to-end round-trip (byte-identical SAM with and without shm) -----
-(cd "$HERE" && ./shm_round_trip_test.sh) || fail "shm_round_trip_test"
-ok "shm_round_trip_test"
-
-# --- shm --meth flag (parity with mem --meth's c2t-suffix resolution) --------
-(cd "$HERE" && ./shm_meth_test.sh) || fail "shm_meth_test"
-ok "shm_meth_test"
+# THP advice on the attached segment; needs the phiX index built above.
+thp_advise() { (cd "$ROOT" && ./shm_thp_advise_test "$FIXTURES/phix.fa"); }
+run_or_skip shm_thp_advise_test thp_advise
+# End-to-end round-trip (byte-identical SAM with and without shm).
+run_or_skip shm_round_trip_test "$HERE/shm_round_trip_test.sh"
+# shm --meth flag (parity with mem --meth's c2t-suffix resolution).
+run_or_skip shm_meth_test "$HERE/shm_meth_test.sh"
 
 echo "ALL UNIT TESTS PASSED"
