@@ -117,7 +117,6 @@ void check_same_region(const mem_alnreg_t &a, const mem_alnreg_t &b) {
     CHECK(a.is_alt == b.is_alt);
     CHECK(a.frac_rep == b.frac_rep);
     CHECK(a.hash == b.hash);
-    CHECK(a.flg == b.flg);
     CHECK(a.meth_hypothesis == b.meth_hypothesis);
     CHECK(a.meth_strand_hyp == b.meth_strand_hyp);
 }
@@ -374,7 +373,6 @@ TEST_CASE("mem_sort_dedup_patch: a patched pair becomes one region spanning both
     regs[0].is_alt = 0, regs[1].is_alt = 1;
     regs[0].frac_rep = 0.25f, regs[1].frac_rep = 0.5f;
     regs[0].hash = 0x1111u, regs[1].hash = 0x2222u;
-    regs[0].flg = 1, regs[1].flg = 2;
     regs[0].meth_hypothesis = 1, regs[1].meth_hypothesis = 2;
     regs[0].meth_strand_hyp = 1, regs[1].meth_strand_hyp = 2;
     mem_alnreg_t want = regs[1];

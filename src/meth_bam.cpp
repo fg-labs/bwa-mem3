@@ -437,16 +437,9 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
     }
 
-    /* Restore pre-c2t bases so MethylDackel sees real C/Ts. CodeRabbit: prefer
-     * the first-class meth_orig_seq field (native-alphabet output no longer
-     * depends on comment preservation); fall back to the YS:Z comment only when
-     * meth_orig_seq is unavailable. FASTQ ingest builds comments as
-     * "YS:Z:<l_seq bytes>\tYC:Z:XX" starting at offset 0 — rely on that. */
+    /* Restore pre-c2t bases so MethylDackel sees real C/Ts, from the
+     * first-class meth_orig_seq field (set by ingest for every --meth read). */
     const char *orig_seq = s->meth_orig_seq;
-    if (orig_seq == NULL && s->comment && s->l_seq > 0
-        && s->comment[0] == 'Y' && s->comment[1] == 'S' && s->comment[2] == ':') {
-        orig_seq = s->comment + 5;
-    }
 
     int emit_seq = !(p.flag & 0x100);
     size_t l_emit = 0;
@@ -474,7 +467,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
                 }
             }
         } else if (!p.is_rev) {
-            /* Fallback: YS:Z (orig_seq) was missing. s->seq holds ASCII
+            /* Fallback: meth_orig_seq was missing. s->seq holds ASCII
              * (post-c2t in meth mode); map ASCII → 0..4 via nst_nt4_table. */
             for (size_t i = 0; i < l_emit; ++i) {
                 unsigned char c = (unsigned char)s->seq[qb + (int)i];
@@ -693,21 +686,12 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * mapped records. Each is additionally gated on its --meth-tags bit, and
      * the gate wraps the value's derivation rather than just the append, so a
      * deselected tag costs nothing to compute -- the contract --help and the
-     * methylation docs state. The YC:Z payload in s->comment carries the (CT|GA)
-     * value (the comment buffer is "YS:Z:<seq>\tYC:Z:<dir>", see
-     * src/fastmap.cpp:415-425). Locate it with a marker search rather
-     * than l_seq arithmetic so any future YS framing change (alternate
-     * prefix length, prior FASTQ comments folded in) stays detectable. */
+     * methylation docs state. */
     if (opt->meth_tags & MEM_METH_TAG_XR) {
-        const char *xr = NULL;
-        if (s->comment != NULL) {
-            const char *yc = strstr(s->comment, "\tYC:Z:");
-            if (yc != NULL) {
-                const char *p2 = yc + 6;  /* skip "\tYC:Z:" */
-                if      (p2[0] == 'C' && p2[1] == 'T') xr = "CT";
-                else if (p2[0] == 'G' && p2[1] == 'A') xr = "GA";
-            }
-        }
+        /* XR:Z is the read's conversion: R1 (meth_base_ot 1, OT) is C->T, R2
+         * (0, OB) is G->A. -1 marks a non---meth read, which gets no XR. */
+        const char *xr = s->meth_base_ot == 1 ? "CT"
+                       : s->meth_base_ot == 0 ? "GA" : NULL;
         if (xr != NULL) {
             if (bam_aux_append(b, "XR", 'Z', 3, (const uint8_t *)xr) < 0) return -1;
         }
