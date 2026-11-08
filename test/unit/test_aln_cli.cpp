@@ -155,7 +155,47 @@ TEST_CASE("aln_cli: short-insert is documented and refused before single-end I/O
     fclose(capture);
     CHECK(status == 0);
     CHECK(help.find("--short-insert") != std::string::npos);
-    CHECK(help.find("unless --meth or --short-insert is given") != std::string::npos);
+    CHECK(help.find("unless --meth, --short-insert or --ref-span-insert is given") != std::string::npos);
+}
+
+TEST_CASE("aln_cli: ref-span-insert parses, is documented and is refused before single-end I/O"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    for (bool meth : {false, true}) {
+        bwa_tests::StderrCapture capture;
+        const std::string out = x.dir + "/span-single.sam";
+        const int status = meth
+            ? run({"--meth", "--ref-span-insert", "-f", out, "/missing-index", "/missing-reads"})
+            : run({"--ref-span-insert", "-f", out, "/missing-index", "/missing-reads"});
+        const std::string error = capture.text();
+        CHECK(status == 1);
+        CHECK(error.find("--ref-span-insert requires paired-end input") != std::string::npos);
+        CHECK(error.find("index") == std::string::npos);
+        CHECK(access(out.c_str(), F_OK) != 0);
+    }
+    { // parsed as a flag, not as taking the next argument: paired input runs to completion
+        const std::string out = x.dir + "/span-pe.sam";
+        bwa_tests::StderrCapture capture;
+        CHECK(run({"--ref-span-insert", "-f", out, x.prefix, x.fq, x.fq}) == 0);
+        CHECK(n_records(slurp(out)) == 8);
+    }
+    FILE *capture = tmpfile();
+    REQUIRE(capture != nullptr);
+    fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    REQUIRE(saved >= 0);
+    REQUIRE(dup2(fileno(capture), fileno(stdout)) >= 0);
+    const int status = run({"--help"});
+    fflush(stdout);
+    REQUIRE(dup2(saved, fileno(stdout)) >= 0);
+    close(saved);
+    rewind(capture);
+    std::string help;
+    char buf[1024];
+    while (fgets(buf, sizeof buf, capture)) help += buf;
+    fclose(capture);
+    CHECK(status == 0);
+    CHECK(help.find("  --ref-span-insert") != std::string::npos);
 }
 
 TEST_CASE("aln_cli: meaningless negative values and malformed numbers are refused"

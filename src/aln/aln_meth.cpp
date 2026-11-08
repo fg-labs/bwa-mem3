@@ -782,7 +782,8 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
 /* Bounded local evidence can improve placement, but cannot resolve omitted genomic loci. */
 static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
                           const gap_opt_t *opt, const isize_info_t *ii,
-                          bwa_seq_t *p[2], aln_meth_read_t *r[2], int end, bool short_insert) try
+                          bwa_seq_t *p[2], aln_meth_read_t *r[2], int end, bool short_insert,
+                          bool ref_span) try
 {
     const int mate=1-end;
     auto *pm=p[end];auto *pa=p[mate];auto *ra=r[mate];auto *rm=r[end];
@@ -864,7 +865,9 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
                                      : (candidate.alignment.rb<(int64_t)a.pos || candidate.alignment.re<a_re)))
             continue;
         const int64_t length=a.strand?a_re-candidate.alignment.rb:candidate.alignment.re-a.pos;
-        if(length<std::max(p[0]->len,p[1]->len)) continue;
+        // --ref-span-insert: the outer span must cover both alignments' reference spans, as in pairing.
+        if(length<(ref_span?std::max<int64_t>(a.span,candidate.alignment.re-candidate.alignment.rb)
+                            :(int64_t)std::max(p[0]->len,p[1]->len))) continue;
         int64_t score=(a.cost+candidate.cost)*10;
         if(ii->high) {
             if(ii->std<=0) {fprintf(stderr,"ERROR: --meth invalid cap-rescue insert deviation\n");exit(1);}
@@ -926,6 +929,7 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 	// Complete means no lookup/work cutoff in configured discovery, not all genome hits.
 	const int max_occ = popt->max_occ;
 	std::vector<bwt_aln1_t> a[2];
+	std::vector<int32_t> span[2]; // --ref-span-insert: each hit's reference span, for pairing
 	std::vector<pair64_t> arr;
 	kstring_t str = {0, 0, 0};
     std::vector<std::pair<int,int>> initial_selection(n);
@@ -942,6 +946,10 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 				arr.clear();
 				for (int j = 0; j < 2; ++j) {
 					a[j].assign(r[j]->hits.size(), bwt_aln1_t());
+					if (popt->ref_span_insert) {
+						span[j].resize(r[j]->hits.size());
+						for (size_t x = 0; x < r[j]->hits.size(); ++x) span[j][x] = r[j]->hits[x].span;
+					}
 					for (size_t x = 0; x < r[j]->hits.size(); ++x) {
 						const aln_meth_hit_t &o = r[j]->hits[x];
 						a[j][x].n_mm = o.n_mm; a[j][x].n_gapo = o.n_gapo; a[j][x].n_gape = o.n_gape;
@@ -960,8 +968,10 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 				bwt_aln1_t *save[2] = {p[0]->aln, p[1]->aln};
 				p[0]->aln = a[0].data(); p[1]->aln = a[1].data();
                 // Stock multiplies s_mm by ten; clamp only above all representable pair-score gaps.
+                const int32_t *spans[2] = {span[0].data(), span[1].data()};
                 cnt_chg += bwa_pe_pairing_same_contig(ref->bns, p, &v, popt,
-                                                     std::min(gopt->s_mm, INT_MAX/10), ii);
+                                                     std::min(gopt->s_mm, INT_MAX/10), ii,
+                                                     popt->ref_span_insert ? spans : nullptr);
 				p[0]->aln = save[0]; p[1]->aln = save[1];
 				// the ends' new loci (pairing may move either): their hypotheses and gaps
 				for (int j = 0; j < 2; ++j) {
@@ -991,7 +1001,8 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
             bwa_seq_t *p[2]={seqs[0]+i,seqs[1]+i};
             aln_meth_read_t *r[2]={res[0]+i,res[1]+i};
             const bool cap0=r[0]->flags&ALN_METH_BIND_BEST,cap1=r[1]->flags&ALN_METH_BIND_BEST;
-            if(cap0!=cap1) cnt_chg+=meth_cap_rescue(ref,mo,gopt,ii,p,r,cap0?0:1,popt->short_insert);
+            if(cap0!=cap1) cnt_chg+=meth_cap_rescue(ref,mo,gopt,ii,p,r,cap0?0:1,popt->short_insert,
+                                                popt->ref_span_insert);
         }
 	// mate rescue (bwa_paired_sw_core with the anchor's matrix; the rescued mate takes its hypothesis)
 	if (popt->is_sw && ii->avg >= 0.0) {
@@ -1019,7 +1030,7 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 					if (end[k] > l_pac) end[k] = l_pac;
 					seq = pmate->rseq;
 				} else {
-					beg[k] = (int64_t)pref->pos + pref->len - ii->avg - 3 * ii->std - pmate->len * 0.5;
+					beg[k] = aln_rescue_anchor_end(pref, popt) - ii->avg - 3 * ii->std - pmate->len * 0.5;
 					end[k] = beg[k] + 6 * ii->std + 2 * pmate->len;
 					if (beg[k] < 0) beg[k] = 0;
 					if (end[k] > aln_rescue_window_ceiling(pref, popt)) end[k] = aln_rescue_window_ceiling(pref, popt);

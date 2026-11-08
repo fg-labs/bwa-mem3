@@ -1,8 +1,8 @@
 # src/aln: bwa `aln`/`samse`/`sampe` port
 
 This directory holds the code behind `bwa-mem3 aln`, a fused port of bwa's
-short-read `aln` + `samse`/`sampe` pipeline whose SAM records without `--meth` or
-`--short-insert` are byte-identical to
+short-read `aln` + `samse`/`sampe` pipeline whose SAM records without `--meth`,
+`--short-insert` or `--ref-span-insert` are byte-identical to
 stock bwa 0.7.19's (the header is too, except the `@PG` line, which names bwa-mem3), as
 checked on the generated reads described in `docs/src/cli/aln.md`.
 
@@ -145,6 +145,18 @@ Each change to upstream-derived code adds a line here.
   or produce unrepresentable integer penalties under this option. These opt-in changes can alter pair selection, proper-pair flags,
   MAPQ and rescue windows; pairing geometry and the rescue algorithm are unchanged.
   Without the option, the stock inference and scoring behavior is preserved.
+- `bwtaln.h`, `bwape.cpp`/`bwape.h`, `aln_meth.cpp`: the default-zero `pe_opt_t::ref_span_insert`
+  enables `--ref-span-insert`, which measures inserts from alignment reference spans (len + n_del -
+  n_ins, i.e. len + ref_shift) where stock uses read lengths. `infer_isize` (new `ref_span`
+  parameter) ends each observation at the later read's `pos + len + ref_shift`. `pairing` takes the
+  reverse hit's end, and the minimum outer span, from per-hit spans: from `bwt_aln1_t::n_del`/`n_ins`,
+  or for `--meth` from the `span` array `bwa_pe_pairing_same_contig` now accepts (each
+  `aln_meth_hit_t::span`); a read pairing moves takes its new hit's `ref_shift` (stock keeps the
+  old one). `bwa_pe_pair_grouped` places each reverse hit from its own span rather than the read's
+  best hit's. `aln_rescue_anchor_end` gives mate rescue the anchor's reference end (both paths), and
+  `--meth` cap rescue, whose inserts already come from spans, takes its minimum outer span from the
+  two spans. TLEN is unchanged: `pos_5` already uses the CIGAR. Every change branches once per pair
+  or hit on the option; without it the stock arithmetic runs unchanged.
 - Paired-end driver (`aln_run_pe`, new code). `bwa-mem3 aln [options] <prefix> <R1.fq> <R2.fq>` is `aln` on each
   file followed by `sampe`. Per batch of 0x40000 reads from each file: R1's reads are read, then R2's (stock
   order); each file is searched as its own batch, because stock runs `aln` on each file separately and the
