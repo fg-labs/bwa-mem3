@@ -37,6 +37,8 @@ namespace bwa_aln {
 typedef struct {
 	pair64_v arr;
 	const bwt_aln1_t *aln[2];
+	// --ref-span-insert: each hit's reference span, or null to derive it from aln's n_del/n_ins
+	const int32_t *span[2];
 } pe_data_t;
 
 pe_opt_t *bwa_init_pe_opt(void)
@@ -58,10 +60,10 @@ pe_opt_t *bwa_init_pe_opt(void)
 #define OUTLIER_BOUND 2.0
 
 int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
-                const bntseq_t *bns, int report, bool short_insert)
+                const bntseq_t *bns, int report, bool short_insert, bool ref_span)
 {
 	uint64_t x, *isizes, n_ap = 0;
-	int n, i, tot, p25, p75, p50, max_len = 1, tmp;
+	int n, i, j, tot, p25, p75, p50, max_len = 1, tmp;
 	double skewness = 0.0, kurtosis = 0.0, y;
 
 	ii->avg = ii->std = -1.0;
@@ -72,11 +74,22 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 		p[0] = seqs[0] + i; p[1] = seqs[1] + i;
 		if (p[0]->mapQ >= 20 && p[1]->mapQ >= 20
 			&& (!bns || bns_pos2rid(bns, p[0]->pos) == bns_pos2rid(bns, p[1]->pos))) {
-			x = (p[0]->pos < p[1]->pos)? p[1]->pos + p[1]->len - p[0]->pos : p[0]->pos + p[0]->len - p[1]->pos;
+			if (!ref_span) x = (p[0]->pos < p[1]->pos)? p[1]->pos + p[1]->len - p[0]->pos : p[0]->pos + p[0]->len - p[1]->pos;
+			else { // the later read's reference end: its start plus the span of the alignment there
+				// On equal starts (--short-insert pairs them), read 2's end when only read 2 is reverse,
+				// as pairing measures a coincident pair; otherwise read 1's, as before.
+				const bool first_later = p[0]->pos > p[1]->pos || (p[0]->pos == p[1]->pos && !(p[1]->strand && !p[0]->strand));
+				const bwa_seq_t *b = first_later ? p[0] : p[1], *a = first_later ? p[1] : p[0];
+				x = b->pos + (bwtint_t)((int64_t)b->len + b->ref_shift) - a->pos;
+			}
 			if (x < 100000) isizes[tot++] = x;
 		}
-		if (p[0]->len > max_len) max_len = p[0]->len;
-		if (p[1]->len > max_len) max_len = p[1]->len;
+		// The fence's floor is the longest read, or with ref_span its longest reference span, so that
+		// it is in the same units as the observations.
+		for (j = 0; j < 2; ++j) {
+			const int64_t extent = ref_span ? (int64_t)p[j]->len + p[j]->ref_shift : (int64_t)p[j]->len;
+			if (extent > max_len) max_len = (int)extent;
+		}
 	}
 	if (tot < 20) {
 		if (report) fprintf(stderr, "[infer_isize] fail to infer insert size: too few good pairs\n");
@@ -155,6 +168,22 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	int i, j, o_n, subo_n, cnt_chg = 0, low_bound = ii->low, max_len;
 	// --short-insert also pairs mates that start at the same base; -A overrides the option.
 	const bool coincident = opt->short_insert && !opt->force_isize;
+	// --ref-span-insert: the reverse read's end, and the minimum outer span, come from the hits'
+	// reference spans (read length plus deletions minus insertions) rather than read lengths.
+	const bool ref_span = opt->ref_span_insert;
+	auto hit_span = [&](const pair64_t &w) -> int64_t {
+		const int j = (int)(w.y & 1);
+		if (d->span[j]) return d->span[j][w.y >> 2];
+		const bwt_aln1_t *r = d->aln[j] + (w.y >> 2);
+		return (int64_t)p[j]->len + (int)r->n_del - (int)r->n_ins;
+	};
+	// The full read's reference footprint at a hit: its span plus any trimmed bases. Under
+	// --short-insert (coincident: in effect unless -A) a fragment can be shorter than the reads, so
+	// trimmed bases need not lie in it: the minimum outer span is then the hits' spans alone.
+	auto hit_footprint = [&](const pair64_t &w) -> int64_t {
+		const bwa_seq_t *q = p[w.y & 1];
+		return hit_span(w) + (int64_t)q->full_len - (int64_t)q->len;
+	};
 	uint64_t o_score, subo_score;
 	pair64_t last_pos[2][2], o_pos[2];
 	max_len = p[0]->full_len;
@@ -164,8 +193,14 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	// here v>=u. When ii is set, we check insert size with ii; otherwise with opt->max_isize
 #define __pairing_aux(u,v) do { \
 		bwtint_t l = (v).x + p[(v).y&1]->len - ((u).x); \
+		bwtint_t min_l = max_len; \
+		if (ref_span && (u).x != (uint64_t)-1) { \
+			l = (v).x + (bwtint_t)hit_span(v) - (u).x; \
+			min_l = (bwtint_t)(coincident ? std::max<int64_t>(hit_span(u), hit_span(v)) \
+			                                     : std::max<int64_t>(hit_footprint(u), hit_footprint(v))); \
+		} \
 		if ((u).x != (uint64_t)-1 && ((v).x > (u).x || (coincident && (v).x == (u).x)) \
-			&& l >= max_len \
+			&& l >= min_l \
 			&& ((ii->high && l <= ii->high_bayesian) || (ii->high == 0 && l <= opt->max_isize))) \
 		{ \
 			uint64_t s = d->aln[(v).y&1][(v).y>>2].score + d->aln[(u).y&1][(u).y>>2].score; \
@@ -190,11 +225,16 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 #define __pairing_aux2(q, w) do { \
 		const bwt_aln1_t *r = d->aln[(w).y&1] + ((w).y>>2); \
 		(q)->extra_flag |= SAM_FPP; \
-		if ((q)->pos != (w).x || (q)->strand != ((w).y>>1&1)) { \
+		const bool moved = (q)->pos != (w).x || (q)->strand != ((w).y>>1&1); \
+		/* Stock installs the hit only when the read moves, and keeps the old hit's ref_shift. The \
+		 * option installs the selected hit, and its span, even at the same start and strand: two \
+		 * hits there can differ in their indels, and refinement must use the paired hit's span. */ \
+		if (moved || ref_span) { \
 			(q)->n_mm = r->n_mm; (q)->n_gapo = r->n_gapo; (q)->n_gape = r->n_gape; (q)->strand = (w).y>>1&1; \
 			(q)->score = r->score; \
 			(q)->pos = (w).x; \
-			if ((q)->mapQ > 0) ++cnt_chg; \
+			if (ref_span) (q)->ref_shift = (int)(hit_span(w) - (int64_t)(q)->len); \
+			if (moved && (q)->mapQ > 0) ++cnt_chg; \
 		} \
 	} while (0)
 
@@ -289,17 +329,20 @@ int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm
 	pe_data_t d;
 	d.arr = *arr;
 	d.aln[0] = p[0]->aln, d.aln[1] = p[1]->aln;
+	d.span[0] = d.span[1] = nullptr;
 	int ret = pairing(p, &d, opt, s_mm, ii);
 	*arr = d.arr;
 	return ret;
 }
 
 int bwa_pe_pairing_same_contig(const bntseq_t *bns, bwa_seq_t *p[2], pair64_v *arr,
-                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii)
+                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii,
+                               const int32_t *const span[2])
 {
     pe_data_t d;
     d.arr = *arr;
     d.aln[0] = p[0]->aln; d.aln[1] = p[1]->aln;
+    d.span[0] = span ? span[0] : nullptr; d.span[1] = span ? span[1] : nullptr;
     const int ret = pairing<true>(p, &d, opt, s_mm, ii, bns);
     *arr = d.arr;
     return ret;
@@ -363,7 +406,8 @@ void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isi
                       const pe_opt_t *opt, const isize_info_t *last_ii, const bntseq_t *bns, int report)
 {
 	// Shared stock inference/fallback; converted indices must supply the original length.
-	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len, bns, report, opt->short_insert);
+	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len, bns, report, opt->short_insert,
+	            opt->ref_span_insert);
 	if (ii->avg < 0.0 && last_ii->avg > 0.0) *ii = *last_ii;
 	if (opt->force_isize) {
 		if (report) fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");
@@ -425,7 +469,7 @@ int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_s
 	std::vector<bwtint_t> mrows;    // the group's extra hits' rows, resolved in place
 	std::vector<uint8_t> did;       // per read of the group: its extra hits were generated
 
-	d = (pe_data_t*)aln_calloc(1, sizeof(pe_data_t));
+	d = (pe_data_t*)aln_calloc(1, sizeof(pe_data_t)); // span[] stays null: spans come from aln
 
 	for (g0 = 0; g0 < n_seqs; g0 = g1) {
 		long long n_rows = 0, weight = 0;
@@ -475,12 +519,21 @@ int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_s
 				const long long nr = st_n[i - g0];
 				pair64_t *a = arr.data() + s0;
 				const bwtint_t *sa = rows.data() + s0;
-				for (long long c = 0; c < nr; ++c) {
-					int strand;
-					const int jj = (int)(a[c].y & 1);
-					a[c].x = bwa_pos_from_sa(bns, sa[c], p[jj]->len + p[jj]->ref_shift, &strand);
-					a[c].y |= (uint64_t)(strand<<1);
-				}
+				if (!opt->ref_span_insert)
+					for (long long c = 0; c < nr; ++c) {
+						int strand;
+						const int jj = (int)(a[c].y & 1);
+						a[c].x = bwa_pos_from_sa(bns, sa[c], p[jj]->len + p[jj]->ref_shift, &strand);
+						a[c].y |= (uint64_t)(strand<<1);
+					}
+				else // --ref-span-insert: a reverse hit's start from its own span, not the best hit's
+					for (long long c = 0; c < nr; ++c) {
+						int strand;
+						const int jj = (int)(a[c].y & 1);
+						const bwt_aln1_t *r = p[jj]->aln + (a[c].y >> 2);
+						a[c].x = bwa_pos_from_sa(bns, sa[c], (int)p[jj]->len + (int)r->n_del - (int)r->n_ins, &strand);
+						a[c].y |= (uint64_t)(strand<<1);
+					}
 				d->arr.a = a, d->arr.n = d->arr.m = (size_t)nr;
 				cnt_chg += pairing(p, d, opt, gopt->s_mm, ii);
 			}
@@ -634,10 +687,16 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 	return cigar;
 }
 
+int64_t aln_rescue_anchor_end(const bwa_seq_t *anchor, const pe_opt_t *opt)
+{
+	// Stock takes the anchor's end from its read length; --ref-span-insert from its reference span.
+	return (int64_t)anchor->pos + anchor->len + (opt->ref_span_insert ? anchor->ref_shift : 0);
+}
+
 int64_t aln_rescue_window_floor(const bwa_seq_t *anchor, const pe_opt_t *opt)
 {
 	// A forward anchor's reverse mate starts after the anchor ends (stock), or at its start.
-	return (int64_t)anchor->pos + (opt->short_insert ? 0 : anchor->len);
+	return opt->short_insert ? (int64_t)anchor->pos : aln_rescue_anchor_end(anchor, opt);
 }
 
 int64_t aln_rescue_window_ceiling(const bwa_seq_t *anchor, const pe_opt_t *opt)
@@ -688,7 +747,7 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 			} while (0)
 
 #define __set_left_coor(_a, _b, _pref, _pmate) do {						\
-				(_a) = (int64_t)_pref->pos + _pref->len - ii->avg - 3 * ii->std - _pmate->len * 0.5; \
+				(_a) = aln_rescue_anchor_end(_pref, popt) - ii->avg - 3 * ii->std - _pmate->len * 0.5; \
 				(_b) = (_a) + 6 * ii->std + 2 * _pmate->len;			\
 				if ((_a) < 0) (_a) = 0;									\
 				if ((_b) > aln_rescue_window_ceiling(_pref, popt)) (_b) = aln_rescue_window_ceiling(_pref, popt); \

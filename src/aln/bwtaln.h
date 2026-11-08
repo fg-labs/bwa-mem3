@@ -134,6 +134,7 @@ typedef struct {
 	int type, is_sw, is_preload;
 	double ap_prior;
 	int short_insert; // opt-in: estimate below the batch's longest read length; pair coincident starts
+	int ref_span_insert; // opt-in: measure inserts from each alignment's reference span, not its read length
 } pe_opt_t;
 
 struct __bwa_seqio_t;
