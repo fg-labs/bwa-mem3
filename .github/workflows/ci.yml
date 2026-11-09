@@ -1956,6 +1956,11 @@ jobs:
         # runs here (Linux) when nothing else is staged on the runner.
         run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_meth_cli.sh
 
+      - name: aln --known-snvs checks (synthetic reference)
+        # No-SNV identity, untouched reads unchanged, over-budget ALT reads placed with XV,
+        # thread-count independence and VCF errors, single- and paired-end, plain and --meth.
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_known_snvs.sh
+
       - name: mem CLI helpers still fail on bad input
         # Run before the mem CLI scripts, as on the Linux ARM64 row.
         run: bash test/regression/mem_cli_selftest.sh
