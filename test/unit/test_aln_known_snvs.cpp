@@ -36,10 +36,6 @@
 #include <set>
 #include <sys/stat.h>
 
-#if defined(BWA_TESTS_CHILD_SKIP_LEAK_CHECK)
-#include <sanitizer/lsan_interface.h>
-#endif
-
 int bwa_index(int argc, char *argv[]); // src/bwtindex.cpp, the `index` command
 
 namespace {
@@ -1691,21 +1687,14 @@ TEST_CASE("aln_known_snvs: --known-snvs and a read file cannot both be standard 
 
 TEST_CASE("aln_known_snvs: a run that ends with exit() removes its window directory"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
-    bwa_tests::TempDir tmp{"ks_exit"};
-    const std::string root = tmp.path();
-    // Use a plain fork: run_in_child's glibc ASAN on_exit handler calls _exit and can bypass
-    // the window cleanup handler inherited from earlier tests. Only this child's deliberately
-    // abandoned allocations are exempt from leak checking; exit() must run the real cleanup.
-    fflush(nullptr);
-    const pid_t child = fork();
-    REQUIRE(child >= 0);
-    if (child == 0) {
-#if defined(BWA_TESTS_CHILD_SKIP_LEAK_CHECK)
-        __lsan_disable();
-#endif
-        setenv("TMPDIR", root.c_str(), 1);
-        FMI_search fmi(x.prefix.c_str());
+    // Exec only this case: a plain fork inherits other tests' worker TLS and OpenMP state.
+    // This deliberately non-unwinding child does not leak-check; its ASAN memory checks and
+    // the parent runner's full leak check remain enabled. Real exit() handlers must still run.
+    const char *child_root = getenv("BWA_TEST_KS_EXIT_ROOT");
+    const char *child_prefix = getenv("BWA_TEST_KS_EXIT_PREFIX");
+    if (child_root && child_prefix) {
+        if (setenv("TMPDIR", child_root, 1) != 0) _exit(4);
+        FMI_search fmi(child_prefix);
         fmi.load_index(/*load_pac=*/true, 1, /*build_seed_jump=*/false);
         bwa_aln::ks_sites_t sites;
         sites.by_contig.assign(fmi.idx->bns->n_seqs, {});
@@ -1714,13 +1703,42 @@ TEST_CASE("aln_known_snvs: a run that ends with exit() removes its window direct
         bwa_aln::ks_windows_t w;
         if (bwa_aln::ks_windows_build(&sites, fmi.idx->bns, fmi.idx->pac, 1, 0, &w) != 0) _exit(2);
         struct stat st;
-        if (w.dir.rfind(root + "/", 0) != 0 || stat(w.dir.c_str(), &st) != 0) _exit(3);
-        exit(1);
+        if (w.dir.rfind(std::string(child_root) + "/", 0) != 0 || stat(w.dir.c_str(), &st) != 0) _exit(3);
+        // A status of its own: a failed index load also ends with exit(1), before any directory.
+        exit(42);
     }
+    REQUIRE(child_root == nullptr);
+    REQUIRE(child_prefix == nullptr);
+    KsIndex &x = fixture();
+    bwa_tests::TempDir tmp{"ks_exit"};
+    const std::string root = tmp.path();
+    const std::string executable = doctest::getContextOptions()->binary_name.c_str();
+    const char *asan_env = getenv("ASAN_OPTIONS");
+    const bool had_asan = asan_env != nullptr;
+    const std::string old_asan = asan_env ? asan_env : "";
+    const std::string asan = old_asan + ":detect_leaks=0";
+    // Prepare the environment before fork, while worker/library locks are safe to use.
+    REQUIRE(setenv("BWA_TEST_KS_EXIT_ROOT", root.c_str(), 1) == 0);
+    REQUIRE(setenv("BWA_TEST_KS_EXIT_PREFIX", x.prefix.c_str(), 1) == 0);
+    REQUIRE(setenv("ASAN_OPTIONS", asan.c_str(), 1) == 0);
+    fflush(nullptr);
+    const pid_t child = fork();
+    if (child == 0) {
+        const char *args[] = {executable.c_str(),
+            "--test-case=aln_known_snvs: a run that ends with exit() removes its window directory",
+            "--no-colors", nullptr};
+        execvp(args[0], const_cast<char *const *>(args));
+        _exit(127);
+    }
+    REQUIRE(unsetenv("BWA_TEST_KS_EXIT_ROOT") == 0);
+    REQUIRE(unsetenv("BWA_TEST_KS_EXIT_PREFIX") == 0);
+    if (had_asan) REQUIRE(setenv("ASAN_OPTIONS", old_asan.c_str(), 1) == 0);
+    else REQUIRE(unsetenv("ASAN_OPTIONS") == 0);
+    REQUIRE(child > 0);
     int status = 0;
     REQUIRE(waitpid(child, &status, 0) == child);
     REQUIRE(WIFEXITED(status));
-    REQUIRE(WEXITSTATUS(status) == 1); // 2 or 3: the windows were not built where expected
+    REQUIRE(WEXITSTATUS(status) == 42); // 1: index load failed; 2-4: setup failed; 127: exec failed
     std::vector<std::string> left;
     DIR *d = opendir(root.c_str());
     REQUIRE(d != nullptr);
