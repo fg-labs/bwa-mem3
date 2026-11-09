@@ -6,6 +6,8 @@
 
 #include "aln_known_snvs.h"
 #include "aln_bwt.h"
+#include "aln_meth.h"
+#include "aln_meth_realign.h"
 #include "aln_alloc.h"
 #include "bwase.h"
 #include "bwtgap.h"
@@ -23,6 +25,9 @@
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <getopt.h>
+
+int bwa_index(int argc, char *argv[]); // src/bwtindex.cpp, the `index` command
 
 namespace bwa_aln {
 
@@ -164,7 +169,7 @@ void remove_dir(const std::string &dir)
 } // namespace
 
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
-					 ks_windows_t *out)
+					 int meth, ks_windows_t *out)
 {
 	ks_windows_free(out);
 	for (int rid = 0; rid < (int)sites->by_contig.size(); ++rid) {
@@ -206,15 +211,40 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 		ks_windows_free(out);
 		return -1;
 	}
-	if (bwa_idx_build(fa.c_str(), fa.c_str()) != 0) {
-		fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows in '%s'\n", out->dir.c_str());
-		ks_windows_free(out);
-		return -1;
+	if (meth) { // `index --meth`: the converted index, and the original one it is checked against
+		std::string a0 = "index", a1 = "--meth", a2 = fa;
+		char *argv[] = {&a0[0], &a1[0], &a2[0], nullptr};
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+		optind = 1;
+		optreset = 1;
+#else
+		optind = 0;
+#endif
+		if (bwa_index(3, argv) != 0) {
+			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows in '%s'\n", out->dir.c_str());
+			ks_windows_free(out);
+			return -1;
+		}
+		out->fmi = new FMI_search((fa + ".meth").c_str());
+		out->fmi->load_index(/*load_pac=*/false, n_threads);
+		out->bwt = bwt_from_fmi(out->fmi);
+		out->mref = new aln_meth_ref_t();
+		if (aln_meth_ref_load(out->mref, fa.c_str(), out->fmi->idx->bns, n_threads) != 0) {
+			ks_windows_free(out);
+			return -1;
+		}
+		out->bns = out->mref->bns;
+	} else {
+		if (bwa_idx_build(fa.c_str(), fa.c_str()) != 0) {
+			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows in '%s'\n", out->dir.c_str());
+			ks_windows_free(out);
+			return -1;
+		}
+		out->fmi = new FMI_search(fa.c_str());
+		out->fmi->load_index(/*load_pac=*/true, n_threads);
+		out->bns = out->fmi->idx->bns;
+		out->bwt = bwt_from_fmi(out->fmi);
 	}
-	out->fmi = new FMI_search(fa.c_str());
-	out->fmi->load_index(/*load_pac=*/true, n_threads);
-	out->bns = out->fmi->idx->bns;
-	out->bwt = bwt_from_fmi(out->fmi);
 	if (out->bns->n_seqs != (int)out->win.size()) {
 		fprintf(stderr, "[E::aln] --known-snvs: the window index has %d contigs for %zu windows\n",
 				out->bns->n_seqs, out->win.size());
@@ -226,6 +256,10 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 
 void ks_windows_free(ks_windows_t *w)
 {
+	if (w->mref) {
+		aln_meth_ref_free(w->mref);
+		delete w->mref;
+	}
 	if (w->bwt) bwt_destroy(w->bwt);
 	delete w->fmi;
 	if (!w->dir.empty()) remove_dir(w->dir);
@@ -456,7 +490,7 @@ int ks_twin_place(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, 
 }
 
 int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t *opt, const bwa_seq_t *s,
-				  int64_t alt_site, std::vector<ks_vote_t> *out)
+				  int64_t alt_site, int hyp, std::vector<ks_vote_t> *out)
 {
 	out->clear();
 	if (s->type != BWA_TYPE_UNIQUE && s->type != BWA_TYPE_REPEAT) return -1;
@@ -472,9 +506,11 @@ int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t 
 	for (int i = 0; i < s->len; ++i) rs[i] = s->strand ? (s->seq[s->len - 1 - i] > 3 ? 4 : 3 - s->seq[s->len - 1 - i]) : s->seq[i];
 	const int diffs = s->n_mm + s->n_gapo + s->n_gape;
 	const int max_diff = read_max_diff(opt, s->len);
+	// Under --meth a converted base (C->T, or G->A) also reads as its source.
+	const int source = hyp == 1 ? 1 : 2, target = hyp == 1 ? 3 : 0;
+	auto in_set = [&](uint8_t b, uint8_t allele) { return b == allele || (hyp >= 0 && allele == source && b == target); };
 	int first = -1;
 	for (; it != lst.end() && it->pos < cbeg + span; ++it) {
-		// read index of reference position it->pos
 		int qi = -1;
 		const int64_t rpos = it->pos;
 		if (!s->cigar) {
@@ -501,21 +537,24 @@ int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t 
 		v.rid = rid;
 		v.qi = qi;
 		const uint8_t b = rs[qi];
-		v.allele = b == it->ref ? 'R' : b == it->alt ? 'A' : 'O';
-		const uint8_t assumed = (alt_site == bns->anns[rid].offset + rpos) ? it->alt : it->ref;
-		v.away = diffs - (b != assumed ? 1 : 0);
+		const bool is_ref = in_set(b, it->ref), is_alt = in_set(b, it->alt);
+		v.allele = is_ref && is_alt ? 'H' : is_ref ? 'R' : is_alt ? 'A' : 'O';
+		const bool alt_assumed = alt_site == KS_ALT_ALL || alt_site == bns->anns[rid].offset + rpos;
+		v.away = diffs - (in_set(b, alt_assumed ? it->alt : it->ref) ? 0 : 1);
 		v.max_diff = max_diff;
-		if (first < 0 && v.allele != 'O') first = (int)out->size();
+		if (first < 0 && (v.allele == 'R' || v.allele == 'A')) first = (int)out->size();
 		out->push_back(v);
 	}
 	return first;
 }
 
-void ks_twin_seq(const bwa_seq_t *s, const ks_vote_t &v, std::vector<uint8_t> *read_order)
+void ks_twin_seq(const bwa_seq_t *s, const ks_vote_t &v, int hyp, std::vector<uint8_t> *read_order)
 {
 	// s->seq is in read order after refinement; v.qi indexes the reference-oriented read.
 	read_order->assign(s->seq, s->seq + s->len);
-	const uint8_t other = v.allele == 'R' ? v.site->alt : v.site->ref;
+	uint8_t other = v.allele == 'R' ? v.site->alt : v.site->ref;
+	if (hyp == 1 && other == 1) other = 3;      // C reads as T on a C->T strand
+	else if (hyp == 0 && other == 2) other = 0; // G reads as A on a G->A strand
 	if (s->strand) (*read_order)[s->len - 1 - v.qi] = 3 - other;
 	else (*read_order)[v.qi] = other;
 }
@@ -535,6 +574,22 @@ void ks_format_xv(const bntseq_t *bns, const std::vector<ks_vote_t> &votes, int 
 		if ((int)i == twin_of && twin_same >= 0) snprintf(buf, sizeof buf, "%d,%d", twin_same, twin_mapq);
 		else snprintf(buf, sizeof buf, "NA,NA");
 		out->append(buf);
+	}
+}
+
+void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_meth_read_t &wres,
+						std::vector<aln_meth_candidate_t> *out)
+{
+	out->clear();
+	for (const aln_meth_hit_t &h : wres.hits) {
+		if (h.rid < 0 || h.rid >= (int)w->win.size()) continue;
+		const ks_window_t &win = w->win[h.rid];
+		const int64_t off = (int64_t)h.pos - w->bns->anns[h.rid].offset;
+		if (off < 0 || off + h.span > win.len) continue;
+		const int64_t beg = win.beg + off;
+		if (win.site_pos < beg || win.site_pos >= beg + h.span) continue; // misses its site
+		const int64_t rb = bns->anns[win.rid].offset + beg;
+		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb, rb + h.span});
 	}
 }
 

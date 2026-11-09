@@ -176,6 +176,7 @@ template <> struct gap_group<AlnMeth> {
 		const int64_t *ord;      // per read of the (possibly compacted) batch: its ordinal in the stream
 		const uint8_t *keep;     // per read: keep both strata (others share its search), or null
 		aln_meth_read_t *res;    // per read of the (possibly compacted) batch
+		const std::vector<aln_meth_candidate_t> *extra; // per read: --known-snvs candidates, or null
 	};
 
 	static thread_local const ctx_t *ctx;
@@ -204,6 +205,7 @@ template <> struct gap_group<AlnMeth> {
 		const gap_opt_t *opt = group->opt;
 		const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
 		aln_meth_slot_start(slot(c), p, ctx->res + r, ctx->ord[r], max_diff, ctx->keep ? ctx->keep[r] : 0);
+		slot(c)->extra = ctx->extra ? ctx->extra + r : nullptr;
 	}
 	static const ubyte_t *seq(const gap_slot_core_t *c, const bwa_seq_t *) { return slot(c)->vseq.data(); }
 	static int job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start_meth(j, bwt); }
@@ -692,12 +694,14 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
-						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res)
+						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res,
+						  const std::vector<aln_meth_candidate_t> *extra)
 {
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	gap_group<AlnMeth>::ctx_t mc;
 	mc.ref = ref; mc.mo = mo; mc.read_no = read_no; mc.keep_strata = keep_strata; mc.max_xa_hits = max_xa_hits;
 	mc.keep = nullptr;
+	mc.extra = extra;
 	std::vector<int64_t> ord(n_seqs);
 	std::vector<uint8_t> has_copy(n_seqs, 0);
 	for (int i = 0; i < n_seqs; ++i) ord[i] = ord0 + i;
@@ -713,7 +717,10 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			std::vector<uint8_t> keep_c(n_u);
 			std::vector<aln_meth_read_t> res_c(n_u);
 			for (int k = 0; k < n_u; ++k) ord_c[k] = ord0 + uniq[k], keep_c[k] = has_copy[uniq[k]];
+			std::vector<std::vector<aln_meth_candidate_t>> extra_c(extra ? n_u : 0);
+			for (int k = 0; extra && k < n_u; ++k) extra_c[k] = extra[uniq[k]];
 			mc.ord = ord_c.data(); mc.keep = keep_c.data(); mc.res = res_c.data();
+			mc.extra = extra ? extra_c.data() : nullptr;
 			search_reads<AlnMeth>(bwt, n_u, seqs, &bopt, n_threads, &mc);
 			for (int k = 0; k < n_u; ++k) res[uniq[k]] = std::move(res_c[k]);
 		},

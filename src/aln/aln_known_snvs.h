@@ -61,12 +61,18 @@ struct ks_windows_t {
 	::FMI_search *fmi = nullptr;
 	bwt_t *bwt = nullptr;
 	const bntseq_t *bns = nullptr;       // the window index's contigs (one per window)
+	struct aln_meth_ref_t *mref = nullptr; // --meth: the windows' converted index as a reference
 };
 
 /* Builds one window per site allele from `pac` (its stored bases, so N runs carry the main index's
  * fill) and indexes them. Returns 0, or -1 with an error on stderr. */
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
-					 ks_windows_t *out);
+					 int meth, ks_windows_t *out);
+
+/* --meth: the candidate windows (original reference, rid = contig) of the hits a read's search on
+ * the converted window index found that cover their window's site. */
+void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const struct aln_meth_read_t &wres,
+						std::vector<struct aln_meth_candidate_t> *out);
 void ks_windows_free(ks_windows_t *w);
 
 /* What ks_override did to a read. */
@@ -109,12 +115,18 @@ struct ks_vote_t {
 };
 
 /* The sites under a refined single-end record (s->seq in read order, CIGAR set), in position
- * order. Returns the index of the first REF or ALT vote (the one that gets a twin), or -1. */
+ * order. alt_site: the packed position of the site whose ALT the placement's cost assumes, -1 for
+ * none, KS_ALT_ALL for every site under it. hyp: -1 for a plain record; under --meth the
+ * converted strand (1: C->T, 0: G->A), and an allele the conversion can explain on that strand
+ * ('H': hidden) gets no twin, as a vote that cannot tell REF from ALT. Returns the index of the
+ * first REF or ALT vote (the one that gets a twin), or -1. */
+#define KS_ALT_ALL (-2)
 int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t *opt, const bwa_seq_t *s,
-				  int64_t alt_site, std::vector<ks_vote_t> *out);
+				  int64_t alt_site, int hyp, std::vector<ks_vote_t> *out);
 
-/* The read, in read order, with REF and ALT swapped at the vote's site. */
-void ks_twin_seq(const bwa_seq_t *s, const ks_vote_t &v, std::vector<uint8_t> *read_order);
+/* The read, in read order, with REF and ALT swapped at the vote's site (under --meth, hyp >= 0,
+ * the swapped-in base as the conversion leaves it unmethylated). */
+void ks_twin_seq(const bwa_seq_t *s, const ks_vote_t &v, int hyp, std::vector<uint8_t> *read_order);
 
 /* The XV:Z value: one `contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq` per site,
  * `;`-separated; the twin fields are NA except for votes[twin_of] (twin_same >= 0). */

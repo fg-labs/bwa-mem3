@@ -211,10 +211,12 @@ How it works:
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual
   cuts. The stock primary is kept while it is still among the best.
+- `--meth`: the converted search also resolves the windows that the ALT-window search finds, with
+  the ALTs in place.
 - Reads longer than about 160 bases, and reads with more than 256 candidate loci, keep their
   stock result.
 
-Single-end only for now: paired input and `--meth` are refused before any output.
+Single-end only for now: paired input is refused before any output.
 
 CIGAR, MD and NM are still against the reference, so an ALT read shows its mismatch; `XM:i` is the
 mismatch count with the ALT credited. A read that does not touch a site is unchanged.
@@ -225,7 +227,8 @@ Every record over a site gets `XV:Z`, one entry per site separated by `;`:
 contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq
 ```
 
-- `allele`: `R` (REF), `A` (ALT) or `O` (another base).
+- `allele`: `R` (REF), `A` (ALT), `O` (another base), or under `--meth` `H` (the conversion can
+  explain both alleles on that strand).
 - `away`: the read's differences outside the site.
 - `max_diff`: the read's mismatch budget.
 - `twin_same`, `twin_mapq`: for the first `R` or `A` site only (`NA` otherwise), the read is

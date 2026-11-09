@@ -6,6 +6,8 @@
 #include <set>
 #include <tuple>
 #include "aln_meth.h"
+#include "aln_meth_realign.h"
+#include <vector>
 #include "bwtgap.h"
 namespace bwa_aln {
 struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; };
@@ -27,6 +29,8 @@ struct aln_meth_slot_t {
     // Exact windows dedup before DP; every distinct span is evaluated before locus collapse.
     std::set<std::tuple<int,int,int,int64_t,int64_t>> windows;
     std::map<std::tuple<int,int,int,int64_t>, size_t> loci;
+    // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
+    const std::vector<aln_meth_candidate_t> *extra = nullptr;
 };
 struct aln_meth_group_t {
     const bwt_t *bwt = nullptr;

@@ -121,7 +121,7 @@ Known SNVs:
   --known-snvs FILE   VCF/BCF of SNVs (FILTER ignored): a read carrying a site's ALT is
                    placed as on a genome with both alleles, and every read over a site
                    gets XV:Z (allele, differences elsewhere, budget, allele-swapped twin's
-                   placement) [off]; single-end, without --meth
+                   placement) [off]; single-end, plain or --meth
 
 New in bwa-mem3 aln:
   -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]

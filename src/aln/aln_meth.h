@@ -40,6 +40,7 @@ struct aln_meth_ref_t {
 	const bntseq_t *conv_bns = nullptr;
 	bntseq_t *bns = nullptr;
 	uint8_t *pac = nullptr;
+	const struct ks_sites_t *known_snvs = nullptr; // --known-snvs sites (null without); not owned
 };
 int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads);
 void aln_meth_ref_free(aln_meth_ref_t *r);
@@ -74,6 +75,7 @@ struct aln_meth_occ_t {
     bwtint_t pos;
     int rid, strand, hyp;
     int n_mm = 0, n_gapo = 0, n_gape = 0, n_ins = 0, n_del = 0, n_conv = 0;
+    int alt = 0; // --known-snvs: aligned with the window's ALTs in place
     int64_t cost = 0;
     aln_meth_alignment_t alignment;
 };
@@ -89,6 +91,7 @@ struct aln_meth_hit_t {
     int32_t span, cost, rid, n_conv;
     uint32_t cig, n_cig;
     uint8_t strand, hyp, n_mm, n_gapo, n_gape;
+    uint8_t alt; // --known-snvs: aligned with the window's ALTs in place (in the padding)
 };
 static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record");
 // incomplete: lookup budget, an unrepresentable competitor, CIGAR storage, -m work budget
@@ -127,10 +130,14 @@ struct aln_meth_group_t;
  * draw is seeded from it). res[i] gets read i's result. keep_strata: keep every locus of both
  * strata (paired-end pairs on them; an incomplete read, which never pairs, keeps only its main
  * hit); otherwise a read keeps its main hit, and the other loci only when they will be printed as
- * XA (at most max_xa_hits + 1 occurrences). */
+ * XA (at most max_xa_hits + 1 occurrences). extra (--known-snvs, or null): per read, candidate
+ * windows the search did not have to propose, resolved (with and without the ALTs) before the read
+ * finishes. */
+struct aln_meth_candidate_t;
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
-						  int keep_strata, int max_xa_hits, struct aln_dup_state_t *dup, aln_meth_read_t *res);
+						  int keep_strata, int max_xa_hits, struct aln_dup_state_t *dup, aln_meth_read_t *res,
+						  const std::vector<aln_meth_candidate_t> *extra = nullptr);
 
 /* samse under --meth for reads [0, n). Caller must run bwase_initialize once
  * before dispatching any finish workers (as aln_run_se_meth does). */

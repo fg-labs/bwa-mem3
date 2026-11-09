@@ -4,6 +4,7 @@
  * paired-end options; see README.md. */
 #include "aln_main.h"
 #include "aln_known_snvs.h"
+#include "aln_meth_realign.h"
 
 #include <assert.h>
 #include <getopt.h>
@@ -221,9 +222,9 @@ void se_post_worker(void *data, int st, int n, int tid)
 		if (c->ks_rec) {
 			for (int i = 0; i < n; ++i) {
 				ks_rec_t &r = c->ks_rec[st + i];
-				r.twin_of = ks_site_votes(c->o->known_snvs, c->bns, &c->o->gap, seqs + i, alt_site[i], &r.votes);
+				r.twin_of = ks_site_votes(c->o->known_snvs, c->bns, &c->o->gap, seqs + i, alt_site[i], -1, &r.votes);
 				if (r.twin_of < 0) continue;
-				ks_twin_seq(seqs + i, r.votes[r.twin_of], &r.tseq);
+				ks_twin_seq(seqs + i, r.votes[r.twin_of], -1, &r.tseq);
 				r.pos = (int64_t)seqs[i].pos;
 				r.strand = seqs[i].strand;
 			}
@@ -612,19 +613,92 @@ struct se_meth_ctx_t {
 	bwa_seq_t *seqs;
 	aln_meth_read_t *res;
 	fmt_bufs_t *fb;
+	ks_rec_t *ks_rec = nullptr; // --known-snvs (as se_ctx_t)
+	int ks_phase = 0;
 };
+
+/* --known-snvs under --meth: the twins of a batch searched (window index, then main with the
+ * windows' candidates) and finished as single-end reads; their draws are seeded from ordinals past
+ * any read's, so no read's draw changes. */
+void ks_place_twins_meth(const aln_opt_t *o, const bwt_t *bwt, std::vector<ks_rec_t> &rec, int64_t ord0)
+{
+	std::vector<int> idx;
+	for (int i = 0; i < (int)rec.size(); ++i)
+		if (rec[i].twin_of >= 0) idx.push_back(i);
+	const int nt = (int)idx.size();
+	if (nt == 0) return;
+	const int is_comp = o->gap.mode & BWA_MODE_COMPREAD;
+	bwa_seq_t *tw = (bwa_seq_t*)aln_calloc(nt, sizeof(bwa_seq_t));
+	for (int j = 0; j < nt; ++j) {
+		const std::vector<uint8_t> &t = rec[idx[j]].tseq;
+		bwa_seq_t *p = tw + j;
+		p->tid = -1;
+		p->full_len = p->clip_len = p->len = (uint32_t)t.size();
+		p->seq = (ubyte_t*)aln_calloc(t.size(), 1);
+		p->rseq = (ubyte_t*)aln_calloc(t.size(), 1);
+		memcpy(p->seq, t.data(), t.size());
+		memcpy(p->rseq, t.data(), t.size());
+		seq_reverse(p->len, p->seq, 0);
+		seq_reverse(p->len, p->rseq, is_comp);
+		p->name = aln_strdup("twin");
+	}
+	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	const int64_t tord = ord0 + ((int64_t)1 << 48); // past any read's ordinal
+	std::vector<aln_meth_read_t> wres((size_t)nt), tres((size_t)nt);
+	aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, nt, tw, &o->gap, n_threads, 1, tord, 1,
+						  o->max_xa_hits, nullptr, wres.data());
+	std::vector<std::vector<aln_meth_candidate_t>> extra(nt);
+	for (int j = 0; j < nt; ++j) ks_meth_candidates(o->ks_windows, o->meth_ref->bns, wres[j], &extra[j]);
+	wres.clear();
+	aln_meth_search_batch(bwt, o->meth_ref, o->meth, nt, tw, &o->gap, n_threads, 1, tord, 0, o->max_xa_hits, nullptr,
+						  tres.data(), extra.data());
+	aln_meth_finish_se(o->meth_ref, o->meth, &o->gap, o->max_xa_hits, nt, tw, tres.data());
+	for (int j = 0; j < nt; ++j) {
+		ks_rec_t &r = rec[idx[j]];
+		const bwa_seq_t &t = tw[j];
+		r.twin_mapq = t.type == BWA_TYPE_NO_MATCH ? 0 : t.mapQ;
+		r.twin_same = t.type == BWA_TYPE_UNIQUE && (int)t.strand == r.strand &&
+					  std::llabs((int64_t)t.pos - r.pos) <= KS_TWIN_SLOP;
+	}
+	bwa_free_read_seq(nt, tw);
+}
 
 /* Single end under --meth, reads [st, st + n): strata, main hit, refinement, MD/NM and SAM text. */
 void se_meth_post_worker(void *data, int st, int n, int tid)
 {
 	se_meth_ctx_t *c = (se_meth_ctx_t*)data;
 	const aln_opt_t *o = c->o;
-	aln_meth_finish_se(o->meth_ref, o->meth, &o->gap, o->max_xa_hits, n, c->seqs + st, c->res + st);
+	if (c->ks_phase != 2) {
+		aln_meth_finish_se(o->meth_ref, o->meth, &o->gap, o->max_xa_hits, n, c->seqs + st, c->res + st);
+		for (int i = 0; c->ks_rec && i < n; ++i) {
+			const aln_meth_read_t &res = c->res[st + i];
+			if (res.main < 0) continue;
+			ks_rec_t &r = c->ks_rec[st + i];
+			const aln_meth_hit_t &h = res.hits[res.main];
+			r.twin_of = ks_site_votes(o->known_snvs, o->meth_ref->bns, &o->gap, c->seqs + st + i,
+									  h.alt ? KS_ALT_ALL : -1, res.hyp, &r.votes);
+			if (r.twin_of < 0) continue;
+			ks_twin_seq(c->seqs + st + i, r.votes[r.twin_of], res.hyp, &r.tseq);
+			r.pos = (int64_t)c->seqs[st + i].pos;
+			r.strand = c->seqs[st + i].strand;
+		}
+		if (c->ks_phase == 1) return;
+	}
 	kstring_t *k = &c->fb->buf[tid];
 	fmt_seg_t g;
 	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
-	for (int i = 0; i < n; ++i)
+	std::string xv;
+	for (int i = 0; i < n; ++i) {
 		aln_meth_print_sam1(k, o->meth_ref, o->meth, c->seqs + st + i, c->res + st + i, 1, 0, o->gap.mode, o->gap.max_top2);
+		if (c->ks_rec && !c->ks_rec[st + i].votes.empty()) {
+			const ks_rec_t &r = c->ks_rec[st + i];
+			ks_format_xv(o->meth_ref->bns, r.votes, r.twin_of, r.twin_same, r.twin_mapq, &xv);
+			--k->l;
+			kputs("\tXV:Z:", k);
+			kputs(xv.c_str(), k);
+			kputc('\n', k);
+		}
+	}
 	g.len = k->l - g.off;
 	c->fb->segs[tid].push_back(g);
 }
@@ -662,11 +736,32 @@ int aln_run_se_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq, aln
 		bwa_seq_t *seqs = cur.seqs;
 		const int n_seqs = cur.n;
 		res.assign((size_t)n_seqs, aln_meth_read_t());
+		// --known-snvs: search the ALT windows first; the windows they find covering their site are
+		// resolved by each read's main search as candidates it may not have proposed itself
+		std::vector<std::vector<aln_meth_candidate_t>> ks_extra;
+		if (o->ks_windows) {
+			std::vector<aln_meth_read_t> wres((size_t)n_seqs);
+			aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n_seqs, seqs, &o->gap,
+								  o->gap.n_threads, 1, tot, 1, o->max_xa_hits, nullptr, wres.data());
+			ks_extra.resize(n_seqs);
+			for (int i = 0; i < n_seqs; ++i)
+				ks_meth_candidates(o->ks_windows, o->meth_ref->bns, wres[i], &ks_extra[i]);
+		}
 		const int n_shared = aln_meth_search_batch(bwt, o->meth_ref, o->meth, n_seqs, seqs, &o->gap, o->gap.n_threads,
-												   1, tot, 0, o->max_xa_hits, dup, res.data());
+												   1, tot, 0, o->max_xa_hits, dup, res.data(),
+												   ks_extra.empty() ? nullptr : ks_extra.data());
 		if (bwa_verbose >= 4) fprintf(stderr, "[M::aln] %d of %d reads shared an identical read's search.\n", n_shared, n_seqs);
 		tot += n_seqs;
 		se_meth_ctx_t c = {o, seqs, res.data(), &fb};
+		std::vector<ks_rec_t> ks_rec;
+		if (o->ks_windows) {
+			ks_rec.resize(n_seqs);
+			c.ks_rec = ks_rec.data();
+			c.ks_phase = 1;
+			kt_for_nt(se_meth_post_worker, &c, n_seqs, n_threads);
+			ks_place_twins_meth(o, bwt, ks_rec, tot);
+			c.ks_phase = 2;
+		}
 		fb.reset();
 		kt_for_nt(se_meth_post_worker, &c, n_seqs, n_threads);
 		int stop;
@@ -842,7 +937,7 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  --known-snvs FILE   VCF/BCF of SNVs (FILTER ignored): a read carrying a site's ALT is\n"
 	            "                   placed as on a genome with both alleles, and every read over a site\n"
 	            "                   gets XV:Z (allele, differences elsewhere, budget, allele-swapped twin's\n"
-	            "                   placement) [off]; single-end, without --meth\n");
+	            "                   placement) [off]; single-end, plain or --meth\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
 	fprintf(fp, "  -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]\n");
 	fprintf(fp, "            (some errors and warnings still print at 0)\n");
@@ -1340,17 +1435,22 @@ int main_aln(int argc, char *argv[])
 					"%lld duplicates skipped)\n", (long long)ks_sites.n_sites, (long long)ks_sites.n_records,
 					(long long)ks_sites.n_not_snv, (long long)ks_sites.n_duplicate);
 		if (!ks_sites.empty()) {
-			if (o.meth || paired) {
-				fprintf(stderr, "[E::aln] --known-snvs with %s is not supported yet\n", o.meth ? "--meth" : "paired-end input");
+			if (paired) {
+				fprintf(stderr, "[E::aln] --known-snvs with paired-end input is not supported yet\n");
 				free(meth_hdr_lines);
 				if (o.meth) aln_meth_ref_free(&meth_ref);
 				bwt_destroy(bwt);
 				delete fmi;
 				return 1;
 			}
+			if (o.meth) { // --meth realigns its candidate windows with the ALTs in place too
+				meth_ref.known_snvs = &ks_sites;
+				o.known_snvs = &ks_sites;
+			}
 			const double t0 = realtime();
-			if (ks_windows_build(&ks_sites, ks_bns, ks_pac, opt->n_threads, &ks_windows) != 0) {
+			if (ks_windows_build(&ks_sites, ks_bns, ks_pac, opt->n_threads, o.meth != nullptr, &ks_windows) != 0) {
 				free(meth_hdr_lines);
+				if (o.meth) aln_meth_ref_free(&meth_ref);
 				bwt_destroy(bwt);
 				delete fmi;
 				return 1;

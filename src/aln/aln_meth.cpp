@@ -109,9 +109,9 @@ static inline const int8_t *meth_mat(const aln_meth_opt_t *mo, int hyp, int *m)
     return *m == 5 ? (hyp ? mo->mat_ot : mo->mat_ob) : (hyp ? mo->mat7_ot : mo->mat7_ob);
 }
 static void fetch_window(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int64_t rb, int64_t len,
-                         int rid, std::vector<uint8_t> &win)
+                         int rid, std::vector<uint8_t> &win, int alt = 0)
 {
-    aln_meth_fetch_window(*ref, *mo, rb, (int)len, rid, win);
+    aln_meth_fetch_window(*ref, *mo, rb, (int)len, rid, win, alt);
 }
 static inline uint64_t splitmix64(uint64_t *x)
 {
@@ -202,12 +202,12 @@ static bool alignment_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, b
  * candidate could have competed (cost within the retained window) is marked incomplete. */
 static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
                               const gap_opt_t *opt, int64_t rb, int64_t re,
-                              const ubyte_t *query, int len, aln_meth_occ_t *o)
+                              const ubyte_t *query, int len, aln_meth_occ_t *o, int alt = 0)
 {
     int m;
     const int8_t *mat = meth_mat(mo, o->hyp, &m);
     std::vector<uint8_t> win;
-    fetch_window(ref, mo, rb, re - rb, o->rid, win);
+    fetch_window(ref, mo, rb, re - rb, o->rid, win, alt);
     int q = 0, t = 0;
     for (uint32_t item : o->alignment.raw_cigar) {
         const int op = item & 15, n = item >> 4;
@@ -235,6 +235,8 @@ static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *m
               (int64_t)opt->s_gape * o->n_gape;
     return o->cost <= INT_MAX && o->n_mm <= 255 && o->n_gapo <= 255 && o->n_gape <= 255;
 }
+static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
+                        int alt, int n_ins, int n_del);
 static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_t sa)
 {
     aln_meth_group_t *g = x->grp;
@@ -253,18 +255,30 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
     const int64_t rb = g->ref->bns->anns[rid].offset + (pos - ca.offset);
     const auto key = std::make_tuple(rid, hyp, strand, rb, rb + span);
     if (!x->windows.insert(key).second) return;
-    aln_meth_occ_t o;
-    o.rid = rid; o.hyp = hyp; o.strand = strand;
     const aln_meth_candidate_t candidate{rid, strand, hyp, rb, rb + span};
     const ubyte_t *query = strand ? x->p->rseq : x->rd_fwd.data();
+    // --known-snvs: a window holding a site is also aligned with the ALTs in place; the locus
+    // keeps the cheaper of the two (the replace-if-better below).
+    const int n_hap = aln_meth_window_has_site(*g->ref, rb, span, rid) ? 2 : 1;
+    for (int alt = 0; alt < n_hap; ++alt)
+        resolve_one(x, candidate, query, alt, h.e.n_ins, h.e.n_del);
+}
+static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
+                        int alt, int n_ins, int n_del)
+{
+    aln_meth_group_t *g = x->grp;
+    const int rid = candidate.rid, hyp = candidate.hyp, strand = candidate.strand;
+    const int64_t rb = candidate.rb, span = candidate.re - candidate.rb;
+    aln_meth_occ_t o;
+    o.rid = rid; o.hyp = hyp; o.strand = strand; o.alt = alt;
     const auto status = aln_meth_realign_window(*g->ref, *g->mo, candidate, query, x->len,
-                                               h.e.n_ins, h.e.n_del, &o.alignment);
+                                               n_ins, n_del, &o.alignment, alt);
     // Invalid/resource/empty normalized alignments must never be silently omitted competitors.
     if (status != aln_meth_eval_status::ok) {
         fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
         exit(1);
     }
-    if (!account_alignment(g->ref, g->mo, g->opt, rb, rb + span, query, x->len, &o)) {
+    if (!account_alignment(g->ref, g->mo, g->opt, rb, rb + span, query, x->len, &o, alt)) {
         ++x->res->n_unrepresentable;
         x->unrep_cost = std::min(x->unrep_cost, o.cost);
         return;
@@ -355,6 +369,7 @@ static aln_meth_hit_t meth_hit(const aln_meth_occ_t &o, std::vector<uint32_t> &c
     else h.cig = 0; // no CIGAR: no table offset to go stale
     h.strand = (uint8_t)o.strand; h.hyp = (uint8_t)o.hyp;
     h.n_mm = (uint8_t)o.n_mm; h.n_gapo = (uint8_t)o.n_gapo; h.n_gape = (uint8_t)o.n_gape;
+    h.alt = (uint8_t)o.alt;
     return h;
 }
 void aln_meth_store_loci(aln_meth_read_t *res)
@@ -446,6 +461,16 @@ static __attribute__((noinline)) void meth_slot_finish_tail(aln_meth_read_t *res
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
     aln_meth_read_t *r = x->res;
+    if (x->extra) { // --known-snvs: windows the ALT-window search found, as both haplotypes
+        for (const aln_meth_candidate_t &c : *x->extra) {
+            if ((c.hyp ^ c.strand) != x->grp->read_no) continue;
+            if (!x->windows.insert(std::make_tuple(c.rid, c.hyp, c.strand, c.rb, c.re)).second) continue;
+            const int span = (int)(c.re - c.rb);
+            const ubyte_t *query = c.strand ? x->p->rseq : x->rd_fwd.data();
+            for (int alt = 0; alt < 2; ++alt)
+                resolve_one(x, c, query, alt, std::max(0, x->len - span), std::max(0, span - x->len));
+        }
+    }
     if (r->occ.empty()) return;
     int64_t best = INT64_MAX;
     for (const auto &o : r->occ) best = std::min(best, o.cost);
