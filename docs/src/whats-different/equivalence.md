@@ -7,7 +7,9 @@ strict input/error handling documented there. Opt-in `aln --short-insert` change
 paired insert-size calibration, pairs mates with coincident starts and widens mate rescue
 to overlap the anchor, and can change pair selection, proper-pair flags, MAPQ and rescued
 mates, with or without `--meth`. Opt-in `aln --ref-span-insert` measures paired inserts from
-alignment reference spans instead of read lengths and can change the same outputs. Opt-in `aln --meth` changes search,
+alignment reference spans instead of read lengths and can change the same outputs. Opt-in
+`aln --known-snvs` credits known SNV ALT alleles and can change placement, MAPQ, flags and
+alternative hits at the sites, and adds `XV:Z`. Opt-in `aln --meth` changes search,
 refinement, accounting and tags and is not stock or MEM-equivalent. The MEM
 methylation accuracy/performance evidence on this site does not establish those
 properties for the rewritten `aln --meth` path. Its stock-shaped MAPQ is a heuristic

@@ -28,6 +28,12 @@ mate that runs past its anchor is rescued with the overhang soft-clipped. The fl
 off and is rejected with single-end input; `-A` overrides it. Enabling it can change pair
 selection, proper-pair flags, MAPQ, rescued mates and their CIGARs.
 
+`aln --known-snvs FILE` (off by default; single-end) places reads
+carrying a known SNV's ALT allele as on a genome holding both alleles, so short ALT reads are not
+lost to an extra mismatch. It tags reads over a site with `XV:Z`, including where an
+allele-swapped twin of the read lands, so allele counts can drop reads that only one allele would
+place. See [aln](../cli/aln.md#known-snvs---known-snvs).
+
 `--ref-span-insert` (paired ordinary or methylation-aware alignment, off by default) measures
 inserts from the alignments' reference spans rather than read lengths, in insert-size
 estimation, pairing (including the `-a` bound) and mate rescue windows, so a mate whose

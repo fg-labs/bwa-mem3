@@ -3,6 +3,7 @@
  * set is stock `bwa aln`'s plus the samse/sampe -n (as --max-xa-hits), -f and -r, and sampe's
  * paired-end options; see README.md. */
 #include "aln_main.h"
+#include "aln_known_snvs.h"
 
 #include <assert.h>
 #include <getopt.h>
@@ -33,6 +34,7 @@
 #include "bwape.h"
 #include "bwase.h"
 #include "bwaseqio.h"
+#include "aln_alloc.h"
 #include "bwtgap.h"
 #include "aln_meth.h"
 #include "../meth_opts.h"
@@ -182,6 +184,21 @@ struct se_ctx_t {
 	ubyte_t *pac;
 	bwa_seq_t *seqs;
 	fmt_bufs_t *fb;
+	bwt_aln1_t **ks_aln = nullptr;         // --known-snvs: each read's window hits (null without)
+	const int *ks_n = nullptr;
+	std::vector<int64_t> *ks_count = nullptr; // per thread, KS_N_OUTCOMES counters each
+	struct ks_rec_t *ks_rec = nullptr;     // per read: its sites, twin and XV (with ks_aln)
+	int ks_phase = 0;                      // 0: place and print; 1: place only; 2: print only
+};
+
+/* --known-snvs, per read: the sites under its final placement and its twin's outcome. */
+struct ks_rec_t {
+	std::vector<ks_vote_t> votes;
+	int twin_of = -1;            // the vote that gets a twin, or -1
+	std::vector<uint8_t> tseq;   // the twin, in read order
+	int64_t pos = 0;             // the read's final placement
+	int strand = 0;
+	int twin_same = -1, twin_mapq = 0;
 };
 
 /* Single end, reads [st, st + n): SA to position, refinement, MD, trim correction and SAM text;
@@ -191,13 +208,43 @@ void se_post_worker(void *data, int st, int n, int tid)
 {
 	se_ctx_t *c = (se_ctx_t*)data;
 	bwa_seq_t *seqs = c->seqs + st;
-	bwa_cal_pac_pos(c->bns, c->bwt, n, seqs, c->o->gap.max_diff, c->o->gap.fnr);
-	bwa_refine_gapped(c->bns, n, seqs, c->pac);
+	if (c->ks_phase != 2) {
+		bwa_cal_pac_pos(c->bns, c->bwt, n, seqs, c->o->gap.max_diff, c->o->gap.fnr);
+		std::vector<int64_t> alt_site(c->ks_aln ? n : 0, -1);
+		if (c->ks_aln) {
+			int64_t *cnt = c->ks_count->data() + (size_t)tid * KS_N_OUTCOMES;
+			for (int i = 0; i < n; ++i)
+				++cnt[ks_override(c->o->ks_windows, c->bns, c->bwt, &c->o->gap, c->o->max_xa_hits, seqs + i,
+								  c->ks_aln[st + i], c->ks_n[st + i], &alt_site[i])];
+		}
+		bwa_refine_gapped(c->bns, n, seqs, c->pac);
+		if (c->ks_rec) {
+			for (int i = 0; i < n; ++i) {
+				ks_rec_t &r = c->ks_rec[st + i];
+				r.twin_of = ks_site_votes(c->o->known_snvs, c->bns, &c->o->gap, seqs + i, alt_site[i], &r.votes);
+				if (r.twin_of < 0) continue;
+				ks_twin_seq(seqs + i, r.votes[r.twin_of], &r.tseq);
+				r.pos = (int64_t)seqs[i].pos;
+				r.strand = seqs[i].strand;
+			}
+		}
+		if (c->ks_phase == 1) return;
+	}
 	kstring_t *k = &c->fb->buf[tid];
 	fmt_seg_t g;
 	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
-	for (int i = 0; i < n; ++i)
+	std::string xv;
+	for (int i = 0; i < n; ++i) {
 		bwa_print_sam1(k, c->bns, seqs + i, 0, c->o->gap.mode, c->o->gap.max_top2);
+		if (c->ks_rec && !c->ks_rec[st + i].votes.empty()) { // XV goes before the record's newline
+			const ks_rec_t &r = c->ks_rec[st + i];
+			ks_format_xv(c->bns, r.votes, r.twin_of, r.twin_same, r.twin_mapq, &xv);
+			--k->l;
+			kputs("\tXV:Z:", k);
+			kputs(xv.c_str(), k);
+			kputc('\n', k);
+		}
+	}
 	g.len = k->l - g.off;
 	c->fb->segs[tid].push_back(g);
 }
@@ -252,6 +299,52 @@ void pe_post_worker(void *data, int st, int n, int tid)
 
 } // namespace
 
+namespace {
+
+/* --known-snvs: every twin of a batch searched as one more batch (main and window index), then
+ * placed without a draw, so the stock drand48 stream never sees them. */
+void ks_place_twins(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, std::vector<ks_rec_t> &rec)
+{
+	std::vector<int> idx;
+	for (int i = 0; i < (int)rec.size(); ++i)
+		if (rec[i].twin_of >= 0) idx.push_back(i);
+	const int nt = (int)idx.size();
+	if (nt == 0) return;
+	const int is_comp = o->gap.mode & BWA_MODE_COMPREAD;
+	bwa_seq_t *tw = (bwa_seq_t*)aln_calloc(nt, sizeof(bwa_seq_t));
+	for (int j = 0; j < nt; ++j) {
+		const std::vector<uint8_t> &t = rec[idx[j]].tseq;
+		bwa_seq_t *p = tw + j;
+		p->tid = -1;
+		p->full_len = p->clip_len = p->len = (uint32_t)t.size();
+		p->seq = (ubyte_t*)aln_calloc(t.size(), 1);
+		p->rseq = (ubyte_t*)aln_calloc(t.size(), 1);
+		memcpy(p->seq, t.data(), t.size());
+		memcpy(p->rseq, t.data(), t.size());
+		seq_reverse(p->len, p->seq, 0); // as bwa_read_seq leaves a read for the search
+		seq_reverse(p->len, p->rseq, is_comp);
+		p->name = aln_strdup("twin");
+	}
+	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	aln_search_batch(o->ks_windows->bwt, nt, tw, &o->gap, n_threads, nullptr);
+	std::vector<bwt_aln1_t*> win_aln(nt);
+	std::vector<int> win_n(nt);
+	for (int j = 0; j < nt; ++j) {
+		win_aln[j] = tw[j].aln; win_n[j] = tw[j].n_aln;
+		tw[j].aln = 0; tw[j].n_aln = 0;
+	}
+	aln_search_batch(bwt, nt, tw, &o->gap, n_threads, nullptr);
+	for (int j = 0; j < nt; ++j) {
+		ks_rec_t &r = rec[idx[j]];
+		r.twin_same = ks_twin_place(o->ks_windows, bns, bwt, &o->gap, tw + j, win_aln[j], win_n[j], r.pos,
+									r.strand, &r.twin_mapq);
+		free(win_aln[j]);
+	}
+	bwa_free_read_seq(nt, tw);
+}
+
+} // namespace
+
 int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
 			   const char *fn_fq, aln_out_t *out)
 {
@@ -268,6 +361,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	srand48(bns->seed); // once per run, never per batch
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
 	fmt_bufs_t fb(n_threads);
+	std::vector<int64_t> ks_count((size_t)n_threads * KS_N_OUTCOMES, 0);
 	long long tot = 0;
 	int ret = 0;
 	struct batch_t { bwa_seq_t *seqs; int n; };
@@ -286,15 +380,44 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		tot += n_seqs;
 		const int n_shared = aln_search_batch(bwt, n_seqs, seqs, &o->gap, o->gap.n_threads, dup);
 		if (bwa_verbose >= 4) fprintf(stderr, "[M::aln] %d of %d reads shared an identical read's search.\n", n_shared, n_seqs);
+		// --known-snvs: the same search on the ALT windows, kept beside the main search's hits
+		std::vector<bwt_aln1_t*> ks_aln;
+		std::vector<int> ks_n;
+		if (o->ks_windows) {
+			ks_aln.resize(n_seqs);
+			ks_n.resize(n_seqs);
+			for (int i = 0; i < n_seqs; ++i) {
+				ks_aln[i] = seqs[i].aln; ks_n[i] = seqs[i].n_aln;
+				seqs[i].aln = 0; seqs[i].n_aln = 0;
+			}
+			aln_search_batch(o->ks_windows->bwt, n_seqs, seqs, &o->gap, o->gap.n_threads, nullptr);
+			for (int i = 0; i < n_seqs; ++i) {
+				std::swap(ks_aln[i], seqs[i].aln);
+				std::swap(ks_n[i], seqs[i].n_aln);
+			}
+		}
 		// serial and in read order: bwa_aln2seq_core draws from drand48
 		for (int i = 0; i < n_seqs; ++i)
 			bwa_aln2seq_core(seqs[i].n_aln, seqs[i].aln, &seqs[i], 1, o->max_xa_hits);
 		se_ctx_t c = {o, bwt, bns, pac, seqs, &fb};
+		std::vector<ks_rec_t> ks_rec;
+		if (o->ks_windows) {
+			c.ks_aln = ks_aln.data();
+			c.ks_n = ks_n.data();
+			c.ks_count = &ks_count;
+			ks_rec.resize(n_seqs);
+			c.ks_rec = ks_rec.data();
+			c.ks_phase = 1;
+			kt_for_nt(se_post_worker, &c, n_seqs, n_threads);
+			ks_place_twins(o, bwt, bns, ks_rec);
+			c.ks_phase = 2;
+		}
 		fb.reset();
 		kt_for_nt(se_post_worker, &c, n_seqs, n_threads);
 		int stop;
 		if (fb.write(out, &stop) != 0) ret = 1;
 		bwa_free_read_seq(n_seqs, seqs);
+		for (bwt_aln1_t *a : ks_aln) free(a);
 		if (ret) { // the batch read ahead is never aligned
 			ahead.abandon();
 			if (next.seqs) bwa_free_read_seq(next.n, next.seqs);
@@ -307,6 +430,13 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			break;
 		}
 		cur = next;
+	}
+	if (o->ks_windows && bwa_verbose >= 3) {
+		int64_t t[KS_N_OUTCOMES] = {0};
+		for (size_t i = 0; i < ks_count.size(); ++i) t[i % KS_N_OUTCOMES] += ks_count[i];
+		fprintf(stderr, "[M::aln] --known-snvs: %lld reads credited, %lld at a site with no change, "
+				"%lld kept stock (too many hits or too long)\n", (long long)t[KS_CREDITED],
+				(long long)t[KS_SAME], (long long)t[KS_INCOMPLETE]);
 	}
 	if (bwa_seq_n_bad(ks)) ret = 1; // malformed records were skipped (and named on stderr)
 	// Not fatal (stock's err_gzclose exits): the caller still closes the output, so a BAM is
@@ -708,6 +838,11 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "   Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.\n");
 	fprintf(fp, "   aln -B is barcode length, not mem's mismatch penalty. Records carry\n");
 	fprintf(fp, "   XR/XG/XM:Z instead of XM:i/XO:i/XG:i.\n");
+	fprintf(fp, "\nKnown SNVs:\n");
+	fprintf(fp, "  --known-snvs FILE   VCF/BCF of SNVs (FILTER ignored): a read carrying a site's ALT is\n"
+	            "                   placed as on a genome with both alleles, and every read over a site\n"
+	            "                   gets XV:Z (allele, differences elsewhere, budget, allele-swapped twin's\n"
+	            "                   placement) [off]; single-end, without --meth\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
 	fprintf(fp, "  -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]\n");
 	fprintf(fp, "            (some errors and warnings still print at 0)\n");
@@ -852,7 +987,7 @@ static int aln_parse_double(const char *flag, const char *s, double lo, double *
 	return 1;
 }
 
-enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP, OPT_SHORT_INSERT, OPT_REF_SPAN_INSERT };
+enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP, OPT_SHORT_INSERT, OPT_REF_SPAN_INSERT, OPT_KNOWN_SNVS };
 
 int main_aln(int argc, char *argv[])
 {
@@ -861,6 +996,9 @@ int main_aln(int argc, char *argv[])
 	gap_opt_t *opt = &o.gap;
 	int c, opte = -1, bam = 0, bam_level = 1, pe_flag = 0, bc_len = 0;
 	const char *out_path = NULL;
+	const char *ks_path = NULL;
+	ks_sites_t ks_sites;
+	ks_windows_t ks_windows;
 	std::unique_ptr<char, decltype(&free)> rg_line(NULL, &free);
 	aln_meth_opt_t meth_opt;
 	aln_meth_ref_t meth_ref;
@@ -872,6 +1010,7 @@ int main_aln(int argc, char *argv[])
 		{"max-occ", required_argument, 0, OPT_MAX_OCC},
 		{"short-insert", no_argument, 0, OPT_SHORT_INSERT},
 		{"ref-span-insert", no_argument, 0, OPT_REF_SPAN_INSERT},
+		{"known-snvs", required_argument, 0, OPT_KNOWN_SNVS},
 		{"bam", no_argument, 0, OPT_BAM},
 		{"bam-level", required_argument, 0, OPT_BAM_LEVEL},
 		{"help", no_argument, 0, OPT_HELP},
@@ -974,6 +1113,7 @@ int main_aln(int argc, char *argv[])
 		case OPT_MAX_OCC: ALN_INT("--max-occ", INT_MIN, &o.pe.max_occ); pe_flag = 1; break;
 		case OPT_SHORT_INSERT: o.pe.short_insert = 1; break;
 		case OPT_REF_SPAN_INSERT: o.pe.ref_span_insert = 1; break;
+		case OPT_KNOWN_SNVS: ks_path = optarg; break;
 		case OPT_BAM: bam = 1; break;
 		case OPT_BAM_LEVEL:
 			if (!aln_parse_int("--bam-level", optarg, 0, 9, &bam_level)) return 1;
@@ -1184,6 +1324,44 @@ int main_aln(int argc, char *argv[])
 		}
 		meth_hdr_lines = bwa_load_hdr_from_index(meth_orig.c_str()); // the original reference's sidecar
 	}
+	if (ks_path) {
+		// Sites are checked against the original reference (under --meth, not the converted one).
+		const bntseq_t *ks_bns = o.meth ? meth_ref.bns : bns;
+		const uint8_t *ks_pac = o.meth ? meth_ref.pac : fmi->idx->pac;
+		if (ks_load(ks_path, ks_bns, ks_pac, &ks_sites) != 0) {
+			free(meth_hdr_lines);
+			if (o.meth) aln_meth_ref_free(&meth_ref);
+			bwt_destroy(bwt);
+			delete fmi;
+			return 1;
+		}
+		if (bwa_verbose >= 3)
+			fprintf(stderr, "[M::aln] --known-snvs: %lld SNV alleles from %lld records (%lld alleles not SNVs, "
+					"%lld duplicates skipped)\n", (long long)ks_sites.n_sites, (long long)ks_sites.n_records,
+					(long long)ks_sites.n_not_snv, (long long)ks_sites.n_duplicate);
+		if (!ks_sites.empty()) {
+			if (o.meth || paired) {
+				fprintf(stderr, "[E::aln] --known-snvs with %s is not supported yet\n", o.meth ? "--meth" : "paired-end input");
+				free(meth_hdr_lines);
+				if (o.meth) aln_meth_ref_free(&meth_ref);
+				bwt_destroy(bwt);
+				delete fmi;
+				return 1;
+			}
+			const double t0 = realtime();
+			if (ks_windows_build(&ks_sites, ks_bns, ks_pac, opt->n_threads, &ks_windows) != 0) {
+				free(meth_hdr_lines);
+				bwt_destroy(bwt);
+				delete fmi;
+				return 1;
+			}
+			if (bwa_verbose >= 3)
+				fprintf(stderr, "[M::aln] --known-snvs: indexed %zu ALT windows in %.1f s\n",
+						ks_windows.win.size(), realtime() - t0);
+			o.known_snvs = &ks_sites;
+			o.ks_windows = &ks_windows;
+		}
+	}
 	kstring_t hdr = {0, 0, 0};
 	if (o.meth) {
 		if (aln_meth_header(&hdr, &meth_ref, rg_line.get(), bwa_pg, meth_hdr_lines) != 0) {
@@ -1209,6 +1387,7 @@ int main_aln(int argc, char *argv[])
 	}
 	if (out && aln_out_close(out) != 0) ret = 1;
 
+	ks_windows_free(&ks_windows);
 	bwt_destroy(bwt);
 	if (o.meth) aln_meth_ref_free(&meth_ref);
 	delete fmi;
