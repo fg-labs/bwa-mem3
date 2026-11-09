@@ -145,4 +145,43 @@ grep -q 'Executing in' "$tmpdir/saf.err" \
         exit 1
     }
 
+# --- 5. `mem --tie-break --help <ref> <reads>` -- same shape as case 4. ------
+rc=0
+"$bin" mem --tie-break "--help" "$ref" "$reads" \
+    > "$tmpdir/tb.out" 2> "$tmpdir/tb.err" || rc=$?
+[[ $rc -ne 0 ]] \
+    || {
+        echo "FAIL: 'mem --tie-break --help' exited 0; expected non-zero (--help is not 'index' or 'name')" >&2
+        exit 1
+    }
+grep -q 'Executing in' "$tmpdir/tb.err" \
+    || {
+        echo "FAIL: banner missing from 'mem --tie-break --help' invocation; pre-scan wrongly matched the option's value" >&2
+        echo "---- stderr ----" >&2
+        cat "$tmpdir/tb.err" >&2
+        exit 1
+    }
+
+# --- 6. The pre-scan list covers every required_argument mem long option. ---
+# main.cpp's MEM_LONG_OPTS_WITH_ARG must name each `{"<name>", required_argument,
+# ...}` entry of main_mem's long_opts (fastmap.cpp, plus the METH_LONG_OPTIONS_*
+# macros in meth_opts.h); a missing one makes `mem --<name> --help` short-circuit
+# to the help text instead of rejecting --help as the option's value. Checked
+# against the sources so a new option cannot drift out of the list unnoticed.
+src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
+required_opts="$(grep -hoE '\{"[a-z0-9-]+",[[:space:]]*required_argument' \
+    "$src_dir/fastmap.cpp" "$src_dir/meth_opts.h" \
+    | sed -E 's/^\{"([^"]+)".*/--\1/' | sort -u)"
+[[ -n "$required_opts" ]] || {
+    echo "FAIL: found no required_argument long options in fastmap.cpp/meth_opts.h; the extraction pattern no longer matches" >&2
+    exit 1
+}
+prescan_opts="$(sed -n '/MEM_LONG_OPTS_WITH_ARG\[\] = {/,/NULL,/p' "$src_dir/main.cpp" \
+    | grep -oE '"--[a-z0-9-]+"' | tr -d '"' | sort -u)"
+missing="$(comm -23 <(printf '%s\n' "$required_opts") <(printf '%s\n' "$prescan_opts"))"
+[[ -z "$missing" ]] || {
+    echo "FAIL: required_argument mem options missing from MEM_LONG_OPTS_WITH_ARG (src/main.cpp): $(echo "$missing" | tr '\n' ' ')" >&2
+    exit 1
+}
+
 echo "PASS: mem --help short-circuits; mem <opt-with-arg> --help does not"
