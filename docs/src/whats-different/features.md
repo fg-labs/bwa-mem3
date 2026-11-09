@@ -29,7 +29,7 @@ off and is rejected with single-end input; `-A` overrides it. Enabling it can ch
 selection, proper-pair flags, MAPQ, rescued mates and their CIGARs.
 ([PR #752](https://github.com/fg-labs/bwa-mem3/pull/752))
 
-`aln --known-snvs FILE` (off by default; single-end, plain or `--meth`) places reads
+`aln --known-snvs FILE` (off by default; single-end, paired-end and `--meth`) places reads
 carrying a known SNV's ALT allele as on a genome holding both alleles, so short ALT reads are not
 lost to an extra mismatch. It tags reads over a site with `XV:Z`, including where an
 allele-swapped twin of the read lands, so allele counts can drop reads that only one allele would

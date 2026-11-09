@@ -882,12 +882,12 @@ int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
 }
 
 void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
-                            bwamem_hugetlb_mode_t huge_pages)
+                            bwamem_hugetlb_mode_t huge_pages, bool allow_shm)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
      * mapping; the segment lifetime belongs to the shm-loading process. */
-    {
+    if (allow_shm) {
         size_t   shm_attach_len = 0;
         uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
         if (shm_base_local != NULL) {

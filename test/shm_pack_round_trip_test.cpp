@@ -18,16 +18,21 @@
 #include "FMI_search.h"
 #include "bntseq.h"
 #include "utils.h"
+#include "bwa.h"
 #include "framework/shm_registry_guard.h"
+#include "framework/temp_dir.h"
 
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <vector>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define CHECK(cond) do { \
@@ -284,16 +289,78 @@ int main(int argc, char *argv[]) {
     CHECK_EQ(std::memcmp(saved, marker, sizeof(marker)), 0);
     CHECK_EQ(std::memcmp(reopened, marker, sizeof(marker)), 0);
 
-    /* Registered restaging still succeeds, attaches, and is removed by -d. */
+    // A distinct, deliberately nonmatching disk index has the staged fixture's basename. It is
+    // built before the fixture is staged, so a failed write cannot leave the fixture registered;
+    // the allow_shm=false checks below run after staging, against a live basename collision.
+    // Neither accidental shared PAC nor shared checkpoint bytes may satisfy this oracle.
+    bwa_tests::TempDir disk_dir{"shm_disk_source"};
+    const char *leaf = std::strrchr(prefix, '/'); leaf = leaf ? leaf + 1 : prefix;
+    const std::string disk_prefix = disk_dir.file(leaf);
+    const std::string disk_sequence = "ACGTTGCAAGTCCTAGGATCCGTAACGTAGCTAGCA";
+    disk_dir.write(leaf, ">different\n" + disk_sequence + "\n");
+    CHECK_EQ(bwa_idx_build(disk_prefix.c_str(), disk_prefix.c_str(), 0, 3), 0);
+    std::vector<uint8_t> expected_pac(disk_sequence.size() / 4 + 1, 0);
+    for (size_t i = 0; i < disk_sequence.size(); ++i)
+        expected_pac[i / 4] |= (uint8_t)std::string("ACGT").find(disk_sequence[i]) << ((3 - i % 4) * 2);
+    // Read checkpoint bytes directly: another loader could reproduce the same hybrid bug.
+    FILE *disk_bwt = std::fopen((disk_prefix + ".bwt.2bit.64").c_str(), "rb");
+    CHECK(disk_bwt != NULL);
+    int64_t disk_len = 0, disk_counts[5] = {};
+    CHECK_EQ(std::fread(&disk_len, sizeof(disk_len), 1, disk_bwt), 1u);
+    CHECK_EQ(disk_len, (int64_t)(2 * disk_sequence.size() + 1));
+    CHECK_EQ(std::fread(disk_counts, sizeof(int64_t), 5, disk_bwt), 5u);
+    const size_t checkpoint_bytes = ((disk_len >> CP_SHIFT) + 1) * sizeof(CP_OCC);
+    std::vector<uint8_t> expected_checkpoints(checkpoint_bytes);
+    CHECK_EQ(std::fread(expected_checkpoints.data(), 1, checkpoint_bytes, disk_bwt), checkpoint_bytes);
+    CHECK_EQ(std::fclose(disk_bwt), 0);
+
+    /* Registered restaging still succeeds, attaches, and is removed by -d. The checks after
+     * staging run in a child: a failed CHECK aborts it, and this process still destroys the
+     * staged fixture (the basename collision stays live until the child ends) before failing. */
     CHECK_EQ(bwa_shm_stage(prefix), 0);
-    CHECK_EQ(bwa_shm_test(prefix), 1);
-    CHECK_EQ(bwa_shm_stage(prefix), 0);
-    size_t attached_len = 0;
-    uint8_t *attached = bwa_shm_attach(prefix, &attached_len);
-    CHECK(attached != NULL);
-    CHECK(attached_len > sizeof(bwa_shm_header_t));
-    CHECK_EQ(munmap(attached, attached_len), 0);
+    std::fflush(nullptr);
+    const pid_t checker = fork();
+    if (checker == 0) {
+        CHECK_EQ(bwa_shm_test(prefix), 1);
+        CHECK_EQ(bwa_shm_stage(prefix), 0);
+        size_t attached_len = 0;
+        uint8_t *attached = bwa_shm_attach(prefix, &attached_len);
+        CHECK(attached != NULL);
+        CHECK(attached_len > sizeof(bwa_shm_header_t));
+        CHECK_EQ(munmap(attached, attached_len), 0);
+        {
+            FMI_search shared(prefix);
+            shared.load_index(/*load_pac=*/true, /*n_threads=*/1, /*build_seed_jump=*/false);
+            CHECK(shared.shm_attached_base() != NULL);
+        }
+        for (int load_pac = 0; load_pac <= 1; ++load_pac) {
+            // Private temporary indexes must use their own disk bytes even when
+            // another index with the same basename is staged on this host.
+            FMI_search disk(disk_prefix.c_str());
+            disk.load_index(load_pac, /*n_threads=*/1, /*build_seed_jump=*/false,
+                            BWAMEM_HUGETLB_OFF, /*allow_shm=*/false);
+            CHECK(disk.shm_attached_base() == NULL);
+            CHECK((disk.idx->pac != NULL) == load_pac);
+            CHECK_EQ(disk.reference_seq_len, disk_len);
+            CHECK_EQ(disk.cp_occ_size_bytes(), (int64_t)checkpoint_bytes);
+            CHECK_EQ(std::memcmp(disk.cp_occ_data(), expected_checkpoints.data(), checkpoint_bytes), 0);
+            for (int i = 0; i < 5; ++i) CHECK_EQ(disk.count_data()[i], disk_counts[i] + 1);
+            CHECK_EQ(disk.idx->bns->n_seqs, 1);
+            CHECK(std::strcmp(disk.idx->bns->anns[0].name, "different") == 0);
+            if (load_pac) CHECK_EQ(std::memcmp(disk.idx->pac, expected_pac.data(), expected_pac.size()), 0);
+        }
+        std::fflush(nullptr);
+        _exit(0);
+    }
+    int checker_status = 0;
+    pid_t waited = -1;
+    if (checker > 0)
+        do waited = waitpid(checker, &checker_status, 0); while (waited < 0 && errno == EINTR);
     CHECK_EQ(bwa_shm_destroy(), 0);
+    CHECK(checker > 0);
+    CHECK_EQ(waited, checker);
+    CHECK(WIFEXITED(checker_status));
+    CHECK_EQ(WEXITSTATUS(checker_status), 0);
     errno = 0;
     const int leftover_fd = shm_open(segment, O_RDONLY, 0);
     const int leftover_errno = errno;

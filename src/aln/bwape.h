@@ -5,7 +5,8 @@
  * MODIFIED from the original: moved into namespace bwa_aln; alignments come from each
  * read's own aln array instead of being read from a .sai file; bwa_cal_pac_pos_pe is cut into
  * four stages and bwa_paired_sw into a counting core and a report; bwa_pe_pairing and
- * bwa_pe_pair_grouped are new (for the unit tests). See README.md. */
+ * bwa_pe_pair_grouped are new (for the unit tests). Known-SNV pairing and rescue accept
+ * explicit allele-bearing hits and single-allele windows. See README.md. */
 #ifndef BWA_MEM3_ALN_BWAPE_H
 #define BWA_MEM3_ALN_BWAPE_H
 
@@ -13,7 +14,30 @@
 #include "../bntseq.h"
 #include "../utils.h"
 
+#include <vector>
+
 namespace bwa_aln {
+
+/* One alignment of a read given by position rather than SA row (--known-snvs: an end whose hits
+ * were recomputed with the ALT credited): forward-strand packed start, strand, search score and
+ * counts, and ref_shift (deletions minus insertions). */
+struct pe_hit_t {
+	int64_t pos;
+	int strand, score, n_mm, n_gapo, n_gape, ref_shift;
+	uint64_t alt_site_plus1; // selected packed site allele + 1; zero means the original reference
+};
+
+/* --known-snvs: a site allele as one value, packed position << 2 | ALT code (never negative). */
+inline int64_t aln_site_key(int64_t pos, int alt) { return pos << 2 | (int64_t)(alt & 3); }
+inline int64_t aln_site_key_pos(int64_t key) { return key >> 2; }
+inline int aln_site_key_alt(int64_t key) { return (int)(key & 3); }
+
+/* --known-snvs mate rescue: list(ctx, beg, end, out) fills `out` with (packed position, ALT code)
+ * for every site allele in the packed range [beg, end). */
+struct pe_alt_sites_t {
+	void (*list)(const void *ctx, int64_t beg, int64_t end, std::vector<std::pair<int64_t, uint8_t>> *out);
+	const void *ctx;
+};
 
 typedef struct {
 	double avg, std, ap_prior;
@@ -33,10 +57,10 @@ pe_opt_t *bwa_init_pe_opt(void);
  * lower fence's floor is then the longest reference span (len + ref_shift) rather than the longest read.
  * Returns 0, or -1 (ii->avg = -1) when it cannot; prints its findings to stderr when `report`
  * is set. With `bns` (--meth), pairs whose ends lie on different contigs are not counted;
- * the defaults are stock's. */
+ * excluded[i] skips pair i from both the observations and the span floor; the defaults are stock's. */
 int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
                 const bntseq_t *bns = nullptr, int report = 1, bool short_insert = false,
-                bool ref_span = false);
+                bool ref_span = false, const uint8_t *excluded = nullptr);
 
 /* Single-end positions, then pairing, for one batch. Each read's alignments are its aln /
  * n_aln. Consumes drand48(): call serially, in read order. When the batch gives no estimate
@@ -66,9 +90,16 @@ void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t
  * only same-contig pairs are counted (as --meth pairs them), and the reports follow `report`. */
 void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
                       const pe_opt_t *opt, const isize_info_t *last_ii,
-                      const bntseq_t *bns = nullptr, int report = 1);
+                      const bntseq_t *bns = nullptr, int report = 1, const uint8_t *excluded = nullptr);
+/* With `hits` (--known-snvs), a pair where hits[j][i] is non-empty for either end pairs that end on
+ * those hits, by position, instead of its SA rows; its extra hits come from the same list. With
+ * `moved_span`, moved_span[j][i] is the reference span of the hit pairing moved end j of pair i
+ * to, or -1 when pairing did not move it. Without --ref-span-insert a moved end keeps its old hit's
+ * ref_shift (as stock does), so this is the only record of the new hit's span. */
 int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt);
+				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt,
+				const std::vector<pe_hit_t> *const hits[2] = nullptr,
+				int32_t *const moved_span[2] = nullptr);
 /* sampe's pairing of one pair, for the unit tests' reference: `arr` holds upstream's
  * (position, k<<2 | strand<<1 | end) array for the pair (sorted in place); the alignments are
  * p[0]->aln and p[1]->aln. Returns the number of alignments whose position changed. */
@@ -97,15 +128,43 @@ constexpr long long ALN_PE_GROUP_ROWS = 8192;
  * pairs of weight up to group_rows: pairing rows, plus a bound on extra hits, plus one per pair;
  * a heavier pair is a group alone. The output does not depend on group_rows. */
 int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows);
+						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows,
+						const std::vector<pe_hit_t> *const hits[2] = nullptr,
+						int32_t *const moved_span[2] = nullptr);
 
 /* Mate Smith-Waterman for unpaired reads: upstream's bwa_paired_sw without its stderr report
  * (the driver calls these two directly; upstream's wrapper is not kept). Does nothing unless popt->is_sw and ii->avg >= 0;
  * otherwise adds its singleton (index 1) and discordant (index 0) counts to n_tot and
- * n_mapped. Independent per pair; no RNG. bwa_paired_sw_report prints the counts. */
+ * n_mapped. Independent per pair; no RNG. bwa_paired_sw_report prints the counts.
+ * With `alt` (--known-snvs), the mate is also aligned against the window with each site allele in
+ * it substituted, one at a time, and aln_rescue_pick chooses among those alignments; its counts are
+ * against that window. alt_site[j][i] is then set for every read the rescue moves: the substituted
+ * site allele (aln_site_key), or -1. */
 void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,
-						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2]);
+						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2],
+						const pe_alt_sites_t *alt = nullptr, int64_t *const alt_site[2] = nullptr);
 void bwa_paired_sw_report(const uint64_t n_tot[2], const uint64_t n_mapped[2]);
+
+/* --known-snvs mate rescue: one alignment of the mate in its rescue window, against the reference
+ * or with one site allele in place. `site` is the caller's tag for the trial (not read here). */
+struct pe_rescue_trial_t {
+	bwa_cigar_t *cigar; // null: the trial found no alignment
+	int n_cigar;
+	uint32_t cnt;       // n_mm<<16 | n_gapo<<8 | n_gape
+	int64_t beg;
+	int score;          // the local alignment score
+	int64_t site;
+	int tie;            // no CIGAR because the best score ties at two loci that do not overlap: that
+	                    // score (at least SW_MIN_MATCH_LEN); 0 otherwise
+};
+/* The trial ALT-aware mate rescue keeps from t[0, n), or -1 for none. A trial without a CIGAR, or
+ * (popt->short_insert) one aln_rescue_within_fragment rejects for `anchor`, is never kept. Of the
+ * rest the best score wins; among equal-best trials whose loci overlap, the first in t wins (the
+ * caller's order: the reference window, then each site allele), not the lowest start. A tie at
+ * loci that do not overlap leaves none, as bwa_sw_core rejects an equal best within one window.
+ * So does a trial whose own window ties (`tie`) at a score the pick does not beat: on a genome
+ * holding both alleles the mate is then as ambiguous as that window. */
+int aln_rescue_pick(const pe_rescue_trial_t *t, int n, const bwa_seq_t *anchor, const pe_opt_t *popt);
 
 } // namespace bwa_aln
 

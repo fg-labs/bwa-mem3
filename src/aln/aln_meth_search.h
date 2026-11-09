@@ -9,6 +9,7 @@
 #include "aln_meth_realign.h"
 #include <vector>
 #include "bwtgap.h"
+#include "aln_known_snvs.h"
 namespace bwa_aln {
 struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; };
 struct aln_meth_group_t;
@@ -32,6 +33,7 @@ struct aln_meth_slot_t {
     std::map<std::tuple<int,int,int,int64_t>, size_t> loci;
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
+    aln_meth_alt_bound_t alt_bound; // ALT-index lower bound (aln_meth_alt_certificate), not the genomic width
 };
 struct aln_meth_group_t {
     const bwt_t *bwt = nullptr;
@@ -47,7 +49,9 @@ struct aln_meth_group_t {
 static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
     const gap_opt_t &opt=x->job->opt;
     return opt.s_mm>0 && opt.s_gape>=0 && opt.s_gapo>opt.s_mm &&
-        !(opt.mode&BWA_MODE_NONSTOP) && !x->job->seed_width && !x->res->flags;
+        !(opt.mode&BWA_MODE_NONSTOP) && !x->job->seed_width && !x->res->flags &&
+        (!(x->grp->ref && x->grp->ref->known_snvs) ||
+         (x->alt_bound.valid && x->len > 0 && x->len <= KS_WINDOW_HALF));
 }
 bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
 // Keep batches bounded, but only refine score boundaries when stopping is possible.

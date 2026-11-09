@@ -155,7 +155,7 @@ TEST_CASE("aln_cli: short-insert is documented and refused before single-end I/O
     fclose(capture);
     CHECK(status == 0);
     CHECK(help.find("--short-insert") != std::string::npos);
-    CHECK(help.find("unless --meth, --short-insert or --ref-span-insert is given") != std::string::npos);
+    CHECK(help.find("unless --meth, --short-insert, --ref-span-insert or --known-snvs is given") != std::string::npos);
 }
 
 TEST_CASE("aln_cli: ref-span-insert parses, is documented and is refused before single-end I/O"

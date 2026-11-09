@@ -5,6 +5,7 @@
 #include "htslib/vcf.h"
 
 #include "aln_known_snvs.h"
+#include "aln_main.h"
 #include "aln_bwt.h"
 #include "aln_meth.h"
 #include "aln_meth_realign.h"
@@ -78,7 +79,15 @@ int ks_load(const char *path, const bntseq_t *bns, const uint8_t *pac, ks_sites_
 		fprintf(stderr, "[E::aln] --known-snvs: '%s' is not a VCF or BCF file\n", path);
 		return -1;
 	}
+	if (bcf_hdr_set_samples(v.hdr, nullptr, 0) < 0) {
+		fprintf(stderr, "[E::aln] --known-snvs: cannot exclude unused samples from '%s'\n", path);
+		return -1;
+	}
 	v.rec = bcf_init();
+	if (!v.rec) {
+		fprintf(stderr, "[E::aln] --known-snvs: cannot allocate a VCF record for '%s'\n", path);
+		return -1;
+	}
 	int r;
 	while ((r = bcf_read(v.fp, v.hdr, v.rec)) == 0) {
 		bcf1_t *rec = v.rec;
@@ -239,21 +248,22 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 		return -1;
 	}
 	if (meth) { // `index --meth`: the converted index, and the original one it is checked against
-		std::string a0 = "index", a1 = "--meth", a2 = fa;
-		char *argv[] = {&a0[0], &a1[0], &a2[0], nullptr};
+		std::string a0 = "index", a1 = "--meth", a2 = "-t", a3 = std::to_string(std::max(1, n_threads)), a4 = fa;
+		char *argv[] = {&a0[0], &a1[0], &a2[0], &a3[0], &a4[0], nullptr};
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
 		optind = 1;
 		optreset = 1;
 #else
 		optind = 0;
 #endif
-		if (bwa_index(3, argv) != 0) {
+		if (bwa_index(5, argv) != 0) {
 			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows in '%s'\n", out->dir.c_str());
 			ks_windows_free(out);
 			return -1;
 		}
 		out->fmi = new FMI_search((fa + ".meth").c_str());
-		out->fmi->load_index(/*load_pac=*/false, n_threads, /*build_seed_jump=*/false); // aln never reads it
+		out->fmi->load_index(/*load_pac=*/false, n_threads, /*build_seed_jump=*/false,
+				BWAMEM_HUGETLB_OFF, /*allow_shm=*/false);
 		out->bwt = bwt_from_fmi(out->fmi);
 		out->mref = new aln_meth_ref_t();
 		if (aln_meth_ref_load(out->mref, fa.c_str(), out->fmi->idx->bns, n_threads) != 0) {
@@ -261,6 +271,9 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 			return -1;
 		}
 		out->bns = out->mref->bns;
+		// One site offset per window contig: resolve_window indexes it by the original contig rid (crid >> 1).
+		if (out->bns->n_seqs == (int)out->win.size())
+			for (const ks_window_t &w : out->win) out->mref->window_site.push_back((int32_t)(w.site_pos - w.beg));
 	} else {
 		if (bwa_idx_build(fa.c_str(), fa.c_str()) != 0) {
 			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows in '%s'\n", out->dir.c_str());
@@ -268,11 +281,13 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 			return -1;
 		}
 		out->fmi = new FMI_search(fa.c_str());
-		out->fmi->load_index(/*load_pac=*/true, n_threads, /*build_seed_jump=*/false); // aln never reads it
+		out->fmi->load_index(/*load_pac=*/true, n_threads, /*build_seed_jump=*/false,
+				BWAMEM_HUGETLB_OFF, /*allow_shm=*/false);
 		out->bns = out->fmi->idx->bns;
 		out->bwt = bwt_from_fmi(out->fmi);
 	}
-	if (out->bns->n_seqs != (int)out->win.size()) {
+	if (out->bns->n_seqs != (int)out->win.size() ||
+		(out->mref && out->mref->window_site.size() != (size_t)out->bns->n_seqs)) {
 		fprintf(stderr, "[E::aln] --known-snvs: the window index has %d contigs for %zu windows\n",
 				out->bns->n_seqs, out->win.size());
 		ks_windows_free(out);
@@ -300,12 +315,19 @@ namespace {
 
 constexpr int KS_MAX_LOCI = 256; // hits expanded per read; above it the stock result stands
 
+// Differences as the gap search counts them against max_diff (bwtgap.cpp): gap extensions only in
+// the default mode, not once -e has cleared BWA_MODE_GAPE.
+int gap_diffs(const gap_opt_t *opt, int n_mm, int n_gapo, int n_gape)
+{
+	return n_mm + n_gapo + ((opt->mode & BWA_MODE_GAPE) ? n_gape : 0);
+}
+
 struct ks_hit_t {
 	int64_t pos;       // forward-strand start in the main index's packed coordinates
 	int strand;
 	int score, n_mm, n_gapo, n_gape, ref_shift;
-	int64_t alt_site;  // packed coordinate of the site whose ALT this hit's cost assumes, or -1
-	int diffs() const { return n_mm + n_gapo + n_gape; }
+	int64_t alt_site;  // the site allele (aln_site_key) this hit's cost assumes, or -1
+	int diffs(const gap_opt_t *opt) const { return gap_diffs(opt, n_mm, n_gapo, n_gape); }
 };
 
 uint64_t mix64(uint64_t x)
@@ -370,11 +392,11 @@ ks_outcome_t ks_merge(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *b
 			const int64_t beg = win.beg + off;
 			if (win.site_pos < beg || win.site_pos >= beg + span) continue; // misses its site
 			const int64_t base = bns->anns[win.rid].offset;
-			win_hits.push_back(hit_of(q, base + beg, strand, base + win.site_pos));
+			win_hits.push_back(hit_of(q, base + beg, strand, aln_site_key(base + win.site_pos, win.alt)));
 		}
 	}
 	if (win_hits.empty()) return KS_UNTOUCHED;
-	if (len + opt->max_gape > KS_WINDOW_HALF) return KS_INCOMPLETE;
+	if ((int64_t)len + opt->max_gape > KS_WINDOW_HALF) return KS_INCOMPLETE;
 
 	// The cuts (aln's: score <= best + mismatch penalty, differences <= min(max_diff, best's + 1))
 	// come from the scores alone, so only the main search's intervals that pass them are expanded:
@@ -385,32 +407,39 @@ ks_outcome_t ks_merge(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *b
 	for (int k = 0; k < n_aln; ++k) best = std::min(best, (int)aln[k].score);
 	int best_diffs = INT32_MAX;
 	for (const ks_hit_t &h : win_hits)
-		if (h.score == best) best_diffs = std::min(best_diffs, h.diffs());
+		if (h.score == best) best_diffs = std::min(best_diffs, h.diffs(opt));
 	for (int k = 0; k < n_aln; ++k)
-		if ((int)aln[k].score == best) best_diffs = std::min(best_diffs, (int)(aln[k].n_mm + aln[k].n_gapo + aln[k].n_gape));
+		if ((int)aln[k].score == best) best_diffs = std::min(best_diffs, gap_diffs(opt, aln[k].n_mm, aln[k].n_gapo, aln[k].n_gape));
 	const int cap = std::max(std::min(max_diff, best_diffs + 1), best_diffs);
-	auto passes = [&](int score, int diffs) { return score <= best + opt->s_mm && diffs <= cap; };
+	auto passes = [&](int score, int diffs) {
+		return opt->mode & BWA_MODE_NONSTOP ? diffs <= max_diff : score <= (int64_t)best + opt->s_mm && diffs <= cap;
+	};
 	std::vector<ks_hit_t> hits;
 	n_rows = 0;
 	for (int k = 0; k < n_aln; ++k)
-		if (passes((int)aln[k].score, (int)(aln[k].n_mm + aln[k].n_gapo + aln[k].n_gape)))
+		if (passes((int)aln[k].score, gap_diffs(opt, aln[k].n_mm, aln[k].n_gapo, aln[k].n_gape)))
 			n_rows += (int64_t)(aln[k].l - aln[k].k + 1);
 	if (n_rows > KS_MAX_LOCI) return KS_INCOMPLETE;
 	for (int k = 0; k < n_aln; ++k) {
 		const bwt_aln1_t &q = aln[k];
-		if (!passes((int)q.score, (int)(q.n_mm + q.n_gapo + q.n_gape))) continue;
+		if (!passes((int)q.score, gap_diffs(opt, q.n_mm, q.n_gapo, q.n_gape))) continue;
 		const int span = len + (int)q.n_del - (int)q.n_ins;
 		for (bwtint_t r = q.k; r <= q.l; ++r) {
 			int strand;
 			const bwtint_t p = bwa_sa2pos(bns, bwt, r, span, &strand);
 			if (p == (bwtint_t)-1) continue;
-			hits.push_back(hit_of(q, (int64_t)p, strand, -1));
+			const ks_hit_t h = hit_of(q, (int64_t)p, strand, -1);
+			auto it = std::find_if(hits.begin(), hits.end(), [&](const ks_hit_t &x) {
+				return x.strand == h.strand && x.pos == h.pos;
+			});
+			if (it == hits.end()) hits.push_back(h);
+			else if (h.score < it->score) *it = h;
 		}
 	}
 	// Merge: per (strand, start) the lower score wins.
 	bool changed = false;
 	for (const ks_hit_t &h : win_hits) {
-		if (!passes(h.score, h.diffs())) continue;
+		if (!passes(h.score, h.diffs(opt))) continue;
 		auto it = std::find_if(hits.begin(), hits.end(), [&](const ks_hit_t &x) {
 			return x.strand == h.strand && x.pos == h.pos;
 		});
@@ -423,11 +452,16 @@ ks_outcome_t ks_merge(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *b
 		}
 	}
 	if (!changed) return KS_SAME;
+	if (hits.size() > KS_MAX_LOCI) return KS_INCOMPLETE;
 	std::stable_sort(hits.begin(), hits.end(), [](const ks_hit_t &a, const ks_hit_t &b) {
 		return a.score != b.score ? a.score < b.score : a.pos != b.pos ? a.pos < b.pos : a.strand < b.strand;
 	});
 	int c1 = 0;
 	while (c1 < (int)hits.size() && hits[c1].score == best) ++c1;
+	// Main-index rows crossing the forward/reverse junction may have supplied `best` but no
+	// usable position. Keep the stock outcome rather than credit an unrepresented best stratum.
+	if (c1 == 0) return KS_INCOMPLETE;
+	if (!(opt->mode & BWA_MODE_NONSTOP) && c1 > opt->max_top2) hits.resize(c1);
 	m->kept = std::move(hits);
 	m->c1 = c1;
 	m->max_diff = max_diff;
@@ -445,12 +479,15 @@ int approx_mapq(int c1, int c2, int n_mm, int max_diff)
 } // namespace
 
 ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
-						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site)
+						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site,
+						 std::vector<pe_hit_t> *hits, bool stopped)
 {
 	*alt_site = -1;
+	if (hits) hits->clear();
 	ks_merged_t m;
 	const ks_outcome_t r = ks_merge(w, bns, bwt, opt, s->len, s->aln, s->n_aln, win_aln, win_n, &m);
 	if (r != KS_CREDITED) return r;
+	if (stopped) return KS_INCOMPLETE; // a search that stopped at -m may lack competitors
 	std::vector<ks_hit_t> &kept = m.kept;
 	const int c1 = m.c1;
 	// The stock primary stays when it is still among the best; otherwise a per-read draw.
@@ -471,6 +508,10 @@ ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t
 	s->type = c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
 	s->seQ = s->mapQ = bwa_approx_mapQ(s, m.max_diff);
 	*alt_site = p.alt_site;
+	if (hits)
+		for (const ks_hit_t &h : kept) {
+			hits->push_back({h.pos, h.strand, h.score, h.n_mm, h.n_gapo, h.n_gape, h.ref_shift, (uint64_t)(h.alt_site + 1)});
+		}
 
 	if (s->multi) free(s->multi);
 	s->multi = 0; s->n_multi = 0;
@@ -484,9 +525,56 @@ ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t
 			x.gap = kept[i].n_gapo + kept[i].n_gape;
 			x.mm = kept[i].n_mm;
 			x.ref_shift = kept[i].ref_shift;
+			x.alt_site_plus1 = (uint64_t)(kept[i].alt_site + 1);
 		}
 	}
 	return KS_CREDITED;
+}
+
+bool ks_span_in_contig(const bntseq_t *bns, int64_t pos, int64_t span, int64_t contig_pos)
+{
+	if (contig_pos < 0 || contig_pos >= bns->l_pac || pos < 0 || span <= 0) return false;
+	const bntann1_t &ann = bns->anns[bns_pos2rid(bns, contig_pos)];
+	const int64_t end = ann.offset + ann.len;
+	return pos >= ann.offset && pos < end && span <= end - pos;
+}
+
+bool ks_twin_same_contig(const bntseq_t *bns, int64_t twin_pos, int64_t span, int64_t original_pos)
+{
+	return ks_span_in_contig(bns, twin_pos, span, original_pos) && std::llabs(twin_pos - original_pos) <= KS_TWIN_SLOP;
+}
+
+namespace {
+
+/* A placed read's reference span: its CIGAR's, or without one the search's len + ref_shift. This
+ * differs from pos_end, which takes len alone without a CIGAR: a gapped search hit that was never
+ * given a CIGAR still spans its deletions minus insertions (ref_shift), and an ungapped one has
+ * ref_shift 0. */
+int64_t ks_read_ref_span(const bwa_seq_t *s)
+{
+	return s->cigar ? bwa_cigar_ref_span(s->cigar, s->n_cigar) : (int64_t)s->len + s->ref_shift;
+}
+
+} // namespace
+
+bool ks_twin_read_same_contig(const bntseq_t *bns, const bwa_seq_t *twin, int64_t original_pos)
+{
+	if (twin->pos > (uint64_t)INT64_MAX) return false;
+	return ks_twin_same_contig(bns, (int64_t)twin->pos, ks_read_ref_span(twin), original_pos);
+}
+
+bool ks_twin_pair_same_contig(const bntseq_t *bns, const bwa_seq_t *twin, const bwa_seq_t *mate,
+							  int64_t original_pos, int64_t twin_span, int64_t mate_span)
+{
+	// a CIGAR, else the hit pairing moved the end to, else the search's len + ref_shift
+	auto span = [](const bwa_seq_t *s, int64_t moved) {
+		return !s->cigar && moved >= 0 ? moved : ks_read_ref_span(s);
+	};
+	if (twin->pos > (uint64_t)INT64_MAX) return false;
+	if (!ks_twin_same_contig(bns, (int64_t)twin->pos, span(twin, twin_span), original_pos)) return false;
+	if (mate->type == BWA_TYPE_NO_MATCH) return true;
+	if (mate->pos > (uint64_t)INT64_MAX) return false;
+	return ks_span_in_contig(bns, (int64_t)mate->pos, span(mate, mate_span), (int64_t)mate->pos);
 }
 
 int ks_twin_place(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
@@ -501,7 +589,7 @@ int ks_twin_place(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, 
 		const ks_hit_t &b = m.kept[0];
 		*mapq = approx_mapq(m.c1, (int)m.kept.size() - m.c1, b.n_mm, m.max_diff);
 		if (m.c1 > 1) return 0; // MAPQ 0: a tie never passes
-		return b.strand == strand && std::llabs(b.pos - pos) <= KS_TWIN_SLOP;
+		return b.strand == strand && ks_twin_same_contig(bns, b.pos, (int64_t)t->len + b.ref_shift, pos);
 	}
 	// The stock result, without a draw: c1 rows at the best score, c2 the rest.
 	if (t->n_aln == 0) return 0;
@@ -516,29 +604,94 @@ int ks_twin_place(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, 
 	const bwt_aln1_t &q = t->aln[0];
 	int s;
 	const bwtint_t p = bwa_sa2pos(bns, bwt, q.k, t->len + (int)q.n_del - (int)q.n_ins, &s);
-	return p != (bwtint_t)-1 && s == strand && std::llabs((int64_t)p - pos) <= KS_TWIN_SLOP;
+	return p != (bwtint_t)-1 && s == strand
+		&& ks_twin_same_contig(bns, (int64_t)p, (int64_t)t->len + q.n_del - q.n_ins, pos);
+}
+
+int ks_site_rel(const ks_sites_t *sites, const bntseq_t *bns, int rid, int64_t pos, int64_t key)
+{
+	if (key < 0 || !sites || rid < 0 || rid >= (int)sites->by_contig.size()) return 0;
+	const std::vector<ks_site_t> &lst = sites->by_contig[rid];
+	const int64_t off = bns->anns[rid].offset;
+	auto it = std::lower_bound(lst.begin(), lst.end(), pos - off, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
+	for (int rel = 1; it != lst.end() && rel <= 255; ++it, ++rel)
+		if (aln_site_key(off + it->pos, it->alt) == key) return rel;
+	return 0;
+}
+
+int64_t ks_site_of_rel(const ks_sites_t *sites, const bntseq_t *bns, int rid, int64_t pos, int rel)
+{
+	if (rel <= 0 || !sites || rid < 0 || rid >= (int)sites->by_contig.size()) return -1;
+	const std::vector<ks_site_t> &lst = sites->by_contig[rid];
+	const int64_t off = bns->anns[rid].offset;
+	auto it = std::lower_bound(lst.begin(), lst.end(), pos - off, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
+	if (lst.end() - it < rel) return -1;
+	it += rel - 1;
+	return aln_site_key(off + it->pos, it->alt);
 }
 
 int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t *opt, const bwa_seq_t *s,
-				  int64_t alt_site, int hyp, std::vector<ks_vote_t> *out)
+				  int64_t alt_site, int hyp, std::vector<ks_vote_t> *out, const uint8_t *pac, int cpg, int collapsed)
 {
 	out->clear();
-	if (s->type != BWA_TYPE_UNIQUE && s->type != BWA_TYPE_REPEAT) return -1;
+	if (s->type != BWA_TYPE_UNIQUE && s->type != BWA_TYPE_REPEAT && s->type != BWA_TYPE_MATESW) return -1;
 	const int rid = bns_pos2rid(bns, (int64_t)s->pos);
 	if (rid < 0) return -1;
 	const int64_t cbeg = (int64_t)s->pos - bns->anns[rid].offset;
 	const int64_t span = pos_end(s) - (int64_t)s->pos;
+	if (span > bns->anns[rid].len - cbeg) return -1;
 	const std::vector<ks_site_t> &lst = sites->by_contig[rid];
 	auto it = std::lower_bound(lst.begin(), lst.end(), cbeg, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
 	if (it == lst.end() || it->pos >= cbeg + span) return -1;
 	// The read in reference orientation (s->seq is in read order after refinement).
 	std::vector<uint8_t> rs(s->len);
 	for (int i = 0; i < s->len; ++i) rs[i] = s->strand ? (s->seq[s->len - 1 - i] > 3 ? 4 : 3 - s->seq[s->len - 1 - i]) : s->seq[i];
-	const int diffs = s->n_mm + s->n_gapo + s->n_gape;
-	const int max_diff = read_max_diff(opt, s->len);
+	int diffs = gap_diffs(opt, s->n_mm, s->n_gapo, s->n_gape); // as counted against max_diff
+	// The base the placement's cost assumes at each site: the credited site allele's ALT there,
+	// the REF elsewhere.
+	const int64_t one_pos = alt_site >= 0 ? aln_site_key_pos(alt_site) : -1;
+	const int one_alt = alt_site >= 0 ? aln_site_key_alt(alt_site) : -1;
+    // Plain refinement may normalize an adjacent gap. Count the emitted alignment against
+    // the selected allele rather than mixing its CIGAR with the search history's counts.
+    if (hyp < 0 && pac) {
+        diffs = 0;
+        int qi = 0;
+        int64_t rp = (int64_t)s->pos;
+        const int nc = s->cigar ? s->n_cigar : 1;
+        for (int j = 0; j < nc; ++j) {
+            const int op = s->cigar ? __cigar_op(s->cigar[j]) : FROM_M;
+            const int len = s->cigar ? __cigar_len(s->cigar[j]) : s->len;
+            if (op == FROM_M) {
+                for (int k = 0; k < len; ++k) {
+                    const int ref = rp == one_pos ? one_alt : (int)_get_pac(pac, rp);
+                    diffs += rs[qi] > 3 || ref != rs[qi]; ++qi; ++rp;
+                }
+            } else if (op == FROM_I || op == FROM_D) {
+                diffs += 1 + ((opt->mode & BWA_MODE_GAPE) ? len - 1 : 0);
+                if (op == FROM_I) qi += len; else rp += len;
+            } else if (op == FROM_S) qi += len;
+        }
+    }
+	const int max_diff = read_max_diff(opt, s->clip_len > 0 ? s->clip_len : s->len);
 	// Under --meth a converted base (C->T, or G->A) also reads as its source.
 	const int source = hyp == 1 ? 1 : 2, target = hyp == 1 ? 3 : 0;
-	auto in_set = [&](uint8_t b, uint8_t allele) { return b == allele || (hyp >= 0 && allele == source && b == target); };
+	const int64_t c_off = bns->anns[rid].offset, c_len = bns->anns[rid].len;
+	// Under --meth-context cpg the aligner converts only at a CpG (meth_label_cpg): the base after
+	// a C->T site, or before a G->A one, is the CpG's other half, read with the credited ALT in
+	// place; an ambiguity run at either base undoes the label.
+	auto converts_at = [&](int64_t cpos) {
+		if (hyp < 0) return false;
+		if (!cpg || !pac) return true;
+		const int64_t npos = hyp == 1 ? cpos + 1 : cpos - 1;
+		if (npos < 0 || npos >= c_len) return false;
+		const int64_t p0 = c_off + std::min(cpos, npos);
+		if (bns_cnt_ambi(bns, p0, 2, nullptr) > 0) return false;
+		const int64_t nk = c_off + npos;
+		const int nb = one_pos == nk ? one_alt : (int)_get_pac(pac, nk);
+		return nb == (hyp == 1 ? 2 : 1);
+	};
+	bool conv = false; // converts_at the current site
+	auto in_set = [&](uint8_t b, uint8_t allele) { return b == allele || (conv && allele == source && b == target); };
 	int first = -1;
 	for (; it != lst.end() && it->pos < cbeg + span; ++it) {
 		int qi = -1;
@@ -563,14 +716,17 @@ int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t 
 		}
 		if (qi < 0 || qi >= s->len) continue;
 		ks_vote_t v;
+		conv = converts_at(rpos);
+		v.conv = conv;
 		v.site = &*it;
 		v.rid = rid;
 		v.qi = qi;
 		const uint8_t b = rs[qi];
 		const bool is_ref = in_set(b, it->ref), is_alt = in_set(b, it->alt);
 		v.allele = is_ref && is_alt ? 'H' : is_ref ? 'R' : is_alt ? 'A' : 'O';
-		const bool alt_assumed = alt_site == KS_ALT_ALL || alt_site == bns->anns[rid].offset + rpos;
-		v.away = diffs - (in_set(b, alt_assumed ? it->alt : it->ref) ? 0 : 1);
+		const uint8_t assumed = one_pos == bns->anns[rid].offset + rpos ? (uint8_t)one_alt : it->ref;
+		const bool scored_match = in_set(b, assumed) || (collapsed && assumed == target && b == source);
+		v.away = diffs - (scored_match ? 0 : 1); // the site's own base is not a difference away
 		v.max_diff = max_diff;
 		if (first < 0 && (v.allele == 'R' || v.allele == 'A')) first = (int)out->size();
 		out->push_back(v);
@@ -581,12 +737,13 @@ int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t 
 void ks_twin_seq(const bwa_seq_t *s, const ks_vote_t &v, int hyp, std::vector<uint8_t> *read_order)
 {
 	// s->seq is in read order after refinement; v.qi indexes the reference-oriented read.
-	read_order->assign(s->seq, s->seq + s->len);
+	const int len = s->clip_len > 0 ? s->clip_len : s->len;
+	read_order->assign(s->seq, s->seq + len);
 	uint8_t other = v.allele == 'R' ? v.site->alt : v.site->ref;
-	if (hyp == 1 && other == 1) other = 3;      // C reads as T on a C->T strand
-	else if (hyp == 0 && other == 2) other = 0; // G reads as A on a G->A strand
-	if (s->strand) (*read_order)[s->len - 1 - v.qi] = 3 - other;
-	else (*read_order)[v.qi] = other;
+	if (hyp == 1 && v.conv && other == 1) other = 3;      // C reads as T on a C->T strand
+	else if (hyp == 0 && v.conv && other == 2) other = 0; // G reads as A on a G->A strand
+	const int qi = s->strand ? (int)s->len - 1 - v.qi : v.qi;
+	if (qi >= 0 && qi < len) (*read_order)[qi] = s->strand ? 3 - other : other;
 }
 
 void ks_format_xv(const bntseq_t *bns, const std::vector<ks_vote_t> &votes, int twin_of, int twin_same,
@@ -597,7 +754,13 @@ void ks_format_xv(const bntseq_t *bns, const std::vector<ks_vote_t> &votes, int 
 		const ks_vote_t &v = votes[i];
 		char buf[64];
 		if (!out->empty()) out->push_back(';');
-		out->append(bns->anns[v.rid].name);
+		for (const unsigned char *p = (const unsigned char *)bns->anns[v.rid].name; *p; ++p) {
+			if (*p == '%' || *p == ':' || *p == ',' || *p == ';') {
+				out->push_back('%');
+				out->push_back("0123456789ABCDEF"[*p >> 4]);
+				out->push_back("0123456789ABCDEF"[*p & 15]);
+			} else out->push_back((char)*p);
+		}
 		snprintf(buf, sizeof buf, ":%lld:%c>%c,%c,%d,%d,", (long long)v.site->pos + 1, "ACGT"[v.site->ref],
 				 "ACGT"[v.site->alt], v.allele, v.away, v.max_diff);
 		out->append(buf);
@@ -621,6 +784,90 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 		const int64_t rb = bns->anns[win.rid].offset + beg;
 		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb, rb + h.span});
 	}
+}
+
+void ks_rescue_sites(const void *ctx, int64_t beg, int64_t end, std::vector<std::pair<int64_t, uint8_t>> *out)
+{
+	const ks_rescue_ctx_t *c = (const ks_rescue_ctx_t*)ctx;
+	if (end <= beg) return;
+	const int rid0 = bns_pos2rid(c->bns, beg);
+	if (rid0 < 0) return;
+	// The range can run past its first contig (rescue windows are not clipped to one): every
+	// contig it reaches, in order.
+	for (int rid = rid0; rid < c->bns->n_seqs && c->bns->anns[rid].offset < end; ++rid) {
+		const int64_t off = c->bns->anns[rid].offset;
+		const std::vector<ks_site_t> &lst = c->sites->by_contig[rid];
+		auto it = std::lower_bound(lst.begin(), lst.end(), beg - off, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
+		for (; it != lst.end() && off + it->pos < end; ++it) {
+			if ((int)out->size() == KS_RESCUE_MAX_SITES) return;
+			out->push_back({off + it->pos, it->alt});
+		}
+	}
+}
+
+void ks_aln2seq_nodraw(const bntseq_t *bns, bwa_seq_t *s)
+{
+	// bwa_aln2seq_core's set_main branch with its draws taken from a per-read stream (erand48)
+	uint64_t h = read_seed(bns, s);
+	unsigned short x[3] = {(unsigned short)h, (unsigned short)(h >> 16), (unsigned short)(h >> 32)};
+	if (s->n_aln == 0) {
+		s->type = BWA_TYPE_NO_MATCH;
+		s->c1 = s->c2 = 0;
+		return;
+	}
+	const bwt_aln1_t *aln = s->aln;
+	int i;
+	int64_t cnt = 0;
+	const int best = aln[0].score;
+	for (i = 0; i < s->n_aln; ++i) {
+		const bwt_aln1_t *p = aln + i;
+		if (p->score > best) break;
+		if (erand48(x) * (double)(p->l - p->k + 1 + cnt) > (double)cnt) {
+			s->n_mm = p->n_mm; s->n_gapo = p->n_gapo; s->n_gape = p->n_gape;
+			s->ref_shift = (int)p->n_del - (int)p->n_ins;
+			s->score = p->score;
+			s->sa = p->k + (bwtint_t)((double)(p->l - p->k + 1) * erand48(x));
+		}
+		cnt += (int64_t)(p->l - p->k + 1);
+	}
+	s->c1 = cnt;
+	for (; i < s->n_aln; ++i) cnt += (int64_t)(aln[i].l - aln[i].k + 1);
+	s->c2 = cnt - s->c1;
+	s->type = s->c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
+}
+
+gap_opt_t ks_discovery_opt(const gap_opt_t &opt)
+{
+	gap_opt_t discovery = opt;
+	discovery.mode |= BWA_MODE_NONSTOP;
+	discovery.max_top2 = INT_MAX;
+	return discovery;
+}
+
+int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
+				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res)
+{
+	std::vector<std::vector<aln_meth_candidate_t>> extra;
+	std::vector<int> flags;
+	std::vector<aln_meth_alt_bound_t> alt_bounds;
+	if (o->ks_windows) {
+		std::vector<aln_meth_read_t> windows(n);
+		const gap_opt_t discovery = ks_discovery_opt(o->gap);
+		aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n, seqs, &discovery,
+							  o->gap.n_threads, read_no, ord, 1, o->max_xa_hits, window_dup, windows.data(), nullptr,
+							  nullptr, true);
+		extra.resize(n); flags.resize(n); alt_bounds.resize(n);
+		for (int i = 0; i < n; ++i) {
+			ks_meth_candidates(o->ks_windows, o->meth_ref->bns, windows[i], &extra[i]);
+			// Incoming flags both split duplicate groups and disable stopping in the genomic search.
+			flags[i] = windows[i].flags;
+			alt_bounds[i] = aln_meth_alt_certificate(windows[i]);
+		}
+	}
+	return aln_meth_search_batch(bwt, o->meth_ref, o->meth, n, seqs, &o->gap, o->gap.n_threads, read_no, ord, keep,
+								 o->max_xa_hits, dup, res, extra.empty() ? nullptr : extra.data(),
+								 alt_bounds.empty() ? nullptr : alt_bounds.data(), false,
+								 flags.empty() ? nullptr : flags.data());
 }
 
 } // namespace bwa_aln

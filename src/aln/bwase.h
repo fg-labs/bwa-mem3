@@ -5,7 +5,8 @@
  * MODIFIED from the original: moved into namespace bwa_aln, SAM text goes to a
  * kstring_t instead of stdout, the .sai reading is dropped, and the BWT is a
  * parameter (bwa_cal_pac_pos no longer reloads it from disk). bwa_pos_from_sa is
- * bwa_sa2pos's tail, split out so callers can batch the SA lookups. */
+ * bwa_sa2pos's tail, split out so callers can batch the SA lookups. Known-SNV refinement
+ * accepts selected alleles and emits original-reference alternative edit distances. See README.md. */
 #ifndef BWA_MEM3_ALN_BWASE_H
 #define BWA_MEM3_ALN_BWASE_H
 
@@ -37,8 +38,11 @@ void bwa_cal_pac_pos_core(const bntseq_t *bns, const bwt_t *bwt, bwa_seq_t *seq,
  * extra hit). */
 void bwa_cal_pac_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, int max_mm, float fnr);
 /* `pacseq` is the 2-bit packed forward reference (l_pac/4 + 1 bytes). Reverses each
- * read's seq in place, as upstream does. */
-void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t *pacseq);
+ * read's seq in place, as upstream does. Optional per-read ALT positions/bases affect
+ * primary CIGAR refinement only; alternatives carry their own selected allele in multi.
+ * MD/NM (including ALT-credited XA edit distances) remain relative to pacseq. */
+void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t *pacseq,
+                       const int64_t *alt_pos = nullptr, const uint8_t *alt_base = nullptr);
 /* Shared stock SAM helpers: first overlapping ambiguity run, reference end coordinates,
  * strand-aware five-prime coordinate (-1 if unmapped), and original read sequence text. */
 int aln_bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id);

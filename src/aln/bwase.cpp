@@ -13,7 +13,8 @@
  * vfprintf takes a process-wide locale lock that serialises the formatting threads (the
  * text produced is the same); bwa_sa2pos's tail is split out as bwa_pos_from_sa, and
  * bwa_cal_pac_pos makes all its SA lookups in one batch (bwt_sa_batch) before upstream's loop.
- * See README.md.
+ * Known-SNV refinement uses selected-allele CIGARs and original-reference MD/NM for
+ * primary and alternative hits. See README.md.
  *
  * aln_bns_cnt_ambi is from bwa's bntseq.c, which carries the MIT licence below (this file's
  * other code is Apache 2.0, as stated above). The reference window in bwa_refine_gapped_core
@@ -258,7 +259,7 @@ int aln_bns_cnt_ambi(const bntseq_t *bns, int64_t pos_f, int len, int *ref_id)
 	return nn;
 }
 
-static bwa_cigar_t *bwa_refine_gapped_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, ubyte_t *seq, int ref_shift, bwtint_t *_rb, int *n_cigar)
+static bwa_cigar_t *bwa_refine_gapped_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, ubyte_t *seq, int ref_shift, bwtint_t *_rb, int *n_cigar, int64_t alt_pos = -1, int alt_base = 0)
 {
 	bwa_cigar_t *cigar = 0;
 	uint32_t *cigar32 = 0;
@@ -276,6 +277,7 @@ static bwa_cigar_t *bwa_refine_gapped_core(bwtint_t l_pac, const ubyte_t *pacseq
 	rseq = (ubyte_t*)aln_malloc(re - rb);
 	bns_get_seq_into(l_pac, pacseq, rb, re, rseq, &rlen);
 	xassert(re - rb == rlen, "reference window length mismatch");
+	if (alt_pos >= rb && alt_pos < re) rseq[alt_pos - rb] = alt_base;
 	w = abs((int)rlen - len) * 1.5;
 	ksw_global(len, seq, rlen, rseq, 5, mat, 5, 1, SW_BW > w? SW_BW : w, n_cigar, &cigar32);
 	xassert(*n_cigar > 0, "global alignment returned no CIGAR");
@@ -380,7 +382,8 @@ static void bwa_correct_trimmed(bwa_seq_t *s)
 	s->len = s->full_len;
 }
 
-void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t *pacseq)
+void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t *pacseq,
+                       const int64_t *alt_pos, const uint8_t *alt_base)
 {
 	int i, j, k;
 	kstring_t *str;
@@ -392,14 +395,17 @@ void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t
 			bwt_multi1_t *q = s->multi + j;
 			int n_cigar;
 			if (q->gap) { // gapped alignment
-				q->cigar = bwa_refine_gapped_core(bns->l_pac, pacseq, s->len, q->strand? s->rseq : s->seq, q->ref_shift, &q->pos, &n_cigar);
+				q->cigar = bwa_refine_gapped_core(bns->l_pac, pacseq, s->len, q->strand? s->rseq : s->seq, q->ref_shift, &q->pos, &n_cigar,
+					q->alt_site_plus1 ? (int64_t)((q->alt_site_plus1 - 1) >> 2) : -1,
+					(int)((q->alt_site_plus1 - 1) & 3));
 				q->n_cigar = n_cigar;
 				if (q->cigar) s->multi[k++] = *q;
 			} else s->multi[k++] = *q;
 		}
 		s->n_multi = k; // this squeezes out gapped alignments which failed the CIGAR generation
 		if (s->type == BWA_TYPE_NO_MATCH || s->type == BWA_TYPE_MATESW || s->n_gapo == 0) continue;
-		s->cigar = bwa_refine_gapped_core(bns->l_pac, pacseq, s->len, s->strand? s->rseq : s->seq, s->ref_shift, &s->pos, &s->n_cigar);
+		s->cigar = bwa_refine_gapped_core(bns->l_pac, pacseq, s->len, s->strand? s->rseq : s->seq, s->ref_shift, &s->pos, &s->n_cigar,
+                                              alt_pos ? alt_pos[i] : -1, alt_base ? alt_base[i] : 0);
 		if (s->cigar == 0) s->type = BWA_TYPE_NO_MATCH;
 	}
 	// generate MD tag
@@ -411,11 +417,31 @@ void bwa_refine_gapped(const bntseq_t *bns, int n_seqs, bwa_seq_t *seqs, ubyte_t
 			s->md = bwa_cal_md1(s->n_cigar, s->cigar, s->len, s->pos, s->strand? s->rseq : s->seq, bns->l_pac, pacseq, str, &nm);
 			s->nm = nm;
 		}
+		for (j = 0; j < s->n_multi; ++j) {
+			bwt_multi1_t *q = s->multi + j;
+			if (!q->alt_site_plus1) continue; // untouched hits retain stock XA counts
+			char *md = bwa_cal_md1(q->n_cigar, q->cigar, s->len, q->pos, q->strand ? s->rseq : s->seq,
+				bns->l_pac, pacseq, str, &q->reference_nm);
+			free(md);
+		}
 	}
 	free(str->s); free(str);
 
-	// correct for trimmed reads
-	for (i = 0; i < n_seqs; ++i) bwa_correct_trimmed(seqs + i);
+	// Correct credited alternatives too: their emitted CIGAR must describe the same
+	// searched bases as reference_nm. Leave untouched alternatives byte-identical to stock.
+	for (i = 0; i < n_seqs; ++i) {
+		bwa_seq_t *s = seqs + i;
+		if (s->len != s->full_len) for (j = 0; j < s->n_multi; ++j) {
+			bwt_multi1_t *q = s->multi + j;
+			if (!q->alt_site_plus1) continue;
+			bwa_seq_t t = {};
+			t.len = s->len; t.full_len = s->full_len; t.strand = q->strand;
+			t.cigar = q->cigar; t.n_cigar = q->n_cigar;
+			bwa_correct_trimmed(&t);
+			q->cigar = t.cigar; q->n_cigar = t.n_cigar;
+		}
+		bwa_correct_trimmed(s);
+	}
 }
 
 int64_t pos_end(const bwa_seq_t *p)
@@ -561,7 +587,7 @@ void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa
 						for (k = 0; k < (int)q->n_cigar; ++k)
 							{ put_int(out, __cigar_len(q->cigar[k])); kputc("MIDS"[__cigar_op(q->cigar[k])], out); }
 					} else { put_int(out, p->len); kputc('M', out); }
-					kputc(',', out); put_int(out, q->gap + q->mm); kputc(';', out);
+					kputc(',', out); put_int(out, q->alt_site_plus1 ? q->reference_nm : q->gap + q->mm); kputc(';', out);
 				}
 			}
 		}

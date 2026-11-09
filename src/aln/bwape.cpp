@@ -12,7 +12,8 @@
  * of the code that uses them, and bwa_pe_pair is restructured into per-group phases for that.
  * The bwa_paired_sw wrapper itself is not kept (nothing calls it). bwa_pe_pairing and
  * bwa_pe_pair_grouped expose pairing and the grouping to the unit tests. Pairing sorts its rows
- * with pdqsort_128 in place of ks_introsort_128; the sorted array is the same. See README.md. */
+ * with pdqsort_128 in place of ks_introsort_128; the sorted array is the same. Known-SNV
+ * pairing consumes allele-bearing hit lists and rescue tries single-allele windows. See README.md. */
 #include "bwape.h"
 #include "aln_alloc.h"
 
@@ -39,6 +40,9 @@ typedef struct {
 	const bwt_aln1_t *aln[2];
 	// --ref-span-insert: each hit's reference span, or null to derive it from aln's n_del/n_ins
 	const int32_t *span[2];
+	// written by pairing: per end, the reference span of the hit it moved the end to, or -1 when
+	// it did not move the end (the end's ref_shift then still describes its hit)
+	int32_t moved_span[2];
 } pe_data_t;
 
 pe_opt_t *bwa_init_pe_opt(void)
@@ -60,7 +64,7 @@ pe_opt_t *bwa_init_pe_opt(void)
 #define OUTLIER_BOUND 2.0
 
 int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
-                const bntseq_t *bns, int report, bool short_insert, bool ref_span)
+                const bntseq_t *bns, int report, bool short_insert, bool ref_span, const uint8_t *excluded)
 {
 	uint64_t x, *isizes, n_ap = 0;
 	int n, i, j, tot, p25, p75, p50, max_len = 1, tmp;
@@ -70,6 +74,7 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	ii->low = ii->high = ii->high_bayesian = 0;
 	isizes = (uint64_t*)aln_calloc(n_seqs, 8);
 	for (i = 0, tot = 0; i != n_seqs; ++i) {
+		if (excluded && excluded[i]) continue;
 		bwa_seq_t *p[2];
 		p[0] = seqs[0] + i; p[1] = seqs[1] + i;
 		if (p[0]->mapQ >= 20 && p[1]->mapQ >= 20
@@ -229,6 +234,7 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 		/* Stock installs the hit only when the read moves, and keeps the old hit's ref_shift. The \
 		 * option installs the selected hit, and its span, even at the same start and strand: two \
 		 * hits there can differ in their indels, and refinement must use the paired hit's span. */ \
+		if (moved) d->moved_span[(w).y & 1] = (int32_t)hit_span(w); \
 		if (moved || ref_span) { \
 			(q)->n_mm = r->n_mm; (q)->n_gapo = r->n_gapo; (q)->n_gape = r->n_gape; (q)->strand = (w).y>>1&1; \
 			(q)->score = r->score; \
@@ -240,6 +246,7 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 
 	o_score = subo_score = (uint64_t)-1;
 	o_n = subo_n = 0;
+	d->moved_span[0] = d->moved_span[1] = -1;
 	/* pdqsort_128 in place of upstream's ks_introsort_128: both order rows by the whole
 	 * (x, y), so rows equal under it are identical bytes and the sorted array is the same
 	 * (utils.h). The guard keeps pdqsort_128 from forming a + n on an empty, null array. */
@@ -403,11 +410,12 @@ void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t
 }
 
 void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
-                      const pe_opt_t *opt, const isize_info_t *last_ii, const bntseq_t *bns, int report)
+                      const pe_opt_t *opt, const isize_info_t *last_ii, const bntseq_t *bns, int report,
+                      const uint8_t *excluded)
 {
 	// Shared stock inference/fallback; converted indices must supply the original length.
 	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len, bns, report, opt->short_insert,
-	            opt->ref_span_insert);
+	            opt->ref_span_insert, excluded);
 	if (ii->avg < 0.0 && last_ii->avg > 0.0) *ii = *last_ii;
 	if (opt->force_isize) {
 		if (report) fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");
@@ -444,6 +452,119 @@ static long long pe_pair_rows(bwa_seq_t *p[2], const pe_opt_t *opt, long long *n
 	return n_occ[0] + n_occ[1];
 }
 
+/* --known-snvs: one pair where at least one end's hits are given by position (h[j] non-empty).
+ * Upstream's per-pair body with that end's array built from its hits and the other end's from its
+ * SA rows, one lookup at a time (such pairs are few); the extra hits of a listed end are its other
+ * listed hits, under upstream's count rule. A listed end that pairing moves takes its new hit's
+ * ref_shift. */
+static int pe_pair_listed(const bntseq_t *bns, const bwt_t *bwt, bwa_seq_t *p[2],
+						  const std::vector<pe_hit_t> *h[2], const isize_info_t *ii, const pe_opt_t *opt,
+						  const gap_opt_t *gopt, int32_t moved_span[2])
+{
+	int j, cnt_chg = 0;
+	std::vector<bwt_aln1_t> syn[2];
+	long long n_occ[2];
+	for (j = 0; j < 2; ++j) {
+		n_occ[j] = 0;
+		if (!h[j]->empty()) {
+			syn[j].resize(h[j]->size());
+			for (size_t k = 0; k < h[j]->size(); ++k) {
+				const pe_hit_t &x = (*h[j])[k];
+				bwt_aln1_t &a = syn[j][k];
+				memset(&a, 0, sizeof a);
+				a.n_mm = x.n_mm, a.n_gapo = x.n_gapo, a.n_gape = x.n_gape, a.score = x.score;
+				a.n_del = x.ref_shift > 0 ? x.ref_shift : 0;
+				a.n_ins = x.ref_shift < 0 ? -x.ref_shift : 0;
+			}
+			n_occ[j] = (long long)h[j]->size();
+		} else
+			for (int k = 0; k < p[j]->n_aln; ++k) n_occ[j] += p[j]->aln[k].l - p[j]->aln[k].k + 1;
+	}
+	const bool mapped = (p[0]->type == BWA_TYPE_UNIQUE || p[0]->type == BWA_TYPE_REPEAT)
+		&& (p[1]->type == BWA_TYPE_UNIQUE || p[1]->type == BWA_TYPE_REPEAT);
+	if (mapped && (n_occ[0] > opt->max_occ || n_occ[1] > opt->max_occ)) return 0; // upstream's `continue`
+	if (mapped) {
+		std::vector<pair64_t> arr;
+		arr.reserve((size_t)(n_occ[0] + n_occ[1]));
+		for (j = 0; j < 2; ++j) {
+			if (!h[j]->empty()) {
+				for (size_t k = 0; k < h[j]->size(); ++k) {
+					pair64_t x;
+					x.x = (uint64_t)(*h[j])[k].pos;
+					x.y = (uint64_t)k<<2 | (uint64_t)(*h[j])[k].strand<<1 | (uint64_t)j;
+					arr.push_back(x);
+				}
+				continue;
+			}
+			for (int k = 0; k < p[j]->n_aln; ++k) {
+				const bwt_aln1_t *r = p[j]->aln + k;
+				const int len = opt->ref_span_insert ? (int)p[j]->len + (int)r->n_del - (int)r->n_ins
+				                                     : (int)p[j]->len + p[j]->ref_shift;
+				for (bwtint_t l = r->k; l <= r->l; ++l) {
+					int strand;
+					pair64_t x;
+					x.x = bwa_sa2pos(bns, bwt, l, len, &strand);
+					x.y = (uint64_t)k<<2 | (uint64_t)strand<<1 | (uint64_t)j;
+					arr.push_back(x);
+				}
+			}
+		}
+		pe_data_t d;
+		d.aln[0] = h[0]->empty() ? p[0]->aln : syn[0].data();
+		d.aln[1] = h[1]->empty() ? p[1]->aln : syn[1].data();
+		d.span[0] = d.span[1] = nullptr;
+		d.arr.a = arr.data(), d.arr.n = d.arr.m = arr.size();
+		cnt_chg = pairing(p, &d, opt, gopt->s_mm, ii);
+		moved_span[0] = d.moved_span[0], moved_span[1] = d.moved_span[1];
+		// ks_override keeps one hit per (start, strand), so the coordinates name the selected hit.
+		// With --ref-span-insert, pairing already installed the selected hit's span.
+		if (!opt->ref_span_insert)
+			for (j = 0; j < 2; ++j)
+				for (const pe_hit_t &x : *h[j])
+					if ((bwtint_t)x.pos == p[j]->pos && x.strand == (int)p[j]->strand) {
+						p[j]->ref_shift = x.ref_shift;
+						break;
+					}
+	}
+	if (!(opt->N_multi || opt->n_multi)) return cnt_chg;
+	for (j = 0; j < 2; ++j) {
+		bwa_seq_t *q = p[j];
+		if (q->type == BWA_TYPE_NO_MATCH) continue;
+		const int lim = (!(q->extra_flag&SAM_FPP) && p[1-j]->type != BWA_TYPE_NO_MATCH)
+			? (q->c1 + q->c2 - 1 > opt->N_multi ? opt->n_multi : opt->N_multi) : opt->n_multi;
+		if (h[j]->empty()) {
+			bwa_aln2seq_core(q->n_aln, q->aln, q, 0, lim);
+			int n_multi = 0;
+			for (int k = 0; k < q->n_multi; ++k) {
+				int strand;
+				bwt_multi1_t m = q->multi[k];
+				m.pos = bwa_sa2pos(bns, bwt, m.pos, q->len + m.ref_shift, &strand);
+				m.strand = strand;
+				if (m.pos != q->pos && m.pos != (bwtint_t)-1) q->multi[n_multi++] = m;
+			}
+			q->n_multi = n_multi;
+			continue;
+		}
+		if (!lim) continue; // as bwa_aln2seq_core with no extra hits asked for
+		free(q->multi);
+		q->multi = 0, q->n_multi = 0;
+		if (n_occ[j] > lim + 1) continue;
+		q->multi = (bwt_multi1_t*)aln_calloc((size_t)n_occ[j], sizeof(bwt_multi1_t));
+		for (const pe_hit_t &x : *h[j]) {
+			// the primary only: a hit at its start on the other strand is an alternative
+			if ((bwtint_t)x.pos == q->pos && x.strand == (int)q->strand) continue;
+			bwt_multi1_t &m = q->multi[q->n_multi++];
+			m.pos = (bwtint_t)x.pos;
+			m.strand = x.strand;
+			m.gap = x.n_gapo + x.n_gape;
+			m.mm = x.n_mm;
+			m.ref_shift = x.ref_shift;
+			m.alt_site_plus1 = x.alt_site_plus1;
+		}
+	}
+	return cnt_chg;
+}
+
 /* Upstream's loop over the pairs, restructured so that its SA lookups are made in batches. The
  * pairs are taken in groups of consecutive pairs whose weight (pairing rows + the bound on extra
  * hits + 1 per pair) is at most group_rows; a heavier pair is a group alone, so the group's
@@ -456,7 +577,8 @@ static long long pe_pair_rows(bwa_seq_t *p[2], const pe_opt_t *opt, long long *n
  * pass would read there, so the output is the same. The buffers are std::vectors: an allocation
  * failure ends the process with an uncaught std::bad_alloc rather than aln_alloc's message. */
 int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows)
+						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows,
+						const std::vector<pe_hit_t> *const hits[2], int32_t *const moved_span[2])
 {
 	int i, j, g0, g1, cnt_chg = 0;
 	if (group_rows < 1) group_rows = 1;
@@ -476,7 +598,9 @@ int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_s
 		st.clear(), st_n.clear();
 		for (g1 = g0; g1 < n_seqs; ++g1) {
 			bwa_seq_t *p[2] = {seqs[0] + g1, seqs[1] + g1};
-			long long nm, r = pe_pair_rows(p, opt, &nm);
+			long long nm = 0, r;
+			if (hits && (!hits[0][g1].empty() || !hits[1][g1].empty())) r = -3; // pe_pair_listed
+			else r = pe_pair_rows(p, opt, &nm);
 			const long long w = (r > 0? r : 0) + nm + 1;
 			if (g1 > g0 && weight + w > group_rows) break;
 			weight += w;
@@ -514,7 +638,15 @@ int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_s
 				d->aln[j] = p[j]->aln;
 			}
 			const long long s0 = st[i - g0];
+			if (moved_span) moved_span[0][i] = moved_span[1][i] = -1;
 			if (s0 == -2) continue;
+			if (s0 == -3) {
+				const std::vector<pe_hit_t> *h[2] = {hits[0] + i, hits[1] + i};
+				int32_t moved[2] = {-1, -1};
+				cnt_chg += pe_pair_listed(bns, bwt, p, h, ii, opt, gopt, moved);
+				if (moved_span) moved_span[0][i] = moved[0], moved_span[1][i] = moved[1];
+				continue;
+			}
 			if (s0 >= 0) { // only when both ends mapped
 				const long long nr = st_n[i - g0];
 				pair64_t *a = arr.data() + s0;
@@ -536,6 +668,7 @@ int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_s
 					}
 				d->arr.a = a, d->arr.n = d->arr.m = (size_t)nr;
 				cnt_chg += pairing(p, d, opt, gopt->s_mm, ii);
+				if (moved_span) moved_span[0][i] = d->moved_span[0], moved_span[1][i] = d->moved_span[1];
 			}
 
 			if (do_multi) {
@@ -578,9 +711,10 @@ int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_s
 }
 
 int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt)
+				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt,
+				const std::vector<pe_hit_t> *const hits[2], int32_t *const moved_span[2])
 {
-	return bwa_pe_pair_grouped(bns, bwt, n_seqs, seqs, ii, opt, gopt, ALN_PE_GROUP_ROWS);
+	return bwa_pe_pair_grouped(bns, bwt, n_seqs, seqs, ii, opt, gopt, ALN_PE_GROUP_ROWS, hits, moved_span);
 }
 
 int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
@@ -600,7 +734,11 @@ int bwa_cal_pac_pos_pe(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_se
 // cnt = n_mm<<16 | n_gapo<<8 | n_gape. min_ref is the reference that must remain from *beg: stock
 // requires room for the whole mate (len); --short-insert requires only SW_MIN_MATCH_LEN, so a mate
 // whose overhang runs past the reference end can still be aligned locally and clipped.
-static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, const ubyte_t *seq, int64_t *beg, int reglen, int *n_cigar, uint32_t *_cnt, int min_ref)
+// --known-snvs: sub_pos >= 0 puts sub_base at that packed position of the window (the counts are
+// then against that window), and *score gets the local score. *tie (when set) gets the best score
+// when it is tied at two loci that do not overlap, which leaves no alignment.
+static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, const ubyte_t *seq, int64_t *beg, int reglen, int *n_cigar, uint32_t *_cnt, int min_ref,
+								int64_t sub_pos = -1, int sub_base = 0, int *score = nullptr, int *tie = nullptr)
 {
 	kswr_t r;
 	uint32_t *cigar32 = 0;
@@ -621,6 +759,7 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 	ref_seq = (ubyte_t*)aln_calloc(reglen, 1);
 	for (k = *beg, l = 0; l < reglen && k < l_pac; ++k)
 		ref_seq[l++] = pacseq[k>>2] >> ((~k&3)<<1) & 3;
+	if (sub_pos >= *beg && sub_pos < *beg + (int64_t)l) ref_seq[sub_pos - *beg] = (ubyte_t)sub_base;
 
 	// do alignment
 	xtra = KSW_XSUBO | KSW_XSTART | (len < 250? KSW_XBYTE : 0);
@@ -631,6 +770,7 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 		cigar[k] = __cigar_create((cigar32[k]&0xf), (cigar32[k]>>4));
 
 	if (r.score < SW_MIN_MATCH_LEN || r.score2 == r.score || gscore != r.score) { // poor hit or tandem hits or weird alignment
+		if (tie && r.score >= SW_MIN_MATCH_LEN && r.score2 == r.score) *tie = r.score;
 		free(cigar); free(ref_seq); *n_cigar = 0;
 		return 0;
 	}
@@ -682,6 +822,7 @@ static bwa_cigar_t *bwa_sw_core(bwtint_t l_pac, const ubyte_t *pacseq, int len, 
 		}
 		*_cnt = (uint32_t)n_mm<<16 | n_gapo<<8 | n_gape;
 	}
+	if (score) *score = r.score;
 	
 	free(ref_seq);
 	return cigar;
@@ -708,20 +849,43 @@ int64_t aln_rescue_window_ceiling(const bwa_seq_t *anchor, const pe_opt_t *opt)
 bool aln_rescue_within_fragment(const bwa_seq_t *anchor, int64_t mate_beg, const bwa_cigar_t *cigar,
                                 int n_cigar)
 {
-	int64_t span = 0;
-	for (int i = 0; i < n_cigar; ++i)
-		if (__cigar_op(cigar[i]) == FROM_M || __cigar_op(cigar[i]) == FROM_D) span += __cigar_len(cigar[i]);
-	const int64_t mate_end = mate_beg + span;
+	const int64_t mate_end = mate_beg + bwa_cigar_ref_span(cigar, n_cigar);
 	const int64_t anchor_beg = (int64_t)anchor->pos, anchor_end = anchor_beg + anchor->len + anchor->ref_shift;
 	if (anchor->strand == 0) return mate_beg >= anchor_beg && mate_end >= anchor_end; // reverse mate
 	return mate_beg <= anchor_beg && mate_end <= anchor_end;                          // forward mate
 }
 
+int aln_rescue_pick(const pe_rescue_trial_t *t, int n, const bwa_seq_t *anchor, const pe_opt_t *popt)
+{
+	int pick = -1, tie = 0;
+	int64_t max_beg = 0, min_end = 0; // intersection of all eligible equal-best spans
+	for (int i = 0; i < n; ++i) {
+		tie = std::max(tie, t[i].tie);
+		if (!t[i].cigar) continue;
+		if (popt->short_insert && !aln_rescue_within_fragment(anchor, t[i].beg, t[i].cigar, t[i].n_cigar)) continue;
+		if (pick < 0 || t[i].score > t[pick].score) {
+			pick = i;
+			max_beg = t[i].beg;
+			min_end = t[i].beg + bwa_cigar_ref_span(t[i].cigar, t[i].n_cigar);
+		} else if (t[i].score == t[pick].score) {
+			max_beg = std::max(max_beg, t[i].beg);
+			min_end = std::min(min_end, t[i].beg + bwa_cigar_ref_span(t[i].cigar, t[i].n_cigar));
+		}
+	}
+	// A trial whose own window ties two loci at a score the pick does not beat leaves the mate as
+	// ambiguous as that window: the pick is not the unique best on a genome holding both alleles.
+	if (pick >= 0 && tie >= t[pick].score) return -1;
+	return pick >= 0 && max_beg >= min_end ? -1 : pick;
+}
+
 void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,
-						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2])
+						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2],
+						const pe_alt_sites_t *alt, int64_t *const alt_site[2])
 {
 	const ubyte_t *pacseq = _pacseq;
 	int i;
+	std::vector<std::pair<int64_t, uint8_t>> sites; // --known-snvs: the site alleles in a window
+	std::vector<pe_rescue_trial_t> trials;           // --known-snvs: the window's alignments
 
 	if (!popt->is_sw || ii->avg < 0.0) return;
 
@@ -731,7 +895,7 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 		p[0] = seqs[0] + i; p[1] = seqs[1] + i;
 		if ((p[0]->mapQ >= SW_MIN_MAPQ || p[1]->mapQ >= SW_MIN_MAPQ) && (p[0]->extra_flag&SAM_FPP) == 0) { // unpaired and one read has high mapQ
 			int k, n_cigar[2], is_singleton, mapQ = 0, mq_adjust[2];
-			int64_t beg[2], end[2];
+			int64_t beg[2], end[2], used_site[2] = {-1, -1};
 			bwa_cigar_t *cigar[2];
 			uint32_t cnt[2];
 
@@ -784,8 +948,27 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 					}
 				}
 				// perform SW alignment
-				cigar[k] = bwa_sw_core(bns->l_pac, pacseq, p[k]->len, seq, &beg[k], end[k] - beg[k], &n_cigar[k], &cnt[k],
-				                       popt->short_insert ? SW_MIN_MATCH_LEN : p[k]->len);
+				const int min_ref = popt->short_insert ? SW_MIN_MATCH_LEN : p[k]->len;
+				if (!alt) cigar[k] = bwa_sw_core(bns->l_pac, pacseq, p[k]->len, seq, &beg[k], end[k] - beg[k], &n_cigar[k], &cnt[k], min_ref);
+				else { // the reference window, then each site allele in it (aln_rescue_pick)
+					const int64_t beg0 = beg[k];
+					sites.clear();
+					alt->list(alt->ctx, beg0, end[k], &sites);
+					trials.assign(sites.size() + 1, pe_rescue_trial_t{nullptr, 0, 0, beg0, 0, -1, 0});
+					for (size_t t = 0; t < trials.size(); ++t) {
+						pe_rescue_trial_t &x = trials[t];
+						if (t > 0) x.site = aln_site_key(sites[t - 1].first, sites[t - 1].second);
+						x.cigar = bwa_sw_core(bns->l_pac, pacseq, p[k]->len, seq, &x.beg, end[k] - beg0, &x.n_cigar, &x.cnt, min_ref,
+											  t ? sites[t - 1].first : -1, t ? sites[t - 1].second : 0, &x.score, &x.tie);
+					}
+					const int pick = aln_rescue_pick(trials.data(), (int)trials.size(), p[1-k], popt);
+					cigar[k] = 0, n_cigar[k] = 0;
+					for (int t = 0; t < (int)trials.size(); ++t) {
+						if (t != pick) { free(trials[t].cigar); continue; }
+						cigar[k] = trials[t].cigar, n_cigar[k] = trials[t].n_cigar, cnt[k] = trials[t].cnt;
+						beg[k] = trials[t].beg, used_site[k] = trials[t].site;
+					}
+				}
 				if (cigar[k] && popt->short_insert && !aln_rescue_within_fragment(p[1-k], beg[k], cigar[k], n_cigar[k])) {
 					free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
 				}
@@ -834,6 +1017,7 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 				p[k]->n_cigar = n_cigar[k];
 				// update the rest of information
 				__set_fixed(p[1-k], p[k], beg[k], cnt[k]);
+				if (alt_site) alt_site[k][i] = used_site[k];
 			}
 			free(cigar[0]); free(cigar[1]);
 		}

@@ -180,6 +180,36 @@ private:
 	bool pending_ = false; // start() was called and neither wait() nor abandon() yet
 };
 
+/* Refine a credited primary against its selected allele without modifying the shared reference.
+ * MD/NM are still generated against the original packed reference by bwa_refine_gapped. */
+void ks_refine(const bntseq_t *bns, int n, bwa_seq_t *seqs, ubyte_t *pac, const int64_t *sites)
+{
+    if (!sites) { bwa_refine_gapped(bns, n, seqs, pac); return; }
+    std::vector<int64_t> pos(n, -1);
+    std::vector<uint8_t> bases(n, 0);
+    for (int i = 0; i < n; ++i) if (sites[i] >= 0) {
+        pos[i] = aln_site_key_pos(sites[i]); bases[i] = aln_site_key_alt(sites[i]);
+    }
+    bwa_refine_gapped(bns, n, seqs, pac, pos.data(), bases.data());
+}
+
+/* --known-snvs: each read's genomic search_incomplete before its ALT-window search, then (the
+ * window search sets the flag anew) that flag ORed with the window search's, with the read's own
+ * flag restored to the genomic search's. A read either search stopped at -m keeps its stock result. */
+static void ks_save_stopped(int n, const bwa_seq_t *seqs, std::vector<uint8_t> *stopped)
+{
+	stopped->resize(n);
+	for (int i = 0; i < n; ++i) (*stopped)[i] = seqs[i].search_incomplete ? 1 : 0;
+}
+static void ks_merge_stopped(int n, bwa_seq_t *seqs, std::vector<uint8_t> *stopped)
+{
+	for (int i = 0; i < n; ++i) {
+		const uint8_t genomic = (*stopped)[i];
+		(*stopped)[i] = genomic | (seqs[i].search_incomplete ? 1 : 0);
+		seqs[i].search_incomplete = genomic;
+	}
+}
+
 struct se_ctx_t {
 	const aln_opt_t *o;
 	const bwt_t *bwt;
@@ -189,6 +219,7 @@ struct se_ctx_t {
 	fmt_bufs_t *fb;
 	bwt_aln1_t **ks_aln = nullptr;         // --known-snvs: each read's window hits (null without)
 	const int *ks_n = nullptr;
+	const uint8_t *ks_stopped = nullptr;   // per read: its genomic or window search stopped at -m
 	std::vector<int64_t> *ks_count = nullptr; // per thread, KS_N_OUTCOMES counters each
 	struct ks_rec_t *ks_rec = nullptr;     // per read: its sites, twin and XV (with ks_aln)
 	int ks_phase = 0;                      // 0: place and print; 1: place only; 2: print only
@@ -204,6 +235,17 @@ struct ks_rec_t {
 	int twin_same = -1, twin_mapq = 0;
 };
 
+/* Appends a record's XV tag before the newline ending k (--known-snvs). */
+void ks_append_xv(kstring_t *k, const bntseq_t *bns, const ks_rec_t &r, std::string *xv)
+{
+	if (r.votes.empty()) return;
+	ks_format_xv(bns, r.votes, r.twin_of, r.twin_same, r.twin_mapq, xv);
+	--k->l;
+	kputs("\tXV:Z:", k);
+	kputs(xv->c_str(), k);
+	kputc('\n', k);
+}
+
 /* Single end, reads [st, st + n): SA to position, refinement, MD, trim correction and SAM text;
  * bwa_cal_pac_pos (with its SA lookups batched) and bwa_refine_gapped are upstream's batch loops
  * run on the slice. */
@@ -218,13 +260,14 @@ void se_post_worker(void *data, int st, int n, int tid)
 			int64_t *cnt = c->ks_count->data() + (size_t)tid * KS_N_OUTCOMES;
 			for (int i = 0; i < n; ++i)
 				++cnt[ks_override(c->o->ks_windows, c->bns, c->bwt, &c->o->gap, c->o->max_xa_hits, seqs + i,
-								  c->ks_aln[st + i], c->ks_n[st + i], &alt_site[i])];
+								  c->ks_aln[st + i], c->ks_n[st + i], &alt_site[i], nullptr,
+								  c->ks_stopped[st + i])];
 		}
-		bwa_refine_gapped(c->bns, n, seqs, c->pac);
+		ks_refine(c->bns, n, seqs, c->pac, alt_site.empty() ? nullptr : alt_site.data());
 		if (c->ks_rec) {
 			for (int i = 0; i < n; ++i) {
 				ks_rec_t &r = c->ks_rec[st + i];
-				r.twin_of = ks_site_votes(c->o->known_snvs, c->bns, &c->o->gap, seqs + i, alt_site[i], -1, &r.votes);
+				r.twin_of = ks_site_votes(c->o->known_snvs, c->bns, &c->o->gap, seqs + i, alt_site[i], -1, &r.votes, c->pac);
 				if (r.twin_of < 0) continue;
 				ks_twin_seq(seqs + i, r.votes[r.twin_of], -1, &r.tseq);
 				r.pos = (int64_t)seqs[i].pos;
@@ -239,14 +282,7 @@ void se_post_worker(void *data, int st, int n, int tid)
 	std::string xv;
 	for (int i = 0; i < n; ++i) {
 		bwa_print_sam1(k, c->bns, seqs + i, 0, c->o->gap.mode, c->o->gap.max_top2);
-		if (c->ks_rec && !c->ks_rec[st + i].votes.empty()) { // XV goes before the record's newline
-			const ks_rec_t &r = c->ks_rec[st + i];
-			ks_format_xv(c->bns, r.votes, r.twin_of, r.twin_same, r.twin_mapq, &xv);
-			--k->l;
-			kputs("\tXV:Z:", k);
-			kputs(xv.c_str(), k);
-			kputc('\n', k);
-		}
+		if (c->ks_rec) ks_append_xv(k, c->bns, c->ks_rec[st + i], &xv); // before the record's newline
 	}
 	g.len = k->l - g.off;
 	c->fb->segs[tid].push_back(g);
@@ -262,6 +298,16 @@ struct pe_ctx_t {
 	fmt_bufs_t *fb;
 	std::vector<long long> cnt_chg;       // per thread
 	std::vector<uint64_t> sw_cnt;         // per thread: n_tot[0..1], n_mapped[0..1]
+	// --known-snvs (all null without): per end, per pair
+	bwt_aln1_t **ks_aln[2] = {nullptr, nullptr}; // the window hits
+	const int *ks_n[2] = {nullptr, nullptr};
+	const uint8_t *ks_stopped[2] = {nullptr, nullptr};      // as se_ctx_t
+	std::vector<pe_hit_t> *ks_hits[2] = {nullptr, nullptr}; // a credited end's hits, for the pairing
+	int64_t *ks_alt[2] = {nullptr, nullptr};                // the final placement's ALT (aln_site_key), or -1
+	ks_rec_t *ks_rec[2] = {nullptr, nullptr};
+	std::vector<int64_t> *ks_count = nullptr;               // per thread, KS_N_OUTCOMES counters each
+	const pe_alt_sites_t *ks_rescue = nullptr;
+	int ks_phase = 0;                                       // as se_ctx_t
 };
 
 /* Paired end, pass 1 (pairs [st, st + n)): single-end mapQ and position. */
@@ -279,10 +325,52 @@ void pe_post_worker(void *data, int st, int n, int tid)
 {
 	pe_ctx_t *c = (pe_ctx_t*)data;
 	bwa_seq_t *s[2] = {c->seqs[0] + st, c->seqs[1] + st};
-	c->cnt_chg[tid] += bwa_pe_pair(c->bns, c->bwt, n, s, c->ii, &c->o->pe, &c->o->gap);
-	uint64_t *sw = &c->sw_cnt[4 * tid];
-	bwa_paired_sw_core(c->bns, c->pac, n, s, &c->o->pe, c->ii, sw, sw + 2);
-	for (int j = 0; j < 2; ++j) bwa_refine_gapped(c->bns, n, s[j], c->pac);
+	const bool ks = c->ks_aln[0] != nullptr;
+	if (c->ks_phase != 2) {
+		// --known-snvs: each end credited after the insert size is estimated from stock MAPQs
+		if (ks) {
+			int64_t *cnt = c->ks_count->data() + (size_t)tid * KS_N_OUTCOMES;
+			for (int j = 0; j < 2; ++j)
+				for (int i = 0; i < n; ++i) {
+					int64_t a;
+					++cnt[ks_override(c->o->ks_windows, c->bns, c->bwt, &c->o->gap, 0, s[j] + i,
+									  c->ks_aln[j][st + i], c->ks_n[j][st + i], &a, &c->ks_hits[j][st + i],
+									  c->ks_stopped[j][st + i])];
+				}
+		}
+		const std::vector<pe_hit_t> *h[2] = {ks ? c->ks_hits[0] + st : nullptr, ks ? c->ks_hits[1] + st : nullptr};
+		c->cnt_chg[tid] += bwa_pe_pair(c->bns, c->bwt, n, s, c->ii, &c->o->pe, &c->o->gap, ks ? h : nullptr);
+		int64_t *alt[2] = {nullptr, nullptr};
+		if (ks)
+			for (int j = 0; j < 2; ++j) {
+				alt[j] = c->ks_alt[j] + st;
+				for (int i = 0; i < n; ++i) { // the ALT site of the hit the pairing settled on
+					const std::vector<pe_hit_t> &hj = c->ks_hits[j][st + i];
+					alt[j][i] = -1;
+					for (size_t k = 0; k < hj.size(); ++k)
+						if ((bwtint_t)hj[k].pos == s[j][i].pos && hj[k].strand == (int)s[j][i].strand) {
+							alt[j][i] = (int64_t)hj[k].alt_site_plus1 - 1;
+							break;
+						}
+				}
+			}
+		uint64_t *sw = &c->sw_cnt[4 * tid];
+		bwa_paired_sw_core(c->bns, c->pac, n, s, &c->o->pe, c->ii, sw, sw + 2, ks ? c->ks_rescue : nullptr,
+						   ks ? alt : nullptr);
+		for (int j = 0; j < 2; ++j) ks_refine(c->bns, n, s[j], c->pac, alt[j]);
+		if (c->ks_rec[0])
+			for (int j = 0; j < 2; ++j)
+				for (int i = 0; i < n; ++i) {
+					ks_rec_t &r = c->ks_rec[j][st + i];
+					r.twin_of = ks_site_votes(c->o->known_snvs, c->bns, &c->o->gap, s[j] + i, alt[j][i], -1, &r.votes, c->pac);
+					if (r.twin_of < 0) continue;
+					ks_twin_seq(s[j] + i, r.votes[r.twin_of], -1, &r.tseq);
+					r.pos = (int64_t)s[j][i].pos;
+					r.strand = s[j][i].strand;
+				}
+		if (c->ks_phase == 1) return;
+	}
+	std::string xv;
 	kstring_t *k = &c->fb->buf[tid];
 	fmt_seg_t g;
 	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
@@ -290,7 +378,9 @@ void pe_post_worker(void *data, int st, int n, int tid)
 		bwa_seq_t *p0 = s[0] + i, *p1 = s[1] + i;
 		join_pair_barcodes(p0, p1);
 		bwa_print_sam1(k, c->bns, p0, p1, c->o->gap.mode, c->o->gap.max_top2);
+		if (c->ks_rec[0]) ks_append_xv(k, c->bns, c->ks_rec[0][st + i], &xv);
 		bwa_print_sam1(k, c->bns, p1, p0, c->o->gap.mode, c->o->gap.max_top2);
+		if (c->ks_rec[1]) ks_append_xv(k, c->bns, c->ks_rec[1][st + i], &xv);
 		if (strcmp(p0->name, p1->name) != 0) { // as sampe: stop after this pair
 			g.stop = st + i;
 			break;
@@ -304,6 +394,35 @@ void pe_post_worker(void *data, int st, int n, int tid)
 
 namespace {
 
+/* The run's --known-snvs summary line (per-thread KS_N_OUTCOMES counters). */
+void ks_report(const std::vector<int64_t> &count, const char *what)
+{
+	int64_t t[KS_N_OUTCOMES] = {0};
+	for (size_t i = 0; i < count.size(); ++i) t[i % KS_N_OUTCOMES] += count[i];
+	fprintf(stderr, "[M::aln] --known-snvs: %lld %s credited, %lld at a site with no change, "
+			"%lld kept stock (too many hits, too long, or a search stopped at -m)\n", (long long)t[KS_CREDITED], what,
+			(long long)t[KS_SAME], (long long)t[KS_INCOMPLETE]);
+}
+
+/* A read for the search from its bases in read order (as bwa_read_seq leaves one). full_len, when
+ * above len, is the untrimmed read's length: the search uses len, while pairing's minimum outer
+ * span uses full_len, as for the read itself. The buffers hold full_len bases (the bases past len
+ * zeroed) for a finisher that restores the full length. */
+void ks_make_read(bwa_seq_t *p, const uint8_t *read_order, int len, int is_comp, int full_len = 0)
+{
+	if (full_len < len) full_len = len;
+	p->tid = -1;
+	p->clip_len = p->len = (uint32_t)len;
+	p->full_len = (uint32_t)full_len;
+	p->seq = (ubyte_t*)aln_calloc(full_len, 1);
+	p->rseq = (ubyte_t*)aln_calloc(full_len, 1);
+	memcpy(p->seq, read_order, len);
+	memcpy(p->rseq, read_order, len);
+	seq_reverse(p->len, p->seq, 0);
+	seq_reverse(p->len, p->rseq, is_comp);
+	p->name = aln_strdup("twin");
+}
+
 /* --known-snvs: every twin of a batch searched as one more batch (main and window index), then
  * placed without a draw, so the stock drand48 stream never sees them. */
 void ks_place_twins(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, std::vector<ks_rec_t> &rec)
@@ -315,35 +434,145 @@ void ks_place_twins(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, s
 	if (nt == 0) return;
 	const int is_comp = o->gap.mode & BWA_MODE_COMPREAD;
 	bwa_seq_t *tw = (bwa_seq_t*)aln_calloc(nt, sizeof(bwa_seq_t));
-	for (int j = 0; j < nt; ++j) {
-		const std::vector<uint8_t> &t = rec[idx[j]].tseq;
-		bwa_seq_t *p = tw + j;
-		p->tid = -1;
-		p->full_len = p->clip_len = p->len = (uint32_t)t.size();
-		p->seq = (ubyte_t*)aln_calloc(t.size(), 1);
-		p->rseq = (ubyte_t*)aln_calloc(t.size(), 1);
-		memcpy(p->seq, t.data(), t.size());
-		memcpy(p->rseq, t.data(), t.size());
-		seq_reverse(p->len, p->seq, 0); // as bwa_read_seq leaves a read for the search
-		seq_reverse(p->len, p->rseq, is_comp);
-		p->name = aln_strdup("twin");
-	}
+	for (int j = 0; j < nt; ++j) ks_make_read(tw + j, rec[idx[j]].tseq.data(), (int)rec[idx[j]].tseq.size(), is_comp);
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
-	aln_search_batch(o->ks_windows->bwt, nt, tw, &o->gap, n_threads, nullptr);
+	const gap_opt_t discovery = ks_discovery_opt(o->gap);
+	aln_dup_state_t win_dup, main_dup;
+	aln_search_batch(o->ks_windows->bwt, nt, tw, &discovery, n_threads, o->share_dup_search ? &win_dup : nullptr);
 	std::vector<bwt_aln1_t*> win_aln(nt);
-	std::vector<int> win_n(nt);
+	std::vector<int> win_n(nt), incomplete(nt);
 	for (int j = 0; j < nt; ++j) {
+		incomplete[j] = tw[j].search_incomplete;
 		win_aln[j] = tw[j].aln; win_n[j] = tw[j].n_aln;
 		tw[j].aln = 0; tw[j].n_aln = 0;
 	}
-	aln_search_batch(bwt, nt, tw, &o->gap, n_threads, nullptr);
+	aln_search_batch(bwt, nt, tw, &o->gap, n_threads, o->share_dup_search ? &main_dup : nullptr);
 	for (int j = 0; j < nt; ++j) {
 		ks_rec_t &r = rec[idx[j]];
-		r.twin_same = ks_twin_place(o->ks_windows, bns, bwt, &o->gap, tw + j, win_aln[j], win_n[j], r.pos,
-									r.strand, &r.twin_mapq);
+		r.twin_same = incomplete[j] || tw[j].search_incomplete ? -1
+			: ks_twin_place(o->ks_windows, bns, bwt, &o->gap, tw + j, win_aln[j], win_n[j],
+							r.pos, r.strand, &r.twin_mapq);
 		free(win_aln[j]);
 	}
 	bwa_free_read_seq(nt, tw);
+}
+
+/* --known-snvs, paired end: each twin travels with a copy of its mate (with the same site swapped
+ * too when the mate reads REF or ALT there: the other allele's fragment), and the pairs go through the
+ * batch's pipeline (both searches, crediting, pairing with the batch's insert size, ALT-aware
+ * rescue) with the primary drawn per read, never from drand48. A twin is "same" when its end ends
+ * on the read's strand within KS_TWIN_SLOP of its start, with its whole reference span inside the
+ * read's contig, and its mate is unmapped or its mapped mate's span does not cross a contig end
+ * (ks_twin_pair_same_contig); its MAPQ is the paired one. */
+struct ks_twin_pe_ctx_t {
+	const aln_opt_t *o;
+	const bwt_t *bwt;
+	const bntseq_t *bns;
+	ubyte_t *pac;
+	const isize_info_t *ii;
+	bwa_seq_t *tw[2];
+	bwt_aln1_t **win_aln[2];
+	const int *win_n[2];
+	int *incomplete;          // per twin pair: crediting the twin was incomplete
+	int32_t *moved_span[2];   // per twin pair and end: bwa_pe_pair's moved_span
+	const pe_alt_sites_t *rescue;
+};
+
+void ks_twin_pe_worker(void *data, int st, int n, int tid)
+{
+	(void)tid;
+	ks_twin_pe_ctx_t *c = (ks_twin_pe_ctx_t*)data;
+	bwa_seq_t *s[2] = {c->tw[0] + st, c->tw[1] + st};
+	for (int j = 0; j < 2; ++j)
+		for (int i = 0; i < n; ++i) {
+			bwa_seq_t *p = s[j] + i;
+			p->n_multi = 0;
+			p->extra_flag |= SAM_FPD | (j == 0 ? SAM_FR1 : SAM_FR2);
+			ks_aln2seq_nodraw(c->bns, p);
+		}
+	bwa_pe_se_pos(c->bns, c->bwt, n, s, &c->o->gap);
+	std::vector<std::vector<pe_hit_t>> hits[2];
+	for (int j = 0; j < 2; ++j) {
+		hits[j].resize(n);
+		for (int i = 0; i < n; ++i) {
+			int64_t a;
+			const ks_outcome_t r = ks_override(c->o->ks_windows, c->bns, c->bwt, &c->o->gap, 0, s[j] + i,
+											   c->win_aln[j][st + i], c->win_n[j][st + i], &a, &hits[j][i]);
+			if (r == KS_INCOMPLETE) c->incomplete[st + i] = 1;
+		}
+	}
+	const std::vector<pe_hit_t> *h[2] = {hits[0].data(), hits[1].data()};
+	int32_t *moved[2] = {c->moved_span[0] + st, c->moved_span[1] + st};
+	bwa_pe_pair(c->bns, c->bwt, n, s, c->ii, &c->o->pe, &c->o->gap, h, moved);
+	uint64_t sw[4] = {0, 0, 0, 0};
+	bwa_paired_sw_core(c->bns, c->pac, n, s, &c->o->pe, c->ii, sw, sw + 2, c->rescue, nullptr);
+}
+
+void ks_place_twins_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
+					   const isize_info_t *ii, bwa_seq_t *const seqs[2], std::vector<ks_rec_t> rec[2],
+					   const pe_alt_sites_t *rescue)
+{
+	std::vector<std::pair<int, int>> idx; // (pair, end holding the twin)
+	for (int i = 0; i < (int)rec[0].size(); ++i)
+		for (int j = 0; j < 2; ++j)
+			if (rec[j][i].twin_of >= 0) idx.push_back({i, j});
+	const int nt = (int)idx.size();
+	if (nt == 0) return;
+	const int is_comp = o->gap.mode & BWA_MODE_COMPREAD;
+	std::vector<int> incomplete(nt, 0);
+	bwa_seq_t *tw[2];
+	for (int j = 0; j < 2; ++j) tw[j] = (bwa_seq_t*)aln_calloc(nt, sizeof(bwa_seq_t));
+	for (int t = 0; t < nt; ++t) {
+		const int i = idx[t].first, j = idx[t].second;
+		const std::vector<uint8_t> &ts = rec[j][i].tseq;
+		ks_make_read(tw[j] + t, ts.data(), (int)ts.size(), is_comp, (int)seqs[j][i].full_len);
+		const bwa_seq_t *m = seqs[1 - j] + i; // the mate, its bases in read order after refinement
+		const ks_rec_t &mr = rec[1 - j][i];
+		const ks_site_t *site = rec[j][i].votes[rec[j][i].twin_of].site;
+		std::vector<uint8_t> ms;
+		for (const ks_vote_t &v : mr.votes)
+			if (v.site == site && (v.allele == 'R' || v.allele == 'A')) ks_twin_seq(m, v, -1, &ms);
+		if (ms.empty()) ms.assign(m->seq, m->seq + m->clip_len);
+		ks_make_read(tw[1 - j] + t, ms.data(), (int)ms.size(), is_comp, (int)m->full_len);
+	}
+	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	std::vector<bwt_aln1_t*> win_aln[2];
+	std::vector<int> win_n[2];
+	for (int j = 0; j < 2; ++j) {
+		const gap_opt_t discovery = ks_discovery_opt(o->gap);
+		aln_dup_state_t win_dup, main_dup;
+		aln_search_batch(o->ks_windows->bwt, nt, tw[j], &discovery, n_threads, o->share_dup_search ? &win_dup : nullptr);
+		win_aln[j].resize(nt);
+		win_n[j].resize(nt);
+		for (int t = 0; t < nt; ++t) {
+			incomplete[t] |= tw[j][t].search_incomplete;
+			win_aln[j][t] = tw[j][t].aln; win_n[j][t] = tw[j][t].n_aln;
+			tw[j][t].aln = 0; tw[j][t].n_aln = 0;
+		}
+		aln_search_batch(bwt, nt, tw[j], &o->gap, n_threads, o->share_dup_search ? &main_dup : nullptr);
+		for (int t = 0; t < nt; ++t) incomplete[t] |= tw[j][t].search_incomplete;
+	}
+	ks_twin_pe_ctx_t c;
+	c.o = o, c.bwt = bwt, c.bns = bns, c.pac = pac, c.ii = ii;
+	for (int j = 0; j < 2; ++j) c.tw[j] = tw[j], c.win_aln[j] = win_aln[j].data(), c.win_n[j] = win_n[j].data();
+	c.incomplete = incomplete.data();
+	std::vector<int32_t> moved_span[2];
+	for (int j = 0; j < 2; ++j) moved_span[j].assign(nt, -1), c.moved_span[j] = moved_span[j].data();
+	c.rescue = rescue;
+	kt_for_nt(ks_twin_pe_worker, &c, nt, n_threads);
+	for (int t = 0; t < nt; ++t) {
+		const int i = idx[t].first, j = idx[t].second;
+		ks_rec_t &r = rec[j][i];
+		const bwa_seq_t *q = tw[j] + t;
+		r.twin_mapq = q->mapQ;
+		if (incomplete[t]) r.twin_same = -1;
+		else r.twin_same = q->type != BWA_TYPE_NO_MATCH && (int)q->strand == r.strand
+			&& ks_twin_pair_same_contig(bns, q, tw[1 - j] + t, r.pos, moved_span[j][t], moved_span[1 - j][t]);
+	}
+	for (int j = 0; j < 2; ++j) {
+		for (bwt_aln1_t *a : win_aln[j]) free(a);
+		bwa_free_read_seq(nt, tw[j]);
+	}
 }
 
 } // namespace
@@ -373,6 +602,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	read_batch(&cur);
 	if (bwa_seq_report_read_error(ks)) ret = 1; // cur.seqs is then 0: no batch is processed
 	background_task_t ahead;
+	aln_dup_state_t win_dup_state;
 	aln_dup_state_t dup_state; // this run's duplicate check (see aln_search_batch)
 	aln_dup_state_t *dup = o->share_dup_search? &dup_state : nullptr;
 	while (cur.seqs) {
@@ -386,6 +616,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		// --known-snvs: the same search on the ALT windows, kept beside the main search's hits
 		std::vector<bwt_aln1_t*> ks_aln;
 		std::vector<int> ks_n;
+		std::vector<uint8_t> ks_stopped;
 		if (o->ks_windows) {
 			ks_aln.resize(n_seqs);
 			ks_n.resize(n_seqs);
@@ -393,7 +624,11 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 				ks_aln[i] = seqs[i].aln; ks_n[i] = seqs[i].n_aln;
 				seqs[i].aln = 0; seqs[i].n_aln = 0;
 			}
-			aln_search_batch(o->ks_windows->bwt, n_seqs, seqs, &o->gap, o->gap.n_threads, nullptr);
+			ks_save_stopped(n_seqs, seqs, &ks_stopped);
+			const gap_opt_t discovery = ks_discovery_opt(o->gap);
+			aln_search_batch(o->ks_windows->bwt, n_seqs, seqs, &discovery, o->gap.n_threads,
+			                 o->share_dup_search ? &win_dup_state : nullptr);
+			ks_merge_stopped(n_seqs, seqs, &ks_stopped);
 			for (int i = 0; i < n_seqs; ++i) {
 				std::swap(ks_aln[i], seqs[i].aln);
 				std::swap(ks_n[i], seqs[i].n_aln);
@@ -407,6 +642,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		if (o->ks_windows) {
 			c.ks_aln = ks_aln.data();
 			c.ks_n = ks_n.data();
+			c.ks_stopped = ks_stopped.data();
 			c.ks_count = &ks_count;
 			ks_rec.resize(n_seqs);
 			c.ks_rec = ks_rec.data();
@@ -434,13 +670,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		}
 		cur = next;
 	}
-	if (o->ks_windows && bwa_verbose >= 3) {
-		int64_t t[KS_N_OUTCOMES] = {0};
-		for (size_t i = 0; i < ks_count.size(); ++i) t[i % KS_N_OUTCOMES] += ks_count[i];
-		fprintf(stderr, "[M::aln] --known-snvs: %lld reads credited, %lld at a site with no change, "
-				"%lld kept stock (too many hits or too long)\n", (long long)t[KS_CREDITED],
-				(long long)t[KS_SAME], (long long)t[KS_INCOMPLETE]);
-	}
+	if (o->ks_windows && bwa_verbose >= 3) ks_report(ks_count, "reads");
 	if (bwa_seq_n_bad(ks)) ret = 1; // malformed records were skipped (and named on stderr)
 	// Not fatal (stock's err_gzclose exits): the caller still closes the output, so a BAM is
 	// flushed and terminated before the run exits 1.
@@ -566,18 +796,41 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 {
 	srand48(bns->seed); // once per run, never per batch
 	// each file's own duplicate check: one mate's batches need not look like the other's
-	aln_dup_state_t dup_state[2];
+	aln_dup_state_t dup_state[2], win_dup_state[2];
 	aln_dup_state_t *dup[2] = {nullptr, nullptr};
 	if (o->share_dup_search) dup[0] = &dup_state[0], dup[1] = &dup_state[1];
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
-	return run_pe_batches(o, fn_fq1, fn_fq2, out,
+	std::vector<int64_t> ks_count((size_t)n_threads * KS_N_OUTCOMES, 0);
+	ks_rescue_ctx_t ks_rctx = {o->known_snvs, bns};
+	const pe_alt_sites_t ks_rescue = {ks_rescue_sites, &ks_rctx};
+	const int ret = run_pe_batches(o, fn_fq1, fn_fq2, out,
 		[&](int n_seqs, const int *n_in, bwa_seq_t **seqs, fmt_bufs_t &fb,
 			isize_info_t &last_ii, int64_t) {
 		// each file is its own batch: the gap-open cap follows that file's longest read
+		std::vector<bwt_aln1_t*> ks_aln[2];
+		std::vector<int> ks_n[2];
+		std::vector<uint8_t> ks_stopped[2];
 		for (int m = 0; m < 2; ++m) {
 			const int n_shared = aln_search_batch(bwt, n_in[m], seqs[m], &o->gap, o->gap.n_threads, dup[m]);
 			if (bwa_verbose >= 4)
 				fprintf(stderr, "[M::aln] read %d: %d of %d reads shared an identical read's search.\n", m + 1, n_shared, n_in[m]);
+			if (!o->ks_windows) continue;
+			// --known-snvs: the same search on the ALT windows, kept beside the main search's hits
+			ks_aln[m].resize(n_in[m]);
+			ks_n[m].resize(n_in[m]);
+			for (int i = 0; i < n_in[m]; ++i) {
+				ks_aln[m][i] = seqs[m][i].aln; ks_n[m][i] = seqs[m][i].n_aln;
+				seqs[m][i].aln = 0; seqs[m][i].n_aln = 0;
+			}
+			ks_save_stopped(n_in[m], seqs[m], &ks_stopped[m]);
+			const gap_opt_t discovery = ks_discovery_opt(o->gap);
+			aln_search_batch(o->ks_windows->bwt, n_in[m], seqs[m], &discovery, o->gap.n_threads,
+			                 o->share_dup_search ? &win_dup_state[m] : nullptr);
+			ks_merge_stopped(n_in[m], seqs[m], &ks_stopped[m]);
+			for (int i = 0; i < n_in[m]; ++i) {
+				std::swap(ks_aln[m][i], seqs[m][i].aln);
+				std::swap(ks_n[m][i], seqs[m][i].n_aln);
+			}
 		}
 		// bwa_cal_pac_pos_pe, stage by stage: the drand48 pass serially in stock order, then
 		// positions in parallel, the insert-size barrier, then the per-pair work in parallel
@@ -593,8 +846,32 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		// where they match stock sampe's stderr).
 		bwa_pe_isize_ref(bwt->seq_len / 2, n_seqs, seqs, &ii, &o->pe, &last_ii, nullptr, bwa_verbose >= 3);
 		c.ii = &ii;
+		std::vector<std::vector<pe_hit_t>> ks_hits[2];
+		std::vector<int64_t> ks_alt[2];
+		std::vector<ks_rec_t> ks_rec[2];
+		if (o->ks_windows) {
+			for (int j = 0; j < 2; ++j) {
+				ks_hits[j].resize(n_seqs);
+				ks_alt[j].assign(n_seqs, -1);
+				ks_rec[j].resize(n_seqs);
+				c.ks_aln[j] = ks_aln[j].data();
+				c.ks_n[j] = ks_n[j].data();
+				c.ks_stopped[j] = ks_stopped[j].data();
+				c.ks_hits[j] = ks_hits[j].data();
+				c.ks_alt[j] = ks_alt[j].data();
+				c.ks_rec[j] = ks_rec[j].data();
+			}
+			c.ks_count = &ks_count;
+			c.ks_rescue = &ks_rescue;
+			c.ks_phase = 1;
+			kt_for_nt(pe_post_worker, &c, n_seqs, n_threads);
+			ks_place_twins_pe(o, bwt, bns, pac, &ii, seqs, ks_rec, &ks_rescue);
+			c.ks_phase = 2;
+		}
 		fb.reset();
 		kt_for_nt(pe_post_worker, &c, n_seqs, n_threads);
+		for (int j = 0; j < 2; ++j)
+			for (bwt_aln1_t *a : ks_aln[j]) free(a);
 		long long cnt_chg = 0;
 		uint64_t n_tot[2] = {0, 0}, n_mapped[2] = {0, 0};
 		for (int t = 0; t < n_threads; ++t) {
@@ -606,6 +883,8 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		if (bwa_verbose >= 3 && o->pe.is_sw && ii.avg >= 0.0) bwa_paired_sw_report(n_tot, n_mapped);
 		last_ii = ii;
 	});
+	if (o->ks_windows && bwa_verbose >= 3) ks_report(ks_count, "ends");
+	return ret;
 }
 
 namespace {
@@ -632,35 +911,22 @@ void ks_place_twins_meth(const aln_opt_t *o, const bwt_t *bwt, std::vector<ks_re
 	const int is_comp = o->gap.mode & BWA_MODE_COMPREAD;
 	bwa_seq_t *tw = (bwa_seq_t*)aln_calloc(nt, sizeof(bwa_seq_t));
 	for (int j = 0; j < nt; ++j) {
-		const std::vector<uint8_t> &t = rec[idx[j]].tseq;
-		bwa_seq_t *p = tw + j;
-		p->tid = -1;
-		p->full_len = p->clip_len = p->len = (uint32_t)t.size();
-		p->seq = (ubyte_t*)aln_calloc(t.size(), 1);
-		p->rseq = (ubyte_t*)aln_calloc(t.size(), 1);
-		memcpy(p->seq, t.data(), t.size());
-		memcpy(p->rseq, t.data(), t.size());
-		seq_reverse(p->len, p->seq, 0);
-		seq_reverse(p->len, p->rseq, is_comp);
-		p->name = aln_strdup("twin");
-	}
+        const auto &t = rec[idx[j]].tseq;
+        ks_make_read(tw + j, t.data(), (int)t.size(), is_comp);
+    }
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
 	const int64_t tord = ord0 + ((int64_t)1 << 48); // past any read's ordinal
-	std::vector<aln_meth_read_t> wres((size_t)nt), tres((size_t)nt);
-	aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, nt, tw, &o->gap, n_threads, 1, tord, 1,
-						  o->max_xa_hits, nullptr, wres.data());
-	std::vector<std::vector<aln_meth_candidate_t>> extra(nt);
-	for (int j = 0; j < nt; ++j) ks_meth_candidates(o->ks_windows, o->meth_ref->bns, wres[j], &extra[j]);
-	wres.clear();
-	aln_meth_search_batch(bwt, o->meth_ref, o->meth, nt, tw, &o->gap, n_threads, 1, tord, 0, o->max_xa_hits, nullptr,
-						  tres.data(), extra.data());
+	std::vector<aln_meth_read_t> tres((size_t)nt);
+    aln_dup_state_t dup, window_dup;
+    ks_meth_search(o, bwt, nt, tw, 1, tord, 0, o->share_dup_search ? &dup : nullptr,
+                   o->share_dup_search ? &window_dup : nullptr, tres.data());
 	aln_meth_finish_se(o->meth_ref, o->meth, &o->gap, o->max_xa_hits, nt, tw, tres.data());
 	for (int j = 0; j < nt; ++j) {
 		ks_rec_t &r = rec[idx[j]];
 		const bwa_seq_t &t = tw[j];
 		r.twin_mapq = t.type == BWA_TYPE_NO_MATCH ? 0 : t.mapQ;
 		r.twin_same = t.type == BWA_TYPE_UNIQUE && (int)t.strand == r.strand &&
-					  std::llabs((int64_t)t.pos - r.pos) <= KS_TWIN_SLOP;
+					  ks_twin_read_same_contig(o->meth_ref->bns, &t, r.pos);
 	}
 	bwa_free_read_seq(nt, tw);
 }
@@ -678,7 +944,8 @@ void se_meth_post_worker(void *data, int st, int n, int tid)
 			ks_rec_t &r = c->ks_rec[st + i];
 			const aln_meth_hit_t &h = res.hits[res.main];
 			r.twin_of = ks_site_votes(o->known_snvs, o->meth_ref->bns, &o->gap, c->seqs + st + i,
-									  h.alt ? KS_ALT_ALL : -1, res.hyp, &r.votes);
+									  ks_site_of_rel(o->known_snvs, o->meth_ref->bns, h.rid, (int64_t)h.pos, h.alt),
+									  res.hyp, &r.votes, o->meth_ref->pac, o->meth->m.meth_context == METH_CTX_CPG, o->meth->m.meth_scoring == MEM_METH_SCORING_COLLAPSED);
 			if (r.twin_of < 0) continue;
 			ks_twin_seq(c->seqs + st + i, r.votes[r.twin_of], res.hyp, &r.tseq);
 			r.pos = (int64_t)c->seqs[st + i].pos;
@@ -729,6 +996,7 @@ int aln_run_se_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq, aln
 	read_batch(&cur);
 	if (bwa_seq_report_read_error(ks)) ret = 1;
 	background_task_t ahead;
+	aln_dup_state_t window_dup_state;
 	aln_dup_state_t dup_state; // this run's duplicate check (keyed on the original bases)
 	aln_dup_state_t *dup = o->share_dup_search? &dup_state : nullptr;
 	std::vector<aln_meth_read_t> res;
@@ -738,20 +1006,8 @@ int aln_run_se_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq, aln
 		bwa_seq_t *seqs = cur.seqs;
 		const int n_seqs = cur.n;
 		res.assign((size_t)n_seqs, aln_meth_read_t());
-		// --known-snvs: search the ALT windows first; the windows they find covering their site are
-		// resolved by each read's main search as candidates it may not have proposed itself
-		std::vector<std::vector<aln_meth_candidate_t>> ks_extra;
-		if (o->ks_windows) {
-			std::vector<aln_meth_read_t> wres((size_t)n_seqs);
-			aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n_seqs, seqs, &o->gap,
-								  o->gap.n_threads, 1, tot, 1, o->max_xa_hits, nullptr, wres.data());
-			ks_extra.resize(n_seqs);
-			for (int i = 0; i < n_seqs; ++i)
-				ks_meth_candidates(o->ks_windows, o->meth_ref->bns, wres[i], &ks_extra[i]);
-		}
-		const int n_shared = aln_meth_search_batch(bwt, o->meth_ref, o->meth, n_seqs, seqs, &o->gap, o->gap.n_threads,
-												   1, tot, 0, o->max_xa_hits, dup, res.data(),
-												   ks_extra.empty() ? nullptr : ks_extra.data());
+		const int n_shared = ks_meth_search(o, bwt, n_seqs, seqs, 1, tot, 0, dup,
+                                           o->share_dup_search ? &window_dup_state : nullptr, res.data());
 		if (bwa_verbose >= 4) fprintf(stderr, "[M::aln] %d of %d reads shared an identical read's search.\n", n_shared, n_seqs);
 		tot += n_seqs;
 		se_meth_ctx_t c = {o, seqs, res.data(), &fb};
@@ -797,7 +1053,18 @@ struct pe_meth_ctx_t {
 	fmt_bufs_t *fb;
 	std::vector<long long> cnt_chg;
 	std::vector<uint64_t> sw_cnt;
+	ks_rec_t *ks_rec[2] = {nullptr, nullptr}; // --known-snvs (as se_ctx_t)
+	int ks_phase = 0;
 };
+
+/* --known-snvs under --meth: the site allele (aln_site_key) a finished end's placement credits, or -1. */
+int64_t ks_meth_alt(const aln_opt_t *o, const bwa_seq_t *s, const aln_meth_read_t &r)
+{
+	if (s->type == BWA_TYPE_MATESW) return r.ks_site;
+	if (r.main < 0) return -1;
+	const aln_meth_hit_t &h = r.hits[r.main];
+	return ks_site_of_rel(o->known_snvs, o->meth_ref->bns, h.rid, (int64_t)h.pos, h.alt);
+}
 
 void pe_meth_post_worker(void *data, int st, int n, int tid)
 {
@@ -805,8 +1072,25 @@ void pe_meth_post_worker(void *data, int st, int n, int tid)
 	const aln_opt_t *o = c->o;
 	bwa_seq_t *s[2] = {c->seqs[0] + st, c->seqs[1] + st};
 	aln_meth_read_t *r[2] = {c->res[0] + st, c->res[1] + st};
-	uint64_t *sw = &c->sw_cnt[4 * tid];
-	c->cnt_chg[tid] += aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2);
+	if (c->ks_phase != 2) {
+		uint64_t *sw = &c->sw_cnt[4 * tid];
+		c->cnt_chg[tid] += aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2);
+		if (c->ks_rec[0])
+			for (int j = 0; j < 2; ++j)
+				for (int i = 0; i < n; ++i) {
+					if (s[j][i].type == BWA_TYPE_NO_MATCH) continue;
+					ks_rec_t &kr = c->ks_rec[j][st + i];
+					kr.twin_of = ks_site_votes(o->known_snvs, o->meth_ref->bns, &o->gap, s[j] + i,
+											   ks_meth_alt(o, s[j] + i, r[j][i]), r[j][i].hyp, &kr.votes,
+											   o->meth_ref->pac, o->meth->m.meth_context == METH_CTX_CPG, o->meth->m.meth_scoring == MEM_METH_SCORING_COLLAPSED);
+					if (kr.twin_of < 0) continue;
+					ks_twin_seq(s[j] + i, kr.votes[kr.twin_of], r[j][i].hyp, &kr.tseq);
+					kr.pos = (int64_t)s[j][i].pos;
+					kr.strand = s[j][i].strand;
+				}
+		if (c->ks_phase == 1) return;
+	}
+	std::string xv;
 	kstring_t *k = &c->fb->buf[tid];
 	fmt_seg_t g;
 	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
@@ -814,7 +1098,9 @@ void pe_meth_post_worker(void *data, int st, int n, int tid)
 		bwa_seq_t *p0 = s[0] + i, *p1 = s[1] + i;
 		join_pair_barcodes(p0, p1);
 		aln_meth_print_sam1(k, o->meth_ref, o->meth, p0, r[0] + i, 1, p1, o->gap.mode, o->gap.max_top2);
+		if (c->ks_rec[0]) ks_append_xv(k, o->meth_ref->bns, c->ks_rec[0][st + i], &xv);
 		aln_meth_print_sam1(k, o->meth_ref, o->meth, p1, r[1] + i, 0, p0, o->gap.mode, o->gap.max_top2);
+		if (c->ks_rec[1]) ks_append_xv(k, o->meth_ref->bns, c->ks_rec[1][st + i], &xv);
 		if (strcmp(p0->name, p1->name) != 0) {
 			g.stop = st + i;
 			break;
@@ -824,12 +1110,87 @@ void pe_meth_post_worker(void *data, int st, int n, int tid)
 	c->fb->segs[tid].push_back(g);
 }
 
+/* --known-snvs under --meth, paired end: as ks_place_twins_pe, through the --meth pipeline (window
+ * search, main search with the windows it finds, stages 1 and 2 with the batch's insert size). The
+ * twins' ordinals start past any read's, so no read's draw changes. */
+struct ks_twin_pe_meth_ctx_t {
+	const aln_opt_t *o;
+	const isize_info_t *ii;
+	bwa_seq_t *tw[2];
+	aln_meth_read_t *res[2];
+};
+
+void ks_twin_pe_meth_worker(void *data, int st, int n, int tid)
+{
+	(void)tid;
+	ks_twin_pe_meth_ctx_t *c = (ks_twin_pe_meth_ctx_t*)data;
+	const aln_opt_t *o = c->o;
+	bwa_seq_t *s[2] = {c->tw[0] + st, c->tw[1] + st};
+	aln_meth_read_t *r[2] = {c->res[0] + st, c->res[1] + st};
+	aln_meth_pe_stage1(&o->gap, n, s, r);
+	uint64_t sw[4] = {0, 0, 0, 0};
+	aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2);
+}
+
+void ks_place_twins_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const isize_info_t *ii, bwa_seq_t *const seqs[2],
+							aln_meth_read_t *const res[2], std::vector<ks_rec_t> rec[2], int64_t ord0)
+{
+	std::vector<std::pair<int, int>> idx; // (pair, end holding the twin)
+	for (int i = 0; i < (int)rec[0].size(); ++i)
+		for (int j = 0; j < 2; ++j)
+			if (rec[j][i].twin_of >= 0) idx.push_back({i, j});
+	const int nt = (int)idx.size();
+	if (nt == 0) return;
+	const int is_comp = o->gap.mode & BWA_MODE_COMPREAD;
+	bwa_seq_t *tw[2];
+	for (int j = 0; j < 2; ++j) tw[j] = (bwa_seq_t*)aln_calloc(nt, sizeof(bwa_seq_t));
+	for (int t = 0; t < nt; ++t) {
+		const int i = idx[t].first, j = idx[t].second;
+		const std::vector<uint8_t> &ts = rec[j][i].tseq;
+		ks_make_read(tw[j] + t, ts.data(), (int)ts.size(), is_comp, (int)seqs[j][i].full_len);
+		const bwa_seq_t *m = seqs[1 - j] + i;
+		const ks_site_t *site = rec[j][i].votes[rec[j][i].twin_of].site;
+		std::vector<uint8_t> ms;
+		for (const ks_vote_t &v : rec[1 - j][i].votes)
+			if (v.site == site && (v.allele == 'R' || v.allele == 'A')) ks_twin_seq(m, v, res[1 - j][i].hyp, &ms);
+		if (ms.empty()) ms.assign(m->seq, m->seq + m->clip_len);
+		ks_make_read(tw[1 - j] + t, ms.data(), (int)ms.size(), is_comp, (int)m->full_len);
+	}
+	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	const int64_t tord = ord0 + ((int64_t)1 << 48); // past any read's ordinal
+	std::vector<aln_meth_read_t> tres[2];
+	for (int j = 0; j < 2; ++j) {
+        tres[j].assign((size_t)nt, aln_meth_read_t());
+        aln_dup_state_t dup, window_dup;
+        ks_meth_search(o, bwt, nt, tw[j], j == 0 ? 1 : 0, tord, 1,
+                       o->share_dup_search ? &dup : nullptr, o->share_dup_search ? &window_dup : nullptr,
+                       tres[j].data());
+	}
+	ks_twin_pe_meth_ctx_t c;
+	c.o = o, c.ii = ii;
+	for (int j = 0; j < 2; ++j) c.tw[j] = tw[j], c.res[j] = tres[j].data();
+	kt_for_nt(ks_twin_pe_meth_worker, &c, nt, n_threads);
+	for (int t = 0; t < nt; ++t) {
+		const int i = idx[t].first, j = idx[t].second;
+		ks_rec_t &r = rec[j][i];
+		const bwa_seq_t *q = tw[j] + t;
+		r.twin_mapq = q->type == BWA_TYPE_NO_MATCH ? 0 : q->mapQ;
+		// Unlike plain paired twins (ks_twin_pair_same_contig), the mate needs no span check: no
+		// --meth placement crosses a contig. resolve_window drops a window past its contig's end,
+		// mate rescue is clipped to the anchor's contig (and stops with an error if the rescued
+		// interval leaves it), and aln_meth_realign_window rejects a contig-crossing window.
+		r.twin_same = q->type != BWA_TYPE_NO_MATCH && (int)q->strand == r.strand
+			&& ks_twin_read_same_contig(o->meth_ref->bns, q, r.pos);
+	}
+	for (int j = 0; j < 2; ++j) bwa_free_read_seq(nt, tw[j]);
+}
+
 } // namespace
 
 int aln_run_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq1, const char *fn_fq2, aln_out_t *out)
 {
 	std::vector<aln_meth_read_t> res[2];
-	aln_dup_state_t dup_state[2];
+	aln_dup_state_t dup_state[2], window_dup_state[2];
 	aln_dup_state_t *dup[2] = {nullptr, nullptr};
 	if (o->share_dup_search) dup[0] = &dup_state[0], dup[1] = &dup_state[1];
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
@@ -838,20 +1199,39 @@ int aln_run_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq1, co
 			isize_info_t &last_ii, int64_t tot) {
 		for (int m = 0; m < 2; ++m) { // each file is its own batch and stream (read 1 C->T, read 2 G->A)
 			res[m].assign((size_t)n_in[m], aln_meth_read_t());
-			const int n_shared = aln_meth_search_batch(bwt, o->meth_ref, o->meth, n_in[m], seqs[m], &o->gap, o->gap.n_threads,
-													   m == 0 ? 1 : 0, tot, 1, o->max_xa_hits, dup[m], res[m].data());
+            const int n_shared = ks_meth_search(o, bwt, n_in[m], seqs[m], m == 0 ? 1 : 0, tot, 1, dup[m],
+                                               o->share_dup_search ? &window_dup_state[m] : nullptr, res[m].data());
 			if (bwa_verbose >= 4)
 				fprintf(stderr, "[M::aln] read %d: %d of %d reads shared an identical read's search.\n", m + 1, n_shared, n_in[m]);
 		}
 		aln_meth_read_t *r[2] = {res[0].data(), res[1].data()};
 		aln_meth_pe_stage1(&o->gap, n_seqs, seqs, r);
 		isize_info_t ii;
+		// --known-snvs: exclude ALT-credited pairs from both observations and the span floor.
+		std::vector<uint8_t> ks_excluded;
+		if (o->ks_windows) {
+			ks_excluded.resize(n_seqs);
+			for (int i = 0; i < n_seqs; ++i)
+				ks_excluded[i] = ks_meth_alt(o, seqs[0] + i, r[0][i]) != -1 || ks_meth_alt(o, seqs[1] + i, r[1][i]) != -1;
+		}
 		// pairing is same-contig only, so the estimate counts only same-contig pairs
-		bwa_pe_isize_ref(o->meth_ref->bns->l_pac, n_seqs, seqs, &ii, &o->pe, &last_ii, o->meth_ref->bns, bwa_verbose >= 3);
+		bwa_pe_isize_ref(o->meth_ref->bns->l_pac, n_seqs, seqs, &ii, &o->pe, &last_ii, o->meth_ref->bns,
+						 bwa_verbose >= 3, ks_excluded.empty() ? nullptr : ks_excluded.data());
 		pe_meth_ctx_t c;
 		c.o = o, c.seqs[0] = seqs[0], c.seqs[1] = seqs[1], c.res[0] = r[0], c.res[1] = r[1], c.ii = &ii, c.fb = &fb;
 		c.cnt_chg.assign(n_threads, 0);
 		c.sw_cnt.assign(4 * n_threads, 0);
+		std::vector<ks_rec_t> ks_rec[2];
+		if (o->ks_windows) {
+			for (int j = 0; j < 2; ++j) {
+				ks_rec[j].resize(n_seqs);
+				c.ks_rec[j] = ks_rec[j].data();
+			}
+			c.ks_phase = 1;
+			kt_for_nt(pe_meth_post_worker, &c, n_seqs, n_threads);
+			ks_place_twins_pe_meth(o, bwt, &ii, seqs, r, ks_rec, tot);
+			c.ks_phase = 2;
+		}
 		fb.reset();
 		kt_for_nt(pe_meth_post_worker, &c, n_seqs, n_threads);
 		long long cnt_chg = 0;
@@ -879,7 +1259,7 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one\n");
 	fprintf(fp, "step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe\n");
 	fprintf(fp, "(two files), with no .sai files. On the tested inputs its records match bwa 0.7.19's\n");
-	fprintf(fp, "(@PG differs) unless --meth, --short-insert or --ref-span-insert is given; `-n 1e-2` is\n");
+	fprintf(fp, "(@PG differs) unless --meth, --short-insert, --ref-span-insert or --known-snvs is given; `-n 1e-2` is\n");
 	fprintf(fp, "a probability here and the integer 1 in stock.\n");
 	fprintf(fp, "<prefix> is an index made by `bwa-mem3 index` (also one made with --meth, or one staged\n");
 	fprintf(fp, "by `bwa-mem3 shm`).\n");
@@ -940,7 +1320,7 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  --known-snvs FILE   VCF/BCF of SNVs (FILTER ignored): a read carrying a site's ALT is\n"
 	            "                   placed as on a genome with both alleles, and every read over a site\n"
 	            "                   gets XV:Z (allele, differences elsewhere, budget, allele-swapped twin's\n"
-	            "                   placement) [off]; single-end, plain or --meth\n");
+	            "                   placement) [off]; single-end, paired-end and --meth\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
 	fprintf(fp, "  -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]\n");
 	fprintf(fp, "            (some errors and warnings still print at 0)\n");
@@ -1295,7 +1675,9 @@ int main_aln(int argc, char *argv[])
 		}
 	}
 
-	const char *prefix = argv[optind], *fn_fq = argv[optind + 1];
+	// read 2's path is taken now: building the --known-snvs --meth windows runs `index`, which
+	// resets getopt's optind
+	const char *prefix = argv[optind], *fn_fq = argv[optind + 1], *fn_fq2 = paired ? argv[optind + 2] : nullptr;
 	// --meth: the search runs on the converted index <prefix>.meth; the original index at <prefix>
 	// supplies the reference (both written by `bwa-mem3 index --meth`). <prefix>.meth is accepted too,
 	// unless <prefix>.meth is itself a reference indexed with --meth (it has <prefix>.meth.meth).
@@ -1449,14 +1831,6 @@ int main_aln(int argc, char *argv[])
 					"%lld duplicates skipped)\n", (long long)ks_sites.n_sites, (long long)ks_sites.n_records,
 					(long long)ks_sites.n_not_snv, (long long)ks_sites.n_duplicate);
 		if (!ks_sites.empty()) {
-			if (paired) {
-				fprintf(stderr, "[E::aln] --known-snvs with paired-end input is not supported yet\n");
-				free(meth_hdr_lines);
-				if (o.meth) aln_meth_ref_free(&meth_ref);
-				bwt_destroy(bwt);
-				delete fmi;
-				return 1;
-			}
 			if (o.meth) { // --meth realigns its candidate windows with the ALTs in place too
 				meth_ref.known_snvs = &ks_sites;
 				o.known_snvs = &ks_sites;
@@ -1496,9 +1870,9 @@ int main_aln(int argc, char *argv[])
 	free(hdr.s);
 	int ret = 1;
 	if (out) {
-		if (o.meth) ret = paired ? aln_run_pe_meth(&o, bwt, fn_fq, argv[optind + 2], out)
+		if (o.meth) ret = paired ? aln_run_pe_meth(&o, bwt, fn_fq, fn_fq2, out)
 								 : aln_run_se_meth(&o, bwt, fn_fq, out);
-		else ret = paired ? aln_run_pe(&o, bwt, bns, fmi->idx->pac, fn_fq, argv[optind + 2], out)
+		else ret = paired ? aln_run_pe(&o, bwt, bns, fmi->idx->pac, fn_fq, fn_fq2, out)
 						  : aln_run_se(&o, bwt, bns, fmi->idx->pac, fn_fq, out);
 	}
 	if (out && aln_out_close(out) != 0) ret = 1;

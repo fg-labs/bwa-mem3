@@ -222,36 +222,105 @@ How it works:
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual
   cuts. The stock primary is kept while it is still among the best.
-- `--meth`: the converted search also resolves the windows that the ALT-window search finds, with
-  the ALTs in place.
-- Reads longer than about 160 bases, and reads with more than 256 candidate loci, keep their
-  stock result.
+- Paired end: the insert size is estimated from stock placements first. Mate rescue also aligns
+  the mate against its window with each site allele substituted alone, every other site at REF,
+  for at most the window's first 32 site alleles in position order (later ones stay at REF), so at
+  most 33 alignments per window. It keeps the best score. An alignment that `--short-insert` rules
+  out of the fragment never replaces another, and equal best scores at loci that do not overlap
+  leave the mate unrescued, whether they come from two alignments or from one window whose best is
+  tied: a pick survives only if it scores above every such tie.
+- `--meth`: the converted search also resolves the windows that the ALT-window search finds. Each
+  candidate window holding a site, and each mate-rescue window holding one, is realigned against
+  the reference and then once per site allele (each ALT of a multi-allelic site separately) with
+  only that ALT in place, under the same 32-allele cap (a mate-rescue window counts only the sites
+  on its anchor's contig, since rescue never aligns past that contig). The locus keeps the cheapest alignment;
+  on a tie the reference wins, then the lower (position, ALT). An alignment in a window that only
+  the ALT-window search proposed is kept only within the read's difference limit, as the read's
+  own search would be. When its best-scoring alignment breaks the read's `-n`, `-o` or `-e`
+  limits, the window is realigned once more with its indels held to the window's own extent
+  (ungapped when the window is the read's length), and that alignment is kept if it is within
+  the limits. A pair whose placement assumes an ALT is left out of the insert-size
+  estimate.
+- Without `--meth`, reads longer than about 160 bases, reads with more than 256 candidate
+  loci, and reads whose genomic or ALT-window search stopped at the `-m` limit (it may have
+  missed equal-best loci) keep their stock search result. For paired input that end still goes
+  through pairing and ALT-aware mate rescue with its mate, so its final record can still differ
+  from stock's, for example when its mate is credited. Under `--meth` those override limits do not apply to genomic
+  refinement: discovered loci can receive ALT credit under the converted search's own limits
+  (its SA lookup budget and `-m`). Full-read ALT-window discovery still requires the read to fit
+  inside a fixed window of at most 321 bases; it cannot independently discover an over-budget
+  long read that does not fit. Genomic refinement can credit longer reads at discovered loci,
+  and paired-end mate rescue separately tries ALT-substituted rescue windows, not these fixed
+  discovery windows.
 
-Single-end only for now: paired input is refused before any output.
+CIGAR is refined against the selected ALT-substituted reference. MD and NM remain against the
+original reference, so they include the ALT difference (with the usual conversion accounting
+under `--meth`). Without `--meth`, `XM:i` is the mismatch count with the ALT credited; under `--meth`, `XM:Z` is the
+methylation call string as usual, and no record carries an ALT-credited mismatch count (`XV:Z`'s
+`away` field gives the differences outside each site). A read is unchanged when none of its
+candidate placements covers a site, with three exceptions under `--meth`: batch-wide
+insert-size effects for paired input; a read whose ALT-window search hit a work limit is reported
+as incomplete (MAPQ 0, and for pairs neither end can be promoted by pairing or rescue); and an
+unseeded read over 160 bases cannot stop early (see
+[what it does not handle](../user-guide/known-snvs.md#what-it-does-not-handle)). For paired input
+that must hold for both mates: when one mate is placed, moved or rescued
+at a site, its mate's flags, mate fields and MAPQ change with it. Under paired `--meth`, excluding
+ALT-credited pairs from the insert-size estimate can also change pairing or mate rescue for other
+pairs in the batch, even when neither mate's candidates cover a site.
 
-CIGAR, MD and NM are still against the reference, so an ALT read shows its mismatch; `XM:i` is the
-mismatch count with the ALT credited. A read that does not touch a site is unchanged.
-
-Every record with a read base aligned to a site gets `XV:Z`, one entry per such site separated by
-`;`. A site the alignment covers only with a deletion has no read base, so it gets no entry:
+Every record with a read base aligned to a site gets `XV:Z`, one entry per REF–ALT pair at each
+such site, separated by `;`: a multi-allelic site gives one entry for each ALT, all at the same
+contig and position. Positions are 1-based. A site the alignment covers only with a deletion has
+no read base, so it gets no entry:
 
 ```text
 contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq
 ```
 
 - `allele`: `R` (REF), `A` (ALT), `O` (another base), or under `--meth` `H` (the conversion can
-  explain both alleles on that strand).
-- `away`: the read's differences outside the site.
-- `max_diff`: the read's mismatch budget.
+  explain both alleles on that strand). Under `--meth` a converted base counts as its source
+  allele; under `--meth-context cpg` this equivalence applies only at a CpG, as the alignment
+  scores it. Literal REF and ALT matches still produce `R` and `A` outside CpGs; other bases are `O`.
+- `away`: the read's differences outside the site, counted as the gap search counts them
+  (mismatches, gap opens and, unless `-e` is positive, gap extensions).
+- `contig`: the reference contig name, with `%`, `:`, `,` and `;` percent-escaped as `%25`,
+  `%3A`, `%2C` and `%3B`. Split the entries and fields before decoding the contig once.
+- `max_diff`: the read's mismatch budget at its quality-trimmed search length.
 - `twin_same`, `twin_mapq`: for the first `R` or `A` site only (`NA` otherwise), the read is
-  realigned with REF and ALT swapped at that site.
-  `twin_same` is 1 when that twin lands on the same strand within 5 bases, and `twin_mapq` is
-  the twin's MAPQ. The twin never changes the read's own record or the run's random draws.
+  realigned with REF and ALT swapped at that site (as a pair, with its mate, for paired input).
+  For single-end input, `twin_same` is 1 only when the twin has one best hit, on the same strand
+  within 5 bases, with its whole reference span on the read's contig; an equal-best hit elsewhere
+  makes it 0. For paired input it is 1 when the twin end is mapped on the same strand within 5
+  bases after pairing and rescue, with its whole span on the read's contig and, without `--meth`,
+  either an unmapped mate or a mapped mate whose span does not cross a contig end. Under `--meth`,
+  hits and rescue never cross contigs. `twin_mapq` is the twin's MAPQ. An incomplete plain twin
+  search gives `NA,NA` even for the selected vote. The twin uses the original quality-trimmed
+  bases and never changes the read's own record or the run's random draws.
 
-To count alleles without reference bias, count a read at a site only when it passes the MAPQ
+For unbiased allele fractions under `--meth`, first exclude both alleles where either is a
+conversion-source base in an active strand/context: C for the alignment's CT hypothesis, G for
+GA. This includes C>A on CT and G>T on GA, not just confounded C/T or G/A pairs. At T>C on CT,
+a literal C can be identifiable as ALT while T is hidden; exclude both from fractions anyway.
+Use `XG:Z` for the alignment hypothesis, not read number or SAM orientation, so keep `XG:Z` in
+the output: the default `--meth-tags` does, `--meth-tags none` drops it, and `--meth-tags XG`
+keeps it alone. Do not infer a record's hypothesis when it lacks `XG:Z`. Under
+`--meth-context cpg`, test the allele-substituted original-reference context: the following G
+for CT or preceding C for GA must be on the same contig and neither CpG base may be ambiguous.
+If either allele context permits source-base conversion, exclude both alleles. Outside that
+context, retain the usual rules. For overlapping mates, either covering mate's exclusion removes
+the fragment. Numeric twin fields describe placement only, not counting eligibility; this
+restriction is for downstream counting and changes no alignment or tag.
+
+After that exclusion, count a read with an `R` or `A` vote only when it passes the MAPQ
 cut-off, its twin also passes (`twin_same` 1 and `twin_mapq` at or above the cut-off), and
 `away` is at most `max_diff - 1`. The last rule matters: a read already at its mismatch budget
 places only when an error at the site matches the ALT, so without it errors become ALT counts.
+Only the first `R` or `A` entry is twinned, so at a multi-allelic site the rule is not symmetric
+between the ALTs. For per-ALT counts, give each ALT its own biallelic VCF and run once with each;
+that works only when the target entry is the read's first `R` or `A` entry. If another site the
+read covers can take the twin, run with a VCF holding only the target allele.
+See [Counting alleles at known SNVs](../user-guide/known-snvs.md) for worked examples, paired-end
+fragments and the limits.
 
 This is an opt-in departure from stock output. It can change the position, MAPQ, flags and
 alternative hits of reads at the sites. Without the option the output is unchanged. With a VCF
