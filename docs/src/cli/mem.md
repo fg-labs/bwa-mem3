@@ -885,15 +885,20 @@ a chain cap is in effect, so it is a strict no-op without `--max-extend-chains`.
 The window matters: too wide and it retains — and then extends — far/spurious
 concordant chains, adding alignment CPU on chain-rich reads; sizing it to the
 aligner's own proper-pair insert bound (the auto default) admits only genuine pair
-anchors. Before the insert size is estimated (the first chunk), auto falls back to a
-built-in default.
+anchors. With [`-I`](#-i-floatfloatintint--insert-size-distribution) the bound is
+known up front and auto uses it from the first chunk on, whether or not that chunk is
+read in slices. Without `-I`, auto uses a built-in default (1000 bp) until the first
+successful FR insert-size estimate: a chunk with too few unique FR pairs publishes no
+bound, so the default can outlast the first chunk, and a later failed estimate keeps
+the previous bound.
 
 **When to use it: `--meth`.** Bisulfite's collapsed 3-letter alphabet flattens chain
 weights, so under `--max-extend-chains` the cap often drops a read's true low-weight
 chain and starves PE pairing of the anchor that lets the true concordant pair win —
 flipping both mates to a wrong concordant locus. This option recovers that anchor.
-`--fast` enables it (auto) automatically **under `--meth` only**; on non-meth data the
-cap does not regress placement, so `--fast` leaves it off to preserve the speedup.
+`--fast` enables it (auto) automatically, on non-meth data as well, where the cap
+otherwise drops the true low-weight chain on some reads too
+([#202](https://github.com/fg-labs/bwa-mem3/issues/202)).
 The recovery is **partial** (it narrows, but does not fully close, the placement gap
 to default), and with the auto window the alignment-CPU cost is **~1%** — sizing the
 window to the insert bound is what keeps it there (a wide fixed window instead retains
@@ -1269,10 +1274,11 @@ FASTQ) simply share a seed.
 Paired-end output also depends on the insert-size distribution, which bwa-mem3
 estimates per batch (as bwa and bwa-mem2 do), so for output independent of how
 the input is batched, fix the distribution with
-[`-I`](#-i-floatfloatintint--insert-size-distribution) as well. Even with `-I`,
-`--fast` and `--extend-mate-concordant` without a fixed window are not
-batch-independent: the first input slice is chained with a fallback mate window
-before the insert-size bound is applied. Single-end output needs nothing else.
+[`-I`](#-i-floatfloatintint--insert-size-distribution) as well. With `-I`, the auto
+mate window of `--fast` and `--extend-mate-concordant` uses `-I`'s bound from the
+first batch on, whether or not that batch is read in slices. Without `-I`, that
+window uses a fallback until the first successful insert-size estimate, so it depends
+on how the input is batched. Single-end output needs nothing else.
 
 `name` deviates from both upstreams, so it is a **hard error** with
 [`--compat`](#--compattarget--byte-identical-output-for-another-aligner)

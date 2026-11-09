@@ -4954,6 +4954,27 @@ static void mem_kt_for_sam(worker_t &w, int n)
     mem_kt_for_emit(worker_sam, w, n);
 }
 
+/* When -I supplied the insert-size distribution (pes0), publish its FR high
+ * bound onto opt BEFORE the align pass, so that pass's mate-concordant chain cap
+ * (--extend-mate-concordant auto, which --fast turns on) uses it as its window.
+ * Otherwise the bound is only published after pairing, and the first batch is
+ * capped with MATE_CONCORDANT_WINDOW_FALLBACK instead of the user's insert size.
+ *
+ * Both align entry points must call this: mem_process_seqs (a whole batch) and
+ * mem_align_cohort_slice (one slice of a batch). When only the first did, the
+ * first batch's chain cap depended on whether that batch was read in slices, so
+ * the same -I run gave different output with and without cohort slicing.
+ *
+ * Every later write of est_insert_high under -I (mem_pair_and_emit_cohort and
+ * mem_process_seqs, after pairing) stores this same value, so this adds no new
+ * ordering between the align and pair steps. pes index 1 = FR orientation. */
+static inline void mem_publish_fixed_insert_high(mem_opt_t *opt, const mem_pestat_t *pes0)
+{
+    if ((opt->flag & MEM_F_PE) && opt->mate_concordant_window == -1 &&
+        pes0 && !pes0[1].failed && pes0[1].high > 0)
+        opt->est_insert_high = pes0[1].high;
+}
+
 /* Does a cohort slice's SAM depend only on its own reads? Single-end always;
  * paired-end only when -I supplied the insert-size distribution, since then
  * pairing never reads the rest of the cohort's regions. */
@@ -5007,6 +5028,8 @@ void mem_align_cohort_slice(mem_opt_t *opt,
         }
     }
     w.memo = NULL;
+
+    mem_publish_fixed_insert_high(opt, pes0);
 
     uint64_t tim = __rdtsc();
     /* Single-end: emit each work item's SAM as soon as it is aligned (see
@@ -5118,16 +5141,10 @@ void mem_process_seqs(mem_opt_t *opt,
     w.seqs = seqs; w.n_processed = n_processed;
     w.pes = &pes[0];
 
-    /* When -I supplied the insert-size distribution (pes0), publish its FR high
-     * bound onto opt BEFORE worker_bwt so this chunk's mate-concordant chain cap
-     * (--extend-mate-concordant auto) honors it. Otherwise the bound is only set
-     * post-pairing at the end of this function, so a single-chunk -I run would
-     * cap with the fallback window and never use the user-provided insert size.
-     * The inferred-from-data path (pes0 == NULL) still publishes below for the
-     * next chunk. pes index 1 = FR orientation. */
-    if ((opt->flag & MEM_F_PE) && opt->mate_concordant_window == -1 &&
-        pes0 && !pes0[1].failed && pes0[1].high > 0)
-        opt->est_insert_high = pes0[1].high;
+    /* -I's bound must reach this chunk's chain cap before worker_bwt (see
+     * mem_publish_fixed_insert_high). The inferred-from-data path (pes0 == NULL)
+     * still publishes below, for the next chunk. */
+    mem_publish_fixed_insert_high(opt, pes0);
 
     //int n_ = (opt->flag & MEM_F_PE) ? n : n;   // this requires n%2==0
     int n_ = n;
