@@ -9,7 +9,11 @@ enum class aln_meth_eval_status { ok, invalid_input, resource_error, no_alignmen
 /* Fetch a validated forward-reference window (length <=65535), masking .amb runs to code N
  * before CpG labelling. Used only by aln's methylation refinement, accounting and emission. */
 void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
-    int64_t rb, int len, int rid, std::vector<uint8_t> &target);
+    int64_t rb, int len, int rid, std::vector<uint8_t> &target, int alt = 0);
+/* Whether [rb, rb + len) of contig rid holds a --known-snvs site (false without sites). With
+ * alt set, aln_meth_fetch_window puts each site's ALT in place (the first ALT at a multi-allelic
+ * position) before ambiguity masking and CpG labelling. */
+bool aln_meth_window_has_site(const aln_meth_ref_t &ref, int64_t rb, int len, int rid);
 /* Fixed-reward candidate refiner. Caller cost-ranks its raw CIGAR and owns both CIGARs.
  * Invalid/resource failures print ERROR and must not be interpreted as an absent candidate.
  * Fixed scoring uses the existing meth matrices and ksw_global; hints never certify a band.
@@ -17,6 +21,6 @@ void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
  * Query/window lengths are limited to 65535. No silent coordinate clipping or legacy bitfield casts. */
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &candidate, const ubyte_t *query, int len, int n_ins, int n_del,
-    aln_meth_alignment_t *out);
+    aln_meth_alignment_t *out, int alt = 0);
 }
 #endif

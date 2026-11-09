@@ -11,6 +11,7 @@
 #include "../../src/aln/aln_main.h"
 #include "../../src/aln/aln_meth.h"
 #include "../../src/aln/aln_meth_search.h"
+#include "../../src/aln/aln_known_snvs.h"
 #include "../../src/aln/bwaseqio.h"
 #include "../../src/aln/bwase.h"
 #include "../../src/aln/aln_out.h"
@@ -71,7 +72,7 @@ struct MethRef {
     MethRef()
     {
         dir = tmp.path();
-        fa = dir + "/ref.fa";
+        fa = dir + dir.substr(dir.rfind('/')) + ".fa"; // a unique basename: load_index attaches a staged shm index by basename
         uint32_t st = 1234567;
         c1 = aln_test::lcg_dna(st, 3000);
         c2 = aln_test::lcg_dna(st, 2000);
@@ -1531,6 +1532,69 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
         }
         ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
     }
+    free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
+TEST_CASE("aln_meth: identical reads with different --known-snvs candidates do not share a search")
+{
+    namespace ba=bwa_aln;
+    FMI_search fmi((ref().fa+".meth").c_str()); fmi.load_index(false,1);
+    auto *bwt=ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    auto *opt=ba::gap_init_opt(); opt->fnr=-1; opt->max_diff=2;
+    // A site at c1[q] (A or T) with ALT G. The read, read 1 unmethylated, is c1[q - 10, q + 15) with
+    // G at the site and two A<->G mismatches: three differences, over the budget of 2, so its own
+    // search finds nothing; the site's window as a candidate places it with G (two).
+    int q=1005;
+    while (ref().c1[q]!='A' && ref().c1[q]!='T') ++q;
+    std::string read=ref().c1.substr(q-10,25);
+    read[10]='G';
+    int n_mm=0;
+    for (int k : {3,17,6,20,2,22,4,18})
+        if (n_mm<2 && (read[k]=='A' || read[k]=='G')) read[k]=read[k]=='A'?'G':'A', ++n_mm;
+    REQUIRE(n_mm==2);
+    read=conv(read,'C','T');
+    ba::ks_sites_t sites;
+    sites.by_contig.assign(mr.bns->n_seqs,{});
+    sites.by_contig[0]={{q,(uint8_t)(ref().c1[q]=='A'?0:3),2}};
+    sites.n_sites=1;
+    mr.known_snvs=&sites;
+    const int n=8;
+    const auto fq=write_fq("ks-dups.fq",std::vector<std::string>(n,read));
+    // Only the odd copies have the window (as an incomplete window search gives one copy and not another).
+    const int64_t rb=mr.bns->anns[0].offset+q-10;
+    std::vector<std::vector<ba::aln_meth_candidate_t>> extra(n);
+    for (int i=1;i<n;i+=2) extra[i]={{0,0,1,rb,rb+25}};
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+    auto *input=ba::bwa_seq_open(fq.c_str()); int got=0;
+    auto *reads=ba::bwa_read_seq(input,n,&got,BWA_MODE_COMPREAD,0);
+    REQUIRE(got==n);
+    std::vector<ba::aln_meth_read_t> batch(n);
+    ba::aln_dup_state_t dup;
+    // every copy but the first of each candidate set shares its search
+    CHECK(ba::aln_meth_search_batch(bwt,&mr,&mo,n,reads,opt,1,1,0,0,3,&dup,batch.data(),extra.data())==n-2);
+    for (int i=0;i<n;++i) {
+        CAPTURE(i);
+        ba::aln_meth_read_t single; ba::aln_dup_state_t single_dup;
+        ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads+i,opt,1,1,i,0,3,&single_dup,&single,&extra[i]);
+        REQUIRE((single.main>=0)==(i%2==1)); // the test's premise: only the candidate places it
+        REQUIRE(batch[i].main==single.main);
+        CHECK(batch[i].c1==single.c1); CHECK(batch[i].c2==single.c2);
+        REQUIRE(batch[i].hits.size()==single.hits.size());
+        for (size_t k=0;k<single.hits.size();++k) {
+            const auto &x=batch[i].hits[k], &y=single.hits[k];
+            CHECK(std::make_tuple(x.rid,x.hyp,x.strand,x.pos,x.cost,x.span,x.alt,
+                                  x.n_cig,x.n_conv,x.n_mm,x.n_gapo,x.n_gape)==
+                  std::make_tuple(y.rid,y.hyp,y.strand,y.pos,y.cost,y.span,y.alt,
+                                  y.n_cig,y.n_conv,y.n_mm,y.n_gapo,y.n_gape));
+            if (x.n_cig==y.n_cig) { // the operations, not the cig field (an offset into r.cig)
+                const uint32_t *cx=ba::aln_meth_hit_cigar(batch[i],x), *cy=ba::aln_meth_hit_cigar(single,y);
+                CHECK(std::vector<uint32_t>(cx,cx+x.n_cig)==std::vector<uint32_t>(cy,cy+y.n_cig));
+            }
+        }
+    }
+    ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 

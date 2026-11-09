@@ -26,8 +26,10 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <algorithm>
 #include <atomic>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace bwa_aln {
@@ -176,6 +178,7 @@ template <> struct gap_group<AlnMeth> {
 		const int64_t *ord;      // per read of the (possibly compacted) batch: its ordinal in the stream
 		const uint8_t *keep;     // per read: keep both strata (others share its search), or null
 		aln_meth_read_t *res;    // per read of the (possibly compacted) batch
+		const std::vector<aln_meth_candidate_t> *extra; // per read: --known-snvs candidates, or null
 	};
 
 	static thread_local const ctx_t *ctx;
@@ -204,6 +207,7 @@ template <> struct gap_group<AlnMeth> {
 		const gap_opt_t *opt = group->opt;
 		const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
 		aln_meth_slot_start(slot(c), p, ctx->res + r, ctx->ord[r], max_diff, ctx->keep ? ctx->keep[r] : 0);
+		slot(c)->extra = ctx->extra ? ctx->extra + r : nullptr;
 	}
 	static const ubyte_t *seq(const gap_slot_core_t *c, const bwa_seq_t *) { return slot(c)->vseq.data(); }
 	static int job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start_meth(j, bwt); }
@@ -613,10 +617,17 @@ int dup_sample_check(int n_seqs, const bwa_seq_t *seqs)
  * search_all() searches the whole batch; search_uniq(n_u, uniq, rep) searches its compacted front,
  * the distinct reads (uniq[k] is the batch index of seqs[k]; rep[i] is read i's first copy); after
  * the batch is restored, copy_dup(i, rep[i]) fills duplicate i from its first copy. Returns the
- * number of duplicates, 0 when the batch was searched whole. */
-template <class SearchAll, class SearchUniq, class CopyDup>
+ * number of duplicates, 0 when the batch was searched whole. A copy i for which shares(i, rep[i])
+ * is false (its search depends on more than its bases) takes the first earlier copy it can share
+ * with among those so moved (checking at most ALN_DUP_MAX_REGROUP), or is searched as distinct. */
+constexpr int ALN_DUP_MAX_REGROUP = 16; // earlier distinct copies of one read a copy is checked against
+struct dup_shares_all {
+	bool operator()(int, int) const { return true; }
+};
+template <class SearchAll, class SearchUniq, class CopyDup, class Shares = dup_shares_all>
 static int search_batch_dedup(int n_seqs, bwa_seq_t *seqs, int n_threads, aln_dup_state_t *dup,
-							  SearchAll search_all, SearchUniq search_uniq, CopyDup copy_dup)
+							  SearchAll search_all, SearchUniq search_uniq, CopyDup copy_dup,
+							  Shares shares = Shares())
 {
 	if (!dup || n_seqs < 2) {
 		if (dup && n_seqs == 1 && dup->skip_left > 0) --dup->skip_left; // a batch of the stream too
@@ -634,7 +645,21 @@ static int search_batch_dedup(int n_seqs, bwa_seq_t *seqs, int n_threads, aln_du
 		return 0;
 	}
 	std::vector<int> rep(n_seqs);
-	const int n_dups = detail::find_dup_reads(n_seqs, seqs, rep.data(), n_threads);
+	int n_dups = detail::find_dup_reads(n_seqs, seqs, rep.data(), n_threads);
+	{ // a copy that cannot share its first copy's search shares an earlier such copy's, or is distinct
+		// moved[r]: the copies of first copy r now searched as distinct, oldest first (only this
+		// family is scanned, so a batch with many such families stays linear)
+		std::unordered_map<int, std::vector<int>> moved;
+		for (int i = 0; i < n_seqs; ++i) {
+			if (rep[i] == i || shares(i, rep[i])) continue;
+			int to = i, seen = 0;
+			std::vector<int> &fam = moved[rep[i]];
+			for (size_t k = fam.size(); k-- > 0 && seen < ALN_DUP_MAX_REGROUP; ++seen)
+				if (shares(i, fam[k])) { to = fam[k]; break; }
+			if (to == i) fam.push_back(i), --n_dups;
+			rep[i] = to;
+		}
+	}
 	if ((int64_t)n_dups * ALN_DUP_MIN_RATIO < n_seqs) {
 		// too few to be worth the compaction (the samples were wrong for this batch)
 		dup->skip_left = ALN_DUP_RECHECK - 1;
@@ -692,12 +717,14 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
-						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res)
+						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res,
+						  const std::vector<aln_meth_candidate_t> *extra)
 {
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	gap_group<AlnMeth>::ctx_t mc;
 	mc.ref = ref; mc.mo = mo; mc.read_no = read_no; mc.keep_strata = keep_strata; mc.max_xa_hits = max_xa_hits;
 	mc.keep = nullptr;
+	mc.extra = extra;
 	std::vector<int64_t> ord(n_seqs);
 	std::vector<uint8_t> has_copy(n_seqs, 0);
 	for (int i = 0; i < n_seqs; ++i) ord[i] = ord0 + i;
@@ -713,7 +740,10 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			std::vector<uint8_t> keep_c(n_u);
 			std::vector<aln_meth_read_t> res_c(n_u);
 			for (int k = 0; k < n_u; ++k) ord_c[k] = ord0 + uniq[k], keep_c[k] = has_copy[uniq[k]];
+			std::vector<std::vector<aln_meth_candidate_t>> extra_c(extra ? n_u : 0);
+			for (int k = 0; extra && k < n_u; ++k) extra_c[k] = extra[uniq[k]];
 			mc.ord = ord_c.data(); mc.keep = keep_c.data(); mc.res = res_c.data();
+			mc.extra = extra ? extra_c.data() : nullptr;
 			search_reads<AlnMeth>(bwt, n_u, seqs, &bopt, n_threads, &mc);
 			for (int k = 0; k < n_u; ++k) res[uniq[k]] = std::move(res_c[k]);
 		},
@@ -724,6 +754,16 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			// after this loop. Pairing never reads an incomplete read past its main hit.
 			aln_meth_copy_dup(&res[i], &res[first], aln_meth_draw_seed(ref, read_no, ord0 + i),
 							  keep_strata && !res[first].flags, max_xa_hits);
+		},
+		// --known-snvs: a copy shares only with the same candidate windows (an incomplete window
+		// search keeps each copy's own drawn hit, so copies' candidates can differ)
+		[&](int i, int first) {
+			if (!extra) return true;
+			const std::vector<aln_meth_candidate_t> &a = extra[i], &b = extra[first];
+			return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
+				[](const aln_meth_candidate_t &x, const aln_meth_candidate_t &y) {
+					return x.rid == y.rid && x.strand == y.strand && x.hyp == y.hyp && x.rb == y.rb && x.re == y.re;
+				});
 		});
 	for (int i = 0; i < n_seqs; ++i)
 		if (has_copy[i] && (!keep_strata || res[i].flags)) aln_meth_trim(&res[i], max_xa_hits);

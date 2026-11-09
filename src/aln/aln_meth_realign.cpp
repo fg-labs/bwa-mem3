@@ -1,5 +1,8 @@
 /* SPDX-License-Identifier: MIT */
 #include "aln_meth_realign.h"
+#include "aln_known_snvs.h"
+
+#include <algorithm>
 #include "../bwa.h"
 #include "../ksw.h"
 #include "../meth_model.h"
@@ -30,13 +33,29 @@ int mask_ambiguity(int64_t begin, int64_t end, void *context)
 
 } // namespace
 
+bool aln_meth_window_has_site(const aln_meth_ref_t &ref, int64_t rb, int len, int rid)
+{
+    if (!ref.known_snvs || rid < 0 || rid >= (int)ref.known_snvs->by_contig.size()) return false;
+    const std::vector<ks_site_t> &lst = ref.known_snvs->by_contig[rid];
+    const int64_t beg = rb - ref.bns->anns[rid].offset;
+    auto it = std::lower_bound(lst.begin(), lst.end(), beg, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
+    return it != lst.end() && it->pos < beg + len;
+}
+
 void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
-    int64_t rb, int len, int rid, std::vector<uint8_t> &target)
+    int64_t rb, int len, int rid, std::vector<uint8_t> &target, int alt)
 {
     target.resize(len);
     for (int i = 0; i < len; ++i) {
         const int64_t p = rb + i;
         target[i] = ref.pac[p >> 2] >> ((~p & 3) << 1) & 3;
+    }
+    if (alt && ref.known_snvs && rid >= 0 && rid < (int)ref.known_snvs->by_contig.size()) {
+        const std::vector<ks_site_t> &lst = ref.known_snvs->by_contig[rid];
+        const int64_t beg = rb - ref.bns->anns[rid].offset;
+        auto it = std::lower_bound(lst.begin(), lst.end(), beg, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
+        for (int64_t last = -1; it != lst.end() && it->pos < beg + len; ++it)
+            if (it->pos != last) target[it->pos - beg] = it->alt, last = it->pos;
     }
     ambiguity_window_t window{target.data(), rb};
     bns_iter_ambi(ref.bns, rb, len, mask_ambiguity, &window);
@@ -46,7 +65,7 @@ void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
 
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &c, const ubyte_t *query, int len, int n_ins, int n_del,
-    aln_meth_alignment_t *out)
+    aln_meth_alignment_t *out, int alt)
 {
     if (out) *out = aln_meth_alignment_t();
     if (!out || !query || !ref.bns || !ref.pac || !ref.bns->anns || len <= 0 || len > 65535 ||
@@ -69,7 +88,7 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
             return error(aln_meth_eval_status::invalid_input, "matrix is not the initialized match-1/mismatch-3 model");
     try {
         std::vector<uint8_t> target;
-        aln_meth_fetch_window(ref, mo, c.rb, span, c.rid, target);
+        aln_meth_fetch_window(ref, mo, c.rb, span, c.rid, target, alt);
         const int full = std::max(len, span), delta = std::abs(len - span);
         int band = std::min<int64_t>(full, std::max<int64_t>((int64_t)delta + 3, std::max(n_ins, n_del)));
         const int certificate = m == 5 ? bwa_global_cert_band(mat, 5, 1, 5, 1, len, query, span, target.data()) : -1;
