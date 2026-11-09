@@ -2144,6 +2144,11 @@ jobs:
           PROPER_PAIR_ALT_WORK_DIR=/tmp/proper-pair-alt \
           bash test/regression/proper_pair_alt.sh
 
+      - name: tie-break seeded by read name is input-order independent (--tie-break name)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/tie_break_name.sh
+
       - name: default @HD parity across output paths
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \

@@ -8,7 +8,7 @@ command.
 — every existing flag is accepted, so an existing invocation runs unchanged. The
 fork-added flags are `--bam[=N]`, `--meth` (with `--meth-scoring`,
 `--set-as-failed`, `--chimera-qc`), `--supp-rep-hard-cap`, `--min-ext-len`,
-`--proper-pair-from-emitted`, and `--legacy-reader`; all are off or
+`--proper-pair-from-emitted`, `--tie-break`, and `--legacy-reader`; all are off or
 output-neutral by default. See
 [Coming from bwa or bwa-mem2](../getting-started/migrating.md).
 

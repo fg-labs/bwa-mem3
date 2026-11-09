@@ -54,6 +54,14 @@ The exhaustive per-PR record is git history and the [GitHub PR list](https://git
   [#362](https://github.com/fg-labs/bwa-mem3/issues/362); see
   [Correctness fixes](correctness.md).
 
+- **`--tie-break name`** (opt-in, default `index`): seeds the equal-score
+  tie-breaks (which equal-score alignment is primary, which equally good pairing
+  is emitted) from a hash of the read name instead of the read's position in the
+  input, so reordered, subset or sharded input places each read the same way.
+  The default matches bwa and bwa-mem2; `name` is a hard error with `--compat`
+  (overridable via `--compat-allow-divergent`). See
+  [CLI → mem `--tie-break`](../cli/mem.md#--tie-break-str--what-seeds-equal-score-tie-breaks).
+
 ## Version stamping
 
 `PACKAGE_VERSION` (the value reported by `bwa-mem3 version` and written to

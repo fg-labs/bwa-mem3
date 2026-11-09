@@ -807,6 +807,7 @@ mem_opt_t *mem_opt_init()
      * away -- and a default that important should be visible where the others
      * are set. */
     o->proper_pair_from_emitted = 0;
+    o->tie_break_mode = MEM_TIE_BREAK_INDEX;       /* --tie-break index: bwa's input-position seed */
     o->md_mode      = MEM_MD_FULL;                 /* --md default: literal MD */
     bwa_fill_scmat(o->a, o->b, o->mat);
     mem_opt_fill_meth_mat(o);
@@ -4832,7 +4833,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
                                         &w->regs[i + 2 * RESCUE_PF_DIST]);
             mem_sam_pe_batch_pre(w->opt, mem_aln_bns(w),
                                  mem_aln_pac(w), w->pes,
-                                 (w->n_processed >> 1) + pos++,   // check!
+                                 mem_tie_break_id(w->opt, w->seqs[i].name,
+                                                  (w->n_processed >> 1) + pos++),
                                  &w->seqs[i],
                                  &w->regs[i],
                                  &w->mmc,
@@ -4873,7 +4875,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
             }
             mem_sam_pe_batch_post(w->opt, mem_aln_bns(w),
                                   mem_aln_pac(w), w->pes,
-                                  (w->n_processed >> 1) + pos++,   // check!
+                                  mem_tie_break_id(w->opt, w->seqs[i].name,
+                                                   (w->n_processed >> 1) + pos++),
                                   &w->seqs[i],
                                   &w->regs[i],
                                   &myaln,
@@ -4900,7 +4903,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
                 mem_prefetch_cigar_ref(mem_aln_bns(w), mem_aln_pac(w), w->regs[i+1].a[0].rb);
             mem_mark_primary_se(w->opt, w->regs[i].n,
                                 w->regs[i].a,
-                                w->n_processed + i);
+                                mem_tie_break_id(w->opt, w->seqs[i].name,
+                                                 w->n_processed + i));
 #if V17  // Feature from v0.7.17 of orig. bwa-mem
             if (w->opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(w->opt->T, &w->regs[i]);
 #endif
@@ -5293,6 +5297,21 @@ static void mem_mark_primary_se_core(const mem_opt_t *opt, int n, mem_alnreg_t *
         if (k == z->n) kv_push(int, *z, i);
         else a[i].secondary = z->a[k];
     }
+}
+
+uint64_t mem_tie_break_id(const mem_opt_t *opt, const char *name, uint64_t index_id)
+{
+    if (opt->tie_break_mode != MEM_TIE_BREAK_NAME) return index_id;
+    /* FNV-1a over the name, then hash_64 to spread its bits before masking: the
+     * low bits of a bare FNV-1a are weak for names that differ only near the end
+     * (Illumina tile/x/y fields). Any fixed function of the name gives the order
+     * independence; this one is cheap and has no allocation. */
+    uint64_t h = 0xcbf29ce484222325ULL;
+    for (const unsigned char *p = (const unsigned char *)name; *p; ++p) {
+        h ^= *p;
+        h *= 0x100000001b3ULL;
+    }
+    return hash_64(h) & MEM_TIE_BREAK_NAME_MASK;
 }
 
 /* Thread-local holder for mem_mark_primary_se's index scratch. Frees the buffer

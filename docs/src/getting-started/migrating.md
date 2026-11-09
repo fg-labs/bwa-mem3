@@ -40,7 +40,9 @@ bwa-mem3 adds a few flags on top (none change default behavior): `--bam[=N]`
 (emit BAM directly), `--meth` (native bisulfite/EM-seq), `--supp-rep-hard-cap`
 and `--min-ext-len` (opt-in tuning), and `--proper-pair-from-emitted` (opt-in;
 moves `FLAG` `0x2` away from what bwa and bwa-mem2 emit, so it is a hard error
-with `--compat`, overridable via `--compat-allow-divergent`). See the
+with `--compat`, overridable via `--compat-allow-divergent`), and `--tie-break name`
+(opt-in; seeds equal-score tie-breaks from the read name instead of its input
+position, also a hard error with `--compat`). See the
 [CLI reference](../cli/mem.md).
 
 ## 3. Output is equivalent, not byte-identical
