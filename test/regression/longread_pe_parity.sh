@@ -63,9 +63,42 @@ normalize() { grep -v '^@PG' "$1" | grep -v '^@HD' | sort; }
 
 sam8="$CHR22_SIM_DIR/longread_pe.8bit.sam"
 sam16="$CHR22_SIM_DIR/longread_pe.16bit.sam"
+pairs8="$CHR22_SIM_DIR/longread_pe.8bit.pairs.tsv"
+pairs16="$CHR22_SIM_DIR/longread_pe.16bit.pairs.tsv"
 
-"$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam8.raw" 2> "$CHR22_SIM_DIR/longread_pe.8bit.log"
-BWAMEM3_DISABLE_BSW8=1 "$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam16.raw" 2> "$CHR22_SIM_DIR/longread_pe.16bit.log"
+# Pin both legs, even when the caller disabled the 8-bit tier. Remove stale dumps
+# so a binary that no longer implements the hook cannot pass on an earlier run.
+rm -f "$pairs8" "$pairs16"
+BWAMEM3_DISABLE_BSW8=0 BWAMEM3_DUMP_PAIRS="$pairs8" "$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam8.raw" 2> "$CHR22_SIM_DIR/longread_pe.8bit.log"
+BWAMEM3_DISABLE_BSW8=1 BWAMEM3_DUMP_PAIRS="$pairs16" "$BWA_MEM3" mem -t 4 "$CHR22_FA" "$r1" "$r2" > "$sam16.raw" 2> "$CHR22_SIM_DIR/longread_pe.16bit.log"
+
+for pairs in "$pairs8" "$pairs16"; do
+    if [[ ! -s $pairs ]]; then
+        echo "FAIL: extension routing dump is missing or empty: $pairs" >&2
+        exit 1
+    fi
+    if ! mawk -F '\t' '
+        NR == 1 { if ($0 != "len1\tlen2\th0\tw\ttier") exit 1; next }
+        {
+            if (NF != 5) exit 1
+            for (i = 1; i <= 5; i++) if ($i !~ /^-?[0-9]+$/) exit 1
+            if ($1 < 0 || $2 < 0 || $4 < 0 || ($5 != 1 && $5 != 8 && $5 != 16)) exit 1
+            n++
+        }
+        END { if (n == 0) exit 1 }
+    ' "$pairs"; then
+        echo "FAIL: extension routing dump has invalid rows or no data: $pairs" >&2
+        exit 1
+    fi
+done
+# The dump records the actual tier decision; len2 is the query extension length.
+nlong8=$(mawk 'NR > 1 && $2 >= 128 && $5 == 8 { n++ } END { print n+0 }' "$pairs8")
+nref8=$(mawk 'NR > 1 && $5 == 8 { n++ } END { print n+0 }' "$pairs16")
+if [[ $nlong8 -eq 0 || $nref8 -ne 0 ]]; then
+    echo "FAIL: expected long extensions in the 8-bit tier only in the enabled run (long enabled=$nlong8, all disabled=$nref8)" >&2
+    exit 1
+fi
+echo "long-read PE routing: $nlong8 query extensions >=128 bp in the 8-bit tier; disabled run has none"
 
 normalize "$sam8.raw" > "$sam8"
 normalize "$sam16.raw" > "$sam16"

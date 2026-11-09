@@ -43,6 +43,21 @@ moves `FLAG` `0x2` away from what bwa and bwa-mem2 emit, so it is a hard error
 with `--compat`, overridable via `--compat-allow-divergent`). See the
 [CLI reference](../cli/mem.md).
 
+Other opt-in flags that leave default output unchanged: `--md short|none` (a
+shorter `MD` under `--meth`, or none at all), `--seed-order local-longest`
+(reorders seeds before chaining, [#186](https://github.com/fg-labs/bwa-mem3/pull/186);
+not byte-identical), `--chunk-cap` (bounds the auto-scaled batch size at high
+`-t`, [#298](https://github.com/fg-labs/bwa-mem3/pull/298); when it engages it
+can re-partition the input, which can change pairing, mate rescue and `MAPQ`, so
+the records may not be byte-identical to bwa or bwa-mem2; `-K` takes precedence
+over it), and `--legacy-reader` (the previous input
+reader, for A/B baselining). Any `--seed-order` other than `off`, an explicit
+nonzero `--chunk-cap`, and `--md none` are hard errors with `--compat` too, with
+the same override (`--compat-allow-divergent` runs them with a warning instead).
+`--seed-order off` and `--chunk-cap 0` are accepted; the
+`BWA_MEM3_CHUNK_CAP` sweep override is not checked by `--compat`. The CLI reference
+lists the rest, including the `--fast` speed preset.
+
 ## 3. Output is equivalent, not byte-identical
 
 Where each read maps — position, CIGAR, MAPQ, FLAG — is preserved on the data

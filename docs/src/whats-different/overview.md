@@ -44,6 +44,48 @@ The exhaustive per-PR record is git history and the [GitHub PR list](https://git
   to stock bwa-mem2. Typical values are 5–20 (lower = more aggressive); the
   upstream #260 repro drops from MAPQ=60 to MAPQ=0 at `--supp-rep-hard-cap 18`.
 
+- **`--md {full|short|none}`** (default `full`, unchanged output): `short`
+  lists only the mismatches `NM` counts, so under `--meth` it drops the
+  conversions the scoring frees; `none` writes no `MD` and is refused by
+  `--compat` unless `--compat-allow-divergent` is given (then it warns). Added in
+  [#754](https://github.com/fg-labs/bwa-mem3/pull/754). See [Features](features.md#--md-fullshortnone-md-tag-form-pr-754).
+
+- **`--seed-order STR`** (opt-in, default `off`): `local-longest` orders each
+  read's seeds by read position and, at the same position, longest first, so a
+  contained shorter seed can be absorbed into the longer seed's chain instead of
+  being extended (`global-longest` sorts
+  all of a read's seeds longest-first). Not byte-identical; any value other than
+  `off` is a hard error with `--compat` unless `--compat-allow-divergent` is
+  given (then it warns). Added in [#186](https://github.com/fg-labs/bwa-mem3/pull/186). See
+  [Features](features.md#--seed-order-seed-reordering-before-chaining).
+
+- **`--chunk-cap INT`** (opt-in, default `0` = off): bounds the auto-scaled
+  `chunk_size × -t` batch target so very high `-t` keeps the read/compute/write
+  pipeline overlapped. When the cap engages (it is below the auto-scaled target)
+  it can re-partition the input, so alignment records can differ from bwa/bwa-mem2;
+  a cap at or above the target changes nothing, and `-K` bypasses it. An
+  explicit nonzero cap is a hard error with `--compat` unless
+  `--compat-allow-divergent` is given (then it warns). `--fast` implies a
+  256,000,000-base cap; `--fast --chunk-cap 0` turns it off. The
+  `BWA_MEM3_CHUNK_CAP` environment variable, meant for cap sweeps, overrides
+  both, and `--compat` does not check it, so setting it under `--compat` can
+  engage the cap, and change paired-end records, with no error (only the
+  `chunk cap engaged` notice on stderr). Opt-in since
+  [#298](https://github.com/fg-labs/bwa-mem3/pull/298). See
+  [CLI → mem `--chunk-cap`](../cli/mem.md#--chunk-cap-int--upper-bound-on-the-auto-scaled-batch-size).
+
+- **`--legacy-reader`** (opt-in): reads input with the previous
+  `gzFile`/`kseq` reader instead of the default content-detecting fast reader.
+  For inputs both readers parse identically and partition into equivalent
+  batches, alignment records are expected to be unchanged; this is not a
+  verified cross-host or cross-SIMD-tier guarantee. The `@PG` `CL:` field differs,
+  since it records the flag. Unusual inputs, such as a CRLF-only blank line
+  inside a multiline FASTA sequence, can be parsed differently even within one
+  batch and are outside this expectation. This parsing difference dates to
+  [#153](https://github.com/fg-labs/bwa-mem3/pull/153).
+  It exists for A/B baselining and as an escape hatch. See
+  [CLI → mem `--legacy-reader`](../cli/mem.md#--legacy-reader--use-the-legacy-input-reader).
+
 - **`--proper-pair-from-emitted`** (opt-in, default disabled): derives the
   proper-pair `FLAG` bit (`0x2`) from the alignment bwa-mem3 actually emits
   rather than the top-scoring region. bwa and bwa-mem2 both use the top-scoring
