@@ -114,6 +114,7 @@ struct aln_meth_read_t {
     // search's fields above keep their offsets.
     std::vector<aln_meth_hit_t> hits;
     std::vector<uint32_t> cig;
+    int ks_alt = 0; // --known-snvs: mate rescue placed the read against its window's ALTs
 };
 // The pointer is into h itself (one operation) or into r.cig, so it is valid while both are.
 static inline const uint32_t *aln_meth_hit_cigar(const aln_meth_read_t &r, const aln_meth_hit_t &h)

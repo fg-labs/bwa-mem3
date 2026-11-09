@@ -211,12 +211,12 @@ How it works:
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual
   cuts. The stock primary is kept while it is still among the best.
+- Paired end: the insert size is estimated from stock placements first. Mate rescue also aligns
+  the mate against its window with each site's ALT substituted, and keeps the better score.
 - `--meth`: the converted search also resolves the windows that the ALT-window search finds, with
-  the ALTs in place.
+  the ALTs in place. A pair whose placement assumes an ALT is left out of the insert-size estimate.
 - Reads longer than about 160 bases, and reads with more than 256 candidate loci, keep their
   stock result.
-
-Single-end only for now: paired input is refused before any output.
 
 CIGAR, MD and NM are still against the reference, so an ALT read shows its mismatch; `XM:i` is the
 mismatch count with the ALT credited. A read that does not touch a site is unchanged.
@@ -232,7 +232,7 @@ contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq
 - `away`: the read's differences outside the site.
 - `max_diff`: the read's mismatch budget.
 - `twin_same`, `twin_mapq`: for the first `R` or `A` site only (`NA` otherwise), the read is
-  realigned with REF and ALT swapped at that site.
+  realigned with REF and ALT swapped at that site (as a pair, with its mate, for paired input).
   `twin_same` is 1 when that twin lands on the same strand within 5 bases, and `twin_mapq` is
   the twin's MAPQ. The twin never changes the read's own record or the run's random draws.
 
@@ -240,6 +240,8 @@ To count alleles without reference bias, count a read at a site only when it pas
 cut-off, its twin also passes (`twin_same` 1 and `twin_mapq` at or above the cut-off), and
 `away` is at most `max_diff - 1`. The last rule matters: a read already at its mismatch budget
 places only when an error at the site matches the ALT, so without it errors become ALT counts.
+See [Counting alleles at known SNVs](../user-guide/known-snvs.md) for worked examples, paired-end
+fragments and the limits.
 
 This is an opt-in departure from stock output. It can change the position, MAPQ, flags and
 alternative hits of reads at the sites. Without the option the output is unchanged. With a VCF

@@ -415,9 +415,12 @@ int approx_mapq(int c1, int c2, int n_mm, int max_diff)
 } // namespace
 
 ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
-						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site)
+						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site,
+						 std::vector<pe_hit_t> *hits, std::vector<int64_t> *hit_alt)
 {
 	*alt_site = -1;
+	if (hits) hits->clear();
+	if (hit_alt) hit_alt->clear();
 	ks_merged_t m;
 	const ks_outcome_t r = ks_merge(w, bns, bwt, opt, s->len, s->aln, s->n_aln, win_aln, win_n, &m);
 	if (r != KS_CREDITED) return r;
@@ -441,6 +444,11 @@ ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t
 	s->type = c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
 	s->seQ = s->mapQ = bwa_approx_mapQ(s, m.max_diff);
 	*alt_site = p.alt_site;
+	if (hits)
+		for (const ks_hit_t &h : kept) {
+			hits->push_back({h.pos, h.strand, h.score, h.n_mm, h.n_gapo, h.n_gape, h.ref_shift});
+			if (hit_alt) hit_alt->push_back(h.alt_site);
+		}
 
 	if (s->multi) free(s->multi);
 	s->multi = 0; s->n_multi = 0;
@@ -493,7 +501,7 @@ int ks_site_votes(const ks_sites_t *sites, const bntseq_t *bns, const gap_opt_t 
 				  int64_t alt_site, int hyp, std::vector<ks_vote_t> *out)
 {
 	out->clear();
-	if (s->type != BWA_TYPE_UNIQUE && s->type != BWA_TYPE_REPEAT) return -1;
+	if (s->type != BWA_TYPE_UNIQUE && s->type != BWA_TYPE_REPEAT && s->type != BWA_TYPE_MATESW) return -1;
 	const int rid = bns_pos2rid(bns, (int64_t)s->pos);
 	if (rid < 0) return -1;
 	const int64_t cbeg = (int64_t)s->pos - bns->anns[rid].offset;
@@ -591,6 +599,50 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 		const int64_t rb = bns->anns[win.rid].offset + beg;
 		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb, rb + h.span});
 	}
+}
+
+void ks_rescue_sites(const void *ctx, int64_t beg, int64_t end, std::vector<std::pair<int64_t, uint8_t>> *out)
+{
+	const ks_rescue_ctx_t *c = (const ks_rescue_ctx_t*)ctx;
+	if (end <= beg) return;
+	const int rid = bns_pos2rid(c->bns, beg);
+	if (rid < 0) return;
+	const int64_t off = c->bns->anns[rid].offset;
+	const std::vector<ks_site_t> &lst = c->sites->by_contig[rid];
+	auto it = std::lower_bound(lst.begin(), lst.end(), beg - off, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
+	for (; it != lst.end() && off + it->pos < end && (int)out->size() < KS_RESCUE_MAX_SITES; ++it)
+		out->push_back({off + it->pos, it->alt});
+}
+
+void ks_aln2seq_nodraw(const bntseq_t *bns, bwa_seq_t *s)
+{
+	// bwa_aln2seq_core's set_main branch with its draws taken from a per-read stream (erand48)
+	uint64_t h = read_seed(bns, s);
+	unsigned short x[3] = {(unsigned short)h, (unsigned short)(h >> 16), (unsigned short)(h >> 32)};
+	if (s->n_aln == 0) {
+		s->type = BWA_TYPE_NO_MATCH;
+		s->c1 = s->c2 = 0;
+		return;
+	}
+	const bwt_aln1_t *aln = s->aln;
+	int i;
+	int64_t cnt = 0;
+	const int best = aln[0].score;
+	for (i = 0; i < s->n_aln; ++i) {
+		const bwt_aln1_t *p = aln + i;
+		if (p->score > best) break;
+		if (erand48(x) * (double)(p->l - p->k + 1 + cnt) > (double)cnt) {
+			s->n_mm = p->n_mm; s->n_gapo = p->n_gapo; s->n_gape = p->n_gape;
+			s->ref_shift = (int)p->n_del - (int)p->n_ins;
+			s->score = p->score;
+			s->sa = p->k + (bwtint_t)((double)(p->l - p->k + 1) * erand48(x));
+		}
+		cnt += (int64_t)(p->l - p->k + 1);
+	}
+	s->c1 = cnt;
+	for (; i < s->n_aln; ++i) cnt += (int64_t)(aln[i].l - aln[i].k + 1);
+	s->c2 = cnt - s->c1;
+	s->type = s->c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
 }
 
 } // namespace bwa_aln

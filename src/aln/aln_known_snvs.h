@@ -5,6 +5,7 @@
 
 #include "../bntseq.h"
 #include "bwtaln.h"
+#include "bwape.h"
 
 #include <cstdint>
 #include <string>
@@ -92,8 +93,22 @@ enum ks_outcome_t {
  * recomputed with aln's cuts (score <= best + mismatch penalty, differences <= min(max_diff, best's
  * + 1)), applied before the main intervals are expanded. *alt_site is the packed position of the
  * site whose ALT the new primary's cost assumes, or -1. */
+/* Paired end: `hits` (and `hit_alt`, each hit's ALT site or -1) get the kept hits, best first, for
+ * the pairing (bwa_pe_pair's `hits`); both are cleared unless the read is credited. */
 ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
-						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site);
+						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site,
+						 std::vector<pe_hit_t> *hits = nullptr, std::vector<int64_t> *hit_alt = nullptr);
+/* Mate rescue's site lister (pe_alt_sites_t::list) over a ks_rescue_ctx_t: the site alleles in the
+ * packed range [beg, end) of the contig holding beg, at most KS_RESCUE_MAX_SITES. */
+#define KS_RESCUE_MAX_SITES 32
+struct ks_rescue_ctx_t {
+	const ks_sites_t *sites;
+	const bntseq_t *bns;
+};
+void ks_rescue_sites(const void *ctx, int64_t beg, int64_t end, std::vector<std::pair<int64_t, uint8_t>> *out);
+/* bwa_aln2seq for a twin: the same primary choice with its draws from a per-read stream, so the
+ * run's drand48 stream never sees the twin. */
+void ks_aln2seq_nodraw(const bntseq_t *bns, bwa_seq_t *s);
 
 /* Start tolerance for "the twin lands on the same locus" (refinement can shift a gapped start). */
 #define KS_TWIN_SLOP 5
