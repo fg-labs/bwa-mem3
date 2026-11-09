@@ -286,8 +286,9 @@ int main(int argc, char* argv[])
             "--min-ext-len", "--max-extend-chains", "--dedup", "--dedup-reads",
             "--chunk-cap", "--cohort-slices", "--rescue-band",
             "--cohort-ramp-ratio", "--cohort-ramp-first", "--meth-scoring",
-            "--meth-tags", "--set-as-failed", "--supp-rep-hard-cap",
-            "--seed-order", "--compat", "--md",
+            "--meth-tags", "--meth-context", "--set-as-failed", "--supp-rep-hard-cap",
+            "--seed-order", "--compat", "--md", "--tie-break", "--bam-threads",
+            "--ks-dedup", "--extend-tie-frac", "--extend-tie-floor",
 #ifdef STAGE_PROF
             "--profile",
 #endif

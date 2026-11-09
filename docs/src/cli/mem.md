@@ -243,8 +243,9 @@ Notes and caveats:
   `--compat`, because the upstream has no such knob and so cannot reproduce the
   output at any setting: `--smem-dedup`, `--adaptive-band`, `--max-extend-chains`,
   `--min-ext-len`, `--extend-tie-frac`, `--rescue-kmer`, `--supp-rep-hard-cap`,
-  `--seed-order`, `--chunk-cap`, and
-  [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment).
+  `--seed-order`, `--chunk-cap`,
+  [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment),
+  and [`--tie-break name`](#--tie-break-str--what-seeds-equal-score-tie-breaks).
   [`--md none`](#--md-str--which-md-tag-to-write) is refused the same way: it
   changes no alignment, but both upstreams always write `MD`.
   The error names the offending flags (`--compat and these levers are mutually
@@ -1225,6 +1226,58 @@ x86_64, AVX2 tier) — all on decoy and ALT/HLA contigs, none on the primary
 assembly. Because `0x2` is aligner-defined,
 the drop-in path now takes upstream's answer and this became opt-in. See
 [Correctness fixes → Proper-pair flag](../whats-different/correctness.md).
+
+### Tie-breaking
+
+#### `--tie-break STR` — what seeds equal-score tie-breaks
+
+When a read has several alignments with the same score, or a pair has several
+equally good pairings, one is chosen by hashing an id. That choice decides which
+region is primary (and so, for a split read, which segment is primary and whether
+a supplementary record is emitted) and which pairing is emitted. `STR` picks the
+id:
+
+- **`index`** (default) — the read's position in the input: the read index for
+  single-end, the pair index for paired-end. This is what bwa and bwa-mem2 do, so
+  default output is byte-identical to them. The position comes from a counter over
+  the whole input, so `-K` and `-t` do not change it (except with `-p` input that
+  mixes single and paired reads, where each batch numbers its single reads first),
+  but the same read can land on a different copy of a repeat when the input is
+  reordered, subset, or sharded: realigning a subset of reads does not reproduce
+  their tied placements from the full run.
+- **`name`** — a hash of the read name. A read then makes the same choice wherever
+  it sits in the input: reordered, subset or sharded input places it identically.
+  Both mates share a name (a trailing `/` and digit is stripped on input), so a
+  pair's pairing choice does not depend on its position either. Each mate's own
+  primary is still seeded with its slot in the pair, so swapping the R1 and R2
+  files can move mates that do not form a pair.
+
+Scores are not changed: the option only picks among alignments, or pairings, that
+tie. What the pick decides can still differ from the default's choice, in the same
+way it already differs between two input orders under `index`:
+
+- for a pair, the emitted pairing's mates can individually differ in `AS`, MAPQ
+  and the proper-pair flag, since pairings tie on the pair's total score;
+- for a split read whose segments tie, which segment is primary decides the
+  primary's MAPQ and caps the supplementary's at it;
+- when equal-score regions overlap only partly, which one sorts first decides
+  whether a supplementary record is emitted at all.
+
+Reads whose names occur more than once with different sequences (not a normal
+FASTQ) simply share a seed.
+
+Paired-end output also depends on the insert-size distribution, which bwa-mem3
+estimates per batch (as bwa and bwa-mem2 do), so for output independent of how
+the input is batched, fix the distribution with
+[`-I`](#-i-floatfloatintint--insert-size-distribution) as well. Even with `-I`,
+`--fast` and `--extend-mate-concordant` without a fixed window are not
+batch-independent: the first input slice is chained with a fallback mate window
+before the insert-size bound is applied. Single-end output needs nothing else.
+
+`name` deviates from both upstreams, so it is a **hard error** with
+[`--compat`](#--compattarget--byte-identical-output-for-another-aligner)
+(overridable via `--compat-allow-divergent`). When on, the startup log says
+`tie-break: name`.
 
 ### Debug
 

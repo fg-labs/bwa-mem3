@@ -75,9 +75,9 @@ Options:
                   (run-specific); exclude it when comparing.
                   To stay byte-identical, --compat refuses bwa-mem3-only levers that
                   change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,
-                  --min-ext-len, --rescue-kmer, --seed-order), --md none (the targets
-                  always write MD), and -u under bwa-mem2 (no XB:Z before bwa 0.7.18);
-                  --fast and --meth are always refused.
+                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name), --md none
+                  (the targets always write MD), and -u under bwa-mem2 (no XB:Z before
+                  bwa 0.7.18); --fast and --meth are always refused.
                   Override the forceable ones with --compat-allow-divergent.
                   Keeps every byte-identical optimization, the default contained-seed
                   extension skip included (--keep-contained-ext still opts out of it).
@@ -235,6 +235,17 @@ Supplementary MAPQ rescoring (fg-labs extension):
                  it by default (override with --compat-allow-divergent). Has no
                  effect unless the index has a .alt sidecar: the two differ only
                  for reads with ALT hits [off]
+Tie-breaking (fg-labs extension):
+   --tie-break STR
+                 what seeds the choice among equal-score alignments (which region is
+                 primary, and which of several equally good pairings is emitted): index
+                 or name. index uses the read's position in the input, as bwa and
+                 bwa-mem2 do, so reordered, subset or sharded input can move reads with
+                 tied alignments. name hashes the read name instead, so a read's choice
+                 does not depend on where it sits in the input (paired-end output also
+                 needs -I; see the docs for the remaining caveats). name deviates from
+                 both upstreams; --compat refuses it (override with
+                 --compat-allow-divergent) [index]
 Seed ordering (fg-labs extension):
    --seed-order STR
                  seed emission order before chaining: off|local-longest [off]

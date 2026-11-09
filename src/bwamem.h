@@ -156,6 +156,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * is not built by mem_opt_init must set md_mode itself. */
 enum mem_md_mode { MEM_MD_NONE = 0, MEM_MD_FULL = 1, MEM_MD_SHORT = 2 };
 
+/* --tie-break modes (mem_opt_t.tie_break_mode): what seeds the equal-score
+ * tie-breaks (see mem_tie_break_id). INDEX, the default, is the read's input
+ * position, as in bwa and bwa-mem2; NAME is a hash of the read name. */
+enum mem_tie_break_mode { MEM_TIE_BREAK_INDEX = 0, MEM_TIE_BREAK_NAME = 1 };
+
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
 
@@ -309,6 +314,12 @@ typedef struct mem_opt_t {
      * matches both and no target needs a say in it. --compat and this option
      * are instead mutually exclusive (see main_mem). */
     int    proper_pair_from_emitted;
+    /* --tie-break: a mem_tie_break_mode value. MEM_TIE_BREAK_INDEX (default)
+     * matches bwa and bwa-mem2; MEM_TIE_BREAK_NAME seeds the equal-score
+     * tie-breaks from the read name so they do not depend on where the read
+     * sits in the input, which neither upstream can express, so --compat
+     * refuses it. */
+    int    tie_break_mode;
     int    md_mode;         // --md: a mem_md_mode value (MEM_MD_FULL default)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
@@ -781,6 +792,33 @@ void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+
+/* Largest value mem_tie_break_id returns under --tie-break name. mem_pair takes
+ * the id as an int and shifts it left by 8, so a name-derived id must stay below
+ * 2^23 for that shift to fit; 23 bits is ample entropy for a tie-break seed. */
+#define MEM_TIE_BREAK_NAME_MASK 0x7FFFFFULL
+
+/* The id that seeds a read's (or pair's) equal-score tie-breaks: the order of
+ * equal-score regions in mem_mark_primary_se (which becomes primary, and so which
+ * segment of a split read is primary and whether a supplementary is emitted) and
+ * which of several equal-score pairings mem_pair emits.
+ *
+ * index_id is the read's position in the input -- the read index for single-end,
+ * the pair index for paired-end -- which is what bwa and bwa-mem2 use, and is
+ * returned unchanged by default. It comes from the global read counter, so it
+ * does not depend on -K or -t, but it does change when the input is reordered,
+ * subset or sharded. Under MEM_TIE_BREAK_NAME the id is instead a hash of the
+ * read name, masked to MEM_TIE_BREAK_NAME_MASK, so those changes no longer move
+ * the read. Both mates of a pair carry the same name (the readers strip a /1 or
+ * /2 suffix), so the paired-end caller passes either mate's name; each mate's
+ * own primary is still seeded with its slot (id<<1|0, id<<1|1), so swapping the
+ * R1 and R2 files can move mates that do not pair.
+ *
+ * @param opt       options; only tie_break_mode is read
+ * @param name      read name, NUL-terminated (ignored by default)
+ * @param index_id  the read's input-position id
+ * @return the tie-break seed to pass to mem_mark_primary_se / mem_sam_pe_batch_* */
+uint64_t mem_tie_break_id(const mem_opt_t *opt, const char *name, uint64_t index_id);
 void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);  /* --extend-csub: seed primary sub from dropped chains */
 /* Exposed for unit tests (test/unit/test_chain_cap.cpp). */
 int  mem_chain_cap_extend(mem_chain_t *a, int n, int max_n, float tie_frac, int tie_floor,

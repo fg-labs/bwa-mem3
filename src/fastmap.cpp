@@ -1888,9 +1888,9 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  (run-specific); exclude it when comparing.\n");
     fprintf(stderr, "                  To stay byte-identical, --compat refuses bwa-mem3-only levers that\n");
     fprintf(stderr, "                  change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,\n");
-    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order), --md none (the targets\n");
-    fprintf(stderr, "                  always write MD), and -u under bwa-mem2 (no XB:Z before bwa 0.7.18);\n");
-    fprintf(stderr, "                  --fast and --meth are always refused.\n");
+    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name), --md none\n");
+    fprintf(stderr, "                  (the targets always write MD), and -u under bwa-mem2 (no XB:Z before\n");
+    fprintf(stderr, "                  bwa 0.7.18); --fast and --meth are always refused.\n");
     fprintf(stderr, "                  Override the forceable ones with --compat-allow-divergent.\n");
     fprintf(stderr, "                  Keeps every byte-identical optimization, the default contained-seed\n");
     fprintf(stderr, "                  extension skip included (--keep-contained-ext still opts out of it).\n");
@@ -1992,6 +1992,17 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 it by default (override with --compat-allow-divergent). Has no\n");
     fprintf(stderr, "                 effect unless the index has a .alt sidecar: the two differ only\n");
     fprintf(stderr, "                 for reads with ALT hits [off]\n");
+    fprintf(stderr, "Tie-breaking (fg-labs extension):\n");
+    fprintf(stderr, "   --tie-break STR\n");
+    fprintf(stderr, "                 what seeds the choice among equal-score alignments (which region is\n");
+    fprintf(stderr, "                 primary, and which of several equally good pairings is emitted): index\n");
+    fprintf(stderr, "                 or name. index uses the read's position in the input, as bwa and\n");
+    fprintf(stderr, "                 bwa-mem2 do, so reordered, subset or sharded input can move reads with\n");
+    fprintf(stderr, "                 tied alignments. name hashes the read name instead, so a read's choice\n");
+    fprintf(stderr, "                 does not depend on where it sits in the input (paired-end output also\n");
+    fprintf(stderr, "                 needs -I; see the docs for the remaining caveats). name deviates from\n");
+    fprintf(stderr, "                 both upstreams; --compat refuses it (override with\n");
+    fprintf(stderr, "                 --compat-allow-divergent) [index]\n");
     fprintf(stderr, "Seed ordering (fg-labs extension):\n");
     fprintf(stderr, "   --seed-order STR\n");
     fprintf(stderr, "                 seed emission order before chaining: off|local-longest [off]\n");
@@ -2238,6 +2249,7 @@ int main_mem(int argc, char *argv[])
         OPT_BAM_THREADS,
         OPT_SUPP_REP_HARD_CAP,
         OPT_PROPER_PAIR_FROM_EMITTED,
+        OPT_TIE_BREAK,
         OPT_MD,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
@@ -2304,6 +2316,7 @@ int main_mem(int argc, char *argv[])
         METH_LONG_OPTIONS_MEM_ONLY
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
+        {"tie-break",                required_argument, 0, OPT_TIE_BREAK},
         {"md",                       required_argument, 0, OPT_MD},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
@@ -2818,6 +2831,16 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
+        else if (c == OPT_TIE_BREAK) {
+            if (strcmp(optarg, "index") == 0) opt->tie_break_mode = MEM_TIE_BREAK_INDEX;
+            else if (strcmp(optarg, "name") == 0) opt->tie_break_mode = MEM_TIE_BREAK_NAME;
+            else {
+                fprintf(stderr, "[E::%s] unknown --tie-break '%s' (index|name)\n", __func__, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
         else if (c == OPT_RESCUE_KMER) {
             /* Validated rather than atoi'd for the same reason as --chunk-cap
              * below: atoi maps every unparseable value to 0, and 0 here means
@@ -3332,6 +3355,7 @@ int main_mem(int argc, char *argv[])
             { opt->seed_emit_order != SEED_ORDER_OFF, "--seed-order" },
             { chunk_cap_set && chunk_cap > 0,         "--chunk-cap" },
             { opt->proper_pair_from_emitted != 0,     "--proper-pair-from-emitted" },
+            { opt->tie_break_mode == MEM_TIE_BREAK_NAME, "--tie-break name" },
             /* Output, not alignment: both targets always write MD. --md short
              * needs no row: without --meth (which --compat refuses) it is full. */
             { opt->md_mode == MEM_MD_NONE,            "--md none" },
@@ -3663,6 +3687,8 @@ int main_mem(int argc, char *argv[])
 
     if (opt->seed_emit_order != SEED_ORDER_OFF)
         fprintf(stderr, "[M::%s] seed order: %s\n", __func__, seed_order_to_str(opt->seed_emit_order));
+    if (opt->tie_break_mode == MEM_TIE_BREAK_NAME)
+        fprintf(stderr, "[M::%s] tie-break: name\n", __func__);
     if (fast) {
         /* `alnreg-sort=fast` is deliberately spelled WITHOUT a leading `--`: unlike
          * every other item on this line it is not a flag the user can pass, only a

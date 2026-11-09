@@ -332,6 +332,8 @@ compat_err "mutually exclusive" --compat=bwa-mem2 --adaptive-band
 compat_err "mutually exclusive" --compat=bwa-mem2 --rescue-kmer
 compat_err "mutually exclusive" --compat=bwa-mem2 --supp-rep-hard-cap=10
 compat_err "mutually exclusive" --compat=bwa-mem2 --seed-order local-longest
+compat_err "tie-break name" --compat=bwa-mem2 --tie-break name
+compat_err "tie-break name" --compat=bwa-mem --tie-break name
 # --skip-contained-ext is now the default (byte-identical) and deprecated to an accepted
 # no-op, and --compat keeps the skip (proven byte-identical), so it is accepted, not a hard
 # error; --keep-contained-ext is the opt-out and stays accepted under --compat too (the
@@ -360,6 +362,8 @@ compat_err "mutually exclusive" --smem-dedup --compat=bwa-mem2
 # value-taking levers explicitly (their nonzero forms are exercised above).
 compat_ok --compat=bwa-mem2 --chunk-cap 0
 compat_ok --compat=bwa-mem2 --seed-order off
+compat_ok --compat=bwa-mem2 --tie-break index
+compat_ok --compat=bwa-mem --tie-break index
 compat_ok --compat=bwa-mem2 --rescue-kmer=0
 compat_ok --compat=bwa-mem2 --max-extend-chains=0
 compat_ok --compat=bwa-mem2 --supp-rep-hard-cap=0
@@ -376,6 +380,7 @@ compat_ok --compat=off --smem-dedup
 compat_warn "NOT byte-identical" --compat=bwa-mem2 --smem-dedup --compat-allow-divergent
 compat_warn "NOT byte-identical" --compat=bwa-mem2 --max-extend-chains=5 --compat-allow-divergent
 compat_warn "NOT byte-identical" --compat=bwa-mem2 --proper-pair-from-emitted --compat-allow-divergent
+compat_warn "NOT byte-identical" --compat=bwa-mem2 --tie-break name --compat-allow-divergent
 # The warning, like the error, must NAME the forced lever (same runtime-built list).
 compat_warn "smem-dedup" --compat=bwa-mem2 --smem-dedup --compat-allow-divergent
 compat_warn "proceeding with -u" --compat=bwa-mem2 -u --compat-allow-divergent
