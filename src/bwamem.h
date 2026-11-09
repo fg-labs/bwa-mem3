@@ -1025,6 +1025,23 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
              const mem_pestat_t pes[4], bseq1_t s[2], mem_alnreg_v a[2], int id,
              int *sub, int *n_sub, int z[2], int n_pri[2]);
 
+/* The key mem_pair hashes to break ties between equal-score pairings: a
+ * candidate pair's packed region indices y, mixed with the pair's id.
+ *
+ * bwa and bwa-mem2 write this `y ^ id<<8` with a signed int id, the pair's
+ * index in the input. From the 2^23-th pair on (about 8.4 million pairs) the
+ * shift overflows an int, which is undefined behaviour. Every compiler this
+ * project builds with (clang and gcc, x86-64 and aarch64) emits a 32-bit shift
+ * followed by sign extension to 64 bits for it, so that is what released output
+ * reflects; this spells out exactly those bits in well-defined arithmetic, so
+ * output is unchanged and no longer at the optimizer's mercy. The int32_t
+ * conversion of a uint32_t above INT32_MAX is modular on every supported
+ * compiler (and defined that way from C++20). */
+static inline uint64_t mem_pair_tie_key(uint64_t y, int id)
+{
+    return y ^ (uint64_t)(int64_t)(int32_t)((uint32_t)id << 8);
+}
+
 int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
                      int64_t &pcnt, int64_t &pcnt8, kswr_t *aln,
                      int32_t, int32_t, int tid);

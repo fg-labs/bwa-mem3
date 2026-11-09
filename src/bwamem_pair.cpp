@@ -1248,7 +1248,7 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
                 }
                 p = kv_pushp(pair64_t, u);
                 p->y = (uint64_t)k<<32 | i;
-                p->x = (uint64_t)q<<32 | (hash_64(p->y ^ id<<8) & 0xffffffffU);
+                p->x = (uint64_t)q<<32 | (hash_64(mem_pair_tie_key(p->y, id)) & 0xffffffffU);
             }
         }
         y[v.a[i].y&3] = i;
