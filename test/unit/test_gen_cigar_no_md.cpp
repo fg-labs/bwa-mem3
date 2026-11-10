@@ -825,3 +825,60 @@ TEST_CASE("mem_gen_alt: the XA string carries each hit's CIGAR and NM" *
         }
     }
 }
+
+TEST_CASE("bwa_gen_cigar_band: the band bwa_gen_cigar4 gives a gapped region" * doctest::test_suite("unit/gen_cigar")) {
+    // bwa_gen_cigar4's band (src/bwa.cpp), which mem_alt_project's lift gate also
+    // reads; test_alt_lift.cpp checks that gate end to end. Default scores (a 1,
+    // o 6, e 1). For a 150-base query, half of it pays for a gap of
+    // (75 - 6) / 1 + 1 = 70, so the band is (70 + |rlen - qlen| + 1) >> 1, capped
+    // at w_ and floored at |rlen - qlen| + 3; 100 bases give (45 + 0 + 1) >> 1.
+    CHECK(bwa_gen_cigar_band(1, 6, 1, 6, 1, 100, 150, 150) == 35);
+    CHECK(bwa_gen_cigar_band(1, 6, 1, 6, 1, 36, 150, 150) == 35);
+    CHECK(bwa_gen_cigar_band(1, 6, 1, 6, 1, 20, 150, 150) == 20);
+    CHECK(bwa_gen_cigar_band(1, 6, 1, 6, 1, 0, 150, 150) == 3);
+    CHECK(bwa_gen_cigar_band(1, 6, 1, 6, 1, 100, 100, 100) == 23);
+    CHECK(bwa_gen_cigar_band(1, 6, 1, 6, 1, 100, 150, 250) == 103);  // the floor wins
+    CHECK(bwa_gen_cigar_band(1, 6, 1, 6, 1, 100, 150, 180) == 50);   // (70 + 30 + 1) >> 1
+
+    // bwa_gen_cigar4 itself aligns at that band. A 150-base query that is the
+    // reference window [at, at + 150) with k random bases inserted after its
+    // 50th base and the k bases after its 80th deleted (equal lengths) needs a
+    // band of k: at -w 100 the band is 35, so k = 35 comes back with both
+    // indels, scoring 115 matches less two gaps of 6 + 35 = 41 each, i.e. 33,
+    // and k = 36 cannot. (Where the deletion sits can shift by a base the
+    // flanks share.)
+    const std::string ref = make_reference(kRefLen);
+    meth_test::OrigRefFixture fx(ref);
+    Matrices m(-4);
+    std::mt19937 rng(35u);
+    const int at = 1000;
+    for (int k = 35; k <= 36; ++k) {
+        CAPTURE(k);
+        std::string q = ref.substr(at, 50);
+        for (int i = 0; i < k; ++i) q += "ACGT"[rng() & 3];
+        q += ref.substr(at + 50, 30) + ref.substr(at + 80 + k, 70 - k);
+        REQUIRE(q.size() == 150);
+        std::vector<uint8_t> query;
+        for (char ch : q) query.push_back(nt4(ch));
+        GenCigarOut o = run_gen_cigar(fx, m.sym, query, at, at + 150, 100, 0, 0);
+        std::string cig;
+        bool ins_k = false, del_k = false;
+        for (int i = 0; i < o.n_cigar; ++i) {
+            cig += std::to_string(o.cigar[i] >> 4) + "MIDSH"[o.cigar[i] & 0xf];
+            ins_k |= (o.cigar[i] & 0xf) == 1 && (int) (o.cigar[i] >> 4) == k;
+            del_k |= (o.cigar[i] & 0xf) == 2 && (int) (o.cigar[i] >> 4) == k;
+        }
+        INFO("CIGAR " << cig << " score " << o.score);
+        if (k == 35) {
+            CHECK(o.n_cigar == 5);
+            CHECK(ins_k);
+            CHECK(del_k);
+            CHECK(o.score == 33);
+        } else {
+            CHECK(!ins_k);
+            CHECK(!del_k);
+            CHECK(o.n_cigar != 5);
+        }
+        free(o.cigar);
+    }
+}

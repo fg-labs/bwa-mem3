@@ -2154,6 +2154,11 @@ jobs:
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
           bash test/regression/tie_break_name.sh
 
+      - name: ALT projection lifts ALT hits onto the primary assembly (--alt-project)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/alt_project.sh
+
       - name: default @HD parity across output paths
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \

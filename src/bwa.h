@@ -124,6 +124,11 @@ extern "C" {
 	 * reference of any lengths (see bwa.cpp), or -1. Used by bwa_gen_cigar3. */
 	int bwa_global_cert_band(const int8_t mat[25], int o_del, int e_del, int o_ins, int e_ins,
 	                         int qlen, const uint8_t *query, int tlen, const uint8_t *rseq);
+	/* The band bwa_gen_cigar4 uses for a gapped region of l_query query and rlen
+	 * reference bases given the caller's band w_ (`match` = mat[0]), before the
+	 * certified-band narrowing, which keeps the score and CIGAR (see bwa.cpp). */
+	int bwa_gen_cigar_band(int match, int o_del, int e_del, int o_ins, int e_ins, int w_,
+	                       int l_query, int64_t rlen);
 	uint32_t *bwa_gen_cigar(const int8_t mat[25], int q, int r, int w_,
 							int64_t l_pac, const uint8_t *pac, int l_query,
 							uint8_t *query, int64_t rb, int64_t re,

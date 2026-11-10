@@ -1,5 +1,5 @@
 // Unit tests for bns_restore_core's handling of malformed .ann/.amb headers and
-// of long .ann comment lines.
+// of long .ann comment lines, and for bns_alt_path, the .alt path it reads.
 //
 // The counts and lengths in the .ann ("l_pac n_seqs seed") and .amb ("l_pac
 // n_seqs n_holes") headers come straight from files on disk, so a value out of
@@ -138,6 +138,14 @@ TEST_CASE("bns_restore_core truncates a longer .ann comment and warns") {
     CHECK(WEXITSTATUS(status) == 0);
     CHECK(fx.child_stderr().find(fx.ann + ": the comment of 'chr1' is longer than 8191 "
                                  "characters and was truncated") != std::string::npos);
+}
+
+TEST_CASE("bns_alt_path: the .alt path bns_restore and --alt-project both read") {
+    // bns_restore reads the ALT names from this path and main_mem loads the lift
+    // table from it, so the two cannot name different files.
+    char out[64];
+    bns_alt_path(out, sizeof(out), "idx/ref.fa");
+    CHECK(std::string(out) == "idx/ref.fa.alt");
 }
 
 }  // TEST_SUITE

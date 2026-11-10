@@ -232,6 +232,11 @@ void bns_pac_path(char *out, size_t outsz, const char *prefix)
 	bns_build_path(out, outsz, prefix, ".pac");
 }
 
+void bns_alt_path(char *out, size_t outsz, const char *prefix)
+{
+	bns_build_path(out, outsz, prefix, ".alt");
+}
+
 bntseq_t *bns_restore(const char *prefix)
 {  
 	char ann_filename[PATH_MAX], amb_filename[PATH_MAX], pac_filename[PATH_MAX], alt_filename[PATH_MAX];
@@ -242,7 +247,7 @@ bntseq_t *bns_restore(const char *prefix)
 	bns_pac_path(pac_filename, sizeof(pac_filename), prefix);
 	bns = bns_restore_core(ann_filename, amb_filename, pac_filename);
 	if (bns == 0) return 0;
-	bns_build_path(alt_filename, sizeof(alt_filename), prefix, ".alt");
+	bns_alt_path(alt_filename, sizeof(alt_filename), prefix);
 	if ((fp = fopen(alt_filename, "r")) != 0) { // read .alt file if present
 		char str[1024];
 		khash_t(str) *h;

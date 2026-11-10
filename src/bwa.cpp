@@ -365,6 +365,26 @@ template <int M> static inline uint8_t bwa_ref_base(uint8_t r)
     return M == 5 ? r : meth_code_base(r);
 }
 
+/* The band bwa_gen_cigar4 aligns a gapped region with, before the certified-band
+ * narrowing (which keeps the score and CIGAR): half the longest gap a match run
+ * of half the query can pay for, plus half the length difference, capped at the
+ * caller's w_, then raised to |rlen - l_query| + 3. `match` is mat[0]. Shared
+ * with --alt-project's lift gate (mem_alt_project), which must know the band a
+ * lifted region will get, so the two cannot drift apart. */
+int bwa_gen_cigar_band(int match, int o_del, int e_del, int o_ins, int e_ins, int w_, int l_query, int64_t rlen)
+{
+    int max_gap, max_ins, max_del, min_w, w;
+    max_ins = (int)((double)(((l_query+1)>>1) * match - o_ins) / e_ins + 1.);
+    max_del = (int)((double)(((l_query+1)>>1) * match - o_del) / e_del + 1.);
+    max_gap = max_ins > max_del? max_ins : max_del;
+    max_gap = max_gap > 1? max_gap : 1;
+    w = (max_gap + abs(rlen - l_query) + 1) >> 1;
+    w = w < w_? w : w_;
+    min_w = abs(rlen - l_query) + 3;
+    w = w > min_w? w : min_w;
+    return w;
+}
+
 /* bwa_global_cert_band over a matrix of alphabet size M (row stride M). */
 template <int M>
 static int bwa_global_cert_band_m(const int8_t *mat, int o_del, int e_del, int o_ins, int e_ins,
@@ -668,16 +688,8 @@ static uint32_t *bwa_gen_cigar4_m(const int8_t *mat, const bntseq_t *bns, int o_
         int ungapped = (l_query == re - rb && w_ == 0);
         int w = 0;
         if (!ungapped) {
-            int max_gap, max_ins, max_del, min_w;
-            // set the band-width
-            max_ins = (int)((double)(((l_query+1)>>1) * mat[0] - o_ins) / e_ins + 1.);
-            max_del = (int)((double)(((l_query+1)>>1) * mat[0] - o_del) / e_del + 1.);
-            max_gap = max_ins > max_del? max_ins : max_del;
-            max_gap = max_gap > 1? max_gap : 1;
-            w = (max_gap + abs(rlen - l_query) + 1) >> 1;
-            w = w < w_? w : w_;
-            min_w = abs(rlen - l_query) + 3;
-            w = w > min_w? w : min_w;
+            const int min_w = abs(rlen - l_query) + 3;
+            w = bwa_gen_cigar_band(mat[0], o_del, e_del, o_ins, e_ins, w_, l_query, rlen);
             // the certified band, when narrower: same score and CIGAR (bwa_global_cert_band)
             // Unequal lengths keep the floor min_w (the wavefront kernels' proof needs it), so
             // there the certificate can only help when w is above it. kc is at least

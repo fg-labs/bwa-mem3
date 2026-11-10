@@ -75,7 +75,8 @@ Options:
                   (run-specific); exclude it when comparing.
                   To stay byte-identical, --compat refuses bwa-mem3-only levers that
                   change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,
-                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name), --md none
+                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name,
+                  --alt-project), --md none
                   (the targets always write MD), and -u under bwa-mem2 (no XB:Z before
                   bwa 0.7.18); --fast and --meth are always refused.
                   Override the forceable ones with --compat-allow-divergent.
@@ -253,6 +254,21 @@ Tie-breaking (fg-labs extension):
                  needs -I; see the docs for the remaining caveats). name deviates from
                  both upstreams; --compat refuses it (override with
                  --compat-allow-divergent) [index]
+ALT projection (fg-labs extension):
+   --alt-project
+                 let ALT haplotypes decide placement: lift alignments to ALT contigs
+                 onto the primary assembly through <idxbase>.alt before pairing and
+                 MAPQ, keep one hit per locus, and write the read on the primary
+                 assembly (re-aligned there; AS keeps the ALT score). A lifted hit
+                 replaces a primary hit at its locus only if it outscores it by more
+                 than -A times the primary hit's read bases it leaves out; a tie
+                 keeps the primary hit. A hit stays on the ALT if any of it is in a
+                 .alt clip, it starts or ends in an ALT insertion, less than half of
+                 it is in aligned bases, or its ALT indels move it off its diagonal
+                 by more than -w, more than 1022, or more than the re-alignment band
+                 (capped by the hit's length: about 35 for 150 bp at the default
+                 -A/-O/-E). Needs a .alt sidecar. Incompatible with -j and --meth;
+                 --compat refuses it (override with --compat-allow-divergent) [off]
 Seed ordering (fg-labs extension):
    --seed-order STR
                  seed emission order before chaining: off|local-longest [off]
