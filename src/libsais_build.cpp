@@ -61,18 +61,18 @@ std::string fmt_bases(int64_t bp) {
 
 using bwa::fmt_bytes;
 
+} // anonymous namespace
+
 // Pack the forward-only .pac (l_pac bases) plus its reverse-complement into
-// a doubled .pac on disk. The sais-lite path built this doubled text in
-// memory via pac2nt; writing it packed lets PackedText / emit_0123 /
+// a doubled 2-bit buffer of (2*l_pac+3)/4 bytes. The sais-lite path built this
+// doubled text in memory via pac2nt; packing it lets PackedText / emit_0123 /
 // compute_counts consume both strands without another ASCII round-trip.
 // Parallelises by striping output bytes: each thread fills a disjoint
 // [byte_start, byte_end) range of the output buffer, so there's no
 // aliasing at the forward/reverse-complement seam even when l_pac isn't
 // a multiple of 4.
-void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
-                       const char* out_path, int num_threads)
+std::unique_ptr<uint8_t[]> pack_doubled(const PackedText& fwd, int64_t l_pac, int num_threads)
 {
-    PackedText fwd(fwd_pac_path, l_pac);
     int64_t doubled = 2 * l_pac;
     int64_t nbytes  = (doubled + 3) / 4;
     // Default-init via new[]: every byte is unconditionally overwritten in
@@ -104,6 +104,19 @@ void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
         }
         buf[(size_t)by] = b;
     }
+    return buf;
+}
+
+// Write the doubled .pac (forward + reverse complement) to `out_path` in the
+// on-disk .pac format: packed bytes, a pad byte when the base count is a
+// multiple of 4, then the count byte.
+void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
+                       const char* out_path, int num_threads)
+{
+    PackedText fwd(fwd_pac_path, l_pac);
+    int64_t doubled = 2 * l_pac;
+    int64_t nbytes  = (doubled + 3) / 4;
+    std::unique_ptr<uint8_t[]> buf = pack_doubled(fwd, l_pac, num_threads);
 
     int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) err_fatal(__func__, "open('%s'): %s", out_path, strerror(errno));
@@ -124,6 +137,8 @@ void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
     if (close(fd) != 0)
         err_fatal(__func__, "close('%s'): %s", out_path, strerror(errno));
 }
+
+namespace {
 
 std::string resolve_tmpdir(const LibsaisBuildOpts& opts) {
     if (!opts.tmpdir.empty()) return opts.tmpdir;
