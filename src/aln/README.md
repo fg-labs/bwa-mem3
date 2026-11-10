@@ -2,7 +2,7 @@
 
 This directory holds the code behind `bwa-mem3 aln`, a fused port of bwa's
 short-read `aln` + `samse`/`sampe` pipeline whose SAM records without `--meth`,
-`--short-insert` or `--ref-span-insert` are byte-identical to
+`--short-insert`, `--ref-span-insert` or `--exact-rescue-window` are byte-identical to
 stock bwa 0.7.19's (the header is too, except the `@PG` line, which names bwa-mem3), as
 checked on the generated reads described in `docs/src/cli/aln.md`.
 
@@ -157,6 +157,14 @@ Each change to upstream-derived code adds a line here.
   `--meth` cap rescue, whose inserts already come from spans, takes its minimum outer span from the
   two spans. TLEN is unchanged: `pos_5` already uses the CIGAR. Every change branches once per pair
   or hit on the option; without it the stock arithmetic runs unchanged.
+- `bwtaln.h`, `bwape.cpp`/`bwape.h`, `aln_meth.cpp`, `aln_main.cpp`: the `pe_opt_t::exact_rescue_window`
+  field (appended; zero from `bwa_init_pe_opt`) enables `--exact-rescue-window`, which `aln_main.cpp`
+  sets by default under `--meth` unless `--no-exact-rescue-window` is given. The rescue-window
+  arithmetic of `bwa_paired_sw_core`'s `__set_rght_coor`/`__set_left_coor` moved into
+  `aln_rescue_window`, which the `--meth` mate rescue shares. Without the option it is stock's
+  expression for expression (start truncated, then start + 6 std + 2 len truncated); with it each
+  bound is the anchor-relative offset rounded outward (`floor` for the start, `ceil` for the end),
+  and `--meth` cap rescue takes the same window instead of truncating its own two doubles.
 - Paired-end driver (`aln_run_pe`, new code). `bwa-mem3 aln [options] <prefix> <R1.fq> <R2.fq>` is `aln` on each
   file followed by `sampe`. Per batch of 0x40000 reads from each file: R1's reads are read, then R2's (stock
   order); each file is searched as its own batch, because stock runs `aln` on each file separately and the

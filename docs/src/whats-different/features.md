@@ -9,7 +9,8 @@ which now read `bwa-mem3`).
 ## Short-read `aln` and opt-in methylation
 
 [`bwa-mem3 aln`](../cli/aln.md) fuses stock bwa's short-read backtracking,
-samse and sampe commands. Without `--meth`, `--short-insert` or `--ref-span-insert`, its compatibility
+samse and sampe commands. Without `--meth`, `--short-insert`, `--ref-span-insert` or
+`--exact-rescue-window`, its compatibility
 target is stock bwa 0.7.19, not bwa-mem2. `aln --meth` adds directional converted-window discovery,
 fixed chemistry-aware reward refinement and stock chemistry-aware cost/strata/MAPQ
 accounting on stored CIGARs. All chemistries require both original and converted
@@ -40,6 +41,15 @@ estimation, pairing (including the `-a` bound) and mate rescue windows, so a mat
 alignment has indels is no longer paired on an insert off by their net length. TLEN, already
 taken from the CIGAR, is unchanged. Enabling it can change pair selection, proper-pair flags,
 MAPQ and rescue windows.
+
+`--exact-rescue-window` (paired, off by default for plain `aln`, on by default under `--meth`,
+where `--no-exact-rescue-window` turns it off) rounds the mate-rescue window outward from the
+inferred insert range. Stock `sampe` truncates the window's start and then its end, so the end
+falls up to two bases short and moves for every pair of a geometry at once whenever 6 std crosses
+an integer; a 0.004 change in a batch's inferred std can then change how a whole cohort of
+edge-of-window mates is rescued. With the option each bound is monotone in the mean and std and
+moves only where the stated bound crosses a base. See
+[aln](../cli/aln.md#mate-rescue-window-bounds).
 
 The MEM methylation placement, performance and accuracy measurements in the
 following sections do not validate `aln --meth`. Its revised candidate-refinement
@@ -300,8 +310,8 @@ stride-8 index and is the recommended speed-per-GB operating point; `-u 1`
 
 `bwa-mem3 aln` ports bwa's backtracking aligner for ultrashort, ancient and degraded DNA: it runs
 `bwa aln` followed by `bwa samse` (one read file) or `bwa sampe` (two) in one command, with no
-`.sai` files, on the index `bwa-mem3 index` writes. Without `--meth`, `--short-insert` or
-`--ref-span-insert`, its
+`.sai` files, on the index `bwa-mem3 index` writes. Without `--meth`, `--short-insert`,
+`--ref-span-insert` or `--exact-rescue-window`, its
 SAM records are byte-identical to stock bwa 0.7.19's (the `@PG` line differs) on the generated
 reads the parity checks use, at one and four threads, in CI on Linux x86-64 (AVX2 build) and
 Linux arm64 (NEON), against a stock bwa built without floating-point contraction (a stock build
@@ -786,7 +796,7 @@ Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#re
 | `--hic` Hi-C preset | [#372](https://github.com/fg-labs/bwa-mem3/pull/372) | — | fork-only spelling (opt-in, off by default; sets the same flag bits as `-5SP`, which both upstreams also accept, so identical by construction — the regression confirms byte-identity on phix-derived PE reads with `@PG` excluded, not a cross-host/cross-tier claim) |
 | `bwa-mem3 shm` shared-memory index | [#65](https://github.com/fg-labs/bwa-mem3/pull/65) | — | fork-only |
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
-| `bwa-mem3 aln` backtracking aligner (bwa 0.7.19 `aln` + `samse`/`sampe`) | [#689](https://github.com/fg-labs/bwa-mem3/pull/689) | — | fork-only (without `--meth`, `--short-insert` or `--ref-span-insert`, records byte-identical to stock bwa 0.7.19 built without FP contraction, `@PG` excluded, on the parity checks' generated reads; CI runners: Linux x86-64 AVX2 build, Linux arm64 NEON; scope in [aln](../cli/aln.md)) |
+| `bwa-mem3 aln` backtracking aligner (bwa 0.7.19 `aln` + `samse`/`sampe`) | [#689](https://github.com/fg-labs/bwa-mem3/pull/689) | — | fork-only (without `--meth`, `--short-insert`, `--ref-span-insert` or `--exact-rescue-window`, records byte-identical to stock bwa 0.7.19 built without FP contraction, `@PG` excluded, on the parity checks' generated reads; CI runners: Linux x86-64 AVX2 build, Linux arm64 NEON; scope in [aln](../cli/aln.md)) |
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
 | `--smem-dedup` SMEM deduplication | [#187](https://github.com/fg-labs/bwa-mem3/pull/187) | — | fork-only (opt-in, not byte-identical) |

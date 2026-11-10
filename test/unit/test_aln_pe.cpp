@@ -1483,3 +1483,91 @@ TEST_CASE("aln_pe: ref-span-insert places the rescue window from the anchor's re
     }
     free(pe);
 }
+
+TEST_CASE("aln_pe: exact-rescue-window is an appended option that defaults off"
+          * doctest::test_suite("unit/aln_pe")) {
+    CHECK(offsetof(ba::pe_opt_t, exact_rescue_window) >= offsetof(ba::pe_opt_t, ref_span_insert) + sizeof(int));
+    auto *opt = ba::bwa_init_pe_opt();
+    REQUIRE(opt != nullptr);
+    CHECK(opt->exact_rescue_window == 0);
+    free(opt);
+}
+
+namespace {
+// sampe's rescue-window arithmetic as bwa_paired_sw wrote it (each assignment truncates).
+void sampe_window(int64_t base, bool mate_reverse, int len, const ba::isize_info_t &ii, int64_t *beg, int64_t *end)
+{
+    if (mate_reverse) *beg = base + ii.avg - 3 * ii.std - len * 1.5;
+    else *beg = base - ii.avg - 3 * ii.std - len * 0.5;
+    *end = *beg + 6 * ii.std + 2 * len;
+}
+} // namespace
+
+TEST_CASE("aln_pe: the stock rescue window loses a base when 6 std crosses an integer; the exact one does not"
+          * doctest::test_suite("unit/aln_pe")) {
+    // A forward 150 bp anchor and its reverse 150 bp mate. std 12.6685 and 12.6646 differ by 0.004,
+    // and 6 std crosses 76 between them (at 12.6667). Stock's end is floor(start) + floor(6 std) +
+    // 2 len, so every window of this geometry loses its last base at once; the stated end, avg +
+    // 3 std + len / 2 past the anchor, moves by 0.012 of a base and stays inside the same base.
+    const int64_t base = 1000000;
+    ba::isize_info_t wide = {}, narrow = {};
+    wide.avg = narrow.avg = 300.3;
+    wide.std = 12.6685; narrow.std = 12.6646;
+    int64_t sb[2], se[2], eb[2], ee[2];
+    ba::aln_rescue_window(base, true, 150, &wide, false, &sb[0], &se[0]);
+    ba::aln_rescue_window(base, true, 150, &narrow, false, &sb[1], &se[1]);
+    CHECK(sb[0] == base + 37); CHECK(sb[1] == base + 37);
+    CHECK(se[0] == base + 413); CHECK(se[1] == base + 412); // the cohort-wide step
+    ba::aln_rescue_window(base, true, 150, &wide, true, &eb[0], &ee[0]);
+    ba::aln_rescue_window(base, true, 150, &narrow, true, &eb[1], &ee[1]);
+    CHECK(eb[0] == base + 37); CHECK(eb[1] == base + 37);
+    CHECK(ee[0] == base + 414); CHECK(ee[1] == base + 414); // ceil(300.3 + 3 std + 75), 413.31 and 413.29
+    // The same holds for a reverse anchor's forward mate placed from the anchor's end.
+    ba::aln_rescue_window(base, false, 150, &wide, false, &sb[0], &se[0]);
+    ba::aln_rescue_window(base, false, 150, &narrow, false, &sb[1], &se[1]);
+    CHECK(se[0] - sb[0] == 376); CHECK(se[1] - sb[1] == 375);
+    ba::aln_rescue_window(base, false, 150, &wide, true, &eb[0], &ee[0]);
+    ba::aln_rescue_window(base, false, 150, &narrow, true, &eb[1], &ee[1]);
+    CHECK(eb[0] == eb[1]); CHECK(ee[0] == ee[1]);
+}
+
+TEST_CASE("aln_pe: the exact rescue window rounds the insert range outward and is monotone in std"
+          * doctest::test_suite("unit/aln_pe")) {
+    const int64_t base = 1000000;
+    // (Not avg 250.5 with these even lengths: a start whose fraction is exactly 1/2 makes stock's two
+    // floors cancel, and its end then steps once per third of std as well, apart from rounding.)
+    for (double avg : {99.75, 250.2, 301.37}) for (int len : {30, 100, 150}) for (bool rev : {true, false}) {
+        CAPTURE(avg); CAPTURE(len); CAPTURE(rev);
+        ba::isize_info_t ii = {};
+        ii.avg = avg;
+        int64_t pb = 0, pe = 0, pse = 0;
+        int stock_moves = 0, exact_moves = 0, stock_drops = 0;
+        for (int step = 0; step <= 20000; ++step) {
+            ii.std = 5.0 + step * 0.0007; // 5 to 19
+            int64_t b, e, sb, se, rb, re;
+            ba::aln_rescue_window(base, rev, len, &ii, false, &sb, &se);
+            sampe_window(base, rev, len, ii, &rb, &re);
+            REQUIRE(sb == rb); REQUIRE(se == re); // without the option: sampe's window
+            ba::aln_rescue_window(base, rev, len, &ii, true, &b, &e);
+            const double lo = rev ? avg - 3 * ii.std - len * 1.5 : -avg - 3 * ii.std - len * 0.5;
+            const double hi = lo + 6 * ii.std + 2 * len;
+            // the smallest integer window holding [base + lo, base + hi)
+            REQUIRE((double)(b - base) <= lo); REQUIRE(lo < (double)(b - base) + 1);
+            REQUIRE((double)(e - base) >= hi - 1e-9); REQUIRE((double)(e - base) - 1 < hi + 1e-9);
+            // it holds stock's window, and adds at most two bases at the end
+            REQUIRE(b <= sb); REQUIRE(sb - b <= 1); REQUIRE(e >= se); REQUIRE(e - se <= 2);
+            if (step) {
+                REQUIRE(b <= pb); REQUIRE(e >= pe); // monotone: a wider std never narrows it
+                exact_moves += e != pe;
+                stock_moves += se != pse;
+                stock_drops += se < pse;
+            }
+            pb = b; pe = e; pse = se;
+        }
+        // The stated end crosses a base each third of a unit of std (42 times here). Stock's end
+        // steps up with floor(6 std) (84 times) and back with floor(start) (42 times).
+        CHECK(exact_moves == 42);
+        CHECK(stock_moves == 3 * exact_moves);
+        CHECK(stock_drops == exact_moves);
+    }
+}

@@ -1,13 +1,16 @@
 # Equivalence with bwa-mem2 (bit-identity)
 
 This page's bwa-mem2 comparisons concern `mem`, not the short-read `aln` command.
-Without `--meth`, `--short-insert` or `--ref-span-insert`, [`aln`](../cli/aln.md) targets stock bwa 0.7.19
+Without `--meth`, `--short-insert`, `--ref-span-insert` or `--exact-rescue-window`, [`aln`](../cli/aln.md) targets stock bwa 0.7.19
 `aln` + `samse`/`sampe` record identity, excluding program-header naming and the
 strict input/error handling documented there. Opt-in `aln --short-insert` changes
 paired insert-size calibration, pairs mates with coincident starts and widens mate rescue
 to overlap the anchor, and can change pair selection, proper-pair flags, MAPQ and rescued
 mates, with or without `--meth`. Opt-in `aln --ref-span-insert` measures paired inserts from
 alignment reference spans instead of read lengths and can change the same outputs. Opt-in
+`aln --exact-rescue-window` (the default under `--meth`) rounds the mate-rescue window outward
+instead of truncating it and can change rescued mates, their CIGARs, MAPQ and proper-pair flags.
+Opt-in
 `aln --known-snvs` credits known SNV ALT alleles and can change placement, MAPQ, flags and
 alternative hits at the sites, and adds `XV:Z`. Opt-in `aln --meth` changes search,
 refinement, accounting and tags and is not stock or MEM-equivalent. The MEM
