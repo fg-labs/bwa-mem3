@@ -522,8 +522,11 @@ reviews:
           that benchmark and build notes cite with a version,
           release-please (the public release-automation project this repository
           already links by URL in docs/src/developer-guide/release.md and pins
-          by action ref in .github/workflows/release.yml), and standard OS or
-          cloud instance-type designations.
+          by action ref in .github/workflows/release.yml), the public shell
+          linters ShellCheck and shfmt (pinned in
+          test/regression/shell_lint.sh), including their in-file directives
+          such as `# shellcheck disable=SC2034` and `# shellcheck source=common.sh`,
+          and standard OS or cloud instance-type designations.
           Any other proper-noun tool, harness, bucket, fleet, queue, or internal
           project name is a FAIL. (2) An object-store URL (`s3://`, `gs://`,
           `az://`) or bucket name. (3) A cloud account number, an EC2 instance
