@@ -680,8 +680,12 @@ restores trimmed tails before legacy CIGAR splitting.
 The per-read SA lookup budget is a single total of 4596 by default, not separate
 best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known
 placement when available, marks it as a repeat with MAPQ 0, and omits exact
-`X0`/`X1`/`XA` claims. `-N` does not remove these resource limits. Candidate CIGAR
-retention is capped cumulatively at 64 MiB per read: a read that reaches the cap is
+`X0`/`X1`/`XA` claims. Candidate rows are resolved in batches; once a batch holds
+more rows than the budget has left, the read is incomplete whatever they resolve to,
+so that batch resolves at most 64 more rows (in discovery order) to choose the
+best-known placement instead of spending the rest of the budget
+([#777](https://github.com/fg-labs/bwa-mem3/pull/777)). `-N` does not remove these resource
+limits. Candidate CIGAR retention is capped cumulatively at 64 MiB per read: a read that reaches the cap is
 marked incomplete in the same way, stays unmapped if it has no retained placement,
 and later reads continue; the run does not exit. Refinement separately checks a
 conservative 64 MiB active-allocation estimate (not total process RSS or retained

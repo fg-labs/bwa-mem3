@@ -13,6 +13,7 @@
 #include "../../src/aln/aln_bwt.h"
 #include "../../src/aln/aln_known_snvs.h"
 #include "../../src/aln/aln_meth_realign.h"
+#include "../../src/aln/aln_meth_search.h"
 #include "../../src/aln/bwape.h"
 #include "../../src/aln/bwaseqio.h"
 #include "../../src/aln/bwtgap.h"
@@ -1003,12 +1004,14 @@ TEST_CASE("aln_known_snvs: the ALT-window stop certificate bounds complete site-
         for (int edge : {locus - 1, locus + 30}) CHECK(s.search({edge}, read_no, x.oriented(reverse), full_budget, s.opt, false).certificate.value == 3);
     }
     // Under the read, which carries the reference base: the ALT placement has one mismatch. It could
-    // be retained (best cost plus one mismatch), so the certificate refuses the stop and the genomic
-    // search spends its whole budget on the copies.
+    // be retained (best cost plus one mismatch), so the certificate refuses the stop and the copies
+    // bind the genomic search's lookup budget: past its first row, the binding flush resolves only
+    // ALN_METH_BIND_ROWS more.
     auto under_ref = s.search({locus + 10}, 1, x.oriented(false), full_budget, s.opt);
     CHECK(under_ref.window.flags == 0); CHECK(under_ref.window.site_bound.value == 1);
     CHECK(under_ref.certificate.value == 1);
-    CHECK(under_ref.genomic.flags == ba::ALN_METH_BIND_BEST); CHECK(under_ref.genomic.n_lookups == full_budget);
+    CHECK(under_ref.genomic.flags == ba::ALN_METH_BIND_BEST);
+    CHECK(under_ref.genomic.n_lookups == 1 + ba::ALN_METH_BIND_ROWS);
     // Two windows hold the read beside their sites. A lookup budget of one row binds the window
     // search before it has seen both: it proved nothing about site-covering placements, so the
     // certificate falls back to the width bound and the genomic result stays incomplete.
@@ -3189,4 +3192,86 @@ TEST_CASE("aln_known_snvs: in-memory window index equals the file-built one"
                     bwa_aln::ks_windows_free(&got);
                 }
             }
+}
+
+TEST_CASE("aln_known_snvs: incomplete ALT-window discovery cannot claim unique methylation hits")
+{
+    bwa_tests::TempDir tmp("ks_meth_incomplete");
+    const std::string prefix = tmp.path() + "/" + tmp.path().substr(tmp.path().rfind('/') + 1) + ".fa";
+    const std::string read = "ACAGACAGACAGACAGACAGACAGAC";
+    uint32_t state = 777;
+    std::vector<std::pair<std::string, std::string>> contigs;
+    std::vector<std::string> sites;
+    for (int i = 0; i < 9; ++i) {
+        std::string seq = aln_test::lcg_dna(state, 380);
+        std::string center = read;
+        if (i > 0 && i < 8) std::replace(center.begin(), center.end(), 'C', 'T');
+        if (i == 8) center[12] = 'G';
+        seq.replace(177, read.size(), center);
+        const std::string name = "decoy" + std::to_string(i);
+        contigs.push_back({name, seq});
+        if (i > 0 && i < 8)
+            for (int j = 40; j < 340; ++j) {
+                if (j >= 177 && j < 177 + (int)read.size()) continue;
+                for (char alt : std::string("ACGT"))
+                    if (alt != seq[j]) sites.push_back(row(name.c_str(), j + 1, seq[j], std::string(1, alt)));
+            }
+        if (i == 0) sites.push_back(row(name.c_str(), 179, seq[178], "T"));
+        if (i == 8) sites.push_back(row(name.c_str(), 190, seq[189], std::string(1, read[12])));
+    }
+    FILE *fp = fopen(prefix.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    for (const auto &c : contigs) fprintf(fp, ">%s\n%s\n", c.first.c_str(), c.second.c_str());
+    REQUIRE(fclose(fp) == 0);
+    std::vector<std::string> args = {"index", "--meth", prefix};
+    std::vector<char *> argv;
+    for (auto &a : args) argv.push_back(&a[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)args.size(), argv.data()) == 0);
+    const std::string vcf = tmp.path() + "/sites.vcf";
+    fp = fopen(vcf.c_str(), "w");
+    REQUIRE(fp != nullptr);
+    fprintf(fp, "##fileformat=VCFv4.2\n");
+    for (const auto &c : contigs) fprintf(fp, "##contig=<ID=%s,length=380>\n", c.first.c_str());
+    fprintf(fp, "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n");
+    for (const auto &s : sites) fprintf(fp, "%s\n", s.c_str());
+    REQUIRE(fclose(fp) == 0);
+    const auto fq = write_fq(tmp.path() + "/reads.fq", {{"one", read}, {"duplicate", read}});
+    const auto mate = write_fq(tmp.path() + "/mate.fq", {{"one", revcomp(read)}, {"duplicate", revcomp(read)}});
+    for (bool paired : {false, true}) {
+        const auto out = tmp.path() + (paired ? "/pe.sam" : "/se.sam");
+        std::vector<std::string> a = {"--meth", "-n", "0", "-o", "0", "-t", "1", "--known-snvs", vcf, "-f", out, prefix, fq};
+        if (paired) a.push_back(mate);
+        REQUIRE(run(a) == 0);
+        const auto rec = records(slurp(out));
+        REQUIRE(rec.size() == (paired ? 4 : 2));
+        for (size_t i = 0; i < rec.size(); ++i) {
+            const auto &r = rec[i];
+            REQUIRE(r.size() >= 11);
+            CHECK(r[0] == (i < (paired ? 2u : 1u) ? "one" : "duplicate"));
+            CHECK(r[1] == (paired ? (i % 2 == 0 ? "97" : "145") : "0"));
+            CHECK(r[4] == "0");
+            CHECK(r[5] == "26M");
+            CHECK(r[2] == "decoy0");
+            CHECK(r[3] == "178");
+            CHECK(r[9] == read);
+            CHECK(r[10] == std::string(read.size(), 'I'));
+            CHECK(r[6] == (paired ? "=" : "*"));
+            CHECK(r[7] == (paired ? "178" : "0"));
+            CHECK(r[8] == (paired ? (i % 2 == 0 ? "26" : "-26") : "0"));
+            CHECK(tag(r, "NM:i:") == "NM:i:0");
+            CHECK(tag(r, "MD:Z:") == "MD:Z:26");
+            CHECK(tag(r, "XT:A:") == "XT:A:R");
+            CHECK(tag(r, "XV:Z:") == "XV:Z:decoy0:179:C>T,R,0,0,NA,NA");
+            for (const auto &tag : r) {
+                CHECK(tag.compare(0, 5, "X0:i:") != 0);
+                CHECK(tag.compare(0, 5, "X1:i:") != 0);
+                CHECK(tag.compare(0, 5, "XA:Z:") != 0);
+            }
+        }
+    }
 }
