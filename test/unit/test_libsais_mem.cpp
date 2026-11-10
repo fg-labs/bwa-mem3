@@ -4,10 +4,13 @@
 #include "doctest/doctest.h"
 
 #include "../framework/temp_dir.h"
+#include "../../src/fm_index_writer.h"
 #include "../../src/libsais_build.h"
 
 #include <cstdint>
+#include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <vector>
@@ -93,5 +96,73 @@ TEST_CASE("libsais_mem: pack_doubled and write_doubled_pac equal an independent 
             if (pad) CHECK(disk[nbytes] == 0);
             CHECK(disk.back() == (uint8_t)((2 * l_pac) % 4));
         }
+    }
+}
+
+TEST_CASE("libsais_mem: MemSink holds the same bytes the file writer writes"
+          * doctest::test_suite("unit/libsais_mem"))
+{
+    bwa_tests::TempDir tmp("libsais_mem_sink");
+    // N is the doubled-text length; the index holds N + 1 rows. 4099 rows fill no block or
+    // sample stride exactly; 4096 rows do, so the layout's last cp_occ entry and last SA sample
+    // are reserved but never written, and must read back zero as they do from the file.
+    for (const int64_t N : {(int64_t)4098, (int64_t)4095}) {
+        std::vector<uint8_t> buf((size_t)N + 1, 0);   // libsais alphabet: 1..4 = ACGT, buf[N] = 0
+        uint32_t st = 12345u;
+        int64_t count[5] = {0, 0, 0, 0, 0};
+        int64_t freq[4] = {0, 0, 0, 0};
+        for (int64_t i = 0; i < N; ++i) {
+            st = st * 1664525u + 1013904223u;
+            const uint8_t b = (uint8_t)((st >> 24) & 3);
+            buf[(size_t)i] = (uint8_t)(b + 1);
+            ++freq[b];
+        }
+        for (int c = 1; c <= 4; ++c) count[c] = count[c - 1] + freq[c - 1];
+
+        std::vector<int32_t> sa((size_t)N + 1);
+        for (int64_t i = 0; i <= N; ++i) sa[(size_t)i] = (int32_t)i;
+        std::sort(sa.begin(), sa.end(), [&](int32_t a, int32_t b) {
+            if (a == b) return false;   // irreflexive, as std::sort requires
+            while (true) {   // the unique 0 terminator at buf[N] ends every other comparison
+                if (buf[(size_t)a] != buf[(size_t)b]) return buf[(size_t)a] < buf[(size_t)b];
+                ++a; ++b;
+            }
+        });
+
+        for (const int sa_compx : {0, 3})
+            for (int threads : {1, 4}) {
+                CAPTURE(N);
+                CAPTURE(sa_compx);
+                CAPTURE(threads);
+                const std::string path = tmp.path() + "/idx.bwt.2bit.64";
+                int64_t sent_file = -1;
+                write_fm_index_streaming(path.c_str(), buf.data(), sa.data(), false, N, count,
+                                         &sent_file, sa_compx, threads);
+                const std::vector<uint8_t> file = read_file(path);
+
+                FmArrays arr;
+                MemSink sink(N + 1, sa_compx, &arr);
+                int64_t sent_mem = -1;
+                write_fm_index_streaming(sink, buf.data(), sa.data(), false, N, count, &sent_mem,
+                                         sa_compx, threads);
+
+                const Bwt2bitLayout L = fmi_bwt2bit_layout(N + 1, sa_compx);
+                REQUIRE(file.size() == (size_t)L.total_bytes);
+                CHECK(sent_mem == sent_file);
+                CHECK(arr.ref_seq_len == N + 1);
+                CHECK(std::memcmp(arr.count, file.data() + 8, sizeof arr.count) == 0);
+                CHECK(arr.sentinel_index == sent_file);
+                CHECK(arr.sa_compx == sa_compx);
+                CHECK(std::memcmp(arr.cp_occ, file.data() + L.off_cp_occ,
+                                  (size_t)L.cp_occ_count * sizeof(CP_OCC)) == 0);
+                CHECK(std::memcmp(arr.sa_ms_byte, file.data() + L.off_ms_byte,
+                                  (size_t)L.sa_sample_count) == 0);
+                CHECK(std::memcmp(arr.sa_ls_word, file.data() + L.off_ls_word,
+                                  (size_t)L.sa_sample_count * sizeof(uint32_t)) == 0);
+                if ((N + 1) % ((int64_t)1 << sa_compx) == 0) {
+                    CHECK(arr.sa_ms_byte[L.sa_sample_count - 1] == 0);
+                    CHECK(arr.sa_ls_word[L.sa_sample_count - 1] == 0);
+                }
+            }
     }
 }
