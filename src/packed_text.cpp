@@ -49,8 +49,10 @@ PackedText::PackedText(const std::string& pac_path, int64_t n_bases)
 
 PackedText::~PackedText()
 {
-    if (data_) munmap((void*)data_, map_bytes_);
-    if (fd_ >= 0) close(fd_);
+    // A non-owning view (fd_ < 0, map_bytes_ == 0) must not touch the caller's memory.
+    if (fd_ < 0) return;
+    if (data_ && map_bytes_ > 0) munmap((void*)data_, map_bytes_);
+    close(fd_);
 }
 
 uint64_t PackedText::get_kmer(int64_t pos, int k) const
