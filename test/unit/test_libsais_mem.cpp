@@ -5,6 +5,8 @@
 
 #include "../framework/temp_dir.h"
 #include "../../src/fm_index_writer.h"
+#include "../../src/bntseq.h"
+#include "../../src/bwa.h"
 #include "../../src/libsais_build.h"
 
 #include <cstdint>
@@ -27,6 +29,21 @@ std::vector<uint8_t> read_file(const std::string &path)
     while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + n);
     std::fclose(f);
     return v;
+}
+
+// Locate a test/fixtures file whatever the working directory is (the tests run from
+// the repo root or from test/).
+std::string fixture(const char *name)
+{
+    const std::string src = __FILE__;   // .../test/unit/test_libsais_mem.cpp
+    const std::string dir = src.substr(0, src.rfind('/'));
+    for (const std::string &base : {dir + "/../fixtures/", std::string("test/fixtures/"),
+                                    std::string("fixtures/"), std::string("../fixtures/")}) {
+        FILE *f = std::fopen((base + name).c_str(), "rb");
+        if (f) { std::fclose(f); return base + name; }
+    }
+    FAIL("fixture not found: " << name);
+    return "";
 }
 
 } // namespace
@@ -117,4 +134,59 @@ TEST_CASE("libsais_mem: MemSink holds the same bytes the file writer writes")
         CHECK(std::memcmp(arr.sa_ls_word, file.data() + L.off_ls_word,
                           (size_t)L.sa_sample_count * sizeof(uint32_t)) == 0);
     }
+}
+
+TEST_CASE("libsais_mem: memory build equals the index file")
+{
+    for (const char *fa_name : {"phix.fa", "synthetic_1mb.fa"}) {
+        const std::string fa = fixture(fa_name);
+        bwa_tests::TempDir tmp("libsais_mem_build");
+        const std::string prefix = tmp.path() + "/idx";
+        REQUIRE(bwa_idx_build(fa.c_str(), prefix.c_str(), 0, 3) == 0);
+        bntseq_t *bns = bns_restore(prefix.c_str());
+        REQUIRE(bns != nullptr);
+        const int64_t l_pac = bns->l_pac;
+        bns_destroy(bns);
+        const std::vector<uint8_t> pac = read_file(prefix + ".pac");
+        REQUIRE(pac.size() >= (size_t)((l_pac + 3) / 4));
+        const std::vector<uint8_t> file = read_file(prefix + ".bwt.2bit.64");
+        const int sa_compx = 3;
+        const Bwt2bitLayout L = fmi_bwt2bit_layout(2 * l_pac + 1, sa_compx);
+        REQUIRE(file.size() == (size_t)L.total_bytes);
+        for (int threads : {1, 8}) {
+            CAPTURE(fa_name);
+            CAPTURE(threads);
+            LibsaisBuildOpts opts;
+            opts.num_threads = threads;
+            opts.sa_compx = sa_compx;
+            FmArrays arr;
+            REQUIRE(libsais_build_fm_memory(pac.data(), l_pac, opts, &arr) == 0);
+            CHECK(arr.ref_seq_len == 2 * l_pac + 1);
+            CHECK(arr.sa_compx == sa_compx);
+            CHECK(std::memcmp(&arr.ref_seq_len, file.data(), 8) == 0);
+            CHECK(std::memcmp(arr.count, file.data() + 8, sizeof arr.count) == 0);
+            int64_t sent;
+            std::memcpy(&sent, file.data() + L.off_sentinel, sizeof sent);
+            CHECK(arr.sentinel_index == sent);
+            CHECK(std::memcmp(arr.cp_occ, file.data() + L.off_cp_occ,
+                              (size_t)L.cp_occ_count * sizeof(CP_OCC)) == 0);
+            CHECK(std::memcmp(arr.sa_ms_byte, file.data() + L.off_ms_byte,
+                              (size_t)L.sa_sample_count) == 0);
+            CHECK(std::memcmp(arr.sa_ls_word, file.data() + L.off_ls_word,
+                              (size_t)L.sa_sample_count * sizeof(uint32_t)) == 0);
+        }
+    }
+}
+
+TEST_CASE("libsais_mem: a memory budget refusal allocates nothing")
+{
+    const int64_t l_pac = 1000;
+    std::vector<uint8_t> pac((size_t)(l_pac + 3) / 4, 0x1b);
+    LibsaisBuildOpts opts;
+    opts.max_memory_bytes = 1;   // far below the estimate
+    FmArrays arr;
+    CHECK(libsais_build_fm_memory(pac.data(), l_pac, opts, &arr) == 3);
+    CHECK(arr.cp_occ == nullptr);
+    CHECK(arr.sa_ms_byte == nullptr);
+    CHECK(arr.sa_ls_word == nullptr);
 }

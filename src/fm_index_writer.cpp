@@ -358,20 +358,6 @@ Bwt2bitLayout fmi_bwt2bit_layout(int64_t ref_seq_len, int sa_compx)
     return L;
 }
 
-namespace {
-
-// pwrites each range into an already-sized file.
-struct FileSink : FmSink {
-    explicit FileSink(int fd) : fd_(fd) {}
-    void write(int64_t off, const void* src, size_t n, const char* what) override {
-        pwrite_all(fd_, src, n, (off_t)off, what);
-    }
-private:
-    int fd_;
-};
-
-} // namespace
-
 // Argument checks shared by both write_fm_index_streaming overloads and the sink constructors.
 void check_streaming_args(const char* fn, int64_t ref_seq_len, int sa_compx)
 {
@@ -445,6 +431,16 @@ void write_fm_index_streaming(const char* out_path,
 {
     const int64_t ref_seq_len = pac_len + 1;
     check_streaming_args(__func__, ref_seq_len, sa_compx);
+    FileFmSink sink(out_path, ref_seq_len, sa_compx);
+    write_fm_index_streaming(sink, buf, sa, sa_is_64bit, pac_len, count,
+                             out_sentinel_index, sa_compx, num_threads);
+    sink.commit();
+}
+
+FileFmSink::FileFmSink(const char* out_path, int64_t ref_seq_len, int sa_compx)
+    : out_path_(out_path)
+{
+    check_streaming_args(__func__, ref_seq_len, sa_compx);
     const off_t total_bytes = (off_t)fmi_bwt2bit_layout(ref_seq_len, sa_compx).total_bytes;
 
     // Write to a sibling .tmp file and rename on success so a failed
@@ -456,26 +452,31 @@ void write_fm_index_streaming(const char* out_path,
     // deliberate here: `index` is a single-writer build of a given prefix, so
     // the concurrent-writers race that motivates a unique temp does not apply,
     // and O_TRUNC self-healing is worth keeping.
-    const std::string tmp_path = std::string(out_path) + ".tmp";
-    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-        err_fatal(__func__, "open('%s'): %s", tmp_path.c_str(), strerror(errno));
-    if (ftruncate(fd, total_bytes) != 0)
+    tmp_path_ = out_path_ + ".tmp";
+    fd_ = open(tmp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_ < 0)
+        err_fatal(__func__, "open('%s'): %s", tmp_path_.c_str(), strerror(errno));
+    if (ftruncate(fd_, total_bytes) != 0)
         err_fatal(__func__, "ftruncate('%s', %lld): %s",
-                  tmp_path.c_str(), (long long)total_bytes, strerror(errno));
+                  tmp_path_.c_str(), (long long)total_bytes, strerror(errno));
+}
 
-    FileSink sink(fd);
-    write_fm_index_streaming(sink, buf, sa, sa_is_64bit, pac_len, count,
-                             out_sentinel_index, sa_compx, num_threads);
+void FileFmSink::write(int64_t off, const void* src, size_t n, const char* what)
+{
+    pwrite_all(fd_, src, n, (off_t)off, what);
+}
 
-    if (close(fd) != 0)
-        err_fatal(__func__, "close('%s'): %s", tmp_path.c_str(), strerror(errno));
+void FileFmSink::commit()
+{
+    if (close(fd_) != 0)
+        err_fatal(__func__, "close('%s'): %s", tmp_path_.c_str(), strerror(errno));
+    fd_ = -1;
     // Atomic publish: rename(2) is atomic on the same filesystem, so a
     // concurrent reader sees either the previous good index or the new
     // one, never a partial.
-    if (rename(tmp_path.c_str(), out_path) != 0)
+    if (rename(tmp_path_.c_str(), out_path_.c_str()) != 0)
         err_fatal(__func__, "rename('%s' -> '%s'): %s",
-                  tmp_path.c_str(), out_path, strerror(errno));
+                  tmp_path_.c_str(), out_path_.c_str(), strerror(errno));
 }
 
 FmArrays::~FmArrays()

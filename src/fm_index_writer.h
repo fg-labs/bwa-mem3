@@ -3,6 +3,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "fmi_seed_api.h"   // CP_OCC, CP_SHIFT
 
@@ -57,6 +58,19 @@ struct FmArrays {
 // Fatal on a reference length or sa_compx the on-disk layout cannot represent. Sinks call it
 // before opening, sizing or allocating anything, so a bad argument leaves nothing behind.
 void check_streaming_args(const char* fn, int64_t ref_seq_len, int sa_compx);
+
+// pwrites each range into `<out_path>.tmp`, pre-sized for the layout; commit()
+// closes it and renames it over `out_path` (atomic publish).
+struct FileFmSink : FmSink {
+    FileFmSink(const char* out_path, int64_t ref_seq_len, int sa_compx);
+    void write(int64_t off, const void* src, size_t n, const char* what) override;
+    void commit();
+    FileFmSink(const FileFmSink&) = delete;
+    FileFmSink& operator=(const FileFmSink&) = delete;
+private:
+    std::string out_path_, tmp_path_;
+    int fd_ = -1;
+};
 
 // Routes writes by Bwt2bitLayout offsets into FmArrays. Each write must lie
 // inside a single section (a straddling write is a writer bug and is fatal).
