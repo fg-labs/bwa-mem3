@@ -474,7 +474,10 @@ legacy CIGAR splitting.
 The per-read SA lookup budget is a single total of 4596 by default, not separate
 best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known
 placement when available, marks it as a repeat with MAPQ 0, and omits exact
-`X0`/`X1`/`XA` claims. `-N` does not remove these resource limits. Candidate CIGAR
+`X0`/`X1`/`XA` claims. Candidate rows are resolved in batches; once a batch holds
+more rows than the budget has left, the read is incomplete whatever they resolve to,
+so that batch resolves at most 64 more rows (in discovery order) to choose the
+best-known placement instead of spending the rest of the budget. `-N` does not remove these resource limits. Candidate CIGAR
 retention is capped cumulatively at 64 MiB per read. Refinement separately checks
 a conservative 64 MiB active-allocation estimate (not total process RSS or retained
 backend scratch), and query/window lengths must not exceed 65535 bases. Invalid

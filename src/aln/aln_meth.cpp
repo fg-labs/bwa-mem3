@@ -280,7 +280,7 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
     // --known-snvs: a window holding a site is also aligned with the ALTs in place; the locus
     // keeps the cheaper of the two (the replace-if-better below).
     const int n_hap = aln_meth_window_has_site(*g->ref, rb, span, rid) ? 2 : 1;
-    for (int alt = 0; alt < n_hap; ++alt)
+    for (int alt = 0; alt < n_hap && !(x->res->flags & ALN_METH_BIND_CIGAR); ++alt)
         resolve_one(x, candidate, query, alt, h.e.n_ins, h.e.n_del);
 }
 static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
@@ -331,10 +331,19 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
         if (g->cores[i].state != GAP_SLOT_PARKED) continue;
         aln_meth_slot_t &x = g->slot[i];
         ++x.res->n_flushes;
+        // A flush whose pending rows exceed what is left of the budget binds it: the read ends
+        // incomplete (ALN_METH_BIND_BEST) whatever those rows resolve to, keeping only a MAPQ-0
+        // best-known placement. Resolve just ALN_METH_BIND_ROWS more rows for that placement
+        // rather than the rest of the budget. Earlier flushes are unchanged, so the same reads
+        // end incomplete.
+        int64_t limit = budget, pending = 0;
+        for (const auto &h : x.pend) pending += (int64_t)(h.l - h.k + 1);
+        if (pending > budget - x.res->n_lookups)
+            limit = std::min<int64_t>(budget, x.res->n_lookups + ALN_METH_BIND_ROWS);
         for (const auto &h : x.pend) {
             if (x.stop) break;
             const bwtint_t width = h.l - h.k + 1;
-            const int64_t remaining = budget - x.res->n_lookups;
+            const int64_t remaining = limit - x.res->n_lookups;
             const int n = (int)std::min<uint64_t>(width, (uint64_t)std::max<int64_t>(0, remaining));
             std::vector<bwtint_t> rows(n);
             for (int k = 0; k < n; ++k) rows[k] = h.k + k;

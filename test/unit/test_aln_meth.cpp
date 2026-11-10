@@ -1365,6 +1365,70 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
+TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few more rows")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("bind.fq", {conv(ref().c1.substr(500,50),'C','T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n=0;ba::bwa_seq_t *reads=ba::bwa_read_seq(input,1,&n,BWA_MODE_COMPREAD,0);
+    REQUIRE(n==1);REQUIRE(reads!=nullptr);
+    const std::string prefix=ref().fa+".meth";
+    FMI_search fmi(prefix.c_str());fmi.load_index(false,1);
+    ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    ba::gap_opt_t *opt=ba::gap_init_opt();
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;
+    group.n_slots=1;group.slot.resize(1);
+    ba::gap_slot_core_t core={};group.cores=&core;
+    auto &slot=group.slot[0];slot.grp=&group;slot.job=&core.job;
+    ba::aln_meth_read_t result;
+    const ba::gap_entry_t exact={};
+    // Each flush holds the intervals [k, k + width) of its widths, consecutive over the SA rows;
+    // the rows' windows are whatever they are (the lookup count does not depend on them).
+    REQUIRE(bwt->seq_len>4000);
+    auto run=[&](int budget,const std::vector<std::vector<int>> &flushes) {
+        mo.p_best=budget;mo.p_second=0;ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_slot_start(&slot,reads,&result,0,3,0);
+        std::vector<long> lookups;bwtint_t k=0;
+        for (const auto &widths : flushes) {
+            for (int w : widths) { ba::aln_meth_hit(&slot,&exact,k,k+w-1); k+=w; }
+            core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
+            lookups.push_back(result.n_lookups);
+        }
+        return lookups;
+    };
+    SUBCASE("flushes within the budget resolve every row") {
+        CHECK(run(1000,{{100,200},{300}})==std::vector<long>{300,600});
+        CHECK(result.flags==0);
+    }
+    SUBCASE("a flush that fills the budget exactly does not bind it") {
+        CHECK(run(1000,{{400},{600}})==std::vector<long>{400,1000});
+        CHECK(result.flags==0);
+    }
+    SUBCASE("the binding flush resolves ALN_METH_BIND_ROWS more rows and marks the read") {
+        CHECK(run(1000,{{100},{50,2000,10}})==std::vector<long>{100,100+ba::ALN_METH_BIND_ROWS});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+    }
+    SUBCASE("the binding rows are spread over the pending intervals in order") {
+        CHECK(run(100,{{40,40,40}})==std::vector<long>{ba::ALN_METH_BIND_ROWS});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+    }
+    SUBCASE("the binding flush never resolves past the budget") {
+        CHECK(run(1000,{{980},{30}})==std::vector<long>{980,1000});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+    }
+    SUBCASE("a binding first flush") {
+        CHECK(run(1000,{{1001}})==std::vector<long>{ba::ALN_METH_BIND_ROWS});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+    }
+    ba::aln_meth_slot_finish(&slot);
+    ba::bwa_free_read_seq(n,reads);ba::bwa_seq_close(input);
+    ba::aln_meth_ref_free(&mr);ba::bwt_destroy(bwt);free(opt);
+}
+
 TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique strata")
 {
     namespace ba = bwa_aln;
