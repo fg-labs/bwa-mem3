@@ -8,6 +8,8 @@
 #include "../../src/bntseq.h"
 #include "../../src/bwa.h"
 #include "../../src/libsais_build.h"
+#include "../../src/FMI_search.h"
+#include "../../src/aln/aln_bwt.h"
 
 #include <cstdint>
 #include <algorithm>
@@ -189,4 +191,95 @@ TEST_CASE("libsais_mem: a memory budget refusal allocates nothing")
     CHECK(arr.cp_occ == nullptr);
     CHECK(arr.sa_ms_byte == nullptr);
     CHECK(arr.sa_ls_word == nullptr);
+}
+
+TEST_CASE("libsais_mem: adopted index equals the loaded index")
+{
+    const std::string fa = fixture("phix.fa");
+    bwa_tests::TempDir tmp("libsais_mem_adopt");
+    const std::string prefix = tmp.path() + "/idx";
+    REQUIRE(bwa_idx_build(fa.c_str(), prefix.c_str(), 0, 3) == 0);
+
+    FMI_search loaded(prefix.c_str());
+    loaded.load_index(true, 1);
+
+    bntseq_t *bns0 = bns_restore(prefix.c_str());
+    REQUIRE(bns0 != nullptr);
+    const int64_t l_pac = bns0->l_pac;
+    const std::vector<uint8_t> pac_file = read_file(prefix + ".pac");
+    REQUIRE(pac_file.size() >= (size_t)(l_pac / 4 + 1));
+
+    LibsaisBuildOpts opts;
+    opts.num_threads = 2;
+    opts.sa_compx = 3;
+    auto arrays = std::unique_ptr<FmArrays>(new FmArrays());
+    REQUIRE(libsais_build_fm_memory(pac_file.data(), l_pac, opts, arrays.get()) == 0);
+
+    // The same bytes bwa_idx_load_ele would have slurped (calloc'd l_pac/4+1).
+    uint8_t *pac = (uint8_t *)calloc((size_t)(l_pac / 4 + 1), 1);
+    REQUIRE(pac != nullptr);
+    std::memcpy(pac, pac_file.data(), (size_t)(l_pac / 4 + 1));
+
+    FMI_search adopted("(memory)");
+    adopted.adopt_built(arrays.get(), bns0, pac, 2);
+    CHECK(arrays->cp_occ == nullptr);
+    CHECK(arrays->sa_ms_byte == nullptr);
+    CHECK(arrays->sa_ls_word == nullptr);
+    CHECK(adopted.idx->bns == bns0);
+    CHECK(adopted.idx->pac == pac);
+    CHECK(adopted.idx->mem == nullptr);
+
+    CHECK(adopted.reference_seq_len == loaded.reference_seq_len);
+    CHECK(adopted.sentinel_index == loaded.sentinel_index);
+    CHECK(adopted.sa_compx == loaded.sa_compx);
+    CHECK(adopted.sa_compx_mask == loaded.sa_compx_mask);
+    CHECK(std::memcmp(adopted.count_data(), loaded.count_data(), 5 * sizeof(int64_t)) == 0);
+    CHECK(std::memcmp(adopted.cp_occ_data(), loaded.cp_occ_data(),
+                      (size_t)loaded.cp_occ_size_bytes()) == 0);
+    CHECK(std::memcmp(adopted.sa_ms_byte_data(), loaded.sa_ms_byte_data(),
+                      (size_t)loaded.sa_ms_byte_size_bytes()) == 0);
+    CHECK(std::memcmp(adopted.sa_ls_word_data(), loaded.sa_ls_word_data(),
+                      (size_t)loaded.sa_ls_word_size_bytes()) == 0);
+    CHECK(adopted.idx->bns->l_pac == loaded.idx->bns->l_pac);
+    CHECK(adopted.idx->bns->n_seqs == loaded.idx->bns->n_seqs);
+    CHECK(std::memcmp(adopted.idx->pac, loaded.idx->pac, (size_t)(l_pac / 4 + 1)) == 0);
+
+    bwa_aln::bwt_t *bl = bwa_aln::bwt_from_fmi(&loaded);
+    bwa_aln::bwt_t *ba = bwa_aln::bwt_from_fmi(&adopted);
+    CHECK(ba->primary == bl->primary);
+    CHECK(ba->seq_len == bl->seq_len);
+    for (int c = 0; c < 5; ++c) CHECK(ba->L2[c] == bl->L2[c]);
+    uint32_t st = 99u;
+    for (int i = 0; i < 100; ++i) {
+        st = st * 1664525u + 1013904223u;
+        const int64_t k = (int64_t)(st >> 8) % (2 * l_pac);
+        for (int c = 0; c < 4; ++c)
+            CHECK(bwa_aln::bwt_occ(ba, k, (uint8_t)c) == bwa_aln::bwt_occ(bl, k, (uint8_t)c));
+        const int64_t row = (int64_t)(st >> 4) % loaded.reference_seq_len;
+        CHECK(adopted.get_sa_entry_compressed(row) == loaded.get_sa_entry_compressed(row));
+    }
+    bwa_aln::bwt_destroy(bl);
+    bwa_aln::bwt_destroy(ba);
+}
+
+TEST_CASE("libsais_mem: adopt_built accepts a null pac (BNS only)")
+{
+    const std::string fa = fixture("phix.fa");
+    bwa_tests::TempDir tmp("libsais_mem_adopt_bns");
+    const std::string prefix = tmp.path() + "/idx";
+    REQUIRE(bwa_idx_build(fa.c_str(), prefix.c_str(), 0, 3) == 0);
+    bntseq_t *bns = bns_restore(prefix.c_str());
+    REQUIRE(bns != nullptr);
+    const std::vector<uint8_t> pac_file = read_file(prefix + ".pac");
+    LibsaisBuildOpts opts;
+    opts.num_threads = 1;
+    FmArrays arrays;
+    REQUIRE(libsais_build_fm_memory(pac_file.data(), bns->l_pac, opts, &arrays) == 0);
+    {
+        FMI_search fmi("(memory)");
+        fmi.adopt_built(&arrays, bns, nullptr, 1, false);
+        CHECK(fmi.idx->pac == nullptr);
+        CHECK(fmi.idx->bns == bns);
+        CHECK(arrays.cp_occ == nullptr);
+    }   // ~FMI_search / ~indexEle free the arrays and bns without error
 }
