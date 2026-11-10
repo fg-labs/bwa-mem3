@@ -31,15 +31,14 @@ bwa-mem3 aln ref.fa r.fq > out.sam            # bwa aln + samse
 bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 ```
 
-**Byte-identity.** The SAM records are byte-identical to the
-output of stock bwa 0.7.19 `aln` + `samse`/`sampe` (the header is too, except
-the `@PG` line, which names the program that ran). This is checked against a
-stock bwa 0.7.19 binary on generated single-end and paired-end reads (a phiX plus
-synthetic-contig reference, a few thousand reads per case) with every option below, at
-one and at four threads (the input, output and index forms are checked at one thread).
-The check runs in CI on two GitHub-hosted runners, each at the one SIMD tier its
-build selects: `ubuntu-24.04` (Linux x86_64, AVX2 build) and `ubuntu-24.04-arm`
-(Linux arm64, NEON). Other x86_64 tiers are not
+**Byte-identity.** The tested SAM records and headers matched the output of stock
+bwa 0.7.19 `aln` + `samse`/`sampe`, except for the `@PG` line, which names the
+program that ran. The comparison uses generated single-end and paired-end reads
+(a phiX plus synthetic-contig reference, a few thousand reads per case) with every
+option below, at one and at four threads (the input, output and index forms are
+checked at one thread). It runs in CI on two GitHub-hosted runners, each at the
+one SIMD tier its build selects: `ubuntu-24.04` (Linux x86_64, AVX2 build) and
+`ubuntu-24.04-arm` (Linux arm64, NEON). Other inputs and x86_64 tiers are not
 compared with stock here. The search is scalar; the gapped refinement and the mate Smith-Waterman use bwa-mem3's
 `ksw_global`/`ksw_align`, whose SIMD tiers are checked against the scalar kernels by
 the unit tests rather than by this comparison.
@@ -51,9 +50,10 @@ insert-size and pairing arithmetic of `sampe` and then differ from `aln` (and fr
 x86_64 stock build) at rare rounding boundaries.
 
 The index is the one `bwa-mem3 index` writes (bwa-mem3's own format, not a
-stock `bwa index`). An index built with `index --meth` works and gives the same
-output as a plain index; an index staged with [`shm`](shm.md) is attached
-instead of read from disk. `aln` never aligns in methylation mode.
+stock `bwa index`). For the generated-read workload above, an index built with
+`index --meth` gives the same output as a plain index at one thread on the two CI
+runners and SIMD tiers listed above. An index staged with [`shm`](shm.md) is
+attached instead of read from disk. `aln` never aligns in methylation mode.
 
 ## Synopsis
 
@@ -76,16 +76,16 @@ and the name it has there when it differs.
 | `-l INT` | aln | 32 | Seed length |
 | `-k INT` | aln | 2 | Maximum differences in the seed |
 | `-m INT` | aln | 2000000 | Maximum entries in the search queue |
-| `-t INT` | aln | 1 | Threads |
+| `-t INT` | aln | 1 | Threads (at most 256; below 1 uses 1) |
 | `-M`, `-O`, `-E INT` | aln | 3, 11, 4 | Mismatch, gap-open and gap-extension penalties |
-| `-R INT` | aln | 30 | Stop searching when there are more than INT equally best hits |
+| `-R INT` | aln | 30 | Once there are more than INT equally best hits, keep collecting equally best hits but stop on the first worse-scoring hit |
 | `-q INT` | aln | 0 | Quality threshold for trimming reads down to 35 bp |
-| `-B INT` | aln | 0 | Barcode length (at most 63, or 31 with two read files) |
-| `-L`, `-N`, `-I`, `-Y` | aln | off | Log-scaled gap penalty; non-iterative search; Illumina 1.3+ qualities; drop Casava-filtered reads |
+| `-B INT` | aln | 0 | Barcode length (at most 63, or 31 with two read files); reads with at most `INT` bases are silently discarded |
+| `-L`, `-N`, `-I`, `-Y` | aln | off | Widen the no-gap zone at each read end (`-i`) by `log2(gap opens + gap extensions) / 2 + 1` instead of by the plain sum of gap opens and gap extensions already in the alignment, so further gaps can sit nearer the ends (gap penalties are unchanged); non-iterative search; Illumina 1.3+ qualities; drop Casava-filtered reads |
 | `--max-xa-hits INT` | samse, sampe `-n` | 3 | Maximum alternative hits in the `XA` tag |
 | `-r STR` | samse, sampe | none | Read-group header line |
 | `-f FILE` | samse, sampe | stdout | Output file |
-| `-a INT` | sampe | 500 | Maximum insert size |
+| `-a INT` | sampe | 500 | Maximum insert size when no insert-size estimate is available, including with `-A`; an inferred estimate takes precedence |
 | `--max-occ INT` | sampe `-o` | 100000 | Maximum occurrences for one end |
 | `--max-xa-hits-discordant INT` | sampe `-N` | 10 | Maximum hits to output for discordant pairs |
 | `-c FLOAT` | sampe | 1e-5 | Prior of the chimeric rate (lower bound) |
@@ -95,7 +95,9 @@ and the name it has there when it differs.
 | `--bam-level INT` | new | 1 | BAM compression level (0-9; other values are an error) |
 
 The long names exist because `-n` and `-o` already mean the search options.
-`--max-xa-hits` applies to single-end and paired-end output alike.
+`--max-xa-hits` applies to single-end and paired-end output alike. Both alternative-hit
+limits must be below 2,147,483,647 (`INT_MAX`) to leave room for the extra candidate
+used internally.
 
 The paired-end options are ignored, with a warning, when only one input file is
 given.
@@ -106,10 +108,11 @@ cannot run are refused with `exit 1` before the index loads: a negative `-l`, `-
 `-O`, `-E`, `-B` or `-n`, or penalties and `-o` that leave the search no room for one
 difference (`-M 0 -O 0 -E 0`, or a `-o` below -1 that cancels the others), a `-n`
 probability that is 0 as a float, a `-c` that is not finite (`inf`, `nan`), and an `-r`
-that ends in a newline. On those stock crashes, aborts, drops every read or writes a
+that contains an empty line or ends in a newline. On those stock crashes, aborts, drops every read or writes a
 malformed header. `-n` is read as a probability when it has a `.` or an exponent (`1e-2`);
-stock reads `1e-2` as the integer 1. Other negative values (`-e -1`, `-o -1`, `-i -1`, and
-so on) run as in stock. `-t` below 1 runs one thread, with a warning.
+stock reads `1e-2` as the integer 1 ([#689](https://github.com/fg-labs/bwa-mem3/pull/689)). Other negative values (`-e -1`, `-o -1`, `-i -1`, and
+so on) run as in stock. `-t` below 1 runs one thread, with a warning; above 256
+is refused before the index loads or output opens.
 
 During search, an actual score outside the priority stack or its 11-bit packed range
 (0-2047) exits 1 with a diagnostic instead of overflowing or indexing beyond the stack.
@@ -140,13 +143,16 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
 ## Inputs and outputs
 
 - Input is FASTQ or FASTA, plain or gzip-compressed. There is no BAM input.
-- Reads of 65,536 bases or more cannot be searched. The first one is named on stderr
-  and reading stops there: the reads before it are aligned and written, and the run
-  exits 1. (Stock wraps such a length and can report a false hit; its CIGAR also wraps
-  from 16,384 bases, which `aln` keeps whole.)
+- Reads with 65,536 bases or more remaining after barcode removal (`-B`) cannot be
+  searched. The first one is named on stderr and reading stops there. Single-end
+  output includes the preceding reads; paired-end output includes only the common
+  batch count available from both input files, discarding unmatched records even
+  if they precede the oversized read. The run exits 1. (Stock wraps such a length and can report a false hit; its CIGAR also wraps
+  from 16,384 bases, which `aln` keeps whole; [#689](https://github.com/fg-labs/bwa-mem3/pull/689).)
 - The reference is given as the index prefix, the same path you gave to `index`.
-- Each input file is checked, and `-f` is checked for writing, before the index
-  is loaded, so a typo costs no index load and leaves no partial output. An `-f`
+- Each input file and any existing `-f` path are checked before the index is
+  loaded. Absent output paths are not opened by this check: failures to create
+  them are reported when the output opens, after loading the index. An `-f`
   that names one of the input files, or a file of the index (`.pac`, `.ann`,
   `.bwt.2bit.64` and the others, including the `.meth.*` seed index that
   `index --meth` writes), is refused (writing it would truncate the reads before
@@ -166,11 +172,19 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   with an error before the index loads (the first `-` would take all of standard
   input). For paired reads from pipes, use two named files or process
   substitution (`<(zcat r1.fq.gz) <(zcat r2.fq.gz)`).
-- A malformed FASTQ record (no quality line, or one not as long as the
-  sequence) ends the batch and is skipped, as in stock, so the records written
-  are stock's; `aln` names the record on standard error and exits 1, where stock
-  exits 0. A failure to close an input (for example a truncated gzip stream) is
-  reported and exits 1 too, after the output (BAM included) is completed.
+- A FASTQ record with a `+` separator but no quality line, or a quality string
+  not as long as the sequence, ends that file's batch and is skipped, as in stock.
+  Without a `+` separator, the reader can interpret the record as FASTA and emit
+  it without qualities instead of reporting malformed FASTQ. In single-end
+  mode, a nonempty batch is processed and the reader is called again; an empty
+  batch stops reading, leaving later reads unprocessed. Recovery need not retain
+  every later record: a short quality string can consume following record lines.
+  Paired files end batches independently: only the common count is paired,
+  surplus reads are discarded, and a later end of file or name mismatch can stop
+  processing. `aln` names the malformed record on standard error and exits 1,
+  where stock exits 0. A failure to close an input (for example a truncated gzip stream) is
+  reported and exits 1 too, after the output (BAM included) is completed
+  ([#689](https://github.com/fg-labs/bwa-mem3/pull/689)).
 
 ## Notes
 
@@ -180,9 +194,11 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   reads that both have (stock `sampe` would read past the end of the first
   file). Check the warning when the counts should be equal: the exit status is
   0 in both cases, as stock `sampe`'s is when the second file is shorter (a
-  pipeline that checks only the exit status will not see the dropped reads).
+  pipeline that checks only the exit status will not see the dropped reads;
+  [#689](https://github.com/fg-labs/bwa-mem3/pull/689)).
 - **Read 1 shorter than read 2.** If the first file runs out first, the extra
-  reads of the second are ignored, with a warning, and the exit status is 0.
+  reads of the second are ignored, with a warning, and the exit status is 0
+  ([#689](https://github.com/fg-labs/bwa-mem3/pull/689)).
 - **Mismatched pair names.** A pair whose names differ (after the `/1` and `/2`
   trim) ends the run after that pair is written, with an error and exit 1, as
   `bwa sampe` stops.

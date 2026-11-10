@@ -263,7 +263,9 @@ stride-8 index and is the recommended speed-per-GB operating point; `-u 1`
 `bwa aln` followed by `bwa samse` (one read file) or `bwa sampe` (two) in one command, with no
 `.sai` files, on the index `bwa-mem3 index` writes. Its SAM records are byte-identical to stock
 bwa 0.7.19's (the `@PG` line differs) on the generated reads the parity checks use, at one and
-four threads, in CI on Linux x86-64 (AVX2 build) and Linux arm64 (NEON). `--bam` and
+four threads, in CI on Linux x86-64 (AVX2 build) and Linux arm64 (NEON), against a stock bwa built
+without floating-point contraction (a stock build with its default flags on arm64 can differ at rare
+rounding boundaries). `--bam` and
 `--bam-level` are new; the long options `--max-xa-hits`, `--max-occ` and
 `--max-xa-hits-discordant` stand in for samse/sampe `-n`, sampe `-o` and sampe `-N`. Option values
 on which stock crashes or drops every read (for example a negative `-l` or `-B`) are refused. See

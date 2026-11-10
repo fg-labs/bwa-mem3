@@ -39,7 +39,7 @@ struct SeIndex {
 
     SeIndex()
     {
-        prefix = dir + "/ref.fa";
+        prefix = dir + "/" + dir.substr(dir.rfind('/') + 1) + ".fa";
         REQUIRE(aln_test::write_test_fasta(prefix));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         fmi.reset(new FMI_search(prefix.c_str()));
@@ -493,7 +493,7 @@ struct LongIndex {
 
     explicit LongIndex(int len)
     {
-        prefix = dir + "/ref.fa";
+        prefix = dir + "/" + dir.substr(dir.rfind('/') + 1) + ".fa";
         uint32_t state = 97;
         contig = aln_test::lcg_dna(state, len);
         FILE *fp = fopen(prefix.c_str(), "w");

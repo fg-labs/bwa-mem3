@@ -18,14 +18,14 @@ Search options (from bwa aln):
   -l INT    seed length [32]
   -k INT    maximum differences in the seed [2]
   -m INT    maximum entries in the queue [2000000]
-  -t INT    number of threads [1]
+  -t INT    number of threads, at most 256; below 1 uses 1 [1]
   -M INT    mismatch penalty [3]
   -O INT    gap open penalty [11]
   -E INT    gap extension penalty [4]
   -R INT    stop searching when there are >INT equally best hits [30]
   -q INT    quality threshold for read trimming down to 35bp [0]
   -B INT    length of barcode [0]
-  -L        log-scaled gap penalty for long deletions
+  -L        add a log-scaled gap-open plus gap-extension count to the read-end gap exclusion (-i)
   -N        non-iterative mode: search for all n-difference hits (slooow)
   -I        the input is in the Illumina 1.3+ FASTQ-like format
   -Y        filter Casava-filtered sequences

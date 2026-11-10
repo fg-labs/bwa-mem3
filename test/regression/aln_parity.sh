@@ -434,8 +434,8 @@ else
     trap cleanup EXIT
 fi
 
-# fail before side effects: a missing input or an unwritable -f stops before the index loads and
-# before any output exists
+# A missing input stops before the index loads. An absent output path is opened only after
+# loading the index; failure must still leave no output.
 rm -f "$work/none.sam"
 rc=0
 "$BWA_MEM3" aln "$ref_mem3" "$work/missing.fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
@@ -457,9 +457,9 @@ if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || grep -q 'Index file found' "$wo
 fi
 rc=0
 "$BWA_MEM3" aln -f "$work/no_such_dir/out.sam" "$ref_mem3" "$form_fq" > "$work/none.out" 2> "$work/none.err" || rc=$?
-if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q "cannot open '.*out.sam' for writing" "$work/none.err" \
-    || grep -q 'Index file found' "$work/none.err"; then
-    echo "FAIL: aln_parity: an unwritable -f must exit 1 before the index loads (exit $rc)" >&2
+if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || [ -e "$work/no_such_dir/out.sam" ] \
+    || ! grep -q "cannot open '.*out.sam' for writing" "$work/none.err"; then
+    echo "FAIL: aln_parity: an uncreatable -f must exit 1 with its open error and no output (exit $rc)" >&2
     exit 1
 fi
 rc=0
@@ -476,7 +476,7 @@ if [ "$rc" -ne 1 ] || [ -s "$work/none.out" ] || ! grep -q 'is a directory' "$wo
     echo "FAIL: aln_parity: a directory input must exit 1 and be reported as a directory (exit $rc)" >&2
     exit 1
 fi
-echo "aln_parity: ok fail-before-side-effects (missing FASTQ, missing R2, unwritable -f)"
+echo "aln_parity: ok input preflight and output-open errors (missing FASTQ, missing R2, uncreatable -f)"
 
 # refused before the index loads, with no output: values stock crashes, aborts or drops every read
 # on, malformed numbers, standard input for both files, and an -f that names an input

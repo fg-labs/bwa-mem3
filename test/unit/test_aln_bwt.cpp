@@ -36,7 +36,7 @@ struct AlnIndex {
 
     AlnIndex()
     {
-        prefix = dir + "/ref.fa";
+        prefix = dir + "/" + dir.substr(dir.rfind('/') + 1) + ".fa";
         REQUIRE(aln_test::write_test_fasta(prefix));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         fmi.reset(new FMI_search(prefix.c_str()));

@@ -146,8 +146,9 @@ Each change to upstream-derived code adds a line here.
   and a larger cap never lets a further entry in. The driver still searches each file as its own batch, as stock does.
 - `bwase.cpp`: `aln_print_sam_hdr` is new code that follows the 0.7.19 release's header
   order; its line-start counting is a small helper (`count_line_start`).
-- `aln_main.cpp`: new code. Inputs and `-f` are checked before the index loads, so a failed
-  run leaves no output; help text lists each option with its stock default and source command.
+- `aln_main.cpp`: new code. Inputs and existing `-f` paths are checked before the index loads.
+  Absent output paths are left untouched until the real open after loading the index, which
+  reports creation failures. Help text lists each option with its stock default and source command.
 - `bwape.cpp`/`bwape.h`: `bwa_cal_pac_pos_pe` is cut into its four stages, `bwa_pe_aln2seq` (the
   `drand48` draws), `bwa_pe_se_pos`, `bwa_pe_isize` (`infer_isize` and the `last_ii` fallback) and
   `bwa_pe_pair`, each holding upstream's loop body unchanged; `bwa_cal_pac_pos_pe` calls them in turn

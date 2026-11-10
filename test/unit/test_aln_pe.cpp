@@ -40,7 +40,7 @@ struct PeIndex {
 
     PeIndex()
     {
-        prefix = dir + "/ref.fa";
+        prefix = dir + "/" + dir.substr(dir.rfind('/') + 1) + ".fa";
         uint32_t state = 77;
         contig = aln_test::lcg_dna(state, 6000);
         FILE *fp = fopen(prefix.c_str(), "w");

@@ -7,6 +7,8 @@
 #include "doctest/doctest.h"
 
 #include "aln_test_ref.h"
+#include "aln_bam_decode.h"
+#include "stderr_capture.h"
 #include "../../src/FMI_search.h"
 #include "../../src/aln/aln_main.h"
 #include "../../src/bwa.h"
@@ -25,6 +27,7 @@
 #include <sys/stat.h>
 #include <vector>
 #include <unistd.h>
+#include <utime.h>
 
 namespace {
 
@@ -34,7 +37,7 @@ struct CliIndex {
 
     CliIndex()
     {
-        prefix = dir + "/ref.fa";
+        prefix = dir + "/" + dir.substr(dir.rfind('/') + 1) + ".fa";
         REQUIRE(aln_test::write_test_fasta(prefix));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         const std::string c1 = aln_test::test_contigs()[0].second;
@@ -45,16 +48,7 @@ struct CliIndex {
             fprintf(fp, "@r%d\n%s\n+\n%s\n", i, c1.substr(420 + 20 * i, 36).c_str(), std::string(36, 'I').c_str());
         REQUIRE(fclose(fp) == 0);
     }
-    ~CliIndex()
-    {
-    }
 };
-
-CliIndex &fixture()
-{
-    static CliIndex idx;
-    return idx;
-}
 
 int run(std::initializer_list<std::string> args)
 {
@@ -74,6 +68,19 @@ std::string slurp(const std::string &path)
     return ss.str();
 }
 
+std::string expected_cli_records(int mapq, const std::string &read_group = "")
+{
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::string records;
+    for (int i = 0; i < 4; ++i)
+        records += "r" + std::to_string(i) + "\t0\tc1\t" + std::to_string(421 + 20 * i)
+                + "\t" + std::to_string(mapq) + "\t36M\t*\t0\t0\t"
+                + c1.substr(420 + 20 * i, 36) + "\t" + std::string(36, 'I')
+                + (read_group.empty() ? "" : "\tRG:Z:" + read_group)
+                + "\tXT:A:U\tNM:i:0\tX0:i:1\tX1:i:0\tXM:i:0\tXO:i:0\tXG:i:0\tMD:Z:36\n";
+    return records;
+}
+
 int n_records(const std::string &sam)
 {
     std::istringstream in(sam);
@@ -84,9 +91,16 @@ int n_records(const std::string &sam)
 
 } // namespace
 
+TEST_CASE("aln_cli: synthetic index basename is unique to its temporary directory"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    const std::string leaf = x.dir.substr(x.dir.rfind('/') + 1);
+    CHECK(x.prefix == x.dir + "/" + leaf + ".fa");
+}
+
 TEST_CASE("aln_cli: meaningless negative values and malformed numbers are refused"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string out = scratch.path() + "/v.sam";
     // a vector of vectors, not nested initializer_lists: an inner list's backing array
@@ -112,9 +126,44 @@ TEST_CASE("aln_cli: meaningless negative values and malformed numbers are refuse
     }
 }
 
+TEST_CASE("aln_cli: thread counts above the supported maximum are refused before work"
+          * doctest::test_suite("unit/aln_cli")) {
+    bwa_tests::TempDir scratch{"aln_cli_threads"};
+    const std::string out = scratch.file("out.sam");
+    for (const std::string &count : {std::string("257"), std::string("16000"), std::string("2147483647")}) {
+        CAPTURE(count);
+        bwa_tests::StderrCapture err;
+        CHECK(run({"-t", count, "-f", out, scratch.file("missing.fa"), scratch.file("missing.fq")}) == 1);
+        CHECK(err.text().find("-t wants an integer from") != std::string::npos);
+        CHECK(err.text().find("Index file found") == std::string::npos);
+        CHECK(access(out.c_str(), F_OK) != 0);
+        CHECK(run({"-t", count, "--help"}) == 1);
+    }
+    CHECK(run({"-t", "256", "--help"}) == 0); // parse the boundary without starting 256 workers
+}
+
+TEST_CASE("aln_cli: small thread counts and the lower clamp still align reads"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    bwa_tests::TempDir scratch{"aln_cli_threads"};
+    const std::string want = expected_cli_records(37);
+    for (const std::string &count : {std::string("-1"), std::string("0"), std::string("1"), std::string("2")}) {
+        CAPTURE(count);
+        const std::string out = scratch.file("threads.sam");
+        REQUIRE(run({"-t", count, "-f", out, x.prefix, x.fq}) == 0);
+        const std::string sam = slurp(out);
+        CHECK(n_records(sam) == 4);
+        std::istringstream in(sam);
+        std::string got;
+        for (std::string line; std::getline(in, line);)
+            if (!line.empty() && line[0] != '@') got += line + "\n";
+        CHECK(got == want);
+    }
+}
+
 TEST_CASE("aln_cli: values stock handles still run"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string base = scratch.path() + "/base.sam";
     REQUIRE(run({"-f", base, x.prefix, x.fq}) == 0);
@@ -141,12 +190,8 @@ TEST_CASE("aln_cli: values stock handles still run"
     // not the 37 of a unique hit with differences to spare. The records are built from c1.
     const std::string n0 = scratch.path() + "/n0.sam";
     REQUIRE(run({"-n", "0", "-f", n0, x.prefix, x.fq}) == 0);
-    const std::string c1 = aln_test::test_contigs()[0].second;
-    std::string want, got;
-    for (int i = 0; i < 4; ++i)
-        want += "r" + std::to_string(i) + "\t0\tc1\t" + std::to_string(421 + 20 * i) + "\t25\t36M\t*\t0\t0\t"
-                + c1.substr(420 + 20 * i, 36) + "\t" + std::string(36, 'I')
-                + "\tXT:A:U\tNM:i:0\tX0:i:1\tX1:i:0\tXM:i:0\tXO:i:0\tXG:i:0\tMD:Z:36\n";
+    const std::string want = expected_cli_records(25);
+    std::string got;
     std::istringstream in(slurp(n0));
     for (std::string l; std::getline(in, l);)
         if (!l.empty() && l[0] != '@') got += l + "\n";
@@ -175,7 +220,7 @@ TEST_CASE("aln_cli: read-group blank lines are refused before output"
 
 TEST_CASE("aln_cli: a run without -r does not reuse an earlier run's read group"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string with = scratch.path() + "/rg.with.sam", without = scratch.path() + "/rg.without.sam";
     REQUIRE(run({"-r", "@RG\\tID:grp1\\tSM:s", "-f", with, x.prefix, x.fq}) == 0);
@@ -188,7 +233,7 @@ TEST_CASE("aln_cli: a run without -r does not reuse an earlier run's read group"
 
 TEST_CASE("aln_cli: standard input for both read files is refused"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string out = scratch.path() + "/stdin2.sam";
     CHECK(run({"-f", out, x.prefix, "-", "-"}) == 1);
@@ -197,7 +242,7 @@ TEST_CASE("aln_cli: standard input for both read files is refused"
 
 TEST_CASE("aln_cli: -f naming an input is refused and the input is left intact"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string copy = scratch.path() + "/copy.fq";
     {
@@ -213,7 +258,7 @@ TEST_CASE("aln_cli: -f naming an input is refused and the input is left intact"
 
 TEST_CASE("aln_cli: a malformed record exits 1 after writing what stock writes"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string bad = scratch.path() + "/bad.fq";
     {
@@ -228,7 +273,7 @@ TEST_CASE("aln_cli: a malformed record exits 1 after writing what stock writes"
 
 TEST_CASE("aln_cli: --bam with an -r @SQ that hides the index's contigs is an error"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string out = scratch.path() + "/sq.bam";
     CHECK(run({"--bam", "-f", out, "-r", "@RG\\tID:x\\n@SQ\\tSN:foo\\tLN:10", x.prefix, x.fq}) == 1);
@@ -237,9 +282,31 @@ TEST_CASE("aln_cli: --bam with an -r @SQ that hides the index's contigs is an er
     std::memset(bwa_rg_id, 0, sizeof bwa_rg_id); // -r sets this global; later tests expect no RG tag
 }
 
+TEST_CASE("aln_cli: output preflight does not create and delete absent paths"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    bwa_tests::TempDir scratch{"aln_cli_case"};
+    const std::string target = scratch.path() + "/absent.sam";
+    const std::string link = scratch.path() + "/out.sam";
+    REQUIRE(symlink(target.c_str(), link.c_str()) == 0);
+    const struct utimbuf old_times = {1000000000, 1000000000};
+    for (const std::string &out : {target, link}) {
+        REQUIRE(utime(scratch.path().c_str(), &old_times) == 0);
+        // Invalid BAM reference lengths stop after preflight but before the real output open.
+        CHECK(run({"--bam", "-f", out, "-r", "@RG\\tID:x\\n@SQ\\tSN:c1\\tLN:10", x.prefix, x.fq}) == 1);
+        struct stat st;
+        REQUIRE(stat(scratch.path().c_str(), &st) == 0);
+        CHECK(st.st_mtime == old_times.modtime);
+        CHECK(access(target.c_str(), F_OK) != 0);
+        REQUIRE(lstat(link.c_str(), &st) == 0);
+        CHECK(S_ISLNK(st.st_mode));
+    }
+    std::memset(bwa_rg_id, 0, sizeof bwa_rg_id);
+}
+
 TEST_CASE("aln_cli: --bam with an -r @SQ whose length differs from the index's is an error"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     // c1 is 600 bp in the index and the reads map at 421-497: an LN:10 header would put them
     // past the end of the declared contig
@@ -248,15 +315,44 @@ TEST_CASE("aln_cli: --bam with an -r @SQ whose length differs from the index's i
     CHECK(run({"--bam", "-f", out, "-r", sq, x.prefix, x.fq}) == 1);
     // the same lengths as the index are accepted
     const std::string ok = "@RG\\tID:x\\n@SQ\\tSN:c1\\tLN:600\\n@SQ\\tSN:c2\\tLN:550\\n@SQ\\tSN:c3\\tLN:128";
-    CHECK(run({"--bam", "-f", scratch.path() + "/sq_ok.bam", "-r", ok, x.prefix, x.fq}) == 0);
+    const std::string accepted = scratch.path() + "/sq_ok.bam";
+    REQUIRE(run({"--bam", "-f", accepted, "-r", ok, x.prefix, x.fq}) == 0);
+    CHECK(bwa_tests::decoded_aln_records(accepted) == expected_cli_records(37, "x"));
     // SAM keeps stock's output, which writes the header as given
     CHECK(run({"-f", scratch.path() + "/sq_len.sam", "-r", sq, x.prefix, x.fq}) == 0);
     std::memset(bwa_rg_id, 0, sizeof bwa_rg_id); // -r sets this global; later tests expect no RG tag
 }
 
+TEST_CASE("aln_cli: --bam rejects an empty final duplicate LN before opening output"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    bwa_tests::TempDir scratch{"aln_cli_case"};
+    const std::string out = scratch.path() + "/empty_ln.bam";
+    const std::string sq = "@RG\\tID:x\\n@SQ\\tSN:c1\\tLN:600\\tLN:";
+    CHECK(run({"--bam", "-f", out, "-r", sq, x.prefix, x.fq}) == 1);
+    CHECK(access(out.c_str(), F_OK) != 0);
+    std::memset(bwa_rg_id, 0, sizeof bwa_rg_id);
+}
+
+TEST_CASE("aln_cli: alternative-hit limits reject INT_MAX before opening output"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    bwa_tests::TempDir scratch{"aln_cli_case"};
+    for (const char *flag : {"--max-xa-hits", "--max-xa-hits-discordant"}) {
+        CAPTURE(flag);
+        const std::string out = scratch.path() + "/xa.sam";
+        CHECK(run({flag, "2147483647", "-f", out, x.prefix, x.fq, x.fq}) == 1);
+        CHECK(access(out.c_str(), F_OK) != 0);
+        std::remove(out.c_str());
+        CHECK(run({flag, "2147483646", "-f", out, x.prefix, x.fq, x.fq}) == 0);
+        CHECK(n_records(slurp(out)) == 8);
+        std::remove(out.c_str());
+    }
+}
+
 TEST_CASE("aln_cli: -n with an exponent is a probability, as with a decimal point"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string dec = scratch.path() + "/n_dec.sam", exp = scratch.path() + "/n_exp.sam";
     REQUIRE(run({"-f", dec, "-n", "0.01", x.prefix, x.fq}) == 0);
@@ -290,7 +386,7 @@ TEST_CASE("aln_cli: -n with an exponent is a probability, as with a decimal poin
 
 TEST_CASE("aln_cli: -f naming an index file is refused and the index is left intact"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     for (const char *sfx : {".pac", ".ann", ".bwt.2bit.64"}) {
         CAPTURE(sfx);
@@ -305,7 +401,7 @@ TEST_CASE("aln_cli: -f naming an index file is refused and the index is left int
 
 TEST_CASE("aln_cli: -f naming a file of an index --meth seed index is refused and left intact"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     // `index --meth` writes <prefix>.meth.{pac,ann,amb,bwt.2bit.64} beside the original index;
     // aln reads only the original, but overwriting the seed index would break `mem --meth`.
     for (const char *sfx : {".meth.pac", ".meth.ann", ".meth.amb", ".meth.bwt.2bit.64"}) {
@@ -324,7 +420,7 @@ TEST_CASE("aln_cli: -f naming a file of an index --meth seed index is refused an
 
 TEST_CASE("aln_cli: -f naming the file on standard input is refused and the input is left intact"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string copy = scratch.path() + "/stdin_copy.fq";
     {
@@ -349,7 +445,7 @@ TEST_CASE("aln_cli: -f naming the file on standard input is refused and the inpu
 
 TEST_CASE("aln_cli: -f naming a dangling symlink writes through the link"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string target = scratch.path() + "/link_target.sam", link = scratch.path() + "/link.sam";
     REQUIRE(symlink(target.c_str(), link.c_str()) == 0);
@@ -362,7 +458,7 @@ TEST_CASE("aln_cli: -f naming a dangling symlink writes through the link"
 
 TEST_CASE("aln_cli: -f naming a FIFO gives its reader the whole output"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     const std::string fifo = scratch.path() + "/out.fifo";
     REQUIRE(mkfifo(fifo.c_str(), 0600) == 0);
@@ -393,12 +489,22 @@ TEST_CASE("aln_cli: -f naming a FIFO gives its reader the whole output"
     }
     reader.join();
     CHECK(rc == 0);
-    CHECK(n_records(first) == 4);
+    // These exact reads are unique forward matches at their planted c1 positions.
+    const std::string c1 = aln_test::test_contigs()[0].second;
+    std::string want, got;
+    for (int i = 0; i < 4; ++i)
+        want += "r" + std::to_string(i) + "\t0\tc1\t" + std::to_string(421 + 20 * i) + "\t37\t36M\t*\t0\t0\t"
+                + c1.substr(420 + 20 * i, 36) + "\t" + std::string(36, 'I')
+                + "\tXT:A:U\tNM:i:0\tX0:i:1\tX1:i:0\tXM:i:0\tXO:i:0\tXG:i:0\tMD:Z:36\n";
+    std::istringstream in(first);
+    for (std::string l; std::getline(in, l);)
+        if (!l.empty() && l[0] != '@') got += l + "\n";
+    CHECK(got == want);
 }
 
 TEST_CASE("aln_cli: a batch size below 1 is an error in both drivers"
           * doctest::test_suite("unit/aln_cli")) {
-    CliIndex &x = fixture();
+    CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     FMI_search fmi(x.prefix.c_str());
     fmi.load_index(true, 1);

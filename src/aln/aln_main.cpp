@@ -23,6 +23,7 @@
 #include "../bwa.h"
 #include "../bwa_shm.h"
 #include "../kthread.h"
+#include "../macro.h"
 #include "../read_index_ele.h"
 #include "aln_bwt.h"
 #include "bwape.h"
@@ -348,14 +349,14 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  -l INT    seed length [%d]\n", g->seed_len);
 	fprintf(fp, "  -k INT    maximum differences in the seed [%d]\n", g->max_seed_diff);
 	fprintf(fp, "  -m INT    maximum entries in the queue [%d]\n", g->max_entries);
-	fprintf(fp, "  -t INT    number of threads [%d]\n", g->n_threads);
+	fprintf(fp, "  -t INT    number of threads, at most %d; below 1 uses 1 [%d]\n", MAX_THREADS, g->n_threads);
 	fprintf(fp, "  -M INT    mismatch penalty [%d]\n", g->s_mm);
 	fprintf(fp, "  -O INT    gap open penalty [%d]\n", g->s_gapo);
 	fprintf(fp, "  -E INT    gap extension penalty [%d]\n", g->s_gape);
 	fprintf(fp, "  -R INT    stop searching when there are >INT equally best hits [%d]\n", g->max_top2);
 	fprintf(fp, "  -q INT    quality threshold for read trimming down to %dbp [%d]\n", BWA_MIN_RDLEN, g->trim_qual);
 	fprintf(fp, "  -B INT    length of barcode [0]\n");
-	fprintf(fp, "  -L        log-scaled gap penalty for long deletions\n");
+	fprintf(fp, "  -L        add a log-scaled gap-open plus gap-extension count to the read-end gap exclusion (-i)\n");
 	fprintf(fp, "  -N        non-iterative mode: search for all n-difference hits (slooow)\n");
 	fprintf(fp, "  -I        the input is in the Illumina 1.3+ FASTQ-like format\n");
 	fprintf(fp, "  -Y        filter Casava-filtered sequences\n");
@@ -403,10 +404,9 @@ static int aln_input_ok(const char *fn)
 	return 1;
 }
 
-/* Checks that -f can be written without leaving a file behind (a file created for the check
- * is removed again). Standard output needs no check. Only a regular file, or a new one, is
- * opened for the check: opening and closing a FIFO would hand its reader an early end of file,
- * so a FIFO or device is checked with access(2) instead. */
+/* Preflight existing output paths without opening them: a probe can create a file owned by
+ * another process or give a FIFO reader an early EOF. Absent paths (including dangling symlink
+ * targets) are left to aln_out_open, which reports failures after the index is loaded. */
 static int aln_output_ok(const char *path)
 {
 	if (!path || strcmp(path, "-") == 0) return 1;
@@ -416,30 +416,9 @@ static int aln_output_ok(const char *path)
 		fprintf(stderr, "[E::aln] cannot open '%s' for writing: is a directory\n", path);
 		return 0;
 	}
-	if (existed && !S_ISREG(st.st_mode)) {
-		if (access(path, W_OK) != 0) {
-			fprintf(stderr, "[E::aln] cannot open '%s' for writing: %s\n", path, strerror(errno));
-			return 0;
-		}
-		return 1;
-	}
-	FILE *fp = fopen(path, "a");
-	if (!fp) {
+	if (existed && access(path, W_OK) != 0) {
 		fprintf(stderr, "[E::aln] cannot open '%s' for writing: %s\n", path, strerror(errno));
 		return 0;
-	}
-	fclose(fp);
-	if (!existed) {
-		// A dangling symlink: the open created its target. Remove the target and keep the link,
-		// so the output is written through the link as it would have been without the check.
-		struct stat lst;
-		if (lstat(path, &lst) == 0 && S_ISLNK(lst.st_mode)) {
-			char *target = realpath(path, NULL);
-			if (target) unlink(target);
-			free(target);
-		} else {
-			unlink(path);
-		}
 	}
 	return 1;
 }
@@ -483,7 +462,7 @@ static int aln_bam_sq_lengths_ok(const char *hdr, const bntseq_t *bns)
 				const char *t = (const char*)memchr(f, '\t', end - f);
 				const char *fe = t ? t : end;
 				if (fe - f > 3 && strncmp(f, "SN:", 3) == 0) sn.assign(f + 3, fe);
-				else if (fe - f > 3 && strncmp(f, "LN:", 3) == 0) ln.assign(f + 3, fe);
+				else if (fe - f >= 3 && strncmp(f, "LN:", 3) == 0) ln.assign(f + 3, fe);
 				f = fe + 1;
 			}
 			auto it = std::lower_bound(idx.begin(), idx.end(), std::make_pair(sn, (int64_t)INT64_MIN));
@@ -591,7 +570,9 @@ int main_aln(int argc, char *argv[])
 		case 'l': ALN_INT("-l", 0, &opt->seed_len); break;
 		case 'k': ALN_INT("-k", INT_MIN, &opt->max_seed_diff); break;
 		case 'm': ALN_INT("-m", 0, &opt->max_entries); break;
-		case 't': ALN_INT("-t", INT_MIN, &opt->n_threads); break;
+		case 't':
+			if (!aln_parse_int("-t", optarg, INT_MIN, MAX_THREADS, &opt->n_threads)) return 1;
+			break;
 		case 'L': opt->mode |= BWA_MODE_LOGGAP; break;
 		case 'R': ALN_INT("-R", INT_MIN, &opt->max_top2); break;
 		case 'q': ALN_INT("-q", INT_MIN, &opt->trim_qual); break;
@@ -631,8 +612,15 @@ int main_aln(int argc, char *argv[])
 		case 's': o.pe.is_sw = 0; pe_flag = 1; break;
 		case 'A': o.pe.force_isize = 1; pe_flag = 1; break;
 		case 'P': pe_flag = 1; break; // sampe -P preloads the index; it is always in memory here
-		case OPT_MAX_XA: ALN_INT("--max-xa-hits", INT_MIN, &o.max_xa_hits); o.pe.n_multi = o.max_xa_hits; break;
-		case OPT_MAX_XA_DISC: ALN_INT("--max-xa-hits-discordant", INT_MIN, &o.pe.N_multi); pe_flag = 1; break;
+		// Alternative-hit generation adds one to these limits using int arithmetic.
+		case OPT_MAX_XA:
+			if (!aln_parse_int("--max-xa-hits", optarg, INT_MIN, INT_MAX - 1, &o.max_xa_hits)) return 1;
+			o.pe.n_multi = o.max_xa_hits;
+			break;
+		case OPT_MAX_XA_DISC:
+			if (!aln_parse_int("--max-xa-hits-discordant", optarg, INT_MIN, INT_MAX - 1, &o.pe.N_multi)) return 1;
+			pe_flag = 1;
+			break;
 		case OPT_MAX_OCC: ALN_INT("--max-occ", INT_MIN, &o.pe.max_occ); pe_flag = 1; break;
 		case OPT_BAM: bam = 1; break;
 		case OPT_BAM_LEVEL:
