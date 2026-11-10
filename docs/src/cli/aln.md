@@ -369,7 +369,11 @@ this refinement model.** The five-symbol model uses an actual-matrix band
 certificate when available and otherwise a full band. The existing dispatcher
 may use its SIMD global kernels when their predicates hold. CpG-only scoring
 uses seven reference symbols and full-band scalar refinement, not that certificate
-or SIMD path. Original `.amb` intervals override random packed bases with N at
+or SIMD path. In either alphabet, a window as long as the read whose ungapped reward
+exceeds `length - 13` skips the DP: a gapped path needs an insertion and a deletion
+(at least 12) and aligns at most `length - 1` columns, so the ungapped alignment is
+the unique optimum and the result is the one the DP returns.
+Original `.amb` intervals override random packed bases with N at
 alignment time, without rebuilding either index. CpG labels use true contig flanks
 and respect these ambiguity runs.
 `--meth-context cpg` requires TAPS/5base and non-collapsed scoring.

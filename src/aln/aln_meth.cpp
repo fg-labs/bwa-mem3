@@ -212,15 +212,13 @@ static bool alignment_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, b
  * Returns false when the counts cannot be stored in a record (8-bit fields). A refined
  * window can drift far from its search hit (a low-complexity read whose converted form
  * matches a homopolymer, say); callers drop such a candidate, and a read whose dropped
- * candidate could have competed (cost within the retained window) is marked incomplete. */
-static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
-                              const gap_opt_t *opt, int64_t rb, int64_t re,
-                              const ubyte_t *query, int len, aln_meth_occ_t *o, int alt = 0)
+ * candidate could have competed (cost within the retained window) is marked incomplete.
+ * win is the alignment's reference window as aln_meth_fetch_window returns it. */
+static bool account_alignment(const aln_meth_opt_t *mo, const gap_opt_t *opt, const std::vector<uint8_t> &win,
+                              const ubyte_t *query, int len, aln_meth_occ_t *o)
 {
     int m;
     const int8_t *mat = meth_mat(mo, o->hyp, &m);
-    std::vector<uint8_t> win;
-    fetch_window(ref, mo, rb, re - rb, o->rid, win, alt);
     int q = 0, t = 0;
     for (uint32_t item : o->alignment.raw_cigar) {
         const int op = item & 15, n = item >> 4;
@@ -247,6 +245,15 @@ static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *m
     o->cost = (int64_t)opt->s_mm * o->n_mm + (int64_t)opt->s_gapo * o->n_gapo +
               (int64_t)opt->s_gape * o->n_gape;
     return o->cost <= INT_MAX && o->n_mm <= 255 && o->n_gapo <= 255 && o->n_gape <= 255;
+}
+// account_alignment on the window [rb, re) of o's contig, fetched here.
+static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
+                              const gap_opt_t *opt, int64_t rb, int64_t re,
+                              const ubyte_t *query, int len, aln_meth_occ_t *o, int alt = 0)
+{
+    std::vector<uint8_t> win;
+    fetch_window(ref, mo, rb, re - rb, o->rid, win, alt);
+    return account_alignment(mo, opt, win, query, len, o);
 }
 static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
                         int alt, int n_ins, int n_del);
@@ -281,17 +288,18 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
 {
     aln_meth_group_t *g = x->grp;
     const int rid = candidate.rid, hyp = candidate.hyp, strand = candidate.strand;
-    const int64_t rb = candidate.rb, span = candidate.re - candidate.rb;
     aln_meth_occ_t o;
     o.rid = rid; o.hyp = hyp; o.strand = strand; o.alt = alt;
+    // The accounting reads the same window the refinement fetched (same window, contig and alt).
+    std::vector<uint8_t> &win = x->win;
     const auto status = aln_meth_realign_window(*g->ref, *g->mo, candidate, query, x->len,
-                                               n_ins, n_del, &o.alignment, alt);
+                                               n_ins, n_del, &o.alignment, alt, &win);
     // Invalid/resource/empty normalized alignments must never be silently omitted competitors.
     if (status != aln_meth_eval_status::ok) {
         fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
         exit(1);
     }
-    if (!account_alignment(g->ref, g->mo, g->opt, rb, rb + span, query, x->len, &o, alt)) {
+    if (!account_alignment(g->mo, g->opt, win, query, x->len, &o)) {
         ++x->res->n_unrepresentable;
         x->unrep_cost = std::min(x->unrep_cost, o.cost);
         return;
