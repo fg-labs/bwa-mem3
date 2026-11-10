@@ -1466,8 +1466,9 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     // read_r has 31 equally good converted loci plus worse ones; a small lookup budget caps it.
     const int n=64;
     const auto fq=write_fq("capped-dups.fq",std::vector<std::string>(n,ref().read_r));
-    // Budgets 32 and 40 stop the search after all 31 ties and 1 or 2 worse loci.
-    for (int keep_strata : {1,0}) for (int budget : {32,40}) {
+    // Budget 32 stops the search after all 31 ties and 1 worse locus. (The read's certified stop
+    // completes it at 33 lookups, so a larger budget no longer caps it.)
+    for (int keep_strata : {1,0}) for (int budget : {32}) {
         CAPTURE(keep_strata); CAPTURE(budget);
         ba::aln_meth_opt_t mo; mo.p_best=budget; mo.p_second=0;
         // The 31 ties are counted under collapsed scoring (the mirror cell is free too).
@@ -2048,7 +2049,7 @@ TEST_CASE("aln_meth: ineligible searches batch pending hits instead of flushing 
         CAPTURE(mode);
         job.opt=*opt; job.seed_width=nullptr; result.flags=0;
         if (mode==0) job.opt.mode|=BWA_MODE_NONSTOP;
-        if (mode==1) job.seed_width=&seed;
+        if (mode==1) job.seed_width=&seed, job.opt.max_seed_diff=0; // seeded, no seed differences
         if (mode==2) job.opt.s_mm=0;
         if (mode==3) job.opt.s_gape=-1;
         if (mode==4) result.flags=ba::ALN_METH_BIND_M;
@@ -2210,8 +2211,19 @@ TEST_CASE("aln_meth: retained-cost stop waits for complete strata and handles de
         result.flags=flag; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
     }
     result.flags=0;
-    ba::bwt_width_t seed={}; job.seed_width=&seed;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1)); job.seed_width=nullptr;
+    // A seeded read stops only on a stratum within the seed's difference limit (-k, 2 here).
+    ba::bwt_width_t seed={}; job.seed_width=&seed; REQUIRE(job.opt.max_seed_diff==2);
+    CHECK(ba::aln_meth_can_stop(&slot,opt->s_mm+1));     // best 0: one difference
+    result.occ[0].cost=3; CHECK_FALSE(ba::aln_meth_can_stop(&slot,6));
+    CHECK(ba::aln_meth_can_stop(&slot,7));                 // best 3: two differences
+    result.occ[0].cost=6; CHECK_FALSE(ba::aln_meth_can_stop(&slot,10)); // three: past -k
+    job.seed_width=nullptr; CHECK(ba::aln_meth_can_stop(&slot,10)); job.seed_width=&seed;
+    result.occ[0].cost=0; job.opt.max_seed_diff=1;
+    CHECK(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
+    result.occ[0].cost=3; CHECK_FALSE(ba::aln_meth_can_stop(&slot,7));
+    result.occ[0].cost=0; job.opt.max_seed_diff=0;
+    CHECK_FALSE(ba::aln_meth_stop_eligible(&slot)); CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
+    job.opt.max_seed_diff=2; job.seed_width=nullptr;
     job.opt.mode|=BWA_MODE_NONSTOP; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
     job.opt.mode&=~BWA_MODE_NONSTOP;
     job.opt.max_diff=0; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1)); job.opt.max_diff=4;
@@ -2330,7 +2342,18 @@ TEST_CASE("aln_meth: known-site stop requires a strict valid same-read ALT certi
     }
     res.flags = 0;
     ba::bwt_width_t seed = {}; job.seed_width = &seed;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.seed_width = nullptr;
+    CHECK(ba::aln_meth_can_stop(&slot, 4)); // d=1 fits the seed and LB=2 excludes ALT competitors
+    job.opt.max_seed_diff = 0; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
+    job.opt.max_seed_diff = 1; CHECK(ba::aln_meth_can_stop(&slot, 4)); // d == -k
+    slot.alt_bound.valid = false; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
+    slot.alt_bound.valid = true; slot.alt_bound.value = 1; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
+    slot.alt_bound.value = 3; res.occ[0].cost = 3; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); // d > -k
+    job.opt.max_seed_diff = 2; CHECK(ba::aln_meth_can_stop(&slot, 7));
+    res.occ[0].cost = 0; slot.alt_bound.value = 2;
+    for (int len : {0, 160, 161, 350}) {
+        slot.len = len; CHECK(ba::aln_meth_can_stop(&slot, 4) == (len == 160));
+    }
+    slot.len = 30; job.seed_width = nullptr;
     job.opt.mode |= BWA_MODE_NONSTOP; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.mode &= ~BWA_MODE_NONSTOP;
     job.opt.s_gapo = 3; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.s_gapo = 11;
     for (int m : {0, -1}) { job.opt.s_mm = m; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); }
@@ -2377,12 +2400,15 @@ TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT w
     }
     mr.known_snvs = &sites;
     ba::ks_windows_t windows; REQUIRE(ba::ks_windows_build(&sites, mr.bns, mr.pac, 1, 1, &windows) == 0);
-    auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 2; opt->seed_len = 1024;
+    auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 2;
     using Key = std::tuple<int,int,int,int64_t,int64_t>;
+    // The single-mismatch contigs put differences inside, outside and exactly at the seed edge.
+    for (int seed_len : {1024, 6})
     for (int scoring : {MEM_METH_SCORING_NEUTRAL, MEM_METH_SCORING_COLLAPSED})
     for (int context : {METH_CTX_ALL, METH_CTX_CPG}) for (int read_no : {0, 1}) for (int hyp : {0, 1}) {
         ba::aln_meth_opt_t mo; mo.m.meth_scoring = scoring; mo.m.meth_context = context;
         mo.m.meth_chem = METH_CHEM_TAPS; ba::aln_meth_opt_finish(&mo);
+        opt->seed_len = seed_len; CAPTURE(seed_len);
         const int strand = hyp ^ read_no;
         const auto fq = write_fq_in(tmp.path(), "r.fq", {strand ? aln_test::revcomp(query) : query});
         auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
@@ -2399,6 +2425,7 @@ TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT w
         ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, opt, 1, read_no, 0, 1, 1000,
                                   nullptr, &result, &extra, &certificate, false, &wflags);
         CHECK(result.flags == 0); CHECK(wr.flags == 0);
+        REQUIRE(wr.full_width_bound.valid);CHECK(wr.full_width_bound.value<=1);
         std::set<Key> expected, actual;
         for (int rid = 0; rid < (int)contigs.size(); ++rid) {
             int best = INT_MAX;
@@ -2441,6 +2468,70 @@ TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT w
     free(opt); ba::ks_windows_free(&windows); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
+TEST_CASE("aln_meth: seeded known-site searches use an actual ALT bound without losing retained loci")
+{
+    namespace ba = bwa_aln;
+    bwa_tests::TempDir tmp{"aln_meth_seed_alt"};
+    const std::string fa=tmp.file(tmp.path().substr(tmp.path().find_last_of('/')+1)+".fa");
+    uint32_t state=314159; const std::string query=aln_test::lcg_dna(state,30);
+    std::vector<std::pair<std::string,std::string>> contigs{{"exact",query},{"unrelated",std::string(321,'G')}};
+    for(int i=0;i<30;++i) {
+        auto target=query;
+        for(int p:{i,(i+13)%30}) target[p]="CGTA"[std::string("ACGT").find(target[p])];
+        contigs.push_back({"two_mm_"+std::to_string(i),target});
+    }
+    REQUIRE(aln_test::write_test_fasta(fa,contigs));
+    std::vector<std::string> args{"index","--meth",fa};std::vector<char *> argv;
+    for(auto &arg:args) argv.push_back(&arg[0]);argv.push_back(nullptr);optind=1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset=1;
+#endif
+    REQUIRE(bwa_index((int)args.size(),argv.data())==0);
+    FMI_search fmi((fa+".meth").c_str());fmi.load_index(false,1,true,BWAMEM_HUGETLB_OFF,false);
+    auto *bwt=ba::bwt_from_fmi(&fmi);ba::aln_meth_ref_t ref;
+    REQUIRE(ba::aln_meth_ref_load(&ref,fa.c_str(),fmi.idx->bns,1)==0);
+    ba::ks_sites_t sites;sites.by_contig.resize(contigs.size());
+    sites.by_contig[1].push_back({160,2,0});sites.n_sites=1;ref.known_snvs=&sites;
+    ba::ks_windows_t windows;REQUIRE(ba::ks_windows_build(&sites,ref.bns,ref.pac,1,1,&windows)==0);
+    auto *opt=ba::gap_init_opt();opt->fnr=-1;opt->max_diff=2;opt->seed_len=15;
+    using Key=std::tuple<int,int,int,int64_t,int>;
+    for(int context:{METH_CTX_ALL,METH_CTX_CPG}) for(int read_no:{0,1}) for(int hyp:{0,1}) {
+        ba::aln_meth_opt_t mo;mo.m.meth_context=context;mo.m.meth_chem=METH_CHEM_TAPS;
+        mo.m.meth_scoring=MEM_METH_SCORING_NEUTRAL;ba::aln_meth_opt_finish(&mo);
+        const int strand=hyp^read_no;
+        const auto fq=write_fq_in(tmp.path(),"r.fq",{strand?aln_test::revcomp(query):query});
+        auto *input=ba::bwa_seq_open(fq.c_str());int n=0;
+        auto *reads=ba::bwa_read_seq(input,1,&n,BWA_MODE_COMPREAD,0);REQUIRE(n==1);
+        ba::gap_opt_t discovery=*opt;discovery.mode|=BWA_MODE_NONSTOP;discovery.max_top2=INT_MAX;
+        ba::aln_meth_read_t wr;
+        ba::aln_meth_search_batch(windows.bwt,windows.mref,&mo,1,reads,&discovery,1,read_no,0,1,1000,nullptr,&wr,nullptr,nullptr,true);
+        REQUIRE(wr.flags==0);REQUIRE(wr.full_width_bound.valid);REQUIRE(wr.full_width_bound.value>1);
+        std::vector<ba::aln_meth_candidate_t> extra;ba::ks_meth_candidates(&windows,ref.bns,wr,&extra);
+        ba::aln_meth_read_t certified,uncertified;ba::aln_meth_alt_bound_t unavailable;
+        ba::aln_meth_search_batch(bwt,&ref,&mo,1,reads,opt,1,read_no,0,1,1000,nullptr,&certified,&extra,&wr.full_width_bound);
+        ba::aln_meth_search_batch(bwt,&ref,&mo,1,reads,opt,1,read_no,0,1,1000,nullptr,&uncertified,&extra,&unavailable);
+        CHECK(certified.flags==0);CHECK(uncertified.flags==0);
+        CHECK(certified.n_lookups<uncertified.n_lookups);
+        std::set<Key> expected{{0,hyp,strand,0,0}},actual,control;
+        for(const auto &hit:certified.hits) actual.emplace(hit.rid,hit.hyp,hit.strand,hit.pos,hit.cost);
+        for(const auto &hit:uncertified.hits) control.emplace(hit.rid,hit.hyp,hit.strand,hit.pos,hit.cost);
+        CHECK(actual==expected);CHECK(control==expected);
+        for(const auto *result:{&certified,&uncertified}) {
+            REQUIRE(result->hits.size()==1);
+            const auto &hit=result->hits.front();
+            CHECK(hit.rid==0);CHECK(hit.hyp==hyp);CHECK(hit.strand==strand);
+            CHECK(hit.pos==0);CHECK(hit.span==30);CHECK(hit.pos+hit.span==30);
+            CHECK(cigar_of(*result,hit)==std::vector<uint32_t>{30u<<4});
+            CHECK(hit.n_cig==1);CHECK(hit.cost==0);CHECK(hit.n_mm==0);
+            CHECK(hit.n_gapo==0);CHECK(hit.n_gape==0);CHECK(hit.n_conv==0);CHECK(hit.alt==0);
+            CHECK(result->c1==1);CHECK(result->c2==0);CHECK(result->n_conv_moved==0);
+            CHECK(result->main==0);CHECK(result->flags==0);
+        }
+        ba::bwa_free_read_seq(n,reads);ba::bwa_seq_close(input);
+    }
+    free(opt);ba::ks_windows_free(&windows);ba::aln_meth_ref_free(&ref);ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: zero-cost stopping preserves an independently enumerated tiny candidate set")
 {
     namespace ba=bwa_aln;
@@ -2462,12 +2553,16 @@ TEST_CASE("aln_meth: zero-cost stopping preserves an independently enumerated ti
     FMI_search fmi((fa+".meth").c_str());fmi.load_index(false,1,true,BWAMEM_HUGETLB_OFF,false);
     auto *bwt=ba::bwt_from_fmi(&fmi);ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,fa.c_str(),fmi.idx->bns,1)==0);
-    auto *opt=ba::gap_init_opt();opt->fnr=-1;opt->max_diff=2;opt->seed_len=1024;
+    auto *opt=ba::gap_init_opt();opt->fnr=-1;opt->max_diff=2;
     using Key=std::tuple<int,int,int,int64_t,int64_t>;
+    // Unseeded, and seeded (the 12-base read is longer than -l 6): the seeded search stops on
+    // the same stratum, since one difference is within the seed's -k 2.
+    for(int seed_len : {1024,6})
     for(int scoring : {MEM_METH_SCORING_COLLAPSED,MEM_METH_SCORING_GENOMIC,MEM_METH_SCORING_NEUTRAL})
         for(int context : {METH_CTX_ALL,METH_CTX_CPG}) for(int read_no : {0,1}) for(int hyp : {0,1}) {
             ba::aln_meth_opt_t mo;mo.m.meth_scoring=scoring;mo.m.meth_context=context;
             mo.m.meth_chem=METH_CHEM_TAPS;ba::aln_meth_opt_finish(&mo);
+            opt->seed_len=seed_len;CAPTURE(seed_len);
             const int strand=hyp^read_no;
             const std::string input_read=strand?aln_test::revcomp(query):query;
             std::set<Key> expected;
