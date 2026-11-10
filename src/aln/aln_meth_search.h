@@ -34,6 +34,8 @@ struct aln_meth_slot_t {
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
     aln_meth_alt_bound_t alt_bound; // ALT-index lower bound (aln_meth_alt_certificate), not the genomic width
+    // Scratch: the reference window of the candidate being resolved (refined, then accounted).
+    std::vector<uint8_t> win;
 };
 struct aln_meth_group_t {
     const bwt_t *bwt = nullptr;
