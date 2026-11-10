@@ -352,14 +352,16 @@ Converted-space backtracking proposes original-reference windows within the user
 search limits (`-n`, `-o`, `-e`, seeding options, `-M/-O/-E`, `-N` and `-m`).
 Only the directional copy appropriate to the read is retained. Identical windows
 (original contig, conversion hypothesis, strand, start and end) are evaluated once.
-`-R` does not prune original-reference competitors. For an unseeded search with
-current best cost `B`, let `T = B + M` and `k = floor(T / M)`. When `M > 0`,
-`T < O`, `E >= 0`, the configured difference ceiling admits `k` differences,
-`-N` is off and discovery has not hit a cap, the search can stop after fully
-evaluating converted scores through `M*k`. Every retained raw alignment then has
-no gaps and at most `k` strict mismatches, so that stratum already proposes its
-exact window. A decreasing best cost can only narrow this bound. Other searches
-retain configured generation without a path-cost cutoff. This does not make
+`-R` does not prune original-reference competitors. For current best cost `B`,
+let `T = B + M` and `k = floor(T / M)`. When `M > 0`, `T < O`, `E >= 0`, the
+configured difference ceiling admits `k` differences, `-N` is off and discovery
+has not hit a cap, the search can stop after fully evaluating converted scores
+through `M*k`. Every retained raw alignment then has no gaps and at most `k`
+strict mismatches, so that stratum already proposes its exact window. A read
+longer than `-l` (a seeded search) can stop this way only when `k` is also at
+most the seed's `-k`, so that seeding cannot have excluded such a window. A
+decreasing best cost can only narrow this bound. Other searches retain configured
+generation without a path-cost cutoff. This does not make
 discovery exhaustive or guarantee a globally optimal alignment.
 
 Each window is globally refined on the original reference with a fixed
