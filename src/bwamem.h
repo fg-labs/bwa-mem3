@@ -320,6 +320,11 @@ typedef struct mem_opt_t {
      * sits in the input, which neither upstream can express, so --compat
      * refuses it. */
     int    tie_break_mode;
+    /* --alt-project: the ALT -> primary liftover table (alt_lift.h), or NULL
+     * (default, byte-identical). When set, each ALT alignment region is lifted
+     * onto the primary assembly before primary marking and pairing, so ALT
+     * haplotypes can decide where a read is placed; see mem_alt_project. */
+    const struct alt_lift_t *alt_lift;
     int    md_mode;         // --md: a mem_md_mode value (MEM_MD_FULL default)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
@@ -424,6 +429,16 @@ static_assert(sizeof(((mem_chain_t *) 0)->link) <= sizeof(mem_seed_t *),
 
 typedef struct { size_t n, m, cc; mem_chain_t *a; int capped_w; } mem_chain_v;
 
+/* Width of mem_alnreg_t::alt_bw: the largest band floor a lifted region can
+ * carry is (1 << MEM_ALT_BW_BITS) - 2 (MEM_ALT_BW_MAX), so a hit whose ALT
+ * indels need a wider band stays on the ALT whatever -w is. */
+#define MEM_ALT_BW_BITS 10
+#define MEM_ALT_BW_MAX ((1 << MEM_ALT_BW_BITS) - 2)
+
+/* Width of mem_alnreg_t::n_comp (signed) and the value it saturates at. */
+#define MEM_N_COMP_BITS 16
+#define MEM_N_COMP_MAX ((1 << (MEM_N_COMP_BITS - 1)) - 1)
+
 typedef struct mem_alnreg_t {
     // mem_alnreg_t() {c=NULL;}
     int64_t rb, re; // [rb,re): reference sequence in the alignment
@@ -464,10 +479,13 @@ typedef struct mem_alnreg_t {
     int secondary_all;
     int seedlen0;   // length of the starting seed
     int chain_n_hits; // max SMEM SA-occurrence count across this chain's seeds (1 = no repetitive seed)
-    /* n_comp: number of sub-alignments chained together (count only; no output
-     * reads it). The two --meth hypotheses (-1/0/1) ride in the same word as
-     * signed 2-bit fields, so they no longer cost a word of their own. */
-    signed int n_comp:26, is_alt:2;
+    /* n_comp: number of sub-alignments patched together in dedup, counted as
+     * 2k - 1 for k pieces (mem_alnreg_add_comp). Nothing reads it but the
+     * --dedup-reads verify compare, so it is a count only; it saturates at
+     * MEM_N_COMP_MAX instead of wrapping. The two --meth hypotheses (-1/0/1)
+     * ride in the same word as signed 2-bit fields, so they no longer cost a
+     * word of their own, and so does alt_bw (below). */
+    signed int n_comp:MEM_N_COMP_BITS, is_alt:2;
     /* D3 (--meth, PR-3): bisulfite hypothesis (1=OT, 0=OB, -1=non-meth),
      * propagated from the originating chain so PR-4's asymmetric extension and
      * the output (XG strand) layers can select the right matrix/strand. */
@@ -482,6 +500,16 @@ typedef struct mem_alnreg_t {
      * soft-clips. Set at alnreg creation from the seed strand; -1 = non-meth.
      * (Output XG/XM still use the raw meth_hypothesis — the genome strand.) */
     signed int meth_strand_hyp:2;
+    /* --alt-project: 0 for a region that was not lifted; for a region
+     * mem_alt_project lifted off an ALT contig, 1 + the band floor that
+     * mem_reg2aln passes on to its alignment to the primary reference (the widest
+     * diagonal excursion of the ALT's indels inside the lifted interval).
+     * mem_alt_project lifts a region only when the band bwa_gen_cigar4 will use
+     * for it (bwa_gen_cigar_band, which caps the band by read length) is at least
+     * that floor, and only when the floor is at most MEM_ALT_BW_MAX, the largest
+     * value this field can carry. Written only by mem_alt_project and read only
+     * when opt->alt_lift is set, so it is 0 on every region of a default run. */
+    unsigned int alt_bw:MEM_ALT_BW_BITS;
     float frac_rep;
 } mem_alnreg_t;
 #ifdef __cplusplus
@@ -489,6 +517,27 @@ static_assert(sizeof(mem_alnreg_t) == 96,
               "mem_alnreg_t must stay 96 bytes: it is held for every region of every read in a "
               "batch, and the dedup sorts that gather it are bound by its size");
 #endif
+
+/* The dedup join: p absorbs q, so p's count grows by q's count plus one. Both
+ * counts are in [1, MEM_N_COMP_MAX], so the sum fits an int; the store
+ * saturates at MEM_N_COMP_MAX, since a value past the bit-field's width would
+ * otherwise be truncated (implementation-defined for a signed bit-field, a
+ * wrap to negative on the compilers that build this) and the count would stop
+ * being one. */
+static inline void mem_alnreg_add_comp(mem_alnreg_t *p, const mem_alnreg_t *q)
+{
+    const int n = p->n_comp + q->n_comp + 1;
+    p->n_comp = n > MEM_N_COMP_MAX ? MEM_N_COMP_MAX : n;
+}
+
+/* Dedup's by-score order: score descending, then rb, then qb. The one
+ * definition of that key: bwamem.cpp's alnreg_slt (the by-score dedup sorts) is
+ * this predicate, and mem_alt_project (alt_lift.cpp) refines it, so its output
+ * stays in the order the next dedup-only sort starts from. */
+static inline int mem_alnreg_score_lt(const mem_alnreg_t *a, const mem_alnreg_t *b)
+{
+    return a->score > b->score || (a->score == b->score && (a->rb < b->rb || (a->rb == b->rb && a->qb < b->qb)));
+}
 
 typedef struct { size_t n, m; mem_alnreg_t *a; int capped_w; } mem_alnreg_v;
 /* capped_w: max WEIGHT among chains the cap/gate dropped before extension, carried
@@ -793,6 +842,15 @@ int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 
 int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
 
+/* Dedup's redundancy threshold: an overlap of `ovl` bases is redundant when it
+ * exceeds mask_level_redun (0.95) of `min_len`, the shorter of the two spans.
+ * Shared by dedup_redundant (bwamem.cpp) and mem_alt_project's locus test
+ * (alt_lift.cpp), so the two cannot drift apart. */
+static inline int mem_overlap_redundant(const mem_opt_t *opt, int64_t ovl, int64_t min_len)
+{
+    return ovl > opt->mask_level_redun * min_len;
+}
+
 /* Largest value mem_tie_break_id returns under --tie-break name. mem_pair takes
  * the id as an int and shifts it left by 8, so a name-derived id must stay below
  * 2^23 for that shift to fit; 23 bits is ample entropy for a tie-break seed. */
@@ -908,7 +966,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq
                  int n, const mem_aln_t *list, int which, const mem_aln_t *m_);
 
 static inline int get_rlen(int n_cigar, const uint32_t *cigar);
-static inline int infer_bw(int l1, int l2, int score, int a, int q, int r);
+static inline int infer_bw(int l1, int l2, int score, int a, int q, int r, int no_ungapped_shortcut);
 
 int mem_kernel1_core(FMI_search *fmi, const mem_opt_t *opt,
                      bseq1_t *seq_,
@@ -1316,7 +1374,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
  * depends on besides the read and `opt`: two regions of one read with equal keys
  * get the same ops and NM. mem_core_key returns 0 (no key) for a region whose
  * window is empty or does not lie on one strand. */
-typedef struct { int qb, qe, rev, truesc, w, hyp; int64_t rlen, fb; } mem_core_key_t;
+typedef struct { int qb, qe, rev, truesc, w, hyp, alt_bw; int64_t rlen, fb; } mem_core_key_t;
 int mem_core_key(const bntseq_t *bns, const mem_alnreg_t *ar, mem_core_key_t *k);
 int mem_core_key_equal(const bntseq_t *bns, const uint8_t *pac, const mem_core_key_t *x,
                        const mem_core_key_t *y);

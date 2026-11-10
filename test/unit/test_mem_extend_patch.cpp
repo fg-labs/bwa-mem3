@@ -115,6 +115,7 @@ void check_same_region(const mem_alnreg_t &a, const mem_alnreg_t &b) {
     CHECK(a.seedlen0 == b.seedlen0);
     CHECK(a.chain_n_hits == b.chain_n_hits);
     CHECK(a.is_alt == b.is_alt);
+    CHECK(a.alt_bw == b.alt_bw);
     CHECK(a.frac_rep == b.frac_rep);
     CHECK(a.hash == b.hash);
     CHECK(a.meth_hypothesis == b.meth_hypothesis);
@@ -428,4 +429,48 @@ TEST_CASE("mem_sort_dedup_patch: a patched pair becomes one region spanning both
     check_same_region(regs3[1], b3);
     CHECK((int)regs3[0].n_comp == 1);
     CHECK((int)regs3[1].n_comp == 1);
+}
+
+TEST_CASE("mem_sort_dedup_patch: a join counts 2k - 1 for k pieces"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // 3 adjacent one-base regions of a read that matches the reference exactly
+    // patch into one: in reference-end order, the i-th piece absorbs the piece
+    // that already holds the first i-1 (w = r = 0, and a band of 0 on equal
+    // lengths makes each global alignment an ungapped scan). Every region starts
+    // at 1 and a join adds the absorbed count plus one, so 3 pieces count 5.
+    Fixture f;
+    std::vector<uint8_t> q = f.ref(0, 3);
+    std::vector<mem_alnreg_t> regs;
+    for (int i = 0; i < 3; ++i) regs.push_back(region(i, i + 1, i, i + 1, 1, 0));
+    REQUIRE(mem_sort_dedup_patch(f.opt, &f.bns, f.pac.data(), q.data(), 3, regs.data(), f.opt->mat) == 1);
+    CHECK(regs[0].qb == 0);
+    CHECK(regs[0].qe == 3);
+    CHECK(regs[0].score == 3);
+    CHECK((int)regs[0].n_comp == 5);
+}
+
+TEST_CASE("mem_alnreg_add_comp: n_comp saturates at MEM_N_COMP_MAX"
+          * doctest::test_suite("unit/alnreg_sort_dedup")) {
+    // The dedup join (both window passes call it). The 16-bit field would wrap
+    // a count past MEM_N_COMP_MAX (32,767) to a negative value; it stops there
+    // instead, from just below the maximum and from two counts near it.
+    // test/integration/test_dedup_n_comp.cpp reaches the limit through
+    // mem_sort_dedup_patch's joins, too slow for a unit test.
+    mem_alnreg_t p, q;
+    memset(&p, 0, sizeof p);
+    memset(&q, 0, sizeof q);
+    p.n_comp = MEM_N_COMP_MAX - 4;
+    q.n_comp = 1;
+    mem_alnreg_add_comp(&p, &q);
+    CHECK((int)p.n_comp == MEM_N_COMP_MAX - 2);
+    mem_alnreg_add_comp(&p, &q);
+    CHECK((int)p.n_comp == MEM_N_COMP_MAX);
+    for (int i = 0; i < 3; ++i) {
+        mem_alnreg_add_comp(&p, &q);
+        CHECK((int)p.n_comp == MEM_N_COMP_MAX);
+    }
+    q.n_comp = MEM_N_COMP_MAX;
+    mem_alnreg_add_comp(&p, &q);
+    CHECK((int)p.n_comp == MEM_N_COMP_MAX);
+    CHECK((int)q.n_comp == MEM_N_COMP_MAX);
 }
