@@ -2308,7 +2308,7 @@ TEST_CASE("aln_known_snvs: help excludes credited records from the stock identit
     std::string text; char buf[4096]; size_t n;
     while ((n = fread(buf, 1, sizeof buf, fp))) text.append(buf, n);
     fclose(fp);
-    CHECK(text.find("--ref-span-insert or --known-snvs") != std::string::npos);
+    CHECK(text.find("--ref-span-insert, --known-snvs or") != std::string::npos);
 }
 
 TEST_CASE("aln_known_snvs: collapsed mirror cells are free for away but not biological votes"
