@@ -368,6 +368,16 @@ static int staging_bytes_cb(int64_t l_mem, const char *name, void *ctx)
     return 0;
 }
 
+/* Remove registry entry `name`'s segment at `idx_path`. Every removal of a
+ * segment, by `shm -d`, by the reclaim of an interrupted stage or by a stage's
+ * rollback, goes through here. Errors are ignored (the segment may already be
+ * gone). */
+static void segment_remove(const char *idx_path, const char *name)
+{
+    (void)name;
+    shm_unlink(idx_path);
+}
+
 /* A per-stage token (header reserved[1]); it only has to differ between
  * stagers, so time, PID and a splitmix finalizer suffice. Never 0. */
 static uint64_t stage_token(void)
@@ -795,7 +805,7 @@ static int destroy_cb(int64_t /*l_mem*/, const char *name, void * /*ctx*/)
 {
     char idx_path[PATH_MAX];
     path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
-    shm_unlink(idx_path);   /* ignore errors (entry may already be gone) */
+    segment_remove(idx_path, name);
     return 0;
 }
 
@@ -841,6 +851,7 @@ struct stage_guard {
     void  *ctl = NULL;
     int    ctl_fd = -1;
     void  *idx = MAP_FAILED;
+    size_t idx_len = 0;                  /* length of the `idx` mapping */
     int    idx_fd = -1;
     bool   created = false, released = false;
 
@@ -875,13 +886,13 @@ struct stage_guard {
      * carries our token. Without the lock, leave the entry: `-l` shows it
      * `missing` and the next stage drops it. */
     ~stage_guard() {
-        if (idx != MAP_FAILED) munmap(idx, (size_t)layout->total_size);
+        if (idx != MAP_FAILED) munmap(idx, idx_len);
         if (idx_fd >= 0) close(idx_fd);
         if (created) {
             const bool locked = lock != NULL || lock_registry(/*create=*/false);
             if (still_ours()) {
                 if (locked) ctl_remove(ctl, name);
-                shm_unlink(idx_path);
+                segment_remove(idx_path, name);
             }
         }
         unlock();
@@ -971,7 +982,7 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
     if (state == SEG_DEAD) {
         std::fprintf(stderr, "[M::%s] reclaiming '%s' left by an interrupted stage (PID %llu)\n",
                      __func__, name, pid);
-        shm_unlink(idx_path);
+        segment_remove(idx_path, name);
     }
     ctl_remove(g.ctl, name);   /* a stale entry, if any */
 
@@ -1024,6 +1035,7 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         return -1;
     }
     g.idx = idx_segment_map(g.idx_fd, (size_t)layout.total_size, PROT_READ | PROT_WRITE);
+    g.idx_len = (size_t)layout.total_size;
     if (g.idx == MAP_FAILED) {
         std::fprintf(stderr, "[E::%s] mmap(%s) failed: %s\n",
                      __func__, idx_path, std::strerror(errno));
@@ -1068,9 +1080,10 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
     return 0;
 }
 
-uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
+uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out)
 {
     if (len_out != NULL) *len_out = 0;
+    if (map_len_out != NULL) *map_len_out = 0;
     if (prefix == NULL || prefix[0] == '\0') return NULL;
 
     /* Cheap pre-check: skip the open if there's no registry entry. */
@@ -1142,6 +1155,7 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
     }
 
     if (len_out != NULL) *len_out = (size_t)hdr.total_size;
+    if (map_len_out != NULL) *map_len_out = len;
     return (uint8_t *)m;
 }
 

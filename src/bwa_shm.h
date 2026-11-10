@@ -130,8 +130,12 @@ extern "C" {
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */
 
-	/* Attach helpers used by FMI_search / indexEle / fastmap. */
-	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out);   /* NULL if not staged */
+	/* Attach helpers used by FMI_search / indexEle / fastmap.
+	 * *len_out is the packed index size (the header's total_size), the bound
+	 * for every section lookup. *map_len_out (optional) is the length of the
+	 * mapping, which is what the caller passes to munmap. */
+	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out,
+	                         size_t *map_len_out = NULL);            /* NULL if not staged */
 	int       bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 	                               uint64_t *offset_out, uint64_t *size_out);
 
