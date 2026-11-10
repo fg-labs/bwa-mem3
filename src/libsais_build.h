@@ -1,7 +1,10 @@
 #ifndef BWA_LIBSAIS_BUILD_H
 #define BWA_LIBSAIS_BUILD_H
 
+#include "packed_text.h"
+
 #include <cstdint>
+#include <memory>
 #include <string>
 
 struct LibsaisBuildOpts {
@@ -25,6 +28,16 @@ struct LibsaisBuildOpts {
      * wired up by the caller in bwtindex.cpp, not here. */
     int         sa_compx           = 3;
 };
+
+// Forward text `fwd` (l_pac bases) followed by its reverse complement, 2-bit
+// packed into (2*l_pac+3)/4 bytes: exactly the packed bytes write_doubled_pac
+// writes. Parallelised over output bytes with `num_threads` OpenMP threads.
+std::unique_ptr<uint8_t[]> pack_doubled(const PackedText& fwd, int64_t l_pac, int num_threads);
+
+// Write `pack_doubled` of the forward .pac at `fwd_pac_path` to `out_path` in
+// the on-disk .pac format (packed bytes, pad byte when 2*l_pac % 4 == 0, count byte).
+void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
+                       const char* out_path, int num_threads);
 
 // True when a doubled text of length `N` forces libsais's 64-bit SA path,
 // which doubles the per-suffix cost.

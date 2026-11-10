@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/mman.h>
 #include <unistd.h>
 
 #define _set_pac(pac, l, c) ((pac)[(l)>>2] |= (c)<<((~(l)&3)<<1))
@@ -80,6 +81,51 @@ int main() {
         CHECK(empty.get_kmer(0, 4) == 0);
     }
     unlink(zpath);
+
+    // Non-owning view over an in-memory buffer must agree with the mmapped
+    // PackedText over the same bytes. 1003 is not a multiple of 4 so the
+    // final byte is partial.
+    {
+        const int M = 1003;
+        const size_t nb = (M + 3) / 4;
+        uint8_t* buf = (uint8_t*)calloc(nb, 1);
+        CHECK(buf != nullptr);
+        uint32_t st = 12345u;
+        for (int l = 0; l < M; ++l) {
+            st = st * 1664525u + 1013904223u;
+            _set_pac(buf, l, (st >> 24) & 3);
+        }
+        char vpath[BWA_TEST_PATH_MAX];
+        int vfd = bwa_test_mkstemp(vpath, sizeof vpath, "packed_text_test_view");
+        CHECK(vfd >= 0);
+        CHECK(write(vfd, buf, nb) == (ssize_t)nb);
+        close(vfd);
+        {
+            PackedText mapped(vpath, M);
+            PackedText view((const uint8_t*)buf, (int64_t)M);
+            CHECK(view.length() == M);
+            CHECK(view.data() == buf);
+            for (int l = 0; l < M; ++l) CHECK(view.get_base(l) == mapped.get_base(l));
+            const int64_t poss[] = {0, 1, 500, 990};
+            for (int64_t p : poss) CHECK(view.get_kmer(p, 32) == mapped.get_kmer(p, 32));
+        }
+        // The same over a caller-owned, page-aligned mapping: an erroneous munmap in the view's
+        // destructor would unmap it, which a heap buffer (not page-aligned) can hide.
+        {
+            void* map = mmap(nullptr, nb, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            CHECK(map != MAP_FAILED);
+            memcpy(map, buf, nb);
+            {
+                PackedText view((const uint8_t*)map, (int64_t)M);
+                CHECK(view.data() == map);
+                for (int l = 0; l < M; ++l) CHECK(view.get_base(l) == ((buf[l >> 2] >> ((~l & 3) << 1)) & 3));
+            }
+            CHECK(memcmp(map, buf, nb) == 0);  // still mapped and intact after the view is gone
+            CHECK(munmap(map, nb) == 0);
+        }
+        free(buf);  // view already destroyed; must not have unmapped/closed anything
+        unlink(vpath);
+    }
 
     printf("packed_text_test OK\n");
     return 0;
