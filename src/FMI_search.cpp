@@ -905,7 +905,8 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             if (huge_pages != BWAMEM_HUGETLB_OFF)
                 fprintf(stderr, "[M::load_index] --huge-pages: no effect on an index "
-                        "attached from shared memory; its pages are the segment's\n");
+                        "attached from shared memory; its pages are the segment's "
+                        "(`bwa-mem3 shm --huge-pages` stages it on 1 GB pages)\n");
             return;
         }
     }
