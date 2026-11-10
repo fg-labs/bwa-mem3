@@ -914,7 +914,6 @@ void ks_place_twins_meth(const aln_opt_t *o, const bwt_t *bwt, std::vector<ks_re
         const auto &t = rec[idx[j]].tseq;
         ks_make_read(tw + j, t.data(), (int)t.size(), is_comp);
     }
-	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
 	const int64_t tord = ord0 + ((int64_t)1 << 48); // past any read's ordinal
 	std::vector<aln_meth_read_t> tres((size_t)nt);
     aln_dup_state_t dup, window_dup;
@@ -925,7 +924,7 @@ void ks_place_twins_meth(const aln_opt_t *o, const bwt_t *bwt, std::vector<ks_re
 		ks_rec_t &r = rec[idx[j]];
 		const bwa_seq_t &t = tw[j];
 		r.twin_mapq = t.type == BWA_TYPE_NO_MATCH ? 0 : t.mapQ;
-		r.twin_same = t.type == BWA_TYPE_UNIQUE && (int)t.strand == r.strand &&
+		r.twin_same = tres[j].flags ? -1 : t.type == BWA_TYPE_UNIQUE && (int)t.strand == r.strand &&
 					  ks_twin_read_same_contig(o->meth_ref->bns, &t, r.pos);
 	}
 	bwa_free_read_seq(nt, tw);
@@ -1179,7 +1178,8 @@ void ks_place_twins_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const isize_in
 		// --meth placement crosses a contig. resolve_window drops a window past its contig's end,
 		// mate rescue is clipped to the anchor's contig (and stops with an error if the rescued
 		// interval leaves it), and aln_meth_realign_window rejects a contig-crossing window.
-		r.twin_same = q->type != BWA_TYPE_NO_MATCH && (int)q->strand == r.strand
+		r.twin_same = (tres[0][t].flags || tres[1][t].flags) ? -1 :
+			q->type != BWA_TYPE_NO_MATCH && (int)q->strand == r.strand
 			&& ks_twin_read_same_contig(o->meth_ref->bns, q, r.pos);
 	}
 	for (int j = 0; j < 2; ++j) bwa_free_read_seq(nt, tw[j]);

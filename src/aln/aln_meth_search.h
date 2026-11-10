@@ -11,6 +11,9 @@
 #include "bwtgap.h"
 #include "aln_known_snvs.h"
 namespace bwa_aln {
+// SA rows a read resolves at the flush that binds its lookup budget (at most what is left of it),
+// to pick its best-known placement: that flush makes the read incomplete either way.
+enum { ALN_METH_BIND_ROWS = 64 };
 struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; };
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep

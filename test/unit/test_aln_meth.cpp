@@ -1598,6 +1598,86 @@ TEST_CASE("aln_meth: identical reads with different --known-snvs candidates do n
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
+TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few more rows")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("bind.fq", {conv(ref().c1.substr(500,50),'C','T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n=0;ba::bwa_seq_t *reads=ba::bwa_read_seq(input,1,&n,BWA_MODE_COMPREAD,0);
+    REQUIRE(n==1);REQUIRE(reads!=nullptr);
+    const std::string prefix=ref().fa+".meth";
+    FMI_search fmi(prefix.c_str());fmi.load_index(false,1);
+    ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    ba::gap_opt_t *opt=ba::gap_init_opt();
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;
+    group.n_slots=1;group.slot.resize(1);
+    ba::gap_slot_core_t core={};group.cores=&core;
+    auto &slot=group.slot[0];slot.grp=&group;slot.job=&core.job;
+    ba::aln_meth_read_t result;
+    const ba::gap_entry_t exact={};
+    // Each flush holds the intervals [k, k + width) of its widths, consecutive over the SA rows;
+    // the rows' windows are whatever they are (the lookup count does not depend on them).
+    REQUIRE(bwt->seq_len>4000);
+    auto run=[&](int budget,const std::vector<std::vector<int>> &flushes) {
+        mo.p_best=budget;mo.p_second=0;ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_slot_start(&slot,reads,&result,0,3,0);
+        std::vector<long> lookups;bwtint_t k=0;
+        for (const auto &widths : flushes) {
+            for (int w : widths) { ba::aln_meth_hit(&slot,&exact,k,k+w-1); k+=w; }
+            core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
+            lookups.push_back(result.n_lookups);
+        }
+        return lookups;
+    };
+    SUBCASE("flushes within the budget resolve every row") {
+        CHECK(run(1000,{{100,200},{300}})==std::vector<long>{300,600});
+        CHECK(result.flags==0);
+    }
+    SUBCASE("a flush that fills the budget exactly does not bind it") {
+        CHECK(run(1000,{{400},{600}})==std::vector<long>{400,1000});
+        CHECK(result.flags==0);
+    }
+    SUBCASE("the binding flush resolves ALN_METH_BIND_ROWS more rows and marks the read") {
+        CHECK(run(1000,{{100},{50,2000,10}})==std::vector<long>{100,100+ba::ALN_METH_BIND_ROWS});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+    }
+    SUBCASE("the binding rows are spread over the pending intervals in order") {
+        // The windows of the rows that were looked up, and the rows that were a wrong copy:
+        // together they tell which SA rows the flush resolved.
+        using seen_t=std::pair<decltype(slot.windows),long>;
+        auto rows_of=[&](int budget,const std::vector<std::pair<bwtint_t,int>> &intervals) {
+            mo.p_best=budget;mo.p_second=0;ba::aln_meth_opt_finish(&mo);
+            ba::aln_meth_slot_start(&slot,reads,&result,0,3,0);
+            for (const auto &iv : intervals) ba::aln_meth_hit(&slot,&exact,iv.first,iv.first+iv.second-1);
+            core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
+            return seen_t{slot.windows,result.n_wrong_copy};
+        };
+        // The oracles resolve their rows in full, within the budget: the first 40 rows plus 24
+        // of the second interval (discovery order), and the third interval plus 24 of the second
+        // (the reverse).
+        const seen_t in_order=rows_of(1000,{{0,40},{40,24}}), reversed=rows_of(1000,{{80,40},{40,24}});
+        REQUIRE(in_order!=reversed); // the windows tell the two orders apart
+        CHECK(run(100,{{40,40,40}})==std::vector<long>{ba::ALN_METH_BIND_ROWS});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+        CHECK(seen_t{slot.windows,result.n_wrong_copy}==in_order);
+    }
+    SUBCASE("the binding flush never resolves past the budget") {
+        CHECK(run(1000,{{980},{30}})==std::vector<long>{980,1000});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+    }
+    SUBCASE("a binding first flush") {
+        CHECK(run(1000,{{1001}})==std::vector<long>{ba::ALN_METH_BIND_ROWS});
+        CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
+    }
+    ba::aln_meth_slot_finish(&slot);
+    ba::bwa_free_read_seq(n,reads);ba::bwa_seq_close(input);
+    ba::aln_meth_ref_free(&mr);ba::bwt_destroy(bwt);free(opt);
+}
+
 TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique strata")
 {
     namespace ba = bwa_aln;
@@ -4519,3 +4599,101 @@ TEST_CASE("aln_meth: ref-span-insert estimates the insert size from gapped mates
 }
 
 TEST_SUITE_END;
+
+TEST_CASE("aln_meth: known alleles stop at the CIGAR cap and the next read resets")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("cigar-cap.fq", std::vector<std::string>(2, conv(ref().c1.substr(500, 50), 'C', 'T')));
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 2, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(reads != nullptr);
+    REQUIRE(n == 2);
+    const std::string prefix = ref().fa + ".meth";
+    FMI_search fmi(prefix.c_str());
+    fmi.load_index(false, 1);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    ba::aln_meth_group_t group;
+    group.bwt = bwt; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    group.n_slots = 1; group.slot.resize(1);
+    ba::gap_slot_core_t core = {};
+    group.cores = &core;
+    auto &slot = group.slot[0];
+    slot.grp = &group; slot.job = &core.job;
+    ba::aln_meth_read_t results[2];
+    ba::aln_meth_slot_start(&slot, reads, results, 0, 3, 1);
+    bwtint_t row = (bwtint_t)-1;
+    for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
+        int strand = 0;
+        const auto pos = ba::bwa_pos_from_sa(mr.conv_bns, ba::bwt_sa(bwt, k), 50, &strand);
+        if (pos != (bwtint_t)-1 && strand == 0 && bns_pos2rid(mr.conv_bns, pos) == 1 &&
+            pos == (bwtint_t)(mr.conv_bns->anns[1].offset + 500)) { row = k; break; }
+    }
+    REQUIRE(row < bwt->seq_len);
+
+    ba::gap_entry_t exact = {};
+    auto flush = [&]() {
+        ba::aln_meth_hit(&slot, &exact, row, row);
+        core.state = ba::GAP_SLOT_PARKED;
+        ba::aln_meth_flush_parked(&group);
+    };
+    flush();
+    REQUIRE(results[0].occ.size() == 1);
+    const auto before = results[0].occ[0];
+    ba::ks_sites_t sites;
+    sites.by_contig.assign(mr.bns->n_seqs, {});
+    for (int p=505; p<545 && sites.n_sites<3; ++p) {
+        if (ref().c1[p]!='A') continue;
+        sites.by_contig[0].push_back({p,0,2});
+        ++sites.n_sites;
+    }
+    REQUIRE(sites.n_sites == 3);
+    mr.known_snvs = &sites;
+    uint64_t remaining = 7;
+    int expected = 1;
+    SUBCASE("reference evaluation binds") { remaining = 7; expected = 1; }
+    SUBCASE("first ALT evaluation binds") { remaining = 15; expected = 2; }
+    SUBCASE("second ALT evaluation binds") { remaining = 23; expected = 3; }
+    slot.alignment_bytes = (64ULL << 20) - remaining;
+    slot.windows.clear(); slot.intervals.clear(); // re-evaluate the same locus with the seeded counter
+    const auto rescored = results[0].n_rescored;
+    flush();
+    CHECK(results[0].n_rescored - rescored == expected);
+    CHECK(results[0].flags == ba::ALN_METH_BIND_CIGAR);
+    CHECK(slot.stop == 1);
+    CHECK(slot.alignment_bytes == (64ULL << 20) - remaining + 8 * (expected - 1));
+    CHECK(slot.pend.empty());
+    REQUIRE(results[0].occ.size() == 1);
+    const auto &after = results[0].occ[0];
+    CHECK(std::make_tuple(after.pos, after.rid, after.hyp, after.strand, after.cost, after.ks_site,
+                          after.alt, after.n_mm, after.n_gapo, after.n_gape, after.n_conv, after.n_ins, after.n_del,
+                          after.alignment.rb, after.alignment.re, after.alignment.reward, after.alignment.band) ==
+          std::make_tuple(before.pos, before.rid, before.hyp, before.strand, before.cost, before.ks_site,
+                          before.alt, before.n_mm, before.n_gapo, before.n_gape, before.n_conv, before.n_ins, before.n_del,
+                          before.alignment.rb, before.alignment.re, before.alignment.reward, before.alignment.band));
+    CHECK(after.alignment.raw_cigar == before.alignment.raw_cigar);
+    CHECK(after.alignment.cigar == before.alignment.cigar);
+    ba::aln_meth_slot_finish(&slot);
+    REQUIRE(results[0].main >= 0);
+    CHECK(results[0].hits[results[0].main].pos == 500);
+    ba::aln_meth_slot_start(&slot, reads+1, results+1, 1, 3, 1);
+    CHECK(slot.stop == 0);
+    CHECK(slot.alignment_bytes == 0);
+    flush();
+    CHECK(results[1].n_rescored == 4);
+    CHECK(results[1].flags == 0);
+    ba::aln_meth_slot_finish(&slot);
+    REQUIRE(results[1].main >= 0);
+    CHECK(results[1].hits[results[1].main].pos == 500);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
+    free(opt);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
