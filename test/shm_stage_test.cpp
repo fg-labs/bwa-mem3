@@ -169,9 +169,10 @@ std::string list_output() {
 
 // Attach succeeds and its bytes equal bwa_shm_pack_from_disk's.
 void check_attach_matches(const std::string &prefix) {
-    size_t len = 0;
-    uint8_t *m = bwa_shm_attach(prefix.c_str(), &len);
+    size_t len = 0, map_len = 0;
+    uint8_t *m = bwa_shm_attach(prefix.c_str(), &len, &map_len);
     CHECK(m != NULL);
+    CHECK(map_len >= len);
     uint8_t *disk = NULL;
     uint64_t disk_len = 0;
     CHECK(bwa_shm_pack_from_disk(prefix.c_str(), &disk, &disk_len) == 0);
@@ -210,7 +211,7 @@ void check_attach_matches(const std::string &prefix) {
               && sa.gi == da.gi && sa.is_alt == da.is_alt);
     }
     free(disk);
-    munmap(m, len);
+    munmap(m, map_len);
 }
 
 // Create segment `name` by hand, `size` bytes, with a header of `magic`, PID
