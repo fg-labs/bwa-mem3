@@ -254,4 +254,113 @@ TEST_CASE("aln_realign: m7 context cannot borrow contig neighbors or original N 
     CHECK(a.reward==-1); // original query ambiguity uses the N matrix column
 }
 
+TEST_CASE("aln_realign: equal-length windows match the full-band DP on both sides of the ungapped bound") {
+    // An equal-length window whose ungapped reward beats every gapped path skips the DP; every
+    // other window (rewards at or below the bound, or a gapped optimum) runs it. Both must give
+    // the full-band scalar DP's reward and CIGAR, and hand back the window they aligned against.
+    const int len=40;
+    int n_fast=0,n_dp=0,n_gapped=0;
+    for(int context:{METH_CTX_ALL,METH_CTX_CPG})
+    for(int scoring:{MEM_METH_SCORING_GENOMIC,MEM_METH_SCORING_NEUTRAL})
+    for(int hyp:{0,1}) {
+        ba::aln_meth_opt_t mo;mo.m.meth_context=context;mo.m.meth_scoring=scoring;ba::aln_meth_opt_finish(&mo);
+        const int m=context==METH_CTX_CPG?7:5;
+        const int8_t *mat=m==7?(hyp?mo.mat7_ot:mo.mat7_ob):(hyp?mo.mat_ot:mo.mat_ob);
+        std::vector<uint8_t> t;uint32_t seed=7919u+hyp;
+        for(int i=0;i<len;++i){seed=seed*1664525u+1013904223u;t.push_back(seed>>30);}
+        Ref ref(t);
+        std::vector<std::vector<uint8_t>> queries;
+        for(int k=0;k<=8;++k) { // k strict mismatches: A->C, C->G, G->T, T->A are never conversions
+            std::vector<uint8_t> q=t;
+            for(int j=0;j<k;++j) q[3+4*j]=(q[3+4*j]+1)&3;
+            queries.push_back(q);
+        }
+        std::vector<uint8_t> gapped=t; // one deletion and one insertion: same length, gapped optimum
+        gapped.erase(gapped.begin()+12);gapped.insert(gapped.begin()+30,(uint8_t)((t[30]+1)&3));
+        queries.push_back(gapped);
+        for(const auto &q:queries) {
+            ba::aln_meth_candidate_t c{0,0,hyp,0,len};ba::aln_meth_alignment_t a;std::vector<uint8_t> window;
+            REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,c,q.data(),len,0,0,&a,-1,&window)==ba::aln_meth_eval_status::ok);
+            std::vector<uint8_t> fetched;ba::aln_meth_fetch_window(ref.ref,mo,0,len,0,fetched);
+            CHECK(window==fetched);
+            const int certificate=m==5?bwa_global_cert_band(mat,5,1,5,1,len,q.data(),len,fetched.data()):-1;
+            const int expected_band=certificate<0?len:std::min(len,std::max(3,certificate));
+            CHECK(a.band==expected_band);
+            int ungapped=0;for(int i=0;i<len;++i)ungapped+=mat[fetched[i]*m+q[i]];
+            int n=0;uint32_t *raw=nullptr;
+            const int exact=ksw_global2_scalar_ref(len,q.data(),len,fetched.data(),m,mat,5,1,5,1,len,&n,&raw);
+            const std::vector<uint32_t> expected(raw,raw+n);free(raw);
+            CHECK(a.reward==exact);CHECK(a.raw_cigar==expected);
+            CHECK(a.reward==cigar_score(q,fetched,mat,m,a.raw_cigar));
+            // The displayed record: stock display normalization of the oracle's CIGAR (a terminal
+            // insertion becomes a soft clip; a terminal deletion is dropped and moves that bound).
+            std::vector<uint32_t> shown=expected;int64_t rb=0,re=len;
+            if((shown.back()&15)==1) shown.back()=(shown.back()&~15u)|4;
+            if((shown.front()&15)==1) shown.front()=(shown.front()&~15u)|4;
+            if((shown.back()&15)==2) { re-=shown.back()>>4;shown.pop_back(); }
+            if(!shown.empty()&&(shown.front()&15)==2) { rb+=shown.front()>>4;shown.erase(shown.begin()); }
+            CHECK(a.cigar==shown);CHECK(a.rb==rb);CHECK(a.re==re);
+            if(ungapped>len-13) { // certified: one match over the unchanged candidate window
+                ++n_fast;const std::vector<uint32_t> whole{(uint32_t)len<<4};
+                CHECK(a.raw_cigar==whole);CHECK(a.cigar==whole);CHECK(a.rb==0);CHECK(a.re==len);
+            }
+            else ++n_dp;
+            if(expected.size()>1) ++n_gapped;
+        }
+    }
+    CHECK(n_fast>0);CHECK(n_dp>0);CHECK(n_gapped>0);
+}
+
+TEST_CASE("aln_realign: adjacent ungapped bounds retain the scalar optimum and band") {
+    const auto dna=[](const std::string &text) {
+        std::vector<uint8_t> bases;
+        for(char base:text) bases.push_back(std::string("ACGT").find(base));
+        return bases;
+    };
+    const auto target=dna("GGCGGTAGTTGGTCATCCTCGTTATGTTATTGGCTACCTG");
+    const int len=(int)target.size(),bound=len-13;
+    ba::aln_meth_opt_t mo;mo.m.meth_scoring=MEM_METH_SCORING_NEUTRAL;ba::aln_meth_opt_finish(&mo);
+    Ref ref(target);
+    std::vector<std::vector<uint8_t>> queries;
+    // Three strict mismatches cost 12 reward; each neutral conversion costs one more.
+    for(int conversions=0;conversions<=3;++conversions) {
+        auto query=target;
+        for(int i=0;i<3;++i) query[i]=(query[i]+1)&3;
+        int remaining=conversions;
+        for(int i=3;i<len&&remaining;++i) if(target[i]==1) { query[i]=3;--remaining; }
+        REQUIRE(remaining==0);
+        queries.push_back(query);
+    }
+    // One insertion and deletion beat the diagonal by one at bound-1.
+    queries.push_back(dna("GGCGGTAGTTGGTCAATCCTCTTATGTTATTGGCTACCTG"));
+    int counts[4]={0,0,0,0};
+    for(size_t index=0;index<queries.size();++index) {
+        const auto &query=queries[index];
+        int ungapped=0;
+        for(int i=0;i<len;++i) ungapped+=mo.mat_ot[target[i]*5+query[i]];
+        REQUIRE(ungapped>=bound-2);REQUIRE(ungapped<=bound+1);++counts[ungapped-(bound-2)];
+        int n=0;uint32_t *raw=nullptr;
+        const int exact=ksw_global2_scalar_ref(len,query.data(),len,target.data(),5,mo.mat_ot,5,1,5,1,len,&n,&raw);
+        REQUIRE(n>0);REQUIRE(raw!=nullptr);
+        const std::vector<uint32_t> expected(raw,raw+n);free(raw);
+        ba::aln_meth_alignment_t alignment;std::vector<uint8_t> window;
+        REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,{0,0,1,0,len},query.data(),len,0,0,&alignment,-1,&window)==ba::aln_meth_eval_status::ok);
+        CHECK(window==target);CHECK(alignment.reward==exact);CHECK(alignment.raw_cigar==expected);
+        CHECK(alignment.reward==cigar_score(query,target,mo.mat_ot,5,alignment.raw_cigar));
+        const int certificate=bwa_global_cert_band(mo.mat_ot,5,1,5,1,len,query.data(),len,target.data());
+        CHECK(alignment.band==(certificate<0?len:std::min(len,std::max(3,certificate))));
+        auto shown=expected;int64_t rb=0,re=len;
+        if((shown.back()&15)==1) shown.back()=(shown.back()&~15u)|4;
+        if((shown.front()&15)==1) shown.front()=(shown.front()&~15u)|4;
+        if((shown.back()&15)==2) { re-=shown.back()>>4;shown.pop_back(); }
+        if(!shown.empty()&&(shown.front()&15)==2) { rb+=shown.front()>>4;shown.erase(shown.begin()); }
+        CHECK(alignment.cigar==shown);CHECK(alignment.rb==rb);CHECK(alignment.re==re);
+        if(index==queries.size()-1) {
+            CHECK(ungapped==bound-1);CHECK(exact==bound);
+            CHECK(expected==std::vector<uint32_t>{14u<<4,1u<<4|1,6u<<4,1u<<4|2,19u<<4});
+        }
+    }
+    for(int count:counts) CHECK(count>0);
+}
+
 TEST_SUITE_END;
