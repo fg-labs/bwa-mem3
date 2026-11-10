@@ -70,6 +70,16 @@ struct ks_windows_t {
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
 					 int meth, ks_windows_t *out);
 
+/* The windows as a forward-only reference: bns (one contig `w<i>` per window, no ambiguity
+ * holes, fields as bns_restore gives for today's windows.fa) and pac (l_pac/4+1 bytes, as
+ * bwa_idx_load_ele loads). Caller owns both (bns_destroy / free). */
+void ks_windows_ref(const std::vector<ks_window_t> &win, const bntseq_t *bns, const uint8_t *pac,
+					bntseq_t **out_bns, uint8_t **out_pac);
+/* --meth: per window `r<name>` (G->A) then `f<name>` (C->T), the layout aln_meth_ref_load checks.
+ * Windows only: valid because window text has no ambiguity holes (the 2-bit codes are exact). */
+void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, bntseq_t **conv_bns,
+							 uint8_t **conv_pac);
+
 /* --meth: the candidate windows (original reference, rid = contig) of the hits a read's search on
  * the converted window index found that cover their window's site. */
 void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const struct aln_meth_read_t &wres,

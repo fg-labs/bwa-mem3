@@ -168,6 +168,77 @@ void remove_dir(const std::string &dir)
 
 } // namespace
 
+namespace {
+
+// A restored-state bns (what bns_restore leaves after bwa_idx_load_ele closes fp_pac): seed 11,
+// gi 0, empty anno, no holes, fp_pac NULL, pos2rid built.
+bntseq_t *ks_new_bns(int n_seqs)
+{
+	bntseq_t *b = (bntseq_t *)aln_calloc(1, sizeof(bntseq_t));
+	b->seed = 11;
+	b->n_seqs = n_seqs;
+	b->anns = (bntann1_t *)aln_calloc((size_t)std::max(n_seqs, 1), sizeof(bntann1_t));
+	return b;
+}
+
+void ks_set_ann(bntann1_t *a, const std::string &name, int64_t offset, int32_t len)
+{
+	a->name = aln_strdup(name.c_str());
+	a->anno = aln_strdup("");
+	a->offset = offset;
+	a->len = len;
+}
+
+} // namespace
+
+void ks_windows_ref(const std::vector<ks_window_t> &win, const bntseq_t *bns, const uint8_t *pac,
+					bntseq_t **out_bns, uint8_t **out_pac)
+{
+	bntseq_t *b = ks_new_bns((int)win.size());
+	int64_t off = 0;
+	for (size_t i = 0; i < win.size(); ++i) {
+		ks_set_ann(&b->anns[i], "w" + std::to_string(i), off, win[i].len);
+		off += win[i].len;
+	}
+	b->l_pac = off;
+	uint8_t *p = (uint8_t *)aln_calloc((size_t)(off / 4 + 1), 1);
+	int64_t o = 0;
+	for (const ks_window_t &w : win) {
+		const int64_t base = bns->anns[w.rid].offset + w.beg;
+		for (int32_t j = 0; j < w.len; ++j, ++o) {
+			const int64_t k = base + j;
+			// _set_pac ORs into zeroed bytes, so each base is set once: the ALT in place of REF
+			_set_pac(p, o, j == w.site_pos - w.beg ? w.alt : (pac[k >> 2] >> ((~k & 3) << 1)) & 3);
+		}
+	}
+	bns_build_pos2rid(b);
+	*out_bns = b;
+	*out_pac = p;
+}
+
+void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, bntseq_t **conv_bns,
+							 uint8_t **conv_pac)
+{
+	bntseq_t *b = ks_new_bns(2 * orig_bns->n_seqs);
+	b->l_pac = 2 * orig_bns->l_pac;
+	uint8_t *p = (uint8_t *)aln_calloc((size_t)(b->l_pac / 4 + 1), 1);
+	for (int i = 0; i < orig_bns->n_seqs; ++i) {
+		const bntann1_t &a = orig_bns->anns[i];
+		for (int h = 0; h < 2; ++h) { // r: G->A, then f: C->T (index --meth's order)
+			const int64_t off = 2 * a.offset + h * (int64_t)a.len;
+			ks_set_ann(&b->anns[2 * i + h], std::string(h ? "f" : "r") + a.name, off, a.len);
+			const uint8_t from = h ? 1 : 2, to = h ? 3 : 0;
+			for (int32_t j = 0; j < a.len; ++j) {
+				const uint8_t c = _get_pac(orig_pac, a.offset + j);
+				_set_pac(p, off + j, c == from ? to : c);
+			}
+		}
+	}
+	bns_build_pos2rid(b);
+	*conv_bns = b;
+	*conv_pac = p;
+}
+
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
 					 int meth, ks_windows_t *out)
 {
