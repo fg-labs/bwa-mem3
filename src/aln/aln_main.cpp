@@ -1649,8 +1649,7 @@ int main_aln(int argc, char *argv[])
 		}
 	}
 
-	// read 2's path is taken now: building the --known-snvs --meth windows runs `index`, which
-	// resets getopt's optind
+	// the positional arguments: index prefix, read 1, and read 2 when paired
 	const char *prefix = argv[optind], *fn_fq = argv[optind + 1], *fn_fq2 = paired ? argv[optind + 2] : nullptr;
 	// --meth: the search runs on the converted index <prefix>.meth; the original index at <prefix>
 	// supplies the reference (both written by `bwa-mem3 index --meth`). <prefix>.meth is accepted too,

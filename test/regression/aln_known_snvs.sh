@@ -176,6 +176,40 @@ for e in se pe se.meth pe.meth; do
 done
 echo 'PASS: threads'
 
+# 4b. The ALT-window index is built in memory: a read-only TMPDIR is not touched or needed.
+ro=$tmp/ro
+mkdir "$ro"
+chmod 500 "$ro"
+for e in se se.meth; do
+    args=()
+    [[ $e == *meth ]] && args=(--meth)
+    TMPDIR=$ro run "ks.$e.ro" "${args[@]}" --known-snvs "$tmp/sites.vcf" "$tmp/ref.fa" "$tmp/se.fq"
+    cmp <(body "$tmp/ks.$e.sam") <(body "$tmp/ks.$e.ro.sam") || {
+        echo "FAIL: $e: a read-only TMPDIR changed the output" >&2
+        exit 1
+    }
+done
+chmod 700 "$ro"
+[ -z "$(ls -A "$ro")" ] || {
+    echo "FAIL: --known-snvs wrote into TMPDIR" >&2
+    exit 1
+}
+# chmod 500 does not stop root, so also point TMPDIR at a path no build can mkdtemp in.
+for e in se se.meth; do
+    args=()
+    [[ $e == *meth ]] && args=(--meth)
+    TMPDIR="$tmp/does-not-exist" run "ks.$e.nodir" "${args[@]}" --known-snvs "$tmp/sites.vcf" "$tmp/ref.fa" "$tmp/se.fq"
+    cmp <(body "$tmp/ks.$e.sam") <(body "$tmp/ks.$e.nodir.sam") || {
+        echo "FAIL: $e: a non-existent TMPDIR changed the output" >&2
+        exit 1
+    }
+done
+[ ! -e "$tmp/does-not-exist" ] || {
+    echo "FAIL: --known-snvs created TMPDIR" >&2
+    exit 1
+}
+echo 'PASS: no-temp-files (read-only and non-existent TMPDIR, empty afterwards)'
+
 # 5. --bam carries XV:Z.
 if command -v samtools > /dev/null; then
     "$bin" aln -v 1 --bam --known-snvs "$tmp/sites.vcf" "$tmp/ref.fa" "$tmp/r1.fq" "$tmp/r2.fq" > "$tmp/ks.bam" 2> /dev/null
