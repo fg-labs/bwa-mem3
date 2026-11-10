@@ -4,7 +4,9 @@
 #include "doctest/doctest.h"
 
 #include "../framework/temp_dir.h"
+#include "../framework/temp_index.h"
 #include "../../src/fm_index_writer.h"
+#include "../../src/bntseq.h"
 #include "../../src/libsais_build.h"
 
 #include <cstdint>
@@ -36,6 +38,27 @@ std::vector<uint8_t> read_file(const std::string &path)
     while ((n = std::fread(buf, 1, sizeof buf, f)) > 0) v.insert(v.end(), buf, buf + n);
     std::fclose(f);
     return v;
+}
+
+// Random ACGT bases from a fixed seed.
+std::string random_bases(size_t n, uint32_t seed)
+{
+    static const char kAcgt[] = "ACGT";
+    std::string out(n, 'A');
+    for (char &c : out) {
+        seed = seed * 1664525u + 1013904223u;
+        c = kAcgt[(seed >> 24) & 3];
+    }
+    return out;
+}
+
+// A few-kilobase synthetic reference: three contigs, one with an N run (an ambiguity hole,
+// which the .pac stores as a random base), with lengths that are not multiples of 4.
+std::vector<bwa_tests::Contig> multi_contig_ref()
+{
+    return {{"a", random_bases(1001, 1u)},
+            {"b", random_bases(700, 2u) + "NNNNN" + random_bases(300, 3u)},
+            {"c", random_bases(67, 4u)}};
 }
 
 } // namespace
@@ -137,7 +160,7 @@ TEST_CASE("libsais_mem: MemSink holds the same bytes the file writer writes"
                 const std::string path = tmp.path() + "/idx.bwt.2bit.64";
                 int64_t sent_file = -1;
                 write_fm_index_streaming(path.c_str(), buf.data(), sa.data(), false, N, count,
-                                         &sent_file, sa_compx, threads);
+                                         &sent_file, sa_compx, /*num_threads=*/1);
                 const std::vector<uint8_t> file = read_file(path);
 
                 FmArrays arr;
@@ -159,6 +182,27 @@ TEST_CASE("libsais_mem: MemSink holds the same bytes the file writer writes"
                                   (size_t)L.sa_sample_count) == 0);
                 CHECK(std::memcmp(arr.sa_ls_word, file.data() + L.off_ls_word,
                                   (size_t)L.sa_sample_count * sizeof(uint32_t)) == 0);
+                // Independently derive every checkpoint and sample from the naive suffix array,
+                // so a shared serial/parallel writer error cannot satisfy the file comparison.
+                int64_t running[4] = {0, 0, 0, 0};
+                for (int64_t row = 0; row <= N; ++row) {
+                    const int64_t block = row / CP_BLOCK_SIZE;
+                    if (row % CP_BLOCK_SIZE == 0)
+                        for (int c = 0; c < 4; ++c) CHECK(arr.cp_occ[block].cp_count[c] == running[c]);
+                    const int64_t pos = sa[(size_t)row];
+                    const uint8_t b = buf[(size_t)(pos == 0 ? N : pos - 1)];
+                    for (int c = 0; c < 4; ++c) {
+                        const uint64_t bit = (arr.cp_occ[block].one_hot_bwt_str[c] >> (63 - row % CP_BLOCK_SIZE)) & 1;
+                        CHECK(bit == (uint64_t)(b == c + 1));
+                    }
+                    if (b != 0) ++running[b - 1];
+                    else CHECK(arr.sentinel_index == row);
+                    if (row % ((int64_t)1 << sa_compx) == 0) {
+                        const int64_t sample = row >> sa_compx;
+                        CHECK((uint8_t)arr.sa_ms_byte[sample] == (uint8_t)((uint64_t)pos >> 32));
+                        CHECK(arr.sa_ls_word[sample] == (uint32_t)pos);
+                    }
+                }
                 if ((N + 1) % ((int64_t)1 << sa_compx) == 0) {
                     CHECK(arr.sa_ms_byte[L.sa_sample_count - 1] == 0);
                     CHECK(arr.sa_ls_word[L.sa_sample_count - 1] == 0);
@@ -166,3 +210,113 @@ TEST_CASE("libsais_mem: MemSink holds the same bytes the file writer writes"
             }
     }
 }
+
+TEST_CASE("libsais_mem: memory build equals the index file"
+          * doctest::test_suite("unit/libsais_mem"))
+{
+    const std::vector<std::vector<bwa_tests::Contig>> refs = {
+        {{"one", random_bases(5000, 7u)}}, multi_contig_ref()};
+    for (size_t r = 0; r < refs.size(); ++r) {
+        bwa_tests::TempIndex idx(refs[r]);
+        const std::string &prefix = idx.prefix();
+        const int64_t l_pac = idx.bns()->l_pac;
+        const std::vector<uint8_t> pac = read_file(prefix + ".pac");
+        REQUIRE(pac.size() >= (size_t)((l_pac + 3) / 4));
+        const std::vector<uint8_t> file = read_file(prefix + ".bwt.2bit.64");
+        const int sa_compx = 3;
+        const Bwt2bitLayout L = fmi_bwt2bit_layout(2 * l_pac + 1, sa_compx);
+        REQUIRE(file.size() == (size_t)L.total_bytes);
+        for (int threads : {1, 8}) {
+            CAPTURE(r);
+            CAPTURE(threads);
+            LibsaisBuildOpts opts;
+            opts.num_threads = threads;
+            opts.sa_compx = sa_compx;
+            FmArrays arr;
+            REQUIRE(libsais_build_fm_memory(pac.data(), l_pac, opts, &arr) == 0);
+            CHECK(arr.ref_seq_len == 2 * l_pac + 1);
+            CHECK(arr.sa_compx == sa_compx);
+            CHECK(std::memcmp(&arr.ref_seq_len, file.data(), 8) == 0);
+            CHECK(std::memcmp(arr.count, file.data() + 8, sizeof arr.count) == 0);
+            int64_t sent;
+            std::memcpy(&sent, file.data() + L.off_sentinel, sizeof sent);
+            CHECK(arr.sentinel_index == sent);
+            CHECK(std::memcmp(arr.cp_occ, file.data() + L.off_cp_occ,
+                              (size_t)L.cp_occ_count * sizeof(CP_OCC)) == 0);
+            CHECK(std::memcmp(arr.sa_ms_byte, file.data() + L.off_ms_byte,
+                              (size_t)L.sa_sample_count) == 0);
+            CHECK(std::memcmp(arr.sa_ls_word, file.data() + L.off_ls_word,
+                              (size_t)L.sa_sample_count * sizeof(uint32_t)) == 0);
+        }
+    }
+}
+
+TEST_CASE("libsais_mem: a memory budget refusal allocates nothing"
+          * doctest::test_suite("unit/libsais_mem"))
+{
+    const int64_t l_pac = 1000;
+    std::vector<uint8_t> pac((size_t)(l_pac + 3) / 4, 0x1b);
+    LibsaisBuildOpts opts;
+    opts.max_memory_bytes = 1;   // far below the estimate
+    FmArrays arr;
+    CHECK(libsais_build_fm_memory(pac.data(), l_pac, opts, &arr) == 3);
+    CHECK(arr.cp_occ == nullptr);
+    CHECK(arr.sa_ms_byte == nullptr);
+    CHECK(arr.sa_ls_word == nullptr);
+}
+
+TEST_CASE("libsais_mem: memory budgets include resident output at every sampling rate"
+          * doctest::test_suite("unit/libsais_mem"))
+{
+    const int64_t l_pac = 4096, N = 2 * l_pac;
+    std::vector<uint8_t> pac((size_t)(l_pac + 3) / 4, 0x1b);
+    for (int sa_compx = 0; sa_compx <= CP_SHIFT; ++sa_compx) {
+        CAPTURE(sa_compx);
+        LibsaisBuildOpts opts;
+        opts.num_threads = 1;
+        opts.sa_compx = sa_compx;
+        const Bwt2bitLayout L = fmi_bwt2bit_layout(N + 1, sa_compx);
+        const int64_t resident_bytes = (N + 3) / 4 + L.cp_occ_count * (int64_t)sizeof(CP_OCC)
+                                     + L.sa_sample_count * (int64_t)(sizeof(int8_t) + sizeof(uint32_t));
+        const int64_t sa_bytes = libsais_sa_is_64bit(N) ? sizeof(int64_t) : sizeof(int32_t);
+        const int64_t need = libsais_estimate_peak_bytes(N) + resident_bytes + 10000 * sa_bytes;
+        // Mandatory live allocations, derived directly rather than from the build estimator:
+        // packed doubled text, unpacked text, full SA plus scratch, checkpoints and samples.
+        const int64_t live_bytes = (N + 3) / 4 + (N + 1) + (N + 1 + 10000) * sa_bytes
+                                 + (((N + 1) / 64) + 1) * (int64_t)sizeof(CP_OCC)
+                                 + (((N + 1) / ((int64_t)1 << sa_compx)) + 1) * 5;
+        REQUIRE(need >= live_bytes);
+        opts.max_memory_bytes = libsais_estimate_peak_bytes(N) + resident_bytes;
+        FmArrays without_scratch;
+        CHECK(libsais_build_fm_memory(pac.data(), l_pac, opts, &without_scratch) == 3);
+        CHECK(without_scratch.cp_occ == nullptr);
+        CHECK(without_scratch.sa_ms_byte == nullptr);
+        CHECK(without_scratch.sa_ls_word == nullptr);
+        opts.max_memory_bytes = live_bytes - 1;
+        FmArrays below_live;
+        CHECK(libsais_build_fm_memory(pac.data(), l_pac, opts, &below_live) == 3);
+        CHECK(below_live.cp_occ == nullptr);
+        CHECK(below_live.sa_ms_byte == nullptr);
+        CHECK(below_live.sa_ls_word == nullptr);
+        if (sa_compx <= 1) {
+            opts.max_memory_bytes = libsais_estimate_peak_bytes(N);
+            FmArrays refused;
+            CHECK(libsais_build_fm_memory(pac.data(), l_pac, opts, &refused) == 3);
+            CHECK(refused.cp_occ == nullptr);
+            CHECK(refused.sa_ms_byte == nullptr);
+            CHECK(refused.sa_ls_word == nullptr);
+        }
+        opts.max_memory_bytes = need - 1;
+        FmArrays refused;
+        CHECK(libsais_build_fm_memory(pac.data(), l_pac, opts, &refused) == 3);
+        CHECK(refused.cp_occ == nullptr);
+        CHECK(refused.sa_ms_byte == nullptr);
+        CHECK(refused.sa_ls_word == nullptr);
+        opts.max_memory_bytes = need;
+        FmArrays built;
+        REQUIRE(libsais_build_fm_memory(pac.data(), l_pac, opts, &built) == 0);
+        CHECK(built.ref_seq_len == N + 1);
+        CHECK(built.sa_compx == sa_compx);
+    }
+}
+

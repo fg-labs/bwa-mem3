@@ -1,6 +1,7 @@
 #ifndef BWA_LIBSAIS_BUILD_H
 #define BWA_LIBSAIS_BUILD_H
 
+#include "fm_index_writer.h"
 #include "packed_text.h"
 
 #include <cstdint>
@@ -67,5 +68,12 @@ void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,
 // `<prefix>.0123`), byte-identical to the historical sais-lite-based build.
 int libsais_build_fm_index(const char* prefix, int64_t pac_len,
                            const LibsaisBuildOpts& opts);
+
+// In-memory build of a forward-only 2-bit text (l_pac bases): pack_doubled + core + MemSink.
+// Uses no temp dir and no files. Its budget includes the doubled packed text, resident FM
+// arrays and fixed SA scratch in addition to the disk-build estimate above. Returns 0 on
+// success, 3 on a shortfall.
+int libsais_build_fm_memory(const uint8_t* fwd_pac, int64_t l_pac, const LibsaisBuildOpts& opts,
+                            FmArrays* out);
 
 #endif
