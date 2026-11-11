@@ -22,6 +22,15 @@
 
 namespace bwa_aln {
 
+/* The equal-span scorer's matrix classes (aln_meth_realign.h, aln_meth_fast_init): every cell
+ * is a match, a mismatch, an ambiguity (either base N) or the conversion cell(s), and each class
+ * has one value. ok is false when the scorer does not apply (--meth-context cpg, or another
+ * matrix). best_cell is ungapped_is_optimal's largest cell (0 when every cell is negative). */
+struct aln_meth_fast_t {
+    bool ok = false, collapsed = false;
+    int match = 0, mism = 0, amb = 0, conv = 0, best_cell = 0;
+};
+
 /* The run's --meth settings. The matrices are at aln's scale (bwa_fill_scmat(1, 3)). */
 struct aln_meth_opt_t {
 	meth_opt_t m;                  // the shared options (meth_opt.h)
@@ -29,6 +38,7 @@ struct aln_meth_opt_t {
 	int p_best = 4096;              // legacy budget component; total lookup budget is p_best + p_second
 	int p_second = 500;             // second component of the single total budget
 	int8_t mat_ot[25], mat_ob[25], mat7_ot[49], mat7_ob[49];
+	aln_meth_fast_t fast; // set by aln_meth_opt_finish
 };
 
 /* Builds the matrices (meth_fill_mats on aln's base matrix); call once the options are final. */

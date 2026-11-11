@@ -42,6 +42,7 @@ void aln_meth_opt_finish(aln_meth_opt_t *mo)
 	int8_t base[25];
 	bwa_fill_scmat(1, 3, base); // aln's scale: stock's refinement and mate rescue use bwa_fill_scmat(1, 3)
 	meth_fill_mats(base, 1, &mo->m, mo->mat_ot, mo->mat_ob, mo->mat7_ot, mo->mat7_ob);
+	aln_meth_fast_init(*mo, &mo->fast);
 }
 
 // Pairing is structural: r<name>,f<name> in original order, with identical lengths and
@@ -175,8 +176,7 @@ void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t
     // Reaching the same interval with the same span adds no new candidate window.
     // Other spans must still be evaluated, even if their normalized starts later coincide.
     const int span = x->len + (int)e->n_del - (int)e->n_ins;
-    const auto key = std::make_tuple(k, l, span);
-    if (!x->intervals.insert(key).second) return;
+    if (!x->intervals.insert(aln_meth_iv_key_t{k, l, span}, 0).second) return;
     x->pend.push_back({k, l, *e});
 }
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy)
@@ -195,6 +195,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
         x->rd_rev[k] = std::min<ubyte_t>(p->rseq[k], 4);
     }
     x->pend.clear(); x->windows.clear(); x->intervals.clear(); x->loci.clear();
+    x->bits_ready = 0;
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
     x->flushed_score = -1;
@@ -312,8 +313,7 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
             x->res->site_bound.value = std::min(x->res->site_bound.value, h.e.n_gapo ? 0 : (int)h.e.n_mm);
     }
     const int64_t rb = g->ref->bns->anns[rid].offset + (pos - ca.offset);
-    const auto key = std::make_tuple(rid, hyp, strand, rb, rb + span);
-    if (!x->windows.insert(key).second) return;
+    if (!x->windows.insert(aln_meth_win_key_t{rid, hyp, strand, rb, rb + span}, 0).second) return;
     // A 65535-base read with a deletion spans more than the realigner evaluates. Drop the window
     // as unrepresentable, with cost 0 as its bound: any retained placement is then incomplete.
     if (span > ALN_MAX_READ_LEN) {
@@ -344,23 +344,48 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
     // fits whether its counts fit a record; false when the result misses its site.
     aln_meth_occ_t o;
     bool fits = false;
+    // The equal-span scorer: when the ungapped alignment provably beats every gapped one (the
+    // bound aln_meth_realign_window applies), the window's alignment is [len M], and its reward
+    // and counts come from 64-bit words instead of a fetched window. Same fields as the DP path,
+    // except the band, which stays 0: the alignment is already ungapped, so no band_limit changes it.
+    const aln_meth_fast_t &fast = g->mo->fast;
+    const int len = x->len;
     // The accounting reads the same window the refinement fetched (same window, contig and site).
     std::vector<uint8_t> &win = x->win;
     auto evaluate = [&](int band_limit) {
         o = aln_meth_occ_t();
         o.rid = rid; o.hyp = hyp; o.strand = strand; o.ks_site = site;
-        const auto status = aln_meth_realign_window(*g->ref, *g->mo, candidate, query, x->len,
-                                                   n_ins, n_del, &o.alignment, site, &win, band_limit);
-        // Invalid/resource/empty normalized alignments must never be silently omitted competitors.
-        if (status != aln_meth_eval_status::ok) {
-            fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
-            exit(1);
+        bool scored = false;
+        if (site < 0 && fast.ok && candidate.re - candidate.rb == len && len <= 65535 && g->opt->s_mm >= 0 &&
+            g->opt->s_gapo >= 0 && g->opt->s_gape >= 0) {
+            const int ori = query == x->rd_fwd.data() ? 0 : 1;
+            if (!(x->bits_ready >> ori & 1)) { aln_meth_read_bits(query, len, &x->bits[ori]); x->bits_ready |= 1 << ori; }
+            aln_meth_ungapped_t u;
+            aln_meth_score_ungapped(*g->ref, fast, hyp, candidate.rb, x->bits[ori], &u);
+            if (u.reward > fast.best_cell * (len - 1) - 2 * (5 + 1)) { // ungapped_is_optimal
+                o.alignment.reward = u.reward;
+                o.alignment.rb = candidate.rb; o.alignment.re = candidate.re;
+                o.alignment.raw_cigar.assign(1, (uint32_t)len << 4);
+                o.alignment.cigar = o.alignment.raw_cigar;
+                o.n_mm = u.n_mm; o.n_conv = u.n_conv;
+                o.cost = (int64_t)g->opt->s_mm * o.n_mm;
+                scored = true;
+            }
+        }
+        if (!scored) {
+            const auto status = aln_meth_realign_window(*g->ref, *g->mo, candidate, query, x->len,
+                                                       n_ins, n_del, &o.alignment, site, &win, band_limit);
+            // Invalid/resource/empty normalized alignments must never be silently omitted competitors.
+            if (status != aln_meth_eval_status::ok) {
+                fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
+                exit(1);
+            }
         }
         if (site >= 0) { // --known-snvs: a site the alignment does not cover leaves it as the reference's
             o.alt = ks_site_rel(g->ref->known_snvs, g->ref->bns, rid, o.alignment.rb, site);
             if (aln_site_key_pos(site) < o.alignment.rb || aln_site_key_pos(site) >= o.alignment.re || !o.alt) return false;
         }
-        fits = account_alignment(g->mo, g->opt, win, query, x->len, &o);
+        fits = scored ? o.cost <= INT_MAX && o.n_mm <= 255 : account_alignment(g->mo, g->opt, win, query, x->len, &o);
         return true;
     };
     if (!evaluate(-1)) return;
@@ -395,19 +420,17 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
     }
     x->alignment_bytes += bytes;
     o.pos = o.alignment.rb;
-    const auto locus = std::make_tuple(rid, hyp, strand, o.alignment.rb);
-    const auto it = x->loci.find(locus);
-    if (it == x->loci.end()) {
-        x->loci.emplace(locus, x->res->occ.size());
-        x->res->occ.push_back(std::move(o));
-    } else {
-        const aln_meth_occ_t &cur = x->res->occ[it->second];
+    const auto ins = x->loci.insert(aln_meth_locus_key_t{rid, hyp, strand, o.alignment.rb}, x->res->occ.size());
+    if (ins.second) x->res->occ.push_back(std::move(o));
+    else {
+        const size_t at = x->loci.val[ins.first];
+        const aln_meth_occ_t &cur = x->res->occ[at];
         // --known-snvs: the cheaper wins; on equal cost the reference, then the lower
         // (position, ALT) site allele (aln_site_key order, -1 first)
         const bool better = o.ks_site < 0 && cur.ks_site < 0 ? alignment_better(o, cur, conv_tiebreak(g->mo))
                           : o.cost != cur.cost ? o.cost < cur.cost
                           : (uint64_t)(o.ks_site + 1) < (uint64_t)(cur.ks_site + 1);
-        if (better) x->res->occ[it->second] = std::move(o);
+        if (better) x->res->occ[at] = std::move(o);
     }
 }
 void aln_meth_flush_parked(aln_meth_group_t *g)
@@ -621,7 +644,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
         for (const aln_meth_candidate_t &c : *x->extra) {
             if (x->stop) break;
             if ((c.hyp ^ c.strand) != x->grp->read_no) continue;
-            if (!x->windows.insert(std::make_tuple(c.rid, c.hyp, c.strand, c.rb, c.re)).second) continue;
+            if (!x->windows.insert(aln_meth_win_key_t{c.rid, c.hyp, c.strand, c.rb, c.re}, 0).second) continue;
             const int64_t span = c.re - c.rb;
             // As in resolve_window: a span past the realigner's limit is dropped as unrepresentable.
             if (span > ALN_MAX_READ_LEN) {

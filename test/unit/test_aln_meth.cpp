@@ -1747,22 +1747,27 @@ TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few 
     SUBCASE("the binding rows are spread over the pending intervals in order") {
         // The windows of the rows that were looked up, and the rows that were a wrong copy:
         // together they tell which SA rows the flush resolved.
-        using seen_t=std::pair<decltype(slot.windows),long>;
+        using seen_t=std::pair<decltype(slot.windows.key),long>;
+        // as sets: a flush may resolve a batch's rows in any order
+        auto same=[](const seen_t &a,const seen_t &b) {
+            return a.second==b.second && a.first.size()==b.first.size() &&
+                   std::is_permutation(a.first.begin(),a.first.end(),b.first.begin());
+        };
         auto rows_of=[&](int budget,const std::vector<std::pair<bwtint_t,int>> &intervals) {
             mo.p_best=budget;mo.p_second=0;ba::aln_meth_opt_finish(&mo);
             ba::aln_meth_slot_start(&slot,reads,&result,0,3,0);
             for (const auto &iv : intervals) ba::aln_meth_hit(&slot,&exact,iv.first,iv.first+iv.second-1);
             core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
-            return seen_t{slot.windows,result.n_wrong_copy};
+            return seen_t{slot.windows.key,result.n_wrong_copy};
         };
         // The oracles resolve their rows in full, within the budget: the first 40 rows plus 24
         // of the second interval (discovery order), and the third interval plus 24 of the second
         // (the reverse).
         const seen_t in_order=rows_of(1000,{{0,40},{40,24}}), reversed=rows_of(1000,{{80,40},{40,24}});
-        REQUIRE(in_order!=reversed); // the windows tell the two orders apart
+        REQUIRE(!same(in_order,reversed)); // the windows tell the two orders apart
         CHECK(run(100,{{40,40,40}})==std::vector<long>{ba::ALN_METH_BIND_ROWS});
         CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
-        CHECK(seen_t{slot.windows,result.n_wrong_copy}==in_order);
+        CHECK(same(seen_t{slot.windows.key,result.n_wrong_copy},in_order));
     }
     SUBCASE("the binding flush never resolves past the budget") {
         CHECK(run(1000,{{980},{30}})==std::vector<long>{980,1000});
