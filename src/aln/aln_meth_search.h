@@ -137,6 +137,12 @@ struct aln_meth_slot_t {
     // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row; best_d: the
     // fewest differences of a row at that cost. flushed: a flush has run.
     int cut = 0, best_d = INT_MAX, flushed = 0;
+    // cert: rows are verified stratum by stratum and certificates end the read (single-end, under
+    // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
+    // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
+    int cert = 0, collect = 0;
+    std::vector<aln_meth_pend_t> ivs;
+    uint64_t perm_rng = 0;
     int64_t best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
@@ -160,6 +166,8 @@ struct aln_meth_slot_t {
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
     aln_meth_alt_bound_t alt_bound; // ALT-index lower bound (aln_meth_alt_certificate), not the genomic width
+    // the ordinals of the read's duplicate copies (their draws are made here, aln_meth_slot_finish)
+    const std::vector<int64_t> *copy_ords = nullptr;
     // Scratch: the reference window of the candidate being resolved (refined, then accounted), and
     // the ambiguity bits of a row's window (score_path).
     std::vector<uint8_t> win;
@@ -254,8 +262,10 @@ void aln_meth_redraw_hits(aln_meth_read_t *, uint64_t);
  * loci stored as hits): every field but the work counters is copied and the main hit is redrawn
  * with rng among src's best hits. Unless keep_all, a result aln_meth_trim(max_xa_hits) would cut
  * to its main hit gets only that hit (any max_xa_hits < 0 prints no XA, so it always does). src is
- * unchanged on return. */
-void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng, int keep_all, int max_xa_hits);
+ * unchanged on return. ord: the copy's ordinal; a copy src's search drew for (a repeat
+ * certificate's copy_draw) takes that draw instead. */
+void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng, int keep_all, int max_xa_hits,
+                       int64_t ord = -1);
 uint64_t aln_meth_draw_seed(const aln_meth_ref_t *, int, int64_t);
 void aln_meth_flush_parked(aln_meth_group_t *);
 }
