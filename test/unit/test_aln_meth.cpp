@@ -533,6 +533,94 @@ TEST_CASE("aln_meth: converted repeats do not trigger a rescored -R early stop")
     CHECK(c[0].mapq == 0);
 }
 
+TEST_CASE("aln_meth: a repeat certificate reports X0 as a lower bound and draws its primary uniformly")
+{
+    // Under collapsed scoring read_r has 31 exact loci. With -R 5 the search ends once more than 5 of
+    // them are verified (a repeat certificate): MAPQ 0, X0 the verified count (6 to 31), no X1. The
+    // primary is drawn over all 31, verified or not, per read: over 1,240 copies of the read every
+    // locus is drawn about 40 times (chi-square, 30 degrees of freedom, p < 0.001 at 59.7).
+    const int n = 31 * 40;
+    const std::string fq = write_fq("cert-draw.fq", std::vector<std::string>(n, ref().read_r));
+    const auto v = run_aln({"--meth=taps", "--meth-scoring", "collapsed", "-n", "2", "-l", "1024", "-R", "5"}, {fq});
+    REQUIRE((int)v.size() == n);
+    std::map<std::string, int> drawn;
+    for (const auto &r : v) {
+        CHECK(r.mapq == 0);
+        CHECK(tag_value(r, "XT:A") == "R");
+        const int x0 = std::stoi(tag_value(r, "X0:i"));
+        CHECK(x0 > 5); CHECK(x0 <= 31);
+        CHECK(r.tag.count("X1:i") == 0);
+        ++drawn[r.rname + ":" + std::to_string(r.pos) + (r.flag & 16 ? "-" : "+")];
+    }
+    CHECK(drawn.size() == 31u);
+    double chi2 = 0;
+    for (const auto &d : drawn) chi2 += (d.second - 40.0) * (d.second - 40.0) / 40.0;
+    CAPTURE(chi2);
+    CHECK(chi2 < 59.7);
+}
+
+TEST_CASE("aln_meth: a repeat certificate's draws do not depend on the thread count")
+{
+    // 96 copies of read_r (a repeat certificate under -R 5) in 64-read chunks, so -t 4 splits them
+    // over threads: each copy's drawn primary and X0 must match the single-threaded run.
+    const std::string fq = write_fq("cert-threads.fq", std::vector<std::string>(96, ref().read_r));
+    const std::vector<std::string> opts = {"--meth=taps", "--meth-scoring", "collapsed", "-n", "2", "-l", "1024", "-R", "5"};
+    auto with = [&](const char *t) { auto o = opts; o.push_back("-t"); o.push_back(t); return run_aln(o, {fq}); };
+    const auto one = with("1"), four = with("4");
+    REQUIRE(one.size() == 96); REQUIRE(four.size() == one.size());
+    for (size_t i = 0; i < one.size(); ++i) {
+        CAPTURE(i);
+        CHECK(one[i].mapq == 0);
+        CHECK(std::make_tuple(one[i].flag, one[i].rname, one[i].pos, one[i].mapq, tag_value(one[i], "X0:i")) ==
+              std::make_tuple(four[i].flag, four[i].rname, four[i].pos, four[i].mapq, tag_value(four[i], "X0:i")));
+    }
+}
+
+TEST_CASE("aln_meth: a repeat certificate's drawn gapped row does not lower the verified loci's ceiling")
+{
+    // Default penalties (M 3, O 11, E 4): 31 loci where the read has five transversions (cost 15,
+    // five differences) and one where it lacks two bases (cost 11 + 4 = 15, two differences). With
+    // -R 5 the repeat certificate fires in the cost-15 stratum, and the primary is drawn over all 32.
+    // A drawn gapped row is placed but not verified: it must neither set the top-2 ceiling (which
+    // would drop every verified locus, leaving X0:0 and a nonzero MAPQ) nor be counted.
+    bwa_tests::TempDir tmp{"aln_meth_cert_gap"};
+    const std::string dir = tmp.path(), fa = dir + "/cert-gap.fa";
+    uint32_t st = 2718;
+    const std::string read = aln_test::lcg_dna(st, 40);
+    auto tv = [](char b) { return b == 'A' ? 'T' : b == 'T' ? 'A' : b == 'C' ? 'G' : 'C'; };
+    std::vector<std::pair<std::string, std::string>> contigs;
+    for (int i = 0; i < 31; ++i) {
+        std::string locus = read;
+        for (int k = 0; k < 5; ++k) { const int at = 3 + 8 * k + i % 5; locus[at] = tv(locus[at]); }
+        contigs.push_back({"mm" + std::to_string(i), aln_test::lcg_dna(st, 100) + locus + aln_test::lcg_dna(st, 100)});
+    }
+    contigs.push_back({"gap", aln_test::lcg_dna(st, 100) + read.substr(0, 20) + "GT" + read.substr(20) +
+                              aln_test::lcg_dna(st, 100)});
+    REQUIRE(aln_test::write_test_fasta(fa, contigs));
+    std::vector<std::string> index_args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &arg : index_args) argv.push_back(&arg[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
+    const int n = 256; // copies draw with their own seeds: some draw the gapped locus
+    const auto v = run_aln({"--meth", "-n", "5", "-l", "1024", "-R", "5"},
+                           {write_fq_in(dir, "cert-gap.fq", std::vector<std::string>(n, read))}, fa, dir);
+    REQUIRE((int)v.size() == n);
+    int gapped = 0;
+    for (const auto &r : v) {
+        CAPTURE(r.rname);
+        CHECK(r.mapq == 0);
+        const int x0 = std::stoi(tag_value(r, "X0:i"));
+        CHECK(x0 > 5); CHECK(x0 <= 32);
+        gapped += r.rname == "gap";
+    }
+    CHECK(gapped > 0); // the case the ceiling must survive
+}
+
 TEST_CASE("aln_meth: -N preserves best placements while retaining more worse costs")
 {
     // reads from c1/c2 with conversions, substitutions and reverse-direction cells
@@ -2404,7 +2492,7 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     // completes it at 33 lookups, so a larger budget no longer caps it.)
     for (int keep_strata : {1,0}) for (int budget : {32}) {
         CAPTURE(keep_strata); CAPTURE(budget);
-        ba::aln_meth_opt_t mo; mo.p_best=budget; mo.p_second=0;
+        ba::aln_meth_opt_t mo; mo.p_best=budget; mo.p_second=0; mo.cert_budget=budget;
         // The 31 ties are counted under collapsed scoring (the mirror cell is free too).
         mo.m.meth_scoring=MEM_METH_SCORING_COLLAPSED;
         ba::aln_meth_opt_finish(&mo);
@@ -2820,6 +2908,82 @@ TEST_CASE("aln_meth: the finish applies the difference ceiling only to a search 
         }
     }
     free(opt);
+}
+
+TEST_CASE("aln_meth: under conversion-blind a saturation certificate is stock's, and notes unknown mirror-free strata")
+{
+    // Default penalties (M=3, O=11, E=4), -n 5. A certificate ends a single-end read's row work
+    // at the boundary score next, with or without conversion-blind (the search is that of
+    // --meth-mapq scoring); the observer then says whether the mirror-free strata are known.
+    // - repeat, -R 30: 31 best loci at 12 (four mismatches). They are the mirror-free best too, over
+    //   -R: a mirror-free run is a repeat as well, so the strata are known. With a locus of one gap
+    //   open and one mirror mismatch (14, mirror-free 11) the mirror-free best is 11 and unique: its
+    //   strata run to 14, so at next 13 they are unknown, and at next 15 no row they need is left.
+    // - crowded: one exact locus and 255 one-mismatch loci (3). At next 3 rows of mirror-free cost
+    //   3 can be left, so the strata are unknown; at next 4 they are complete.
+    // - crowded, -R 1, two mirror table loci with two mirror mismatches each (6, mirror-free 0):
+    //   three loci at mirror-free 0 are over -R, so a mirror-free run stops at this boundary and
+    //   the rows resolved there are its strata (mf_stop), certificate or not.
+    // - repeat, -R 0: one best locus is over -R, and so is the one mirror-free best locus: a
+    //   mirror-free run stops there too, so the strata are known, as at stock's -R stop.
+    namespace ba = bwa_aln;
+    enum { REPEAT, REPEAT_MIRROR, CROWDED, CROWDED_MF_STOP, REPEAT_ONE };
+    struct Case { int kind, next, cert, need, mf_stop; };
+    for (const Case &k : {Case{REPEAT, 13, ba::ALN_METH_CERT_REPEAT, 0, 0},
+                          Case{REPEAT_MIRROR, 13, ba::ALN_METH_CERT_REPEAT, 1, 0},
+                          Case{REPEAT_MIRROR, 15, ba::ALN_METH_CERT_REPEAT, 0, 0},
+                          Case{CROWDED, 3, ba::ALN_METH_CERT_CROWDED, 1, 0},
+                          Case{CROWDED, 4, ba::ALN_METH_CERT_CROWDED, 0, 0},
+                          Case{CROWDED_MF_STOP, 3, ba::ALN_METH_CERT_CROWDED, 0, 1},
+                          Case{REPEAT_ONE, 1, ba::ALN_METH_CERT_REPEAT, 0, 0}}) {
+        CAPTURE(k.kind); CAPTURE(k.next);
+        int max_diff[2] = {0, 0};
+        for (int blind = 0; blind < 2; ++blind) {
+            CAPTURE(blind);
+            ba::gap_opt_t *opt = ba::gap_init_opt();
+            opt->max_diff = 5;
+            opt->max_top2 = k.kind == CROWDED_MF_STOP ? 1 : k.kind == REPEAT_ONE ? 0 : 30;
+            ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+            ba::aln_meth_ref_t mr;
+            ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = opt;
+            ba::aln_meth_slot_t slot; slot.grp = &group; slot.blind = blind; slot.max_diff = 5;
+            slot.cert = 1;
+            ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 5; job.score_cut = INT_MAX;
+            slot.job = &job;
+            ba::aln_meth_read_t result; slot.res = &result;
+            auto locus = [&](int64_t cost, int n_mm, int n_gapo, int n_mirror, bwtint_t pos) {
+                ba::aln_meth_occ_t o{}; o.cost = cost; o.n_mm = n_mm; o.n_gapo = n_gapo; o.n_mirror = n_mirror;
+                o.pos = pos; o.alignment.rb = (int64_t)pos;
+                return o;
+            };
+            if (k.kind == REPEAT || k.kind == REPEAT_MIRROR) {
+                for (int i = 0; i < 31; ++i) result.occ.push_back(locus(12, 4, 0, 0, 1000 * (i + 1)));
+                if (k.kind == REPEAT_MIRROR) result.occ.push_back(locus(14, 1, 1, 1, 50000));
+                slot.best = 12;
+            } else {
+                result.occ.push_back(locus(0, 0, 0, 0, 1000));
+                if (k.kind != REPEAT_ONE)
+                    for (int i = 0; i < 255; ++i) result.occ.push_back(locus(3, 1, 0, 0, 10000 + 1000 * i));
+                if (k.kind == CROWDED_MF_STOP && blind) {
+                    for (int i = 0; i < 2; ++i) result.mirror_rows.push_back(locus(6, 2, 0, 2, 500000 + 1000 * i));
+                    slot.mf_best = 0;
+                }
+                slot.best = 0;
+            }
+            const size_t n_occ = result.occ.size();
+            CHECK(ba::aln_meth_boundary(&slot, k.next) == 1);
+            // the search's own state does not depend on the observer
+            CHECK(slot.stop == ba::ALN_METH_STOP_CERT);
+            CHECK(result.cert == k.cert);
+            CHECK(result.flags == 0);
+            CHECK(result.occ.size() == n_occ);
+            max_diff[blind] = job.max_diff;
+            CHECK(slot.blind_need == (blind && k.need));
+            CHECK(slot.mf_stop == (blind && k.mf_stop));
+            free(opt);
+        }
+        CHECK(max_diff[0] == max_diff[1]);
+    }
 }
 
 namespace {
@@ -3344,6 +3508,8 @@ TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few 
     ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    // The budget's binding flush is the search's without stock cuts (its slot has no job options).
+    mr.no_cut=1;
     ba::gap_opt_t *opt=ba::gap_init_opt();
     ba::aln_meth_opt_t mo;
     ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;
@@ -3443,6 +3609,7 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    mr.no_cut=1; // the flushes here are the search's without stock cuts (the slot has no job options)
     ba::aln_meth_opt_t mo;ba::aln_meth_opt_finish(&mo);
     ba::gap_opt_t *opt=ba::gap_init_opt();
     ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;
@@ -3878,6 +4045,7 @@ TEST_CASE("aln_meth: a CIGAR stop survives the lookup budget ending the same flu
     slot.grp = &group; slot.job = &core.job;
     ba::aln_meth_read_t result;
     ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+    slot.cert = 0; // a --known-snvs read (ALT-window candidates) takes no certificates: no cut
     bwtint_t row = (bwtint_t)-1;
     for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
         int strand = 0;
@@ -3940,6 +4108,7 @@ TEST_CASE("aln_meth: a genomic lookup-budget stop still resolves the ALT-window 
     slot.grp = &group; slot.job = &core.job;
     ba::aln_meth_read_t result;
     ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+    slot.cert = 0; // a --known-snvs read (ALT-window candidates) takes no certificates: no cut
     ba::gap_entry_t exact = {};
     ba::aln_meth_hit(&slot, &exact, 0, 0);
     core.state = ba::GAP_SLOT_PARKED;
@@ -7073,6 +7242,7 @@ TEST_CASE("aln_meth: known alleles stop at the CIGAR cap and the next read reset
     slot.grp = &group; slot.job = &core.job;
     ba::aln_meth_read_t results[2];
     ba::aln_meth_slot_start(&slot, reads, results, 0, 3, 1);
+    slot.cert = 0; // the lookup-budget flush: a repeat certificate would end this read's row work
     bwtint_t row = (bwtint_t)-1;
     for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
         int strand = 0;

@@ -621,6 +621,15 @@ same point or `next` is already past `B_mf + M`, the search goes on to rows that
 so the rows resolved at that point are kept as they are and the strata are taken from them (a hit
 at a locus that run never reaches is not one of their loci); if the search is then left incomplete
 they are not complete. When they are not complete the cap is 0, for both ends of a pair.
+A single-end read that ends on a saturation certificate (below) ends there under
+`--meth-mapq conversion-blind` as well, at a converted score `s` with every row below `s` resolved.
+Its strata are complete when `s` is past `B_mf + M`, or when the certificate is a repeat, `B_mf` is
+below `s` and more than `-R` loci at `B_mf` are within their ceiling: a mirror-free run is then a
+repeat too, as at a `-R` stop. Otherwise they are not complete and the cap is 0. A certified
+read's MAPQ is 0 already unless it is a repeat with one best locus (`-R` below 1), so the cap
+changes no other certified record. With `-R` below 1 a mirror-free run's own repeat certificate can
+end it partway through a batch of rows, before the rows the cap counts are all resolved, so there
+the cap can only come out lower than `collapsed`'s MAPQ, never higher.
 These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
 set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
 search instead stops early only on the earlier certified bound: for current best cost `B`,
@@ -630,6 +639,29 @@ at most 160 bases long and the read's ALT-window search gives a lower bound, gre
 the mismatches of every ungapped placement over a known site with its ALT in place, the search can stop after fully evaluating converted scores
 through `M*k`; a seeded read only when `k` is also at most `-k`
 ([#778](https://github.com/fg-labs/bwa-mem3/pull/778)). If any condition fails, discovery continues. This does not make discovery exhaustive or guarantee a globally optimal alignment.
+
+**Saturation certificates (single-end).** Under the stock cuts, a single-end read's rows are
+verified stratum by stratum in converted score, narrow hits first and wide ones (more than 256
+rows) in a pseudo-random order seeded from the read, and the search ends as soon as more rows
+cannot change the stock output ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)):
+
+- *repeat*: more than `-R` loci at the best cost `B`, with every lower stratum verified and `B`
+  at most the current one. MAPQ is 0 and `X0` is the verified count, a lower bound (`X1` is not
+  printed, as for stock's `-R` stop). Under the TAPS/5base tie-break the loci must have no
+  conversions, or number at least 179 (stock MAPQ is then 0 whichever has the fewest) with a best
+  cost below the read's `-n` mismatches. The primary is drawn uniformly over every row of the
+  hits that can hold a best row (rejection sampling, seeded from the read), verified or not,
+  among the best-cost rows within the verified loci's difference ceiling (their fewest
+  differences plus one). A drawn row is placed but not counted, and sets no ceiling. After 256
+  draws without such a row, the primary is drawn among the verified best loci instead.
+- *crowded*: a unique best locus (under the TAPS/5base tie-break, a unique one among the best loci
+  with the fewest conversions; not using all of `-n`, where stock MAPQ is 25) and at least 255
+  retained worse loci: MAPQ 0, `X0` 1 and `X1` the verified count, a lower bound.
+
+Other reads verify every row up to a row budget of 16,384 (4,596 without the certificates: with
+`-N`, a negative penalty, `--known-snvs` or before pairing is decided for paired-end input). A
+tie-break repeat that neither certificate closes ends incomplete past 4,596 rows, as before. A
+read that reaches the budget without a certificate is incomplete, as below.
 
 **Path cost.** Each row is scored on the original reference along the search path that
 found it, as stock aln scores a hit by its path: the path's alignment (its gaps where the
@@ -778,8 +810,8 @@ estimate as candidate refinement and keeps its own 64 MiB cumulative CIGAR budge
 rescued end; unlike the candidate cap, exceeding it exits with an error. It
 restores trimmed tails before legacy CIGAR splitting.
 
-The per-read SA lookup budget is a single total of 4596 by default, not separate
-best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known
+The per-read SA lookup budget is a single total of 4596 by default (16,384 for a read
+verified with certificates, above), not separate best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known
 placement when available, marks it as a repeat with MAPQ 0, and omits exact
 `X0`/`X1`/`XA` claims. Candidate rows are resolved in batches; once a batch holds
 more rows than the budget has left, the read is incomplete whatever they resolve to,

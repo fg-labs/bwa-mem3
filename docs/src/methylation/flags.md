@@ -202,7 +202,11 @@ comes out too high.
   expand is past the mirror-free best plus `-M`, no such row is left. Where a mirror-free run's
   `-R` stop ends it but the search goes on, the strata are taken from the rows the search had
   scored at that stop, which are the mirror-free run's; if the search is then left incomplete
-  (lookup budget, `-m`), they are unknown. In a pair, an end with
+  (lookup budget, `-m`), they are unknown. A single-end read that `aln` ends on a saturation
+  certificate ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)) ends there in both modes;
+  its strata are unknown unless no row that could enter them is left, or it is a repeat with more
+  than `-R` mirror-free best loci (as at a `-R` stop), and its MAPQ is 0 already unless it is a
+  repeat with one best locus (`-R` below 1). In a pair, an end with
   unknown strata gives both ends a cap of 0. Placement, CIGAR, `NM`,
   `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
   is `genomic`'s in every field but MAPQ. A record whose MAPQ the cap lowered

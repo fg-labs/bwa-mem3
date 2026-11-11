@@ -101,16 +101,21 @@ decides whether they can have pruned a row that selection needs (the mirror-free
 more differences than the genomic best when the genomic best is gapped, or a `-R` stop can come
 before the mirror-free strata are complete); if so, the cap is 0, for both ends of a pair. Where a
 mirror-free run's own `-R` stop comes before the search's, the selection is taken from the rows
-resolved at that stop, which are the mirror-free run's. The
+resolved at that stop, which are the mirror-free run's. A single-end read that ends on a
+saturation certificate ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)) ends there in both
+modes; the cap is 0 unless that selection is complete there, and such a read's MAPQ is 0 already
+unless it is a repeat with one best locus (`-R` below 1). The
 paired-end mirror-free pairing uses only the loci of that selection, and runs even where an end's
 stock loci exceed `--max-occ` (so stock pairing does not) but its loci in that selection do not. Measured on a chr22 EM-seq
 simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
 macOS arm64, NEON, clang 21): every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring`
 at the default penalties and with `-M 5 -O 3 -E 1`, `-M 1 -O 3 -E 1`, `-M 2 -O 5 -E 2`, `-e 3`,
 `-e 3 -E 1`, `-R 1`, `-R 2`, `-n 8`, `-l 32 -k 0`, `-m 300`, `-N` and `-M 0`, and no conversion-blind MAPQ
-was above `scoring`'s. At the default penalties 2 of 40,000 reads at 40 bp single end and 6 of 40,000
+was above `scoring`'s. At the default penalties 17 of 40,000 reads at 40 bp single end and 6 of 40,000
 pairs at 40 bp had their cap set to 0 for strata the search may have left incomplete (none at 150 bp);
-at `-M 5 -O 3 -E 1`, 7 and 16, and 2 of 40,000 pairs at 150 bp. Reads whose mirror-free best has more
+at `-M 5 -O 3 -E 1`, 34 and 16, and 2 of 40,000 pairs at 150 bp. The single-end counts were 2 and 7
+before saturation certificates ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)); the added
+reads had MAPQ 0 already, and the cap lowered the same records as before (728 and 1,108). Reads whose mirror-free best has more
 than `-R` loci, where a mirror-free run stops but the search goes on, are no longer among them: their
 caps come from the rows resolved at that stop. Against `--meth-scoring collapsed` itself, no
 conversion-blind MAPQ was above `collapsed`'s at the same placement in any of those runs, single
