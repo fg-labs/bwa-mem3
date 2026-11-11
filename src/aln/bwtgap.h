@@ -56,6 +56,14 @@ typedef struct { // recursion stack
  * with the build before the templates). AlnMeth's per-slot state lives in its ext_t, one per slot
  * beside the slots, never in the stock structs, so their layouts do not change. */
 struct aln_meth_slot_t; // aln_meth.h
+/* AlnMeth keeps its path's gap events in the entry's last_diff_pos, which only the stock hit reads
+ * (gap_shadow), so its entries stay stock-sized: with one gap (n_gapo 1) it is the gap itself, as
+ * ALN_METH_GAP(i, len, del); with more it indexes that path's list of gaps in the slot's arena
+ * (aln_meth_slot_t::garena). i is the index of the complemented read the job steps over at the
+ * gap's first step (an insertion's first inserted base, or the base a deletion follows). --meth
+ * refuses a larger -o than ALN_METH_MAX_GAPS and gaps of 2^15 bases or more. */
+constexpr int ALN_METH_MAX_GAPS = 4;
+#define ALN_METH_GAP(i, len, del) ((uint32_t)(i) | (uint32_t)(len) << 16 | ((del) ? 1u << 31 : 0u))
 struct AlnStock {
 	typedef gap_entry_t entry_t;
 	typedef void ext_t;

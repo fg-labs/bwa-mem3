@@ -18,7 +18,9 @@
  * the interleaved search with the job and width-walk steps inlined, are new as well. Score bounds
  * saturate at the packed score capacity; actual scores are checked before a stack lookup or
  * packing, in both stacks (gap_cscore for gap_cstack_t), and score arithmetic is widened to avoid
- * integer overflow (gap_score_cut for the job's precomputed stop score). */
+ * integer overflow (gap_score_cut for the job's precomputed stop score). Under AlnMeth a child
+ * entry also carries its path's gap events in last_diff_pos (gap_meth_child), which only the stock
+ * hit reads. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
 #include "aln_meth_search.h"
@@ -291,6 +293,16 @@ static GAP_HOT void gap_centry(gap_entry_t *t, int score, int i, bwtint_t k, bwt
 // Both policies use stock-sized search entries; candidate alignments live beside the slots.
 static GAP_HOT gap_entry_t &gap_base(gap_entry_t &e) { return e; }
 static GAP_HOT const gap_entry_t &gap_base(const gap_entry_t &e) { return e; }
+// AlnMeth: child f of parent p takes p's gap events (in last_diff_pos, see ALN_METH_GAP), plus a
+// gap opened (INS, DEL) or extended (EXT) at i. Called only under `if constexpr (P::meth)`.
+enum { GAP_EV_NONE = 0, GAP_EV_INS = 1, GAP_EV_DEL = 2, GAP_EV_EXT = 3 };
+static GAP_HOT void gap_meth_child(aln_meth_slot_t *x, gap_entry_t *f, const gap_entry_t &p, int ev, int i)
+{
+	if (ev == GAP_EV_NONE) f->last_diff_pos = p.last_diff_pos;
+	else if (p.n_gapo == 0) f->last_diff_pos = (int)ALN_METH_GAP(i, 1, ev == GAP_EV_DEL); // a first gap open
+	else if (ev == GAP_EV_EXT && p.n_gapo == 1) f->last_diff_pos = (int)((uint32_t)p.last_diff_pos + (1u << 16));
+	else f->last_diff_pos = aln_meth_gap_arena(x, p, ev == GAP_EV_EXT, ALN_METH_GAP(i, 1, ev == GAP_EV_DEL));
+}
 // Bucket q's top chunk is full (or q has none): put a new chunk from the pool on top.
 static GAP_COLD void gap_bucket_grow(gap_cstack_t *stack, gap_bucket_t *q)
 {
@@ -821,23 +833,32 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 				if (e.n_gapo < opt->max_gapo) { // gap open is allowed
 					// insertion
 					gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					if constexpr (P::meth) gap_meth_child(X, &f, e, GAP_EV_INS, i);
 					// deletion
 					for (j = 0; j != 4; ++j) {
 						k = bwt->L2[j] + cnt_k[j] + 1;
 						l = bwt->L2[j] + cnt_l[j];
-						if (k <= l) gap_cpush_defer(stack, &f, &f_score, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+						if (k <= l) {
+							gap_cpush_defer(stack, &f, &f_score, i + 1, k, l, e.n_mm, e.n_gapo + 1, e.n_gape, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+							if constexpr (P::meth) gap_meth_child(X, &f, e, GAP_EV_DEL, i);
+						}
 					}
 				}
 			} else if (e.state == STATE_I) { // extention of an insertion
-				if (e.n_gape < opt->max_gape) // gap extention is allowed
+				if (e.n_gape < opt->max_gape) { // gap extention is allowed
 					gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins + 1, e.n_del, STATE_I, 1, opt);
+					if constexpr (P::meth) gap_meth_child(X, &f, e, GAP_EV_EXT, i);
+				}
 			} else if (e.state == STATE_D) { // extention of a deletion
 				if (e.n_gape < opt->max_gape) { // gap extention is allowed
 					if (e.n_gape + e.n_gapo < J->max_diff || occ < opt->max_del_occ) {
 						for (j = 0; j != 4; ++j) {
 							k = bwt->L2[j] + cnt_k[j] + 1;
 							l = bwt->L2[j] + cnt_l[j];
-							if (k <= l) gap_cpush_defer(stack, &f, &f_score, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+							if (k <= l) {
+								gap_cpush_defer(stack, &f, &f_score, i + 1, k, l, e.n_mm, e.n_gapo, e.n_gape + 1, e.n_ins, e.n_del + 1, STATE_D, 1, opt);
+								if constexpr (P::meth) gap_meth_child(X, &f, e, GAP_EV_EXT, i);
+							}
 						}
 					}
 				}
@@ -850,13 +871,19 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 				int is_mm = (j != 4 || seq[i] > 3);
 				k = bwt->L2[c] + cnt_k[c] + 1;
 				l = bwt->L2[c] + cnt_l[c];
-				if (k <= l) gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
+				if (k <= l) {
+					gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm + is_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, is_mm, opt);
+					if constexpr (P::meth) gap_meth_child(X, &f, e, GAP_EV_NONE, i);
+				}
 			}
 		} else if (seq[i] < 4) { // try exact match only
 			int c = seq[i] & 3;
 			k = bwt->L2[c] + cnt_k[c] + 1;
 			l = bwt->L2[c] + cnt_l[c];
-			if (k <= l) gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
+			if (k <= l) {
+				gap_cpush_defer(stack, &f, &f_score, i, k, l, e.n_mm, e.n_gapo, e.n_gape, e.n_ins, e.n_del, STATE_M, 0, opt);
+				if constexpr (P::meth) gap_meth_child(X, &f, e, GAP_EV_NONE, i);
+			}
 		}
 		if (f_score >= 0) { // the last child: forward it if the next pop would return it, else store it
 			if (f_score <= stack->best) fwd = 1;

@@ -1620,6 +1620,13 @@ int main_aln(int argc, char *argv[])
 		opt->max_gape = opte;
 		opt->mode &= ~BWA_MODE_GAPE;
 	}
+	// --meth scores a hit's rows along its search path, whose gap events the search entry keeps for
+	// at most ALN_METH_MAX_GAPS gaps of fewer than 2^15 bases each.
+	if (meth_opt.m.meth_mode && (opt->max_gapo > ALN_METH_MAX_GAPS || opt->max_gape >= 32767)) {
+		fprintf(stderr, "[E::aln] --meth allows at most -o %d gap opens and fewer than 32767 gap extensions (-e)\n",
+				ALN_METH_MAX_GAPS);
+		return 1;
+	}
 	if (opt->n_threads < 1) {
 		fprintf(stderr, "[W::aln] -t %d is below 1; using 1 thread\n", opt->n_threads);
 		opt->n_threads = 1;
