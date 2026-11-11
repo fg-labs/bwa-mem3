@@ -291,3 +291,60 @@ TEST_CASE("aln_realign: equal-length windows match the full-band DP on both side
     }
     CHECK(n_fast>0);CHECK(n_dp>0);CHECK(n_gapped>0);
 }
+
+// The equal-span scorer against the base-by-base path it replaces: the fetched window's
+// ungapped reward (ungapped_is_optimal's sum) and the search's accounting of [len M]
+// (account_alignment: a mismatch is an N or a negative cell, a conversion a non-negative
+// off-diagonal cell). Random windows, every scoring mode, both hypotheses, read Ns, reference
+// .amb runs, unaligned starts, lengths across word boundaries.
+TEST_CASE("aln_realign: the equal-span bit-parallel scorer equals the base-by-base scorer") {
+    uint64_t rng = 12345;
+    auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    const int L = 1000;
+    std::vector<uint8_t> bases(L);
+    for (auto &b : bases) b = (uint8_t)(next() & 3);
+    Ref ref(bases);
+    std::vector<bntamb1_t> ambs = {{100, 3, 'N'}, {300, 40, 'N'}, {700, 1, 'N'}, {995, 5, 'N'}};
+    ref.bns.n_holes = (int)ambs.size(); ref.bns.ambs = ambs.data();
+    for (int mode : {MEM_METH_SCORING_COLLAPSED, MEM_METH_SCORING_GENOMIC, MEM_METH_SCORING_NEUTRAL}) {
+        ba::aln_meth_opt_t mo; mo.m.meth_scoring = mode; ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_fast_t f; ba::aln_meth_fast_init(mo, &f);
+        REQUIRE(f.ok);
+        CHECK(f.collapsed == (mode == MEM_METH_SCORING_COLLAPSED));
+        for (int iter = 0; iter < 4000; ++iter) {
+            const int len = 1 + (int)(next() % 140);
+            const int64_t rb = (int64_t)(next() % (uint64_t)(L - len + 1));
+            const int hyp = (int)(next() & 1);
+            std::vector<uint8_t> q(len);
+            for (int k = 0; k < len; ++k) { // mostly the reference, with conversions, mismatches and Ns
+                const uint64_t r = next() % 16;
+                const int b = bases[rb + k];
+                q[k] = r < 9 ? b : r < 13 ? (hyp ? (b == 1 ? 3 : b) : (b == 2 ? 0 : b)) : r < 15 ? (uint8_t)(next() & 3) : 4;
+            }
+            std::vector<uint8_t> win;
+            ba::aln_meth_fetch_window(ref.ref, mo, rb, len, 0, win);
+            const int8_t *mat = hyp ? mo.mat_ot : mo.mat_ob;
+            int sum = 0, n_mm = 0, n_conv = 0;
+            for (int k = 0; k < len; ++k) {
+                sum += mat[win[k] * 5 + q[k]];
+                if (q[k] > 3 || mat[win[k] * 5 + q[k]] < 0) ++n_mm;
+                else if (q[k] != meth_code_base(win[k])) ++n_conv;
+            }
+            ba::aln_meth_read_bits_t rd; ba::aln_meth_read_bits(q.data(), len, &rd);
+            ba::aln_meth_ungapped_t u; ba::aln_meth_score_ungapped(ref.ref, f, hyp, rb, rd, &u);
+            CHECK(u.reward == sum); CHECK(u.n_mm == n_mm); CHECK(u.n_conv == n_conv);
+            // and the optimality bound gives the CIGAR the DP path returns
+            if (u.reward > f.best_cell * (len - 1) - 12) {
+                ba::aln_meth_candidate_t c{0, 0, hyp, rb, rb + len}; ba::aln_meth_alignment_t a;
+                REQUIRE(ba::aln_meth_realign_window(ref.ref, mo, c, q.data(), len, 0, 0, &a) == ba::aln_meth_eval_status::ok);
+                CHECK(a.reward == u.reward);
+                CHECK(a.raw_cigar == std::vector<uint32_t>(1, (uint32_t)len << 4));
+                CHECK(a.cigar == a.raw_cigar); CHECK(a.rb == rb); CHECK(a.re == rb + len);
+            }
+        }
+    }
+    // --meth-context cpg keeps the base-by-base path
+    ba::aln_meth_opt_t mo; mo.m.meth_context = METH_CTX_CPG; ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_fast_t f; ba::aln_meth_fast_init(mo, &f);
+    CHECK(!f.ok);
+}

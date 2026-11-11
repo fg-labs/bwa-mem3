@@ -3,7 +3,9 @@
 #ifndef BWA_MEM3_ALN_METH_SEARCH_H
 #define BWA_MEM3_ALN_METH_SEARCH_H
 #include <limits.h>
+#include <algorithm>
 #include <map>
+#include <utility>
 #include <set>
 #include <tuple>
 #include "aln_meth.h"
@@ -12,6 +14,73 @@
 #include "bwtgap.h"
 namespace bwa_aln {
 struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; };
+/* A flat, open-addressed index of distinct keys (insertion order kept in key, a value per key),
+ * cleared per read. Only membership and lookup are used, as the std::set / std::map it replaces
+ * were, so the results do not depend on the container. K needs operator== and a hash(). */
+template <class K> struct aln_flat_index_t {
+    std::vector<K> key;
+    std::vector<size_t> val;
+    std::vector<int32_t> tab;
+    size_t size() const { return key.size(); }
+    void clear() {
+        key.clear(); val.clear();
+        if (tab.size() != 64) tab.assign(64, -1);
+        else std::fill(tab.begin(), tab.end(), -1);
+    }
+    // the slot of k: its index in key, or -1 (and *pos is where to insert it)
+    int32_t find(const K &k, size_t *pos) const {
+        const size_t mask = tab.size() - 1;
+        for (size_t i = k.hash() & mask;; i = (i + 1) & mask) {
+            const int32_t t = tab[i];
+            if (t < 0) { *pos = i; return -1; }
+            if (key[t] == k) { *pos = i; return t; }
+        }
+    }
+    void grow() {
+        tab.assign(tab.size() * 2, -1);
+        const size_t mask = tab.size() - 1;
+        for (size_t j = 0; j < key.size(); ++j) {
+            size_t i = key[j].hash() & mask;
+            while (tab[i] >= 0) i = (i + 1) & mask;
+            tab[i] = (int32_t)j;
+        }
+    }
+    // inserts k with value v unless present; returns its index and whether it was inserted
+    std::pair<size_t, bool> insert(const K &k, size_t v) {
+        if (tab.empty()) tab.assign(64, -1);
+        size_t pos;
+        const int32_t t = find(k, &pos);
+        if (t >= 0) return {(size_t)t, false};
+        tab[pos] = (int32_t)key.size();
+        key.push_back(k); val.push_back(v);
+        if (key.size() * 2 > tab.size()) grow();
+        return {key.size() - 1, true};
+    }
+};
+static inline uint64_t aln_flat_mix(uint64_t h) {
+    h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; return h ^ (h >> 33);
+}
+struct aln_meth_iv_key_t {
+    bwtint_t k, l; int span;
+    bool operator==(const aln_meth_iv_key_t &o) const { return k == o.k && l == o.l && span == o.span; }
+    uint64_t hash() const { return aln_flat_mix((uint64_t)k * 0x9e3779b97f4a7c15ULL ^ (uint64_t)l ^ ((uint64_t)span << 48)); }
+};
+struct aln_meth_win_key_t {
+    int rid, hyp, strand; int64_t rb, re;
+    bool operator==(const aln_meth_win_key_t &o) const {
+        return rid == o.rid && hyp == o.hyp && strand == o.strand && rb == o.rb && re == o.re;
+    }
+    uint64_t hash() const {
+        return aln_flat_mix((uint64_t)rb * 0x9e3779b97f4a7c15ULL ^ (uint64_t)re ^ ((uint64_t)(hyp * 2 + strand) << 60) ^ (uint64_t)rid << 40);
+    }
+};
+struct aln_meth_locus_key_t {
+    int rid, hyp, strand; int64_t rb;
+    bool operator==(const aln_meth_locus_key_t &o) const {
+        return rid == o.rid && hyp == o.hyp && strand == o.strand && rb == o.rb;
+    }
+    uint64_t hash() const { return aln_flat_mix((uint64_t)rb ^ ((uint64_t)(hyp * 2 + strand) << 60) ^ (uint64_t)rid << 40); }
+};
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
 struct aln_meth_slot_t {
@@ -28,10 +97,13 @@ struct aln_meth_slot_t {
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     std::vector<ubyte_t> vseq, rd_fwd;
     std::vector<aln_meth_pend_t> pend;
-    std::set<std::tuple<bwtint_t,bwtint_t,int>> intervals;
+    aln_flat_index_t<aln_meth_iv_key_t> intervals;
     // Exact windows dedup before DP; every distinct span is evaluated before locus collapse.
-    std::set<std::tuple<int,int,int,int64_t,int64_t>> windows;
-    std::map<std::tuple<int,int,int,int64_t>, size_t> loci;
+    aln_flat_index_t<aln_meth_win_key_t> windows;
+    aln_flat_index_t<aln_meth_locus_key_t> loci; // value: the locus's index in res->occ
+    // The read's two query orientations as bit planes (rd_fwd, then p->rseq), built on first use.
+    aln_meth_read_bits_t bits[2];
+    int bits_ready = 0;
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
     // Scratch: the reference window of the candidate being resolved (refined, then accounted).
