@@ -124,8 +124,9 @@ struct aln_meth_locus_key_t {
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
 // aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not); TOP2 is
-// stock's -R stop under the cut (aln_meth_boundary)
-enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2, ALN_METH_STOP_TOP2 = 3 };
+// stock's -R stop under the cut (aln_meth_boundary), CERT a saturation certificate (a read with
+// aln_meth_slot_t::cert; one that gives up incomplete instead stops with LOOKUP)
+enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2, ALN_METH_STOP_TOP2 = 3, ALN_METH_STOP_CERT = 4 };
 struct aln_meth_slot_t {
     aln_meth_group_t *grp = nullptr;
     gap_job_t *job = nullptr;
@@ -140,6 +141,12 @@ struct aln_meth_slot_t {
     // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row. flushed: a
     // flush has run.
     int cut = 0, flushed = 0;
+    // cert: rows are verified stratum by stratum and certificates end the read (single-end, under
+    // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
+    // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
+    int cert = 0, collect = 0;
+    std::vector<aln_meth_pend_t> ivs;
+    uint64_t perm_rng = 0;
     int64_t best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
@@ -163,6 +170,8 @@ struct aln_meth_slot_t {
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
     aln_meth_alt_bound_t alt_bound; // ALT-index lower bound (aln_meth_alt_certificate), not the genomic width
+    // the ordinals of the read's duplicate copies (their draws are made here, aln_meth_slot_finish)
+    const std::vector<int64_t> *copy_ords = nullptr;
     // Scratch: the reference window of the candidate being resolved (refined, then accounted), and
     // the ambiguity bits of a row's window (score_path).
     std::vector<uint8_t> win;
@@ -190,7 +199,8 @@ static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
 }
 bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
 // Applies stock aln's cuts at a score boundary, for a search whose next entry has score next:
-// see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop).
+// see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop, or for a certificate read a
+// certificate, aln_meth_certify).
 int aln_meth_boundary(aln_meth_slot_t *, int next);
 // Keep batches bounded. Under the cut, flush at the first hit and at every boundary; otherwise
 // refine score boundaries only when stopping is possible.
@@ -200,7 +210,8 @@ static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
         if (!x->pend.empty()) return !x->flushed || score > x->flushed_score;
         if (score <= x->flushed_score) return 0;
         x->flushed_score = score;
-        return x->best != INT64_MAX && aln_meth_boundary(x, score) && (x->stop = ALN_METH_STOP_TOP2);
+        // a certificate read's boundary sets its own stop (aln_meth_certify)
+        return x->best != INT64_MAX && aln_meth_boundary(x, score) && (x->stop || (x->stop = ALN_METH_STOP_TOP2));
     }
     if (score <= x->flushed_score) return 0;
     if (aln_meth_stop_eligible(x)) return 1;
@@ -257,8 +268,10 @@ void aln_meth_redraw_hits(aln_meth_read_t *, uint64_t);
  * loci stored as hits): every field but the work counters is copied and the main hit is redrawn
  * with rng among src's best hits. Unless keep_all, a result aln_meth_trim(max_xa_hits) would cut
  * to its main hit gets only that hit (any max_xa_hits < 0 prints no XA, so it always does). src is
- * unchanged on return. */
-void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng, int keep_all, int max_xa_hits);
+ * unchanged on return. ord: the copy's ordinal; a copy src's search drew for (a repeat
+ * certificate's copy_draw) takes that draw instead. */
+void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng, int keep_all, int max_xa_hits,
+                       int64_t ord = -1);
 uint64_t aln_meth_draw_seed(const aln_meth_ref_t *, int, int64_t);
 void aln_meth_flush_parked(aln_meth_group_t *);
 }
