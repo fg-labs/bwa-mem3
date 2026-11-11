@@ -175,9 +175,9 @@ void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t
     if (!x->intervals.insert(key).second) return;
     x->pend.push_back({k, l, *e});
 }
-const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int, int has_copy)
+const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy)
 {
-    x->p = p; x->res = res; x->len = p->len;
+    x->p = p; x->res = res; x->len = p->len; x->max_diff = max_diff;
     x->keep = has_copy ? ALN_METH_KEEP_COPIES : x->grp->keep_strata ? ALN_METH_KEEP_STRATA : 0;
     *res = aln_meth_read_t();
     x->rng = aln_meth_draw_seed(x->grp->ref, x->grp->read_no, ord);
@@ -303,7 +303,15 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
         fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
         exit(1);
     }
-    if (!account_alignment(g->mo, g->opt, win, query, x->len, &o)) {
+    const bool fits = account_alignment(g->mo, g->opt, win, query, x->len, &o);
+    // Stock aln never reports a hit with more differences than the read's -n allows. The converted
+    // search cannot see a read C over a reference T, so it can propose a window within -n converted
+    // differences whose original-reference alignment has more; drop it before it is a locus (no
+    // X0/X1, MAPQ or pairing). Differences are counted as stock aln counts them: mismatches plus
+    // gap opens, plus gap extensions unless -e was given; conversions are free.
+    const int64_t differences = (int64_t)o.n_mm + o.n_gapo + ((g->opt->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
+    if (differences > x->max_diff) { ++x->res->n_over_diff; return; }
+    if (!fits) {
         ++x->res->n_unrepresentable;
         x->unrep_cost = std::min(x->unrep_cost, o.cost);
         return;
@@ -542,14 +550,14 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
 void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
 {
     if (bwa_verbose < 4) return;
-    long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0;
+    long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0, over = 0;
     for (int i = 0; i < n; ++i) {
         lookups += res[i].n_lookups; wrong += res[i].n_wrong_copy; scored += res[i].n_rescored;
-        dropped += res[i].n_unrepresentable;
+        dropped += res[i].n_unrepresentable; over += res[i].n_over_diff;
         flushes += res[i].n_flushes; incomplete += res[i].flags != 0;
     }
-    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; stock cost/count MAPQ\n",
-            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete);
+    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld windows over -n dropped; stock cost/count MAPQ\n",
+            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over);
 }
 
 /* bwa_cal_md1 with NM counting only the mismatches the mode does not free (and gap lengths); MD

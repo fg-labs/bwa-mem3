@@ -911,6 +911,102 @@ TEST_CASE("aln_meth: stock MAPQ mismatch limit unique and tied placements")
     CHECK(tied[0].mapq == 0);
 }
 
+TEST_CASE("aln_meth: a refined window over the read's -n limit is not a locus")
+{
+    // The converted search frees a read C over a reference T (read 1, OT), so it proposes windows
+    // within -n converted differences whose original-reference alignment has more. Stock aln never
+    // reports such a hit, and neither does --meth: the window does not map the read, count toward
+    // X0/X1 or set the MAPQ.
+    uint32_t st = 8675309;
+    auto flank = [&]() { return aln_test::lcg_dna(st, 100); };
+    auto swap_ag = [](char c) { return c == 'A' ? 'G' : 'A'; };
+    // r (26 bp; a fractional -n 0.04 allows 2 differences): its only locus has 4 read-C/reference-T
+    // mismatches, spread out so that the refinement stays ungapped.
+    std::string r = aln_test::lcg_dna(st, 26), r_over;
+    for (int i : {4, 10, 16, 22}) r[i] = 'C';
+    r_over = r;
+    for (int i : {4, 10, 16, 22}) r_over[i] = 'T';
+    // s (30 bp): 3 read-C/reference-T mismatches (cost 9) at one locus, a one-base deletion
+    // (cost 11, one difference) at another.
+    std::string s = aln_test::lcg_dna(st, 30), s_over;
+    for (int i : {5, 14, 23}) s[i] = 'C';
+    s[15] = 'A';
+    s_over = s;
+    for (int i : {5, 14, 23}) s_over[i] = 'T';
+    const std::string s_gap = s.substr(0, 15) + "G" + s.substr(15);
+    // u (30 bp): 2 genuine A/G mismatches (cost 6) at one locus, 3 read-C/reference-T mismatches
+    // (cost 9, within the retained best + M) at another.
+    std::string u = aln_test::lcg_dna(st, 30), u_near, u_over;
+    for (int i : {3, 13, 26}) u[i] = 'C';
+    u[8] = 'A'; u[20] = 'G';
+    u_near = u; u_near[8] = swap_ag(u[8]); u_near[20] = swap_ag(u[20]);
+    u_over = u;
+    for (int i : {3, 13, 26}) u_over[i] = 'T';
+    const std::string fa = ref().dir + "/strict-n.fa";
+    REQUIRE(aln_test::write_test_fasta(fa, {{"r_over", flank() + r_over + flank()},
+                                            {"s_over", flank() + s_over + flank()},
+                                            {"s_gap", flank() + s_gap + flank()},
+                                            {"u_near", flank() + u_near + flank()},
+                                            {"u_over", flank() + u_over + flank()}}));
+    std::vector<std::string> index_args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &arg : index_args) argv.push_back(&arg[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
+
+    const std::string fq_r = write_fq("strict-n-r.fq", {r});
+    // The fractional default (-n 0.04: 2 for 26 bp), an integer -n below 4, and -N: unmapped.
+    for (const auto &options : {std::vector<std::string>{"--meth"},
+                                std::vector<std::string>{"--meth", "-n", "3"},
+                                std::vector<std::string>{"--meth", "-N"}}) {
+        const auto v = run_aln(options, {fq_r}, fa);
+        REQUIRE(v.size() == 1);
+        CHECK((v[0].flag & 4) != 0);
+        CHECK(v[0].mapq == 0);
+    }
+    // Allowed 4 differences, the same window maps the read.
+    const auto r4 = run_aln({"--meth", "-n", "4"}, {fq_r}, fa);
+    REQUIRE(r4.size() == 1);
+    CHECK((r4[0].flag & 4) == 0);
+    CHECK(r4[0].rname == "r_over");
+    CHECK(r4[0].pos == 101);
+    CHECK(r4[0].cigar == "26M");
+    CHECK(tag_value(r4[0], "NM:i") == "4");
+
+    // s: under -n 2 the cheaper 3-mismatch locus is dropped, so the gapped one is the unique hit;
+    // under -n 3 the 3-mismatch locus is best and the gapped one is a retained competitor.
+    const std::string fq_s = write_fq("strict-n-s.fq", {s});
+    const auto s2 = run_aln({"--meth", "-n", "2"}, {fq_s}, fa);
+    REQUIRE(s2.size() == 1);
+    CHECK(s2[0].rname == "s_gap");
+    CHECK(s2[0].cigar.find('D') != std::string::npos);
+    CHECK(tag_value(s2[0], "X0:i") == "1");
+    CHECK(tag_value(s2[0], "X1:i") == "0");
+    CHECK(s2[0].mapq == 37);
+    const auto s3 = run_aln({"--meth", "-n", "3"}, {fq_s}, fa);
+    REQUIRE(s3.size() == 1);
+    CHECK(s3[0].rname == "s_over");
+    CHECK(tag_value(s3[0], "X0:i") == "1");
+    CHECK(tag_value(s3[0], "X1:i") == "1");
+
+    // u: the over-limit locus is within the retained cost window but does not count toward X1.
+    const std::string fq_u = write_fq("strict-n-u.fq", {u});
+    const auto u2 = run_aln({"--meth", "-n", "2"}, {fq_u}, fa);
+    REQUIRE(u2.size() == 1);
+    CHECK(u2[0].rname == "u_near");
+    CHECK(tag_value(u2[0], "NM:i") == "2");
+    CHECK(tag_value(u2[0], "X0:i") == "1");
+    CHECK(tag_value(u2[0], "X1:i") == "0");
+    const auto u3 = run_aln({"--meth", "-n", "3"}, {fq_u}, fa);
+    REQUIRE(u3.size() == 1);
+    CHECK(u3[0].rname == "u_near");
+    CHECK(tag_value(u3[0], "X1:i") == "1");
+}
+
 TEST_CASE("aln_meth: parallel finish preserves nonzero second-stratum MAPQ")
 {
     const std::string fq=write_fq("mapq-workers.fq",std::vector<std::string>(160,ref().read_r));
@@ -1501,7 +1597,9 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     mr.bns->n_holes=1; mr.bns->ambs=&ambiguous;
     for (int context : {METH_CTX_ALL, METH_CTX_CPG}) {
         mo.m.meth_context=context; ba::aln_meth_opt_finish(&mo);
-        ba::aln_meth_slot_start(&slot,reads,&result,0,3,1);
+        // The read is converted at every C, so under cpg its non-CpG conversions are strict
+        // mismatches, more than -n 3 allows: a limit of its length keeps the window to inspect.
+        ba::aln_meth_slot_start(&slot,reads,&result,0,50,1);
         ba::aln_meth_hit(&slot,&exact,row,row); core.state=ba::GAP_SLOT_PARKED;
         ba::aln_meth_flush_parked(&group);
         REQUIRE(result.occ.size()==1);
