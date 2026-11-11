@@ -44,7 +44,10 @@ struct ProveIndex {
         fa = tmp.unique_file(".fa"); // a unique basename: aln attaches a staged index by name
         uint32_t st = 20261111;
         std::string c1 = aln_test::lcg_dna(st, 4000);
-        std::string c2 = aln_test::lcg_dna(st, 1500) + std::string(30, 'N') + aln_test::lcg_dna(st, 1500);
+        // Sequence the stateful draws explicitly so every compiler builds the same index.
+        std::string c2_right = aln_test::lcg_dna(st, 1500);
+        std::string c2_left = aln_test::lcg_dna(st, 1500);
+        std::string c2 = c2_left + std::string(30, 'N') + c2_right;
         std::string c3 = aln_test::lcg_dna(st, 1000);
         for (int i = 200; i < 700; ++i) c3[i] = (char)std::tolower(c3[i]);
         repeat_unit = aln_test::lcg_dna(st, 120);
@@ -127,6 +130,43 @@ inline int full_ed(const std::vector<uint8_t> &q, const std::vector<uint8_t> &t,
         std::swap(prev, cur);
     }
     return free_end ? *std::min_element(prev.begin(), prev.end()) : prev[m];
+}
+
+// Myers' bit-parallel approximate search (one 128-bit word per text position) for a query of at
+// most 128 bases: the fewest edits of q against any substring of a text of n positions, where
+// eq(peq, b) gives the query positions that match text position b (peq[c]: those holding base c;
+// a query code past 3 matches nothing). Lets a test afford a whole-text oracle.
+template <class Eq> inline int myers_search(const std::vector<uint8_t> &q, size_t n, Eq eq_at)
+{
+    using word = unsigned __int128;
+    const size_t m = q.size();
+    REQUIRE(m <= 128);
+    if (m == 0) return 0;
+    word peq[4] = {0, 0, 0, 0};
+    for (size_t i = 0; i < m; ++i)
+        if (q[i] < 4) peq[q[i]] |= (word)1 << i;
+    const word high = (word)1 << (m - 1);
+    word pv = ~(word)0, mv = 0;
+    int score = (int)m, best = score;
+    for (size_t b = 0; b < n; ++b) {
+        const word eq = eq_at(peq, b);
+        const word xv = eq | mv, xh = (((eq & pv) + pv) ^ pv) | eq;
+        word ph = mv | ~(xh | pv), mh = pv & xh;
+        if (ph & high) ++score;
+        if (mh & high) --score;
+        ph <<= 1; mh <<= 1; // the first row is free (no carry in): a match may start anywhere
+        pv = mh | ~(xv | ph); mv = ph & xv;
+        best = std::min(best, score);
+    }
+    return best;
+}
+
+// full_ed(q, t, false, true), bit-parallel.
+inline int search_ed(const std::vector<uint8_t> &q, const std::vector<uint8_t> &t)
+{
+    return myers_search(q, t.size(), [&](const unsigned __int128 *peq, size_t b) {
+        return t[b] < 4 ? peq[t[b]] : (unsigned __int128)0;
+    });
 }
 
 // A small deterministic generator for the tests' random choices.
