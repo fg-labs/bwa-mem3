@@ -179,9 +179,9 @@ void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t
     if (!x->intervals.insert(key).second) return;
     x->pend.push_back({k, l, *e});
 }
-const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int, int has_copy)
+const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy)
 {
-    x->p = p; x->res = res; x->len = p->len;
+    x->p = p; x->res = res; x->len = p->len; x->max_diff = max_diff;
     x->keep = has_copy ? ALN_METH_KEEP_COPIES : x->grp->keep_strata ? ALN_METH_KEEP_STRATA : 0;
     *res = aln_meth_read_t();
     x->alt_bound = aln_meth_alt_bound_t();
@@ -340,9 +340,10 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
         const int diffs = c.n_mm + c.n_gapo + ((op->mode & BWA_MODE_GAPE) ? c.n_gape : 0);
         return diffs <= max_diff && c.n_gapo <= std::max(0, op->max_gapo) && c.n_gape <= std::max(0, op->max_gape);
     };
-    // Realigns the window (band_limit as aln_meth_realign_window takes it) into a fresh o; false
-    // when the result is not a candidate: it misses its site, or its counts do not fit a record.
+    // Realigns the window (band_limit as aln_meth_realign_window takes it) into a fresh o, with
+    // fits whether its counts fit a record; false when the result misses its site.
     aln_meth_occ_t o;
+    bool fits = false;
     // The accounting reads the same window the refinement fetched (same window, contig and site).
     std::vector<uint8_t> &win = x->win;
     auto evaluate = [&](int band_limit) {
@@ -359,21 +360,30 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
             o.alt = ks_site_rel(g->ref->known_snvs, g->ref->bns, rid, o.alignment.rb, site);
             if (aln_site_key_pos(site) < o.alignment.rb || aln_site_key_pos(site) >= o.alignment.re || !o.alt) return false;
         }
-        if (!account_alignment(g->mo, g->opt, win, query, x->len, &o)) {
-            ++x->res->n_unrepresentable;
-            x->unrep_cost = std::min(x->unrep_cost, o.cost);
-            return false;
-        }
+        fits = account_alignment(g->mo, g->opt, win, query, x->len, &o);
         return true;
     };
     if (!evaluate(-1)) return;
     // A bounded window whose best-scoring alignment breaks those limits is realigned once more
     // with its indels held to the window's own extent (n_ins, n_del: ungapped for a window of the
     // read's length), and kept only if that alignment is within the limits.
-    if (bounded && !within_limits(o)) {
+    if (bounded && fits && !within_limits(o)) {
         const int narrow = std::max(n_ins, n_del);
-        if (o.alignment.band <= narrow || !evaluate(narrow) || !within_limits(o)) return;
+        if (o.alignment.band > narrow && !evaluate(narrow)) return;
     }
+    // Stock aln never reports a hit with more differences than the read's -n allows. The converted
+    // search cannot see a read C over a reference T, so it can propose a window within -n converted
+    // differences whose original-reference alignment has more; drop it before it is a locus (no
+    // X0/X1, MAPQ or pairing). Differences are counted as stock aln counts them: mismatches plus
+    // gap opens, plus gap extensions unless -e was given; conversions are free.
+    const int64_t differences = (int64_t)o.n_mm + o.n_gapo + ((g->opt->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
+    if (differences > x->max_diff) { ++x->res->n_over_diff; return; }
+    if (!fits) {
+        ++x->res->n_unrepresentable;
+        x->unrep_cost = std::min(x->unrep_cost, o.cost);
+        return;
+    }
+    if (bounded && !within_limits(o)) return;
     ++x->res->n_rescored;
     const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
     // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
@@ -568,6 +578,7 @@ void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng,
     src->hits.swap(hits); src->cig.swap(cig);
     // a copy ran no search: the work counters (aln_meth_report) stay with its first copy
     dst->n_lookups = dst->n_wrong_copy = dst->n_rescored = dst->n_flushes = dst->n_unrepresentable = 0;
+    dst->n_over_diff = 0;
     if (src->main >= 0) dst->main = draw_main(src->hits, src->n_conv_moved, rng);
     if (src->main >= 0 && !keep_all && trims(src, src->hits.size(), max_xa_hits)) {
         // Copy only the drawn primary, not the representative's whole locus list.
@@ -654,14 +665,14 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
 void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
 {
     if (bwa_verbose < 4) return;
-    long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0;
+    long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0, over = 0;
     for (int i = 0; i < n; ++i) {
         lookups += res[i].n_lookups; wrong += res[i].n_wrong_copy; scored += res[i].n_rescored;
-        dropped += res[i].n_unrepresentable;
+        dropped += res[i].n_unrepresentable; over += res[i].n_over_diff;
         flushes += res[i].n_flushes; incomplete += res[i].flags != 0;
     }
-    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; stock cost/count MAPQ\n",
-            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete);
+    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld windows over -n dropped; stock cost/count MAPQ\n",
+            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over);
 }
 
 /* bwa_cal_md1 with NM counting only the mismatches the mode does not free (and gap lengths); MD
