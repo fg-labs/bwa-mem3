@@ -529,6 +529,32 @@ TEST_CASE("aln_meth: converted repeats do not trigger a rescored -R early stop")
     CHECK(c[0].mapq == 0);
 }
 
+TEST_CASE("aln_meth: a repeat certificate reports X0 as a lower bound and draws its primary uniformly")
+{
+    // Under collapsed scoring read_r has 31 exact loci. With -R 5 the search ends once more than 5 of
+    // them are verified (a repeat certificate): MAPQ 0, X0 the verified count (6 to 31), no X1. The
+    // primary is drawn over all 31, verified or not, per read: over 1,240 copies of the read every
+    // locus is drawn about 40 times (chi-square, 30 degrees of freedom, p < 0.001 at 59.7).
+    const int n = 31 * 40;
+    const std::string fq = write_fq("cert-draw.fq", std::vector<std::string>(n, ref().read_r));
+    const auto v = run_aln({"--meth=taps", "--meth-scoring", "collapsed", "-n", "2", "-l", "1024", "-R", "5"}, {fq});
+    REQUIRE((int)v.size() == n);
+    std::map<std::string, int> drawn;
+    for (const auto &r : v) {
+        CHECK(r.mapq == 0);
+        CHECK(tag_value(r, "XT:A") == "R");
+        const int x0 = std::stoi(tag_value(r, "X0:i"));
+        CHECK(x0 > 5); CHECK(x0 <= 31);
+        CHECK(r.tag.count("X1:i") == 0);
+        ++drawn[r.rname + ":" + std::to_string(r.pos) + (r.flag & 16 ? "-" : "+")];
+    }
+    CHECK(drawn.size() == 31u);
+    double chi2 = 0;
+    for (const auto &d : drawn) chi2 += (d.second - 40.0) * (d.second - 40.0) / 40.0;
+    CAPTURE(chi2);
+    CHECK(chi2 < 59.7);
+}
+
 TEST_CASE("aln_meth: -N preserves best placements while retaining more worse costs")
 {
     // reads from c1/c2 with conversions, substitutions and reverse-direction cells
@@ -1454,7 +1480,7 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     // completes it at 33 lookups, so a larger budget no longer caps it.)
     for (int keep_strata : {1,0}) for (int budget : {32}) {
         CAPTURE(keep_strata); CAPTURE(budget);
-        ba::aln_meth_opt_t mo; mo.p_best=budget; mo.p_second=0;
+        ba::aln_meth_opt_t mo; mo.p_best=budget; mo.p_second=0; mo.cert_budget=budget;
         // The 31 ties are counted under collapsed scoring (the mirror cell is free too).
         mo.m.meth_scoring=MEM_METH_SCORING_COLLAPSED;
         ba::aln_meth_opt_finish(&mo);
@@ -1533,6 +1559,8 @@ TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few 
     ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    // The budget's binding flush is the search's without stock cuts (its slot has no job options).
+    mr.no_cut=1;
     ba::gap_opt_t *opt=ba::gap_init_opt();
     ba::aln_meth_opt_t mo;
     ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;
@@ -1597,6 +1625,7 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    mr.no_cut=1; // the flushes here are the search's without stock cuts (the slot has no job options)
     ba::aln_meth_opt_t mo;ba::aln_meth_opt_finish(&mo);
     ba::gap_opt_t *opt=ba::gap_init_opt();
     ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;

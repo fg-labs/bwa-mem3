@@ -402,6 +402,25 @@ difference ceiling admits `k` differences and discovery has not hit a cap, the s
 after fully evaluating converted scores through `M*k`; a seeded read only when `k` is also at
 most `-k`. This does not make discovery exhaustive or guarantee a globally optimal alignment.
 
+**Saturation certificates (single-end).** Under the stock cuts, a single-end read's rows are
+verified stratum by stratum in converted score, narrow hits first and wide ones (more than 256
+rows) in a pseudo-random order seeded from the read, and the search ends as soon as more rows
+cannot change the stock output:
+
+- *repeat*: more than `-R` loci at the best cost `B`, with every lower stratum verified and `B`
+  at most the current one. MAPQ is 0 and `X0` is the verified count, a lower bound (`X1` is not
+  printed, as for stock's `-R` stop). Under the TAPS/5base tie-break the loci must have no
+  conversions, or number at least 179 (stock MAPQ is then 0 whichever has the fewest) with a best
+  cost below the read's `-n` mismatches. The primary is drawn uniformly over every row of the
+  hits that can hold a best row (rejection sampling, seeded from the read), verified or not.
+- *crowded*: a unique best locus (not using all of `-n`, where stock MAPQ is 25) and at least 255
+  retained worse loci: MAPQ 0, `X0` 1 and `X1` the verified count, a lower bound.
+
+Other reads verify every row up to a row budget of 16,384 (4,596 without the certificates: with
+`-N`, a negative penalty, `--known-snvs` or before pairing is decided for paired-end input). A
+tie-break repeat that neither certificate closes ends incomplete past 4,596 rows, as before. A
+read that reaches the budget without a certificate is incomplete, as below.
+
 **Path cost.** Each row is scored on the original reference along the search path that
 found it, as stock aln scores a hit by its path: the path's alignment (its gaps where the
 search placed them) is the row's alignment, and its cost is
@@ -514,8 +533,8 @@ not validate this revised behavior. Rescue uses the same active-allocation and
 cumulative CIGAR budgets as the search's candidates and restores trimmed tails before
 legacy CIGAR splitting.
 
-The per-read SA lookup budget is a single total of 4596 by default, not separate
-best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known
+The per-read SA lookup budget is a single total of 4596 by default (16,384 for a read
+verified with certificates, above), not separate best/second-stratum budgets. Lookup or `-m` exhaustion retains a best-known
 placement when available, marks it as a repeat with MAPQ 0, and omits exact
 `X0`/`X1`/`XA` claims. Candidate rows are resolved in batches; once a batch holds
 more rows than the budget has left, the read is incomplete whatever they resolve to,

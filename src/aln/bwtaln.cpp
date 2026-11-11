@@ -177,6 +177,7 @@ template <> struct gap_group<AlnMeth> {
 		const uint8_t *keep;     // per read: keep both strata (others share its search), or null
 		aln_meth_read_t *res;    // per read of the (possibly compacted) batch
 		const std::vector<aln_meth_candidate_t> *extra; // per read: --known-snvs candidates, or null
+		const std::vector<std::vector<int64_t>> *copies; // per read: its duplicate copies' ordinals, or null
 	};
 
 	static thread_local const ctx_t *ctx;
@@ -206,6 +207,7 @@ template <> struct gap_group<AlnMeth> {
 		const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
 		aln_meth_slot_start(slot(c), p, ctx->res + r, ctx->ord[r], max_diff, ctx->keep ? ctx->keep[r] : 0);
 		slot(c)->extra = ctx->extra ? ctx->extra + r : nullptr;
+		slot(c)->copy_ords = ctx->copies ? &(*ctx->copies)[r] : nullptr;
 	}
 	static const ubyte_t *seq(const gap_slot_core_t *c, const bwa_seq_t *) { return slot(c)->vseq.data(); }
 	static int job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start_meth(j, bwt); }
@@ -702,6 +704,7 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 	mc.ref = ref; mc.mo = mo; mc.read_no = read_no; mc.keep_strata = keep_strata; mc.max_xa_hits = max_xa_hits;
 	mc.keep = nullptr;
 	mc.extra = extra;
+	mc.copies = nullptr;
 	std::vector<int64_t> ord(n_seqs);
 	std::vector<uint8_t> has_copy(n_seqs, 0);
 	for (int i = 0; i < n_seqs; ++i) ord[i] = ord0 + i;
@@ -716,7 +719,14 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			std::vector<int64_t> ord_c(n_u);
 			std::vector<uint8_t> keep_c(n_u);
 			std::vector<aln_meth_read_t> res_c(n_u);
-			for (int k = 0; k < n_u; ++k) ord_c[k] = ord0 + uniq[k], keep_c[k] = has_copy[uniq[k]];
+			for (int k = 0; k < n_u; ++k) ord_c[k] = ord[uniq[k]], keep_c[k] = has_copy[uniq[k]];
+			// each copy's ordinal with its first copy, whose search makes the copy's draw when it can
+			// (a repeat certificate's, aln_meth_slot_finish)
+			std::vector<int> at(n_seqs, -1);
+			for (int k = 0; k < n_u; ++k) at[uniq[k]] = k;
+			std::vector<std::vector<int64_t>> copies_c(n_u);
+			for (int i = 0; i < n_seqs; ++i) if (rep[i] != i) copies_c[at[rep[i]]].push_back(ord[i]);
+			mc.copies = &copies_c;
 			std::vector<std::vector<aln_meth_candidate_t>> extra_c(extra ? n_u : 0);
 			for (int k = 0; extra && k < n_u; ++k) extra_c[k] = extra[uniq[k]];
 			mc.ord = ord_c.data(); mc.keep = keep_c.data(); mc.res = res_c.data();
@@ -731,7 +741,20 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			// a copy ran no search: the work counters (aln_meth_report) stay with its first copy
 			res[i].n_lookups = res[i].n_wrong_copy = res[i].n_rescored = res[i].n_flushes = 0;
 			res[i].n_unrepresentable = res[i].n_over_diff = res[i].n_over_seed = 0;
-			if (res[i].main >= 0) aln_meth_redraw_hits(&res[i], aln_meth_draw_seed(ref, read_no, ord0 + i));
+			if (res[i].main >= 0) {
+				// a repeat certificate's copy takes the draw its first copy's search made for it
+				bool placed = false;
+				for (const auto &d : res[first].copy_draw) {
+					if (d.ord != ord[i]) continue;
+					for (size_t h = 0; h < res[i].hits.size() && !placed; ++h) {
+						const aln_meth_hit_t &x = res[i].hits[h];
+						if (x.rid == d.rid && x.hyp == d.hyp && x.strand == d.strand && x.pos == d.pos) res[i].main = (int)h, placed = true;
+					}
+					break;
+				}
+				if (!placed) aln_meth_redraw_hits(&res[i], aln_meth_draw_seed(ref, read_no, ord[i]));
+			}
+			res[i].copy_draw.clear();
 			// Pairing never reads an incomplete read past its main hit.
 			if (!keep_strata || res[i].flags) aln_meth_trim(&res[i], max_xa_hits);
 		});
