@@ -138,6 +138,11 @@ struct aln_meth_slot_t {
     // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
     // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
     int cert = 0, collect = 0;
+    // prove: the search tries the pigeonhole proof once, at its first entry past the exact stratum
+    // (aln_meth_prove_nohit): set under BWA_MODE_GAPE outside the --known-snvs ALT-window search, for
+    // reads allowed at least ALN_METH_PH_MIN_DIFF differences.
+    int prove = 0;
+    aln_meth_ph_scratch_t ph;
     std::vector<aln_meth_pend_t> ivs;
     uint64_t perm_rng = 0;
     int64_t best = INT64_MAX;
@@ -241,6 +246,13 @@ int aln_meth_gap_arena(aln_meth_slot_t *, const gap_entry_t &p, bool ext, uint32
 // has_copy: the read has duplicate copies that will redraw over its loci.
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
+/* The pigeonhole proof for the read of slot x, whose search j has found no hit in its exact stratum
+ * (no interval yet): returns 1 when no search path within the read's -n differences reaches a hit
+ * (aln_meth_pigeonhole), so ending the search there leaves every result as the full search would
+ * (no hit, row, lookup or draw). A read whose root bound leaves no spare difference is not tried:
+ * its search is cheap. */
+enum { ALN_METH_PH_MIN_DIFF = 3 };
+int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j);
 void aln_meth_report(int, int, const aln_meth_read_t *);
 // Finishes a read (stores its occ as hits; see aln_meth_store_loci), then trims it to its main hit
 // (an incomplete read always; a complete one when it has more than max_xa_hits + 1 loci).

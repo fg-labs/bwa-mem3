@@ -280,6 +280,14 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     for (const auto &o : x->res->occ) n += o.cost == x->best && (!conv || o.n_conv == fewest);
     return n > opt.max_top2;
 }
+// Out of line: called from the search kernel at most once per read.
+__attribute__((noinline)) int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j)
+{
+    if (x->intervals.size()) return 0; // a hit already
+    if (j->len < 1 || j->max_diff - j->width[j->len - 1].bid < 1) return 0;
+    long steps = 0, rows = 0;
+    return aln_meth_pigeonhole(x->grp->bwt, *x->grp->ref, j->seq, j->len, j->max_diff, j->width, &x->ph, &steps, &rows);
+}
 void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
     // Reaching the same interval along a path with the same gaps adds no new candidate rows; a path
@@ -306,6 +314,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->bits_ready = 0;
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
+    x->prove = (x->grp->opt->mode & BWA_MODE_GAPE) && !x->grp->ref->no_cut && max_diff >= ALN_METH_PH_MIN_DIFF;
     x->flushed_score = -1;
     const gap_opt_t *o = x->grp->opt;
     x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 && !x->grp->ref->known_snvs &&

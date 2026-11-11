@@ -44,7 +44,10 @@ struct ProveIndex {
         fa = tmp.path() + "/ref.fa";
         uint32_t st = 20261111;
         std::string c1 = aln_test::lcg_dna(st, 4000);
-        std::string c2 = aln_test::lcg_dna(st, 1500) + std::string(30, 'N') + aln_test::lcg_dna(st, 1500);
+        // Sequence the stateful draws explicitly so every compiler builds the same index.
+        std::string c2_right = aln_test::lcg_dna(st, 1500);
+        std::string c2_left = aln_test::lcg_dna(st, 1500);
+        std::string c2 = c2_left + std::string(30, 'N') + c2_right;
         std::string c3 = aln_test::lcg_dna(st, 1000);
         for (int i = 200; i < 700; ++i) c3[i] = (char)std::tolower(c3[i]);
         repeat_unit = aln_test::lcg_dna(st, 120);

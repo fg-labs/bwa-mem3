@@ -141,3 +141,147 @@ int aln_meth_refute_window(const aln_meth_ref_t &ref, int64_t seq_len, const uby
 }
 
 } // namespace bwa_aln
+
+namespace bwa_aln {
+
+int aln_meth_pigeonhole(const bwt_t *bwt, const aln_meth_ref_t &ref, const ubyte_t *seq, int len, int kmax,
+                        const bwt_width_t *width, aln_meth_ph_scratch_t *s, long *steps, long *rows)
+{
+    enum { MAX_PIECES = 32 };
+    *steps = 0; *rows = 0;
+    // n1 pieces allowing one edit and n0 (0 or 1) exact ones: sum(e_j + 1) = 2 n1 + n0 = kmax + 1
+    const int n1 = (kmax + 1) / 2, n0 = (kmax + 1) % 2, p = n1 + n0;
+    s->why = ALN_METH_PH_SHORT;
+    if (kmax < 0 || p > MAX_PIECES || len < p * (int)ALN_METH_PH_MIN_PIECE) return 0;
+    int pa[MAX_PIECES + 1], pe[MAX_PIECES], off[MAX_PIECES + 1];
+    for (int j = 0; j <= p; ++j) pa[j] = (int)((int64_t)j * len / p);
+    for (int j = 0; j < p; ++j) pe[j] = j < n1 ? 1 : 0;
+    off[0] = 0;
+    for (int j = 0; j < p; ++j) off[j + 1] = off[j] + (pa[j + 1] - pa[j]);
+    // Each piece's absent-substring bound: bid[off[j] + t] bounds the edits S[a_j, a_j + t] needs. It
+    // is bwt_cal_width's walk from a_j (on the uncomplemented bases: the index holds both strands, so
+    // a string and its reverse complement occur equally), the pieces' walks run in step. Piece 0 is
+    // the search's own width walk when given.
+    s->bid.resize(off[p]);
+    struct walk_t { bwtint_t k, l; int t, bid; };
+    walk_t w[MAX_PIECES];
+    int n_walk = 0;
+    for (int j = 0; j < p; ++j) {
+        if (j == 0 && width) { for (int t = 0; t < pa[1]; ++t) s->bid[t] = width[t].bid; continue; }
+        w[j] = walk_t{0, bwt->seq_len, 0, 0};
+        ++n_walk;
+    }
+    auto vbase = [&](int at) { return seq[at] > 3 ? 4 : 3 - seq[at]; };
+    while (n_walk) {
+        for (int j = 0; j < p; ++j)
+            if (!(j == 0 && width) && w[j].t < pa[j + 1] - pa[j]) bwt_prefetch_2occ(bwt, w[j].k, w[j].l);
+        for (int j = 0; j < p; ++j) {
+            if ((j == 0 && width) || w[j].t >= pa[j + 1] - pa[j]) continue;
+            walk_t &x = w[j];
+            const int c = vbase(pa[j] + x.t);
+            if (c < 4) {
+                bwtint_t ok, ol;
+                bwt_2occ(bwt, x.k - 1, x.l, (ubyte_t)c, &ok, &ol);
+                ++*steps;
+                x.k = bwt->L2[c] + ok + 1;
+                x.l = bwt->L2[c] + ol;
+            }
+            if (x.k > x.l || c > 3) { x.k = 0; x.l = bwt->seq_len; ++x.bid; }
+            s->bid[off[j] + x.t] = x.bid;
+            if (++x.t == pa[j + 1] - pa[j]) --n_walk;
+        }
+    }
+    // The pieces' occurrences within their allowances: backward search from each piece's last base
+    // (S[j] is the next base a node consumes), all nodes of all pieces advanced one lookup per round.
+    // A node may still place used < e edits: a mismatch, an unaligned read base (insertion) or an
+    // unaligned text base (deletion). Deletions at the piece's right end are not made: dropping that
+    // text base leaves an occurrence with fewer edits at the same start. Nor at its left end, after
+    // its first base: that occurrence starts one base later with one edit fewer, which the window
+    // allows for (aln_meth_refute_window takes starts within kmax of the diagonal either way).
+    s->cur.clear();
+    s->occ_k.clear(); s->occ_l.clear(); s->occ_a.clear();
+    int64_t total = 0;
+    for (int j = 0; j < p; ++j)
+        if (s->bid[off[j + 1] - 1] <= pe[j]) s->cur.push_back(aln_meth_ph_node_t{0, bwt->seq_len, pa[j + 1] - 1, (uint8_t)j, 0});
+    while (!s->cur.empty()) {
+        for (const auto &n : s->cur) bwt_prefetch_2occ(bwt, n.k, n.l);
+        s->next.clear();
+        for (const auto &n : s->cur) {
+            const int A = pa[n.piece], e = pe[n.piece], j = n.j, q = seq[j];
+            auto bound = [&](int jj) { return jj < A ? 0 : s->bid[off[n.piece] + (jj - A)]; };
+            auto emit = [&](bwtint_t k, bwtint_t l) {
+                s->occ_k.push_back(k); s->occ_l.push_back(l); s->occ_a.push_back(A);
+                total += (int64_t)(l - k + 1);
+            };
+            auto push = [&](bwtint_t k, bwtint_t l, int jj, int u) {
+                s->next.push_back(aln_meth_ph_node_t{k, l, jj, n.piece, (uint8_t)u});
+            };
+            if (n.used == e) { // no edit left: the rest of the piece exactly
+                if (q > 3) continue;
+                bwtint_t ok, ol;
+                bwt_2occ(bwt, n.k - 1, n.l, (ubyte_t)q, &ok, &ol);
+                ++*steps;
+                const bwtint_t k = bwt->L2[q] + ok + 1, l = bwt->L2[q] + ol;
+                if (k > l) continue;
+                if (j == A) emit(k, l);
+                else if (bound(j - 1) == 0) push(k, l, j - 1, n.used);
+                continue;
+            }
+            bwtint_t ck[4], cl[4];
+            bwt_2occ4(bwt, n.k - 1, n.l, ck, cl);
+            ++*steps;
+            const bool root = j == pa[n.piece + 1] - 1 && n.used == 0;
+            const int left = e - n.used - 1; // edits left after placing one here
+            for (int c = 0; c < 4; ++c) {
+                const bwtint_t k = bwt->L2[c] + ck[c] + 1, l = bwt->L2[c] + cl[c];
+                if (k > l) continue;
+                const int u = n.used + (c != q); // a read N is a mismatch with every base
+                if (u <= e) {
+                    if (j == A) emit(k, l);
+                    else if (bound(j - 1) <= e - u) push(k, l, j - 1, u);
+                }
+                if (!root && left >= 0 && bound(j) <= left) push(k, l, j, n.used + 1); // text base c unaligned
+            }
+            if (left >= 0) { // read base S[j] unaligned
+                if (j == A) emit(n.k, n.l);
+                else if (bound(j - 1) <= left) push(n.k, n.l, j - 1, n.used + 1);
+            }
+        }
+        if (total > ALN_METH_PH_ROWS) { s->why = ALN_METH_PH_ROWS_CAP; *rows = total; return 0; }
+        if (*steps > ALN_METH_PH_NODES) { s->why = ALN_METH_PH_NODES_CAP; return 0; }
+        std::swap(s->cur, s->next);
+    }
+    // Every occurrence row: the starts S may have there, checked against the text.
+    *rows = total;
+    s->rows.clear();
+    std::vector<int> &row_a = s->occ_a; // reused below as each row's piece start
+    std::vector<int64_t> &st = s->starts;
+    st.clear();
+    for (size_t o = 0; o < s->occ_k.size(); ++o)
+        for (bwtint_t r = s->occ_k[o]; r <= s->occ_l[o]; ++r) s->rows.push_back(r);
+    bwt_sa_batch(bwt, s->rows.data(), (int64_t)s->rows.size(), s->rows.data());
+    size_t at = 0;
+    for (size_t o = 0; o < s->occ_k.size(); ++o)
+        for (bwtint_t r = s->occ_k[o]; r <= s->occ_l[o]; ++r, ++at) {
+            const bwtint_t y = s->rows[at];
+            if (y >= bwt->seq_len) { s->why = ALN_METH_PH_NOT_TEXT; return 0; } // not a text position
+            st.push_back((int64_t)y - row_a[o] - kmax);
+        }
+    std::sort(st.begin(), st.end());
+    st.erase(std::unique(st.begin(), st.end()), st.end());
+    // Rows of one locus (several pieces, or one piece's edit placements) give nearby starts: their
+    // start ranges, [y0, y0 + 2 kmax] each, are checked together while they overlap, up to a span
+    // of 6 kmax (one banded pass over their union).
+    for (size_t i = 0; i < st.size();) {
+        const int64_t lo = st[i];
+        int64_t hi = st[i] + 2 * (int64_t)kmax;
+        size_t j = i + 1;
+        while (j < st.size() && st[j] <= hi + 1 && st[j] + 2 * (int64_t)kmax - lo <= 6 * (int64_t)kmax) hi = st[j++] + 2 * (int64_t)kmax;
+        if (!aln_meth_refute_starts(ref, (int64_t)bwt->seq_len, seq, len, lo, hi, kmax, &s->vs)) { s->why = ALN_METH_PH_WINDOW; return 0; }
+        i = j;
+    }
+    s->why = ALN_METH_PH_PROVEN;
+    return 1;
+}
+
+} // namespace bwa_aln
