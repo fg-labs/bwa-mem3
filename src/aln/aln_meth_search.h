@@ -10,6 +10,7 @@
 #include <tuple>
 #include "aln_meth.h"
 #include "aln_meth_realign.h"
+#include "aln_meth_prove.h"
 #include <vector>
 #include "bwtgap.h"
 namespace bwa_aln {
