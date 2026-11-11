@@ -774,6 +774,13 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 					J->pending = JOB_FLUSH;
 					return 0;
 				}
+				if constexpr (P::meth) { // AlnMeth: past the exact stratum, a read with no hit yet may be
+					// proven to have none (aln_meth_prove_nohit); the search then ends without one
+					if (X->prove && (int)(e.info>>21) > 0) {
+						X->prove = 0;
+						if (aln_meth_prove_nohit(X, J)) break;
+					}
+				}
 			}
 			k = e.k; l = e.l; // SA interval
 			i = e.info&0xffff; // length
