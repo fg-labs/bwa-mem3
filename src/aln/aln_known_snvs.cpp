@@ -257,6 +257,7 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 			ks_windows_free(out);
 			return -1;
 		}
+		out->mref->no_cut = 1;
 		out->bns = out->mref->bns;
 	} else {
 		const int rc = libsais_build_fm_memory(wpac, wbns->l_pac, bo, &arrays);

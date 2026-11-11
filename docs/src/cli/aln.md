@@ -385,18 +385,22 @@ read 2 G->A for directional discovery. In `aln`, `--set-as-failed` requires
 
 Converted-space backtracking finds hits within the user's search limits (`-n`, `-o`,
 `-e`, seeding options, `-M/-O/-E`, `-N` and `-m`). Each SA row of a hit is a candidate
-locus. Only the directional copy appropriate to the read is retained. `-R` does not
-prune original-reference competitors. For current best cost `B`,
-let `T = B + M` and `k = floor(T / M)`. When `M > 0`, `T < O`, `E >= 0`, the
-configured difference ceiling admits `k` differences, `-N` is off and discovery
-has not hit a cap, the search can stop after fully evaluating converted scores
-through `M*k`. Every retained alignment then has no gaps and at most `k`
-strict mismatches, so that stratum already reaches its row. A read
-longer than `-l` (a seeded search) can stop this way only when `k` is also at
-most the seed's `-k`, so that seeding cannot have excluded such a row. A
-decreasing best cost can only narrow this bound. Other searches retain configured
-generation without a path-cost cutoff. This does not make
-discovery exhaustive or guarantee a globally optimal alignment.
+locus. Only the directional copy appropriate to the read is retained.
+
+**Stock cuts.** A row costs at least its path's converted score (below), so the search takes
+stock aln's cuts from the best verified row cost `B`. Rows are resolved at the first hit and
+at every converted-score boundary. The search stops past `B + M` (stock's score cut). Once
+`B` is at most the next entry's score, no unresolved row can cost less, and the difference
+ceiling drops to the best row's differences plus one (stock's top-2 rule, at most `-n`); the
+retained loci obey the same ceiling. Once the best stratum is complete, more than `-R` best
+loci end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
+not printed. These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
+set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
+search instead stops early only on the earlier certified bound: for current best cost `B`,
+let `T = B + M` and `k = floor(T / M)`. When `M > 0`, `T < O`, `E >= 0`, the configured
+difference ceiling admits `k` differences and discovery has not hit a cap, the search can stop
+after fully evaluating converted scores through `M*k`; a seeded read only when `k` is also at
+most `-k`. This does not make discovery exhaustive or guarantee a globally optimal alignment.
 
 **Path cost.** Each row is scored on the original reference along the search path that
 found it, as stock aln scores a hit by its path: the path's alignment (its gaps where the
