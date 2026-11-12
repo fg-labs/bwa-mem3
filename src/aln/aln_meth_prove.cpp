@@ -145,7 +145,8 @@ int aln_meth_refute_window(const aln_meth_ref_t &ref, int64_t seq_len, const uby
 namespace bwa_aln {
 
 int aln_meth_pigeonhole(const bwt_t *bwt, const aln_meth_ref_t &ref, const ubyte_t *seq, int len, int kmax,
-                        const bwt_width_t *width, aln_meth_ph_scratch_t *s, long *steps, long *rows)
+                        const bwt_width_t *width, aln_meth_ph_scratch_t *s, long *steps, long *rows,
+                        int64_t max_rows, long max_nodes)
 {
     enum { MAX_PIECES = 32 };
     *steps = 0; *rows = 0;
@@ -247,8 +248,8 @@ int aln_meth_pigeonhole(const bwt_t *bwt, const aln_meth_ref_t &ref, const ubyte
                 else if (bound(j - 1) <= left) push(n.k, n.l, j - 1, n.used + 1);
             }
         }
-        if (total > ALN_METH_PH_ROWS) { s->why = ALN_METH_PH_ROWS_CAP; *rows = total; return 0; }
-        if (*steps > ALN_METH_PH_NODES) { s->why = ALN_METH_PH_NODES_CAP; return 0; }
+        if (total > max_rows) { s->why = ALN_METH_PH_ROWS_CAP; *rows = total; return 0; }
+        if (*steps > max_nodes) { s->why = ALN_METH_PH_NODES_CAP; return 0; }
         std::swap(s->cur, s->next);
     }
     // Every occurrence row: the starts S may have there, checked against the text.

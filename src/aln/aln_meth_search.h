@@ -142,6 +142,9 @@ struct aln_meth_slot_t {
     // (aln_meth_prove_nohit): set under BWA_MODE_GAPE outside the --known-snvs ALT-window search, for
     // reads allowed at least ALN_METH_PH_MIN_DIFF differences.
     int prove = 0;
+    // prove2_at: once the search has made more Occ4 expansions (n_steps) than this with no hit yet,
+    // the proof is tried again with larger caps (aln_meth_prove_nohit2); INT64_MAX when it is not.
+    int64_t n_steps = 0, prove2_at = INT64_MAX;
     aln_meth_ph_scratch_t ph;
     std::vector<aln_meth_pend_t> ivs;
     uint64_t perm_rng = 0;
@@ -253,6 +256,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *);
  * its search is cheap. */
 enum { ALN_METH_PH_MIN_DIFF = 3 };
 int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j);
+int aln_meth_prove_nohit2(aln_meth_slot_t *x, const gap_job_t *j);
 void aln_meth_report(int, int, const aln_meth_read_t *);
 // Finishes a read (stores its occ as hits; see aln_meth_store_loci), then trims it to its main hit
 // (an incomplete read always; a complete one when it has more than max_xa_hits + 1 loci).

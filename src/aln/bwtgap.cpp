@@ -793,6 +793,10 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 						X->prove = 0;
 						if (aln_meth_prove_nohit(X, J)) break;
 					}
+					if (__builtin_expect(X->n_steps > X->prove2_at, 0)) {
+						X->prove2_at = INT64_MAX;
+						if (aln_meth_prove_nohit2(X, J)) break;
+					}
 				}
 			}
 			k = e.k; l = e.l; // SA interval
@@ -833,6 +837,7 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 		}
 
 		bwt_2occ4(bwt, k - 1, l, cnt_k, cnt_l); // retrieve Occ values
+		if constexpr (P::meth) ++X->n_steps; // the second proof's trigger (aln_meth_prove_nohit2)
 		occ = l - k + 1;
 		f_score = -1; // no child held yet
 		// test whether diff is allowed

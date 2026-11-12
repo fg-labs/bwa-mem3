@@ -280,6 +280,23 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     for (const auto &o : x->res->occ) n += o.cost == x->best && (!conv || o.n_conv == fewest);
     return n > opt.max_top2;
 }
+// The second proof (aln_meth_prove_nohit2): after this many Occ4 expansions with no hit, with these
+// caps (candidate rows, piece-search lookups). Measured on EM-seq pairs: 200k expansions and 16k rows.
+enum : int64_t { ALN_METH_P2_STEPS = 200000, ALN_METH_P2_ROWS = 16384, ALN_METH_P2_NODES = 1 << 20 };
+// Out of line: called from the search kernel at most once per read, after its search has made
+// prove2_at expansions without a hit. The same proof as aln_meth_prove_nohit (P proves that no path
+// reaches a hit at all, wherever the search is), with larger caps: only reads whose search is
+// already long pay for them.
+__attribute__((noinline)) int aln_meth_prove_nohit2(aln_meth_slot_t *x, const gap_job_t *j)
+{
+    if (x->intervals.size()) return 0; // a hit already
+    // the first proof found a window that may hold an alignment (or a row off the text): so would this
+    if (x->ph.why == ALN_METH_PH_WINDOW || x->ph.why == ALN_METH_PH_NOT_TEXT) return 0;
+    if (j->len < 1 || j->max_diff - j->width[j->len - 1].bid < 1) return 0;
+    long steps = 0, rows = 0;
+    return aln_meth_pigeonhole(x->grp->bwt, *x->grp->ref, j->seq, j->len, j->max_diff, j->width, &x->ph, &steps, &rows,
+                               ALN_METH_P2_ROWS, (long)ALN_METH_P2_NODES);
+}
 // Out of line: called from the search kernel at most once per read.
 __attribute__((noinline)) int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j)
 {
@@ -315,6 +332,9 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
     x->prove = (x->grp->opt->mode & BWA_MODE_GAPE) && !x->grp->ref->no_cut && max_diff >= ALN_METH_PH_MIN_DIFF;
+    x->n_steps = 0;
+    x->ph.why = -1; // no proof tried for this read yet
+    x->prove2_at = x->prove ? (int64_t)ALN_METH_P2_STEPS : INT64_MAX;
     x->flushed_score = -1;
     const gap_opt_t *o = x->grp->opt;
     x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 && !x->grp->ref->known_snvs &&
