@@ -986,33 +986,49 @@ static void resolve_with_sites(aln_meth_slot_t *x, const aln_meth_candidate_t &c
         resolve_one(x, candidate, query, key, n_ins, n_del, bounded);
     }
 }
-// Scores one row of hit h (SA value sa) along h's path, as the reference and each site allele.
-static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_t sa)
+/* A row's window on the original reference, from the row's SA value:
+ * kind 0 no window (the row is skipped), 1 the other conversion copy (counted, skipped), 2 a
+ * window [rb, rb + span) of contig rid, hypothesis hyp, strand strand. */
+struct meth_row_loc_t { int64_t rb; int kind, rid, hyp, strand; };
+static inline meth_row_loc_t locate_row(const aln_meth_slot_t *x, int span, bwtint_t sa)
+{
+    const aln_meth_group_t *g = x->grp;
+    meth_row_loc_t L{0, 0, 0, 0, 0};
+    if (span <= 0) return L;
+    int strand;
+    const bwtint_t pos = bwa_pos_from_sa(g->ref->conv_bns, sa, span, &strand);
+    if (pos == (bwtint_t)-1) return L;
+    const int crid = bns_pos2rid(g->ref->conv_bns, pos);
+    if (crid < 0) return L;
+    const bntann1_t &ca = g->ref->conv_bns->anns[crid];
+    if (pos < (bwtint_t)ca.offset || pos - ca.offset > (bwtint_t)ca.len ||
+        (bwtint_t)span > (bwtint_t)ca.len - (pos - ca.offset)) return L;
+    L.hyp = crid & 1, L.rid = crid >> 1, L.strand = strand;
+    if ((L.hyp ^ strand) != g->read_no) { L.kind = 1; return L; }
+    L.kind = 2;
+    L.rb = g->ref->bns->anns[L.rid].offset + (pos - ca.offset);
+    return L;
+}
+// Scores one row of hit h, located at L (locate_row of its SA value), along h's path, as the
+// reference and each site allele of its window.
+static void resolve_located(aln_meth_slot_t *x, const aln_meth_pend_t &h, const meth_row_loc_t &L)
 {
     aln_meth_group_t *g = x->grp;
     const int span = x->len + (int)h.e.n_del - (int)h.e.n_ins;
-    if (span <= 0) return;
-    int strand;
-    const bwtint_t pos = bwa_pos_from_sa(g->ref->conv_bns, sa, span, &strand);
-    if (pos == (bwtint_t)-1) return;
-    const int crid = bns_pos2rid(g->ref->conv_bns, pos);
-    if (crid < 0) return;
-    const bntann1_t &ca = g->ref->conv_bns->anns[crid];
-    if (pos < (bwtint_t)ca.offset || pos - ca.offset > (bwtint_t)ca.len ||
-        (bwtint_t)span > (bwtint_t)ca.len - (pos - ca.offset)) return;
-    const int hyp = crid & 1, rid = crid >> 1;
-    if ((hyp ^ strand) != g->read_no) { ++x->res->n_wrong_copy; return; }
+    if (L.kind == 0) return;
+    if (L.kind == 1) { ++x->res->n_wrong_copy; return; }
+    const int hyp = L.hyp, rid = L.rid, strand = L.strand;
+    const int64_t rb = L.rb;
     // --known-snvs, the ALT-window search: every distinct read-length window reaches here once or
     // more, before exact-window dedup, refinement and locus collapse can drop or move it. One
     // covering its own window's site is an ungapped ALT placement with the history's mismatches
     // (a gapped history of equal span does not give the window's mismatch count: bound it by 0).
     if (x->res->site_bound.valid && span == x->len) {
         xassert(rid >= 0 && (size_t)rid < g->ref->window_site.size(), "--known-snvs window without a recorded site");
-        const int64_t off = (int64_t)(pos - ca.offset), site = g->ref->window_site[rid];
+        const int64_t off = rb - g->ref->bns->anns[rid].offset, site = g->ref->window_site[rid];
         if (site >= off && site < off + span)
             x->res->site_bound.value = std::min(x->res->site_bound.value, h.e.n_gapo ? 0 : (int)h.e.n_mm);
     }
-    const int64_t rb = g->ref->bns->anns[rid].offset + (pos - ca.offset);
     aln_meth_win_key_t key{rid, hyp, strand, rb, rb + span, aln_meth_layout_t()};
     meth_layout(h.gap, h.e.n_gapo, x->len, strand, &key.lay);
     if (layout_span(key.lay, x->len) != span) {
@@ -1032,6 +1048,30 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
         fprintf(stderr, "ERROR: --meth search path (%d gaps: %#x %#x %#x %#x) is not an alignment of the %d-base read\n",
                 (int)h.e.n_gapo, h.gap[0], h.gap[1], h.gap[2], h.gap[3], x->len);
         exit(1);
+    }
+}
+// Scores rows[0, n) of hit h in order, as resolve_located; each group of rows is located first and
+// the reference bytes of its windows prefetched, so that scoring does not wait on them row by row.
+// lookups: count each row in n_lookups as it is scored (rows resolved by SA lookup).
+enum { ALN_METH_LOCATE_AHEAD = 16 };
+static void resolve_rows(aln_meth_slot_t *x, const aln_meth_pend_t &h, const bwtint_t *rows, size_t n, bool lookups)
+{
+    const int span = x->len + (int)h.e.n_del - (int)h.e.n_ins;
+    const uint8_t *pac = x->grp->ref->pac;
+    meth_row_loc_t loc[ALN_METH_LOCATE_AHEAD];
+    for (size_t b = 0; b < n && !x->stop; b += ALN_METH_LOCATE_AHEAD) {
+        const size_t m = std::min<size_t>(ALN_METH_LOCATE_AHEAD, n - b);
+        for (size_t k = 0; k < m; ++k) {
+            loc[k] = locate_row(x, span, rows[b + k]);
+            if (loc[k].kind == 2) {
+                __builtin_prefetch(pac + (loc[k].rb >> 2));
+                __builtin_prefetch(pac + ((loc[k].rb + span) >> 2) + 8);
+            }
+        }
+        for (size_t k = 0; k < m && !x->stop; ++k) {
+            if (lookups) ++x->res->n_lookups;
+            resolve_located(x, h, loc[k]);
+        }
     }
 }
 // A --known-snvs candidate window without a path (its CIGAR is not one): refined by the window DP,
@@ -1108,7 +1148,7 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
         const int32_t c = x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos);
         if (c >= 0) { // rows of an interval already resolved: no lookups
             const size_t off = x.sa_ix.val[c];
-            for (bwtint_t r = 0; r < width && !(x.res->flags & ALN_METH_BIND_CIGAR); ++r) resolve_window(&x, h, x.sa_rows[off + r]);
+            resolve_rows(&x, h, x.sa_rows.data() + off, width, false);
             aln_meth_certify(&x, s);
             continue;
         }
@@ -1123,7 +1163,7 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
         const size_t off = x.sa_rows.size();
         bwtint_t done = 0;
         bool certified = false;
-        while (done < width && !(x.res->flags & ALN_METH_BIND_CIGAR)) {
+        while (done < width && !x.stop) {
             const int64_t left = (int64_t)g->mo->cert_budget - x.res->n_lookups;
             if (left <= 0) break;
             const int n = (int)std::min<uint64_t>(std::min<uint64_t>(width - done, ALN_METH_CHUNK), (uint64_t)left);
@@ -1135,7 +1175,7 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
                 rows[k] = h.k + (width > ALN_METH_WIDE ? (bwtint_t)(((unsigned __int128)a * t + b) % width) : t);
             }
             bwt_sa_batch(g->bwt, rows, n, rows);
-            for (int k = 0; k < n && !(x.res->flags & ALN_METH_BIND_CIGAR); ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[at + k]); }
+            resolve_rows(&x, h, x.sa_rows.data() + at, n, true);
             done += n;
             if (aln_meth_certify(&x, s)) { certified = true; break; }
         }
@@ -1188,7 +1228,7 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             const int32_t c = cached(h);
             if (c >= 0) {
                 const size_t off = x.sa_ix.val[c];
-                for (bwtint_t r = 0; r < width && !x.stop; ++r) resolve_window(&x, h, x.sa_rows[off + r]);
+                resolve_rows(&x, h, x.sa_rows.data() + off, width, false);
                 continue;
             }
             const int64_t remaining = limit - x.res->n_lookups;
@@ -1199,7 +1239,7 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             for (int k = 0; k < n; ++k) rows[k] = h.k + k;
             bwt_sa_batch(g->bwt, rows, n, rows);
             if ((bwtint_t)n == width) x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
-            for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
+            resolve_rows(&x, h, x.sa_rows.data() + off, n, true);
             // A CIGAR stop on this interval's looked-up rows is final: keep it over the lookup
             // stop, which aln_meth_slot_finish lifts to resolve the ALT-window candidates.
             if ((bwtint_t)n < width) {
@@ -1667,7 +1707,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
                 layout_span(key.lay, x->len) == span;
             if (!path) key.lay.n = -1;
             if (!x->windows.insert(key, 0).second) continue;
-            // As in resolve_window: a span past a window's limit is dropped as unrepresentable.
+            // As in resolve_located: a span past a window's limit is dropped as unrepresentable.
             if (span > ALN_MAX_READ_LEN) {
                 ++r->n_unrepresentable;
                 x->unrep_cost = 0;
