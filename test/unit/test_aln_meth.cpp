@@ -2678,8 +2678,11 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     CHECK(ba::bwa_seq_close(input) == 0);
 }
 
-TEST_CASE("aln_meth: ineligible searches batch pending hits instead of flushing score boundaries")
+TEST_CASE("aln_meth: a search without the cut batches pending hits instead of flushing score boundaries")
 {
+    // Without the stock cuts (-N, a negative penalty, or a --known-snvs read that does not fit an
+    // ALT window) the search runs to its -n: it flushes to
+    // keep its batch of pending hits bounded, and where the lookup budget binds, never to stop.
     namespace ba=bwa_aln;
     ba::gap_opt_t *opt=ba::gap_init_opt();
     ba::gap_job_t job={}; job.opt=*opt;
@@ -2687,17 +2690,12 @@ TEST_CASE("aln_meth: ineligible searches batch pending hits instead of flushing 
     ba::aln_meth_group_t group; group.mo=&mo;
     ba::aln_meth_read_t result;
     ba::aln_meth_slot_t slot; slot.grp=&group; slot.job=&job; slot.res=&result;
-    ba::bwt_width_t seed={};
-    for (int mode=0;mode<7;++mode) {
+    REQUIRE(slot.cut==0);
+    for (int mode=0;mode<3;++mode) {
         CAPTURE(mode);
-        job.opt=*opt; job.seed_width=nullptr; result.flags=0;
-        if (mode==0) job.opt.mode|=BWA_MODE_NONSTOP;
-        if (mode==1) job.seed_width=&seed, job.opt.max_seed_diff=0; // seeded, no seed differences
-        if (mode==2) job.opt.s_mm=0;
-        if (mode==3) job.opt.s_gape=-1;
-        if (mode==4) result.flags=ba::ALN_METH_BIND_M;
-        if (mode==5) result.flags=ba::ALN_METH_BIND_BEST;
-        if (mode==6) job.opt.s_gapo=job.opt.s_mm;
+        job.opt=*opt; result.flags=0;
+        if (mode==1) job.opt.mode|=BWA_MODE_NONSTOP;
+        if (mode==2) job.opt.s_gape=-1;
         slot.flushed_score=3;
         slot.pend.clear();
         CHECK_FALSE(ba::aln_meth_needs_flush(&slot,6));
@@ -2707,17 +2705,12 @@ TEST_CASE("aln_meth: ineligible searches batch pending hits instead of flushing 
         CHECK(ba::aln_meth_needs_flush(&slot,6));
         CHECK(ba::aln_meth_needs_flush(&slot,3));
     }
-    // No scored candidates yet: boundary refinement must still be able to find the first best.
-    job.opt=*opt; job.seed_width=nullptr; result.flags=0;
-    slot.flushed_score=3; slot.pend.resize(1);
-    CHECK(result.occ.empty());
-    CHECK(ba::aln_meth_needs_flush(&slot,6));
-    CHECK_FALSE(ba::aln_meth_needs_flush(&slot,3));
-    // Reusing the same slot for an eligible read must not inherit a disabled gate.
-    job.opt.mode|=BWA_MODE_NONSTOP;
-    CHECK_FALSE(ba::aln_meth_needs_flush(&slot,6));
-    job.opt.mode&=~BWA_MODE_NONSTOP; slot.flushed_score=3;
-    CHECK(ba::aln_meth_needs_flush(&slot,6));
+    // A resumed search without the cut never stops at a boundary.
+    job.opt=*opt; slot.final_flush=slot.stop=0; slot.pend.clear();
+    job.e.info=(uint32_t)opt->s_mm<<21;
+    ba::gap_entry_t held={};
+    CHECK(ba::aln_meth_resume(&slot,&job,&held)==0);
+    CHECK(slot.flushed_score==opt->s_mm);
     // An already exhausted lookup budget must be detected at the original boundary,
     // before a later expansion can hit the work cap.
     job.opt.mode|=BWA_MODE_NONSTOP;
@@ -2725,7 +2718,7 @@ TEST_CASE("aln_meth: ineligible searches batch pending hits instead of flushing 
     slot.pend[0].k=10; slot.pend[0].l=11;
     slot.pend[1].k=20; slot.pend[1].l=22;
     slot.pend[2].k=30; slot.pend[2].l=33;
-    mo.p_best=9; mo.p_second=0;
+    mo.p_best=9; mo.p_second=0; slot.flushed_score=3;
     CHECK_FALSE(ba::aln_meth_needs_flush(&slot,6));
     result.n_lookups=1; slot.flushed_score=3;
     CHECK(ba::aln_meth_needs_flush(&slot,6));
@@ -2814,68 +2807,6 @@ TEST_CASE("aln_meth: mixed seed eligibility and caps survive real slot reuse and
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
-TEST_CASE("aln_meth: retained-cost stop waits for complete strata and handles decreasing best costs")
-{
-    namespace ba=bwa_aln;
-    ba::gap_opt_t *opt=ba::gap_init_opt();
-    ba::aln_meth_group_t group; group.opt=opt;
-    ba::gap_job_t job={}; job.opt=*opt; job.opt.max_diff=4;
-    ba::aln_meth_read_t result;
-    ba::aln_meth_occ_t exact{}; exact.cost=0; result.occ.push_back(exact);
-    ba::aln_meth_slot_t slot; slot.grp=&group; slot.job=&job; slot.res=&result;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm));
-    CHECK(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
-    job.e.info=(uint32_t)(opt->s_mm+1)<<21;
-    ba::gap_entry_t held={};
-    CHECK(ba::aln_meth_resume(&slot,&job,&held)==1);
-    CHECK(slot.flushed_score==opt->s_mm+1);
-    result.occ[0].cost=3;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot,6));
-    CHECK(ba::aln_meth_can_stop(&slot,7));
-    // A better result discovered while flushing lowers the necessary stratum boundary.
-    result.occ[0].cost=6; CHECK_FALSE(ba::aln_meth_can_stop(&slot,7));
-    CHECK(ba::aln_meth_can_stop(&slot,10));
-    result.occ[0].cost=3; CHECK(ba::aln_meth_can_stop(&slot,7));
-    job.opt.max_diff=1; CHECK_FALSE(ba::aln_meth_can_stop(&slot,7)); job.opt.max_diff=4;
-    job.opt.s_gapo=6; CHECK_FALSE(ba::aln_meth_can_stop(&slot,7)); job.opt.s_gapo=11;
-    result.occ[0].cost=INT_MAX; CHECK_FALSE(ba::aln_meth_can_stop(&slot,INT_MAX));
-    job.opt.s_mm=INT_MAX; job.opt.s_gapo=INT_MAX;
-    result.occ[0].cost=INT_MAX; CHECK_FALSE(ba::aln_meth_can_stop(&slot,INT_MAX));
-    job.opt.s_mm=3;job.opt.s_gapo=11;
-    // Completing score 3 must not suppress a later flush at 6/7 with a nonzero best.
-    slot.flushed_score=3; CHECK(ba::aln_meth_needs_flush(&slot,6));
-    job.e.info=6u<<21; result.occ[0].cost=3;
-    CHECK(ba::aln_meth_resume(&slot,&job,&held)==0);
-    CHECK_FALSE(ba::aln_meth_needs_flush(&slot,6));
-    CHECK(ba::aln_meth_needs_flush(&slot,7));
-    job.e.info=7u<<21; CHECK(ba::aln_meth_resume(&slot,&job,&held)==1);
-    result.occ[0].cost=0;
-    for (int flag : {ba::ALN_METH_BIND_BEST,ba::ALN_METH_BIND_M}) {
-        result.flags=flag; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
-    }
-    result.flags=0;
-    // A seeded read stops only on a stratum within the seed's difference limit (-k, 2 here).
-    ba::bwt_width_t seed={}; job.seed_width=&seed; REQUIRE(job.opt.max_seed_diff==2);
-    CHECK(ba::aln_meth_can_stop(&slot,opt->s_mm+1));     // best 0: one difference
-    result.occ[0].cost=3; CHECK_FALSE(ba::aln_meth_can_stop(&slot,6));
-    CHECK(ba::aln_meth_can_stop(&slot,7));                 // best 3: two differences
-    result.occ[0].cost=6; CHECK_FALSE(ba::aln_meth_can_stop(&slot,10)); // three: past -k
-    job.seed_width=nullptr; CHECK(ba::aln_meth_can_stop(&slot,10)); job.seed_width=&seed;
-    result.occ[0].cost=0; job.opt.max_seed_diff=1;
-    CHECK(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
-    result.occ[0].cost=3; CHECK_FALSE(ba::aln_meth_can_stop(&slot,7));
-    result.occ[0].cost=0; job.opt.max_seed_diff=0;
-    CHECK_FALSE(ba::aln_meth_stop_eligible(&slot)); CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
-    job.opt.max_seed_diff=2; job.seed_width=nullptr;
-    job.opt.mode|=BWA_MODE_NONSTOP; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
-    job.opt.mode&=~BWA_MODE_NONSTOP;
-    job.opt.max_diff=0; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1)); job.opt.max_diff=4;
-    job.opt.s_gapo=job.opt.s_mm; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
-    job.opt.s_gapo=11; job.opt.s_mm=0; CHECK_FALSE(ba::aln_meth_can_stop(&slot,1));
-    job.opt.s_mm=3; job.opt.s_gape=-1; CHECK_FALSE(ba::aln_meth_can_stop(&slot,4));
-    free(opt);
-}
-
 TEST_CASE("aln_meth: per-read ALT-window candidates survive duplicate compaction")
 {
     namespace ba = bwa_aln;
@@ -2942,57 +2873,6 @@ TEST_CASE("aln_meth: per-read ALT-window candidates survive duplicate compaction
         opt->seed_len = 18;
     }
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
-}
-
-TEST_CASE("aln_meth: known-site stop requires a strict valid same-read ALT certificate")
-{
-    namespace ba = bwa_aln;
-    auto *opt = ba::gap_init_opt();
-    ba::ks_sites_t sites; ba::aln_meth_ref_t ref; ref.known_snvs = &sites;
-    ba::aln_meth_group_t group; group.ref = &ref; group.opt = opt;
-    ba::gap_job_t job = {}; job.opt = *opt; job.opt.max_diff = 3;
-    ba::aln_meth_read_t res; ba::aln_meth_occ_t best = {}; best.cost = 0; res.occ.push_back(best);
-    ba::aln_meth_slot_t slot; slot.grp = &group; slot.job = &job; slot.res = &res; slot.len = 30;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 4)); // unavailable is not zero candidates
-    slot.alt_bound.valid = true; slot.alt_bound.value = 1;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 4)); // LB == d cannot certify
-    slot.alt_bound.value = 2;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 3)); // next == M*d cannot certify
-    CHECK(ba::aln_meth_can_stop(&slot, 4));
-    // No extras list is consulted: a competitive ALT can lie beyond the reference horizon.
-    ba::aln_meth_extra_t empty; slot.extra = &empty;
-    slot.alt_bound.value = 0; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
-    slot.alt_bound.value = 2;
-    for (int len : {0, 160, 161, 350}) {
-        slot.len = len; CHECK(ba::aln_meth_can_stop(&slot, 4) == (len == 160));
-    }
-    slot.len = 30;
-    for (int flag : {ba::ALN_METH_BIND_BEST, ba::ALN_METH_BIND_UNREP, ba::ALN_METH_BIND_CIGAR, ba::ALN_METH_BIND_M}) {
-        res.flags = flag; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
-    }
-    res.flags = 0;
-    ba::bwt_width_t seed = {}; job.seed_width = &seed;
-    CHECK(ba::aln_meth_can_stop(&slot, 4)); // d=1 fits the seed and LB=2 excludes ALT competitors
-    job.opt.max_seed_diff = 0; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
-    job.opt.max_seed_diff = 1; CHECK(ba::aln_meth_can_stop(&slot, 4)); // d == -k
-    slot.alt_bound.valid = false; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
-    slot.alt_bound.valid = true; slot.alt_bound.value = 1; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
-    slot.alt_bound.value = 3; res.occ[0].cost = 3; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); // d > -k
-    job.opt.max_seed_diff = 2; CHECK(ba::aln_meth_can_stop(&slot, 7));
-    res.occ[0].cost = 0; slot.alt_bound.value = 2;
-    for (int len : {0, 160, 161, 350}) {
-        slot.len = len; CHECK(ba::aln_meth_can_stop(&slot, 4) == (len == 160));
-    }
-    slot.len = 30; job.seed_width = nullptr;
-    job.opt.mode |= BWA_MODE_NONSTOP; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.mode &= ~BWA_MODE_NONSTOP;
-    job.opt.s_gapo = 3; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.s_gapo = 11;
-    for (int m : {0, -1}) { job.opt.s_mm = m; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); }
-    job.opt.s_mm = 3; job.opt.s_gape = -1; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.s_gape = 0;
-    job.opt.max_diff = 0; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.max_diff = 3;
-    job.opt.mode &= ~BWA_MODE_GAPE; CHECK(ba::aln_meth_can_stop(&slot, 4));
-    res.occ[0].cost = 3; slot.alt_bound.value = 2; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 7));
-    slot.alt_bound.value = 3; CHECK(ba::aln_meth_can_stop(&slot, 7));
-    free(opt);
 }
 
 TEST_CASE("aln_meth: the known-site search preserves independent REF plus ALT window strata")

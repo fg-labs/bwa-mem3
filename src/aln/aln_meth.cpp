@@ -141,36 +141,6 @@ uint64_t aln_meth_draw_seed(const aln_meth_ref_t *ref, int read_no, int64_t ord)
     splitmix64(&r);
     return r;
 }
-/* For current best B, retained cost T=B+M excludes gaps when T<O and E>=0.
- * Its raw CIGAR then has <=floor(T/M) strict mismatches. Every such equal-span
- * window has an ungapped converted proposal with no more mismatches: genuine
- * matches/conversions project identically and either N counts strictly regardless
- * of PAC fill. Unseeded discovery admitting that many differences proposes every
- * surviving window by score M*floor(T/M). Refine the entire stratum before stopping.
- * Seeding (reads longer than -l) admits at most -k differences in the seed, so a seeded
- * search proposes every such window only when floor(T/M) <= -k: no proposal with that
- * many mismatches in all can have more in its seed.
- * B can only decrease, so later flushes can only narrow the required stratum.
- * This bounds equivalent proposals, NOT the cost of arbitrary search histories. */
-bool aln_meth_can_stop(const aln_meth_slot_t *x, int next_score)
-{
-    const gap_job_t *job=x->job;
-    const gap_opt_t &opt=job->opt;
-    if (!aln_meth_stop_eligible(x) || x->res->occ.empty()) return false;
-    int64_t best=INT64_MAX;
-    for (const auto &o : x->res->occ) best=std::min(best,o.cost);
-    // Stored costs fit INT_MAX; widen before adding penalties or multiplying.
-    if (best<0 || best>INT_MAX) return false;
-    const int64_t retained=best+(int64_t)opt.s_mm;
-    if (retained>=opt.s_gapo) return false;
-    const int64_t differences=retained/opt.s_mm;
-    if (job->seed_width && differences>opt.max_seed_diff) return false;
-    // Every competitive raw alignment is ungapped. A same-read ALT bound
-    // strictly above its mismatch allowance rules out all omitted single-allele improvements.
-    if (x->grp->ref && x->grp->ref->known_snvs && x->alt_bound.value <= differences) return false;
-    return opt.max_diff>=differences && (int64_t)next_score>differences*opt.s_mm;
-}
-
 // e's gaps (see ALN_METH_GAP) into gap[0, e.n_gapo)
 static void entry_gaps(const aln_meth_slot_t *x, const gap_entry_t &e, uint32_t *gap)
 {
@@ -392,7 +362,6 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->p = p; x->res = res; x->len = p->len; x->max_diff = max_diff;
     x->keep = has_copy ? ALN_METH_KEEP_COPIES : x->grp->keep_strata ? ALN_METH_KEEP_STRATA : 0;
     *res = aln_meth_read_t();
-    x->alt_bound = aln_meth_alt_bound_t();
     x->rng = aln_meth_draw_seed(x->grp->ref, x->grp->read_no, ord);
     x->vseq.resize(p->len); x->rd_fwd.resize(p->len); x->rd_rev.resize(p->len);
     aln_meth_convert(x->grp->read_no, p->seq, p->len, x->vseq.data());
