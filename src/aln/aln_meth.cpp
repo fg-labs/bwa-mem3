@@ -1044,17 +1044,26 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
     if (!nonstop) for (const auto &o : r->occ) if (o.cost == best) ceiling = std::min(ceiling, diffs(o) + 1);
     // A dropped candidate that could be a best or retained worse locus leaves X0/X1 unknown.
     if (r->n_unrepresentable && x->unrep_cost <= cut) r->flags |= ALN_METH_BIND_UNREP;
-    std::vector<aln_meth_occ_t> keep;
-    for (auto &o : r->occ) {
+    // The retained loci in (rid, hyp, strand, pos) order. Their keys are sorted with their indexes
+    // and each locus is moved once. std::sort makes the same comparisons and the same permutation
+    // as sorting the loci themselves, so the order matches it, ties included.
+    struct order_t { int rid, hyp, strand; bwtint_t pos; uint32_t i; };
+    std::vector<order_t> order;
+    order.reserve(r->occ.size());
+    for (size_t i = 0; i < r->occ.size(); ++i) {
+        const aln_meth_occ_t &o = r->occ[i];
         if (o.cost > cut || diffs(o) > ceiling) continue;
         if (o.drawn) {} // a drawn primary is placed, not counted: X0 stays the verified count
         else if (o.cost == best) ++r->c1;
         else ++r->c2; // stock c2 counts every retained worse cost, not only the next distinct one
-        keep.push_back(std::move(o));
+        order.push_back(order_t{o.rid, o.hyp, o.strand, o.pos, (uint32_t)i});
     }
-    std::sort(keep.begin(), keep.end(), [](const aln_meth_occ_t &a, const aln_meth_occ_t &b) {
+    std::sort(order.begin(), order.end(), [](const order_t &a, const order_t &b) {
         return std::make_tuple(a.rid, a.hyp, a.strand, a.pos) < std::make_tuple(b.rid, b.hyp, b.strand, b.pos);
     });
+    std::vector<aln_meth_occ_t> keep;
+    keep.reserve(order.size());
+    for (const order_t &k : order) keep.push_back(std::move(r->occ[k.i]));
     r->occ.swap(keep); r->main = 0;
     if (conv_tiebreak(x->grp->mo) && !r->flags) {
         int fewest = INT_MAX, gap = INT_MAX;
