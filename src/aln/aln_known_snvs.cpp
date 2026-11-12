@@ -19,10 +19,13 @@
 #include <algorithm>
 #include <climits>
 #include <cstdlib>
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <unordered_map>
+#include <sys/stat.h>
+#include <unistd.h>
 
 namespace bwa_aln {
 
@@ -216,8 +219,200 @@ void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, 
 	*conv_pac = p;
 }
 
+namespace {
+
+/* --known-snvs-cache: the ALT-window FM-index on disk. The FM arrays are a function of the text
+ * libsais indexes (the packed windows, converted under --meth) and the SA sample rate only, so the
+ * file is keyed on a 128-bit hash of exactly that text, its length, the sample rate, the mode and
+ * the array layout. A file whose key, sizes or payload checksum do not match is not used: the
+ * index is built in memory, as without the option, and the file rewritten. */
+constexpr char KS_CACHE_MAGIC[8] = {'B', 'M', '3', 'K', 'S', 'W', 'I', 'X'};
+constexpr uint64_t KS_CACHE_VERSION = 1;
+constexpr uint64_t KS_CACHE_ENDIAN = 0x0102030405060708ULL;
+
+struct ks_cache_hdr_t {
+	char magic[8];
+	uint64_t version, endian;
+	uint64_t key[2];          // ks_text_key
+	int64_t l_text, sa_compx, meth, sizeof_cp_occ;
+	int64_t ref_seq_len, count[5], sentinel_index;
+	int64_t cp_occ_count, sa_sample_count;
+};
+
+inline uint64_t rotl64(uint64_t x, int r) { return (x << r) | (x >> (64 - r)); }
+
+/* A 64-bit hash of n bytes (four multiply-rotate lanes over 8-byte words, then the tail and the
+ * length): a checksum against stale or damaged files, not a cryptographic one. */
+uint64_t ks_hash(const void *data, size_t n, uint64_t seed)
+{
+	const uint64_t P1 = 0x9e3779b185ebca87ULL, P2 = 0xc2b2ae3d27d4eb4fULL, P3 = 0x165667b19e3779f9ULL;
+	const uint8_t *b = (const uint8_t *)data;
+	uint64_t v[4] = {seed + P1 + P2, seed + P2, seed, seed - P1};
+	size_t i = 0;
+	for (; i + 32 <= n; i += 32)
+		for (int k = 0; k < 4; ++k) {
+			uint64_t w;
+			memcpy(&w, b + i + 8 * k, 8);
+			v[k] = rotl64(v[k] + w * P2, 31) * P1;
+		}
+	uint64_t h = rotl64(v[0], 1) + rotl64(v[1], 7) + rotl64(v[2], 12) + rotl64(v[3], 18);
+	for (int k = 0; k < 4; ++k) h = (h ^ (rotl64(v[k] * P2, 31) * P1)) * P1 + P3;
+	for (; i < n; ++i) h = rotl64(h ^ (b[i] * P3), 11) * P1;
+	h ^= (uint64_t)n;
+	h = (h ^ (h >> 30)) * 0xbf58476d1ce4e5b9ULL;
+	h = (h ^ (h >> 27)) * 0x94d049bb133111ebULL;
+	return h ^ (h >> 31);
+}
+
+void ks_text_key(const uint8_t *text, int64_t l_text, int sa_compx, int meth, uint64_t key[2])
+{
+	const size_t n = (size_t)(l_text + 3) / 4; // the packed bases; later bits are zero
+	const int64_t param[4] = {l_text, sa_compx, meth, (int64_t)sizeof(CP_OCC)};
+	for (int h = 0; h < 2; ++h) {
+		uint64_t k = ks_hash(text, n, h ? 0x6b73636163686532ULL : 0x6b73636163686531ULL);
+		key[h] = ks_hash(param, sizeof param, k);
+	}
+}
+
+/* Reads the cached arrays for the text with this key into *out (as MemSink allocates them).
+ * Returns 0, or -1 with the reason in *why (no file, or a file not used). */
+int ks_cache_load(const char *path, const uint64_t key[2], int64_t l_text, int sa_compx, int meth, FmArrays *out,
+				  std::string *why)
+{
+	FILE *fp = fopen(path, "rb");
+	if (!fp) { *why = errno == ENOENT ? "no file yet" : strerror(errno); return -1; }
+	struct closer { FILE *f; ~closer() { fclose(f); } } c{fp};
+	ks_cache_hdr_t h;
+	if (fread(&h, sizeof h, 1, fp) != 1) { *why = "short header"; return -1; }
+	if (memcmp(h.magic, KS_CACHE_MAGIC, 8) != 0) { *why = "not an ALT-window index"; return -1; }
+	if (h.version != KS_CACHE_VERSION || h.endian != KS_CACHE_ENDIAN || h.sizeof_cp_occ != (int64_t)sizeof(CP_OCC)) {
+		*why = "another format version";
+		return -1;
+	}
+	if (h.key[0] != key[0] || h.key[1] != key[1] || h.l_text != l_text || h.sa_compx != sa_compx || h.meth != meth) {
+		*why = "stale (built for other sites, reference or options)";
+		return -1;
+	}
+	if (h.ref_seq_len != 2 * l_text + 1 || h.sa_compx < 0 || h.sa_compx > CP_SHIFT) { *why = "bad header"; return -1; }
+	const Bwt2bitLayout L = fmi_bwt2bit_layout(h.ref_seq_len, (int)h.sa_compx);
+	if (h.cp_occ_count != L.cp_occ_count || h.sa_sample_count != L.sa_sample_count) { *why = "bad header"; return -1; }
+	const size_t n_cp = (size_t)L.cp_occ_count * sizeof(CP_OCC), n_ms = (size_t)L.sa_sample_count,
+				 n_ls = (size_t)L.sa_sample_count * sizeof(uint32_t);
+	struct stat st;
+	if (fstat(fileno(fp), &st) != 0 || (uint64_t)st.st_size != sizeof h + n_cp + n_ms + n_ls + sizeof(uint64_t)) {
+		*why = "truncated or oversized";
+		return -1;
+	}
+	FmArrays a;
+	a.cp_occ = (CP_OCC *)_mm_malloc(n_cp, 64);
+	a.sa_ms_byte = (int8_t *)_mm_malloc(n_ms, 64);
+	a.sa_ls_word = (uint32_t *)_mm_malloc(n_ls, 64);
+	if (!a.cp_occ || !a.sa_ms_byte || !a.sa_ls_word) { *why = "out of memory"; return -1; }
+	uint64_t sum = 0;
+	if (fread(a.cp_occ, 1, n_cp, fp) != n_cp || fread(a.sa_ms_byte, 1, n_ms, fp) != n_ms ||
+		fread(a.sa_ls_word, 1, n_ls, fp) != n_ls || fread(&sum, sizeof sum, 1, fp) != 1) {
+		*why = "read error";
+		return -1;
+	}
+	uint64_t want = ks_hash(&h, sizeof h, 0);
+	want = ks_hash(a.cp_occ, n_cp, want);
+	want = ks_hash(a.sa_ms_byte, n_ms, want);
+	want = ks_hash(a.sa_ls_word, n_ls, want);
+	if (sum != want) { *why = "checksum mismatch (damaged)"; return -1; }
+	// counts and the sentinel are range-checked again by adopt_built
+	out->ref_seq_len = h.ref_seq_len;
+	for (int i = 0; i < 5; ++i) out->count[i] = h.count[i];
+	out->sentinel_index = h.sentinel_index;
+	out->sa_compx = (int)h.sa_compx;
+	std::swap(out->cp_occ, a.cp_occ);
+	std::swap(out->sa_ms_byte, a.sa_ms_byte);
+	std::swap(out->sa_ls_word, a.sa_ls_word);
+	return 0;
+}
+
+/* Writes the arrays to a unique temporary beside path and renames it over path, so a reader sees
+ * the old file or the new one. Returns 0, or -1 with the reason in *why (nothing left behind). */
+int ks_cache_save(const char *path, const uint64_t key[2], int64_t l_text, int meth, const FmArrays &a,
+				  std::string *why)
+{
+	ks_cache_hdr_t h;
+	memset(&h, 0, sizeof h);
+	memcpy(h.magic, KS_CACHE_MAGIC, 8);
+	h.version = KS_CACHE_VERSION;
+	h.endian = KS_CACHE_ENDIAN;
+	h.key[0] = key[0];
+	h.key[1] = key[1];
+	h.l_text = l_text;
+	h.sa_compx = a.sa_compx;
+	h.meth = meth;
+	h.sizeof_cp_occ = (int64_t)sizeof(CP_OCC);
+	h.ref_seq_len = a.ref_seq_len;
+	for (int i = 0; i < 5; ++i) h.count[i] = a.count[i];
+	h.sentinel_index = a.sentinel_index;
+	const Bwt2bitLayout L = fmi_bwt2bit_layout(a.ref_seq_len, a.sa_compx);
+	h.cp_occ_count = L.cp_occ_count;
+	h.sa_sample_count = L.sa_sample_count;
+	const size_t n_cp = (size_t)L.cp_occ_count * sizeof(CP_OCC), n_ms = (size_t)L.sa_sample_count,
+				 n_ls = (size_t)L.sa_sample_count * sizeof(uint32_t);
+	uint64_t sum = ks_hash(&h, sizeof h, 0);
+	sum = ks_hash(a.cp_occ, n_cp, sum);
+	sum = ks_hash(a.sa_ms_byte, n_ms, sum);
+	sum = ks_hash(a.sa_ls_word, n_ls, sum);
+	std::string tmp = std::string(path) + ".XXXXXX";
+	std::vector<char> tmpl(tmp.begin(), tmp.end());
+	tmpl.push_back('\0');
+	const int fd = mkstemp(tmpl.data());
+	if (fd < 0) { *why = strerror(errno); return -1; }
+	tmp = tmpl.data();
+	FILE *fp = fdopen(fd, "wb");
+	if (!fp) { *why = strerror(errno); close(fd); unlink(tmp.c_str()); return -1; }
+	const mode_t mask = umask(0); // mkstemp makes the file 0600: give it a new file's mode instead
+	umask(mask);
+	bool ok = fchmod(fd, 0666 & ~mask) == 0 && fwrite(&h, sizeof h, 1, fp) == 1 && fwrite(a.cp_occ, 1, n_cp, fp) == n_cp &&
+			  fwrite(a.sa_ms_byte, 1, n_ms, fp) == n_ms && fwrite(a.sa_ls_word, 1, n_ls, fp) == n_ls &&
+			  fwrite(&sum, sizeof sum, 1, fp) == 1 && fflush(fp) == 0;
+	if (!ok) *why = strerror(errno);
+	if (fclose(fp) != 0 && ok) { ok = false; *why = strerror(errno); }
+	if (ok && rename(tmp.c_str(), path) != 0) { ok = false; *why = strerror(errno); }
+	if (!ok) { unlink(tmp.c_str()); return -1; }
+	return 0;
+}
+
+/* The FM arrays of text (l_text bases, forward only): from cache_path when it holds them, else
+ * built in memory (then written to cache_path, when given). *loaded: whether they came from the
+ * file. Returns libsais_build_fm_memory's status (0 on success). */
+int ks_index_text(const uint8_t *text, int64_t l_text, const LibsaisBuildOpts &bo, int meth, const char *cache_path,
+				  FmArrays *out, bool *loaded)
+{
+	*loaded = false;
+	uint64_t key[2] = {0, 0};
+	if (cache_path) {
+		ks_text_key(text, l_text, bo.sa_compx, meth, key);
+		std::string why;
+		if (ks_cache_load(cache_path, key, l_text, bo.sa_compx, meth, out, &why) == 0) {
+			*loaded = true;
+			return 0;
+		}
+		if (bwa_verbose >= 3)
+			fprintf(stderr, "[M::aln] --known-snvs-cache: not using '%s' (%s); building the ALT-window index\n",
+					cache_path, why.c_str());
+	}
+	const int rc = libsais_build_fm_memory(text, l_text, bo, out);
+	if (rc != 0 || !cache_path) return rc;
+	std::string why;
+	if (ks_cache_save(cache_path, key, l_text, meth, *out, &why) != 0) {
+		if (bwa_verbose >= 2)
+			fprintf(stderr, "[W::aln] --known-snvs-cache: cannot write '%s' (%s); the index is used from memory\n",
+					cache_path, why.c_str());
+	} else if (bwa_verbose >= 3)
+		fprintf(stderr, "[M::aln] --known-snvs-cache: wrote the ALT-window index to '%s'\n", cache_path);
+	return 0;
+}
+
+} // namespace
+
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
-					 int meth, ks_windows_t *out)
+					 int meth, ks_windows_t *out, const char *cache_path)
 {
 	ks_windows_free(out);
 	for (int rid = 0; rid < (int)sites->by_contig.size(); ++rid) {
@@ -239,7 +434,9 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 		bntseq_t *cbns = nullptr;
 		uint8_t *cpac = nullptr;
 		ks_windows_meth_convert(wbns, wpac, &cbns, &cpac);
-		const int rc = libsais_build_fm_memory(cpac, cbns->l_pac, bo, &arrays);
+		bool loaded = false;
+		const int rc = ks_index_text(cpac, cbns->l_pac, bo, 1, cache_path, &arrays, &loaded);
+		out->from_cache = loaded;
 		free(cpac);
 		if (rc != 0) {
 			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows (status %d)\n", rc);
@@ -260,7 +457,9 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 		out->mref->no_cut = 1;
 		out->bns = out->mref->bns;
 	} else {
-		const int rc = libsais_build_fm_memory(wpac, wbns->l_pac, bo, &arrays);
+		bool loaded = false;
+		const int rc = ks_index_text(wpac, wbns->l_pac, bo, 0, cache_path, &arrays, &loaded);
+		out->from_cache = loaded;
 		if (rc != 0) {
 			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows (status %d)\n", rc);
 			bns_destroy(wbns);

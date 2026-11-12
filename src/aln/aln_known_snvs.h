@@ -62,15 +62,20 @@ struct ks_windows_t {
 	bwt_t *bwt = nullptr;
 	const bntseq_t *bns = nullptr;       // the window index's contigs (one per window)
 	struct aln_meth_ref_t *mref = nullptr; // --meth: the windows' converted index as a reference
+	bool from_cache = false;               // the FM-index was read from --known-snvs-cache
 };
 
 /* Builds one window per site allele from `pac` (its stored bases, so N runs carry the main index's
  * fill) and indexes them in memory: the windows as a forward-only reference (ks_windows_ref), the
  * FM-index from libsais, adopted by an FMI_search. Under `meth` the FM-index is built over the
  * converted windows (ks_windows_meth_convert) and `mref` holds the original windows; no
- * original-alphabet window index is built. Returns 0, or -1 with an error on stderr. */
+ * original-alphabet window index is built. With `cache_path` the FM-index is read from that file
+ * when it was written for the same indexed text (a 128-bit hash of it, its length, the SA sample
+ * rate and the mode) and passes its checksum; otherwise it is built as above and the file
+ * rewritten (a failed write is a warning). Either way the index is the same. Returns 0, or -1 with
+ * an error on stderr. */
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
-					 int meth, ks_windows_t *out);
+					 int meth, ks_windows_t *out, const char *cache_path = nullptr);
 
 /* The windows as a forward-only reference: bns (one contig `w<i>` per window, no ambiguity
  * holes, fields as bns_restore gives for today's windows.fa) and pac (l_pac/4+1 bytes, as
