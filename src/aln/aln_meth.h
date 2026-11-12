@@ -90,8 +90,9 @@ struct aln_meth_alignment_t {
     std::vector<uint32_t> raw_cigar, cigar;
 };
 /* A final locus is (original contig, hypothesis, strand, normalized start). All windows
- * reaching it compete by cost, then neutral TAPS conversion count when enabled,
- * then normalized CIGAR/end and raw CIGAR for deterministic ties.
+ * reaching it compete by cost, then stock differences, then neutral TAPS conversion count when
+ * enabled, then (--known-snvs) the reference before a site allele and the lower site key, then
+ * normalized CIGAR/end and raw CIGAR for deterministic ties (aln_meth_row_better).
  * Counts/cost describe the raw scored alignment, before terminal display normalization. */
 struct aln_meth_occ_t {
     bwtint_t pos;

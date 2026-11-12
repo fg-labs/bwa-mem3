@@ -264,6 +264,14 @@ int aln_meth_gap_arena(aln_meth_slot_t *, const gap_entry_t &p, bool ext, uint32
 // has_copy: the read has duplicate copies that will redraw over its loci.
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
+/* Whether row a is a better row for its locus than b: lower stock cost; then fewer stock
+ * differences (mismatches and gap opens, and gap extensions under gape), so that the locus keeps,
+ * among its rows at the best cost, one with the differences the search's top-2 ceiling counted
+ * (store_row's best_d), and the finish's ceiling, taken from the stored rows, is the search's;
+ * then, under the TAPS/5base tie-break (conversions), fewer conversions; then (--known-snvs) the
+ * reference before a site allele, and the lower aln_site_key; then the normalized and raw CIGARs and
+ * the end, for a deterministic order. */
+bool aln_meth_row_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, bool conversions, bool gape);
 /* A search path's gap differences inside the seed (above seed_off), counted from its gap events
  * (ALN_METH_GAP), and the same count from the path as a layout (meth_layout), as an ALT-window
  * candidate's CIGAR gives it. The two must agree: -k treats both kinds of row alike. */

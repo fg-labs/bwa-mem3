@@ -564,4 +564,25 @@ TEST_CASE("aln_ks_cuts: plain aln: overlapping ALT windows count one locus once 
     window_overlap_case(false);
 }
 
+TEST_CASE("aln_ks_cuts: neutral conversion ties retain the better one-ALT haplotype")
+{
+    uint32_t st = 20261113;
+    std::string read = no_c(st, 60); read[35] = 'T';
+    std::string c1 = aln_test::lcg_dna(st, 6000);
+    const int a = 1000, b = 3500;
+    c1.replace(a, read.size(), read); c1[a + 35] = 'C';
+    c1.replace(b, read.size(), read);
+    const KsCase k(c1, {{a + 35, 'C', "T", 'T'}}, {read});
+    for (const std::string chem : {"--meth=5base", "--meth=taps"}) {
+        const auto got = k.run({chem, "--meth-scoring", "neutral", "-n", "3", "--known-snvs", k.vcf}, k.ref, chem + ".ks");
+        const auto oracle = k.run({chem, "--meth-scoring", "neutral", "-n", "3"}, k.oracle, chem + ".oracle");
+        REQUIRE(got.size() == 1); REQUIRE(oracle.size() == 1);
+        CAPTURE(chem); CAPTURE(summary(got[0])); CAPTURE(summary(oracle[0]));
+        CHECK(tag(oracle[0], "X0:i") == "2"); CHECK(oracle[0][4] == "0");
+        CHECK(tag(got[0], "X0:i") == tag(oracle[0], "X0:i"));
+        CHECK(tag(got[0], "X1:i") == tag(oracle[0], "X1:i"));
+        CHECK(got[0][4] == oracle[0][4]);
+    }
+}
+
 TEST_SUITE_END();
