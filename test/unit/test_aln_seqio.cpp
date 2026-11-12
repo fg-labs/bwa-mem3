@@ -1,0 +1,302 @@
+// Unit tests for the bwa read-input port (src/aln/bwaseqio.{h,cpp}): name, comment,
+// barcode and quality-trimming rules of bwa_read_seq.
+
+#include "doctest/doctest.h"
+
+#include "../../src/aln/bwaseqio.h"
+#include "stderr_capture.h"
+#include "../framework/temp_dir.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <unistd.h>
+
+namespace {
+
+namespace ba = bwa_aln;
+
+struct Rec {
+    std::string name, comment, seq, qual;
+};
+
+// Writes a FASTQ into its own scratch directory, removed with the file on destruction.
+struct TmpFastq {
+    bwa_tests::TempDir dir{"aln_seqio"};
+    std::string path = dir.file("r.fq");
+    explicit TmpFastq(const std::vector<Rec> &recs) {
+        std::string text;
+        for (const Rec &r : recs)
+            text += "@" + r.name + (r.comment.empty() ? "" : " ") + r.comment + "\n" + r.seq + "\n+\n" + r.qual + "\n";
+        dir.write("r.fq", text); // throws on a short write
+    }
+};
+
+Rec rec(const std::string &name, const std::string &seq, const std::string &qual,
+        const std::string &comment = "") {
+    return Rec{name, comment, seq, qual};
+}
+
+std::vector<int> codes(const ba::ubyte_t *p, int n) {
+    return std::vector<int>(p, p + n);
+}
+
+}  // namespace
+
+TEST_SUITE("unit/aln_seqio") {
+
+TEST_CASE("aln_seqio: only a trailing /1 or /2 is trimmed") {
+    std::vector<Rec> recs;
+    for (const char *n : {"r/1", "r/2", "r/3", "r_1", "r/12"}) recs.push_back(rec(n, "ACGT", "IIII"));
+    TmpFastq f(recs);
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, 0, 0);
+    REQUIRE(n == 5);
+    CHECK(std::string(s[0].name) == "r");
+    CHECK(std::string(s[1].name) == "r");
+    CHECK(std::string(s[2].name) == "r/3");
+    CHECK(std::string(s[3].name) == "r_1");
+    CHECK(std::string(s[4].name) == "r/12");
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: -Y skips reads whose comment's first field after ':' is Y") {
+    TmpFastq f({rec("a", "ACGT", "IIII", "1:Y:0:ACGT"), rec("b", "ACGT", "IIII", "1:N:0:ACGT"),
+                rec("c", "ACGT", "IIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, BWA_MODE_CFY, 0);
+    REQUIRE(n == 2);
+    CHECK(std::string(s[0].name) == "b");
+    CHECK(std::string(s[1].name) == "c");
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: -I subtracts 31 from every quality before trimming") {
+    // "b": '@' is Q31 as Phred+33 but Q0 after the -31 shift, so with -q 20 it trims to the
+    // 35-base minimum only if the conversion runs first (trimming first would keep all 50).
+    TmpFastq f({rec("a", "ACGT", "hhhh"), rec("b", std::string(50, 'A'), std::string(50, '@'))});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, BWA_MODE_IL13, 20);
+    REQUIRE(n == 2);
+    CHECK(std::string((const char *)s[0].qual) == "IIII");
+    CHECK((int)s[1].len == 35);
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: -B 4 lower-cases barcode bases with qual-33 < 13 and drops len <= 4") {
+    TmpFastq f({rec("a", "ACGTAAAA", "#I#IIIII"), rec("b", "ACGT", "IIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, 4 << 24, 0);
+    REQUIRE(n == 1);
+    CHECK(std::string(s[0].bc) == "aCgT");
+    CHECK((int)s[0].len == 4);
+    CHECK((int)s[0].full_len == 4);
+    CHECK(std::string((const char *)s[0].qual) == "IIII");
+    // seq is stored reversed: the remaining "AAAA" is all zeros.
+    CHECK(codes(s[0].seq, 4) == std::vector<int>({0, 0, 0, 0}));
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: -q never trims below 35 bp") {
+    TmpFastq f({rec("a", std::string(50, 'A'), std::string(50, '#'))});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, 0, 20);
+    REQUIRE(n == 1);
+    CHECK((int)s[0].len == 35);
+    CHECK((int)s[0].full_len == 50);
+    CHECK(s[0].clip_len == 35);
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: seq is stored reversed, rseq reversed-and-complemented when COMPREAD") {
+    TmpFastq f({rec("a", "AACG", "IIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1);
+    CHECK(codes(s[0].seq, 4) == std::vector<int>({2, 1, 0, 0}));
+    CHECK(codes(s[0].rseq, 4) == std::vector<int>({1, 2, 3, 3}));
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: lowercase maps like uppercase, IUPAC maps to 4") {
+    TmpFastq f({rec("a", "acgtRYN", "IIIIIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, 0, 0);
+    REQUIRE(n == 1);
+    CHECK(codes(s[0].seq, 7) == std::vector<int>({4, 4, 4, 3, 2, 1, 0}));
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: batches stop at n_needed kept reads") {
+    std::vector<Rec> recs;
+    for (int i = 0; i < 5; ++i) recs.push_back(rec("r" + std::to_string(i), "ACGT", "IIII"));
+    TmpFastq f(recs);
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    std::vector<int> sizes;
+    std::vector<std::string> names;
+    for (;;) {
+        int n = 0;
+        ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 2, &n, 0, 0);
+        if (s == nullptr) {
+            CHECK(n == 0);
+            break;
+        }
+        sizes.push_back(n);
+        for (int i = 0; i < n; ++i) names.emplace_back(s[i].name);
+        ba::bwa_free_read_seq(n, s);
+    }
+    CHECK(sizes == std::vector<int>({2, 2, 1}));
+    // each read exactly once, in input order: sizes alone would pass with a duplicate and a loss
+    CHECK(names == std::vector<std::string>({"r0", "r1", "r2", "r3", "r4"}));
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: empty file returns NULL with n == 0") {
+    TmpFastq f({});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = -1;
+    CHECK(ba::bwa_read_seq(bs, 0x40000, &n, 0, 0) == nullptr);
+    CHECK(n == 0);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: a barcode longer than BWA_MAX_BCLEN is refused, counted and stops reading") {
+    // Not reachable from the CLI (main_aln refuses -B above the limit), but a caller of the
+    // public entry point must see n == 0 and a failure, not a clean end of file.
+    TmpFastq f({rec("r1", "ACGTACGTAC", "IIIIIIIIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = -1;
+    CHECK(ba::bwa_read_seq(bs, 0x40000, &n, (BWA_MAX_BCLEN + 1) << 24, 0) == nullptr);
+    CHECK(n == 0);
+    CHECK(ba::bwa_seq_n_bad(bs) == 1);
+    n = -1;
+    CHECK(ba::bwa_read_seq(bs, 0x40000, &n, 0, 0) == nullptr); // reading has stopped
+    CHECK(n == 0);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: a malformed record ends the batch as in bwa and is counted") {
+    // r1's quality is shorter than its sequence: kseq_read returns -2, which stock's loop treats
+    // as the end of the batch. The batch is unchanged here; the record is now counted, so the
+    // driver can exit 1 after writing the same records.
+    TmpFastq f({rec("r0", "ACGTACGT", "IIIIIIII"), rec("r1", "ACGTACGT", "III"), rec("r2", "ACGTACGT", "IIIIIIII"),
+                rec("r3", "ACGTACGT", "IIIIIIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    REQUIRE(bs != nullptr);
+    CHECK(ba::bwa_seq_n_bad(bs) == 0);
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 10, &n, 0, 0);
+    REQUIRE(s != nullptr);
+    CHECK(n == 1);
+    CHECK(std::string(s[0].name) == "r0");
+    CHECK(ba::bwa_seq_n_bad(bs) == 1);
+    ba::bwa_free_read_seq(n, s);
+    // reading resumes after the bad record, as before: r1's short quality took r2's header and
+    // sequence lines, so the next record is r3 and it is the only one left
+    std::vector<std::string> names;
+    while ((s = ba::bwa_read_seq(bs, 10, &n, 0, 0)) != nullptr) {
+        for (int i = 0; i < n; ++i) names.emplace_back(s[i].name);
+        ba::bwa_free_read_seq(n, s);
+    }
+    CHECK(names == std::vector<std::string>{"r3"});
+    CHECK(ba::bwa_seq_n_bad(bs) == 1);
+    CHECK(ba::bwa_seq_close(bs) == 0);
+}
+
+TEST_CASE("aln_seqio: a later malformed record is numbered counting the earlier one") {
+    // valid, malformed, valid, malformed: the second malformed record is record 4. The bad
+    // qualities are longer than the sequence (a shorter one would take the next record's lines
+    // as more quality, swallowing it).
+    TmpFastq f({rec("r0", "ACGTACGT", "IIIIIIII"), rec("r1", "ACGTACGT", "IIIIIIIIII"), rec("r2", "ACGTACGT", "IIIIIIII"),
+                rec("r3", "ACGTACGT", "IIIIIIIIIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    REQUIRE(bs != nullptr);
+    bwa_tests::StderrCapture cap;
+    int n = 0;
+    ba::bwa_seq_t *s;
+    while ((s = ba::bwa_read_seq(bs, 10, &n, 0, 0)) != nullptr) ba::bwa_free_read_seq(n, s);
+    const std::string err = cap.text();
+    CHECK(err.find("record 2 is malformed") != std::string::npos);
+    CHECK(err.find("record 4 is malformed") != std::string::npos);
+    CHECK(ba::bwa_seq_n_bad(bs) == 2);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: a base byte with the high bit set maps to 4") {
+    TmpFastq f({rec("a", std::string("AC") + (char)0xC3 + "T", "IIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, 0, 0);
+    REQUIRE(n == 1);
+    CHECK(codes(s[0].seq, 4) == std::vector<int>({3, 4, 1, 0})); // stored reversed
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: a batch size below 1 reads nothing") {
+    TmpFastq f({rec("a", "ACGT", "IIII")});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = -1;
+    bwa_tests::QuietStderr quiet;
+    CHECK(ba::bwa_read_seq(bs, 0, &n, 0, 0) == nullptr);
+    CHECK(n == 0);
+    ba::bwa_seq_close(bs);
+}
+
+TEST_CASE("aln_seqio: a missing file gives NULL instead of exiting") {
+    bwa_tests::StderrCapture cap;
+    CHECK(ba::bwa_seq_open("/nonexistent/aln_seqio_missing.fq") == nullptr);
+    CHECK(cap.text().find("aln_seqio_missing.fq") != std::string::npos);
+}
+
+// len and full_len are 20-bit fields and the search packs 16 bits, so a read above 65,535 bases
+// must be refused before it is stored. 1,048,676 bases would wrap to a 100-base read.
+TEST_CASE("aln_seqio: a read longer than 65535 bases is refused before it is stored") {
+    for (const size_t big : {(size_t)65536, (size_t)1048676}) {
+        CAPTURE(big);
+        TmpFastq f({rec("a", "ACGTA", "IIIII"), rec("big", std::string(big, 'A'), std::string(big, 'I')),
+                    rec("c", "ACGTA", "IIIII")});
+        ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+        bwa_tests::StderrCapture cap;
+        int n = 0;
+        ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, 0, 0);
+        REQUIRE(n == 1); // the read before it, and nothing after
+        CHECK(std::string(s[0].name) == "a");
+        ba::bwa_free_read_seq(n, s);
+        CHECK(ba::bwa_read_seq(bs, 0x40000, &n, 0, 0) == nullptr); // reading has stopped
+        CHECK(n == 0);
+        CHECK(ba::bwa_seq_n_bad(bs) == 1);
+        CHECK(cap.text().find("record 2 has " + std::to_string(big) + " bases; the maximum is 65535") != std::string::npos);
+        ba::bwa_seq_close(bs);
+    }
+}
+
+TEST_CASE("aln_seqio: a read of exactly 65535 bases is accepted") {
+    TmpFastq f({rec("max", std::string(65535, 'C'), std::string(65535, 'I'))});
+    ba::bwa_seqio_t *bs = ba::bwa_seq_open(f.path.c_str());
+    int n = 0;
+    ba::bwa_seq_t *s = ba::bwa_read_seq(bs, 0x40000, &n, 0, 0);
+    REQUIRE(n == 1);
+    CHECK((int)s[0].len == 65535);
+    CHECK((int)s[0].full_len == 65535);
+    CHECK(ba::bwa_seq_n_bad(bs) == 0);
+    ba::bwa_free_read_seq(n, s);
+    ba::bwa_seq_close(bs);
+}
+
+} // TEST_SUITE
