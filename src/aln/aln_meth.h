@@ -121,11 +121,6 @@ struct aln_meth_hit_t {
 static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record");
 // incomplete: lookup budget, an unrepresentable competitor, CIGAR storage, -m work budget
 enum { ALN_METH_BIND_BEST = 1, ALN_METH_BIND_UNREP = 2, ALN_METH_BIND_CIGAR = 4, ALN_METH_BIND_M = 8 };
-// A same-read ALT-index lower bound; an unavailable bound must never authorize stopping.
-struct aln_meth_alt_bound_t {
-    int value = 0;
-    bool valid = false;
-};
 /* A complete read whose row work ended on a saturation certificate (aln_meth_read_t::cert), taken
  * once its best stratum is complete: REPEAT, more than -R loci at the best cost (X0 their full
  * count, MAPQ 0); CROWDED, a unique best and at least ALN_METH_CROWDED retained worse loci (X1 is

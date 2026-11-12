@@ -13,7 +13,6 @@
 #include "aln_meth_prove.h"
 #include <vector>
 #include "bwtgap.h"
-#include "aln_known_snvs.h"
 namespace bwa_aln {
 // SA rows a read resolves at the flush that binds its lookup budget (at most what is left of it),
 // to pick its best-known placement: that flush makes the read incomplete either way.
@@ -185,7 +184,6 @@ struct aln_meth_slot_t {
     int bits_ready = 0;
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const aln_meth_extra_t *extra = nullptr;
-    aln_meth_alt_bound_t alt_bound; // ALT-index lower bound, not the genomic width
     // the ordinals of the read's duplicate copies (their draws are made here, aln_meth_slot_finish)
     const std::vector<int64_t> *copy_ords = nullptr;
     // Scratch: the reference window of the candidate being resolved (refined, then accounted), and
@@ -203,23 +201,13 @@ struct aln_meth_group_t {
     std::vector<aln_meth_slot_t> slot;
     gap_slot_core_t *cores = nullptr;
 };
-// These guards do not depend on candidates that the next flush might discover. A seeded read
-// (longer than -l) can stop only once its stratum fits the seed's difference limit (-k), which
-// aln_meth_can_stop checks against the best cost; -k 0 never can.
-static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
-    const gap_opt_t &opt=x->job->opt;
-    return opt.s_mm>0 && opt.s_gape>=0 && opt.s_gapo>opt.s_mm &&
-        !(opt.mode&BWA_MODE_NONSTOP) && (!x->job->seed_width || opt.max_seed_diff>0) && !x->res->flags &&
-        (!(x->grp->ref && x->grp->ref->known_snvs) ||
-         (x->alt_bound.valid && x->len > 0 && x->len <= KS_WINDOW_HALF));
-}
-bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
 // Applies stock aln's cuts at a score boundary, for a search whose next entry has score next:
 // see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop, or for a certificate read a
 // certificate, aln_meth_certify).
 int aln_meth_boundary(aln_meth_slot_t *, int next);
-// Keep batches bounded. Under the cut, flush at the first hit and at every boundary; otherwise
-// refine score boundaries only when stopping is possible.
+// Keep batches bounded. Under the cut, flush at the first hit and at every boundary; without it
+// (-N, a negative penalty, or a --known-snvs read that does not fit an ALT window: the search runs
+// to its -n) flush only for the bound and to find the lookup budget's binding flush at its stratum.
 static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
     if (x->pend.size() >= 32) return 1;
     if (x->cut) { // flush at the first hit and at every score boundary; cut at boundaries
@@ -230,7 +218,6 @@ static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
         return x->best != INT64_MAX && aln_meth_boundary(x, score) && (x->stop || (x->stop = ALN_METH_STOP_TOP2));
     }
     if (score <= x->flushed_score) return 0;
-    if (aln_meth_stop_eligible(x)) return 1;
     // A skipped boundary replaces a flush/resume: do not re-examine this stratum.
     x->flushed_score=score;
     if (x->pend.empty()) return 0;
@@ -257,9 +244,7 @@ static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t 
     *e = j->e;
     const int score=(int)(e->info>>21);
     x->flushed_score=score;
-    if (x->cut) return x->best != INT64_MAX && aln_meth_boundary(x, score);
-    if (aln_meth_can_stop(x,score)) return 1;
-    return 0;
+    return x->cut && x->best != INT64_MAX && aln_meth_boundary(x, score);
 }
 static inline int aln_meth_resume(void *, gap_job_t *, gap_entry_t *) { return 1; }
 void aln_meth_hit(aln_meth_slot_t *, const gap_entry_t *, bwtint_t, bwtint_t);
