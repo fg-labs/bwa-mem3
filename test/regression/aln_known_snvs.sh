@@ -5,8 +5,8 @@
 # SNV leaves single-end, paired-end and --meth output unchanged but for @PG; with sites, records without XV:Z
 # are unchanged, short reads carrying an ALT plus errors (over the mismatch budget, so stock leaves
 # them unmapped) are placed at their true locus with an A vote in XV:Z, single- and paired-end;
-# the output does not depend on the thread count; --bam carries XV:Z; bad VCFs are refused before
-# any output.
+# the output does not depend on the thread count; --known-snvs-cache reads back the same index;
+# --bam carries XV:Z; bad VCFs are refused before any output.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -334,6 +334,43 @@ done
     exit 1
 }
 echo 'PASS: no-temp-files (read-only and non-existent TMPDIR, empty afterwards)'
+
+# 4c. --known-snvs-cache: the first run writes the index, later runs read it, and the output is
+# the same; a cache written for other sites is rebuilt; the option needs --known-snvs.
+for e in pe pe.meth; do
+    args=()
+    [[ $e == *meth ]] && args=(--meth)
+    cache=$tmp/ks.$e.cache
+    run "ks.$e.c1" "${args[@]}" -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    [ -s "$cache" ] && grep -q 'wrote the ALT-window index' "$tmp/ks.$e.c1.err"
+    run "ks.$e.c2" "${args[@]}" -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    grep -q 'loaded the index of' "$tmp/ks.$e.c2.err"
+    body "$tmp/ks.$e.sam" "$tmp/ks.$e.body"
+    for r in c1 c2; do
+        body "$tmp/ks.$e.$r.sam" "$tmp/ks.$e.$r.body"
+        cmp "$tmp/ks.$e.body" "$tmp/ks.$e.$r.body" || {
+            echo "FAIL: $e: --known-snvs-cache ($r) changed the output" >&2
+            exit 1
+        }
+    done
+    head -n 12 "$tmp/sites.vcf" > "$tmp/sites.few.vcf"
+    run "ks.$e.few" "${args[@]}" --known-snvs "$tmp/sites.few.vcf" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    run "ks.$e.few.c" "${args[@]}" -v 3 --known-snvs "$tmp/sites.few.vcf" --known-snvs-cache "$cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    grep -q 'not using .* (stale' "$tmp/ks.$e.few.c.err"
+    body "$tmp/ks.$e.few.sam" "$tmp/ks.$e.few.body"
+    body "$tmp/ks.$e.few.c.sam" "$tmp/ks.$e.few.c.body"
+    cmp "$tmp/ks.$e.few.body" "$tmp/ks.$e.few.c.body" || {
+        echo "FAIL: $e: a stale --known-snvs-cache changed the output" >&2
+        exit 1
+    }
+done
+rc=0
+"$bin" aln --known-snvs-cache "$tmp/x.cache" "$reference" "$tmp/se.fq" > "$tmp/nocache.out" 2> "$tmp/nocache.err" || rc=$?
+[ "$rc" = 1 ] && grep -qF -- 'needs --known-snvs' "$tmp/nocache.err" && [ ! -e "$tmp/x.cache" ] || {
+    echo "FAIL: --known-snvs-cache without --known-snvs: exit $rc" >&2
+    exit 1
+}
+echo 'PASS: cache (written, read back, stale rebuilt; same output)'
 
 # 5. --bam carries XV:Z.
 if command -v samtools > /dev/null; then
