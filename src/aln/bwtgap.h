@@ -206,6 +206,10 @@ typedef struct {
 	// results
 	bwt_aln1_t *aln;
 	int n_aln;
+	// plain aln's no-hit proof (aln_plain_prove_nohit): 1 + the gate bin of a probe, else 0; the
+	// probe's start and its thread's proof time then (ns). Read when the job ends.
+	int probe_bin;
+	int64_t probe_t0, probe_p0;
 } gap_job_t;
 int gap_job_start(gap_job_t *j, const bwt_t *bwt);
 int gap_job_run(gap_job_t *j, const bwt_t *bwt);

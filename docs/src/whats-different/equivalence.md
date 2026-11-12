@@ -157,7 +157,18 @@ and 5-base slices of 1 million and of 200,000 reads (hg19, an x86_64 AVX-512 hos
 single-end output was byte-identical (md5 of non-`@PG` lines), including the read-length bins,
 `--known-snvs`, simulated reads and the AVX2 and AVX-512 tiers; on 1 million EM-seq pairs one
 pair changed this way. Output
-without `--meth` is byte-identical: the proof runs only in the `--meth` search.
+without `--meth` was byte-identical under #787, whose proof ran only in the `--meth` search.
+
+Since [#790](https://github.com/fg-labs/bwa-mem3/pull/790), plain `aln` (no `--meth`; not under
+a positive `-e`, nor with `--known-snvs`, nor with penalties whose search scores might not fit
+its stack) can also end a read with no exact occurrence on the same proof, run on the plain index.
+Such a read ends with no hit, as its full search would, so the output is meant to be unchanged.
+On 1 million single-end reads and 1 million pairs (also with `--short-insert`) of ultrashort
+EM-seq and 5-base reads aligned unconverted to hg19 (an x86_64 host at the AVX-512BW and AVX2
+tiers, clang 19.1.7), plain output (non-`@PG` lines) was byte-identical to #787 and to stock bwa
+0.7.19 (`aln` with `samse`/`sampe`); on 1 million synthetic pairs per chemistry on hg19 chr22
+(Graviton4, arm64, NEON tier; compiler not recorded) it was byte-identical to #787. These are
+observations on those runs, not a guarantee for other inputs.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
