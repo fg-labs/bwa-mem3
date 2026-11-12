@@ -358,8 +358,13 @@ Each change to upstream-derived code adds a line here.
   `max_occ` still skips its extra hits. A pair's body reads and writes only that pair's reads, and
   no stage here draws from `drand48`, so the output is the same as upstream's single pass.
 - Pairing sort (new code). `pairing` sorts its (position, k<<2 | strand<<1 | end) rows with
-  `pdqsort_128` in place of `ks_introsort_128`. Both order rows by the whole (x, y), so rows equal
+  `aln_pair_sort` in place of `ks_introsort_128`. Both order rows by the whole (x, y), so rows equal
   under that order are identical bytes and the sorted array is the same whichever sort makes it.
+  Below 256 rows, or when the key below does not fit, `aln_pair_sort` is `pdqsort_128`. From 256
+  rows it is an LSD radix sort on the 63-bit key `((x - x_min) << by) | y`, where `by` is the bit
+  width of the rows' largest y: `x - x_min` does not wrap and `y < 2^by`, so the key orders the rows
+  exactly as (x, y) does. The keys and the sort's second buffer use the array's own 2n words (key i
+  is written to word i once row i has been read), so it allocates nothing.
 
 ## Methylation candidate ranking and stock accounting
 
