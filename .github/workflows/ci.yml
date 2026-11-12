@@ -9,7 +9,7 @@ on:
   # devel-aln instead run full validation of the integrated feature, without
   # publishing coverage or writing the main compiler caches.
   #
-  # Two depths, decided once by .github/scripts/ci-depth.sh and read by the
+  # Two depths, decided by .github/scripts/ci-depth.sh and read by the
   # steps as CI_DEPTH. The merge_group run is always full: what lands is
   # checked at full depth. A pull_request run, repeated on every push to the
   # branch, is light unless its diff touches the SIMD kernels, their harnesses
@@ -18,7 +18,7 @@ on:
   # trims only the kernels' deep safety nets: the rescue kernel sweeps run at
   # their reduced job counts on every row, the canonical row skips the
   # AVX-512BW kswv unit tree, and the MSan padded-lane gate (not a required
-  # check) does not run. Every other job and step runs at both depths, so the
+  # check) skips its workload. Every other job and step runs at both depths, so the
   # required checks report as before; the script falls back to full whenever it
   # cannot tell.
   push:
@@ -461,11 +461,9 @@ jobs:
       - name: Rescue docs match the source (pages, knob list, gates)
         run: bash test/regression/rescue_docs_lint.sh
 
-  # The run's CI depth (see the top of the file) as a job output, for the jobs
-  # that skip whole on a light PR run and so must know before they start (the
-  # MSan gate). build-and-test runs the same script as its own first step
-  # instead of waiting on this job, which would delay every row. Seconds of
-  # work: a depth-1 checkout and, on a PR, a depth-1 fetch of the base commit.
+  # Report CI depth as a standalone diagnostic. Workload jobs run the same
+  # script locally rather than delaying their check creation on this job.
+  # Seconds of work: a depth-1 checkout and, on a PR, a depth-1 base fetch.
   ci-depth:
     name: CI depth (full in the merge queue, light on most PRs)
     if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
@@ -484,6 +482,9 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
         run: bash .github/scripts/ci-depth.sh
+
+      - name: MSan check lifecycle regression
+        run: python3 -I .github/scripts/test_msan_check_lifecycle.py
 
   build-and-test:
     strategy:
@@ -2695,15 +2696,13 @@ jobs:
   # (delete `continue-on-error`) ONCE THE PADDED-LANE INITIALIZATION FIXES ARE
   # IN main.
   #
-  # Full-depth runs only (ci-depth, see the top of the file): the merge queue,
-  # and PRs that touch the kernels or this test. A light PR skips the job,
-  # which is not a required check. `!cancelled()` keeps it running when
-  # ci-depth itself fails (its output is then empty, which is not 'light'), so
-  # a broken depth job costs time, never the gate.
+  # Publish this check without waiting for another job: a cancelled duplicate
+  # run must not leave the only MSan status on the head while ci-depth queues.
+  # Decide depth locally and skip only the expensive workload on light PRs.
+  # A failed depth decision leaves an empty output, which still runs the gate.
   msan-padded-lane-gate:
     name: MSan padded-lane gate (banded-SW)
-    needs: ci-depth
-    if: ${{ !cancelled() && (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln') && needs.ci-depth.outputs.depth != 'light' }}
+    if: github.event_name != 'push' || github.ref == 'refs/heads/devel-aln'
     runs-on: ubuntu-24.04
     # One instrumented build of the kernel + a single fast run. Ceiling catches
     # a hung runner only.
@@ -2722,7 +2721,19 @@ jobs:
           persist-credentials: false
           submodules: recursive
 
+      - name: Decide the CI depth
+        id: depth
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: bash .github/scripts/ci-depth.sh
+
+      - name: Skip the padded-lane workload on a light PR
+        if: steps.depth.outputs.depth == 'light'
+        run: |
+          echo "SKIP: light PR; the padded-lane workload runs at full depth only"
+
       - name: Install dependencies (Linux)
+        if: steps.depth.outputs.depth != 'light'
         # Same set the matrix rows install: zlib/libdeflate for htslib's static
         # link path, autoconf/automake for its configure, libomp for the
         # libsais -fopenmp compile pulled in when building libbwa.a. libomp-19-dev
@@ -2733,6 +2744,7 @@ jobs:
           version: 1.1
 
       - name: Install clang-19 (Linux)
+        if: steps.depth.outputs.depth != 'light'
         # Same verified-key install as the build-and-test matrix.
         uses: ./.github/actions/install-clang-19
 
@@ -2741,12 +2753,14 @@ jobs:
       # only on a runner that resolves -march=native the same way; the rest of
       # the MSan libbwa.a build is shared across runners.
       - name: Set up ccache
+        if: steps.depth.outputs.depth != 'light'
         uses: ./.github/actions/setup-ccache
         with:
           config: msan-padded-lane-gate
           max-size: 200M
 
       - name: Build the padded-lane gate under MemorySanitizer
+        if: steps.depth.outputs.depth != 'light'
         # MSAN=1 forces USE_MIMALLOC off (mimalloc's malloc override interposes
         # ahead of the sanitizer runtime) and compiles with -fsanitize=memory
         # -fsanitize-memory-track-origins=2. Built at -march=native against the
@@ -2757,6 +2771,7 @@ jobs:
             kernel_padded_lane_uninit_test
 
       - name: Run the padded-lane gate
+        if: steps.depth.outputs.depth != 'light'
         # exitcode=77 so an uninitialized padded-lane read is a distinct,
         # unmistakable failure code (not the 1 a build/link error would give);
         # halt_on_error=1 stops at the first report. Exit 0 == every padded-lane
@@ -2766,7 +2781,7 @@ jobs:
             ./kernel_padded_lane_uninit_test
 
       - name: ccache statistics
-        if: always()
+        if: always() && steps.depth.outputs.depth != 'light'
         run: ccache --show-stats || true
 
   # Profiling (--profile) is compiled out of the default build, so the matrix
