@@ -463,6 +463,16 @@ static bool layout_cigar(const aln_meth_layout_t &L, int len, std::vector<uint32
     if (q < len) c->push_back((uint32_t)(len - q) << 4);
     return true;
 }
+// Whether layout_cigar(L, len) succeeds, without building the CIGAR.
+static bool layout_ok(const aln_meth_layout_t &L, int len)
+{
+    int q = 0;
+    for (int g = 0; g < L.n; ++g) {
+        if (L.qpos[g] < q || L.len[g] <= 0) return false;
+        q = L.qpos[g] + (L.del[g] ? 0 : L.len[g]);
+    }
+    return q <= len;
+}
 // The layout of a raw CIGAR of M/I/D operations (false: another operation, or too many gaps).
 static bool cigar_layout(const uint32_t *c, size_t n, aln_meth_layout_t *L)
 {
@@ -528,16 +538,22 @@ static const aln_meth_read_bits_t &slot_bits(aln_meth_slot_t *x, int ori)
  * blocks serve the 5-letter model on the reference haplotype; otherwise the window is fetched
  * (with its ALTs, CpG labels) and counted base by base as account_alignment counts. */
 static bool score_path(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, int hyp, int strand, int64_t rb,
-                       int span, int alt, aln_meth_occ_t *o, int *seed_mm)
+                       int span, int alt, aln_meth_occ_t *o, int *seed_mm, bool defer = false)
 {
     aln_meth_group_t *g = x->grp;
     const int len = x->len, ori = strand ? 1 : 0;
     o->rid = rid; o->hyp = hyp; o->strand = strand; o->alt = alt;
     o->alignment.rb = rb; o->alignment.re = rb + span;
-    if (!layout_cigar(L, len, &o->alignment.raw_cigar)) return false;
+    const bool fast = alt == 0 && g->mo->fast.ok;
+    // defer (the bit-parallel blocks only): the CIGARs are left to store_row (materialize_row),
+    // which builds them only for a row it keeps
+    const bool deferred = defer && fast;
+    if (deferred) {
+        if (!layout_ok(L, len)) return false;
+    } else if (!layout_cigar(L, len, &o->alignment.raw_cigar)) return false;
     *seed_mm = 0;
     const bool seeded = x->job && x->job->seed_width;
-    if (alt == 0 && g->mo->fast.ok) {
+    if (fast) {
         const aln_meth_read_bits_t &rd = slot_bits(x, ori);
         aln_meth_amb_bits(*g->ref, rb, span, &x->amb);
         aln_meth_block_counts_t c;
@@ -576,12 +592,21 @@ static bool score_path(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, 
         }
     }
     o->cost = (int64_t)g->opt->s_mm * o->n_mm + (int64_t)g->opt->s_gapo * o->n_gapo + (int64_t)g->opt->s_gape * o->n_gape;
+    if (deferred) return true; // CIGARs and start: materialize_row
     normalize_display(&o->alignment);
     o->pos = o->alignment.rb;
     return true;
 }
+// A deferred row's CIGARs and start, as score_path makes them.
+static void materialize_row(aln_meth_occ_t &o, const aln_meth_layout_t &L, int len)
+{
+    layout_cigar(L, len, &o.alignment.raw_cigar);
+    normalize_display(&o.alignment);
+    o.pos = o.alignment.rb;
+}
 // Applies the strict -n/-k filters and stores o as its locus's candidate (the cheaper wins).
-static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs)
+// lay: the row's layout when score_path deferred its CIGARs.
+static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, const aln_meth_layout_t *lay = nullptr)
 {
     aln_meth_group_t *g = x->grp;
     // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
@@ -603,6 +628,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs)
     if (x->cut && x->best != INT64_MAX && o.cost > x->best + g->opt->s_mm) return;
     if (o.cost < x->best) { x->best = o.cost; x->best_d = (int)differences; }
     else if (o.cost == x->best) x->best_d = std::min(x->best_d, (int)differences);
+    if (lay && o.alignment.raw_cigar.empty()) materialize_row(o, *lay, x->len); // a built CIGAR is never empty
     const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
     // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
     if (bytes > (64ULL << 20) - x->alignment_bytes) {
@@ -665,12 +691,12 @@ static void resolve_located(aln_meth_slot_t *x, const aln_meth_pend_t &h, const 
     for (int alt = 0; alt < n_hap && !(x->res->flags & ALN_METH_BIND_CIGAR); ++alt) {
         aln_meth_occ_t o;
         int seed_mm = 0;
-        if (!score_path(x, key.lay, rid, hyp, strand, rb, span, alt, &o, &seed_mm)) {
+        if (!score_path(x, key.lay, rid, hyp, strand, rb, span, alt, &o, &seed_mm, true)) {
             fprintf(stderr, "ERROR: --meth search path (%d gaps: %#x %#x %#x %#x) is not an alignment of the %d-base read\n",
                     (int)h.e.n_gapo, h.gap[0], h.gap[1], h.gap[2], h.gap[3], x->len);
             exit(1);
         }
-        store_row(x, o, seed_mm + seed_gaps);
+        store_row(x, o, seed_mm + seed_gaps, &key.lay);
     }
 }
 // Scores rows[0, n) of hit h in order, as resolve_located; each group of rows is located first and
