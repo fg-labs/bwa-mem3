@@ -8,15 +8,12 @@ how the original bases come back for scoring and output.
 
 ## What gets projected (for seeding only)
 
-`--meth` requires the [directional input convention](overview.md#library-orientation)
-for every chemistry:
+For [directional input](overview.md#library-orientation), seeding projects reads as follows:
 
 - **R1** (read 1): every `C` is replaced with `T` (input hypothesis `CT`).
 - **R2** (read 2): every `G` is replaced with `A` (input hypothesis `GA`).
 
-Single-end mode uses the R1 (`C→T`) rule for all reads. These hypotheses are
-independent of genomic mapping strand: either mate can map forward or reverse.
-Chemistry selection does not infer or change this input convention.
+Single-end mode uses the R1 (`C→T`) rule for all reads.
 
 This projection is applied **only to the copy of the read used for seeding**. The
 `.meth` doubled seed index built by `bwa-mem3 index --meth` holds two projections
@@ -26,9 +23,8 @@ of each chromosome:
 - `r`-prefixed contigs (e.g. `rchr1`): the chromosome with every `G` → `A`.
 
 Seed hits are remapped from the converted contigs to original coordinates.
-The conversion hypothesis and the hit's strand determine the scoring matrix;
-R1 is not restricted to one genomic strand, nor R2 to the other. `XR:Z` records
-the input read conversion (`CT` for R1/single-end, `GA` for R2), while `XG:Z`
+The conversion hypothesis and the hit's strand determine the scoring matrix.
+`XR:Z` records the input read conversion (`CT` for R1/single-end, `GA` for R2), while `XG:Z`
 records the aligned genome conversion strand. See [SAM tags](tags.md) for their
 relationship on forward and reverse alignments.
 

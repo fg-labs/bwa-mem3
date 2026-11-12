@@ -103,17 +103,7 @@ uses for its TAPS path).
 `XM:Z` from `--meth=taps` is already in the correct polarity, so tools that
 consume `XM:Z` directly need no adjustment.
 
-## Library directionality
-
-TAPS uses the same [directional library requirement](overview.md#library-orientation)
-as every other chemistry: R1/single-end `CT` and R2 `GA` are input conversion
-hypotheses, not fixed genomic mapping strands. `--meth=taps` does not infer or
-change orientation. Verify the protocol and read layout; PBAT-style
-opposite-orientation and non-directional libraries are not supported.
-
-Real-data validation used `SRR25526768` (the `XG:Z` split was 49.8 % `CT` /
-49.9 % `GA`). That split describes aligned genomic strands, not a test that
-establishes library directionality.
+This chemistry still requires a [directional library](overview.md#library-orientation).
 
 ## Validation status
 

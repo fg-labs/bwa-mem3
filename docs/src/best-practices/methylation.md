@@ -16,10 +16,7 @@ For *what* the flags are and *how* the scoring modes work, see the reference:
 
 ## When to keep the defaults
 
-First verify the [directional library requirement](../methylation/overview.md#library-orientation):
-R1/single-end uses C-to-T and R2 uses G-to-A as input conversion hypotheses,
-not fixed genomic mapping strands. Neither chemistry selection nor QC flags
-infer or change library orientation.
+First verify the [directional library requirement](../methylation/overview.md#library-orientation).
 
 For standard directional whole-genome bisulfite and EM-seq workflows, the defaults
 (`genomic` scoring plus `-B 4 -L 10 -U 100 -T 40 -M -C`) are appropriate as-is.
@@ -61,9 +58,8 @@ bwa-mem3 mem --meth --set-as-failed r -t 16 ref.fa R1.fq.gz R2.fq.gz \
 
 **Chimera QC is opt-in** (off by default, matching Bismark). Leave it off for
 standard directional EM-seq / WGBS. Consider it for chimera-prone supported
-directional data, or when you want bwameth.py-style heuristic flagging.
-PBAT / scBS-Seq protocols must meet the
-[library orientation requirement](../methylation/overview.md#library-orientation).
+data or bwameth.py-style heuristic flagging; it does not enable
+[unsupported library orientations](../methylation/overview.md#library-orientation).
 Pass `--chimera-qc` to enable it (see
 [Flags](../methylation/flags.md#--chimera-qc) for the exact heuristic):
 
