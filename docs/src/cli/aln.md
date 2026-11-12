@@ -675,8 +675,9 @@ plus one: any alignment within the limit aligns some piece within its allowance.
 of each piece within its allowance is found on the converted index, and the read's alignments
 around each are bounded by a banded edit distance on the index text. When none can be within the
 limit, the search ends with no hit, where the full search would also end with none; otherwise, or past
-4,096 candidate rows, it searches as usual. The ALT-window search of `--known-snvs` is not
-checked this way. The output can change: a no-hit read whose search used to stop at the `-m`
+4,096 candidate rows, it searches as usual. A read whose search then makes 200,000 index
+expansions without finding a hit is checked once more the same way, with a cap of 16,384 candidate
+rows. The ALT-window search of `--known-snvs` is not checked this way. The output can change: a no-hit read whose search used to stop at the `-m`
 work bound, incomplete, is now proven complete; for paired-end input such an end can then be
 placed by mate rescue ([#787](https://github.com/fg-labs/bwa-mem3/pull/787)).
 
