@@ -92,7 +92,8 @@ struct aln_meth_ph_scratch_t {
 enum { ALN_METH_PH_PROVEN = 0, ALN_METH_PH_SHORT = 1, ALN_METH_PH_ROWS_CAP = 2, ALN_METH_PH_NODES_CAP = 3, ALN_METH_PH_WINDOW = 4,
        ALN_METH_PH_NOT_TEXT = 5 };
 int aln_meth_pigeonhole(const bwt_t *bwt, const aln_meth_ref_t &ref, const ubyte_t *seq, int len, int kmax,
-                        const bwt_width_t *width, aln_meth_ph_scratch_t *s, long *steps, long *rows);
+                        const bwt_width_t *width, aln_meth_ph_scratch_t *s, long *steps, long *rows,
+                        int64_t max_rows = ALN_METH_PH_ROWS, long max_nodes = ALN_METH_PH_NODES);
 
 } // namespace bwa_aln
 
