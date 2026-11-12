@@ -15,6 +15,7 @@ namespace {
 namespace ba = bwa_aln;
 using aln_prove_test::full_ed;
 using aln_prove_test::prove_index;
+using aln_prove_test::prove_index_plain;
 using aln_prove_test::Rng;
 
 // A read-like string from T[y, y + n) with e random unit edits (mismatch, insertion or deletion).
@@ -249,6 +250,88 @@ TEST_CASE("aln_meth_prove: the pigeonhole proof never refutes an indexed hit and
         if (got) CHECK(indexed_ed > kmax);
         // A mask no-hit is sufficient but not necessary: piece enumeration uses actual bases.
         // No resource cap binds on this small index.
+        if (masked_ed > kmax) CHECK(got == 1);
+        (got ? proven : found) += 1;
+    }
+    CHECK(proven > 40);
+    CHECK(found > 30);
+}
+
+TEST_CASE("aln_meth_prove: on a plain index the masks are the indexed base, or any base in an N run")
+{
+    auto &x = prove_index_plain();
+    const int64_t n = (int64_t)x.bwt->seq_len;
+    REQUIRE(n == 2 * (int64_t)x.ref.bns->l_pac);
+    std::vector<uint8_t> m(n);
+    ba::aln_meth_text_masks(x.ref, 0, n, m.data());
+    int64_t any = 0;
+    for (int64_t y = 0; y < n; ++y) {
+        REQUIRE((m[y] >> x.text[y] & 1) == 1);
+        REQUIRE((m[y] == 0xf || __builtin_popcount(m[y]) == 1));
+        any += m[y] == 0xf;
+    }
+    CHECK(any == 2 * 30); // the N run, on both strands
+    Rng rng(11);
+    for (int t = 0; t < 2000; ++t) {
+        const int64_t y0 = rng.below((int)n), len = rng.below(300);
+        const int64_t y1 = std::min(n, y0 + len);
+        std::vector<uint8_t> w(y1 - y0);
+        ba::aln_meth_text_masks(x.ref, y0, y1, w.data());
+        for (int64_t y = y0; y < y1; ++y) REQUIRE(w[y - y0] == m[y]);
+    }
+}
+
+TEST_CASE("aln_meth_prove: plain-index ambiguous masks are not indexed occurrences")
+{
+    auto &x = prove_index_plain();
+    // Derived from text [5480, 5552), changing only bases in the original N run [5500, 5530).
+    const std::string bases = "GGACTGATCGTTTGACCTGTGTTTCCGCTGAGAGGAATCTGAGATATTTATCAATAACAGCAGATGCCACTT";
+    std::vector<uint8_t> seq;
+    for (char c : bases) seq.push_back(c == 'A' ? 0 : c == 'C' ? 1 : c == 'G' ? 2 : 3);
+    std::vector<uint8_t> masks(x.text.size());
+    ba::aln_meth_text_masks(x.ref, 0, (int64_t)x.text.size(), masks.data());
+    const int masked_ed = mask_ed_anywhere(seq, masks, 3);
+    const int indexed_ed = full_ed(seq, x.text, false, true);
+    long steps = 0, rows = 0;
+    ba::aln_meth_ph_scratch_t s;
+    const int got = ba::aln_meth_pigeonhole(x.bwt, x.ref, seq.data(), (int)seq.size(), 3, nullptr, &s, &steps, &rows);
+    CHECK(masked_ed == 0);
+    REQUIRE(indexed_ed == 21);
+    CHECK(got == 1);
+    // An actual indexed substring crossing that same run must never be refuted.
+    seq.assign(x.text.begin() + 5480, x.text.begin() + 5552);
+    REQUIRE(full_ed(seq, x.text, false, true) == 0);
+    CHECK(ba::aln_meth_pigeonhole(x.bwt, x.ref, seq.data(), (int)seq.size(), 3, nullptr, &s, &steps, &rows) == 0);
+}
+
+TEST_CASE("aln_meth_prove: on a plain index the proof never refutes an indexed hit and proves mask no-hits")
+{
+    auto &x = prove_index_plain();
+    const int64_t n = (int64_t)x.bwt->seq_len;
+    std::vector<uint8_t> masks(n);
+    ba::aln_meth_text_masks(x.ref, 0, n, masks.data());
+    Rng rng(29);
+    ba::aln_meth_ph_scratch_t s;
+    int proven = 0, found = 0;
+    for (int t = 0; t < 160; ++t) {
+        const int kmax = 3 + rng.below(4), len = 40 + rng.below(80);
+        std::vector<uint8_t> seq;
+        if (t % 4 == 0) {
+            for (int b = 0; b < len; ++b) seq.push_back((uint8_t)rng.below(4));
+        } else {
+            const int64_t y = rng.below((int)(n - len - 20));
+            seq = mutate(x.text, y, len, kmax - 1 + rng.below(4), rng);
+        }
+        if (t % 9 == 0) seq[rng.below((int)seq.size())] = 4;
+        const int masked_ed = mask_ed_anywhere(seq, masks, kmax);
+        const int indexed_ed = full_ed(seq, x.text, false, true);
+        long steps = 0, rows = 0;
+        const int got = ba::aln_meth_pigeonhole(x.bwt, x.ref, seq.data(), (int)seq.size(), kmax, nullptr, &s, &steps, &rows);
+        INFO("t=" << t << " kmax=" << kmax << " indexed_ed=" << indexed_ed << " masked_ed=" << masked_ed);
+        CHECK(masked_ed <= indexed_ed);
+        // Ambiguous text masks are permissive; safety must be checked against actual indexed bases.
+        if (indexed_ed <= kmax) CHECK(got == 0);
+        if (got) CHECK(indexed_ed > kmax);
         if (masked_ed > kmax) CHECK(got == 1);
         (got ? proven : found) += 1;
     }

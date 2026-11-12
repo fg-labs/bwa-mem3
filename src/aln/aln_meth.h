@@ -55,6 +55,9 @@ struct aln_meth_ref_t {
 	// --known-snvs ALT-window search: its windows are candidates for the main search, which takes no
 	// stock cuts under --known-snvs, so neither does this one
 	int no_cut = 0;
+	// plain (non-converted) index: conv_bns == bns and the index text is pac itself (plain aln's
+	// no-hit proof; positions of an .amb run may be any base)
+	int plain = 0;
 };
 int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads);
 /* Takes ownership of an in-memory original reference (bns, pac) and checks it pairs with

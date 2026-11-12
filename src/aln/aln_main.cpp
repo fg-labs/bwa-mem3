@@ -37,6 +37,7 @@
 #include "bwaseqio.h"
 #include "aln_alloc.h"
 #include "bwtgap.h"
+#include "aln_meth_search.h"
 #include "aln_meth.h"
 #include "../meth_opts.h"
 
@@ -529,6 +530,25 @@ void ks_place_twins_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns
 
 } // namespace
 
+/* Plain aln's no-hit proof (aln_plain_prove_nohit) for the scope of a plain run's main search. Off
+ * under --known-snvs (its window search runs on another index) and when the index text is not the
+ * pac as loaded (both strands, 2 l_pac). */
+struct plain_prove_scope_t {
+	aln_meth_ref_t r;
+	bool on = false;
+	plain_prove_scope_t(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac)
+	{
+		if (o->ks_windows || !pac || bwt->seq_len != 2 * (bwtint_t)bns->l_pac) return;
+		r.conv_bns = bns; r.bns = const_cast<bntseq_t*>(bns); r.pac = pac; r.plain = 1;
+		aln_plain_prove_begin(&r, o->gap.n_threads);
+		on = true;
+	}
+	~plain_prove_scope_t()
+	{
+		if (on) aln_plain_prove_end();
+	}
+};
+
 int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_t *pac,
 			   const char *fn_fq, aln_out_t *out)
 {
@@ -543,6 +563,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	bwa_seq_defer_read_errors(ks); // reported below, on this thread (see background_task_t)
 	bwase_initialize();
 	srand48(bns->seed); // once per run, never per batch
+	plain_prove_scope_t prove_scope(o, bwt, bns, pac);
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
 	fmt_bufs_t fb(n_threads);
 	std::vector<int64_t> ks_count((size_t)n_threads * KS_N_OUTCOMES, 0);
@@ -740,6 +761,7 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			   const char *fn_fq1, const char *fn_fq2, aln_out_t *out)
 {
 	srand48(bns->seed); // once per run, never per batch
+	plain_prove_scope_t prove_scope(o, bwt, bns, pac);
 	// each file's own duplicate check: one mate's batches need not look like the other's
 	aln_dup_state_t dup_state[2];
 	aln_dup_state_t *dup[2] = {nullptr, nullptr};

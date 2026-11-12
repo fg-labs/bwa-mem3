@@ -365,6 +365,36 @@ Each change to upstream-derived code adds a line here.
   width of the rows' largest y: `x - x_min` does not wrap and `y < 2^by`, so the key orders the rows
   exactly as (x, y) does. The keys and the sort's second buffer use the array's own 2n words (key i
   is written to word i once row i has been read), so it allocates nothing.
+- No-hit proof (new code, `aln_plain_prove_nohit` in `aln_meth.cpp`). The `--meth` pigeonhole proof
+  (`aln_meth_pigeonhole`, `aln_meth_prove.h`) also runs on the plain index, whose text is `pac` with
+  each `.amb` run read as any base (`aln_meth_ref_t::plain`). Under `BWA_MODE_GAPE` (no `-e`), every
+  stock hit is an alignment of the read within `max_diff` unit edits, and the search's other limits
+  (seed, gap opens, end skips, `-m`) only remove paths. A read with `max_diff` >= 3 and no exact
+  occurrence (its whole-read width walk restarted) is tried in `gap_job_start`, before its search
+  starts; if the proof shows that no such alignment exists, the read ends there with no hit, which
+  is how the full search would end. The search loop itself is unchanged.
+  Off under `--known-snvs`. Whether the proof runs changes only when a no-hit search stops, so a
+  gate decides it by cost, from two measurements. Per 4-base read-length bin, the proven rate:
+  reads with a hit elsewhere, or windows that survive, are tried for nothing, so a bin is tried
+  while it proves at least half of its last 64 or so attempts. For the run, whether a proof saves
+  more time than it takes: a proof saves the rest of a no-hit search, which is long on a large
+  genome and short on a small one, and costs about the same either way, so on a small genome it
+  can cost more than the search it ends. The gate keeps the time attempts take and samples of the
+  time a proven read's search takes, and tries the proof while proven rate x saved > time taken
+  over the bins it tries. A sample is a probe: a read tried and proven whose search runs anyway
+  (same result), timed from the proof to the end; the search interleaves `ALN_GROUP` reads in
+  turns of one lookup, so the read's share is that interval, less the thread's proofs within it,
+  over `ALN_GROUP`. The estimate starts after 256 samples. Some eligible reads are probes whatever
+  the state, so the estimates follow the input: one in 64 where the proof runs, and where it does
+  not, from one in 1,024, doubling after each probe that leaves it off up to one in 16,384, so a
+  bin or a run the proof does not pay for costs almost nothing. The windows are the run's, shared
+  by the search threads (relaxed atomics, updated once per attempt). On the whole genome,
+  unconverted EM-seq reads (mostly unmapped) keep the proof on; bins where most reads have a hit,
+  and small genomes, turn it off. The search threads are started per batch,
+  so the proof scratch is the run's: one per thread, allocated and sized by
+  `aln_plain_prove_begin` on the calling thread and lent to each batch's threads (a scratch
+  allocated by every batch's threads in their own allocator heaps raised peak RSS by about 30 MB);
+  a scratch left above 1 MiB by a proof is released.
 
 ## Methylation candidate ranking and stock accounting
 
