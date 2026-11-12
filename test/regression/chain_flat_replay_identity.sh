@@ -149,7 +149,7 @@ mawk 'BEGIN {
     printf "@long0\n%s\n+\n%s\n", t, substr(qq, 1, 36000) > "reads.fq"
 }' > ref.fa 2> /dev/null
 "$BWA_MEM3" index ref.fa > index.log 2>&1 || fail "bwa-mem3 index exited nonzero"
-"$BWA_MEM3" index --meth ref.fa > index-meth.log 2>&1 || fail "bwa-mem3 index --meth exited nonzero"
+"$BWA_MEM3" index --meth --force ref.fa > index-meth.log 2>&1 || fail "bwa-mem3 index --meth exited nonzero"
 
 # The default run carries the stats: each forced path must actually have run.
 align def ref.fa reads.fq -- BWA3_CHAIN_STATS=1

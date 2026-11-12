@@ -41,6 +41,8 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <zlib.h>
+#include <string>
+#include <vector>
 
 #include "bntseq.h"
 #include "bwa.h"
@@ -79,162 +81,285 @@ static void meth_project_and_write(FILE *out, const char *prefix, const char *na
     if (bl) fwrite(buf, 1, bl, out);
 }
 
-/* Skip the rebuild if the c2t FASTA is already newer than the input. */
-static int meth_c2t_is_fresh(const char *in_fa, const char *out_fa)
+/* Scratch is registered with atexit as well as scoped cleanup: index writers
+ * below this layer can call exit(). SIGKILL and machine failure cannot clean up. */
+static std::string meth_scratch_dir;
+static void meth_cleanup_scratch()
 {
-    struct stat a, b;
-    if (stat(in_fa, &a) != 0 || stat(out_fa, &b) != 0) return 0;
-    return b.st_mtime >= a.st_mtime;
+    if (!meth_scratch_dir.empty()) {
+        unlink((meth_scratch_dir + "/seed.fa").c_str());
+        rmdir(meth_scratch_dir.c_str());
+        meth_scratch_dir.clear();
+    }
+}
+struct MethScratchGuard {
+    ~MethScratchGuard() { meth_cleanup_scratch(); }
+};
+
+/* Use the same fallback naming as the alignment header loader. */
+static std::string meth_dict_path(const std::string& prefix)
+{
+    char *path = bwa_dict_path(prefix.c_str());
+    std::string result(path);
+    free(path);
+    return result;
 }
 
-/* D3 BS-seq index layout. `index --meth` builds TWO indexes from `fa`:
- *   1. The ORIGINAL-alphabet index `<fa>.{pac,ann,amb,bwt.2bit.64}` — real chrom
- *      names + original bases. This is the extension/scoring reference and the basis
- *      for variant-callable `mem --meth` output. (Identical to a normal `index`.)
- *      `mem` pac-fetches its bases from `.pac`, so no `.0123` is written (see
- *      bwa_idx_build's emit_unpacked_ref default).
- *   2. A converted SEED index `<fa>.meth.{pac,ann,amb,bwt.2bit.64}`, built over a
- *      per-strand-converted FASTA `<fa>.meth.fa` (two contigs per chromosome:
- *      `>r<name>` = G->A reverse-strand target, `>f<name>` = C->T forward-strand
- *      target). 3-letter seeding requires per-strand conversion because C->T and
- *      reverse-complement do not commute. This index is used ONLY to find seed
- *      SA-intervals, which are then remapped to original coordinates for chaining and
- *      extension. The `.meth` separation is by file PREFIX (not by changing the global
- *      CP_FILENAME_SUFFIX, which serves every index). */
-/* Sum the reference length the way bns_fasta2bntseq will pack it, so the seed
- * index's cost can be estimated before any index is built. Costs one extra
- * sequential pass over the reference on every --meth run, including the ones
- * that go on to succeed: ~10 s for an uncompressed hg38, longer for a gzipped
- * one where the pass is decompression-bound. That is under 1% of the two SA
- * constructions it guards, and it buys a refusal that leaves no partial index
- * behind. Returns -1 on read error. */
+/* Read and validate the whole source before touching any destination. zlib can
+ * report a truncated gzip stream as EOF to kseq, so check both error channels. */
 static int64_t fasta_count_bases(const char *fa)
 {
     gzFile in = gzopen(fa, "r");
-    if (in == NULL) return -1;
+    if (!in) return -1;
     kseq_t *seq = kseq_init(in);
     int64_t total = 0;
-    int kr = 0;
-    while ((kr = kseq_read(seq)) >= 0) total += (int64_t)seq->seq.l;
+    int kr;
+    while ((kr = kseq_read(seq)) >= 0) {
+        if (seq->seq.l > (size_t)((INT64_MAX / 12 - 1) / 4 - total)) { kr = -2; break; }
+        total += (int64_t)seq->seq.l;
+    }
+    int ze;
+    gzerror(in, &ze);
     kseq_destroy(seq);
-    gzclose(in);
-    return kr < -1 ? -1 : total;
+    int close_rc = gzclose(in);
+    return kr < -1 || (ze != Z_OK && ze != Z_STREAM_END) || close_rc != Z_OK ? -1 : total;
 }
 
-static int meth_index_build(const char *fa, int emit_unpacked_ref,
+/* Copy sidecars verbatim, preserving the header reader's .hdr-over-.dict rule. */
+static bool meth_copy_file(const std::string& source, const std::string& dest)
+{
+    FILE *in = fopen(source.c_str(), "rb");
+    if (!in) return false;
+    FILE *out = fopen(dest.c_str(), "wb");
+    if (!out) { fclose(in); return false; }
+    char buffer[65536];
+    size_t n;
+    bool ok = true;
+    while ((n = fread(buffer, 1, sizeof(buffer), in)) != 0)
+        if (fwrite(buffer, 1, n, out) != n) { ok = false; break; }
+    ok = ok && !ferror(in) && !ferror(out);
+    if (fclose(in) != 0) ok = false;
+    if (fclose(out) != 0) ok = false;
+    if (!ok) fprintf(stderr, "ERROR: copying %s to %s failed\n", source.c_str(), dest.c_str());
+    return ok;
+}
+
+/* Resolve aliases, including a symlinked parent directory, before comparing
+ * names. The output parent must already exist; indexing never creates it. */
+static std::string meth_absolute_path(const std::string& path)
+{
+    size_t slash = path.find_last_of('/');
+    std::string parent = slash == std::string::npos ? "." : path.substr(0, slash + 1);
+    char resolved[PATH_MAX];
+    if (!realpath(parent.c_str(), resolved)) return "";
+    return std::string(resolved) + "/" + path.substr(slash == std::string::npos ? 0 : slash + 1);
+}
+
+static bool meth_same_file(const std::string& a, const std::string& b)
+{
+    struct stat sa, sb;
+    return (stat(a.c_str(), &sa) == 0 && stat(b.c_str(), &sb) == 0 &&
+            sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) ||
+           meth_absolute_path(a) == meth_absolute_path(b);
+}
+
+/* Convert into private scratch, checking parser, gzip, write and close errors. */
+static bool meth_write_seed_fasta(const char *fa, const std::string& conv)
+{
+    gzFile in = gzopen(fa, "r");
+    FILE *out = fopen(conv.c_str(), "wb");
+    if (!in || !out) {
+        if (in) gzclose(in);
+        if (out) fclose(out);
+        fprintf(stderr, "ERROR: cannot open methylation conversion input/output\n");
+        return false;
+    }
+    fprintf(stderr, "[bwa_index:--meth] writing fresh seed FASTA %s\n", conv.c_str());
+    kseq_t *seq = kseq_init(in);
+    int kr;
+    while ((kr = kseq_read(seq)) >= 0) {
+        for (size_t i = 0; i < seq->seq.l; ++i) {
+            char c = seq->seq.s[i];
+            if (c >= 'a' && c <= 'z') seq->seq.s[i] = (char)(c - 'a' + 'A');
+        }
+        meth_project_and_write(out, "r", seq->name.s, seq->seq.s, seq->seq.l, 'G', 'A');
+        meth_project_and_write(out, "f", seq->name.s, seq->seq.s, seq->seq.l, 'C', 'T');
+        if (ferror(out)) break;
+    }
+    int ze;
+    gzerror(in, &ze);
+    bool ok = kr == -1 && (ze == Z_OK || ze == Z_STREAM_END) && !ferror(out);
+    kseq_destroy(seq);
+    if (gzclose(in) != Z_OK) ok = false;
+    if (fclose(out) != 0) ok = false;
+    if (!ok) {
+        fprintf(stderr, "ERROR: failed reading or writing methylation conversion\n");
+        return false;
+    }
+    return true;
+}
+
+/* Publish retained conversion atomically; scratch and output may be on different
+ * filesystems. A failed copy never exposes a partial retained FASTA. */
+static bool meth_retain_fasta(const std::string& source, const std::string& dest)
+{
+    if (rename(source.c_str(), dest.c_str()) == 0) return true;
+    if (errno != EXDEV) {
+        fprintf(stderr, "ERROR: retaining %s: %s\n", dest.c_str(), strerror(errno));
+        return false;
+    }
+    std::string pattern = dest + ".XXXXXX";
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    int fd = mkstemp(name.data());
+    if (fd < 0) { fprintf(stderr, "ERROR: retaining %s: %s\n", dest.c_str(), strerror(errno)); return false; }
+    close(fd);
+    bool ok = meth_copy_file(source, name.data());
+    if (ok && rename(name.data(), dest.c_str()) != 0) {
+        fprintf(stderr, "ERROR: publishing %s: %s\n", dest.c_str(), strerror(errno));
+        ok = false;
+    }
+    unlink(name.data());
+    return ok;
+}
+
+/* Only these known artifacts may be replaced. No globbing, recursive removal,
+ * or symlink following is permitted, even when --force was requested. */
+static int meth_index_build(const char *fa, const char *prefix, bool minimal,
+                            bool keep_fasta, bool force, int emit_unpacked_ref,
                             int64_t max_memory_bytes, int max_memory_user_specified)
 {
-    /* 0. Preflight the DOMINANT build before writing anything. --meth builds two
-     * indexes sequentially in one process: the original over N = 2*l_pac, then a
-     * seed over a per-strand-converted FASTA whose text is twice as long again
-     * (4*l_pac). The seed therefore costs ~2x the original and is what decides
-     * whether the invocation can run at all -- but the per-build check inside
-     * libsais_build_fm_index only fires once that build starts, i.e. after the
-     * original index has already been built and written. On hg38 that wastes an
-     * hour and leaves a half-populated index directory. The seed's size is known
-     * from the reference length alone, so refuse up front instead. */
-    if (max_memory_bytes > 0) {
-        int64_t l_pac = fasta_count_bases(fa);
-        if (l_pac < 0) {
-            fprintf(stderr, "ERROR: cannot read %s to estimate index memory\n", fa);
-            return 2;
-        }
-        int64_t seed_need = libsais_estimate_peak_bytes(4 * l_pac);
-        if (seed_need > max_memory_bytes) {
-            fprintf(stderr, "[bwa_index:--meth] the seed index dominates: ~%s vs ~%s for "
-                            "the original, because its per-strand-converted text is "
-                            "twice as long\n",
-                    bwa::fmt_bytes(seed_need).c_str(),
-                    bwa::fmt_bytes(libsais_estimate_peak_bytes(2 * l_pac)).c_str());
-            libsais_report_budget_shortfall("index --meth", seed_need, max_memory_bytes,
-                                            max_memory_user_specified != 0, 2 * l_pac);
-            return 3;
-        }
-    }
-
-    /* 1. Original-alphabet index (extension reference). emit_unpacked_ref applies
-     * to the original only (its `.0123` is the legacy bwa-mem2 extension target);
-     * the seed index never needs an unpacked ref (step 2b passes false). */
-    fprintf(stderr, "[bwa_index:--meth] building original index for %s ...\n", fa);
-    if (bwa_idx_build(fa, fa, emit_unpacked_ref) != 0) {
-        fprintf(stderr, "ERROR: bwa_idx_build failed on original %s\n", fa);
-        return 5;
-    }
-
-    /* 2a. Emit the per-strand-converted seed FASTA <fa>.meth.fa. */
-    char conv_fa[PATH_MAX];
-    int n = snprintf(conv_fa, sizeof(conv_fa), "%s.meth.fa", fa);
-    if (n <= 0 || (size_t)n >= sizeof(conv_fa)) {
-        fprintf(stderr, "ERROR: reference path too long\n");
+    std::string dest(prefix), source(fa);
+    if (dest.empty() || dest.back() == '/' || dest.size() + 32 >= PATH_MAX ||
+        (dest.size() >= 5 && dest.compare(dest.size() - 5, 5, ".meth") == 0)) {
+        fprintf(stderr, "ERROR: invalid methylation output prefix (must not end in .meth)\n");
         return 1;
     }
-
-    if (meth_c2t_is_fresh(fa, conv_fa)) {
-        fprintf(stderr, "[bwa_index:--meth] %s is newer than %s; skipping seed FASTA emission\n",
-                conv_fa, fa);
-    } else {
-        gzFile in = gzopen(fa, "r");
-        if (in == NULL) {
-            fprintf(stderr, "ERROR: cannot open %s\n", fa);
-            return 2;
-        }
-        FILE *out = fopen(conv_fa, "w");
-        if (out == NULL) {
-            fprintf(stderr, "ERROR: cannot open %s for writing\n", conv_fa);
-            gzclose(in);
-            return 3;
-        }
-        fprintf(stderr, "[bwa_index:--meth] writing seed FASTA %s ...\n", conv_fa);
-
-        kseq_t *seq = kseq_init(in);
-        int64_t total_bases = 0, n_seqs = 0;
-        int kr = 0;
-        while ((kr = kseq_read(seq)) >= 0) {
-            /* upper-case before projection so soft-masked ref regions round-trip. */
-            for (size_t i = 0; i < seq->seq.l; ++i) {
-                char c = seq->seq.s[i];
-                if (c >= 'a' && c <= 'z') seq->seq.s[i] = (char)(c - 'a' + 'A');
-            }
-            meth_project_and_write(out, "r", seq->name.s, seq->seq.s, seq->seq.l, 'G', 'A');
-            meth_project_and_write(out, "f", seq->name.s, seq->seq.s, seq->seq.l, 'C', 'T');
-            total_bases += (int64_t)seq->seq.l;
-            ++n_seqs;
-        }
-        kseq_destroy(seq);
-        gzclose(in);
-        /* kseq_read returns -1 on clean EOF; < -1 is a parse/IO error. Don't leave a
-         * partial seed FASTA on disk and don't feed it to bwa_idx_build. */
-        if (kr < -1) {
-            fclose(out);
-            unlink(conv_fa);
-            fprintf(stderr, "ERROR: failed while reading %s (kseq_read=%d)\n", fa, kr);
-            return 4;
-        }
-        if (fclose(out) != 0) {
-            unlink(conv_fa);
-            fprintf(stderr, "ERROR: failed to close %s\n", conv_fa);
-            return 4;
-        }
-        fprintf(stderr, "[bwa_index:--meth] emitted %lld seqs, %lld bp (doubled to %lld bp of seed text)\n",
-                (long long)n_seqs, (long long)total_bases, (long long)(2 * total_bases));
-    }
-
-    /* 2b. Build the converted seed index under the `.meth` prefix. */
-    char meth_prefix[PATH_MAX];
-    n = snprintf(meth_prefix, sizeof(meth_prefix), "%s.meth", fa);
-    if (n <= 0 || (size_t)n >= sizeof(meth_prefix)) {
-        fprintf(stderr, "ERROR: reference path too long\n");
+    if (meth_absolute_path(dest).empty()) {
+        fprintf(stderr, "ERROR: output parent directory does not exist: %s\n", prefix);
         return 1;
     }
-    fprintf(stderr, "[bwa_index:--meth] building seed index %s.* ...\n", meth_prefix);
-    /* emit_unpacked_ref=false (also the default now): the seed `.0123` is never
-     * read by `mem --meth` (extension uses the original reference), so don't
-     * write it (~13 GB on hg38). Kept explicit for documentation; the seed
-     * `.pac` + `.bwt.2bit.64` + `.ann`/`.amb` are still built. */
-    if (bwa_idx_build(conv_fa, meth_prefix, /*emit_unpacked_ref=*/false) != 0) {
-        fprintf(stderr, "ERROR: bwa_idx_build failed on seed index %s\n", conv_fa);
-        return 5;
+    char *header_path = NULL;
+    int header_error = 0;
+    FILE *header = bwa_open_index_header(fa, 1, &header_path, &header_error);
+    std::string hdr(header_path);
+    free(header_path);
+    if (header_error) {
+        fprintf(stderr, "ERROR: cannot read metadata %s: %s\n", hdr.c_str(), strerror(header_error));
+        return 1;
     }
+    const bool have_hdr = header != NULL;
+    if (header) fclose(header);
+    std::string alt = source + ".alt";
+    struct stat alt_stat;
+    bool have_alt = stat(alt.c_str(), &alt_stat) == 0;
+    if (!have_alt && (errno != ENOENT || lstat(alt.c_str(), &alt_stat) == 0)) {
+        fprintf(stderr, "ERROR: cannot inspect metadata %s\n", alt.c_str());
+        return 1;
+    }
+    if (have_alt) {
+        FILE *fp = S_ISREG(alt_stat.st_mode) ? fopen(alt.c_str(), "r") : NULL;
+        if (!fp) { fprintf(stderr, "ERROR: cannot read metadata %s\n", alt.c_str()); return 1; }
+        fclose(fp);
+    }
+    // In-place builds must continue to consult the source dictionary on each
+    // alignment, not shadow future updates with a newly materialized .hdr.
+    const bool relocated = meth_absolute_path(source) != meth_absolute_path(dest);
+    std::vector<std::pair<std::string, std::string>> sidecars;
+    if (have_alt) sidecars.emplace_back(alt, dest + ".alt");
+    if (have_hdr) sidecars.emplace_back(hdr, relocated ? dest + ".hdr" : hdr);
+    std::vector<std::string> protected_paths = {source, source + ".alt", source + ".hdr", meth_dict_path(source)};
+    std::vector<std::string> remove_paths;
+    const char *suffixes[] = {".amb", ".ann", ".pac", ".bwt.2bit.64", ".0123",
+        ".meth.amb", ".meth.ann", ".meth.pac", ".meth.bwt.2bit.64", ".meth.0123",
+        ".meth.fa", ".alt", ".hdr"};
+    for (const char *suffix : suffixes) {
+        std::string path = dest + suffix;
+        struct stat st;
+        if (lstat(path.c_str(), &st) != 0) {
+            if (errno == ENOENT) continue;
+            fprintf(stderr, "ERROR: cannot inspect output %s: %s\n", path.c_str(), strerror(errno));
+            return 1;
+        }
+        // Sidecars already at their source name are inputs, not replacements.
+        bool input_sidecar = false;
+        for (const auto& mapping : sidecars)
+            if (path == mapping.second &&
+                meth_absolute_path(mapping.first) == meth_absolute_path(mapping.second))
+                input_sidecar = true;
+        if (input_sidecar) continue;
+        bool protected_file = false;
+        for (const auto& input : protected_paths)
+            if (meth_same_file(path, input)) protected_file = true;
+        if (!S_ISREG(st.st_mode) || st.st_nlink != 1 || protected_file) {
+            fprintf(stderr, "ERROR: unsafe output collision: %s (source, alias, symlink or non-regular file)\n", path.c_str());
+            return 1;
+        }
+        if (!force) {
+            fprintf(stderr, "ERROR: output exists: %s; use --force to replace known index artifacts\n", path.c_str());
+            return 1;
+        }
+        remove_paths.push_back(path);
+    }
+    // Seed metadata would describe the wrong contigs. An unrelated destination
+    // dictionary must not silently become the relocated original's header.
+    for (const auto& path : {dest + ".meth.alt", dest + ".meth.hdr", meth_dict_path(dest), meth_dict_path(dest + ".meth")}) {
+        struct stat st;
+        if (lstat(path.c_str(), &st) == 0 &&
+            !(path == meth_dict_path(dest) && meth_same_file(path, meth_dict_path(source)))) {
+            fprintf(stderr, "ERROR: conflicting metadata: %s; refusing to replace unrelated files\n", path.c_str());
+            return 1;
+        }
+    }
+
+    int64_t length = fasta_count_bases(fa);
+    if (length <= 0) {
+        fprintf(stderr, "ERROR: cannot read a nonempty reference from %s\n", fa);
+        return 2;
+    }
+    int64_t seed_need = libsais_estimate_peak_bytes(4 * length);
+    if (max_memory_bytes > 0 && seed_need > max_memory_bytes) {
+        fprintf(stderr, "[bwa_index:--meth] the seed index dominates: ~%s vs ~%s for "
+                        "the original, because its per-strand-converted text is twice as long\n",
+                bwa::fmt_bytes(seed_need).c_str(),
+                bwa::fmt_bytes(libsais_estimate_peak_bytes(2 * length)).c_str());
+        libsais_report_budget_shortfall("index --meth", seed_need, max_memory_bytes,
+                                        max_memory_user_specified != 0, 2 * length);
+        return 3;
+    }
+
+    const char *tmp = getenv("BWA_INDEX_TMPDIR");
+    if (!tmp) tmp = getenv("TMPDIR");
+    if (!tmp) tmp = "/tmp";
+    std::string pattern = std::string(tmp) + "/bwa-meth-XXXXXX";
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    if (!mkdtemp(name.data())) {
+        fprintf(stderr, "ERROR: cannot create methylation scratch in %s: %s\n", tmp, strerror(errno));
+        return 1;
+    }
+    meth_scratch_dir = name.data();
+    static bool registered = false;
+    if (!registered) { atexit(meth_cleanup_scratch); registered = true; }
+    MethScratchGuard guard;
+    std::string conv = meth_scratch_dir + "/seed.fa";
+    if (!meth_write_seed_fasta(fa, conv)) return 2;
+    for (const auto& path : remove_paths) {
+        if (unlink(path.c_str()) != 0) {
+            fprintf(stderr, "ERROR: cannot remove %s: %s\n", path.c_str(), strerror(errno));
+            return 1;
+        }
+    }
+    if (minimal) {
+        gzFile fp = xzopen(fa, "r");
+        bns_fasta2bntseq(fp, prefix, 1);
+        err_gzclose(fp);
+    } else if (bwa_idx_build(fa, prefix, emit_unpacked_ref) != 0) return 5;
+    if (bwa_idx_build(conv.c_str(), (dest + ".meth").c_str(), false) != 0) return 5;
+    for (const auto& mapping : sidecars)
+        if (!meth_same_file(mapping.first, mapping.second) &&
+            !meth_copy_file(mapping.first, mapping.second)) return 5;
+    if (keep_fasta && !meth_retain_fasta(conv, dest + ".meth.fa")) return 5;
     return 0;
 }
 
@@ -267,9 +392,14 @@ static void index_usage(void)
 	        "                     [auto: RAM less a reserve of min(max(2G, 5%%), 50%%),\n"
 	        "                     cgroup-aware]\n"
 	        "  --tmp-dir PATH     scratch directory [$TMPDIR]\n"
-	        "  --meth             build a BS-aware dual index. Writes the original-alphabet\n"
-	        "                     index at <in.fasta>.* plus a converted seed FM-index at\n"
-	        "                     <in.fasta>.meth.* (used by `bwa-mem3 mem --meth`).\n"
+	        "  --meth             build original <prefix>.* and converted <prefix>.meth.*\n"
+	        "                     indexes; -p defaults to <in.fasta>. Use with mem --meth.\n"
+	        "  --meth-only        with --meth, pack the original without its FM-index;\n"
+	        "                     seven index files, for methylation alignment only\n"
+	        "  --keep-meth-fasta  with --meth, retain fresh conversion as <prefix>.meth.fa\n"
+	        "                     (otherwise removed from unique scratch on exit)\n"
+	        "  --force            with --meth, replace existing known index artifacts;\n"
+	        "                     rejects source aliases, symlinks and directories\n"
 	        "  --emit-unpacked-ref also write the unpacked `<prefix>.0123` reference. Off by\n"
 	        "                     default: `mem` pac-fetches bases from `.pac`, so `.0123`\n"
 	        "                     is never read. Enable only for an external consumer that\n"
@@ -311,6 +441,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 	int c;
 	char *prefix = 0;
 	int meth = 0;
+	bool meth_only = false, keep_meth_fasta = false, force = false;
 	int emit_unpacked_ref = 0;     // 0 => don't write <prefix>.0123 (mem pac-fetches)
 	int64_t user_max_memory = 0;   // 0 => auto default
 	int     user_threads    = 0;   // 0 => auto default
@@ -320,6 +451,9 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		{"max-memory",        required_argument, 0, 1001},
 		{"tmp-dir",           required_argument, 0, 1002},
 		{"emit-unpacked-ref", no_argument,       0, 1003},
+		{"meth-only",         no_argument,       0, 1004},
+		{"keep-meth-fasta",   no_argument,       0, 1005},
+		{"force",             no_argument,       0, 1006},
 		{"threads",           required_argument, 0, 't'},
 		{"help",              no_argument,       0, 'h'},
 		{0, 0, 0, 0}
@@ -364,6 +498,12 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 			setenv("BWA_INDEX_TMPDIR", optarg, 1);
 		} else if (c == 1003) {
 			emit_unpacked_ref = 1;
+		} else if (c == 1004) {
+			meth_only = true;
+		} else if (c == 1005) {
+			keep_meth_fasta = true;
+		} else if (c == 1006) {
+			force = true;
 		} else if (c == 'h') {
 			index_usage();
 			return 0;
@@ -374,6 +514,15 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 
 	if (optind + 1 > argc) {
 		index_usage();
+		return 1;
+	}
+
+	if (!meth && (meth_only || keep_meth_fasta || force)) {
+		fprintf(stderr, "ERROR: --meth-only, --keep-meth-fasta and --force require --meth\n");
+		return 1;
+	}
+	if (meth_only && emit_unpacked_ref) {
+		fprintf(stderr, "ERROR: --meth-only cannot be combined with --emit-unpacked-ref\n");
 		return 1;
 	}
 
@@ -426,22 +575,19 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 	}
 
 	if (meth) {
-		if (prefix != 0) {
-			fprintf(stderr, "ERROR: --meth does not accept -p (outputs <in.fasta>.* and <in.fasta>.meth.*)\n");
-			return 1;
-		}
+		if (prefix == 0) prefix = argv[optind];
 		if (user_sa_compx != 3) {
 			fprintf(stderr, "ERROR: --meth does not accept -u (SA sampling rate is fixed for meth indexes)\n");
 			return 1;
 		}
-		int rc = meth_index_build(argv[optind], emit_unpacked_ref,
+		int rc = meth_index_build(argv[optind], prefix, meth_only, keep_meth_fasta, force, emit_unpacked_ref,
 		                         resolved_mem, user_max_memory > 0);
 		/* The real reference only. The `.meth` seed index has no .alt of its own
 		 * and its contigs are f/r-prefixed, so it can never have ALT status to
 		 * lose -- the same reason `mem` skips this check in meth mode
 		 * (fastmap.cpp). Stating it here beats relying on the seed prefix
 		 * happening not to resolve a sidecar. */
-		if (rc == 0) warn_if_sidecar_hides_alt(argv[optind]);
+		if (rc == 0) warn_if_sidecar_hides_alt(prefix);
 		return rc;
 	}
 	if (prefix == 0) prefix = argv[optind];

@@ -118,6 +118,10 @@ ok "bandedswa_zdrop_eweight_test (z-drop gap-extend weighting parity)"
 "$HERE/pg_cl_escape_test.sh" "$BWAMEM3" "$FIXTURES" || fail "pg_cl_escape_test failed"
 ok "pg_cl_escape_test"
 
+# Generated prefix/minimal-index fixtures do not depend on the shared phiX index.
+BWA_MEM3="$BWAMEM3" "$HERE/regression/meth_index_output.sh" || fail "meth_index_output failed"
+ok "meth_index_output"
+
 # --- meth_rg_header_test --------------------------------------------------
 # A `-R` read group must be emitted as an @RG header line in --meth mode,
 # not just stamped as RG:Z on records (the default path always was). Guards

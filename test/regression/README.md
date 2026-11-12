@@ -1,5 +1,7 @@
 # Regression scripts
 
+`meth_index_output.sh` generates its own reference and SE/PE reads to check full/minimal methylation index layouts, output prefixes, EM-seq/bisulfite/TAPS alignment parity, ordinary alignment compatibility, safe forced replacement, metadata relocation, gzip/read-only sources, scratch precedence and failure cleanup. Set `BWA_MEM3` to the binary under test; it runs in both `make test` and the canonical CI methylation step.
+
 End-to-end parity and invariant checks. `chr22_parity.sh`,
 `version_banner.sh`, `arg_range_validation.sh` and `rescue_prune_identity.sh` run on every matrix
 row (the last one's pruning and banding checks need a build with the SIMD filter, which every row's build has; its table row says why); the rest run on the canonical

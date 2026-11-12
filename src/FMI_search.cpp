@@ -927,6 +927,11 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     if (cpstream == NULL)
     {
         fprintf(stderr, "ERROR! Unable to open the file: %s\n", cp_file_name);
+        std::string seed_index = std::string(ref_file_name) + ".meth" + CP_FILENAME_SUFFIX;
+        if (access(seed_index.c_str(), R_OK) == 0)
+            fprintf(stderr, "This may be a --meth-only index: use mem --meth for methylation "
+                            "alignment, or rebuild with index --meth --force (without "
+                            "--meth-only) for ordinary alignment.\n");
         exit(EXIT_FAILURE);
     }
     else

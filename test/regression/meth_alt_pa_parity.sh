@@ -125,7 +125,7 @@ PY
 }
 
 "$BWA_MEM3" index ref.fa > index.log 2>&1
-"$BWA_MEM3" index --meth ref.fa > index-meth.log 2>&1 || {
+"$BWA_MEM3" index --meth --force ref.fa > index-meth.log 2>&1 || {
     echo "FAIL: bwa-mem3 index --meth failed" >&2
     cat index-meth.log >&2
     exit 1

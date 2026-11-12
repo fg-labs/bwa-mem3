@@ -36,10 +36,12 @@ This builds the normal 4-letter index at the bare prefix **plus** a converted se
 | File(s) | Description |
 |---------|-------------|
 | `ref.fa.amb`, `ref.fa.ann`, `ref.fa.bwt.2bit.64`, `ref.fa.pac` | Normal index over the original reference (used for scoring/extension; bases are pac-fetched from `.pac`, so no `.0123` is built). |
-| `ref.fa.meth.fa` | Per-strand C→T / G→A converted FASTA (`f`/`r` doubled contigs). |
+| `ref.fa.meth.fa` (only with `--keep-meth-fasta`) | Per-strand C→T / G→A converted FASTA (`f`/`r` doubled contigs). |
 | `ref.fa.meth.*` | FM-index over the converted FASTA (used only for **seeding**). |
 
 Both indexes live next to `ref.fa`; `bwa-mem3 index ref.fa` (no `--meth`) builds only the first set.
+
+To write elsewhere, add `-p /idx/ref` and align against `/idx/ref`. For methylation-only use, add `--meth-only`: it omits the original `.bwt.2bit.64`, leaving seven index files and any source sidecars. Ordinary alignment then requires rebuilding without `--meth-only`. Existing outputs require `--force`; the converted FASTA is temporary unless explicitly retained. See [indexing](../user-guide/indexing.md#minimal-methylation-output-and-safe-rebuilds) for safety and scratch details.
 
 ## Align bisulfite-converted reads
 
@@ -58,7 +60,7 @@ bwa-mem3 mem --meth -t 16 ref.fa R1.fq.gz \
   | samtools sort -o out.bam
 ```
 
-Pass the original (unconverted) reference path. bwa-mem3 finds the `ref.fa.meth.*` seed index
+Pass the original-reference output prefix (the FASTA path only when `-p` was omitted). bwa-mem3 finds the `<prefix>.meth.*` seed index
 automatically when `--meth` is active. The paired-end-only flags (`-U 100`, `-p`) do not apply
 to single-end input.
 

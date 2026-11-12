@@ -69,7 +69,7 @@ bwa-mem3 index --meth ref.fa
 Methylation mode builds a **dual index**: the normal FM-index over the original
 reference (at the bare prefix), plus a converted **seed** index under the `.meth`
 prefix. The seed index is built over a per-strand-converted FASTA
-(`ref.fa.meth.fa`) whose contigs are doubled (`f`-prefixed C→T, `r`-prefixed G→A):
+(temporary unless `--keep-meth-fasta` is requested) whose contigs are doubled (`f`-prefixed C→T, `r`-prefixed G→A):
 
 ```text
 # normal index over the original reference (used for scoring/extension)
@@ -78,7 +78,6 @@ ref.fa.ann
 ref.fa.bwt.2bit.64
 ref.fa.pac
 # converted seed index (used only for seeding)
-ref.fa.meth.fa
 ref.fa.meth.amb
 ref.fa.meth.ann
 ref.fa.meth.bwt.2bit.64
@@ -100,16 +99,28 @@ ref.fa.meth.pac
 The `.meth` seed FM-index is roughly twice the size of the normal FM-index (its
 contigs are doubled), so a `--meth` build is larger than a plain build but well
 under 3× (by default no `.0123` is written; `--emit-unpacked-ref` adds it for the
-original index only). For hg38, budget on the order of 35 GB
-of disk for the combined dual index plus the intermediate `ref.fa.meth.fa`.
+original index only). For hg38, budget roughly 34 GB for the dual-index output and separately allow at least 7 GB in the scratch directory for the doubled converted FASTA, plus additional space for the index builder's temporary files. If output and scratch share a filesystem, add these budgets together. The converted FASTA is removed by default; `--keep-meth-fasta` also requires room for a retained copy beside the output.
 
-> **Tip — Pass the original FASTA to mem, not the seed index**
+> **Tip — Pass the original-reference output prefix to mem, not the seed index**
 >
-> When running `bwa-mem3 mem --meth`, pass the original FASTA path (`ref.fa`);
+> When running `bwa-mem3 mem --meth`, pass the original-reference output prefix (`ref.fa` by default, or the `-p` value);
 > bwa-mem3 finds `ref.fa.meth.*` automatically. A legacy `ref.fa.bwameth.c2t`
 > index from an older release is **not** usable — rebuild with
 > `bwa-mem3 index --meth` (see
 > [Migrating from bwameth.py c2t](../methylation/external-c2t.md)).
+
+### Minimal methylation output and safe rebuilds
+
+```bash
+bwa-mem3 index --meth --meth-only -p /idx/hg38 ref.fa.gz
+bwa-mem3 mem --meth /idx/hg38 R1.fq.gz R2.fq.gz
+```
+
+`--meth-only` packs the original `.amb/.ann/.pac` without constructing its FM-index, leaving seven index files plus optional metadata. Ordinary alignment cannot use this minimal layout. The doubled seed build still sets the memory requirement. `--meth-only --emit-unpacked-ref` is rejected.
+
+`-p` works with `--meth` and preserves source ALT and header/dictionary metadata at the output prefix, not on converted seed contigs. Existing index outputs require `--force` before replacement. Force only replaces known artifacts, rejects unsafe aliases/symlinks/directories, and removes stale files when switching layouts. It does not provide transactional rollback after a writer failure. Ordinary indexing is unchanged.
+
+Conversion is always fresh in unique scratch selected by `--tmp-dir`, `BWA_INDEX_TMPDIR`, `TMPDIR`, then `/tmp`. Use `--keep-meth-fasta` to retain `<prefix>.meth.fa`. Scratch cleanup covers success and handled failures, including `exit()`; SIGKILL and machine failure can leave temporary directories behind. See the [index CLI](../cli/index-cmd.md) for the full lifecycle and collision policy.
 
 ## Output file locations
 

@@ -116,8 +116,9 @@ index never needs an unpacked reference.
 
 Builds a **dual index**: the normal FM-index over the original FASTA (at the bare
 prefix), plus a converted **seed** FM-index under the `.meth` prefix, built over a
-per-strand-converted FASTA `<in.fasta>.meth.fa` (`f`-prefixed C→T and `r`-prefixed
-G→A doubled contigs). All files are placed alongside the original FASTA.
+fresh per-strand-converted FASTA (`f`-prefixed C→T and `r`-prefixed G→A doubled contigs). Use `-p PREFIX` to write both indexes elsewhere; the source directory need not be writable. The output parent directory must already exist, and the prefix must not end in `.meth`.
+
+When relocating, source `<in.fasta>.alt` is copied to `<prefix>.alt`. The source `<in.fasta>.hdr` takes precedence over its dictionary fallback (remove trailing `.gz`, then the final filename extension, and append `.dict`); the selected file is copied verbatim to `<prefix>.hdr`. No metadata is attached to converted seed contigs. Conflicting destination dictionaries or seed sidecars are rejected rather than overwritten.
 
 By default, neither index writes an unpacked `.0123`: `mem --meth` extends against
 the original reference (whose bases it pac-fetches from `.pac`), never the seed, so
@@ -127,8 +128,26 @@ runtime RSS reduction comes from avoiding the original `.0123` load (~6.4 GB).
 (`--emit-unpacked-ref` overrides this for the **original** index only; the
 `.meth` seed never needs one.)
 
-Pass the **original** FASTA prefix to all three `index`, `shm`, and `mem` commands;
-the `.meth` seed index is located automatically when `--meth` is present.
+Pass the **output prefix** (not the source FASTA if `-p` relocated it) to `shm --meth` and `mem --meth`; the `.meth` seed index is located automatically.
+
+### `--meth-only` — omit the ordinary FM-index
+
+Requires `--meth`. Writes exactly seven index files: `<prefix>.{amb,ann,pac}` and `<prefix>.meth.{amb,ann,pac,bwt.2bit.64}` (plus applicable sidecars). The original reference is packed without constructing its FM-index. This index supports only methylation alignment; ordinary `mem` fails with rebuild guidance. Combining this option with `--emit-unpacked-ref` is rejected. The doubled seed build still determines the memory budget; minimal output does not lower that preflight requirement.
+
+```bash
+bwa-mem3 index --meth --meth-only -p /idx/hg38 ref.fa.gz
+bwa-mem3 mem --meth /idx/hg38 R1.fq.gz R2.fq.gz
+```
+
+### `--keep-meth-fasta` — retain the converted FASTA
+
+Requires `--meth`. Conversion is always regenerated in a unique scratch directory, never reused by timestamp. With this option it is also copied to `<prefix>.meth.fa` after successful indexing. Scratch selection is `--tmp-dir`, then `BWA_INDEX_TMPDIR`, then `TMPDIR`, then `/tmp`. Allow room for the doubled converted FASTA as well as the index builder's scratch. Conversion scratch is removed on success and handled failures, including lower-level `exit()` calls. SIGKILL, abrupt signals, or machine failure can leave scratch behind; remove abandoned `bwa-meth-*` directories manually.
+
+### `--force` — replace known methylation index artifacts
+
+Requires `--meth`. Without it, an existing output artifact causes refusal before modification. With it, only known index artifacts and relocated `.alt`/`.hdr` outputs may be replaced; source aliases, hard links, symlinks, directories, and conflicting unrelated metadata are rejected. Other files are untouched. Switching between full and minimal output removes stale `.bwt.2bit.64`, `.0123`, and retained `.meth.fa` artifacts as appropriate.
+
+The seed memory budget and conversion are checked before replacement begins. Replacement is **not transactional**: a subsequent index-writing failure may leave a partial index; rerun with `--force` after fixing the cause. Do not rebuild a prefix while another process is reading or modifying it. Ordinary `index` behavior without `--meth` is unchanged.
 
 ## Notes / Gotchas
 
@@ -137,13 +156,13 @@ the `.meth` seed index is located automatically when `--meth` is present.
 > A standard hg38 index is ~11 GB of index files on disk and takes several
 > minutes to build. A `--meth` build adds the seed index on top — the doubled
 > seed FM-index (~21 GB) plus its packed `.pac` (~1.6 GB) — for roughly **34 GB**
-> of index files (~37 GB including the converted `.meth.fa`). That is a little
+> of index files (conversion scratch is additional and not retained by default). That is a little
 > over double the plain footprint, not triple: by default no unpacked `.0123` is
 > built for either index (`--emit-unpacked-ref` adds it for the original only).
 > Build once and store on shared storage; all alignment jobs on the same reference
 > share the files.
 >
-> **Note — a `--meth` index is a superset, not a separate index**
+> **Note — a default `--meth` index is a superset (unless `--meth-only`)**
 >
 > `index --meth` writes the normal index at the bare prefix *plus* the `.meth`
 > seed index. The bare-prefix index is an ordinary index, so `bwa-mem3 mem ref.fa`

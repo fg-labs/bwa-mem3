@@ -39,7 +39,7 @@ fail() {
 }
 
 # --- A2: dual index emitted ------------------------------------------------
-"$BWA_MEM3" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
+"$BWA_MEM3" index --meth --keep-meth-fasta ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
 for f in ref.fa.pac ref.fa.bwt.2bit.64 ref.fa.meth.pac ref.fa.meth.bwt.2bit.64 ref.fa.meth.ann; do
     [ -s "$f" ] || fail "missing/empty index file: $f"
 done

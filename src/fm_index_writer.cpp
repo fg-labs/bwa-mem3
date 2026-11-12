@@ -42,6 +42,15 @@
 #include <unistd.h>
 #include <vector>
 
+// Streaming writes can terminate through err_fatal, so scoped cleanup alone
+// cannot reclaim the unique output temporary. Builds are serial per process.
+static std::string streaming_temp_path;
+static void cleanup_streaming_temp()
+{
+    if (!streaming_temp_path.empty()) unlink(streaming_temp_path.c_str());
+    streaming_temp_path.clear();
+}
+
 // A small ring buffer that accumulates writes to one output region. When
 // `fill` reaches `cap`, the whole ring is pwritten at `cursor` and `cursor`
 // advances. This amortises the syscall cost across many small appends.
@@ -398,19 +407,22 @@ void write_fm_index_streaming(const char* out_path,
     const off_t off_sent    = (off_t)L.off_sentinel;
     const off_t total_bytes = (off_t)L.total_bytes;
 
-    // Write to a sibling .tmp file and rename on success so a failed
-    // build (err_fatal anywhere downstream) never leaves a partial /
-    // zero-filled index sitting at the canonical path. A leftover .tmp
-    // from a previous failed run is overwritten by O_TRUNC on the next
-    // attempt, so it self-heals without explicit cleanup.
-    // A fixed name (not mkstemp, unlike rewrite_fm_index_resampled_sa) is
-    // deliberate here: `index` is a single-writer build of a given prefix, so
-    // the concurrent-writers race that motivates a unique temp does not apply,
-    // and O_TRUNC self-healing is worth keeping.
-    const std::string tmp_path = std::string(out_path) + ".tmp";
-    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-        err_fatal(__func__, "open('%s'): %s", tmp_path.c_str(), strerror(errno));
+    // Never open predictable temporary names: even a single writer must not
+    // truncate an unrelated file or follow an attacker-controlled symlink.
+    std::string pattern = std::string(out_path) + ".XXXXXX";
+    std::vector<char> name(pattern.begin(), pattern.end());
+    name.push_back('\0');
+    int fd = mkstemp(name.data());
+    if (fd < 0) err_fatal(__func__, "mkstemp('%s'): %s", pattern.c_str(), strerror(errno));
+    const std::string tmp_path(name.data());
+    streaming_temp_path = tmp_path;
+    static bool registered = false;
+    if (!registered) { std::atexit(cleanup_streaming_temp); registered = true; }
+    // Preserve the previous create(0644) permissions, including the caller's umask.
+    mode_t mask = umask(0);
+    umask(mask);
+    if (fchmod(fd, 0644 & ~mask) != 0)
+        err_fatal(__func__, "fchmod('%s'): %s", tmp_path.c_str(), strerror(errno));
     if (ftruncate(fd, total_bytes) != 0)
         err_fatal(__func__, "ftruncate('%s', %lld): %s",
                   tmp_path.c_str(), (long long)total_bytes, strerror(errno));
@@ -446,6 +458,7 @@ void write_fm_index_streaming(const char* out_path,
     if (rename(tmp_path.c_str(), out_path) != 0)
         err_fatal(__func__, "rename('%s' -> '%s'): %s",
                   tmp_path.c_str(), out_path, strerror(errno));
+    streaming_temp_path.clear();
 }
 
 void rewrite_fm_index_resampled_sa(const char* out_path,
@@ -510,8 +523,7 @@ void rewrite_fm_index_resampled_sa(const char* out_path,
     }
 
     // The fatal pwrite_all() would err_fatal() on the first failed section write,
-    // leaving the unique mkstemp temp behind -- unlike write_fm_index_streaming's
-    // fixed "<out>.tmp", a mkstemp name never self-heals on the next run. Route
+    // leaving the unique mkstemp temp behind. Route
     // every write through pwrite_all_status() and a single cleanup path that
     // unlinks the temp before reporting, so a reachable failure (e.g. ENOSPC)
     // does not orphan a partial temp next to the index. (unlink-then-err_fatal

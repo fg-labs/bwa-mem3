@@ -62,6 +62,7 @@ env:
   # ubuntu-24.04's ca-certificates lacks (curl exit 60). Integrity comes from
   # the CHR17_SHA256 pin, which is checked after every download.
   CHR17_URL: "http://hgdownload.soe.ucsc.edu/goldenpath/hg38/chromosomes/chr17.fa.gz"
+  CHR17_FALLBACK_URL: "http://hgdownload2.soe.ucsc.edu/goldenpath/hg38/chromosomes/chr17.fa.gz"
   CHR17_SHA256: "9acaede8d9b0a190489b49ebf38063bc69897c0d5f125c7549a6f7ee91a0b3c0"  # UCSC hg38 chr17.fa.gz
   HOLODECK_VERSION: "0.2.0"
   SIM_COVERAGE: "1"           # ~415K PE pairs on chr17 at read-length 100
@@ -120,8 +121,15 @@ jobs:
         if: steps.cache-chr17.outputs.cache-hit != 'true'
         run: |
           mkdir -p /tmp/ci-data
-          curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sL "$CHR17_URL" -o /tmp/ci-data/chr17.fa.gz
-          got_sha256="$(sha256sum /tmp/ci-data/chr17.fa.gz | awk '{print $1}')"
+          # Use UCSC's alternate download server if primary retries fail.
+          # Bound each attempt so a stalled primary cannot prevent failover.
+          if ! curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sSL \
+            --connect-timeout 15 --max-time 60 "$CHR17_URL" -o /tmp/ci-data/chr17.fa.gz; then
+            echo "Primary chr17 download failed; trying alternate UCSC server" >&2
+            curl --fail --retry 3 --retry-delay 2 --retry-all-errors -sSL \
+              --connect-timeout 15 --max-time 60 "$CHR17_FALLBACK_URL" -o /tmp/ci-data/chr17.fa.gz
+          fi
+          got_sha256="$(sha256sum /tmp/ci-data/chr17.fa.gz | mawk '{print $1}')"
           if [ "$got_sha256" != "$CHR17_SHA256" ]; then
             echo "chr17.fa.gz sha256 mismatch: expected $CHR17_SHA256, got $got_sha256"
             exit 1

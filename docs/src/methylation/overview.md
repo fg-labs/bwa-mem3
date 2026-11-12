@@ -216,6 +216,20 @@ Steps:
    command line. Output is SAM text by default and uncompressed BAM (`wb0`)
    under `--bam`; pipe either directly to `samtools sort`.
 
+## Index artifacts
+
+By default, `index --meth` builds a dual-purpose index that also supports ordinary alignment. `--meth-only` omits construction of the ordinary FM-index; it does not change methylation alignment or the doubled seed memory requirement. Use `-p PREFIX` to write elsewhere and pass that prefix to `mem --meth`.
+
+| Artifacts at `PREFIX` | Default `--meth` | With `--meth-only` |
+|-----------------------|-----------------|--------------------|
+| `.amb`, `.ann`, `.pac` (original reference) | Written | Written |
+| `.bwt.2bit.64` (ordinary FM-index) | Written | Omitted |
+| `.meth.amb`, `.meth.ann`, `.meth.pac`, `.meth.bwt.2bit.64` (seed index) | Written | Written |
+| `.meth.fa` (converted FASTA) | Only with `--keep-meth-fasta` | Only with `--keep-meth-fasta` |
+| `.alt`, `.hdr` (applicable source metadata) | Preserved at original prefix | Preserved at original prefix |
+
+Minimal output is seven index files plus applicable metadata; it cannot serve ordinary alignment. Existing index artifacts require `--force` for safe replacement. Conversion is always fresh in unique scratch and removed on success or handled failure unless retained; abrupt termination such as SIGKILL can leave scratch behind. See [index options and lifecycle](../cli/index-cmd.md#--meth-only--omit-the-ordinary-fm-index).
+
 ## Quick-start commands
 
 ```bash

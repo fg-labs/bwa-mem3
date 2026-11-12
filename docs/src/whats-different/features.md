@@ -24,8 +24,10 @@ bwa-mem3 index --meth ref.fa          # once per reference
 bwa-mem3 mem --meth ref.fa R1.fq R2.fq | samtools sort -o out.bam
 ```
 
+`index --meth -p PREFIX` selects the output location. `--meth-only` skips the ordinary FM-index for a seven-file methylation-only layout, and `--keep-meth-fasta` retains the otherwise temporary conversion. Replacing existing outputs requires `--force`. See [index output and lifecycle options](../cli/index-cmd.md#--meth-only--omit-the-ordinary-fm-index).
+
 `index --meth` builds a dual index: the normal index over the original reference
-plus a converted **seed** index `<ref>.meth.*` (over `<ref>.meth.fa`, a doubled
+plus a converted **seed** index `<ref>.meth.*` (over a temporary FASTA, a doubled
 reference with `f`-prefixed C→T and `r`-prefixed G→A contigs). Reads seed in that
 3-letter space but are scored against the original 4-letter reference, so the
 index layout is **not** the same as bwameth.py's single `.bwameth.c2t` reference.

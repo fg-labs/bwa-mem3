@@ -120,14 +120,14 @@ if ! command -v samtools > /dev/null 2>&1; then
 fi
 
 # --meth requires the D3 seed index built with `index --meth`. Check the full
-# artifact set (converted seed FASTA + the four seed FMI files), not just one,
+# artifact set (the four seed FMI files), not just one,
 # so a partial index left by an interrupted run is rebuilt rather than skipped —
 # matching the non-meth block above. The seed has no `.0123` (never read in
 # --meth; extension uses the original reference, which itself pac-fetches).
-if [[ ! -s "$ref.meth.fa" || ! -s "$ref.meth.bwt.2bit.64" ||
+if [[ ! -s "$ref.meth.bwt.2bit.64" ||
     ! -s "$ref.meth.amb" || ! -s "$ref.meth.ann" ||
     ! -s "$ref.meth.pac" ]]; then
-    "$bin" index --meth "$ref" > /dev/null 2>&1 \
+    "$bin" index --meth --force "$ref" > /dev/null 2>&1 \
         || {
             echo "FAIL: bwa-mem3 index --meth on phix.fa failed" >&2
             exit 1
