@@ -37,6 +37,32 @@ that must hold the batch partition fixed — compare at the same `-t`, or pass
 small number of records on their own. See
 [Equivalence → batch size, `-t`, and why comparisons need `-K`](../whats-different/equivalence.md#batch-size--t-and-why-comparisons-need--k).
 
+## Library orientation
+
+`--meth` supports **directional libraries only**, for every chemistry. It uses
+**R1 or single-end: C-to-T (`CT`); R2: G-to-A (`GA`)** as input conversion
+hypotheses. These are not fixed genomic mapping strands: either mate can map
+to either genomic strand. They describe how the input reads were generated,
+not which genomic strand an alignment must occupy.
+
+The chemistry selector (`--meth=emseq`, `--meth=taps`, or `--meth=5base`) sets
+methylation-call polarity and the default scoring mode; it neither infers nor
+changes library orientation. Check the library preparation protocol and read
+layout before alignment. The kit name or a single-cell label alone does not
+establish compatibility.
+
+PBAT-style opposite-orientation libraries and non-directional libraries that
+require additional conversion hypotheses are **not supported**. This is an
+input requirement, not an automatic detection or rejection check: unsupported
+reads can still produce alignments, but those alignments are not evidence of
+support. For PBAT or scBS-Seq data, use `--meth` only if the actual protocol and
+read layout satisfy the directional convention above; otherwise use an
+aligner that explicitly supports that orientation.
+
+`--chimera-qc` is only a post-alignment longest-match heuristic. It neither
+detects library orientation nor adds PBAT or non-directional support. Changing
+scoring modes or QC flags does not add the missing conversion hypotheses.
+
 ## How `NM`/`MD` are computed under `--meth`
 
 Under `--meth`, an aligned substitution (a read base aligned to a different
@@ -192,8 +218,10 @@ Steps:
 
 2. **Seeding against the `.meth` doubled seed index.** The projected read is
    seeded against the converted seed FM-index (`<ref>.meth.*`), which contains a
-   forward C→T projection (`f`-prefixed contigs) and a reverse G→A projection
-   (`r`-prefixed contigs) of each chromosome.
+   C→T projection (`f`-prefixed contigs) and a G→A projection
+   (`r`-prefixed contigs) of each chromosome, both in forward coordinates.
+   Either read can seed in either genomic orientation; the input conversion
+   hypothesis and hit orientation determine which converted copy is compatible.
 
 3. **Seed remap to original coordinates.** Every seed is mapped back to original
    genome coordinates, and the contig prefix it came from sets a strand

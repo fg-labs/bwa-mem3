@@ -8,25 +8,29 @@ how the original bases come back for scoring and output.
 
 ## What gets projected (for seeding only)
 
-Paired-end bisulfite reads follow a strand convention:
+`--meth` requires the [directional input convention](overview.md#library-orientation)
+for every chemistry:
 
-- **R1** (read 1): every `C` is replaced with `T` (models the OT / CTOB strands).
-- **R2** (read 2): every `G` is replaced with `A` (models the OB / CTOT strands).
+- **R1** (read 1): every `C` is replaced with `T` (input hypothesis `CT`).
+- **R2** (read 2): every `G` is replaced with `A` (input hypothesis `GA`).
 
-Single-end mode uses the R1 (`C→T`) rule for all reads.
+Single-end mode uses the R1 (`C→T`) rule for all reads. These hypotheses are
+independent of genomic mapping strand: either mate can map forward or reverse.
+Chemistry selection does not infer or change this input convention.
 
 This projection is applied **only to the copy of the read used for seeding**. The
 `.meth` doubled seed index built by `bwa-mem3 index --meth` holds two projections
 of each chromosome:
 
 - `f`-prefixed contigs (e.g. `fchr1`): the chromosome with every `C` → `T`.
-- `r`-prefixed contigs (e.g. `rchr1`): the reverse-complement strand with every
-  `G` → `A`.
+- `r`-prefixed contigs (e.g. `rchr1`): the chromosome with every `G` → `A`.
 
-Projected R1 reads seed against `f`-prefixed contigs and projected R2 reads
-against `r`-prefixed contigs. The contig prefix records the strand hypothesis
-(`f` → OT, `r` → OB), which both selects the per-strand scoring matrix and feeds
-the Bismark `XG:Z` tag (`CT` for OT, `GA` for OB).
+Seed hits are remapped from the converted contigs to original coordinates.
+The conversion hypothesis and the hit's strand determine the scoring matrix;
+R1 is not restricted to one genomic strand, nor R2 to the other. `XR:Z` records
+the input read conversion (`CT` for R1/single-end, `GA` for R2), while `XG:Z`
+records the aligned genome conversion strand. See [SAM tags](tags.md) for their
+relationship on forward and reverse alignments.
 
 > **Key difference from bwameth / 3-letter aligners**
 >

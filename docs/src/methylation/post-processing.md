@@ -74,8 +74,9 @@ and X operations.
 The chimera heuristic is only applied to mapped records (`!(flag & 0x4)
 && direction != 0`). Unmapped records are not touched.
 
-See [Flags](flags.md) for when to use `--chimera-qc` (PBAT / scBS-Seq;
-bwameth.py-equivalence runs).
+See [Flags](flags.md#--chimera-qc) for use on chimera-prone supported directional
+data. PBAT / scBS-Seq protocols must meet the
+[library orientation requirement](overview.md#library-orientation).
 
 ## `--set-as-failed` strand filtering
 

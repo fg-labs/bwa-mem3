@@ -16,7 +16,12 @@ For *what* the flags are and *how* the scoring modes work, see the reference:
 
 ## When to keep the defaults
 
-For standard whole-genome bisulfite and EM-seq workflows, the defaults
+First verify the [directional library requirement](../methylation/overview.md#library-orientation):
+R1/single-end uses C-to-T and R2 uses G-to-A as input conversion hypotheses,
+not fixed genomic mapping strands. Neither chemistry selection nor QC flags
+infer or change library orientation.
+
+For standard directional whole-genome bisulfite and EM-seq workflows, the defaults
 (`genomic` scoring plus `-B 4 -L 10 -U 100 -T 40 -M -C`) are appropriate as-is.
 The filtering values come from the bwameth.py codebase. `genomic` keeps the
 mirror change (reference T read as C) a mismatch, which gives better-calibrated
@@ -43,10 +48,11 @@ small target region and insert sizes are more variable, consider lowering `-T`
 the default `-U 100` is appropriate. However, if your amplicons are short
 (< 100 bp), consider lowering `-L` further to reduce clipping at read ends.
 
-**Non-standard conversion chemistry.** Some library preparations use only one
-strand conversion (C→T only, not G→A). In such cases, `--set-as-failed r`
-suppresses alignments to the reverse-complement strand, which reduces noise
-from strand-ambiguous alignments:
+**Strand-specific QC.** If a supported directional protocol requires
+alignments under one genome conversion hypothesis (`XG:Z`) to be marked
+QC-failed, use `--set-as-failed r` (`XG:Z:GA`) or `f` (`XG:Z:CT`). This marks
+matching records with `0x200`; it does not remove them, change the input
+conversion hypotheses, or enable an unsupported library orientation:
 
 ```bash
 bwa-mem3 mem --meth --set-as-failed r -t 16 ref.fa R1.fq.gz R2.fq.gz \
@@ -54,10 +60,12 @@ bwa-mem3 mem --meth --set-as-failed r -t 16 ref.fa R1.fq.gz R2.fq.gz \
 ```
 
 **Chimera QC is opt-in** (off by default, matching Bismark). Leave it off for
-standard directional EM-seq / WGBS. Turn it on for PBAT / scBS-Seq libraries
-(where intra-fragment chimerism is common) or when you want bwameth.py-equivalent
-flagging — pass `--chimera-qc` (see [Flags](../methylation/flags.md#--chimera-qc)
-for the exact heuristic):
+standard directional EM-seq / WGBS. Consider it for chimera-prone supported
+directional data, or when you want bwameth.py-style heuristic flagging.
+PBAT / scBS-Seq protocols must meet the
+[library orientation requirement](../methylation/overview.md#library-orientation).
+Pass `--chimera-qc` to enable it (see
+[Flags](../methylation/flags.md#--chimera-qc) for the exact heuristic):
 
 ```bash
 bwa-mem3 mem --meth --chimera-qc -t 16 ref.fa R1.fq.gz R2.fq.gz \

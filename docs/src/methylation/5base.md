@@ -15,6 +15,13 @@ matched: its 400,000 primary records and every secondary and supplementary one.
 Only the `@PG` header's `CL:` differs, since it records the spelling used; what
 a `Z` call measures differs too (see 5hmC below), but not how reads align.
 
+Like every `--meth` chemistry, 5-base requires a
+[directional library](overview.md#library-orientation): R1/single-end `CT` and
+R2 `GA` are input conversion hypotheses, not fixed genomic mapping strands.
+`--meth=5base` neither infers nor changes library orientation. Check the actual
+protocol and read layout, not just the kit name; PBAT-style opposite-orientation
+and non-directional libraries are not supported.
+
 ## TL;DR
 
 ```bash
