@@ -183,7 +183,7 @@ runs:
       # Exact-key hit: the cache already holds this build's .debs, nothing to
       # save. Saved right after the install rather than at job end, so a later
       # failing step in the job does not lose it.
-      if: github.event_name == 'push' && steps.debs.outputs.cache-hit != 'true'
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.debs.outputs.cache-hit != 'true'
       uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
         path: ${{ steps.prep.outputs.debdir }}

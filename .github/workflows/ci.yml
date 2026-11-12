@@ -5,8 +5,9 @@ on:
   # tests the exact commit that then lands, so a full run on the push to main
   # would test the same commit twice. On push only two jobs run: coverage (it
   # gives Codecov the main baseline PR diffs compare against) and warm-caches
-  # (it saves the compiler caches PR and merge-queue runs restore); every other
-  # job carries `if: github.event_name != 'push'`.
+  # (it saves the compiler caches PR and merge-queue runs restore). Pushes to
+  # devel-aln instead run full validation of the integrated feature, without
+  # publishing coverage or writing the main compiler caches.
   #
   # Two depths, decided once by .github/scripts/ci-depth.sh and read by the
   # steps as CI_DEPTH. The merge_group run is always full: what lands is
@@ -21,7 +22,7 @@ on:
   # required checks report as before; the script falls back to full whenever it
   # cannot tell.
   push:
-    branches: [main]
+    branches: [main, devel-aln]
   pull_request:
   merge_group:
 
@@ -72,7 +73,7 @@ jobs:
   # matrix row, and so it reports in seconds instead of after a full build.
   ndebug-gate-lint:
     name: NDEBUG gate lint (src/)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     # Source-only lint that reports in seconds; a generous ceiling so only a
     # genuinely hung runner trips it, never a slow-but-normal one.
@@ -94,7 +95,7 @@ jobs:
 
   avx2-floor-lint:
     name: AVX2 floor (pre-AVX2 x86 refused)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-24.04
     # The pre-AVX2 x86 tiers (sse41/sse42/avx) were retired with the scalar
     # mate-rescue path: batched kswv requires AVX2+, and a sub-AVX2 build would
@@ -230,7 +231,7 @@ jobs:
 
   ubuntu-latest-toolchain:
     name: ubuntu-latest toolchain (AVX2 probe + clang-19 install)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     # Most jobs pin ubuntu-24.04, but ubuntu-latest now resolves to 26.04, whose
     # gcc defaults to -march=x86-64-v3 and for which apt.llvm.org publishes no
     # LLVM 19. Check both on the real image: the AVX2 probe must still refuse a
@@ -285,7 +286,7 @@ jobs:
   # reads as "the opt-in macro list drifted" rather than as an NDEBUG finding.
   debug-macro-flag-lint:
     name: Opt-in debug macro list (ci.yml <-> src/)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -311,7 +312,7 @@ jobs:
   # wiring is checked statically instead.
   calloc-interpose-flag-lint:
     name: Calloc-interposing tests build with -fno-builtin-malloc
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -334,7 +335,7 @@ jobs:
   # rather than being buried in a matrix row. Runs in seconds.
   shell-lint:
     name: Shell lint (shellcheck + shfmt)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     # Downloads two small pinned tools then lints; well under a minute normally.
     timeout-minutes: 10
@@ -399,7 +400,7 @@ jobs:
   # failure reads as "a regression script runs nowhere" on its own line.
   regression-coverage-lint:
     name: Regression scripts are run by CI
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -419,7 +420,7 @@ jobs:
   # went stale" rather than as a finding about src/.
   readme-contract-lint:
     name: Regression README contract (README <-> test/regression/)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -442,7 +443,7 @@ jobs:
   # docs went stale" rather than as a build or test finding.
   rescue-docs-lint:
     name: Rescue developer docs (pages, knob list <-> src/)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     # Source-only lint, seconds of work; ceiling catches a hung runner only.
     timeout-minutes: 10
@@ -467,7 +468,7 @@ jobs:
   # work: a depth-1 checkout and, on a PR, a depth-1 fetch of the base commit.
   ci-depth:
     name: CI depth (full in the merge queue, light on most PRs)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
@@ -565,7 +566,7 @@ jobs:
             artifact_slug: "linux-x86_64-avx2-gcc-compat"
 
     name: ${{ matrix.name }}
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ${{ matrix.os }}
     # Heaviest job here: on top of the mimalloc build plus reference
     # download/index, the canonical row runs the unit-test harness, the
@@ -1756,7 +1757,7 @@ jobs:
   # compile is served from it.
   canonical-regressions:
     name: Linux x86_64 AVX2 (mimalloc) — regressions
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-24.04
     # One build from a warm compiler cache, the chr22 fixture and index, and a
     # few minutes of regression scripts. Ceiling catches a hung runner only.
@@ -2335,7 +2336,7 @@ jobs:
   # canonical-regressions above does the same for that row's own build.
   rebuild-variants:
     name: Rebuild variants (debug macros, SIMD floor, ASAN)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-24.04
     # Three builds plus the chr22 fixture and parity, a few minutes normally.
     # Ceiling catches a hung runner only.
@@ -2652,6 +2653,7 @@ jobs:
                 --xml coverage.xml
 
       - name: Upload coverage to Codecov
+        if: github.event_name != 'push' || github.ref == 'refs/heads/main'
         uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6.0.0
         with:
           files: coverage.xml
@@ -2666,7 +2668,7 @@ jobs:
       # save). Saved even when a test failed: ccache never stores a failed
       # compile, so whatever is in the cache is valid.
       - name: Save ccache
-        if: github.event_name == 'push' && !cancelled()
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && !cancelled()
         uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ${{ runner.temp }}/ccache
@@ -2701,7 +2703,7 @@ jobs:
   msan-padded-lane-gate:
     name: MSan padded-lane gate (banded-SW)
     needs: ci-depth
-    if: ${{ !cancelled() && github.event_name != 'push' && needs.ci-depth.outputs.depth != 'light' }}
+    if: ${{ !cancelled() && (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln') && needs.ci-depth.outputs.depth != 'light' }}
     runs-on: ubuntu-24.04
     # One instrumented build of the kernel + a single fast run. Ceiling catches
     # a hung runner only.
@@ -2772,7 +2774,7 @@ jobs:
   # the stage_prof unit test) so the opt-in path cannot silently bit-rot.
   profiling-build:
     name: Profiling build (STAGE_PROF=1)
-    if: github.event_name != 'push'
+    if: (github.event_name != 'push' || github.ref == 'refs/heads/devel-aln')
     runs-on: ubuntu-24.04
     # Single instrumented build plus a small unit test and one regression.
     timeout-minutes: 20
@@ -2850,7 +2852,7 @@ jobs:
   # apt cache current, and install-clang-19 saves its .deb cache from here.
   warm-caches:
     name: Warm compiler cache (${{ matrix.config }})
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ${{ matrix.os }}
     # `actions: write` only for the step that deletes superseded cache entries.
     # This job runs only on push to main, so it never runs PR code.

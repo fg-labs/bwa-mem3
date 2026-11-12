@@ -9,7 +9,7 @@ on:
       - '.github/workflows/docs.yml'
       - '.readthedocs.yaml'
   push:
-    branches: [main]
+    branches: [main, devel-aln]
 
 # The single job builds mdbook and drift-checks the generated CLI snippets. Its
 # only git operation is a local `git diff --exit-code docs/_generated/`, which
