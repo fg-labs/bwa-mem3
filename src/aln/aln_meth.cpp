@@ -683,6 +683,16 @@ static bool layout_cigar(const aln_meth_layout_t &L, int len, std::vector<uint32
     if (q < len) c->push_back((uint32_t)(len - q) << 4);
     return true;
 }
+// Whether layout_cigar(L, len) succeeds, without building the CIGAR.
+static bool layout_ok(const aln_meth_layout_t &L, int len)
+{
+    int q = 0;
+    for (int g = 0; g < L.n; ++g) {
+        if (L.qpos[g] < q || L.len[g] <= 0) return false;
+        q = L.qpos[g] + (L.del[g] ? 0 : L.len[g]);
+    }
+    return q <= len;
+}
 // The layout of a raw CIGAR of M/I/D operations (false: another operation, or too many gaps).
 static bool cigar_layout(const uint32_t *c, size_t n, aln_meth_layout_t *L)
 {
@@ -749,16 +759,23 @@ static const aln_meth_read_bits_t &slot_bits(aln_meth_slot_t *x, int ori)
  * window is fetched (with that site's ALT, CpG labels) and counted base by base as
  * account_alignment counts. */
 static bool score_path(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, int hyp, int strand, int64_t rb,
-                       int span, int64_t site, aln_meth_occ_t *o, int *seed_mm, int *seed_mirror)
+                       int span, int64_t site, aln_meth_occ_t *o, int *seed_mm, int *seed_mirror,
+                       bool defer = false)
 {
     aln_meth_group_t *g = x->grp;
     const int len = x->len, ori = strand ? 1 : 0;
     o->rid = rid; o->hyp = hyp; o->strand = strand; o->ks_site = site;
     o->alignment.rb = rb; o->alignment.re = rb + span;
-    if (!layout_cigar(L, len, &o->alignment.raw_cigar)) return false;
+    const bool fast = site < 0 && g->mo->fast.ok;
+    // defer (the bit-parallel blocks only): the CIGARs are left to store_row (materialize_row),
+    // which builds them only for a row it keeps
+    const bool deferred = defer && fast;
+    if (deferred) {
+        if (!layout_ok(L, len)) return false;
+    } else if (!layout_cigar(L, len, &o->alignment.raw_cigar)) return false;
     *seed_mm = *seed_mirror = 0;
     const bool seeded = x->job && x->job->seed_width;
-    if (site < 0 && g->mo->fast.ok) {
+    if (fast) {
         const aln_meth_read_bits_t &rd = slot_bits(x, ori);
         aln_meth_amb_bits(*g->ref, rb, span, &x->amb);
         aln_meth_block_counts_t c;
@@ -804,6 +821,7 @@ static bool score_path(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, 
         }
     }
     o->cost = (int64_t)g->opt->s_mm * o->n_mm + (int64_t)g->opt->s_gapo * o->n_gapo + (int64_t)g->opt->s_gape * o->n_gape;
+    if (deferred) return true; // CIGARs and start: materialize_row
     normalize_display(&o->alignment);
     o->pos = o->alignment.rb;
     return true;
@@ -819,6 +837,13 @@ static bool within_read_limits(const aln_meth_slot_t *x, const aln_meth_occ_t &o
     const gap_opt_t *op = x->grp->opt;
     const int diffs = o.n_mm - (mirror_free ? o.n_mirror : 0) + o.n_gapo + ((op->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
     return diffs <= x->max_diff && o.n_gapo <= std::max(0, op->max_gapo) && o.n_gape <= std::max(0, op->max_gape);
+}
+// A deferred row's CIGARs and start, as score_path makes them.
+static void materialize_row(aln_meth_occ_t &o, const aln_meth_layout_t &L, int len)
+{
+    layout_cigar(L, len, &o.alignment.raw_cigar);
+    normalize_display(&o.alignment);
+    o.pos = o.alignment.rb;
 }
 // --meth-mapq conversion-blind: whether row a is a better row of its locus than b with their
 // mirror mismatches free. Under collapsed scoring a mirror mismatch is a conversion and a row's
@@ -837,8 +862,9 @@ static bool mirror_free_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b,
 // --meth-mapq conversion-blind: notes row o in the mirror table (aln_meth_read_t::mirror_rows)
 // when it is within the read's limits with its mirror mismatches free, as collapsed scoring
 // applies them: -n, -k, a record's fields and, for a bounded window, within_read_limits. A copy is
-// kept; o is not changed, so store_row goes on as under scoring. The table keeps, per locus, the
-// best row by mirror_free_better. Without the stock cuts only rows with a mirror mismatch need an
+// kept; o is not changed, so store_row goes on as under scoring, but for a deferred row's CIGARs
+// and start (lay), which are built once the row passes those checks. The table keeps, per locus,
+// the best row by mirror_free_better. Without the stock cuts only rows with a mirror mismatch need an
 // entry: a row without one costs its genomic cost mirror-free, so the row that beats it in occ is
 // no worse mirror-free (meth_blind_strata takes the better of the two). Under the cuts the
 // mirror-free strata apply a difference ceiling, and a mirror-free run keeps a locus's best row
@@ -848,8 +874,9 @@ static bool mirror_free_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b,
 // drops otherwise is not needed: without a mirror mismatch it is over the read's limits or past
 // the best + M on both costs.
 // The table has a CIGAR budget of its own; past it the strata are unknown (blind_partial).
-static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, const aln_meth_occ_t &o, int seed_diffs,
-                                                       bool bounded, int seed_mirror)
+static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs,
+                                                       bool bounded, int seed_mirror,
+                                                       const aln_meth_layout_t *lay = nullptr)
 {
     const gap_opt_t *op = x->grp->opt;
     aln_meth_read_t *r = x->res;
@@ -863,6 +890,8 @@ static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, const
     // Under the cut the mirror-free strata keep rows within M of the mirror-free best, which is at
     // most the best so far (store_row's drop, on mirror-free costs).
     if (x->cut && x->best != INT64_MAX && mirror_free_cost(o.cost, op->s_mm, o.n_mirror) > x->best + op->s_mm) return;
+    // The tie-break, the budget and the key's start need the row's CIGARs: build a deferred row's.
+    if (lay && o.alignment.raw_cigar.empty()) materialize_row(o, *lay, x->len);
     const aln_meth_mirror_key_t key{aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb},
                                     x->cut ? (int)differences : 0};
     size_t pos;
@@ -883,14 +912,16 @@ static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, const
     }
 }
 // Applies the strict -n/-k filters and stores o as its locus's candidate (the cheaper wins).
-// seed_mirror: the mirror-cell mismatches among seed_diffs.
-static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, bool bounded = false, int seed_mirror = 0)
+// seed_mirror: the mirror-cell mismatches among seed_diffs; lay: the row's layout when score_path
+// deferred its CIGARs.
+static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, bool bounded = false, int seed_mirror = 0,
+                      const aln_meth_layout_t *lay = nullptr)
 {
     aln_meth_group_t *g = x->grp;
     // --meth-mapq conversion-blind observes the rows with a mirror mismatch before the filters
     // below (and, under the cuts, the rows a locus's occ row beats or replaces), until a
     // mirror-free run stops on -R where this search goes on (mf_stop).
-    if (o.n_mirror && x->blind && !x->mf_stop) store_mirror_row(x, o, seed_diffs, bounded, seed_mirror);
+    if (o.n_mirror && x->blind && !x->mf_stop) store_mirror_row(x, o, seed_diffs, bounded, seed_mirror, lay);
     // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
     // seed than -k allows. The converted search cannot see a read C over a reference T, so it can
     // reach a row within -n (-k) converted differences whose original-reference path has more; drop
@@ -916,6 +947,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     // The mirror table saw the row first (a row without a mirror mismatch costs as much mirror-free).
     if (x->cut && x->best != INT64_MAX && o.cost > x->best + g->opt->s_mm) return;
     x->best = std::min(x->best, o.cost);
+    if (lay && o.alignment.raw_cigar.empty()) materialize_row(o, *lay, x->len); // a built CIGAR is never empty
     const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
     // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
     if (bytes > (64ULL << 20) - x->alignment_bytes) {
@@ -938,7 +970,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
         // --meth-mapq conversion-blind under the cuts: the losing row of a locus, if it has no
         // mirror mismatch (the table already holds those), for the mirror-free strata
         // (store_mirror_row). It passed the read's limits, so it passes them mirror-free too.
-        const aln_meth_occ_t &loser = better ? cur : o;
+        aln_meth_occ_t &loser = better ? x->res->occ[at] : o; // built: store_row materialized o above
         if (x->cut && x->blind && !x->mf_stop && !loser.n_mirror) store_mirror_row(x, loser, 0, false, 0);
         if (better) x->res->occ[at] = std::move(o);
     }
@@ -953,12 +985,12 @@ static bool score_row_sites(aln_meth_slot_t *x, const aln_meth_layout_t &L, int 
     auto one = [&](int64_t site) {
         aln_meth_occ_t o;
         int seed_mm = 0, seed_mirror = 0;
-        if (!score_path(x, L, rid, hyp, strand, rb, span, site, &o, &seed_mm, &seed_mirror)) return false;
+        if (!score_path(x, L, rid, hyp, strand, rb, span, site, &o, &seed_mm, &seed_mirror, true)) return false;
         if (site >= 0) {
             o.alt = ks_site_rel(g->ref->known_snvs, g->ref->bns, rid, o.alignment.rb, site);
             if (aln_site_key_pos(site) < o.alignment.rb || aln_site_key_pos(site) >= o.alignment.re || !o.alt) return true;
         }
-        store_row(x, o, seed_mm + seed_gaps, bounded, seed_mirror);
+        store_row(x, o, seed_mm + seed_gaps, bounded, seed_mirror, &L); // builds a deferred row's CIGARs if kept
         return true;
     };
     if (!one(-1)) return false;
