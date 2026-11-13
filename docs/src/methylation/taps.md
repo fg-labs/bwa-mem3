@@ -103,12 +103,7 @@ uses for its TAPS path).
 `XM:Z` from `--meth=taps` is already in the correct polarity, so tools that
 consume `XM:Z` directly need no adjustment.
 
-## Library directionality
-
-`--meth` assumes a **directional** library (R1 → `CT`, R2 → `GA`). Standard TAPS
-protocols are directional; verified on real data (`SRR25526768`), where the
-`XG:Z` split is 49.8 % `CT` / 49.9 % `GA`. Undirectional libraries are not
-supported.
+This chemistry still requires a [directional library](overview.md#library-orientation).
 
 ## Validation status
 

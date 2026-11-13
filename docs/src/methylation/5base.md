@@ -15,6 +15,8 @@ matched: its 400,000 primary records and every secondary and supplementary one.
 Only the `@PG` header's `CL:` differs, since it records the spelling used; what
 a `Z` call measures differs too (see 5hmC below), but not how reads align.
 
+This chemistry still requires a [directional library](overview.md#library-orientation).
+
 ## TL;DR
 
 ```bash

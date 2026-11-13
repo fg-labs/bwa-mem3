@@ -1013,6 +1013,8 @@ seeds in the converted `.meth` seed index, then extended and scored against the
 `XR:Z`/`XG:Z`/`XM:Z`, opt-in chimera QC). The reference must have been indexed with
 `bwa-mem3 index --meth`.
 
+Requires a [directional library](../methylation/overview.md#library-orientation).
+
 An optional chemistry selects the `XM:Z` call polarity and the scoring default:
 `--meth` / `--meth=emseq` for bisulfite and EM-seq, `--meth=taps` for TAPS, and
 `--meth=5base` for Illumina 5-base (the TAPS chemistry; see
@@ -1088,9 +1090,8 @@ unreliable for a given library preparation.
 
 Off by default (matches Bismark, which has no equivalent heuristic).
 When set, mapped records whose longest M/=/X CIGAR run is less than 44 % of
-the read length get `0x200` set, `0x2` cleared, and MAPQ capped at 1. Useful
-for PBAT / scBS-Seq libraries where intra-fragment chimerism is common, or
-when reproducing bwameth.py output bit-for-bit.
+the read length get `0x200` set, `0x2` cleared, and MAPQ capped at 1.
+It does not enable [unsupported library orientations](../methylation/overview.md#library-orientation).
 
 ### Threading
 

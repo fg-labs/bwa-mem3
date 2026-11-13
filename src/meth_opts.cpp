@@ -254,6 +254,12 @@ void meth_opts_usage_shared(FILE *fp)
     fprintf(fp, "                 as without --meth; add --bam for BAM. Requires the reference to\n");
     fprintf(fp, "                 have been built with `bwa-mem3 index --meth` (emits the original\n");
     fprintf(fp, "                 index plus a ref.fa.meth.* converted seed index).\n");
+    fprintf(fp, "                 Supports directional libraries only:\n");
+    fprintf(fp, "                 R1/SE: C->T; R2: G->A are input conversion hypotheses,\n");
+    fprintf(fp, "                 not fixed genomic mapping strands; either may map to either strand.\n");
+    fprintf(fp, "                 The chemistry neither infers nor changes library orientation.\n");
+    fprintf(fp, "                 PBAT-style opposite-orientation and non-directional libraries\n");
+    fprintf(fp, "                 are unsupported; verify the library protocol before alignment.\n");
     fprintf(fp, "                 CHEM selects the chemistry and thus the XM:Z call polarity:\n");
     fprintf(fp, "                   emseq  bisulfite/EM-seq, UNmethylated C converts [default]\n");
     fprintf(fp, "                          (aliases: em-seq, bisulfite)\n");
@@ -319,4 +325,5 @@ void meth_opts_usage_mem_only(FILE *fp)
     fprintf(fp, "   --chimera-qc\n");
     fprintf(fp, "                 enable the bwameth.py-style longest-match <44%% chimera heuristic\n");
     fprintf(fp, "                 (sets 0x200, clears 0x2, caps MAPQ at 1). Off by default; not in Bismark.\n");
+    fprintf(fp, "                 It neither detects orientation nor enables PBAT/non-directional support.\n");
 }

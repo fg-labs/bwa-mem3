@@ -4,6 +4,13 @@ bwa-mem3 supports bisulfite-converted (WGBS/RRBS/EM-seq) read alignment through 
 flag on both `index` and `mem`. No Python interpreter, no piped preprocessor, and no separate
 postprocessing step are required.
 
+**Directional libraries only:** R1 and single-end reads use the C-to-T input
+conversion hypothesis; R2 uses G-to-A. Either mate can map to either genomic
+strand. Verify the protocol and read layout first: chemistry selection and
+`--chimera-qc` do not detect or change orientation or enable PBAT/non-directional
+support. See [Library orientation](../methylation/overview.md#library-orientation)
+for the compatibility requirement, including PBAT and scBS-Seq data.
+
 > **Note — variant-aware by default, bwameth-compatible on request**
 >
 > By default (`--meth-scoring genomic`) bwa-mem3 frees only the conversion direction and keeps

@@ -9,6 +9,8 @@ strand-filtering logic inside `meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
 
 ## `--meth[={emseq|taps|5base}]`
 
+All chemistries require [directional libraries](overview.md#library-orientation).
+
 Selects the **methylation chemistry**. Defaults to `emseq`, so a bare `--meth`
 keeps the EM-seq chemistry it always had. Its scoring default is now `genomic`
 rather than `collapsed`, so scores, `MAPQ`, `NM` and placements can change on
@@ -315,8 +317,9 @@ QC-fail propagation across the read group also applies.
 **When to use it:**
 
 The 44 % threshold was calibrated by bwameth.py for standard mammalian whole-
-genome bisulfite-sequencing (WGBS) libraries with typical read lengths and is
-helpful on PBAT / scBS-Seq libraries where intra-fragment chimeras are common.
+genome bisulfite-sequencing (WGBS) libraries with typical read lengths. Consider
+it for chimera-prone supported data. It does not enable
+[unsupported library orientations](overview.md#library-orientation).
 For Bismark-equivalent output (and most directional EM-seq / WGBS workflows),
 leave it off.
 

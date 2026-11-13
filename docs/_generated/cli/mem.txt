@@ -161,6 +161,12 @@ Methylation (--meth) options:
                  as without --meth; add --bam for BAM. Requires the reference to
                  have been built with `bwa-mem3 index --meth` (emits the original
                  index plus a ref.fa.meth.* converted seed index).
+                 Supports directional libraries only:
+                 R1/SE: C->T; R2: G->A are input conversion hypotheses,
+                 not fixed genomic mapping strands; either may map to either strand.
+                 The chemistry neither infers nor changes library orientation.
+                 PBAT-style opposite-orientation and non-directional libraries
+                 are unsupported; verify the library protocol before alignment.
                  CHEM selects the chemistry and thus the XM:Z call polarity:
                    emseq  bisulfite/EM-seq, UNmethylated C converts [default]
                           (aliases: em-seq, bisulfite)
@@ -222,6 +228,7 @@ Methylation (--meth) options:
    --chimera-qc
                  enable the bwameth.py-style longest-match <44% chimera heuristic
                  (sets 0x200, clears 0x2, caps MAPQ at 1). Off by default; not in Bismark.
+                 It neither detects orientation nor enables PBAT/non-directional support.
 Supplementary MAPQ rescoring (fg-labs extension):
    --supp-rep-hard-cap INT
                  force MAPQ=0 for supplementary alignments whose chain contains any seed

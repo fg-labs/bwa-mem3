@@ -74,6 +74,21 @@ if grep -q 'Executing in' "$tmpdir/help.err"; then
     exit 1
 fi
 
+# Ignore help wrapping while checking the directional-library contract.
+meth_help="$(tr -s '[:space:]' ' ' < "$tmpdir/help.err")"
+for requirement in \
+    'directional libraries only' \
+    'R1/SE: C->T; R2: G->A.*input conversion hypotheses' \
+    'not fixed genomic mapping strands' \
+    'chemistry neither infers nor changes library orientation' \
+    'PBAT-style opposite-orientation and non-directional libraries are unsupported' \
+    'neither detects orientation nor enables PBAT/non-directional support'; do
+    grep -Eq "$requirement" <<< "$meth_help" || {
+        echo "FAIL: mem --help missing methylation library contract: $requirement" >&2
+        exit 1
+    }
+done
+
 # --- 2. `mem -o --help <ref> <reads>` is a legitimate run whose -o value -----
 # is the literal string `--help`. The banner must be printed, the run must
 # exit 0, and SAM must be written to a file literally named `--help`. Run
