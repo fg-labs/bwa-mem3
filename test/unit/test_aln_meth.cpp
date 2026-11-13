@@ -1446,6 +1446,7 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
     auto *opt=ba::gap_init_opt(); opt->fnr=-1; opt->max_diff=3;
+    opt->max_top2=1000; // so that stock's -R stop (more than 30 best loci) does not end it first
     // read_r has 31 equally good converted loci plus worse ones; a small lookup budget caps it.
     const int n=64;
     const auto fq=write_fq("capped-dups.fq",std::vector<std::string>(n,ref().read_r));
