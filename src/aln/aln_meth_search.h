@@ -44,11 +44,13 @@ struct aln_meth_group_t {
     std::vector<aln_meth_slot_t> slot;
     gap_slot_core_t *cores = nullptr;
 };
-// These guards do not depend on candidates that the next flush might discover.
+// These guards do not depend on candidates that the next flush might discover. A seeded read
+// (longer than -l) can stop only once its stratum fits the seed's difference limit (-k), which
+// aln_meth_can_stop checks against the best cost; -k 0 never can.
 static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
     const gap_opt_t &opt=x->job->opt;
     return opt.s_mm>0 && opt.s_gape>=0 && opt.s_gapo>opt.s_mm &&
-        !(opt.mode&BWA_MODE_NONSTOP) && !x->job->seed_width && !x->res->flags;
+        !(opt.mode&BWA_MODE_NONSTOP) && (!x->job->seed_width || opt.max_seed_diff>0) && !x->res->flags;
 }
 bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
 // Keep batches bounded, but only refine score boundaries when stopping is possible.

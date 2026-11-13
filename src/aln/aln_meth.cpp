@@ -145,6 +145,9 @@ uint64_t aln_meth_draw_seed(const aln_meth_ref_t *ref, int read_no, int64_t ord)
  * matches/conversions project identically and either N counts strictly regardless
  * of PAC fill. Unseeded discovery admitting that many differences proposes every
  * surviving window by score M*floor(T/M). Refine the entire stratum before stopping.
+ * Seeding (reads longer than -l) admits at most -k differences in the seed, so a seeded
+ * search proposes every such window only when floor(T/M) <= -k: no proposal with that
+ * many mismatches in all can have more in its seed.
  * B can only decrease, so later flushes can only narrow the required stratum.
  * This bounds equivalent proposals, NOT the cost of arbitrary search histories. */
 bool aln_meth_can_stop(const aln_meth_slot_t *x, int next_score)
@@ -159,6 +162,7 @@ bool aln_meth_can_stop(const aln_meth_slot_t *x, int next_score)
     const int64_t retained=best+(int64_t)opt.s_mm;
     if (retained>=opt.s_gapo) return false;
     const int64_t differences=retained/opt.s_mm;
+    if (job->seed_width && differences>opt.max_seed_diff) return false;
     return opt.max_diff>=differences && (int64_t)next_score>differences*opt.s_mm;
 }
 

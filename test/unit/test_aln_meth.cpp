@@ -1296,8 +1296,9 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     // read_r has 31 equally good converted loci plus worse ones; a small lookup budget caps it.
     const int n=64;
     const auto fq=write_fq("capped-dups.fq",std::vector<std::string>(n,ref().read_r));
-    // Budgets 32 and 40 stop the search after all 31 ties and 1 or 2 worse loci.
-    for (int keep_strata : {1,0}) for (int budget : {32,40}) {
+    // Budget 32 stops the search after all 31 ties and 1 worse locus. (The read's certified stop
+    // completes it at 33 lookups, so a larger budget no longer caps it.)
+    for (int keep_strata : {1,0}) for (int budget : {32}) {
         CAPTURE(keep_strata); CAPTURE(budget);
         ba::aln_meth_opt_t mo; mo.p_best=budget; mo.p_second=0;
         // The 31 ties are counted under collapsed scoring (the mirror cell is free too).
@@ -1662,7 +1663,7 @@ TEST_CASE("aln_meth: ineligible searches batch pending hits instead of flushing 
         CAPTURE(mode);
         job.opt=*opt; job.seed_width=nullptr; result.flags=0;
         if (mode==0) job.opt.mode|=BWA_MODE_NONSTOP;
-        if (mode==1) job.seed_width=&seed;
+        if (mode==1) job.seed_width=&seed, job.opt.max_seed_diff=0; // seeded, no seed differences
         if (mode==2) job.opt.s_mm=0;
         if (mode==3) job.opt.s_gape=-1;
         if (mode==4) result.flags=ba::ALN_METH_BIND_M;
@@ -1824,8 +1825,19 @@ TEST_CASE("aln_meth: retained-cost stop waits for complete strata and handles de
         result.flags=flag; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
     }
     result.flags=0;
-    ba::bwt_width_t seed={}; job.seed_width=&seed;
-    CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1)); job.seed_width=nullptr;
+    // A seeded read stops only on a stratum within the seed's difference limit (-k, 2 here).
+    ba::bwt_width_t seed={}; job.seed_width=&seed; REQUIRE(job.opt.max_seed_diff==2);
+    CHECK(ba::aln_meth_can_stop(&slot,opt->s_mm+1));     // best 0: one difference
+    result.occ[0].cost=3; CHECK_FALSE(ba::aln_meth_can_stop(&slot,6));
+    CHECK(ba::aln_meth_can_stop(&slot,7));                 // best 3: two differences
+    result.occ[0].cost=6; CHECK_FALSE(ba::aln_meth_can_stop(&slot,10)); // three: past -k
+    job.seed_width=nullptr; CHECK(ba::aln_meth_can_stop(&slot,10)); job.seed_width=&seed;
+    result.occ[0].cost=0; job.opt.max_seed_diff=1;
+    CHECK(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
+    result.occ[0].cost=3; CHECK_FALSE(ba::aln_meth_can_stop(&slot,7));
+    result.occ[0].cost=0; job.opt.max_seed_diff=0;
+    CHECK_FALSE(ba::aln_meth_stop_eligible(&slot)); CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
+    job.opt.max_seed_diff=2; job.seed_width=nullptr;
     job.opt.mode|=BWA_MODE_NONSTOP; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1));
     job.opt.mode&=~BWA_MODE_NONSTOP;
     job.opt.max_diff=0; CHECK_FALSE(ba::aln_meth_can_stop(&slot,opt->s_mm+1)); job.opt.max_diff=4;
@@ -1855,12 +1867,16 @@ TEST_CASE("aln_meth: zero-cost stopping preserves an independently enumerated ti
     FMI_search fmi((fa+".meth").c_str());fmi.load_index(false,1);
     auto *bwt=ba::bwt_from_fmi(&fmi);ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,fa.c_str(),fmi.idx->bns,1)==0);
-    auto *opt=ba::gap_init_opt();opt->fnr=-1;opt->max_diff=2;opt->seed_len=1024;
+    auto *opt=ba::gap_init_opt();opt->fnr=-1;opt->max_diff=2;
     using Key=std::tuple<int,int,int,int64_t,int64_t>;
+    // Unseeded, and seeded (the 12-base read is longer than -l 6): the seeded search stops on
+    // the same stratum, since one difference is within the seed's -k 2.
+    for(int seed_len : {1024,6})
     for(int scoring : {MEM_METH_SCORING_COLLAPSED,MEM_METH_SCORING_GENOMIC,MEM_METH_SCORING_NEUTRAL})
         for(int context : {METH_CTX_ALL,METH_CTX_CPG}) for(int read_no : {0,1}) for(int hyp : {0,1}) {
             ba::aln_meth_opt_t mo;mo.m.meth_scoring=scoring;mo.m.meth_context=context;
             mo.m.meth_chem=METH_CHEM_TAPS;ba::aln_meth_opt_finish(&mo);
+            opt->seed_len=seed_len;CAPTURE(seed_len);
             const int strand=hyp^read_no;
             const std::string input_read=strand?aln_test::revcomp(query):query;
             std::set<Key> expected;
