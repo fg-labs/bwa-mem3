@@ -34,6 +34,8 @@
 #include "bwase.h"
 #include "bwaseqio.h"
 #include "bwtgap.h"
+#include "aln_meth.h"
+#include "../meth_opts.h"
 
 extern char *bwa_pg;
 
@@ -50,6 +52,8 @@ void aln_opt_init(aln_opt_t *o)
 	free(pe);
 	o->batch_size = 0x40000;
 	o->share_dup_search = 1;
+	o->meth = nullptr;
+	o->meth_ref = nullptr;
 }
 
 /* The next batch is read on a helper thread while the current one is processed (background_task_t). */
@@ -449,6 +453,107 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	return ret;
 }
 
+/* What --meth runs at this stage of the stack: single-end, --meth-context all. */
+static int aln_meth_enabled(const aln_opt_t *o, int paired)
+{
+	if (paired) {
+		fprintf(stderr, "[E::aln] paired-end --meth is not yet supported by aln\n");
+		return 0;
+	}
+	if (o->meth->m.meth_context == METH_CTX_CPG) {
+		fprintf(stderr, "[E::aln] --meth-context cpg is not yet supported by aln\n");
+		return 0;
+	}
+	return 1;
+}
+
+namespace {
+
+struct se_meth_ctx_t {
+	const aln_opt_t *o;
+	bwa_seq_t *seqs;
+	aln_meth_read_t *res;
+	fmt_bufs_t *fb;
+};
+
+/* Single end under --meth, reads [st, st + n): strata, main hit, refinement, MD/NM and SAM text. */
+void se_meth_post_worker(void *data, int st, int n, int tid)
+{
+	se_meth_ctx_t *c = (se_meth_ctx_t*)data;
+	const aln_opt_t *o = c->o;
+	aln_meth_finish_se(o->meth_ref, o->meth, &o->gap, o->max_xa_hits, n, c->seqs + st, c->res + st);
+	kstring_t *k = &c->fb->buf[tid];
+	fmt_seg_t g;
+	g.st = st, g.tid = tid, g.stop = -1, g.off = k->l;
+	for (int i = 0; i < n; ++i)
+		aln_meth_print_sam1(k, o->meth_ref, o->meth, c->seqs + st + i, c->res + st + i, 1, 0, o->gap.mode, o->gap.max_top2);
+	g.len = k->l - g.off;
+	c->fb->segs[tid].push_back(g);
+}
+
+} // namespace
+
+int aln_run_se_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq, aln_out_t *out)
+{
+	if (o->batch_size <= 0) { // as aln_run_se
+		fprintf(stderr, "[E::aln] the batch size must be positive, not %d\n", o->batch_size);
+		return 1;
+	}
+	bwa_seqio_t *ks = bwa_seq_open(fn_fq);
+	if (!ks) {
+		return 1;
+	}
+	bwa_seq_defer_read_errors(ks);
+	bwase_initialize();
+	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	fmt_bufs_t fb(n_threads);
+	long long tot = 0;
+	int ret = 0;
+	struct batch_t { bwa_seq_t *seqs; int n; };
+	auto read_batch = [&](batch_t *b) { b->seqs = bwa_read_seq(ks, o->batch_size, &b->n, o->gap.mode, o->gap.trim_qual); };
+	batch_t cur = {}, next = {};
+	read_batch(&cur);
+	if (bwa_seq_report_read_error(ks)) ret = 1;
+	background_task_t ahead;
+	aln_dup_state_t dup_state; // this run's duplicate check (keyed on the original bases)
+	aln_dup_state_t *dup = o->share_dup_search? &dup_state : nullptr;
+	std::vector<aln_meth_read_t> res;
+	while (cur.seqs) {
+		next = {}; // stays empty if the read is abandoned before it runs
+		ahead.start([&] { read_batch(&next); }); // the next batch is read while this one is aligned
+		bwa_seq_t *seqs = cur.seqs;
+		const int n_seqs = cur.n;
+		res.assign((size_t)n_seqs, aln_meth_read_t());
+		const int n_shared = aln_meth_search_batch(bwt, o->meth_ref, o->meth, n_seqs, seqs, &o->gap, o->gap.n_threads,
+												   1, tot, 0, o->max_xa_hits, dup, res.data());
+		if (bwa_verbose >= 4) fprintf(stderr, "[M::aln] %d of %d reads shared an identical read's search.\n", n_shared, n_seqs);
+		tot += n_seqs;
+		se_meth_ctx_t c = {o, seqs, res.data(), &fb};
+		fb.reset();
+		kt_for_nt(se_meth_post_worker, &c, n_seqs, n_threads);
+		int stop;
+		if (fb.write(out, &stop) != 0) ret = 1;
+		bwa_free_read_seq(n_seqs, seqs);
+		if (ret) { // the batch read ahead is never aligned
+			ahead.abandon();
+			if (next.seqs) bwa_free_read_seq(next.n, next.seqs);
+			break;
+		}
+		ahead.wait();
+		if (bwa_verbose >= 3) fprintf(stderr, "[M::aln] %lld sequences have been processed.\n", tot);
+		if (bwa_seq_report_read_error(ks)) {
+			ret = 1;
+			break;
+		}
+		cur = next;
+	}
+	if (bwa_seq_n_bad(ks)) ret = 1;
+	if (bwa_seq_close(ks) != 0) ret = 1;
+	return ret;
+}
+
+int aln_run_pe_meth(const aln_opt_t *, const bwt_t *, const char *, const char *, aln_out_t *) { return 1; }
+
 } // namespace bwa_aln
 
 using namespace bwa_aln;
@@ -497,6 +602,13 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  -s        disable Smith-Waterman for the unmapped mate\n");
 	fprintf(fp, "  -A        disable insert size estimate (force -s)\n");
 	fprintf(fp, "  -P        accepted and ignored (sampe -P loads the index into memory; always so here)\n");
+	fprintf(fp, "\nMethylation (shared with bwa-mem3 mem):\n");
+	meth_opts_usage_shared(fp);
+	fprintf(fp, "   Under --meth, converted search proposes windows; original-reference global realignment\n");
+	fprintf(fp, "   refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.\n");
+	fprintf(fp, "   Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.\n");
+	fprintf(fp, "   the -B values above are mem's. The records carry XR/XG/XM:Z instead of\n");
+	fprintf(fp, "   XM:i/XO:i/XG:i.\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
 	fprintf(fp, "  --bam     write BAM instead of SAM\n");
 	fprintf(fp, "  --bam-level INT     BAM compression level 0-9 [1]\n");
@@ -649,6 +761,10 @@ int main_aln(int argc, char *argv[])
 	int c, opte = -1, bam = 0, bam_level = 1, pe_flag = 0, bc_len = 0;
 	const char *out_path = NULL;
 	std::unique_ptr<char, decltype(&free)> rg_line(NULL, &free);
+	aln_meth_opt_t meth_opt;
+	aln_meth_ref_t meth_ref;
+	meth_cli_t meth_cli;
+	memset(&meth_cli, 0, sizeof meth_cli);
 	static const struct option long_opts[] = {
 		{"max-xa-hits", required_argument, 0, OPT_MAX_XA},
 		{"max-xa-hits-discordant", required_argument, 0, OPT_MAX_XA_DISC},
@@ -656,6 +772,7 @@ int main_aln(int argc, char *argv[])
 		{"bam", no_argument, 0, OPT_BAM},
 		{"bam-level", required_argument, 0, OPT_BAM_LEVEL},
 		{"help", no_argument, 0, OPT_HELP},
+		METH_LONG_OPTIONS_SHARED
 		{0, 0, 0, 0}
 	};
 
@@ -752,10 +869,36 @@ int main_aln(int argc, char *argv[])
 			if (!aln_parse_int("--bam-level", optarg, 0, 9, &bam_level)) return 1;
 			break;
 		case OPT_HELP: return aln_usage(&o, stdout);
-		default: return 1;
+		default:
+			if (meth_opts_parse_shared(c, optarg, &meth_opt.m, &meth_cli)) break;
+			return 1;
 		}
 	}
 #undef ALN_INT
+	// getopt binds optional arguments only with '='; do not reinterpret a real path, nor an index
+	// prefix whose FASTA is gone (its plain or converted index files are there).
+	for (int pos = optind; meth_cli.set_meth && pos < argc; ++pos) {
+		const char *canon = nullptr;
+		const char *flag = meth_opts_stray_flag(argv[pos], &canon);
+		if (!flag || access(argv[pos], F_OK) == 0) continue;
+		if (pos == optind && (access((std::string(argv[pos]) + ".ann").c_str(), F_OK) == 0 ||
+							  access((std::string(argv[pos]) + ".meth.bwt.2bit.64").c_str(), F_OK) == 0))
+			continue;
+		fprintf(stderr, "ERROR: '%s' looks like a value for %s, not a positional path; "
+				"use %s=%s (comma-separated for --meth-tags)\n",
+				argv[pos], flag, flag, canon ? canon : argv[pos]);
+		return 1;
+	}
+	meth_opts_finalize_shared(&meth_opt.m, &meth_cli); // the shared checks and chemistry defaults
+	if (meth_opt.m.meth_mode) {
+		aln_meth_opt_finish(&meth_opt);
+		o.meth = &meth_opt;
+		o.meth_ref = &meth_ref;
+		if (aln_meth_header_check(rg_line.get()) != 0) return 1;
+	} else if (meth_opt.m.meth_set_as_failed) {
+		fprintf(stderr, "[E::aln] --set-as-failed requires --meth\n");
+		return 1;
+	}
 	if (opte > 0) {
 		opt->max_gape = opte;
 		opt->mode &= ~BWA_MODE_GAPE;
@@ -786,6 +929,7 @@ int main_aln(int argc, char *argv[])
 	const int paired = optind + 3 == argc;
 	if (pe_flag && !paired)
 		fprintf(stderr, "[W::aln] paired-end options (-a, -c, -s, -A, -P, --max-occ, --max-xa-hits-discordant) are ignored with one FASTQ\n");
+	if (o.meth && !aln_meth_enabled(&o, paired)) return 1; // before any index is probed or loaded
 
 	{
 		const int max_bc = paired ? BWA_MAX_BCLEN / 2 : BWA_MAX_BCLEN; // paired: both barcodes are joined into one buffer
@@ -797,13 +941,68 @@ int main_aln(int argc, char *argv[])
 	}
 
 	const char *prefix = argv[optind], *fn_fq = argv[optind + 1];
+	// --meth: the search runs on the converted index <prefix>.meth; the original index at <prefix>
+	// supplies the reference (both written by `bwa-mem3 index --meth`). <prefix>.meth is accepted too,
+	// unless <prefix>.meth is itself a reference indexed with --meth (it has <prefix>.meth.meth).
+	std::string meth_orig, meth_conv;
+	if (o.meth) {
+		const std::string a = prefix, sfx = ".meth";
+		const bool ends = a.size() >= sfx.size() && a.compare(a.size() - sfx.size(), sfx.size(), sfx) == 0;
+		const std::string stripped = ends ? a.substr(0, a.size() - sfx.size()) : std::string();
+		// A converted index counts whether its FM-index is on disk or staged with `bwa-mem3 shm`
+		// (attached without its disk files).
+		auto conv_present = [](const std::string &p) {
+			return access((p + ".bwt.2bit.64").c_str(), F_OK) == 0 || bwa_shm_test(p.c_str()) == 1;
+		};
+		const bool as_orig = conv_present(a + sfx);
+		const bool as_conv = ends && access((stripped + ".ann").c_str(), F_OK) == 0 && conv_present(a);
+		if (as_orig && as_conv) {
+			fprintf(stderr, "ERROR: --meth index '%s' is ambiguous: it names either a reference indexed with --meth "
+					"or the converted index of '%s'; rename one of them\n", prefix, stripped.c_str());
+			return 1;
+		}
+		if (ends && !as_orig) {
+			meth_conv = a;
+			meth_orig = a.substr(0, a.size() - sfx.size());
+		} else {
+			meth_conv = a + sfx;
+			meth_orig = a;
+		}
+		prefix = meth_conv.c_str();
+		// Probe the small original-reference files before loading the converted FM-index.
+		for (const char *suffix : {".ann", ".amb", ".pac"}) {
+			const std::string path = meth_orig + suffix;
+			struct stat st;
+			if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || access(path.c_str(), R_OK) != 0) {
+				fprintf(stderr, "ERROR: --meth cannot read the original reference index file '%s'; "
+						"run `bwa-mem3 index --meth` on the reference\n", path.c_str());
+				return 1;
+			}
+		}
+		// A converted index staged with `bwa-mem3 shm` is attached without its disk files.
+		const bool conv_staged = bwa_shm_test(meth_conv.c_str()) == 1;
+		for (const char *suffix : {".bwt.2bit.64", ".ann", ".amb", ".pac"}) {
+			if (conv_staged) break;
+			const std::string path = meth_conv + suffix;
+			struct stat st;
+			if (stat(path.c_str(), &st) != 0 || !S_ISREG(st.st_mode) || access(path.c_str(), R_OK) != 0) {
+				fprintf(stderr, "ERROR: --meth cannot read the converted index file '%s'; "
+						"run `bwa-mem3 index --meth` on the reference\n", path.c_str());
+				return 1;
+			}
+		}
+	}
 	{
 		// An index staged with `bwa-mem3 shm` is attached by load_index without reading the
 		// disk files, so only an index that is not staged must be on disk.
 		std::string probe = std::string(prefix) + ".bwt.2bit.64";
 		if (bwa_shm_test(prefix) != 1 && access(probe.c_str(), F_OK) != 0) {
-			fprintf(stderr, "[E::aln] fail to locate the index '%s' (no %s); run `bwa-mem3 index` first\n",
-					prefix, probe.c_str());
+			if (o.meth)
+				fprintf(stderr, "ERROR: --meth cannot locate the converted index '%s' (no %s); "
+						"run `bwa-mem3 index --meth` on the reference\n", prefix, probe.c_str());
+			else
+				fprintf(stderr, "[E::aln] fail to locate the index '%s' (no %s); run `bwa-mem3 index` first\n",
+						prefix, probe.c_str());
 			return 1;
 		}
 	}
@@ -822,39 +1021,79 @@ int main_aln(int argc, char *argv[])
 		}
 	}
 	{ // -f naming an index file would truncate it before (or while) the index is read; the
-	  // `.meth.*` files are an `index --meth` seed index, which aln does not read but `mem --meth` needs
+	  // `.meth.*` files are an `index --meth` converted index, which `aln --meth` and `mem --meth` read
 		static const char *const idx_sfx[] = {"", ".bwt.2bit.64", ".pac", ".ann", ".amb", ".0123", ".alt",
 											  ".meth.bwt.2bit.64", ".meth.pac", ".meth.ann", ".meth.amb"};
-		for (const char *sfx : idx_sfx) {
-			std::string comp = std::string(prefix) + sfx;
-			if (aln_same_file(out_path, comp.c_str())) {
-				fprintf(stderr, "[E::aln] -f '%s' is the index file '%s'; writing it would overwrite the index\n",
-						out_path, comp.c_str());
+		for (const std::string &base : {std::string(prefix), meth_orig}) { // --meth also reads the original index
+			if (base.empty()) continue;
+			for (const char *sfx : idx_sfx) {
+				std::string comp = base + sfx;
+				if (aln_same_file(out_path, comp.c_str())) {
+					fprintf(stderr, "[E::aln] -f '%s' is the index file '%s'; writing it would overwrite the index\n",
+							out_path, comp.c_str());
+					return 1;
+				}
+			}
+		}
+		if (!meth_orig.empty()) { // --meth reads the original reference's header sidecar
+			const std::string hdr_path = meth_orig + ".hdr";
+			char *dict_path = bwa_index_dict_path(meth_orig.c_str());
+			if (dict_path == nullptr) {
+				fprintf(stderr, "[E::aln] out of memory checking -f '%s' against the header sidecars\n", out_path);
 				return 1;
 			}
+			const char *side = aln_same_file(out_path, hdr_path.c_str()) ? hdr_path.c_str()
+							 : aln_same_file(out_path, dict_path) ? dict_path : nullptr;
+			const int refused = side != nullptr;
+			if (refused) fprintf(stderr, "[E::aln] -f '%s' is the header sidecar '%s'; writing it would overwrite "
+								 "the reference's header\n", out_path, side);
+			free(dict_path);
+			if (refused) return 1;
 		}
 	}
 	if (!aln_output_ok(out_path)) return 1;
 	FMI_search *fmi = new FMI_search(prefix);
 	// aln searches with bwt_2occ4/call_one_step and never reads mem's seed jump table, so
 	// skip building it (saves its memory and build time at start-up; output unchanged).
-	fmi->load_index(/*load_pac=*/true, opt->n_threads, /*build_seed_jump=*/false);
+	fmi->load_index(/*load_pac=*/!o.meth, opt->n_threads, /*build_seed_jump=*/false); // under --meth the converted pac is not used
 	const bntseq_t *bns = fmi->idx->bns;
 	bwa_aln::bwt_t *bwt = bwt_from_fmi(fmi);
-
+	char *meth_hdr_lines = NULL;
+	if (o.meth) {
+		if (aln_meth_ref_load(&meth_ref, meth_orig.c_str(), bns, opt->n_threads) != 0) {
+			bwt_destroy(bwt);
+			delete fmi;
+			return 1;
+		}
+		meth_hdr_lines = bwa_load_hdr_from_index(meth_orig.c_str()); // the original reference's sidecar
+	}
 	kstring_t hdr = {0, 0, 0};
-	aln_print_sam_hdr(&hdr, bns, rg_line.get(), bwa_pg);
+	if (o.meth) {
+		if (aln_meth_header(&hdr, &meth_ref, rg_line.get(), bwa_pg, meth_hdr_lines) != 0) {
+			free(hdr.s);
+			free(meth_hdr_lines);
+			aln_meth_ref_free(&meth_ref);
+			bwt_destroy(bwt);
+			delete fmi;
+			return 1;
+		}
+	}
+	else aln_print_sam_hdr(&hdr, bns, rg_line.get(), bwa_pg);
+	free(meth_hdr_lines);
 	aln_out_t *out = (!bam || aln_bam_sq_lengths_ok(rg_line.get(), bns))
 		? aln_out_open(out_path, bam, bam_level, hdr.s, opt->n_threads) : NULL;
 	free(hdr.s);
 	int ret = 1;
 	if (out) {
-		ret = paired ? aln_run_pe(&o, bwt, bns, fmi->idx->pac, fn_fq, argv[optind + 2], out)
-					 : aln_run_se(&o, bwt, bns, fmi->idx->pac, fn_fq, out);
+		if (o.meth) ret = paired ? aln_run_pe_meth(&o, bwt, fn_fq, argv[optind + 2], out)
+								 : aln_run_se_meth(&o, bwt, fn_fq, out);
+		else ret = paired ? aln_run_pe(&o, bwt, bns, fmi->idx->pac, fn_fq, argv[optind + 2], out)
+						  : aln_run_se(&o, bwt, bns, fmi->idx->pac, fn_fq, out);
 	}
 	if (out && aln_out_close(out) != 0) ret = 1;
 
 	bwt_destroy(bwt);
+	if (o.meth) aln_meth_ref_free(&meth_ref);
 	delete fmi;
 	return ret;
 }
