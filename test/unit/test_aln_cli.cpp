@@ -8,6 +8,7 @@
 
 #include "aln_test_ref.h"
 #include "aln_bam_decode.h"
+#include "scoped_env.h"
 #include "stderr_capture.h"
 #include "../../src/FMI_search.h"
 #include "../../src/aln/aln_main.h"
@@ -502,12 +503,38 @@ TEST_CASE("aln_cli: -f naming a FIFO gives its reader the whole output"
     CHECK(got == want);
 }
 
+TEST_CASE("aln_cli: aln loads the index without building mem's seed jump table"
+          * doctest::test_suite("unit/aln_cli")) {
+    // The table builder is the only reader of BWA3_BWTSEED_JUMP, and it reports an invalid
+    // value on stderr; so an invalid value shows whether a load built the table.
+    CliIndex x;
+    bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
+    bwa_tests::ScopedEnv env("BWA3_BWTSEED_JUMP", "not-a-depth");
+    const std::string diag = "BWA3_BWTSEED_JUMP=\"not-a-depth\"";
+    SUBCASE("a building load reports the value (positive control)") {
+        bwa_tests::StderrCapture cap;
+        {
+            FMI_search fmi(x.prefix.c_str());
+            fmi.load_index(true, 1);
+        }
+        CHECK(cap.text().find(diag) != std::string::npos);
+    }
+    SUBCASE("main_aln does not") {
+        const std::string sai = scratch.path() + "/r.sai";
+        bwa_tests::StderrCapture cap;
+        const int rc = run({"-f", sai, x.prefix, x.fq});
+        const std::string err = cap.text();
+        CHECK(rc == 0);
+        CHECK(err.find(diag) == std::string::npos);
+    }
+}
+
 TEST_CASE("aln_cli: a batch size below 1 is an error in both drivers"
           * doctest::test_suite("unit/aln_cli")) {
     CliIndex x;
     bwa_tests::TempDir scratch{"aln_cli_case"}; // this case's files, removed when it ends
     FMI_search fmi(x.prefix.c_str());
-    fmi.load_index(true, 1);
+    fmi.load_index(true, 1, /*build_seed_jump=*/false);  // as main_aln loads it
     bwa_aln::bwt_t *bwt = bwa_aln::bwt_from_fmi(&fmi);
     bwa_aln::aln_opt_t o;
     bwa_aln::aln_opt_init(&o);

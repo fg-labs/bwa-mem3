@@ -40,7 +40,7 @@ struct AlnIndex {
         REQUIRE(aln_test::write_test_fasta(prefix));
         REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
         fmi.reset(new FMI_search(prefix.c_str()));
-        fmi->load_index(true, 1);
+        fmi->load_index(true, 1, /*build_seed_jump=*/false);  // as main_aln loads it
         bwt = ba::bwt_from_fmi(fmi.get());
         l_pac = (int64_t)bwt->seq_len / 2;
         tmp_dir.remove();
