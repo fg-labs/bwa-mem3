@@ -31,7 +31,7 @@ bwa-mem3 aln ref.fa r.fq > out.sam            # bwa aln + samse
 bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 ```
 
-**Byte-identity without `--meth`.** The tested SAM records and headers matched the output of stock
+**Byte-identity without `--meth` or `--short-insert`.** The tested SAM records and headers matched the output of stock
 bwa 0.7.19 `aln` + `samse`/`sampe`, except for the `@PG` line, which names the
 program that ran. The comparison uses generated single-end and paired-end reads
 (a phiX plus synthetic-contig reference, a few thousand reads per case) with every
@@ -98,6 +98,7 @@ and the name it has there when it differs.
 | `--max-xa-hits-discordant INT` | sampe `-N` | 10 | Maximum hits to output for discordant pairs |
 | `-c FLOAT` | sampe | 1e-5 | Prior of the chimeric rate (lower bound) |
 | `-s`, `-A` | sampe | off | Skip Smith-Waterman for an unmapped mate; skip the insert size estimate (which also skips that Smith-Waterman, as in stock) |
+| `--short-insert` | new | off | Estimate short inserts without a batch-wide minimum set by the longest read; paired input required |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
 | `-v INT` | new | 3 | 0-2 suppress progress, 3 reports progress, 4 adds lookup/window/incomplete diagnostics; some errors and warnings still print at 0 |
 | `--bam` | new | off | Write BAM instead of SAM |
@@ -108,8 +109,46 @@ The long names exist because `-n` and `-o` already mean the search options.
 limits must be below 2,147,483,647 (`INT_MAX`) to leave room for the extra candidate
 used internally.
 
-The paired-end options are ignored, with a warning, when only one input file is
-given.
+The stock paired-end options are ignored, with a warning, when only one input file is
+given. `--short-insert` instead requires two input files and rejects single-end use before
+loading the index or creating output.
+
+### Short, overlapping fragments
+
+Use `--short-insert` when short fragments overlap and a longer read in the batch would
+otherwise exclude them from insert-size estimation, or when both reads often cover the whole
+fragment. It works with ordinary and
+methylation-aware (`--meth`) paired alignment:
+
+```bash
+bwa-mem3 aln --short-insert ref.fa r1.fq r2.fq > out.sam
+```
+
+The option sets the estimator's lower bound to the lower interquartile fence, with a
+minimum of one base, rather than the longest read in the batch. It keeps the upper
+fence, minimum number of high-quality pairs and previous-batch fallback. Failed
+estimates use the no-estimate fallback; `-A` overrides the option and disables insert
+estimation and mate rescue.
+
+The option also accepts a pair whose reverse read starts at the same base as its forward
+read. Stock pairing requires the reverse read to start strictly after the forward one, so
+when trimmed reads each cover a whole fragment shorter than the read length, almost no pair
+is proper and neither mate's MAPQ benefits from the other. Every other geometry requirement
+is kept: the reverse read may not start before the forward read, the outer span must be at
+least the longer read, and the insert must fit the estimate (or `-a` without one).
+
+Mate rescue (and, with `--meth`, cap rescue) may also search the anchor's own span. Stock
+rescue looks for the mate only beyond the anchor, so it can never place a mate that covers the
+same fragment. A rescued mate must stay inside the fragment the anchor implies: the forward read
+may neither start nor end after the reverse read. Rescue is a local alignment, so a mate that
+runs past its anchor (for example, read 1 starting with adapter sequence ahead of the fragment)
+is rescued with that overhang soft-clipped.
+
+This is an opt-in departure from stock output. The inferred distribution, the coincident
+starts and the wider rescue windows can change pair selection, proper-pair flags, MAPQ, rescued
+mates and their CIGARs. This option does not make every short pair proper. Under this option, pairing and methylation cap rescue
+reject candidates when the insert-likelihood calculation underflows or its penalty
+cannot be represented as an integer. Existing defaults are unchanged.
 
 **Option values.** Numbers must be well formed: where stock's `atoi` reads `abc` as 0 and
 `20x` as 20, `aln` stops with an error naming the option. Values that stock accepts but

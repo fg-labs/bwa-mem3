@@ -669,7 +669,7 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
 /* Bounded local evidence can improve placement, but cannot resolve omitted genomic loci. */
 static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
                           const gap_opt_t *opt, const isize_info_t *ii,
-                          bwa_seq_t *p[2], aln_meth_read_t *r[2], int end) try
+                          bwa_seq_t *p[2], aln_meth_read_t *r[2], int end, bool short_insert) try
 {
     const int mate=1-end;
     auto *pm=p[end];auto *pa=p[mate];auto *ra=r[mate];auto *rm=r[end];
@@ -717,8 +717,9 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
             fprintf(stderr,"ERROR: --meth cap-rescue window out of range\n");exit(1);
         }
         int64_t beg=(int64_t)begin,last=(int64_t)finish;
-        if(a.strand) last=std::min<int64_t>(last,a.pos);
-        else beg=std::max(beg,a.alignment.re);
+        // As in mate rescue, --short-insert lets the window cover the anchor's own span.
+        if(a.strand) last=std::min<int64_t>(last,short_insert?a.alignment.re:(int64_t)a.pos);
+        else beg=std::max<int64_t>(beg,short_insert?(int64_t)a.pos:a.alignment.re);
         beg=std::max<int64_t>(beg,ann.offset);last=std::min<int64_t>(last,ann.offset+ann.len);
         if(last<=beg) continue;
         const auto key=std::make_tuple(a.rid,a.hyp,1-a.strand,beg,last);
@@ -745,6 +746,10 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
         }
         bytes+=used;
         if(display.empty() || (display.front()&15)==4 || (display.back()&15)==4 || candidate.cost>bound) continue;
+        // Keep the candidate inside the fragment: the forward read neither starts nor ends after the reverse.
+        if(short_insert && (a.strand ? (candidate.alignment.rb>(int64_t)a.pos || candidate.alignment.re>a.alignment.re)
+                                     : (candidate.alignment.rb<(int64_t)a.pos || candidate.alignment.re<a.alignment.re)))
+            continue;
         const int64_t length=a.strand?a.alignment.re-candidate.alignment.rb:candidate.alignment.re-a.pos;
         if(length<std::max(p[0]->len,p[1]->len)) continue;
         int64_t score=(a.cost+candidate.cost)*10;
@@ -753,6 +758,8 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
             const double penalty=-4.343*log(.5*erfc(M_SQRT1_2*fabs(length-ii->avg)/ii->std));
             // An underflowed Gaussian tail cannot support this candidate pair.
             if(!isfinite(penalty)) continue;
+            // Match pairing's opt-in rejection of numerically unrepresentable likelihoods.
+            if(short_insert && penalty+.499>INT_MAX) continue;
             if(penalty>INT_MAX) {
                 fprintf(stderr,"ERROR: --meth cap-rescue pair score out of range\n");exit(1);
             }
@@ -869,7 +876,7 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
             bwa_seq_t *p[2]={seqs[0]+i,seqs[1]+i};
             aln_meth_read_t *r[2]={res[0]+i,res[1]+i};
             const bool cap0=r[0]->flags&ALN_METH_BIND_BEST,cap1=r[1]->flags&ALN_METH_BIND_BEST;
-            if(cap0!=cap1) cnt_chg+=meth_cap_rescue(ref,mo,gopt,ii,p,r,cap0?0:1);
+            if(cap0!=cap1) cnt_chg+=meth_cap_rescue(ref,mo,gopt,ii,p,r,cap0?0:1,popt->short_insert);
         }
 	// mate rescue (bwa_paired_sw_core with the anchor's matrix; the rescued mate takes its hypothesis)
 	if (popt->is_sw && ii->avg >= 0.0) {
@@ -893,20 +900,23 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 				if (pref->strand == 0) {
 					beg[k] = (int64_t)pref->pos + ii->avg - 3 * ii->std - pmate->len * 1.5;
 					end[k] = beg[k] + 6 * ii->std + 2 * pmate->len;
-					if (beg[k] < (int64_t)pref->pos + pref->len) beg[k] = pref->pos + pref->len;
+					if (beg[k] < aln_rescue_window_floor(pref, popt)) beg[k] = aln_rescue_window_floor(pref, popt);
 					if (end[k] > l_pac) end[k] = l_pac;
 					seq = pmate->rseq;
 				} else {
 					beg[k] = (int64_t)pref->pos + pref->len - ii->avg - 3 * ii->std - pmate->len * 0.5;
 					end[k] = beg[k] + 6 * ii->std + 2 * pmate->len;
 					if (beg[k] < 0) beg[k] = 0;
-					if (end[k] > (int64_t)pref->pos) end[k] = pref->pos;
+					if (end[k] > aln_rescue_window_ceiling(pref, popt)) end[k] = aln_rescue_window_ceiling(pref, popt);
 					seq = pmate->seq;
 					seq_reverse(pmate->len, seq, 0);
 				}
                 const int anchor_rid = bns_pos2rid(ref->bns, pref->pos);
                 cigar[k] = meth_sw_core(ref, mo, r[1-k]->hyp, anchor_rid, pmate->len, seq,
                                         &beg[k], end[k], &n_cigar[k], &cnt[k]);
+				if (cigar[k] && popt->short_insert && !aln_rescue_within_fragment(pref, beg[k], cigar[k], n_cigar[k])) {
+					free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
+				}
 				if (cigar[k] && pmate->type != BWA_TYPE_NO_MATCH) {
 					int64_t s_old, s_new; int clip = 0;
 					if (__cigar_op(cigar[k][0]) == 3) clip += __cigar_len(cigar[k][0]);
