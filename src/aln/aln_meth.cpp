@@ -254,7 +254,9 @@ static int aln_meth_certify(aln_meth_slot_t *x, int s)
  *   genomic loci (windows of nearby sites overlap, so one locus is a row in several windows), and
  *   under the TAPS/5base tie-break only loci with no conversions. A lower final best then has every
  *   row within its own B_f + M, and the final best B itself has more than -R loci, as stock's stop.
- * A stop records the horizon (aln_meth_read_t::horizon) the main search checks at its finish. */
+ * A stop records the horizon (aln_meth_read_t::horizon) the main search checks at its finish.
+ * B is min(the seed cap_best, the generator's own best): a seed is an upper bound on the final best,
+ * so every argument above holds for it as for a row of the generator's own. */
 static __attribute__((noinline)) int aln_meth_boundary_gen(aln_meth_slot_t *x, int next)
 {
     gap_job_t *job = x->job;
@@ -360,7 +362,8 @@ void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t
     if (!x->intervals.insert(key, 0).second) return;
     x->pend.push_back(h);
 }
-const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy)
+const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy,
+                                   int64_t cap_best)
 {
     x->p = p; x->res = res; x->len = p->len; x->max_diff = max_diff;
     x->keep = has_copy ? ALN_METH_KEEP_COPIES : x->grp->keep_strata ? ALN_METH_KEEP_STRATA : 0;
@@ -391,7 +394,9 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->gen = x->grp->ref->ks_window;
     x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 &&
         (!x->grp->ref->known_snvs || x->gen || ks_fits_window(x->len, o));
-    x->best = INT64_MAX; x->best_d = INT_MAX; x->flushed = 0;
+    // A generator's seed is its starting best: its cuts then apply from its first entry.
+    x->cap_best = x->gen ? cap_best : INT64_MAX;
+    x->best = x->cap_best; x->best_d = INT_MAX; x->flushed = 0;
     x->extras_done = 0; x->ceil_applied = INT_MAX; x->r_stop = 0;
     // Certificates stay off under --known-snvs (main and ALT-window search): the window search is a
     // generator whose best is not the read's, and the main search's rows below its best are final
@@ -1363,7 +1368,7 @@ static __attribute__((noinline)) void meth_gen_finish(aln_meth_slot_t *x)
     const gap_opt_t *opt = x->grp->opt;
     // the -m work bound ends the search between two flushes: every row below the last boundary
     if (r->flags & ALN_METH_BIND_M) r->horizon = std::min<int64_t>(r->horizon, std::max(0, x->flushed_score));
-    int64_t best = INT64_MAX;
+    int64_t best = x->cap_best; // the seed, when one was given, bounds the cut as a row at it would
     for (const auto &o : r->occ) best = std::min(best, o.cost);
     const bool nonstop = !x->cut;
     const int64_t cut = nonstop || best == INT64_MAX ? INT64_MAX : best + (int64_t)opt->s_mm;
