@@ -33,6 +33,8 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <stdlib.h>
 #include <zlib.h>
 #include <assert.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include "bntseq.h"
 #include "bwa.h"
 #include "ksw.h"
@@ -1277,34 +1279,59 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
     return 0;
 }
 
-// Load the contents of `<prefix>.hdr` if present, else `<baseprefix>.dict`
-// (where baseprefix drops a trailing ".gz" then the final dotted suffix of the
-// basename, whatever it is -- e.g. foo.fa -> foo, GRCh38.p14 -> GRCh38), into
-// a newly-allocated, newline-separated but not newline-terminated string.
-// Returns NULL if neither file exists (or is empty). Caller owns the result
-// and must free() it.
+char *bwa_dict_path(const char *prefix)
+{
+    std::string path(prefix);
+    if (path.size() >= 3 && path.compare(path.size() - 3, 3, ".gz") == 0)
+        path.resize(path.size() - 3);
+    size_t dot = path.find_last_of('.'), slash = path.find_last_of('/');
+    if (dot != std::string::npos && (slash == std::string::npos || dot > slash))
+        path.resize(dot);
+    char *result = strdup((path + ".dict").c_str());
+    if (!result) err_fatal(__func__, "out of memory allocating dictionary path");
+    return result;
+}
+
+FILE *bwa_open_index_header(const char *prefix, int strict, char **path, int *error)
+{
+    *error = 0;
+    *path = strdup((std::string(prefix) + ".hdr").c_str());
+    if (!*path) err_fatal(__func__, "out of memory allocating header path");
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        struct stat st;
+        bool missing = false;
+        if (strict && stat(*path, &st) != 0) {
+            int saved = errno;
+            // A dangling symlink is existing metadata, not absence.
+            if (saved != ENOENT || lstat(*path, &st) == 0) {
+                *error = saved;
+                return NULL;
+            }
+            missing = true;
+        }
+        if (strict && !missing && !S_ISREG(st.st_mode)) {
+            *error = EINVAL;
+            return NULL;
+        }
+        FILE *fp = missing ? NULL : fopen(*path, "r");
+        if (fp) return fp;
+        if (strict && !missing) { *error = errno; return NULL; }
+        if (attempt == 0) {
+            free(*path);
+            *path = bwa_dict_path(prefix);
+        }
+    }
+    return NULL;
+}
+
+// Preserve the loader's permissive .hdr-open failure -> dictionary fallback.
+// The indexer uses the same selector in strict mode before replacing outputs.
 char *bwa_load_hdr_from_index(const char *prefix)
 {
     if (prefix == NULL) return NULL;
-
-    kstring_t path = { 0, 0, NULL };
-    ksprintf(&path, "%s.hdr", prefix);
-    FILE *fp = fopen(path.s, "r");
-    if (!fp) {
-        // Try <baseprefix>.dict: drop the ".hdr" we just appended, then drop
-        // a trailing ".gz" (if any) and the final dotted suffix inside the
-        // basename — e.g. foo.fa -> foo, foo.fasta.gz -> foo — before
-        // appending ".dict".
-        size_t l;
-        path.l -= 4; // drop ".hdr"
-        if (path.l >= 3 && strncmp(&path.s[path.l - 3], ".gz", 3) == 0)
-            path.l -= 3;
-        for (l = path.l; l > 0 && path.s[l - 1] != '/'; --l) {
-            if (path.s[l - 1] == '.') { path.l = l - 1; break; }
-        }
-        ksprintf(&path, ".dict");
-        fp = fopen(path.s, "r");
-    }
+    char *path = NULL;
+    int error = 0;
+    FILE *fp = bwa_open_index_header(prefix, 0, &path, &error);
 
     char *out = NULL;
     if (fp) {
@@ -1323,7 +1350,7 @@ char *bwa_load_hdr_from_index(const char *prefix)
         }
     }
 
-    free(path.s);
+    free(path);
     return out;
 }
 

@@ -106,7 +106,7 @@ check "SAM text" "$sam_hd"
 # Built unconditionally: the cleanup above removes phix.fa.* (which includes
 # phix.fa.meth.*), so an "is it already there" guard would never be false.
 # Built before the samtools gate so this path is checked on hosts without it.
-"$BWA_MEM3" index --meth "$ref" > index-meth.log 2>&1 \
+"$BWA_MEM3" index --meth --force "$ref" > index-meth.log 2>&1 \
     || {
         echo "FAIL: bwa-mem3 index --meth failed" >&2
         cat index-meth.log >&2

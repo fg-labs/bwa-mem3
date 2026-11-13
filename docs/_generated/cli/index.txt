@@ -7,9 +7,14 @@ Usage: bwa-mem3 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [-
                      [auto: RAM less a reserve of min(max(2G, 5%), 50%),
                      cgroup-aware]
   --tmp-dir PATH     scratch directory [$TMPDIR]
-  --meth             build a BS-aware dual index. Writes the original-alphabet
-                     index at <in.fasta>.* plus a converted seed FM-index at
-                     <in.fasta>.meth.* (used by `bwa-mem3 mem --meth`).
+  --meth             build original <prefix>.* and converted <prefix>.meth.*
+                     indexes; -p defaults to <in.fasta>. Use with mem --meth.
+  --meth-only        with --meth, pack the original without its FM-index;
+                     seven index files, for methylation alignment only
+  --keep-meth-fasta  with --meth, retain fresh conversion as <prefix>.meth.fa
+                     (otherwise removed from unique scratch on exit)
+  --force            with --meth, replace existing known index artifacts;
+                     rejects source aliases, symlinks and directories
   --emit-unpacked-ref also write the unpacked `<prefix>.0123` reference. Off by
                      default: `mem` pac-fetches bases from `.pac`, so `.0123`
                      is never read. Enable only for an external consumer that

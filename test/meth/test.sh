@@ -60,8 +60,16 @@ BAM2="$SCRATCH/meth_test2.bam"
 # Layer 1: BAM emission smoke test
 # ---------------------------------------------------------------------------
 
-if [[ ! -f ref.fa.bwameth.c2t.bwt.2bit.64 ]]; then
-    "$BWAMEM3" index --meth ref.fa > /dev/null 2>&1
+complete_index=1
+for suffix in amb ann pac bwt.2bit.64 meth.amb meth.ann meth.pac meth.bwt.2bit.64; do
+    [[ -s ref.fa.$suffix ]] || complete_index=0
+done
+if [[ $complete_index == 0 ]]; then
+    "$BWAMEM3" index --meth --force ref.fa > index-meth.log 2>&1 || {
+        cat index-meth.log >&2
+        echo "FAIL: methylation index repair failed" >&2
+        exit 1
+    }
 fi
 
 # PAIRED-END on purpose. This ran paired until the D3 rewrite dropped the mate

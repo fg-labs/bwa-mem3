@@ -230,6 +230,12 @@ extern "C" {
 	 * sets *line/*len to the next record (no newline) and advances *p, returning
 	 * 1, or returns 0 at end of text. */
 	int bwa_hdr_next_line(const char **p, const char **line, size_t *len);
+	/* Allocate the dictionary fallback path; caller frees the result. */
+	char *bwa_dict_path(const char *prefix);
+	/* Open .hdr then dictionary. strict rejects existing unreadable/nonregular
+	 * metadata instead of falling back. path is allocated even on absence;
+	 * error is nonzero only for a strict inspection/open failure. */
+	FILE *bwa_open_index_header(const char *prefix, int strict, char **path, int *error);
 	char *bwa_load_hdr_from_index(const char *prefix);
 	/* Warn (at bwa_verbose >= 2) when the index marks contigs ALT but the
 	 * sidecar's @SQ block carries no AH for them. The sidecar is authoritative

@@ -87,31 +87,35 @@ TD="$(mktemp -d)"
 trap 'rm -rf "$TD"' EXIT
 cp "$FA_SRC" "$TD/m.fa"
 # The fixture is ~1 Mbp -> original est ~11.4 MiB, seed est ~22.9 MiB.
-if "$BWAMEM3" index --meth --max-memory 16M "$TD/m.fa" > "$TD/out" 2> "$TD/err"; then
-    echo "FAIL: --meth --max-memory 16M should have been refused (seed needs ~23 MiB)"
-    FAIL=1
-else
-    rc=$?
-    if [[ "$rc" -ne 3 ]]; then
-        echo "FAIL: --meth budget refusal exited $rc, expected 3"
-        cat "$TD/err"
-        FAIL=1
-    elif ! grep -q 'seed index dominates' "$TD/err"; then
-        echo "FAIL: --meth refusal did not explain that the seed dominates"
-        cat "$TD/err"
+for layout in full minimal; do
+    meth_args=(--meth)
+    [[ $layout == minimal ]] && meth_args+=(--meth-only)
+    if "$BWAMEM3" index "${meth_args[@]}" --max-memory 16M "$TD/m.fa" > "$TD/out" 2> "$TD/err"; then
+        echo "FAIL: --meth --max-memory 16M should have been refused (seed needs ~23 MiB)"
         FAIL=1
     else
-        # The point of the up-front check: nothing was built before refusing.
-        leaked="$(find "$TD" -name 'm.fa.*' -not -name '*.fai' | head -5)"
-        if [[ -n "$leaked" ]]; then
-            echo "FAIL: --meth refusal left index artifacts behind:"
-            echo "$leaked"
+        rc=$?
+        if [[ "$rc" -ne 3 ]]; then
+            echo "FAIL: --meth budget refusal exited $rc, expected 3"
+            cat "$TD/err"
+            FAIL=1
+        elif ! grep -q 'seed index dominates' "$TD/err"; then
+            echo "FAIL: --meth refusal did not explain that the seed dominates"
+            cat "$TD/err"
             FAIL=1
         else
-            echo "OK:   --meth --max-memory 16M refused up front (exit 3, nothing written)"
+            # The point of the up-front check: nothing was built before refusing.
+            leaked="$(find "$TD" -name 'm.fa.*' -not -name '*.fai' | head -5)"
+            if [[ -n "$leaked" ]]; then
+                echo "FAIL: --meth refusal left index artifacts behind:"
+                echo "$leaked"
+                FAIL=1
+            else
+                echo "OK:   --meth --max-memory 16M refused up front (exit 3, nothing written)"
+            fi
         fi
     fi
-fi
+done
 rm -rf "$TD"
 trap - EXIT
 

@@ -96,7 +96,7 @@ mawk -v n="$N_READS" -v len="$READ_LEN" 'BEGIN {
     tail -5 index.log >&2
     fail "index exited nonzero"
 }
-"$BWA_MEM3" index --meth ref.fa > index_meth.log 2>&1 || {
+"$BWA_MEM3" index --meth --force ref.fa > index_meth.log 2>&1 || {
     tail -5 index_meth.log >&2
     fail "index --meth exited nonzero"
 }

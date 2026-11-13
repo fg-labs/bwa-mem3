@@ -116,7 +116,7 @@ PY
     tail -5 index.log >&2
     exit 1
 }
-"$BWA_MEM3" index --meth ref.fa > index-meth.log 2>&1 || {
+"$BWA_MEM3" index --meth --force ref.fa > index-meth.log 2>&1 || {
     echo "FAIL: bwa-mem3 index --meth failed" >&2
     tail -5 index-meth.log >&2
     exit 1

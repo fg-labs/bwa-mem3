@@ -369,7 +369,7 @@ fi
 # exactly where it does not prune on converted copies (rescue_band_meth_on). TAPS at the genomic
 # and neutral scorings (neutral is its default) filters under the exact relation on aarch64
 # (rescue_meth_rel), and bands both passes on top of that pruning.
-"$BIN" index --meth ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
+"$BIN" index --meth --force ref.fa > /dev/null 2>&1 || fail "index --meth nonzero exit"
 sc_note=""
 # A scoring label's output stem, and one field of a stats line ($1 = the line, $2 = the field).
 sc_stem() { printf 'sc_%s' "$(printf '%s' "$1" | tr -c 'A-Za-z0-9' '_')"; }
