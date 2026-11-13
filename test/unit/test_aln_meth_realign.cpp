@@ -24,15 +24,15 @@ struct Ref {
 };
 // Exhaustive legal M/I/D histories, independent of ksw and certificate implementation.
 int oracle(const std::vector<uint8_t> &q, const std::vector<uint8_t> &t, const int8_t *mat,
-           int r=0, int x=0, int state=0) {
+           int r=0, int x=0, int state=0, int m=5) {
     if (r==(int)q.size() && x==(int)t.size()) return 0;
     int best=INT_MIN/4;
     if(r<(int)q.size() && x<(int)t.size())
-        best=mat[t[x]*5+q[r]]+oracle(q,t,mat,r+1,x+1,0);
+        best=mat[t[x]*m+q[r]]+oracle(q,t,mat,r+1,x+1,0,m);
     if(r<(int)q.size() && state!=2)
-        best=std::max(best,-(state==1?1:6)+oracle(q,t,mat,r+1,x,1));
+        best=std::max(best,-(state==1?1:6)+oracle(q,t,mat,r+1,x,1,m));
     if(x<(int)t.size() && state!=1)
-        best=std::max(best,-(state==2?1:6)+oracle(q,t,mat,r,x+1,2));
+        best=std::max(best,-(state==2?1:6)+oracle(q,t,mat,r,x+1,2,m));
     return best;
 }
 int cigar_score(const std::vector<uint8_t>&q,const std::vector<uint8_t>&t,const int8_t*mat,int m,
@@ -164,4 +164,45 @@ TEST_CASE("aln_realign: wide dispatcher calls execute existing SIMD when tier su
     int n=0;uint32_t*raw=nullptr;
     CHECK(a.reward==ksw_global2_scalar_ref(150,q.data(),150,t.data(),5,mo.mat_ot,5,1,5,1,150,&n,&raw));
     CHECK(a.raw_cigar==std::vector<uint32_t>(raw,raw+n));free(raw);
+}
+
+TEST_CASE("aln_realign: m7 full fallback matches independent oracle without SIMD") {
+    for(int mode:{MEM_METH_SCORING_GENOMIC,MEM_METH_SCORING_NEUTRAL})
+    for(int hyp:{0,1}) for(int bits=0;bits<64;++bits) {
+        std::vector<uint8_t> target={1,2,1,0},query(4);
+        for(int k=0;k<4;++k) query[k]=(bits>>(k*2))&3;
+        Ref ref(target);ba::aln_meth_opt_t mo;mo.m.meth_context=METH_CTX_CPG;mo.m.meth_scoring=mode;
+        ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_candidate_t candidate{0,0,hyp,0,4};ba::aln_meth_alignment_t a;
+        const unsigned long before=ksw_g2_wave_exec_count();
+        REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,candidate,query.data(),4,0,0,&a)==ba::aln_meth_eval_status::ok);
+        CHECK(ksw_g2_wave_exec_count()==before);CHECK(a.band==4);
+        const std::vector<uint8_t> labeled={METH_C5,METH_G6,1,0};
+        const int8_t *mat=hyp?mo.mat7_ot:mo.mat7_ob;
+        CHECK(a.reward==oracle(query,labeled,mat,0,0,0,7));
+        CHECK(a.reward==cigar_score(query,labeled,mat,7,a.raw_cigar));
+        int n=0;uint32_t *raw=nullptr;
+        CHECK(a.reward==ksw_global2_scalar_ref(4,query.data(),4,labeled.data(),7,mat,5,1,5,1,4,&n,&raw));
+        CHECK(a.raw_cigar==std::vector<uint32_t>(raw,raw+n));free(raw);
+    }
+}
+
+TEST_CASE("aln_realign: m7 context cannot borrow contig neighbors or original N runs") {
+    Ref ref({1,2,1,2});bntann1_t anns[2]={};anns[0].len=1;anns[1].offset=1;anns[1].len=3;
+    ref.bns.anns=anns;ref.bns.n_seqs=2;
+    ba::aln_meth_opt_t mo;mo.m.meth_context=METH_CTX_CPG;mo.m.meth_scoring=MEM_METH_SCORING_NEUTRAL;
+    ba::aln_meth_opt_finish(&mo);ba::aln_meth_alignment_t a;
+    uint8_t t=3,g=0,n=4;
+    REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,{0,0,1,0,1},&t,1,0,0,&a)==ba::aln_meth_eval_status::ok);
+    CHECK(a.reward==-3); // terminal C cannot borrow the next contig's initial G
+    REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,{1,1,0,1,2},&g,1,0,0,&a)==ba::aln_meth_eval_status::ok);
+    CHECK(a.reward==-3); // initial G cannot borrow preceding contig C
+    REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,{1,0,1,2,3},&t,1,0,0,&a)==ba::aln_meth_eval_status::ok);
+    CHECK(a.reward==0); // true same-contig partner beyond window
+    bntamb1_t ambiguous={};ambiguous.offset=3;ambiguous.len=1;ambiguous.amb='N';
+    ref.bns.ambs=&ambiguous;ref.bns.n_holes=1;
+    REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,{1,0,1,2,3},&t,1,0,0,&a)==ba::aln_meth_eval_status::ok);
+    CHECK(a.reward==-3); // PAC G is inside an original N run
+    REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,{1,0,1,2,3},&n,1,0,0,&a)==ba::aln_meth_eval_status::ok);
+    CHECK(a.reward==-1); // original query ambiguity uses the N matrix column
 }

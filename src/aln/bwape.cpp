@@ -56,7 +56,8 @@ pe_opt_t *bwa_init_pe_opt(void)
 // for normal distribution, this is about 3std
 #define OUTLIER_BOUND 2.0
 
-int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L)
+int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
+                const bntseq_t *bns, int report)
 {
 	uint64_t x, *isizes, n_ap = 0;
 	int n, i, tot, p25, p75, p50, max_len = 1, tmp;
@@ -68,7 +69,8 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	for (i = 0, tot = 0; i != n_seqs; ++i) {
 		bwa_seq_t *p[2];
 		p[0] = seqs[0] + i; p[1] = seqs[1] + i;
-		if (p[0]->mapQ >= 20 && p[1]->mapQ >= 20) {
+		if (p[0]->mapQ >= 20 && p[1]->mapQ >= 20
+			&& (!bns || bns_pos2rid(bns, p[0]->pos) == bns_pos2rid(bns, p[1]->pos))) {
 			x = (p[0]->pos < p[1]->pos)? p[1]->pos + p[1]->len - p[0]->pos : p[0]->pos + p[0]->len - p[1]->pos;
 			if (x < 100000) isizes[tot++] = x;
 		}
@@ -76,7 +78,7 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 		if (p[1]->len > max_len) max_len = p[1]->len;
 	}
 	if (tot < 20) {
-		fprintf(stderr, "[infer_isize] fail to infer insert size: too few good pairs\n");
+		if (report) fprintf(stderr, "[infer_isize] fail to infer insert size: too few good pairs\n");
 		free(isizes);
 		return -1;
 	}
@@ -88,7 +90,7 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	ii->low = tmp > max_len? tmp : max_len; // ii->low is unsigned
 	ii->high = (int)(p75 + OUTLIER_BOUND * (p75 - p25) + .499);
 	if (ii->low > ii->high) {
-		fprintf(stderr, "[infer_isize] fail to infer insert size: upper bound is smaller than read length\n");
+		if (report) fprintf(stderr, "[infer_isize] fail to infer insert size: upper bound is smaller than read length\n");
 		free(isizes);
 		return -1;
 	}
@@ -119,23 +121,25 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	ii->ap_prior = .01 * (n_ap + .01) / tot;
 	if (ii->ap_prior < ap_prior) ii->ap_prior = ap_prior;
 	free(isizes);
-	fprintf(stderr, "[infer_isize] (25, 50, 75) percentile: (%d, %d, %d)\n", p25, p50, p75);
+	if (report) fprintf(stderr, "[infer_isize] (25, 50, 75) percentile: (%d, %d, %d)\n", p25, p50, p75);
 	if (isnan(ii->std) || p75 > 100000) {
 		ii->low = ii->high = ii->high_bayesian = 0; ii->avg = ii->std = -1.0;
-		fprintf(stderr, "[infer_isize] fail to infer insert size: weird pairing\n");
+		if (report) fprintf(stderr, "[infer_isize] fail to infer insert size: weird pairing\n");
 		return -1;
 	}
 	for (y = 1.0; y < 10.0; y += 0.01)
 		if (.5 * erfc(y / M_SQRT2) < ap_prior / L * (y * ii->std + ii->avg)) break;
 	ii->high_bayesian = (bwtint_t)(y * ii->std + ii->avg + .499);
-	fprintf(stderr, "[infer_isize] low and high boundaries: %ld and %ld for estimating avg and std\n", (long)ii->low, (long)ii->high);
-	fprintf(stderr, "[infer_isize] inferred external isize from %d pairs: %.3lf +/- %.3lf\n", n, ii->avg, ii->std);
-	fprintf(stderr, "[infer_isize] skewness: %.3lf; kurtosis: %.3lf; ap_prior: %.2e\n", skewness, kurtosis, ii->ap_prior);
-	fprintf(stderr, "[infer_isize] inferred maximum insert size: %ld (%.2lf sigma)\n", (long)ii->high_bayesian, y);
+	if (report) fprintf(stderr, "[infer_isize] low and high boundaries: %ld and %ld for estimating avg and std\n", (long)ii->low, (long)ii->high);
+	if (report) fprintf(stderr, "[infer_isize] inferred external isize from %d pairs: %.3lf +/- %.3lf\n", n, ii->avg, ii->std);
+	if (report) fprintf(stderr, "[infer_isize] skewness: %.3lf; kurtosis: %.3lf; ap_prior: %.2e\n", skewness, kurtosis, ii->ap_prior);
+	if (report) fprintf(stderr, "[infer_isize] inferred maximum insert size: %ld (%.2lf sigma)\n", (long)ii->high_bayesian, y);
 	return 0;
 }
 
-static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm, const isize_info_t *ii)
+template <bool SameContig = false>
+static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
+                   const isize_info_t *ii, const bntseq_t *bns = nullptr)
 {
 	int i, j, o_n, subo_n, cnt_chg = 0, low_bound = ii->low, max_len;
 	uint64_t o_score, subo_score;
@@ -181,8 +185,19 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	if (d->arr.n > 1) pdqsort_128(d->arr.n, d->arr.a);
 	for (j = 0; j < 2; ++j) last_pos[j][0].x = last_pos[j][0].y = last_pos[j][1].x = last_pos[j][1].y = (uint64_t)-1;
 	if (opt->type == BWA_PET_STD) {
+        int last_rid = -1;
 		for (i = 0; i < d->arr.n; ++i) {
 			pair64_t x = d->arr.a[i];
+            if (SameContig) {
+                const int rid = bns_pos2rid(bns, x.x);
+                if (rid != last_rid) {
+                    // Reset only the predecessor cache; aggregate best/runner-up counts
+                    // across every eligible contig in this one stock scoring pass.
+                    for (j = 0; j < 2; ++j)
+                        last_pos[j][0].x = last_pos[j][0].y = last_pos[j][1].x = last_pos[j][1].y = (uint64_t)-1;
+                    last_rid = rid;
+                }
+            }
 			int strand = x.y>>1&1;
 			if (strand == 1) { // reverse strand, then check
 				int y = 1 - (x.y&1);
@@ -248,6 +263,17 @@ int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm
 	return ret;
 }
 
+int bwa_pe_pairing_same_contig(const bntseq_t *bns, bwa_seq_t *p[2], pair64_v *arr,
+                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii)
+{
+    pe_data_t d;
+    d.arr = *arr;
+    d.aln[0] = p[0]->aln; d.aln[1] = p[1]->aln;
+    const int ret = pairing<true>(p, &d, opt, s_mm, ii, bns);
+    *arr = d.arr;
+    return ret;
+}
+
 /* bwa_cal_pac_pos_pe is upstream's single function cut into its stages, so that the driver can
  * run the RNG-free stages in parallel (see bwape.h). Stage bodies are upstream's, in order, apart
  * from the batched SA lookups in bwa_pe_se_pos and bwa_pe_pair (README.md, "Batched SA lookups"). */
@@ -299,11 +325,17 @@ void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t 
 void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, const pe_opt_t *opt,
 				  const isize_info_t *last_ii)
 {
-	// infer isize
-	infer_isize(n_seqs, seqs, ii, opt->ap_prior, bwt->seq_len/2);
+    bwa_pe_isize_ref(bwt->seq_len/2, n_seqs, seqs, ii, opt, last_ii);
+}
+
+void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
+                      const pe_opt_t *opt, const isize_info_t *last_ii, const bntseq_t *bns, int report)
+{
+	// Shared stock inference/fallback; converted indices must supply the original length.
+	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len, bns, report);
 	if (ii->avg < 0.0 && last_ii->avg > 0.0) *ii = *last_ii;
 	if (opt->force_isize) {
-		fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");
+		if (report) fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");
 		ii->low = ii->high = 0; ii->avg = ii->std = -1.0;
 	}
 }

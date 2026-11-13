@@ -24,8 +24,11 @@ typedef struct {
 pe_opt_t *bwa_init_pe_opt(void);
 
 /* Estimates the insert-size distribution from the pairs where both ends are unique enough.
- * Returns 0, or -1 (ii->avg = -1) when it cannot; prints its findings to stderr. */
-int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L);
+ * Returns 0, or -1 (ii->avg = -1) when it cannot; prints its findings to stderr when `report`
+ * is set. With `bns` (--meth), pairs whose ends lie on different contigs are not counted;
+ * the defaults are stock's. */
+int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
+                const bntseq_t *bns = nullptr, int report = 1);
 
 /* Single-end positions, then pairing, for one batch. Each read's alignments are its aln /
  * n_aln. Consumes drand48(): call serially, in read order. When the batch gives no estimate
@@ -51,12 +54,20 @@ void bwa_pe_aln2seq(int n_seqs, bwa_seq_t *seqs[2]);
 void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], const gap_opt_t *gopt);
 void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, const pe_opt_t *opt,
 				  const isize_info_t *last_ii);
+/* Same stock inference/fallback policy with an explicit original reference length; with `bns`,
+ * only same-contig pairs are counted (as --meth pairs them), and the reports follow `report`. */
+void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
+                      const pe_opt_t *opt, const isize_info_t *last_ii,
+                      const bntseq_t *bns = nullptr, int report = 1);
 int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
 				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt);
 /* sampe's pairing of one pair, for the unit tests' reference: `arr` holds upstream's
  * (position, k<<2 | strand<<1 | end) array for the pair (sorted in place); the alignments are
  * p[0]->aln and p[1]->aln. Returns the number of alignments whose position changed. */
 int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
+/* Stock scoring/count aggregation, restricted to same-contig candidates before selection. */
+int bwa_pe_pairing_same_contig(const bntseq_t *bns, bwa_seq_t *p[2], pair64_v *arr,
+                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
 /* The largest weight of a group of pairs in bwa_pe_pair (see bwa_pe_pair_grouped). */
 constexpr long long ALN_PE_GROUP_ROWS = 8192;
 /* bwa_pe_pair with the group size as a parameter (bwa_pe_pair passes ALN_PE_GROUP_ROWS); the unit
