@@ -43,12 +43,11 @@ void aln_meth_opt_finish(aln_meth_opt_t *mo)
 	meth_fill_mats(base, 1, &mo->m, mo->mat_ot, mo->mat_ob, mo->mat7_ot, mo->mat7_ob);
 }
 
-int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads)
+// Pairing is structural: r<name>,f<name> in original order, with identical lengths and
+// contiguous offsets. Metadata cannot detect two different sequences with the same layout.
+static int meth_ref_check(aln_meth_ref_t *r, const char *orig_desc, const bntseq_t *conv_bns, const char *hint)
 {
 	r->conv_bns = conv_bns;
-	if (meth_orig_ref_load(orig_prefix, &r->bns, &r->pac, n_threads < 1 ? 1 : n_threads) != 0) return -1;
-	// Pairing is structural: r<name>,f<name> in original order, with identical lengths and
-	// contiguous offsets. Metadata cannot detect two different sequences with the same layout.
 	bool matches = conv_bns && (int64_t)conv_bns->n_seqs == 2LL * r->bns->n_seqs
 		&& conv_bns->l_pac == 2 * r->bns->l_pac;
 	for (int i = 0; matches && i < r->bns->n_seqs; ++i) {
@@ -62,11 +61,25 @@ int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t
 	}
 	if (!matches) {
 		fprintf(stderr, "ERROR: --meth converted index does not match the original reference '%s' "
-				"(contig names, lengths or offsets); rebuild with `bwa-mem3 index --meth`\n", orig_prefix);
+				"(contig names, lengths or offsets)%s\n", orig_desc, hint);
 		aln_meth_ref_free(r);
 		return -1;
 	}
 	return 0;
+}
+
+int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads)
+{
+	r->conv_bns = conv_bns;
+	if (meth_orig_ref_load(orig_prefix, &r->bns, &r->pac, n_threads < 1 ? 1 : n_threads) != 0) return -1;
+	return meth_ref_check(r, orig_prefix, conv_bns, "; rebuild with `bwa-mem3 index --meth`");
+}
+
+int aln_meth_ref_adopt(aln_meth_ref_t *r, bntseq_t *orig_bns, uint8_t *orig_pac, const bntseq_t *conv_bns)
+{
+	r->bns = orig_bns;
+	r->pac = orig_pac;
+	return meth_ref_check(r, "(in-memory windows)", conv_bns, " (internal error: the in-memory window references are inconsistent)");
 }
 
 void aln_meth_ref_free(aln_meth_ref_t *r)

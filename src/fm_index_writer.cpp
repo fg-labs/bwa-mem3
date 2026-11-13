@@ -46,18 +46,18 @@
 // `fill` reaches `cap`, the whole ring is pwritten at `cursor` and `cursor`
 // advances. This amortises the syscall cost across many small appends.
 struct Ring {
-    int      fd;
+    FmSink*  sink;
     uint8_t* buf;
     size_t   cap;      // bytes
     size_t   fill;     // bytes used
-    off_t    cursor;   // next file offset to write
+    int64_t  cursor;   // next file offset to write
     const char* what;  // for error messages
 };
 
 static inline void ring_flush(Ring& r) {
     if (r.fill == 0) return;
-    pwrite_all(r.fd, r.buf, r.fill, r.cursor, r.what);
-    r.cursor += (off_t)r.fill;
+    r.sink->write(r.cursor, r.buf, r.fill, r.what);
+    r.cursor += (int64_t)r.fill;
     r.fill    = 0;
 }
 
@@ -69,8 +69,8 @@ static inline void ring_append(Ring& r, const void* src, size_t n) {
     }
     ring_flush(r);
     if (n >= r.cap) {
-        pwrite_all(r.fd, src, n, r.cursor, r.what);
-        r.cursor += (off_t)n;
+        r.sink->write(r.cursor, src, n, r.what);
+        r.cursor += (int64_t)n;
         return;
     }
     memcpy(r.buf + r.fill, src, n);
@@ -141,8 +141,8 @@ static void count_stripe(int64_t s, int64_t e,
 template <typename SaIdx>
 static void emit_stripe(int64_t s, int64_t e,
                         const uint8_t* buf, const SaIdx* sa, int64_t N,
-                        int fd,
-                        off_t off_cp, off_t off_msb, off_t off_lsw,
+                        FmSink& sink,
+                        int64_t off_cp, int64_t off_msb, int64_t off_lsw,
                         const int64_t running_init[4],
                         int64_t sa_mask)
 {
@@ -151,9 +151,9 @@ static void emit_stripe(int64_t s, int64_t e,
     std::vector<uint8_t> cp_occ_buf(kCpOccRingEntries * sizeof(CP_OCC));
     std::vector<uint8_t> sa_ms_buf(kSampleRingSamples * sizeof(int8_t));
     std::vector<uint8_t> sa_ls_buf(kSampleRingSamples * sizeof(uint32_t));
-    Ring cp_occ_ring = { fd, cp_occ_buf.data(), cp_occ_buf.size(), 0, off_cp,  "cp_occ" };
-    Ring sa_ms_ring  = { fd, sa_ms_buf.data(),  sa_ms_buf.size(),  0, off_msb, "sa_ms_byte" };
-    Ring sa_ls_ring  = { fd, sa_ls_buf.data(),  sa_ls_buf.size(),  0, off_lsw, "sa_ls_word" };
+    Ring cp_occ_ring = { &sink, cp_occ_buf.data(), cp_occ_buf.size(), 0, off_cp,  "cp_occ" };
+    Ring sa_ms_ring  = { &sink, sa_ms_buf.data(),  sa_ms_buf.size(),  0, off_msb, "sa_ms_byte" };
+    Ring sa_ls_ring  = { &sink, sa_ls_buf.data(),  sa_ls_buf.size(),  0, off_lsw, "sa_ls_word" };
 
     // running[5]: bases A/C/G/T occurrence-count accumulators ([0..3]) plus
     // a trailing sentinel-bucket ([4]) that absorbs the b==4 increment from
@@ -221,15 +221,15 @@ static void emit_stripe(int64_t s, int64_t e,
 // Returns nothing: every failure path inside calls err_fatal and terminates
 // the process, so a recoverable-error int rc would be a misleading contract.
 template <typename SaIdx>
-static void write_fm_index_streaming_typed(int fd,
+static void write_fm_index_streaming_typed(FmSink& sink,
                                            const uint8_t* buf,
                                            const SaIdx* sa,
                                            int64_t pac_len,
                                            int64_t ref_seq_len,
-                                           off_t off_cp_occ,
-                                           off_t off_ms_byte,
-                                           off_t off_ls_word,
-                                           off_t off_sent,
+                                           int64_t off_cp_occ,
+                                           int64_t off_ms_byte,
+                                           int64_t off_ls_word,
+                                           int64_t off_sent,
                                            const int64_t count[5],
                                            int64_t* out_sentinel_index,
                                            int sa_compx,
@@ -320,18 +320,18 @@ static void write_fm_index_streaming_typed(int fd,
 
         int64_t first_block_idx  = s >> CP_SHIFT;
         int64_t first_sample_idx = s >> sa_compx;
-        off_t off_cp  = off_cp_occ  + (off_t)first_block_idx  * (off_t)sizeof(CP_OCC);
-        off_t off_msb = off_ms_byte + (off_t)first_sample_idx * (off_t)sizeof(int8_t);
-        off_t off_lsw = off_ls_word + (off_t)first_sample_idx * (off_t)sizeof(uint32_t);
+        int64_t off_cp  = off_cp_occ  + first_block_idx  * (int64_t)sizeof(CP_OCC);
+        int64_t off_msb = off_ms_byte + first_sample_idx * (int64_t)sizeof(int8_t);
+        int64_t off_lsw = off_ls_word + first_sample_idx * (int64_t)sizeof(uint32_t);
 
         emit_stripe<SaIdx>(s, e, buf, sa, pac_len,
-                           fd, off_cp, off_msb, off_lsw,
+                           sink, off_cp, off_msb, off_lsw,
                            stripe_running_start[t].data(), sa_mask);
     }
 
-    pwrite_all(fd, &ref_seq_len,     sizeof(int64_t),     0,               "ref_seq_len");
-    pwrite_all(fd, count,            5 * sizeof(int64_t), sizeof(int64_t), "count[5]");
-    pwrite_all(fd, &sentinel_index,  sizeof(int64_t),     off_sent,        "sentinel_index");
+    sink.write(0,                  &ref_seq_len,    sizeof(int64_t),     "ref_seq_len");
+    sink.write(sizeof(int64_t),    count,           5 * sizeof(int64_t), "count[5]");
+    sink.write(off_sent,           &sentinel_index, sizeof(int64_t),     "sentinel_index");
 
     // Trailing field, appended after sentinel_index rather than folded into
     // the fixed header, so every offset above (cp_occ/SA-sample/sentinel)
@@ -339,8 +339,7 @@ static void write_fm_index_streaming_typed(int fd,
     // indexes built before this field existed; the loader treats a missing
     // tail as the legacy default (SA_COMPX == 3).
     int64_t sa_compx_i64 = sa_compx;
-    pwrite_all(fd, &sa_compx_i64,    sizeof(int64_t),
-               off_sent + (off_t)sizeof(int64_t), "sa_compx");
+    sink.write(off_sent + (int64_t)sizeof(int64_t), &sa_compx_i64, sizeof(int64_t), "sa_compx");
 
     *out_sentinel_index = sentinel_index;
 }
@@ -359,7 +358,27 @@ Bwt2bitLayout fmi_bwt2bit_layout(int64_t ref_seq_len, int sa_compx)
     return L;
 }
 
-void write_fm_index_streaming(const char* out_path,
+// Argument checks shared by both write_fm_index_streaming overloads and the sink constructors.
+void check_streaming_args(const char* fn, int64_t ref_seq_len, int sa_compx)
+{
+    // sa_ms_byte is stored as int8_t (top byte of a 40-bit SA value), so
+    // SA values >= 2^39 would silently sign-extend on load and corrupt the
+    // index. Reject up front rather than producing a broken .bwt.2bit.64.
+    if (ref_seq_len > ((int64_t)1 << 39))
+        err_fatal(fn, "ref_seq_len=%lld exceeds on-disk SA-sample range (~5.5e11)",
+                  (long long)ref_seq_len);
+
+    // emit_stripe's per-block sample check reduces a global (i & sa_mask)
+    // test to a block-local (j & sa_mask) test, which is only valid when
+    // every CP_BLOCK_SIZE-aligned block start also lands on a sample-period
+    // boundary -- i.e. when the sample period (1<<sa_compx) divides
+    // CP_BLOCK_SIZE (64). Reject anything outside that range rather than
+    // silently emitting samples at the wrong global rows.
+    if (sa_compx < 0 || sa_compx > CP_SHIFT)
+        err_fatal(fn, "sa_compx=%d out of supported range [0, %d]", sa_compx, CP_SHIFT);
+}
+
+void write_fm_index_streaming(FmSink& sink,
                               const uint8_t* buf,
                               const void* sa,
                               bool sa_is_64bit,
@@ -370,50 +389,11 @@ void write_fm_index_streaming(const char* out_path,
                               int num_threads)
 {
     const int64_t ref_seq_len = pac_len + 1;
-    // sa_ms_byte is stored as int8_t (top byte of a 40-bit SA value), so
-    // SA values >= 2^39 would silently sign-extend on load and corrupt the
-    // index. Reject up front rather than producing a broken .bwt.2bit.64.
-    if (ref_seq_len > ((int64_t)1 << 39))
-        err_fatal(__func__,
-                  "ref_seq_len=%lld exceeds on-disk SA-sample range (~5.5e11)",
-                  (long long)ref_seq_len);
-
-    // emit_stripe's per-block sample check reduces a global (i & sa_mask)
-    // test to a block-local (j & sa_mask) test, which is only valid when
-    // every CP_BLOCK_SIZE-aligned block start also lands on a sample-period
-    // boundary -- i.e. when the sample period (1<<sa_compx) divides
-    // CP_BLOCK_SIZE (64). Reject anything outside that range rather than
-    // silently emitting samples at the wrong global rows.
-    if (sa_compx < 0 || sa_compx > CP_SHIFT)
-        err_fatal(__func__,
-                  "sa_compx=%d out of supported range [0, %d]",
-                  sa_compx, CP_SHIFT);
+    check_streaming_args(__func__, ref_seq_len, sa_compx);
 
     // Single source of truth for the on-disk section offsets (see
     // fmi_bwt2bit_layout / Bwt2bitLayout in fm_index_writer.h).
     const Bwt2bitLayout L = fmi_bwt2bit_layout(ref_seq_len, sa_compx);
-    const off_t off_cp_occ  = (off_t)L.off_cp_occ;
-    const off_t off_ms_byte = (off_t)L.off_ms_byte;
-    const off_t off_ls_word = (off_t)L.off_ls_word;
-    const off_t off_sent    = (off_t)L.off_sentinel;
-    const off_t total_bytes = (off_t)L.total_bytes;
-
-    // Write to a sibling .tmp file and rename on success so a failed
-    // build (err_fatal anywhere downstream) never leaves a partial /
-    // zero-filled index sitting at the canonical path. A leftover .tmp
-    // from a previous failed run is overwritten by O_TRUNC on the next
-    // attempt, so it self-heals without explicit cleanup.
-    // A fixed name (not mkstemp, unlike rewrite_fm_index_resampled_sa) is
-    // deliberate here: `index` is a single-writer build of a given prefix, so
-    // the concurrent-writers race that motivates a unique temp does not apply,
-    // and O_TRUNC self-healing is worth keeping.
-    const std::string tmp_path = std::string(out_path) + ".tmp";
-    int fd = open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0)
-        err_fatal(__func__, "open('%s'): %s", tmp_path.c_str(), strerror(errno));
-    if (ftruncate(fd, total_bytes) != 0)
-        err_fatal(__func__, "ftruncate('%s', %lld): %s",
-                  tmp_path.c_str(), (long long)total_bytes, strerror(errno));
 
     // For tiny references (full_blocks < 2 * T), per-stripe ring buffers
     // and OMP pool spin-up don't amortise, so we silently scale T down,
@@ -428,24 +408,123 @@ void write_fm_index_streaming(const char* out_path,
 
     if (sa_is_64bit) {
         write_fm_index_streaming_typed<int64_t>(
-            fd, buf, (const int64_t*)sa, pac_len, ref_seq_len,
-            off_cp_occ, off_ms_byte, off_ls_word, off_sent,
+            sink, buf, (const int64_t*)sa, pac_len, ref_seq_len,
+            L.off_cp_occ, L.off_ms_byte, L.off_ls_word, L.off_sentinel,
             count, out_sentinel_index, sa_compx, T);
     } else {
         write_fm_index_streaming_typed<int32_t>(
-            fd, buf, (const int32_t*)sa, pac_len, ref_seq_len,
-            off_cp_occ, off_ms_byte, off_ls_word, off_sent,
+            sink, buf, (const int32_t*)sa, pac_len, ref_seq_len,
+            L.off_cp_occ, L.off_ms_byte, L.off_ls_word, L.off_sentinel,
             count, out_sentinel_index, sa_compx, T);
     }
+}
 
-    if (close(fd) != 0)
-        err_fatal(__func__, "close('%s'): %s", tmp_path.c_str(), strerror(errno));
+void write_fm_index_streaming(const char* out_path,
+                              const uint8_t* buf,
+                              const void* sa,
+                              bool sa_is_64bit,
+                              int64_t pac_len,
+                              const int64_t count[5],
+                              int64_t* out_sentinel_index,
+                              int sa_compx,
+                              int num_threads)
+{
+    const int64_t ref_seq_len = pac_len + 1;
+    check_streaming_args(__func__, ref_seq_len, sa_compx);
+    FileFmSink sink(out_path, ref_seq_len, sa_compx);
+    write_fm_index_streaming(sink, buf, sa, sa_is_64bit, pac_len, count,
+                             out_sentinel_index, sa_compx, num_threads);
+    sink.commit();
+}
+
+FileFmSink::FileFmSink(const char* out_path, int64_t ref_seq_len, int sa_compx)
+    : out_path_(out_path)
+{
+    check_streaming_args(__func__, ref_seq_len, sa_compx);
+    const off_t total_bytes = (off_t)fmi_bwt2bit_layout(ref_seq_len, sa_compx).total_bytes;
+
+    // Write to a sibling .tmp file and rename on success so a failed
+    // build (err_fatal anywhere downstream) never leaves a partial /
+    // zero-filled index sitting at the canonical path. A leftover .tmp
+    // from a previous failed run is overwritten by O_TRUNC on the next
+    // attempt, so it self-heals without explicit cleanup.
+    // A fixed name (not mkstemp, unlike rewrite_fm_index_resampled_sa) is
+    // deliberate here: `index` is a single-writer build of a given prefix, so
+    // the concurrent-writers race that motivates a unique temp does not apply,
+    // and O_TRUNC self-healing is worth keeping.
+    tmp_path_ = out_path_ + ".tmp";
+    fd_ = open(tmp_path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd_ < 0)
+        err_fatal(__func__, "open('%s'): %s", tmp_path_.c_str(), strerror(errno));
+    if (ftruncate(fd_, total_bytes) != 0)
+        err_fatal(__func__, "ftruncate('%s', %lld): %s",
+                  tmp_path_.c_str(), (long long)total_bytes, strerror(errno));
+}
+
+void FileFmSink::write(int64_t off, const void* src, size_t n, const char* what)
+{
+    pwrite_all(fd_, src, n, (off_t)off, what);
+}
+
+void FileFmSink::commit()
+{
+    if (close(fd_) != 0)
+        err_fatal(__func__, "close('%s'): %s", tmp_path_.c_str(), strerror(errno));
+    fd_ = -1;
     // Atomic publish: rename(2) is atomic on the same filesystem, so a
     // concurrent reader sees either the previous good index or the new
     // one, never a partial.
-    if (rename(tmp_path.c_str(), out_path) != 0)
+    if (rename(tmp_path_.c_str(), out_path_.c_str()) != 0)
         err_fatal(__func__, "rename('%s' -> '%s'): %s",
-                  tmp_path.c_str(), out_path, strerror(errno));
+                  tmp_path_.c_str(), out_path_.c_str(), strerror(errno));
+}
+
+FmArrays::~FmArrays()
+{
+    if (cp_occ)     _mm_free(cp_occ);
+    if (sa_ms_byte) _mm_free(sa_ms_byte);
+    if (sa_ls_word) _mm_free(sa_ls_word);
+}
+
+MemSink::MemSink(int64_t ref_seq_len, int sa_compx, FmArrays* out)
+    : L_((check_streaming_args(__func__, ref_seq_len, sa_compx),
+          fmi_bwt2bit_layout(ref_seq_len, sa_compx))), out_(out)
+{
+    out_->ref_seq_len = ref_seq_len;
+    out_->sa_compx    = sa_compx;
+    out_->cp_occ     = (CP_OCC*)_mm_malloc((size_t)L_.cp_occ_count * sizeof(CP_OCC), 64);
+    out_->sa_ms_byte = (int8_t*)_mm_malloc((size_t)L_.sa_sample_count * sizeof(int8_t), 64);
+    out_->sa_ls_word = (uint32_t*)_mm_malloc((size_t)L_.sa_sample_count * sizeof(uint32_t), 64);
+    if (!out_->cp_occ || !out_->sa_ms_byte || !out_->sa_ls_word)
+        err_fatal(__func__, "out of memory allocating the in-memory FM index (ref_seq_len=%lld)",
+                  (long long)ref_seq_len);
+}
+
+void MemSink::write(int64_t off, const void* src, size_t n, const char*)
+{
+    const int64_t end = off + (int64_t)n;
+    auto into = [&](int64_t sec_off, int64_t sec_end, void* dst) {
+        if (off < sec_off || off >= sec_end) return false;
+        xassert(end <= sec_end, "MemSink: write straddles a section boundary");
+        memcpy((uint8_t*)dst + (off - sec_off), src, n);
+        return true;
+    };
+    const int64_t off_count = (int64_t)sizeof(int64_t);
+    if (into(0, off_count, &out_->ref_seq_len)) return;
+    if (into(off_count, FMI_BWT2BIT_HDR_BYTES, out_->count)) return;
+    if (into(L_.off_cp_occ, L_.off_ms_byte, out_->cp_occ)) return;
+    if (into(L_.off_ms_byte, L_.off_ls_word, out_->sa_ms_byte)) return;
+    if (into(L_.off_ls_word, L_.off_sentinel, out_->sa_ls_word)) return;
+    if (into(L_.off_sentinel, L_.off_sa_compx_tag, &out_->sentinel_index)) return;
+    if (off >= L_.off_sa_compx_tag && off < L_.total_bytes) {
+        xassert(end <= L_.total_bytes, "MemSink: write straddles a section boundary");
+        xassert(n == sizeof(int64_t), "MemSink: bad sa_compx tag write");
+        int64_t v;
+        memcpy(&v, src, sizeof v);
+        out_->sa_compx = (int)v;
+        return;
+    }
+    xassert(0, "MemSink: write outside every section");
 }
 
 void rewrite_fm_index_resampled_sa(const char* out_path,

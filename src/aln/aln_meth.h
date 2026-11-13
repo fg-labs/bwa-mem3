@@ -43,6 +43,10 @@ struct aln_meth_ref_t {
 	const struct ks_sites_t *known_snvs = nullptr; // --known-snvs sites (null without); not owned
 };
 int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads);
+/* Takes ownership of an in-memory original reference (bns, pac) and checks it pairs with
+ * conv_bns exactly as aln_meth_ref_load does. Returns 0, or -1 with the same error (the reference
+ * is freed). */
+int aln_meth_ref_adopt(aln_meth_ref_t *r, bntseq_t *orig_bns, uint8_t *orig_pac, const bntseq_t *conv_bns);
 void aln_meth_ref_free(aln_meth_ref_t *r);
 
 /* Reject user @SQ records before any output/index work; returns 0 or -1 with an error. */

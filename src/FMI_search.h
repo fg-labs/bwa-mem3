@@ -213,6 +213,8 @@ void ks_dedup_configure(const char *mode_arg);
  * coordinates. */
 void ks_dedup_position_counts(uint64_t *total, uint64_t *distinct);
 
+struct FmArrays;   /* fm_index_writer.h */
+
 class FMI_search: public indexEle
 {
     public:
@@ -269,6 +271,14 @@ class FMI_search: public indexEle
      * destructor munmaps `base` and leaves the aliased buffers untouched.
      * Builds no seed jump table: load_index builds it after the attach. */
     void load_index_from_shm(uint8_t *base, size_t len);
+
+    /* Takes ownership of `arrays`' three buffers (nulls them) and of `bns`/`pac` (freed by
+     * ~indexEle as for a disk load). `pac` may be NULL (BNS only, the state
+     * load_index(false, ...) leaves). Sets reference_seq_len, count[] (+1, with the same xassert
+     * range checks as load_index), sentinel_index, sa_compx, sa_compx_mask; builds the seed jump
+     * table when asked. No file access. */
+    void adopt_built(FmArrays *arrays, bntseq_t *bns, uint8_t *pac, int n_threads,
+                     bool build_seed_jump = true);
 
     /* Densify the SA sample table on the fly: given an existing FM-index's
      * checkpoint-occ block, C[] array, and SA samples taken at stride
@@ -528,6 +538,11 @@ private:
         static int64_t seed_jump_level_off(int L) { return (((int64_t)1 << (2 * L)) - 4) / 3; }
         static inline void seed_jump_prefetch(const SeedJumpEntry *e);
         void build_seed_jump_table(int n_threads);
+
+        /* Validate raw count[], apply the +1 adjustment, re-validate; and validate
+         * sentinel_index. Shared by load_index and adopt_built. */
+        void check_and_adjust_counts();
+        void check_sentinel_index();
         void seed_jump_children(int L, int64_t first, int64_t n);
         static void *seed_jump_worker(void *arg);
 

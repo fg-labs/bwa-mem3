@@ -54,6 +54,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "smem_parked.h"
 #include "profiling.h"
 #include "libsais_build.h"
+#include "fm_index_writer.h"
 
 /*
  * Parallel index load.
@@ -881,6 +882,91 @@ int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
+/* Validate the raw count[] (as read from disk or built in memory) and apply the +1
+ * adjustment, then re-validate. Shared by load_index and adopt_built. */
+void FMI_search::check_and_adjust_counts()
+{
+    int64_t ii = 0;
+    // Validate the RAW on-disk count[] before the +1 adjustment below. Doing the
+    // bounds/monotonicity checks on the raw values (rather than after +1) is what
+    // makes this overflow-safe: a corrupt count[ii] == INT64_MAX would trigger
+    // signed-overflow UB in `count[ii] + 1` before any post-adjustment check
+    // could fail closed. On disk count[] is the cumulative C[] array of the
+    // reference, so a valid raw entry lies in [0, reference_seq_len]; the shm
+    // producer (bwa_shm_compute) applies the same +1 and load_index_from_shm
+    // then validates the adjusted [1, ref_seq_len+1] range.
+    for (ii = 0; ii < 5; ii++) {
+        // A raw count[ii] outside [0, ref_seq_len] (e.g. a disk -1, or a value
+        // exceeding the reference length) drives smem.k out of cp_occ on the
+        // first backwardExt once adjusted.
+        xassert(count[ii] >= 0 && count[ii] <= reference_seq_len,
+                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
+        // count[] is the cumulative C[] array, so it must be non-decreasing; a
+        // non-monotone pair yields a negative smem.s (interval width) downstream.
+        // The +1 is applied uniformly, so raw monotonicity == adjusted monotonicity.
+        xassert(ii == 0 || count[ii] >= count[ii - 1],
+                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
+    }
+    for(ii = 0; ii < 5; ii++)// update read count structure
+    {
+        count[ii] = count[ii] + 1;
+    }
+    // Validate count[] (post +1-adjustment, range [1, ref_seq_len+1]) as
+    // load_index_from_shm does; a count[a] exceeding the reference length drives
+    // smem.k out of cp_occ on the first backwardExt.
+    for (ii = 0; ii < 5; ii++) {
+        // Lower bound is 1, not 0: the +1 adjustment above is applied before
+        // this check (load_index_from_shm instead validates the raw disk value
+        // in [0, ref_seq_len] and adjusts after), so a disk count[ii] == -1
+        // becomes 0 here and would slip past a >= 0 test -- leaving the disk
+        // loader open to an invalid FM interval that the shm producer rejects.
+        xassert(count[ii] >= 1 && count[ii] <= reference_seq_len + 1,
+                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
+        // count[] is the cumulative C[] array, so it must be non-decreasing; a
+        // non-monotone pair yields a negative smem.s (interval width) downstream.
+        xassert(ii == 0 || count[ii] >= count[ii - 1],
+                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
+    }
+}
+
+/* Fail closed on an out-of-range sentinel_index. Shared by load_index and adopt_built. */
+void FMI_search::check_sentinel_index()
+{
+    xassert(sentinel_index >= 0 && sentinel_index < reference_seq_len,
+            "FMI index: sentinel_index out of bounds (corrupt .bwt.2bit.64?)");
+}
+
+void FMI_search::adopt_built(FmArrays *arrays, bntseq_t *bns, uint8_t *pac, int n_threads,
+                             bool build_seed_jump)
+{
+    xassert(arrays != NULL && arrays->cp_occ != NULL && arrays->sa_ms_byte != NULL
+            && arrays->sa_ls_word != NULL, "adopt_built: arrays are empty");
+    xassert(bns != NULL, "adopt_built: bns is NULL");
+    xassert(cp_occ == NULL && sa_ms_byte == NULL && sa_ls_word == NULL && shm_base == NULL
+            && idx->bns == NULL && idx->pac == NULL, "adopt_built: index already loaded");
+    xassert(arrays->sa_compx >= 0 && arrays->sa_compx <= CP_SHIFT,
+            "adopt_built: sa_compx out of range");
+
+    reference_seq_len = arrays->ref_seq_len;
+    xassert(reference_seq_len > 0 && reference_seq_len <= 0x7fffffffffLL,
+            "FMI index: reference_seq_len out of bounds");
+    sa_compx      = arrays->sa_compx;
+    sa_compx_mask = (1LL << sa_compx) - 1;
+    for (int i = 0; i < 5; i++) count[i] = arrays->count[i];
+    check_and_adjust_counts();
+    sentinel_index = arrays->sentinel_index;
+    check_sentinel_index();
+
+    cp_occ     = arrays->cp_occ;      arrays->cp_occ = NULL;
+    sa_ms_byte = arrays->sa_ms_byte;  arrays->sa_ms_byte = NULL;
+    sa_ls_word = arrays->sa_ls_word;  arrays->sa_ls_word = NULL;
+
+    idx->bns = bns;
+    idx->pac = pac;
+
+    if (build_seed_jump) build_seed_jump_table(index_load_threads(n_threads));
+}
+
 void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                             bwamem_hugetlb_mode_t huge_pages)
 {
@@ -1002,47 +1088,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
 
     fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes,
                           cp_occ_huge.base != NULL ? huge_load_nt : load_nt);
-    int64_t ii = 0;
-    // Validate the RAW on-disk count[] before the +1 adjustment below. Doing the
-    // bounds/monotonicity checks on the raw values (rather than after +1) is what
-    // makes this overflow-safe: a corrupt count[ii] == INT64_MAX would trigger
-    // signed-overflow UB in `count[ii] + 1` before any post-adjustment check
-    // could fail closed. On disk count[] is the cumulative C[] array of the
-    // reference, so a valid raw entry lies in [0, reference_seq_len]; the shm
-    // producer (bwa_shm_compute) applies the same +1 and load_index_from_shm
-    // then validates the adjusted [1, ref_seq_len+1] range.
-    for (ii = 0; ii < 5; ii++) {
-        // A raw count[ii] outside [0, ref_seq_len] (e.g. a disk -1, or a value
-        // exceeding the reference length) drives smem.k out of cp_occ on the
-        // first backwardExt once adjusted.
-        xassert(count[ii] >= 0 && count[ii] <= reference_seq_len,
-                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
-        // count[] is the cumulative C[] array, so it must be non-decreasing; a
-        // non-monotone pair yields a negative smem.s (interval width) downstream.
-        // The +1 is applied uniformly, so raw monotonicity == adjusted monotonicity.
-        xassert(ii == 0 || count[ii] >= count[ii - 1],
-                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
-    }
-    for(ii = 0; ii < 5; ii++)// update read count structure
-    {
-        count[ii] = count[ii] + 1;
-    }
-    // Validate count[] (post +1-adjustment, range [1, ref_seq_len+1]) as
-    // load_index_from_shm does; a count[a] exceeding the reference length drives
-    // smem.k out of cp_occ on the first backwardExt.
-    for (ii = 0; ii < 5; ii++) {
-        // Lower bound is 1, not 0: the +1 adjustment above is applied before
-        // this check (load_index_from_shm instead validates the raw disk value
-        // in [0, ref_seq_len] and adjusts after), so a disk count[ii] == -1
-        // becomes 0 here and would slip past a >= 0 test -- leaving the disk
-        // loader open to an invalid FM interval that the shm producer rejects.
-        xassert(count[ii] >= 1 && count[ii] <= reference_seq_len + 1,
-                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
-        // count[] is the cumulative C[] array, so it must be non-decreasing; a
-        // non-monotone pair yields a negative smem.s (interval width) downstream.
-        xassert(ii == 0 || count[ii] >= count[ii - 1],
-                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
-    }
+    check_and_adjust_counts();
 
     // Suffix-array sample arrays: one entry per sampled row (every row when
     // the SA is not compressed).
@@ -1067,8 +1113,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     sentinel_index = -1;
     #if SA_COMPRESSION
     err_fread_noeof(&sentinel_index, sizeof(int64_t), 1, cpstream);
-    xassert(sentinel_index >= 0 && sentinel_index < reference_seq_len,
-            "FMI index: sentinel_index out of bounds (corrupt .bwt.2bit.64?)");
+    check_sentinel_index();
     fprintf(stderr, "* sentinel-index: %lld\n", (long long)sentinel_index);
     #endif
     fclose(cpstream);

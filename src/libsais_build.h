@@ -1,7 +1,13 @@
 #ifndef BWA_LIBSAIS_BUILD_H
 #define BWA_LIBSAIS_BUILD_H
 
+#include "fm_index_writer.h"
+#include "packed_text.h"
+
+#include <chrono>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
 
 struct LibsaisBuildOpts {
@@ -25,6 +31,16 @@ struct LibsaisBuildOpts {
      * wired up by the caller in bwtindex.cpp, not here. */
     int         sa_compx           = 3;
 };
+
+// Forward text `fwd` (l_pac bases) followed by its reverse complement, 2-bit
+// packed into (2*l_pac+3)/4 bytes: exactly the packed bytes write_doubled_pac
+// writes. Parallelised over output bytes with `num_threads` OpenMP threads.
+std::unique_ptr<uint8_t[]> pack_doubled(const PackedText& fwd, int64_t l_pac, int num_threads);
+
+// Write `pack_doubled` of the forward .pac at `fwd_pac_path` to `out_path` in
+// the on-disk .pac format (packed bytes, pad byte when 2*l_pac % 4 == 0, count byte).
+void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
+                       const char* out_path, int num_threads);
 
 // True when a doubled text of length `N` forces libsais's 64-bit SA path,
 // which doubles the per-suffix cost.
@@ -54,5 +70,22 @@ void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,
 // `<prefix>.0123`), byte-identical to the historical sais-lite-based build.
 int libsais_build_fm_index(const char* prefix, int64_t pac_len,
                            const LibsaisBuildOpts& opts);
+
+// Shared core of every build: phases 1-3 (unpack the doubled text `doubled`, libsais GSA,
+// streaming FM-index write) over N = doubled.length() bases, T threads, `count` = the
+// compute_counts() histogram of the text. The caller does the budget check and thread
+// resolution beforehand. `open_sink` is called once, after the GSA is built, and returns the
+// sink the index is written through; deferring it means a failure in phase 1 or 2 has
+// created nothing (e.g. no partial .tmp file). `t_start` is when the caller's build began; the
+// phase-3 "total" is measured from it. Returns 0; other failures are fatal.
+int libsais_build_fm_core(const PackedText& doubled, const LibsaisBuildOpts& opts,
+                          const int64_t count[5], int T,
+                          std::chrono::steady_clock::time_point t_start,
+                          const std::function<FmSink&()>& open_sink);
+
+// In-memory build of a forward-only 2-bit text (l_pac bases): pack_doubled + core + MemSink.
+// Uses no temp dir and no files. Returns 0 on success, 3 on a budget shortfall.
+int libsais_build_fm_memory(const uint8_t* fwd_pac, int64_t l_pac, const LibsaisBuildOpts& opts,
+                            FmArrays* out);
 
 #endif

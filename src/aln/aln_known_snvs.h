@@ -54,11 +54,10 @@ struct ks_window_t {
 	uint8_t alt;
 };
 
-/* The ALT windows of a site set and their FM-index, built into a private temporary directory that
- * is removed when the windows are freed. Window i is contig i of the index. */
+/* The ALT windows of a site set and their FM-index, built and held entirely in memory (no files,
+ * no temporary directory). Window i is contig i of the index. */
 struct ks_windows_t {
 	std::vector<ks_window_t> win;
-	std::string dir;                     // the temporary directory (empty once removed)
 	::FMI_search *fmi = nullptr;
 	bwt_t *bwt = nullptr;
 	const bntseq_t *bns = nullptr;       // the window index's contigs (one per window)
@@ -66,9 +65,22 @@ struct ks_windows_t {
 };
 
 /* Builds one window per site allele from `pac` (its stored bases, so N runs carry the main index's
- * fill) and indexes them. Returns 0, or -1 with an error on stderr. */
+ * fill) and indexes them in memory: the windows as a forward-only reference (ks_windows_ref), the
+ * FM-index from libsais, adopted by an FMI_search. Under `meth` the FM-index is built over the
+ * converted windows (ks_windows_meth_convert) and `mref` holds the original windows; no
+ * original-alphabet window index is built. Returns 0, or -1 with an error on stderr. */
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
 					 int meth, ks_windows_t *out);
+
+/* The windows as a forward-only reference: bns (one contig `w<i>` per window, no ambiguity
+ * holes, fields as bns_restore gives for today's windows.fa) and pac (l_pac/4+1 bytes, as
+ * bwa_idx_load_ele loads). Caller owns both (bns_destroy / free). */
+void ks_windows_ref(const std::vector<ks_window_t> &win, const bntseq_t *bns, const uint8_t *pac,
+					bntseq_t **out_bns, uint8_t **out_pac);
+/* --meth: per window `r<name>` (G->A) then `f<name>` (C->T), the layout aln_meth_ref_load checks.
+ * Windows only: valid because window text has no ambiguity holes (the 2-bit codes are exact). */
+void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, bntseq_t **conv_bns,
+							 uint8_t **conv_pac);
 
 /* --meth: the candidate windows (original reference, rid = contig) of the hits a read's search on
  * the converted window index found that cover their window's site. */

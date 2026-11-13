@@ -206,7 +206,7 @@ whose contig is not in the reference, or whose REF differs from it, is an error 
 How it works:
 
 - A window of 160 bases either side of each site, with the ALT in place, is indexed when the run
-  starts (in a temporary directory under `$TMPDIR`, removed at exit).
+  starts, in memory, with `-t` threads (no files are written).
 - Each read is also searched against the windows. A hit there that covers its window's site is
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual

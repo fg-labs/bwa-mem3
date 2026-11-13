@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <functional>
 #include <memory>
 #include <new>
 #include <string>
@@ -61,18 +62,18 @@ std::string fmt_bases(int64_t bp) {
 
 using bwa::fmt_bytes;
 
+} // anonymous namespace
+
 // Pack the forward-only .pac (l_pac bases) plus its reverse-complement into
-// a doubled .pac on disk. The sais-lite path built this doubled text in
-// memory via pac2nt; writing it packed lets PackedText / emit_0123 /
+// a doubled 2-bit buffer of (2*l_pac+3)/4 bytes. The sais-lite path built this
+// doubled text in memory via pac2nt; packing it lets PackedText / emit_0123 /
 // compute_counts consume both strands without another ASCII round-trip.
 // Parallelises by striping output bytes: each thread fills a disjoint
 // [byte_start, byte_end) range of the output buffer, so there's no
 // aliasing at the forward/reverse-complement seam even when l_pac isn't
 // a multiple of 4.
-void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
-                       const char* out_path, int num_threads)
+std::unique_ptr<uint8_t[]> pack_doubled(const PackedText& fwd, int64_t l_pac, int num_threads)
 {
-    PackedText fwd(fwd_pac_path, l_pac);
     int64_t doubled = 2 * l_pac;
     int64_t nbytes  = (doubled + 3) / 4;
     // Default-init via new[]: every byte is unconditionally overwritten in
@@ -104,6 +105,19 @@ void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
         }
         buf[(size_t)by] = b;
     }
+    return buf;
+}
+
+// Write the doubled .pac (forward + reverse complement) to `out_path` in the
+// on-disk .pac format: packed bytes, a pad byte when the base count is a
+// multiple of 4, then the count byte.
+void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
+                       const char* out_path, int num_threads)
+{
+    PackedText fwd(fwd_pac_path, l_pac);
+    int64_t doubled = 2 * l_pac;
+    int64_t nbytes  = (doubled + 3) / 4;
+    std::unique_ptr<uint8_t[]> buf = pack_doubled(fwd, l_pac, num_threads);
 
     int fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (fd < 0) err_fatal(__func__, "open('%s'): %s", out_path, strerror(errno));
@@ -124,6 +138,8 @@ void write_doubled_pac(const char* fwd_pac_path, int64_t l_pac,
     if (close(fd) != 0)
         err_fatal(__func__, "close('%s'): %s", out_path, strerror(errno));
 }
+
+namespace {
 
 std::string resolve_tmpdir(const LibsaisBuildOpts& opts) {
     if (!opts.tmpdir.empty()) return opts.tmpdir;
@@ -203,82 +219,51 @@ void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,
                 suggest_n, suggest_sfx);
 }
 
-int libsais_build_fm_index(const char* prefix, int64_t pac_len,
-                           const LibsaisBuildOpts& opts)
+namespace {
+
+// Cap effective parallelism at (N+1) / 16 Mbp. On tiny inputs the OMP
+// pool spin-up + per-thread heap arenas cost more than the parallel
+// work saves, which breaks the --max-memory contract on small fixtures.
+int effective_threads(int64_t N, int T_user)
 {
-    int     T_user = opts.num_threads > 0 ? opts.num_threads : 1;
-    int64_t N = pac_len;   // doubled-text length
-    int64_t l_pac = N / 2;
-
-    // Cap effective parallelism at (N+1) / 16 Mbp. On tiny inputs the OMP
-    // pool spin-up + per-thread heap arenas cost more than the parallel
-    // work saves, which breaks the --max-memory contract on small fixtures.
     constexpr int64_t kMinBasesPerThread = 16LL << 20;
-    int T = (int)std::min<int64_t>(T_user,
-                                   std::max<int64_t>(1, (N + 1) / kMinBasesPerThread));
+    return (int)std::min<int64_t>(T_user,
+                                  std::max<int64_t>(1, (N + 1) / kMinBasesPerThread));
+}
 
-    auto t0 = clock_t_::now();
+// Resolves the effective thread count into *T, prints the header + estimate
+// lines and enforces the memory budget. Returns 0, or 3 on a shortfall (after
+// reporting it). Shared by every build entry point so they behave alike.
+int begin_build(int64_t N, const LibsaisBuildOpts& opts, int* T_out)
+{
+    const int T_user = opts.num_threads > 0 ? opts.num_threads : 1;
+    const int T      = effective_threads(N, T_user);
+    *T_out = T;
     std::fprintf(stderr, "[libsais_build] N=%lld threads=%d (user-requested=%d)\n",
             (long long)N, T, T_user);
-
-    const bool    use_int64_sa = libsais_sa_is_64bit(N);
-    const int64_t est_bytes    = libsais_estimate_peak_bytes(N);
+    const int64_t est_bytes = libsais_estimate_peak_bytes(N);
     if (opts.max_memory_bytes > 0 && est_bytes > opts.max_memory_bytes) {
         libsais_report_budget_shortfall("libsais", est_bytes, opts.max_memory_bytes,
-                                        opts.max_memory_user_specified, l_pac);
+                                        opts.max_memory_user_specified, N / 2);
         return 3;
     }
     std::fprintf(stderr, "[libsais_build] estimate ~%s (budget %s)\n",
             fmt_bytes(est_bytes).c_str(),
             opts.max_memory_bytes > 0 ? fmt_bytes(opts.max_memory_bytes).c_str() : "unset");
+    return 0;
+}
 
-    // Phase 0: materialise a doubled .pac so downstream helpers can mmap it
-    // via PackedText. bns_fasta2bntseq writes forward-only; we append the
-    // RC half in a scratch temp file.
-    std::string tmp_base = resolve_tmpdir(opts);
-    char workdir[PATH_MAX];
-    std::snprintf(workdir, sizeof(workdir), "%s/bwa_libsais_XXXXXX", tmp_base.c_str());
-    if (!mkdtemp(workdir))
-        err_fatal(__func__, "mkdtemp under '%s' failed: %s",
-                  tmp_base.c_str(), strerror(errno));
-    std::string doubled_pac = std::string(workdir) + "/doubled.pac";
-    // RAII guard so the workdir + doubled.pac are removed on every exit
-    // path, including the err_fatal calls below. err_fatal calls exit(),
-    // so we also wire an atexit hook for non-stack-unwinding paths.
-    struct TmpGuard {
-        std::string dir;
-        std::string pac;
-        static TmpGuard*& current() { static TmpGuard* g = nullptr; return g; }
-        static void atexit_cleanup() {
-            if (auto* g = current()) g->cleanup();
-        }
-        void cleanup() {
-            if (!pac.empty()) { ::unlink(pac.c_str()); pac.clear(); }
-            if (!dir.empty()) { ::rmdir(dir.c_str());  dir.clear(); }
-        }
-        ~TmpGuard() { cleanup(); current() = nullptr; }
-    } tmp_guard{workdir, doubled_pac};
-    TmpGuard::current() = &tmp_guard;
-    std::atexit(&TmpGuard::atexit_cleanup);
+} // namespace
 
-    write_doubled_pac((std::string(prefix) + ".pac").c_str(), l_pac,
-                      doubled_pac.c_str(), T);
-
-    PackedText pac(doubled_pac.c_str(), N);
-
-    /* D3 --meth seed index passes emit_unpacked_ref=false: the seed `.0123` is
-     * never read at runtime (extension uses the original reference), so skip
-     * the ~13 GB write. The FM build below uses `pac`, not the `.0123` file. */
-    if (opts.emit_unpacked_ref) {
-        if (emit_0123(pac, prefix, T) != 0)
-            err_fatal(__func__, "emit_0123 failed");
-    }
-
-    int64_t count[5] = {0};
-    compute_counts(pac, count, T);
-    std::fprintf(stderr, "[libsais_build] phase 0 (doubled-pac%s + count) %.2fs\n",
-            opts.emit_unpacked_ref ? " + .0123" : "", elapsed_since(t0));
-
+// Phases 1-3: unpack, libsais GSA, streaming FM-index write. The sink is opened
+// only once the GSA is built, so a failure in phase 1 or 2 leaves nothing behind.
+int libsais_build_fm_core(const PackedText& pac, const LibsaisBuildOpts& opts,
+                          const int64_t count[5], int T,
+                          std::chrono::steady_clock::time_point t0,
+                          const std::function<FmSink&()>& open_sink)
+{
+    const int64_t N = pac.length();
+    const bool use_int64_sa = libsais_sa_is_64bit(N);
     // Phase 1: unpack .pac into a libsais-ready byte buffer. Alphabet is
     // {0=$, 1..4=ACGT}; the trailing 0 at index N is the GSA terminator.
     auto t1 = clock_t_::now();
@@ -286,8 +271,9 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
     // buf[N] is set explicitly to the GSA terminator below, so the
     // value-init zero-fill std::vector<uint8_t>(N+1) performed was a wasted
     // ~6.2 GiB write on a doubled-human input.
-    // new (nothrow) + err_fatal: OOM here must run the TmpGuard cleanup (see
-    // below), which a throwing new[] -> std::terminate would skip.
+    // new (nothrow) + err_fatal: OOM here must run the file path's TmpGuard
+    // cleanup (libsais_build_fm_index), which a throwing new[] -> std::terminate
+    // would skip.
     std::unique_ptr<uint8_t[]> buf(new (std::nothrow) uint8_t[(size_t)(N + 1)]);
     if (!buf) err_fatal(__func__, "out of memory: %lld bytes for the SAIS input buffer", (long long)(N + 1));
     // Capture out-of-range bases without crashing inside the OpenMP region:
@@ -346,7 +332,7 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
     // Phase 3: streaming FM-index writer reads BWT bytes and SA samples
     // in flight from sa + buf; no bwt[] or samples[] is materialised.
     auto t3 = clock_t_::now();
-    std::string bwt_path = std::string(prefix) + ".bwt.2bit.64";
+    FmSink& sink = open_sink();
     int64_t sentinel_index = -1;
     // Drive the dispatch off the explicit width flag rather than
     // checking which unique_ptr is non-null; the latter is correct today
@@ -356,7 +342,7 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
         ? (const void*)sa64.get()
         : (const void*)sa32.get();
     write_fm_index_streaming(
-        bwt_path.c_str(), buf_ptr,
+        sink, buf_ptr,
         sa_ptr,
         /*sa_is_64bit=*/use_int64_sa,
         N, count, &sentinel_index, opts.sa_compx, T);
@@ -364,5 +350,95 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
             "[libsais_build] phase 3 (streaming FM-index write) %.2fs, sentinel_index=%lld; total %.2fs\n",
             elapsed_since(t3), (long long)sentinel_index, elapsed_since(t0));
 
+    return 0;
+}
+
+int libsais_build_fm_memory(const uint8_t* fwd_pac, int64_t l_pac, const LibsaisBuildOpts& opts,
+                            FmArrays* out)
+{
+    const int64_t N = 2 * l_pac;
+    int T = 1;
+    auto t0 = clock_t_::now();
+    // Budget first, so a refused build allocates nothing.
+    if (int rc = begin_build(N, opts, &T)) return rc;
+    PackedText fwd(fwd_pac, l_pac);
+    std::unique_ptr<uint8_t[]> dbl = pack_doubled(fwd, l_pac, T);
+    PackedText pac(dbl.get(), N);
+    int64_t count[5] = {0};
+    compute_counts(pac, count, T);
+    std::unique_ptr<MemSink> sink;
+    return libsais_build_fm_core(pac, opts, count, T, t0, [&]() -> FmSink& {
+        sink.reset(new MemSink(N + 1, opts.sa_compx, out));
+        return *sink;
+    });
+}
+
+int libsais_build_fm_index(const char* prefix, int64_t pac_len,
+                           const LibsaisBuildOpts& opts)
+{
+    const int64_t N      = pac_len;   // doubled-text length
+    const int64_t l_pac  = N / 2;
+    int T = 1;
+
+    auto t0 = clock_t_::now();
+    if (int rc = begin_build(N, opts, &T)) return rc;
+
+    // Phase 0: materialise a doubled .pac so downstream helpers can mmap it
+    // via PackedText. bns_fasta2bntseq writes forward-only; we append the
+    // RC half in a scratch temp file.
+    std::string tmp_base = resolve_tmpdir(opts);
+    char workdir[PATH_MAX];
+    std::snprintf(workdir, sizeof(workdir), "%s/bwa_libsais_XXXXXX", tmp_base.c_str());
+    if (!mkdtemp(workdir))
+        err_fatal(__func__, "mkdtemp under '%s' failed: %s",
+                  tmp_base.c_str(), strerror(errno));
+    std::string doubled_pac = std::string(workdir) + "/doubled.pac";
+    // RAII guard so the workdir + doubled.pac are removed on every exit
+    // path, including the err_fatal calls below. err_fatal calls exit(),
+    // so we also wire an atexit hook for non-stack-unwinding paths.
+    struct TmpGuard {
+        std::string dir;
+        std::string pac;
+        static TmpGuard*& current() { static TmpGuard* g = nullptr; return g; }
+        static void atexit_cleanup() {
+            if (auto* g = current()) g->cleanup();
+        }
+        void cleanup() {
+            if (!pac.empty()) { ::unlink(pac.c_str()); pac.clear(); }
+            if (!dir.empty()) { ::rmdir(dir.c_str());  dir.clear(); }
+        }
+        ~TmpGuard() { cleanup(); current() = nullptr; }
+    } tmp_guard{workdir, doubled_pac};
+    TmpGuard::current() = &tmp_guard;
+    std::atexit(&TmpGuard::atexit_cleanup);
+
+    write_doubled_pac((std::string(prefix) + ".pac").c_str(), l_pac,
+                      doubled_pac.c_str(), T);
+
+    PackedText pac(doubled_pac.c_str(), N);
+
+    /* D3 --meth seed index passes emit_unpacked_ref=false: the seed `.0123` is
+     * never read at runtime (extension uses the original reference), so skip
+     * the ~13 GB write. The FM build below uses `pac`, not the `.0123` file. */
+    if (opts.emit_unpacked_ref) {
+        if (emit_0123(pac, prefix, T) != 0)
+            err_fatal(__func__, "emit_0123 failed");
+    }
+
+    int64_t count[5] = {0};
+    compute_counts(pac, count, T);
+    std::fprintf(stderr, "[libsais_build] phase 0 (doubled-pac%s + count) %.2fs\n",
+            opts.emit_unpacked_ref ? " + .0123" : "", elapsed_since(t0));
+
+    const std::string bwt_path = std::string(prefix) + ".bwt.2bit.64";
+    // The .tmp is created only once the GSA is built (see libsais_build_fm_core),
+    // so a failure before phase 3 leaves no partial index behind.
+    std::unique_ptr<FileFmSink> sink;
+    int rc = libsais_build_fm_core(pac, opts, count, T, t0, [&]() -> FmSink& {
+        sink.reset(new FileFmSink(bwt_path.c_str(), N + 1, opts.sa_compx));
+        return *sink;
+    });
+    if (rc != 0) return rc;
+    sink->commit();
     return 0;
 }

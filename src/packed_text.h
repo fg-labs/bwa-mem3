@@ -17,6 +17,12 @@ public:
     PackedText(const std::string& pac_path, int64_t n_bases);
     ~PackedText();
 
+    // Non-owning view over `n_bases` bases already in memory in the same
+    // layout. The caller keeps `data` alive for the view's lifetime; the
+    // destructor unmaps and closes nothing. `data` must hold at least
+    // ceil(n_bases / 4) bytes.
+    PackedText(const uint8_t* data, int64_t n_bases) : data_(data), n_(n_bases) {}
+
     PackedText(const PackedText&) = delete;
     PackedText& operator=(const PackedText&) = delete;
 
@@ -36,7 +42,7 @@ public:
     uint64_t get_kmer(int64_t pos, int k) const;
 
 private:
-    int     fd_ = -1;
+    int     fd_ = -1;       // -1 and map_bytes_ == 0 for a non-owning view
     size_t  map_bytes_ = 0;
     const uint8_t* data_ = nullptr;
     int64_t n_ = 0;

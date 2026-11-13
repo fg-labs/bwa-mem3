@@ -1,7 +1,9 @@
 #ifndef BWA_FM_INDEX_WRITER_H
 #define BWA_FM_INDEX_WRITER_H
 
+#include <cstddef>
 #include <cstdint>
+#include <string>
 
 #include "fmi_seed_api.h"   // CP_OCC, CP_SHIFT
 
@@ -28,6 +30,57 @@ struct Bwt2bitLayout {
 // Compute the section offsets for `ref_seq_len` at SA sample-rate shift
 // `sa_compx`. Pure arithmetic, no I/O. `sa_compx` must be in [0, CP_SHIFT].
 Bwt2bitLayout fmi_bwt2bit_layout(int64_t ref_seq_len, int sa_compx);
+
+// Destination for the bytes of a .bwt.2bit.64 image. The writer calls write()
+// with the file offset each byte range would occupy, from several threads at
+// once, always to disjoint ranges. The file sink pwrites them; MemSink routes
+// them into in-memory arrays.
+struct FmSink {
+    virtual ~FmSink() = default;
+    virtual void write(int64_t off, const void* src, size_t n, const char* what) = 0;
+};
+
+// The built index as load_index would hold it before the +1 count adjustment.
+struct FmArrays {
+    int64_t ref_seq_len = 0;            // N + 1
+    int64_t count[5] = {0};             // raw, as on disk
+    int64_t sentinel_index = -1;
+    int     sa_compx = 0;
+    CP_OCC*   cp_occ = nullptr;         // _mm_malloc(..., 64); cp_occ_count entries
+    int8_t*   sa_ms_byte = nullptr;     // _mm_malloc(..., 64); sa_sample_count entries
+    uint32_t* sa_ls_word = nullptr;     // _mm_malloc(..., 64); sa_sample_count entries
+    ~FmArrays();                        // _mm_free each non-null
+    FmArrays() = default;
+    FmArrays(const FmArrays&) = delete;
+    FmArrays& operator=(const FmArrays&) = delete;
+};
+
+// Fatal on a reference length or sa_compx the on-disk layout cannot represent. Sinks call it
+// before opening, sizing or allocating anything, so a bad argument leaves nothing behind.
+void check_streaming_args(const char* fn, int64_t ref_seq_len, int sa_compx);
+
+// pwrites each range into `<out_path>.tmp`, pre-sized for the layout; commit()
+// closes it and renames it over `out_path` (atomic publish).
+struct FileFmSink : FmSink {
+    FileFmSink(const char* out_path, int64_t ref_seq_len, int sa_compx);
+    void write(int64_t off, const void* src, size_t n, const char* what) override;
+    void commit();
+    FileFmSink(const FileFmSink&) = delete;
+    FileFmSink& operator=(const FileFmSink&) = delete;
+private:
+    std::string out_path_, tmp_path_;
+    int fd_ = -1;
+};
+
+// Routes writes by Bwt2bitLayout offsets into FmArrays. Each write must lie
+// inside a single section (a straddling write is a writer bug and is fatal).
+struct MemSink : FmSink {
+    MemSink(int64_t ref_seq_len, int sa_compx, FmArrays* out);   // allocates the three arrays
+    void write(int64_t off, const void* src, size_t n, const char* what) override;
+private:
+    Bwt2bitLayout L_;
+    FmArrays* out_;
+};
 
 // Write a bwa-mem2 .bwt.2bit.64 FM index directly from the libsais GSA
 // output, without materialising the full BWT byte array or the dense
@@ -75,6 +128,18 @@ Bwt2bitLayout fmi_bwt2bit_layout(int64_t ref_seq_len, int sa_compx);
 // (libsais_build_fm_index, after `libsais_gsa_omp` has joined) satisfies
 // this; future callers must too.
 void write_fm_index_streaming(const char* out_path,
+                              const uint8_t* buf,
+                              const void* sa,
+                              bool sa_is_64bit,
+                              int64_t pac_len,
+                              const int64_t count[5],
+                              int64_t* out_sentinel_index,
+                              int sa_compx,
+                              int num_threads = 1);
+
+// Same as above, but every byte goes to `sink` (at the offset it would have in
+// the file) instead of a file. Same validation, striping, and threading contract.
+void write_fm_index_streaming(FmSink& sink,
                               const uint8_t* buf,
                               const void* sa,
                               bool sa_is_64bit,
