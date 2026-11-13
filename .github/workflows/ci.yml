@@ -2600,8 +2600,15 @@ jobs:
       - name: Install dependencies
         uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
         with:
-          packages: zlib1g-dev libdeflate-dev autoconf automake gcovr ccache
+          packages: zlib1g-dev libdeflate-dev autoconf automake ccache
           version: 1.0
+
+      # gcovr comes from PyPI at a pinned version, not apt: the runner's apt
+      # gcovr (7.0) cannot parse gcov block lines for source lines >= 10000,
+      # where gcov drops the separating space (`%%%%%:10000-block  0`), and
+      # exits with UnknownLineType. 7.2 parses them.
+      - name: Install gcovr
+        run: pipx install 'gcovr==7.2'
 
       # Coverage builds through ccache too: it caches the .gcno notes file with
       # the object, and the checkout path (which gcov records) is the same on
