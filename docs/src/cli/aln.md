@@ -429,8 +429,9 @@ piece when `-n` is even, so that the allowances plus one sum to `-n` + 1: any al
 allowance is found on the converted index, and the read's alignments around each are bounded by a
 banded edit distance on the index text. When none can be within `-n`,
 the search ends with no hit, where the full search would also end with none; otherwise, or past
-4,096 candidate rows, it searches as usual. The ALT-window search of `--known-snvs` is not
-checked this way.
+4,096 candidate rows, it searches as usual. A read whose search then makes 200,000 index
+expansions without finding a hit is checked once more the same way, with a cap of 16,384 candidate
+rows. The ALT-window search of `--known-snvs` is not checked this way.
 
 **Path cost.** Each row is scored on the original reference along the search path that
 found it, as stock aln scores a hit by its path: the path's alignment (its gaps where the

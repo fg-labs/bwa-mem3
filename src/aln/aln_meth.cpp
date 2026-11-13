@@ -280,6 +280,23 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     for (const auto &o : x->res->occ) n += o.cost == x->best && (!conv || o.n_conv == fewest);
     return n > opt.max_top2;
 }
+// The second proof (aln_meth_prove_nohit2): after this many Occ4 expansions with no hit, with these
+// caps (candidate rows, piece-search lookups). Measured on EM-seq pairs: 200k expansions and 16k rows.
+enum : int64_t { ALN_METH_P2_STEPS = 200000, ALN_METH_P2_ROWS = 16384, ALN_METH_P2_NODES = 1 << 20 };
+// Out of line: called from the search kernel at most once per read, after its search has made
+// prove2_at expansions without a hit. The same proof as aln_meth_prove_nohit (P proves that no path
+// reaches a hit at all, wherever the search is), with larger caps: only reads whose search is
+// already long pay for them.
+__attribute__((noinline)) int aln_meth_prove_nohit2(aln_meth_slot_t *x, const gap_job_t *j)
+{
+    if (x->intervals.size()) return 0; // a hit already
+    // the first proof found a window that may hold an alignment (or a row off the text): so would this
+    if (x->ph.why == ALN_METH_PH_WINDOW || x->ph.why == ALN_METH_PH_NOT_TEXT) return 0;
+    if (j->len < 1 || j->max_diff - j->width[j->len - 1].bid < 1) return 0;
+    long steps = 0, rows = 0;
+    return aln_meth_pigeonhole(x->grp->bwt, *x->grp->ref, j->seq, j->len, j->max_diff, j->width, &x->ph, &steps, &rows,
+                               ALN_METH_P2_ROWS, (long)ALN_METH_P2_NODES);
+}
 // Out of line: called from the search kernel at most once per read.
 __attribute__((noinline)) int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j)
 {
@@ -315,6 +332,9 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
     x->prove = (x->grp->opt->mode & BWA_MODE_GAPE) && !x->grp->ref->no_cut && max_diff >= ALN_METH_PH_MIN_DIFF;
+    x->n_steps = 0;
+    x->ph.why = -1; // no proof tried for this read yet
+    x->prove2_at = x->prove ? (int64_t)ALN_METH_P2_STEPS : INT64_MAX;
     x->flushed_score = -1;
     const gap_opt_t *o = x->grp->opt;
     x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 && !x->grp->ref->known_snvs &&
@@ -443,6 +463,16 @@ static bool layout_cigar(const aln_meth_layout_t &L, int len, std::vector<uint32
     if (q < len) c->push_back((uint32_t)(len - q) << 4);
     return true;
 }
+// Whether layout_cigar(L, len) succeeds, without building the CIGAR.
+static bool layout_ok(const aln_meth_layout_t &L, int len)
+{
+    int q = 0;
+    for (int g = 0; g < L.n; ++g) {
+        if (L.qpos[g] < q || L.len[g] <= 0) return false;
+        q = L.qpos[g] + (L.del[g] ? 0 : L.len[g]);
+    }
+    return q <= len;
+}
 // The layout of a raw CIGAR of M/I/D operations (false: another operation, or too many gaps).
 static bool cigar_layout(const uint32_t *c, size_t n, aln_meth_layout_t *L)
 {
@@ -508,16 +538,22 @@ static const aln_meth_read_bits_t &slot_bits(aln_meth_slot_t *x, int ori)
  * blocks serve the 5-letter model on the reference haplotype; otherwise the window is fetched
  * (with its ALTs, CpG labels) and counted base by base as account_alignment counts. */
 static bool score_path(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, int hyp, int strand, int64_t rb,
-                       int span, int alt, aln_meth_occ_t *o, int *seed_mm)
+                       int span, int alt, aln_meth_occ_t *o, int *seed_mm, bool defer = false)
 {
     aln_meth_group_t *g = x->grp;
     const int len = x->len, ori = strand ? 1 : 0;
     o->rid = rid; o->hyp = hyp; o->strand = strand; o->alt = alt;
     o->alignment.rb = rb; o->alignment.re = rb + span;
-    if (!layout_cigar(L, len, &o->alignment.raw_cigar)) return false;
+    const bool fast = alt == 0 && g->mo->fast.ok;
+    // defer (the bit-parallel blocks only): the CIGARs are left to store_row (materialize_row),
+    // which builds them only for a row it keeps
+    const bool deferred = defer && fast;
+    if (deferred) {
+        if (!layout_ok(L, len)) return false;
+    } else if (!layout_cigar(L, len, &o->alignment.raw_cigar)) return false;
     *seed_mm = 0;
     const bool seeded = x->job && x->job->seed_width;
-    if (alt == 0 && g->mo->fast.ok) {
+    if (fast) {
         const aln_meth_read_bits_t &rd = slot_bits(x, ori);
         aln_meth_amb_bits(*g->ref, rb, span, &x->amb);
         aln_meth_block_counts_t c;
@@ -556,12 +592,21 @@ static bool score_path(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, 
         }
     }
     o->cost = (int64_t)g->opt->s_mm * o->n_mm + (int64_t)g->opt->s_gapo * o->n_gapo + (int64_t)g->opt->s_gape * o->n_gape;
+    if (deferred) return true; // CIGARs and start: materialize_row
     normalize_display(&o->alignment);
     o->pos = o->alignment.rb;
     return true;
 }
+// A deferred row's CIGARs and start, as score_path makes them.
+static void materialize_row(aln_meth_occ_t &o, const aln_meth_layout_t &L, int len)
+{
+    layout_cigar(L, len, &o.alignment.raw_cigar);
+    normalize_display(&o.alignment);
+    o.pos = o.alignment.rb;
+}
 // Applies the strict -n/-k filters and stores o as its locus's candidate (the cheaper wins).
-static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs)
+// lay: the row's layout when score_path deferred its CIGARs.
+static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, const aln_meth_layout_t *lay = nullptr)
 {
     aln_meth_group_t *g = x->grp;
     // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
@@ -583,6 +628,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs)
     if (x->cut && x->best != INT64_MAX && o.cost > x->best + g->opt->s_mm) return;
     if (o.cost < x->best) { x->best = o.cost; x->best_d = (int)differences; }
     else if (o.cost == x->best) x->best_d = std::min(x->best_d, (int)differences);
+    if (lay && o.alignment.raw_cigar.empty()) materialize_row(o, *lay, x->len); // a built CIGAR is never empty
     const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
     // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
     if (bytes > (64ULL << 20) - x->alignment_bytes) {
@@ -598,23 +644,39 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs)
         if (alignment_better(o, x->res->occ[at], conv_tiebreak(g->mo))) x->res->occ[at] = std::move(o);
     }
 }
-// Scores one row of hit h (SA value sa) along h's path, as each haplotype of its window.
-static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_t sa)
+/* A row's window on the original reference, from the row's SA value:
+ * kind 0 no window (the row is skipped), 1 the other conversion copy (counted, skipped), 2 a
+ * window [rb, rb + span) of contig rid, hypothesis hyp, strand strand. */
+struct meth_row_loc_t { int64_t rb; int kind, rid, hyp, strand; };
+static inline meth_row_loc_t locate_row(const aln_meth_slot_t *x, int span, bwtint_t sa)
+{
+    const aln_meth_group_t *g = x->grp;
+    meth_row_loc_t L{0, 0, 0, 0, 0};
+    if (span <= 0) return L;
+    int strand;
+    const bwtint_t pos = bwa_pos_from_sa(g->ref->conv_bns, sa, span, &strand);
+    if (pos == (bwtint_t)-1) return L;
+    const int crid = bns_pos2rid(g->ref->conv_bns, pos);
+    if (crid < 0) return L;
+    const bntann1_t &ca = g->ref->conv_bns->anns[crid];
+    if (pos < (bwtint_t)ca.offset || pos - ca.offset > (bwtint_t)ca.len ||
+        (bwtint_t)span > (bwtint_t)ca.len - (pos - ca.offset)) return L;
+    L.hyp = crid & 1, L.rid = crid >> 1, L.strand = strand;
+    if ((L.hyp ^ strand) != g->read_no) { L.kind = 1; return L; }
+    L.kind = 2;
+    L.rb = g->ref->bns->anns[L.rid].offset + (pos - ca.offset);
+    return L;
+}
+// Scores one row of hit h, located at L (locate_row of its SA value), along h's path, as each
+// haplotype of its window.
+static void resolve_located(aln_meth_slot_t *x, const aln_meth_pend_t &h, const meth_row_loc_t &L)
 {
     aln_meth_group_t *g = x->grp;
     const int span = x->len + (int)h.e.n_del - (int)h.e.n_ins;
-    if (span <= 0) return;
-    int strand;
-    const bwtint_t pos = bwa_pos_from_sa(g->ref->conv_bns, sa, span, &strand);
-    if (pos == (bwtint_t)-1) return;
-    const int crid = bns_pos2rid(g->ref->conv_bns, pos);
-    if (crid < 0) return;
-    const bntann1_t &ca = g->ref->conv_bns->anns[crid];
-    if (pos < (bwtint_t)ca.offset || pos - ca.offset > (bwtint_t)ca.len ||
-        (bwtint_t)span > (bwtint_t)ca.len - (pos - ca.offset)) return;
-    const int hyp = crid & 1, rid = crid >> 1;
-    if ((hyp ^ strand) != g->read_no) { ++x->res->n_wrong_copy; return; }
-    const int64_t rb = g->ref->bns->anns[rid].offset + (pos - ca.offset);
+    if (L.kind == 0) return;
+    if (L.kind == 1) { ++x->res->n_wrong_copy; return; }
+    const int hyp = L.hyp, rid = L.rid, strand = L.strand;
+    const int64_t rb = L.rb;
     aln_meth_win_key_t key{rid, hyp, strand, rb, rb + span, aln_meth_layout_t()};
     meth_layout(h.gap, h.e.n_gapo, x->len, strand, &key.lay);
     if (layout_span(key.lay, x->len) != span) {
@@ -629,12 +691,36 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
     for (int alt = 0; alt < n_hap && !(x->res->flags & ALN_METH_BIND_CIGAR); ++alt) {
         aln_meth_occ_t o;
         int seed_mm = 0;
-        if (!score_path(x, key.lay, rid, hyp, strand, rb, span, alt, &o, &seed_mm)) {
+        if (!score_path(x, key.lay, rid, hyp, strand, rb, span, alt, &o, &seed_mm, true)) {
             fprintf(stderr, "ERROR: --meth search path (%d gaps: %#x %#x %#x %#x) is not an alignment of the %d-base read\n",
                     (int)h.e.n_gapo, h.gap[0], h.gap[1], h.gap[2], h.gap[3], x->len);
             exit(1);
         }
-        store_row(x, o, seed_mm + seed_gaps);
+        store_row(x, o, seed_mm + seed_gaps, &key.lay);
+    }
+}
+// Scores rows[0, n) of hit h in order, as resolve_located; each group of rows is located first and
+// the reference bytes of its windows prefetched, so that scoring does not wait on them row by row.
+// lookups: count each row in n_lookups as it is scored (rows resolved by SA lookup).
+enum { ALN_METH_LOCATE_AHEAD = 16 };
+static void resolve_rows(aln_meth_slot_t *x, const aln_meth_pend_t &h, const bwtint_t *rows, size_t n, bool lookups)
+{
+    const int span = x->len + (int)h.e.n_del - (int)h.e.n_ins;
+    const uint8_t *pac = x->grp->ref->pac;
+    meth_row_loc_t loc[ALN_METH_LOCATE_AHEAD];
+    for (size_t b = 0; b < n && !(x->res->flags & ALN_METH_BIND_CIGAR); b += ALN_METH_LOCATE_AHEAD) {
+        const size_t m = std::min<size_t>(ALN_METH_LOCATE_AHEAD, n - b);
+        for (size_t k = 0; k < m; ++k) {
+            loc[k] = locate_row(x, span, rows[b + k]);
+            if (loc[k].kind == 2) {
+                __builtin_prefetch(pac + (loc[k].rb >> 2));
+                __builtin_prefetch(pac + ((loc[k].rb + span) >> 2) + 8);
+            }
+        }
+        for (size_t k = 0; k < m && !(x->res->flags & ALN_METH_BIND_CIGAR); ++k) {
+            if (lookups) ++x->res->n_lookups;
+            resolve_located(x, h, loc[k]);
+        }
     }
 }
 // A --known-snvs candidate window without a path (its CIGAR is not one): refined by the window DP,
@@ -689,7 +775,7 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
         const int32_t c = x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos);
         if (c >= 0) { // rows of an interval already resolved: no lookups
             const size_t off = x.sa_ix.val[c];
-            for (bwtint_t r = 0; r < width && !(x.res->flags & ALN_METH_BIND_CIGAR); ++r) resolve_window(&x, h, x.sa_rows[off + r]);
+            resolve_rows(&x, h, x.sa_rows.data() + off, width, false);
             if (aln_meth_certify(&x, s)) x.stop = 1;
             continue;
         }
@@ -716,7 +802,7 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
                 rows[k] = h.k + (width > ALN_METH_WIDE ? (bwtint_t)(((unsigned __int128)a * t + b) % width) : t);
             }
             bwt_sa_batch(g->bwt, rows, n, rows);
-            for (int k = 0; k < n && !(x.res->flags & ALN_METH_BIND_CIGAR); ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[at + k]); }
+            resolve_rows(&x, h, x.sa_rows.data() + at, n, true);
             done += n;
             if (aln_meth_certify(&x, s)) { x.stop = 1; certified = true; break; }
             if (x.collect) { certified = true; break; }
@@ -761,7 +847,7 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             const int32_t c = cached(h);
             if (c >= 0) {
                 const size_t off = x.sa_ix.val[c];
-                for (bwtint_t r = 0; r < width && !(x.res->flags & ALN_METH_BIND_CIGAR); ++r) resolve_window(&x, h, x.sa_rows[off + r]);
+                resolve_rows(&x, h, x.sa_rows.data() + off, width, false);
                 continue;
             }
             const int64_t remaining = limit - x.res->n_lookups;
@@ -772,7 +858,7 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             for (int k = 0; k < n; ++k) rows[k] = h.k + k;
             bwt_sa_batch(g->bwt, rows, n, rows);
             if ((bwtint_t)n == width) x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
-            for (int k = 0; k < n && !(x.res->flags & ALN_METH_BIND_CIGAR); ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
+            resolve_rows(&x, h, x.sa_rows.data() + off, n, true);
             if ((bwtint_t)n < width) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = 1; }
         }
         x.pend.clear();
@@ -1024,17 +1110,26 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
     if (!nonstop) for (const auto &o : r->occ) if (o.cost == best) ceiling = std::min(ceiling, diffs(o) + 1);
     // A dropped candidate that could be a best or retained worse locus leaves X0/X1 unknown.
     if (r->n_unrepresentable && x->unrep_cost <= cut) r->flags |= ALN_METH_BIND_UNREP;
-    std::vector<aln_meth_occ_t> keep;
-    for (auto &o : r->occ) {
+    // The retained loci in (rid, hyp, strand, pos) order. Their keys are sorted with their indexes
+    // and each locus is moved once. std::sort makes the same comparisons and the same permutation
+    // as sorting the loci themselves, so the order matches it, ties included.
+    struct order_t { int rid, hyp, strand; bwtint_t pos; uint32_t i; };
+    std::vector<order_t> order;
+    order.reserve(r->occ.size());
+    for (size_t i = 0; i < r->occ.size(); ++i) {
+        const aln_meth_occ_t &o = r->occ[i];
         if (o.cost > cut || diffs(o) > ceiling) continue;
         if (o.drawn) {} // a drawn primary is placed, not counted: X0 stays the verified count
         else if (o.cost == best) ++r->c1;
         else ++r->c2; // stock c2 counts every retained worse cost, not only the next distinct one
-        keep.push_back(std::move(o));
+        order.push_back(order_t{o.rid, o.hyp, o.strand, o.pos, (uint32_t)i});
     }
-    std::sort(keep.begin(), keep.end(), [](const aln_meth_occ_t &a, const aln_meth_occ_t &b) {
+    std::sort(order.begin(), order.end(), [](const order_t &a, const order_t &b) {
         return std::make_tuple(a.rid, a.hyp, a.strand, a.pos) < std::make_tuple(b.rid, b.hyp, b.strand, b.pos);
     });
+    std::vector<aln_meth_occ_t> keep;
+    keep.reserve(order.size());
+    for (const order_t &k : order) keep.push_back(std::move(r->occ[k.i]));
     r->occ.swap(keep); r->main = 0;
     if (conv_tiebreak(x->grp->mo) && !r->flags) {
         int fewest = INT_MAX, gap = INT_MAX;
