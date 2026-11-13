@@ -2007,6 +2007,10 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 both upstreams; --compat refuses it (override with\n");
     fprintf(stderr, "                 --compat-allow-divergent) [index]\n");
     fprintf(stderr, "ALT projection (fg-labs extension):\n");
+    fprintf(stderr, "   --alt-project-min-gap INT\n");
+    fprintf(stderr, "                 refuse a lift unless it beats every different-locus hit covering\n");
+    fprintf(stderr, "                 the same query segment by more than INT times -A. Requires\n");
+    fprintf(stderr, "                 --alt-project; 0 disables this experimental ambiguity guard [0]\n");
     fprintf(stderr, "   --alt-project\n");
     fprintf(stderr, "                 let ALT haplotypes decide placement: lift alignments to ALT contigs\n");
     fprintf(stderr, "                 onto the primary assembly through <idxbase>.alt before pairing and\n");
@@ -2120,6 +2124,7 @@ static void mem_close_input_readers(ktp_aux_t &aux, gzFile fp, gzFile fp2,
 int main_mem(int argc, char *argv[])
 {
     int          i, c, ignore_alt = 0, no_mt_io = 0, alt_project = 0;
+    bool         alt_project_gap_set = false;
     int          fixed_chunk_size          = -1;
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
@@ -2269,6 +2274,7 @@ int main_mem(int argc, char *argv[])
         OPT_PROPER_PAIR_FROM_EMITTED,
         OPT_TIE_BREAK,
         OPT_ALT_PROJECT,
+        OPT_ALT_PROJECT_MIN_GAP,
         OPT_MD,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
@@ -2337,6 +2343,7 @@ int main_mem(int argc, char *argv[])
         {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
         {"tie-break",                required_argument, 0, OPT_TIE_BREAK},
         {"alt-project",              no_argument,       0, OPT_ALT_PROJECT},
+        {"alt-project-min-gap",      required_argument, 0, OPT_ALT_PROJECT_MIN_GAP},
         {"md",                       required_argument, 0, OPT_MD},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
@@ -2852,6 +2859,17 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
         else if (c == OPT_ALT_PROJECT) alt_project = 1;
+        else if (c == OPT_ALT_PROJECT_MIN_GAP) {
+            int64_t gap;
+            if (parse_bounded_i64(optarg, 0, INT_MAX, &gap) != 0) {
+                fprintf(stderr, "[E::%s] --alt-project-min-gap expects an integer in [0, %d]\n", __func__, INT_MAX);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->alt_project_min_gap = (int) gap;
+            alt_project_gap_set = true;
+        }
         else if (c == OPT_TIE_BREAK) {
             if (strcmp(optarg, "index") == 0) opt->tie_break_mode = MEM_TIE_BREAK_INDEX;
             else if (strcmp(optarg, "name") == 0) opt->tie_break_mode = MEM_TIE_BREAK_NAME;
@@ -3169,6 +3187,12 @@ int main_mem(int argc, char *argv[])
         free(opt);
         if (out_opened)
             fclose(aux.fp);
+        return 1;
+    }
+    if (alt_project_gap_set && !alt_project) {
+        fprintf(stderr, "[E::%s] --alt-project-min-gap requires --alt-project\n", __func__);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
         return 1;
     }
     if (alt_project && (ignore_alt || opt->meth_mode)) {
@@ -4036,6 +4060,10 @@ int main_mem(int argc, char *argv[])
         }
         fprintf(stderr, "[M::%s] alt-project: %d ALT contigs lift onto the primary assembly\n", __func__, alt_lift->n_lift);
         opt->alt_lift = alt_lift.get();
+        const char *pair_gap = getenv("BWAMEM3_ALT_PROJECT_PAIR_GAP");
+        opt->alt_project_pair_gap = pair_gap && strcmp(pair_gap, "1") == 0;
+        if (opt->alt_project_pair_gap)
+            fprintf(stderr, "[M::%s] experimental alt-project: paired confidence gap\n", __func__);
     }
     /* D3 (--meth, PR-3): --ignore-alt clears is_alt on the SEED bns above, but
      * --meth chaining/extension/output read is_alt from the ORIGINAL bns

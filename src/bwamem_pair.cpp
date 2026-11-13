@@ -37,6 +37,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "kstring.h"
 #include "bwamem.h"
 #include "bam_writer.h"
+#include "alt_lift.h"
 #include "kvec.h"
 #include "utils.h"
 #include "ksw.h"
@@ -1915,6 +1916,11 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     mem_seed_capped_sub(&a[0], opt->a);
     mem_seed_capped_sub(&a[1], opt->a);
 
+    if (opt->alt_lift)
+        for (int end = 0; end < 2; ++end)
+            mem_alt_trace_pair(bns, "paired_input", s[end].name, s[end].id,
+                               (int) a[end].n, a[end].a, n_pri[end], -2);
+
     if (opt->flag & MEM_F_NOPAIRING) { *extra_flag_out = extra_flag; return n; }
 
     // pairing single-end hits
@@ -1988,6 +1994,17 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         q_se[1] = mem_approx_mapq_se(opt, &a[1].a[0]);
 
     }
+    /* Experimental confidence-only guard: preserve every projected locus for
+     * pair selection, then subtract the requested margin from the pair's score
+     * advantage. Cap both ends so SE/PE recombination cannot undo the guard. */
+    if (opt->alt_lift && opt->alt_project_pair_gap && opt->alt_project_min_gap > 0
+        && o > score_un && (a[0].a[z[0]].alt_bw || a[1].a[z[1]].alt_bw)) {
+        const int64_t margin = (int64_t) opt->alt_project_min_gap * opt->a;
+        const int64_t advantage = std::max((int64_t) 0, (int64_t) o - subo_wide - margin);
+        const int cap = std::min(60, raw_mapq(advantage, opt->a));
+        q_se[0] = std::min(q_se[0], cap);
+        q_se[1] = std::min(q_se[1], cap);
+    }
     for (i = 0; i < 2; ++i) {
         int k = a[i].a[z[i]].secondary_all;
         if (k >= 0 && k < n_pri[i]) { // switch secondary and primary if both of them are non-ALT
@@ -2030,6 +2047,12 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
      * valid and this function assembles the proper-pair 0x2 FLAG bit itself. */
     int n = mem_pair_resolve_batch_post(opt, bns, pac, pes, id, s, a, myaln, mmc,
                                         gcnt, tid, n_pri, z, q_se, &extra_flag, &paired);
+
+    if (opt->alt_lift)
+        for (int end = 0; end < 2; ++end)
+            mem_alt_trace_pair(bns, "paired_result", s[end].name, s[end].id,
+                               (int) a[end].n, a[end].a, n_pri[end],
+                               paired ? z[end] : -1, paired ? q_se[end] : -1);
 
     if (paired) {
         char **XA[2];

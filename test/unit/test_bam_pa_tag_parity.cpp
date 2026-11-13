@@ -246,6 +246,35 @@ TEST_CASE("pa: the --bam value is the float32 of the SAM text token"
     free(opt);
 }
 
+TEST_CASE("XL: source provenance is identical in SAM and BAM, including long names"
+          * doctest::test_suite("unit/bam_pa_tag_parity")) {
+    mem_opt_t *opt = mem_opt_init();
+    RefFixture ref;
+    ReadFixture read;
+    CigarFixture cig;
+    const std::string name(8192, 'x');
+    ref.ann.name = const_cast<char *>(name.c_str());
+    auto aln = make_aln(cig.buf, 10, 0);
+    for (int source : {0, 1}) {
+        aln.alt_source_rid_plus1 = source;
+        const std::string sam = emit_sam(opt, &ref.bns, &read.s, &aln);
+        bam1_t *b = bam_writer_alloc();
+        REQUIRE(mem_aln_to_bam(b, opt, &ref.bns, &read.s, 1, &aln, 0, NULL) == 0);
+        uint8_t *tag = bam_aux_get(b, "XL");
+        if (source) {
+            REQUIRE(tag != nullptr);
+            CHECK(std::string(bam_aux2Z(tag)) == name);
+            CHECK(sam.find("\tXL:Z:" + name) != std::string::npos);
+        } else {
+            CHECK(tag == nullptr);
+            CHECK(sam.find("\tXL:") == std::string::npos);
+        }
+        CHECK(sam_tag_names(sam) == bam_tag_names(b));
+        bam_writer_free(b);
+    }
+    free(opt);
+}
+
 TEST_CASE("pa: ties at the fourth decimal round the way the SAM text does"
           * doctest::test_suite("unit/bam_pa_tag_parity")) {
     // 39/48 == 0.8125 exactly, so this is a genuine halfway case. printf's

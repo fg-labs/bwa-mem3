@@ -544,6 +544,20 @@ lower MAPQ, so a read whose haplotype exists only as an ALT is placed by the
 primary assembly alone. With `--alt-project`, alignments to ALT contigs are
 lifted onto the primary assembly before primary marking, pairing and MAPQ:
 
+**Placement trust:** projection checks whether the `.alt` alignment describes
+an interval, not whether it names the correct biological locus. An ALT placed
+at the wrong copy of a duplicated region can move matching reads there. Curate
+ambiguous placements before use. The `.alt` MAPQ field is not used; MAPQ 255
+means confidence is unavailable, not that the placement is certain. The
+optional score-gap guard below can refuse some ambiguous lifts, but cannot
+establish the correct locus when no competing hit was found. Even a correctly
+placed ALT can attract reads from another paralog if that copy's matching
+haplotype is absent from the reference. Identical read pairs from different
+copies cannot be separated by an alignment-score cutoff alone; informative
+mate sequence can resolve some cases, but a larger gap can also discard useful
+haplotype evidence. Validate the reference's competing haplotype representation,
+not just each ALT's placement.
+
 - **Lift.** The hit's reference interval is mapped through that ALT's `.alt`
   CIGAR (FLAG 16 flips the strand). It keeps its score and query span. A hit is
   lifted only when the lift describes it: none of it lies in a clip of the `.alt`
@@ -611,8 +625,19 @@ hit's `XA` entry and, where the default writes the ALT hit as a supplementary
 record (a read that runs off the end of the ALT, say), that record and the
 `SA:Z` tag linking to it. `XA` and `HN` on the remaining record list and count
 the read's other hits, so they can change with the set of hits that remain.
-The header still lists the ALT contigs; records reach them only for hits that
-were not lifted (above) and for ALT contigs with no usable `.alt` line.
+Lifted records carry `XL:Z:<source-contig>`, naming the ALT contig from which
+that record was projected. It describes the selected source, not every ALT
+that supported the locus; it does not encode the original source interval.
+Unlifted and mate-rescued records do not inherit a mate's source. `XA`/`XB`
+entries retain their existing format and do not include source provenance.
+
+The header still lists the ALT contigs; records reach them for hits that were
+not lifted (including score-gap refusals) and for ALT contigs with no usable
+`.alt` line. This is not a primary-only output mode. Large ALT dictionaries can
+increase downstream memory use even when few records remain on ALTs; deleting
+`@SQ` lines alone is unsafe while records or alignment tags still refer to them.
+Models and filters trained on ordinary alignments may need reevaluation or
+retraining on projected alignments.
 
 `--alt-project` needs a `.alt` sidecar whose lines carry alignments (RNAME, POS,
 CIGAR). A usable line is a primary alignment (no FLAG `0x4`, `0x100` or `0x800`)
@@ -635,6 +660,69 @@ reads hits on the allele contigs needs a run without `--alt-project`.
   [`--compat`](#--compattarget--byte-identical-output-for-another-aligner)
   (overridable via `--compat-allow-divergent`).
 - When on, the startup log reports how many ALT contigs lift.
+
+#### `--alt-project-min-gap INT` - experimental cross-locus ambiguity guard
+
+Default 0 (disabled). Requires `--alt-project`, even when explicitly set to 0.
+For a positive value, an otherwise eligible lift must score **more than**
+`INT * -A` above every competing hit at a different locus. Equality refuses
+the lift, as does a higher-scoring competitor. With no competitor, the gap
+check passes.
+
+Competitors include primary-assembly hits and other geometrically eligible
+projections. They must overlap more than half the shorter query interval;
+disjoint pieces of a split alignment do not compete. The existing locus
+relation is used: reference overlap must exceed 95% of the shorter span and
+query overlap must exceed half, on the same contig and strand. Distinct tandem
+placements therefore remain competitors. Scores are the existing raw local
+alignment scores, without length normalization.
+
+All decisions use the same projected candidate snapshot, before replacement
+and grouping, so refusing one lift does not change another lift's competitor
+set. Refusal leaves the original ALT hit available for normal ALT-aware
+handling; it does not delete the hit, force an unmapped record, or guarantee
+the placement of a run without projection. Pairing and MAPQ still follow the
+usual pipeline. Refusing a projection can remove its score from primary-locus
+pair competition, so the selected placement can change or become more confident.
+The guard does not promise to lower MAPQ, and an ALT hit left behind is not a
+safe fallback to the correct locus. This guard is experimental: choosing a
+larger gap can suppress useful haplotype placements as well as ambiguous ones.
+Validate both errors and true-positive retention on independent data before
+selecting a value.
+
+For read-level debugging, set `BWAMEM3_ALT_PROJECT_TRACE` to an exact QNAME or
+comma-separated QNAMEs. With `--alt-project`, stderr reports tab-separated
+`[alt-project-trace]` rows for original and projected candidates, geometric
+refusals, score comparisons, the first vetoing competitor, and grouping outcomes.
+Paired reads also report post-rescue, primary-marked candidates (`paired_input`)
+and the selected pair/MAPQ (`paired_result`; -1 denotes the unpaired fallback).
+These later stages use their own candidate indices, not projection input indices.
+Reference intervals are zero-based, forward, half-open; query intervals retain
+the aligner's orientation. Candidate indices refer to the input list, not final
+SAM record order. Group kinds are 0 (unlifted), 1 (can replace), and 2 (cannot
+replace); `keep` and `output_index` describe projection-stage survivors only.
+
+Tracing does not change alignment decisions. Projection, paired input, and paired
+result each admit 64 selected read invocations per process. Each invocation allows
+4096 ordinary rows plus one truncation marker; projection comparison detail has
+a separate 512-row cap. Limits are marked in the log. Read IDs distinguish mates
+within a batch, not across batches, and worker rows can interleave. Join by QNAME
+to final SAM records for emitted placement and MAPQ. The trace does not explain
+candidates already pruned upstream. With whole-read
+memoization, only representatives reach projection; use `--dedup-reads off` if
+a selected duplicate has no trace. Gap 0 still traces candidate comparisons,
+but labels the ambiguity gate disabled.
+
+A developer-only alternative, `BWAMEM3_ALT_PROJECT_PAIR_GAP=1`, defers the positive
+gap to paired confidence instead of refusing projections. Projection and pair
+selection then match gap 0. If the paired alignment beats the independently selected ends and either selected
+end is lifted, both MAPQs are capped at `min(60, round(6.02 * max(0, pair_score - competitor_score - INT * -A) / -A))`.
+The competitor score includes the best alternative pair or the unpaired score,
+whichever is greater. This cap only lowers MAPQ; it does not change placement or
+alignment scores. Ordinary selected pairs, single-end reads, and unpaired
+fallbacks receive no extra cap. It is a development experiment, not a calibrated
+mapping-error probability or a validated accuracy improvement. A lower MAPQ can
+remove useful evidence from downstream callers even when placement is unchanged.
 
 ### Scoring
 

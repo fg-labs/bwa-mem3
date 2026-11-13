@@ -4495,7 +4495,7 @@ int mem_kernel2_core(FMI_search *fmi,
          * primary marking and pairing (and before the shrink below, since the
          * lift can drop regions). Off by default (alt_lift == NULL). */
         if (opt->alt_lift)
-            regs[l].n = mem_alt_project(opt, aln_bns, regs[l].n, regs[l].a);
+            regs[l].n = mem_alt_project(opt, aln_bns, regs[l].n, regs[l].a, seq_[l].name, seq_[l].id);
         /* Paired-end: give back the slack in this read's regions now that dedup
          * has settled their count. av->a was sized to the total seeds of the
          * read's chains, and the regions are held until the batch's SAM pass
@@ -4715,7 +4715,9 @@ static const char *read_memo_alnreg_field_diff(const mem_alnreg_t *a, const mem_
     RM_D(rb); RM_D(re); RM_D(qb); RM_D(qe); RM_D(rid);
     RM_D(score); RM_D(truesc); RM_D(sub); RM_D(alt_sc); RM_D(csub); RM_D(sub_n);
     RM_D(w); RM_D(seedcov); RM_D(secondary); RM_D(secondary_all);
-    RM_D(seedlen0); RM_D(chain_n_hits); RM_D(frac_rep);
+    if (a->alt_bw) { RM_D(alt_source_rid); }
+    else { RM_D(seedlen0); }
+    RM_D(chain_n_hits); RM_D(frac_rep);
     RM_D(meth_hypothesis); RM_D(meth_strand_hyp);
 #undef RM_D
     if (a->n_comp != b->n_comp) return "n_comp";
@@ -5552,6 +5554,7 @@ static int mem_aln_is_conversion_of(const mem_opt_t *opt, const bntseq_t *bns,
            anchor->flag == flag && anchor->mapq == (uint32_t)mapq &&
            anchor->score == p->score && anchor->sub == (p->sub > p->csub ? p->sub : p->csub) &&
            anchor->is_alt == (uint32_t)p->is_alt && anchor->alt_sc == p->alt_sc &&
+           anchor->alt_source_rid_plus1 == (opt->alt_lift && p->alt_bw ? p->alt_source_rid + 1 : 0) &&
            anchor->meth_hypothesis == p->meth_hypothesis;
 }
 
@@ -5730,6 +5733,8 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
         size_t anno_len = ((opt->flag & MEM_F_REF_HDR) && p->rid >= 0
                            && bns->anns[p->rid].anno && bns->anns[p->rid].anno[0])
                           ? strlen(bns->anns[p->rid].anno) : 0;
+        size_t xl_len = p->alt_source_rid_plus1 > 0 && !(p->flag & 4)
+                      ? strlen(bns->anns[p->alt_source_rid_plus1 - 1].name) + 6 : 0;
         size_t xa_len   = p->XA ? strlen(p->XA) : 0;
         size_t rg_len   = bwa_rg_id[0] ? strlen(bwa_rg_id) : 0;
         size_t mate_cigar_len = (m && m->n_cigar) ? (size_t)m->n_cigar * 16 : 0;
@@ -5747,7 +5752,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                     + (size_t)p->n_cigar * 16  /* primary CIGAR */
                     + mate_cigar_len           /* MC:Z mate CIGAR */
                     + rname_len + rnext_len    /* RNAME + RNEXT */
-                    + md_len + xa_len + rg_len + comm_len + anno_len
+                    + md_len + xa_len + xl_len + rg_len + comm_len + anno_len
                     + sa_need                  /* SA:Z (multi-supp) */
                     + 256;                      /* slack for ints + tags
                                                  * (incl. pa:f:, bounded by
@@ -5873,6 +5878,10 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
     }
 
     /* -u adds each hit's score and MAPQ to the list and, as in bwa, names it XB. */
+    if (p->alt_source_rid_plus1 > 0 && !(p->flag & 4)) {
+        kputsn_u("\tXL:Z:", 6, str);
+        kputs_u(bns->anns[p->alt_source_rid_plus1 - 1].name, str);
+    }
     if (p->XA) { kputsn_u((opt->flag & MEM_F_XB)? "\tXB:Z:" : "\tXA:Z:", 6, str); kputs_u(p->XA, str); }
     if (p->HN >= 0 && opt->compat->emit_hn) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 
@@ -6173,6 +6182,7 @@ mem_aln_t mem_reg2aln(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *
     a.pos = pos - bns->anns[a.rid].offset;
     a.score = ar->score; a.sub = ar->sub > ar->csub? ar->sub : ar->csub;
     a.is_alt = ar->is_alt; a.alt_sc = ar->alt_sc;
+    if (opt->alt_lift && ar->alt_bw) a.alt_source_rid_plus1 = ar->alt_source_rid + 1;
     return a;
 }
 

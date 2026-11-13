@@ -61,6 +61,10 @@
 #     no record names the ALT; and --dedup-reads on and off over input with every
 #     pair duplicated, with the memo shown to engage (dup > 0, final=ON) and the
 #     BWAMEM3_DEDUP_READS_VERIFY check of duplicate regions passing
+#   * matching ALT haplotypes represented at both paralogs preserve low paired
+#     confidence for identical ambiguous reads, while a mate in distinct flanks
+#     resolves either locus; an asymmetric-reference negative control fails the
+#     uncertainty check, and the paired-confidence experiment keeps placement
 #   * --alt-project is refused with -j, with --meth, without a .alt and with a
 #     .alt that has no usable line, and --compat-allow-divergent admits it under
 #     --compat (the --compat refusal itself is checked in compat_byte_identical.sh)
@@ -267,6 +271,39 @@ aln fwd proj.sam --alt-project
 grep -q "alt-project: 1 ALT contigs" proj.sam.log || fail "--alt-project did not report the lift table"
 aln rev projr.sam --alt-project
 
+# Trace only selected complete read groups, without changing any SAM records.
+trace_name=$(
+    python3 - << 'EOF'
+with open("r1.fq") as fq:
+    print(fq.readline().strip()[1:])
+EOF
+)
+BWAMEM3_ALT_PROJECT_TRACE="$trace_name" aln fwd trace.sam --alt-project
+python3 - "$trace_name" << 'EOF'
+import sys
+from samrecs import records
+name = sys.argv[1]
+assert list(records("trace.sam")) == list(records("proj.sam")), "trace changed SAM records"
+rows = [l.rstrip().split("\t") for l in open("trace.sam.log") if l.startswith("[alt-project-trace]\t")]
+assert rows, "selected read has no projection trace"
+assert {r[1] for r in rows} == {name}, "unselected read leaked into trace"
+assert {r[3] for r in rows} >= {"input", "project", "compare", "gate", "group", "summary", "paired_input", "paired_result"}, "missing candidate stages"
+assert len({r[2] for r in rows if r[3] == "summary"}) == 2, "trace lost a mate"
+assert any("gap=0" in r for r in rows if r[3] == "summary"), "disabled gate was not identified"
+for mate in (1, 2):
+    with open(f"r{mate}.fq") as fq:
+        record = "".join(next(fq) for _ in range(4))
+    with open(f"trace{mate}.fq", "w") as fq:
+        fq.write(record * 40)
+EOF
+BWAMEM3_ALT_PROJECT_TRACE="absent,$trace_name" "$BIN" mem -t 4 -I 400,10 --dedup-reads off --alt-project fwd.fa trace1.fq trace2.fq > trace.cap.sam 2> trace.cap.log
+python3 - << 'EOF'
+rows = [l.rstrip().split("\t") for l in open("trace.cap.log") if l.startswith("[alt-project-trace]\t")]
+assert sum(r[3] == "begin" for r in rows) == 64, "read invocation cap failed"
+assert sum(r[3] == "summary" for r in rows) == 64, "bounded traces lost summaries"
+assert sum(r[3] == "call_limit" and "phase=0" in r for r in rows) == 1, "invocation truncation must be explicit"
+EOF
+
 summ def1.sam > def.tsv
 summ proj.sam > proj.tsv
 summ projr.sam > projr.tsv
@@ -302,8 +339,8 @@ python3 snpcheck.py proj.tsv diffs.txt || fail "a lifted SNP read is misplaced o
 awk '$10 <= 1000 && 1000 < $11 { print $1 }' proj.tsv | sort -u > snp.names
 bad=$(awk 'NR == FNR { n[$1] = 1; next } ($1 in n) && ($3 != "chrA" || int($7 / 2) % 2 != 1)' snp.names proj.tsv | wc -l)
 [[ $bad -eq 0 ]] || fail "$((bad)) mates of SNP fragments are off chrA or not a proper pair"
-# No record names the ALT contig, in any field.
-grep -v '^@' proj.sam > proj.body
+# No alignment field names the ALT contig; XL records historical provenance.
+awk -F '\t' '!/^@/ {for(i=1;i<=NF;i++) if($i !~ /^XL:Z:/) print $i}' proj.sam > proj.body
 grep -q 'chrA_alt1' proj.body && fail "--alt-project wrote a record that names the ALT contig"
 # Deletion: X:1500 is chrA 0-based 4500, so the D starts at 1-based 4501. Every
 # mate with at least 10 ALT bases on each side of it must carry it there.
@@ -415,7 +452,7 @@ if not p: sys.exit("no primary record")
 p = p[0]
 if (p[2], p[3], p[5], tags(p).get("AS")) != ("chrA", "3405", "4S146M", "146") or int(p[4]) == 0:
     sys.exit(f"primary {p[2]}:{p[3]} {p[5]} MAPQ {p[4]} AS:{tags(p).get('AS')}, want chrA:3405 4S146M AS:146, MAPQ > 0")
-if any("chrA_alt1" in "\t".join(t) for t in rs): sys.exit("a record names the ALT")
+if any("chrA_alt1" in "\t".join(x for x in t if not x.startswith("XL:Z:")) for t in rs): sys.exit("a record names the ALT")
 dv = d["v_400"]
 if (dv[2], dv[3]) != ("chrA", "8001"): sys.exit(f"the default places it at {dv[2]}:{dv[3]}, not the paralog (vacuous)")
 EOF
@@ -424,6 +461,20 @@ EOF
 # unit away score the same, so both survive: MAPQ 0, XS equal to AS, and under
 # -a a secondary at the other placement.
 "$BIN" mem -t 2 -a --alt-project tan.fa tan.fq > tan.sam 2> tan.log || fail "mem -a --alt-project on tan failed"
+BWAMEM3_ALT_PROJECT_TRACE=t_500 "$BIN" mem -t 2 -a --alt-project --alt-project-min-gap 2 tan.fa tan.fq > tan.gap.sam 2> tan.gap.log
+python3 - << 'EOF'
+rows = [l.rstrip().split("\t") for l in open("tan.gap.log") if l.startswith("[alt-project-trace]\t")]
+assert rows and {r[1] for r in rows} == {"t_500"}, "trace must match exact names"
+assert any(r[3] == "veto" for r in rows), "tandem competitor did not veto the lift"
+assert any(r[3] == "gate" and "decision=refuse" in r for r in rows), "missing refused-candidate trace"
+EOF
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 BWAMEM3_ALT_PROJECT_TRACE=t_500 "$BIN" mem -t 2 -a --alt-project --alt-project-min-gap 2 tan.fa tan.fq > tan.pair.sam 2> tan.pair.log
+python3 - << 'EOF'
+from samrecs import records
+rows = [l.rstrip().split("\t") for l in open("tan.pair.log") if l.startswith("[alt-project-trace]\t")]
+assert any(r[3] == "gate" and "decision=defer_to_pair" in r for r in rows), "pair-confidence selector not enabled"
+assert list(records("tan.pair.sam")) == list(records("tan.sam")), "pair-only confidence experiment changed single-end records"
+EOF
 python3 - tan.sam << 'EOF' || fail "--alt-project dropped a competing placement in a tandem repeat"
 import sys
 from samrecs import recs, tags
@@ -477,7 +528,7 @@ for name, rs in got.items():
     else:
         n_past += 1
         if p[2] not in ("chrA", "chrB") or int(p[3]) != 3001 + s - 300: sys.exit(f"{name}: {p[2]}:{p[3]}")
-        if any("chrA_alt2" in "\t".join(t) for t in rs): sys.exit(f"{name}: a record names chrA_alt2")
+        if any("chrA_alt2" in "\t".join(x for x in t if not x.startswith("XL:Z:")) for t in rs): sys.exit(f"{name}: a record names chrA_alt2")
 if n_in < 10 or n_edge < 10 or n_past < 10: sys.exit(f"only {n_in} clip / {n_edge} edge / {n_past} past reads")
 EOF
 python3 clipcheck.py clip.sam clip.def.sam || fail "--alt-project mishandled reads in, across or past an ALT clip"
@@ -508,7 +559,7 @@ cmp -s <(nopg detf.t1.sam) <(nopg detf.t4.sam) || fail "--fast --alt-project out
 # producer and, under pipefail, hide a match).
 summ detf.t1.sam > detf.tsv
 python3 snpcheck.py detf.tsv diffs.txt || fail "--fast --alt-project did not lift the SNP reads to their chrA positions"
-grep -v '^@' detf.t1.sam > detf.body
+awk -F '\t' '!/^@/ {for(i=1;i<=NF;i++) if($i !~ /^XL:Z:/) print $i}' detf.t1.sam > detf.body
 grep -q 'chrA_alt1' detf.body && fail "--fast --alt-project wrote a record that names the ALT contig"
 # --dedup-reads: byte-identical on and off (its documented contract), and the
 # memo must engage, or on == off is vacuous: its stats line reports duplicate
@@ -527,6 +578,165 @@ BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t 4 -I 400,
 grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* ' detd.verify.log \
     || fail "--dedup-reads VERIFY compared no duplicate pair (see detd.verify.log)"
 cmp -s <(nopg detd.verify.sam) <(nopg detd.off.t4.sam) || fail "--dedup-reads VERIFY output differs from the off run's"
+
+# Lift provenance identifies the actual winning ALT, not an overlapping tile.
+python3 - << 'EOF'
+from samrecs import recs
+rs = [r for values in recs("proj.sam").values() for r in values]
+lifted = [r for r in rs if any(t == "XL:Z:chrA_alt1" for t in r[11:])]
+assert lifted, "no lifted record has source ALT provenance"
+assert all(r[2] == "chrA" for r in lifted), "source tag on an unlifted ALT record"
+assert not any(t.startswith("XL:") for values in recs("def1.sam").values() for r in values for t in r[11:])
+EOF
+
+# Direct BAM must retain the same source tags and alignment content as SAM.
+if command -v samtools > /dev/null 2>&1; then
+    "$BIN" mem -t 2 -I 400,10 --alt-project --bam=0 fwd.fa r1.fq r2.fq > proj.bam 2> proj.bam.log || fail "direct BAM projection failed"
+    samtools quickcheck proj.bam || fail "projected BAM failed quickcheck"
+    samtools view proj.bam > proj.bam.sam
+    python3 - << 'EOF'
+from samrecs import recs
+a, b = recs("proj.sam"), recs("proj.bam.sam")
+assert a.keys() == b.keys()
+for name in a:
+    left = sorted((r[:11], sorted(r[11:])) for r in a[name])
+    right = sorted((r[:11], sorted(r[11:])) for r in b[name])
+    assert left == right, name
+EOF
+fi
+
+# The gap is explicit, nonnegative, and meaningless without projection.
+for gap in -1 1x 2147483648; do
+    "$BIN" mem --alt-project --alt-project-min-gap "$gap" fwd.fa r1.fq r2.fq > /dev/null 2> gap.bad.log && fail "invalid gap $gap accepted"
+    grep -q 'alt-project-min-gap' gap.bad.log || fail "invalid gap gave unrelated error"
+done
+"$BIN" mem --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > /dev/null 2> gap.dep.log && fail "gap accepted without projection"
+grep -q 'requires --alt-project' gap.dep.log || fail "gap dependency gave wrong error"
+"$BIN" mem -t 2 -I 400,10 --alt-project --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > gap.zero.sam 2> gap.zero.log || fail "zero gap failed"
+cmp -s <(nopg gap.zero.sam) <(nopg proj.sam) || fail "zero gap changes projection output"
+for t in 1 4; do
+    BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --alt-project --alt-project-min-gap 2 --dedup-reads on fwd.fa r1d.fq r2d.fq > "gap.t$t.sam" 2> "gap.t$t.log" || fail "positive gap failed with dedup verification"
+    grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* ' "gap.t$t.log" || fail "positive gap compared no duplicate pairs"
+done
+cmp -s <(nopg gap.t1.sam) <(nopg gap.t4.sam) || fail "positive gap differs across thread counts"
+
+# Confidence-only experiment must leave placement untouched, remain deterministic,
+# replay duplicate pairs correctly, and agree between direct SAM and BAM output.
+for t in 1 4; do
+    BWAMEM3_ALT_PROJECT_PAIR_GAP=1 BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --alt-project --alt-project-min-gap 2 --dedup-reads on fwd.fa r1d.fq r2d.fq > "pairgap.t$t.sam" 2> "pairgap.t$t.log"
+    grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* ' "pairgap.t$t.log" || fail "pair confidence compared no duplicate pairs"
+done
+cmp -s <(nopg pairgap.t1.sam) <(nopg pairgap.t4.sam) || fail "pair confidence differs across threads"
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 2 -I 400,10 --alt-project --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > pairgap.zero.sam 2> pairgap.zero.log
+cmp -s <(nopg pairgap.zero.sam) <(nopg proj.sam) || fail "zero pair confidence gap changes records"
+python3 - << 'EOF'
+from samrecs import records
+base, current = list(records("detd.off.t4.sam")), list(records("pairgap.t4.sam"))
+assert len(base) == len(current)
+for b, r in zip(base, current):
+    assert b[:4] + b[5:11] == r[:4] + r[5:11], "pair confidence changed placement"
+    assert int(r[4]) <= int(b[4]), "pair confidence raised MAPQ"
+    assert [t for t in r[11:] if t[:3] in ("AS:", "XS:", "XL:", "NM:")] == [t for t in b[11:] if t[:3] in ("AS:", "XS:", "XL:", "NM:")]
+EOF
+if command -v samtools > /dev/null 2>&1; then
+    BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 4 -I 400,10 --alt-project --alt-project-min-gap 2 --dedup-reads on --bam=0 fwd.fa r1d.fq r2d.fq > pairgap.bam 2> pairgap.bam.log
+    samtools quickcheck pairgap.bam
+    samtools view pairgap.bam > pairgap.bam.sam
+    python3 - << 'EOF'
+from samrecs import records
+left, right = list(records("pairgap.t4.sam")), list(records("pairgap.bam.sam"))
+assert len(left) == len(right)
+for a, b in zip(left, right):
+    assert a[:11] == b[:11] and sorted(a[11:]) == sorted(b[11:])
+EOF
+fi
+
+# Equal haplotype hypotheses at two paralogs must remain in paired competition.
+# Ambiguous pairs have identical bytes but different source labels; a mate in
+# distinct flanks resolves the locus. The asymmetric reference is a negative
+# control: omitting one hypothesis must make the uncertainty check fail.
+python3 - << 'EOF'
+import random
+rng = random.Random(775119)
+rc = str.maketrans("ACGT", "TGCA")
+references, placements = [], []
+for family in range(8):
+    a = "".join(rng.choice("ACGT") for _ in range(3000))
+    b = list(a)
+    for pos in range(650, 1150, 50):
+        b[pos] = rng.choice([base for base in "ACGT" if base != a[pos]])
+    for pos in range(1200, 1600, 10):
+        b[pos] = rng.choice([base for base in "ACGT" if base != a[pos]])
+    b = "".join(b)
+    tile = b[600:780] + rng.choice([base for base in "ACGT" if base != b[780]]) + b[781:1200]
+    references.append(f">A{family}\n{a}\n>B{family}\n{b}\n>hapA{family}\n{tile}\n")
+    placements.append(f"hapA{family}\t0\tA{family}\t601\t60\t600M\t*\t0\t0\t*\t*\n")
+    with open("sym.r1.fq", "a") as r1, open("sym.r2.fq", "a") as r2:
+        for start in (650, 660, 670, 680):
+            for informative, length in ((0, 400), (1, 750)):
+                for source, primary in (("A", a), ("B", b)):
+                    haplotype = primary[:600] + tile + primary[1200:]
+                    end = start + length
+                    reads = (haplotype[start:start + 151],
+                             haplotype[end - 151:end].translate(rc)[::-1])
+                    name = f"sym_{family}_{start}_{informative}_{source}"
+                    for handle, read in zip((r1, r2), reads):
+                        handle.write(f"@{name}\n{read}\n+\n{'I' * 151}\n")
+open("asym.fa", "w").write("".join(references))
+open("asym.fa.alt", "w").write("".join(placements))
+for family in range(8):
+    tile = references[family].splitlines()[-1]
+    references.append(f">hapB{family}\n{tile}\n")
+    placements.append(f"hapB{family}\t0\tB{family}\t601\t60\t600M\t*\t0\t0\t*\t*\n")
+open("sym.fa", "w").write("".join(references))
+open("sym.fa.alt", "w").write("".join(placements))
+EOF
+for ref in asym sym; do
+    "$BIN" index "$ref.fa" > "$ref.index.log" 2>&1
+    "$BIN" mem -t 2 -I 575,175,1100,100 --alt-project "$ref.fa" sym.r1.fq sym.r2.fq > "$ref.sam" 2> "$ref.log"
+done
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 2 -I 575,175,1100,100 --alt-project --alt-project-min-gap 2 sym.fa sym.r1.fq sym.r2.fq > sym.pair.sam 2> sym.pair.log
+python3 - << 'EOF'
+from samrecs import records, tags
+
+def check_symmetric(path):
+    observed = {}
+    for row in records(path):
+        flag = int(row[1])
+        if flag & 0x900:
+            continue
+        _, family, start, informative, source = row[0].split("_")
+        mate = 1 if flag & 64 else 2
+        key = row[0], mate
+        assert key not in observed, "duplicate primary end"
+        observed[key] = row
+        assert not flag & 4, "unmapped symmetric read"
+        if informative == "0":
+            assert int(row[4]) < 20, "equally represented paired loci lost uncertainty"
+        else:
+            expected = int(start) + (0 if mate == 1 else 750 - 151)
+            assert row[2] == source + family and int(row[3]) == expected + 1
+            assert bool(flag & 16) == (mate == 2) and flag & 2
+            assert int(row[4]) >= 20, "informative mate did not resolve the locus"
+    assert len(observed) == 256, "missing primary ends"
+    return observed
+
+base = check_symmetric("sym.sam")
+current = check_symmetric("sym.pair.sam")
+assert base.keys() == current.keys()
+for key, old in base.items():
+    new = current[key]
+    assert old[:4] + old[5:11] == new[:4] + new[5:11]
+    assert int(new[4]) <= int(old[4])
+    for tag in ("AS", "XS", "NM", "XL"):
+        assert tags(old).get(tag) == tags(new).get(tag)
+try:
+    check_symmetric("asym.sam")
+except AssertionError as error:
+    assert str(error) == "equally represented paired loci lost uncertainty", str(error)
+else:
+    raise AssertionError("symmetric uncertainty check accepts a missing haplotype hypothesis")
+EOF
 
 # Refusals
 "$BIN" mem -j --alt-project fwd.fa r1.fq r2.fq > /dev/null 2> j.log && fail "-j --alt-project was accepted"

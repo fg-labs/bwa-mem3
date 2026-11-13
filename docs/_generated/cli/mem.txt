@@ -255,6 +255,10 @@ Tie-breaking (fg-labs extension):
                  both upstreams; --compat refuses it (override with
                  --compat-allow-divergent) [index]
 ALT projection (fg-labs extension):
+   --alt-project-min-gap INT
+                 refuse a lift unless it beats every different-locus hit covering
+                 the same query segment by more than INT times -A. Requires
+                 --alt-project; 0 disables this experimental ambiguity guard [0]
    --alt-project
                  let ALT haplotypes decide placement: lift alignments to ALT contigs
                  onto the primary assembly through <idxbase>.alt before pairing and

@@ -15,6 +15,8 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
+#include <stdarg.h>
 #include <vector>
 
 #include "bwamem.h"
@@ -333,8 +335,87 @@ struct alt_project_ent_t {
     int kind;   /* AP_UNLIFTED, or lifted and AP_CAN_REPLACE or AP_CANNOT_REPLACE */
     int keep;
 };
-enum { AP_UNLIFTED = 0, AP_CAN_REPLACE = 1, AP_CANNOT_REPLACE = 2 };
+enum { AP_UNLIFTED = 0, AP_CAN_REPLACE = 1, AP_CANNOT_REPLACE = 2, AP_REFUSED = 3 };
+
+/* Developer-only diagnostics: exact comma-separated QNAMEs, at most 64 read
+ * invocations and 4096 rows per invocation. No region is changed by tracing.
+ * Read IDs distinguish mates within a batch; rows may interleave across threads. */
+struct alt_project_trace_t {
+    const char *name;
+    int id, rows = 0;
+    bool enabled = false;
+
+    alt_project_trace_t(const char *read_name, int read_id, int phase = 0) : name(read_name), id(read_id)
+    {
+        static const char *names = getenv("BWAMEM3_ALT_PROJECT_TRACE");
+        static std::atomic<unsigned> phase_calls[3]{};
+        auto &calls = phase_calls[phase];
+        if (!names || !name) return;
+        const size_t len = strlen(name);
+        for (const char *p = names; *p;) {
+            const char *end = strchr(p, ',');
+            if (!end) end = p + strlen(p);
+            if ((size_t) (end - p) == len && strncmp(p, name, len) == 0) {
+                // Saturate the counter so a long repeated-QNAME input cannot wrap.
+                unsigned call = calls.load(std::memory_order_relaxed);
+                while (call < 65 && !calls.compare_exchange_weak(call, call + 1, std::memory_order_relaxed)) {}
+                enabled = call < 64;
+                if (call == 64) {
+                    enabled = true;
+                    row("call_limit", "read_limit=64\tphase=%d\tremaining_reads_not_shown=1", phase);
+                    enabled = false;
+                }
+                break;
+            }
+            p = *end ? end + 1 : end;
+        }
+    }
+
+    void row(const char *stage, const char *format, ...)
+    {
+        if (!enabled || rows > 4096) return;
+        flockfile(stderr);
+        fprintf(stderr, "[alt-project-trace]\t%s\t%d\t%s\t", name, id,
+                rows == 4096 ? "truncated" : stage);
+        if (rows == 4096) fputs("row_limit=4096", stderr);
+        else {
+            va_list args;
+            va_start(args, format);
+            vfprintf(stderr, format, args);
+            va_end(args);
+        }
+        fputc('\n', stderr);
+        funlockfile(stderr);
+        ++rows;
+    }
+
+    void region(const char *stage, const bntseq_t *bns, int i, const mem_alnreg_t &a)
+    {
+        if (!enabled) return;
+        const int rev = a.rb >= bns->l_pac;
+        const int64_t off = a.rid >= 0 ? bns->anns[a.rid].offset : 0;
+        const int64_t start = (rev ? 2 * bns->l_pac - a.re : a.rb) - off;
+        const int64_t end = (rev ? 2 * bns->l_pac - a.rb : a.re) - off;
+        row(stage, "i=%d\tref=%s\tstart=%lld\tend=%lld\tstrand=%c\tqb=%d\tqe=%d\tscore=%d\talt=%d\tlifted=%d",
+            i, a.rid >= 0 ? bns->anns[a.rid].name : "*", (long long) start, (long long) end,
+            rev ? '-' : '+', a.qb, a.qe, a.score, (int) a.is_alt, (int) (a.alt_bw != 0));
+    }
+};
 } // namespace
+
+void mem_alt_trace_pair(const bntseq_t *bns, const char *stage,
+                        const char *name, int read_id, int n, const mem_alnreg_t *a,
+                        int n_primary, int selected, int mapq)
+{
+    alt_project_trace_t trace(name, read_id, selected == -2 ? 1 : 2);
+    if (!trace.enabled) return;
+    trace.row(stage, "n=%d\tn_primary=%d\tselected=%d\tmapq=%d", n, n_primary, selected, mapq);
+    for (int i = 0; i < n; ++i) {
+        trace.region(selected == -2 ? "paired_candidate" : "resolved_candidate", bns, i, a[i]);
+        trace.row("paired_metadata", "i=%d\tsub=%d\tcsub=%d\tsecondary=%d\tsecondary_all=%d\tfrac_rep=%.6f",
+                  i, a[i].sub, a[i].csub, a[i].secondary, a[i].secondary_all, a[i].frac_rep);
+    }
+}
 
 /* --alt-project (see alt_lift.h). A region on ALT contig `rid` covers forward
  * contig interval [fb, fe) (a reverse-strand region, rb >= l_pac, is the mirror
@@ -418,14 +499,26 @@ enum { AP_UNLIFTED = 0, AP_CAN_REPLACE = 1, AP_CANNOT_REPLACE = 2 };
  * lifted region and a colinear primary one with no overlapping read bases stay
  * two regions, as the ALT piece and the primary piece of such a read do without
  * the flag. */
-int mem_alt_project(const mem_opt_t *opt, const bntseq_t *bns, int n, mem_alnreg_t *a)
+int mem_alt_project(const mem_opt_t *opt, const bntseq_t *bns, int n, mem_alnreg_t *a,
+                    const char *read_name, int read_id)
 {
     const alt_lift_t *L = opt->alt_lift;
-    if (L == NULL || n <= 0) return n;
+    if (L == NULL) return n;
+    alt_project_trace_t trace(read_name, read_id);
+    trace.row("begin", "n=%d\tgap=%d\tmatch=%d", n, opt->alt_project_min_gap, opt->a);
+    for (int i = 0; trace.enabled && i < n; ++i) trace.region("input", bns, i, a[i]);
+    if (n <= 0) {
+        trace.row("summary", "input=%d\toutput=%d\tgap=%d", n, n, opt->alt_project_min_gap);
+        return n;
+    }
     const int64_t l_pac = bns->l_pac;
     /* filled at the first lift; one buffer per thread, reused across reads */
     static thread_local std::vector<alt_project_ent_t> e;
+    static thread_local std::vector<mem_alnreg_t> original;
     e.clear();
+    original.clear();
+    const bool pre_pair_gap = opt->alt_project_min_gap > 0 && !opt->alt_project_pair_gap;
+    if (pre_pair_gap) original.assign(a, a + n);
     for (int i = 0; i < n; ++i) {
         mem_alnreg_t *p = &a[i];
         if (!p->is_alt || p->rid < 0) continue;
@@ -434,13 +527,23 @@ int mem_alt_project(const mem_opt_t *opt, const bntseq_t *bns, int n, mem_alnreg
         const int64_t fe = is_rev ? (l_pac << 1) - p->rb : p->re;
         const int64_t off = bns->anns[p->rid].offset;
         alt_lift_iv_t iv;
-        if (alt_lift_interval(L, p->rid, fb - off, fe - off, &iv) != 0) continue;
+        if (alt_lift_interval(L, p->rid, fb - off, fe - off, &iv) != 0) {
+            trace.row("geometry", "i=%d\tdecision=unliftable", i);
+            continue;
+        }
         if (iv.n_clip > 0 || iv.edge_ins || 2 * iv.n_aln < fe - fb
-            || iv.max_diag > opt->w || iv.max_diag > MEM_ALT_BW_MAX) continue;
+            || iv.max_diag > opt->w || iv.max_diag > MEM_ALT_BW_MAX) {
+            trace.row("geometry", "i=%d\tdecision=refuse\tclip=%lld\tedge_ins=%d\taligned=%lld\tdiag=%lld",
+                      i, (long long) iv.n_clip, iv.edge_ins, (long long) iv.n_aln, (long long) iv.max_diag);
+            continue;
+        }
         /* mem_reg2aln passes a band of at least max_diag, and a wider band never
          * narrows bwa_gen_cigar4's, so this is the narrowest it can use */
         if (bwa_gen_cigar_band(opt->mat[0], opt->o_del, opt->e_del, opt->o_ins, opt->e_ins,
-                               (int) iv.max_diag, p->qe - p->qb, iv.pe - iv.ps) < iv.max_diag) continue;
+                               (int) iv.max_diag, p->qe - p->qb, iv.pe - iv.ps) < iv.max_diag) {
+            trace.row("geometry", "i=%d\tdecision=band_refuse", i);
+            continue;
+        }
         if (e.empty()) {   /* nothing is lifted yet: every rid and rb is its own */
             e.resize(n);
             for (int k = 0; k < n; ++k) e[k] = {k, a[k].rid, AP_UNLIFTED, 0};
@@ -448,13 +551,68 @@ int mem_alt_project(const mem_opt_t *opt, const bntseq_t *bns, int n, mem_alnreg
         const int64_t toff = bns->anns[iv.trid].offset;
         if (is_rev ^ iv.rev) { p->rb = (l_pac << 1) - (toff + iv.pe); p->re = (l_pac << 1) - (toff + iv.ps); }
         else                 { p->rb = toff + iv.ps;                 p->re = toff + iv.pe; }
+        p->alt_source_rid = p->rid;
         p->rid = iv.trid;
         p->is_alt = 0;
         p->alt_bw = (unsigned) iv.max_diag + 1;
         p->dedup_re_rank = 0;  /* its `re` moved: unranked for the next dedup-only call */
         e[i].kind = AP_CAN_REPLACE;
+        trace.region("project", bns, i, *p);
     }
-    if (e.empty()) return n;
+    if (e.empty()) {
+        trace.row("summary", "input=%d\toutput=%d\tgap=%d", n, n, opt->alt_project_min_gap);
+        return n;
+    }
+    /* At gap zero, diagnose the same candidate relations without enabling the
+     * gate. Keep this separate from decisions so tracing cannot affect them. */
+    if (trace.enabled) {
+        int comparisons = 0;
+        for (int i = 0; i < n && comparisons < 512; ++i) {
+            if (e[i].kind == AP_UNLIFTED) continue;
+            for (int j = 0; j < n && comparisons < 512; ++j) {
+                if (i == j) continue;
+                const int overlap = std::min(a[i].qe, a[j].qe) - std::max(a[i].qb, a[j].qb);
+                const int span = std::min(a[i].qe - a[i].qb, a[j].qe - a[j].qb);
+                const bool same = alt_project_same_locus(opt, &a[i], &a[j]);
+                const bool eligible = !a[j].is_alt && a[j].rid >= 0 && overlap > 0 && 2LL * overlap > span && !same;
+                trace.row("compare", "i=%d\tj=%d\toverlap=%d\tshort_span=%d\tsame_locus=%d\teligible=%d\tdelta=%lld",
+                          i, j, overlap, span, same, eligible, (long long) a[i].score - a[j].score);
+                ++comparisons;
+            }
+        }
+        if (comparisons == 512) trace.row("compare_limit", "rows=512\tdetail_limit_reached=1");
+    }
+    if (pre_pair_gap) {
+        // Decide from all eligible projected candidates before restoring any refusal.
+        const int64_t margin = (int64_t) opt->alt_project_min_gap * opt->a;
+        for (int i = 0; i < n; ++i) {
+            if (e[i].kind == AP_UNLIFTED) continue;
+            for (int j = 0; j < n; ++j) {
+                if (i == j || a[j].is_alt || a[j].rid < 0) continue;
+                const int overlap = std::min(a[i].qe, a[j].qe) - std::max(a[i].qb, a[j].qb);
+                const int span = std::min(a[i].qe - a[i].qb, a[j].qe - a[j].qb);
+                if (overlap <= 0 || 2LL * overlap <= span || alt_project_same_locus(opt, &a[i], &a[j])) continue;
+                if ((int64_t) a[i].score - a[j].score <= margin) {
+                    e[i].kind = AP_REFUSED;
+                    trace.row("veto", "i=%d\tj=%d\tdelta=%lld\tmargin=%lld", i, j,
+                              (long long) a[i].score - a[j].score, (long long) margin);
+                    break;
+                }
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            if (e[i].kind != AP_UNLIFTED)
+                trace.row("gate", "i=%d\tdecision=%s", i, e[i].kind == AP_REFUSED ? "refuse" : "pass");
+            if (e[i].kind != AP_REFUSED) continue;
+            a[i] = original[i];
+            e[i].kind = AP_UNLIFTED;
+        }
+    }
+    if (trace.enabled && !pre_pair_gap)
+        for (int i = 0; i < n; ++i)
+            if (e[i].kind != AP_UNLIFTED)
+                trace.row("gate", "i=%d\tdecision=%s", i,
+                          opt->alt_project_min_gap == 0 ? "disabled" : "defer_to_pair");
     /* Step 0 */
     for (int i = 0; i < n; ++i) {
         if (e[i].kind == AP_UNLIFTED) continue;
@@ -462,6 +620,7 @@ int mem_alt_project(const mem_opt_t *opt, const bntseq_t *bns, int n, mem_alnreg
             if (e[j].kind == AP_UNLIFTED && alt_project_same_locus(opt, &a[i], &a[j])
                 && !alt_project_replaces(opt, &a[i], &a[j])) {
                 e[i].kind = AP_CANNOT_REPLACE;
+                trace.row("replace", "i=%d\tj=%d\tdecision=cannot_replace", i, j);
                 break;
             }
     }
@@ -495,8 +654,12 @@ int mem_alt_project(const mem_opt_t *opt, const bntseq_t *bns, int n, mem_alnreg
     /* survivors in priority order; one buffer per thread, reused across reads */
     static thread_local std::vector<mem_alnreg_t> out;
     out.clear();
-    for (int r = 0; r < n; ++r)
+    for (int r = 0; r < n; ++r) {
+        trace.row("group", "i=%d\tkind=%d\tkeep=%d\toutput_index=%d", e[r].i, e[r].kind,
+                  e[r].keep, e[r].keep ? (int) out.size() : -1);
         if (e[r].keep) out.push_back(a[e[r].i]);
+    }
+    trace.row("summary", "input=%d\toutput=%d\tgap=%d", n, (int) out.size(), opt->alt_project_min_gap);
     std::copy(out.begin(), out.end(), a);
     return (int) out.size();
 }

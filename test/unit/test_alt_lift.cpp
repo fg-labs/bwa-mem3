@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 #include <string>
 #include <unistd.h>
 #include <vector>
@@ -138,6 +139,37 @@ mem_alnreg_t reg(const FakeBns &fb, int rid, int64_t cs, int64_t ce, int rev, in
     r.is_alt = fb.bns.anns[rid].is_alt;
     r.seedcov = tag;
     return r;
+}
+// Resolve already-projected candidates without rescue, to isolate pairing/MAPQ.
+struct PairOutcome { int paired, flag, q[2], score[2]; int64_t rb[2]; };
+PairOutcome project_and_pair(mem_opt_t *opt, const FakeBns &fb,
+                             const std::vector<mem_alnreg_t> input[2]) {
+    std::vector<mem_alnreg_t> regions[2] = {input[0], input[1]};
+    opt->flag |= MEM_F_NO_RESCUE;
+    mem_alnreg_v a[2] = {};
+    for (int i = 0; i < 2; ++i) {
+        regions[i].resize(mem_alt_project(opt, &fb.bns, (int) regions[i].size(), regions[i].data()));
+        a[i].a = regions[i].data();
+        a[i].n = a[i].m = regions[i].size();
+    }
+    mem_pestat_t pes[4] = {};
+    for (auto &p : pes) p.failed = 1;
+    pes[1].failed = 0;
+    pes[1].avg = 299; pes[1].std = 30; pes[1].low = 180; pes[1].high = 420;
+    bseq1_t reads[2] = {};
+    mem_cache *cache = (mem_cache *) calloc(1, sizeof(mem_cache));
+    REQUIRE(cache != nullptr);
+    int32_t gcnt = 0;
+    int n_pri[2], selected[2] = {-1, -1};
+    PairOutcome out = {};
+    mem_pair_resolve_batch_post(opt, &fb.bns, nullptr, pes, 7, reads, a, nullptr, cache,
+                               gcnt, 0, n_pri, selected, out.q, &out.flag, &out.paired);
+    for (int i = 0; i < 2; ++i) {
+        out.rb[i] = out.paired ? a[i].a[selected[i]].rb : -1;
+        out.score[i] = out.paired ? a[i].a[selected[i]].score : -1;
+    }
+    free(cache);
+    return out;
 }
 } // namespace
 
@@ -967,6 +999,264 @@ TEST_CASE("mem_alt_project: a read with no region to lift is left as it is" * do
     memcpy(b, a, sizeof(a));
     REQUIRE(mem_alt_project(o.o, &fb.bns, 3, a) == 3);
     CHECK(memcmp(a, b, sizeof(a)) == 0);
+}
+
+TEST_CASE("mem_alt_project: paired-confidence gap retains full candidate scores" * doctest::test_suite("unit/alt_lift")) {
+    FakeBns fb({{"chr1", 20000, 0}, {"alt", 1000, 1}});
+    TmpFile f("alt\t0\tchr1\t1001\t60\t1000M\t*\t0\t0\t*\t*\n");
+    LiftGuard lift(alt_lift_load(f.path.c_str(), &fb.bns));
+    OptGuard opt;
+    opt.o->alt_lift = lift.l;
+    opt.o->alt_project_min_gap = 2;
+    opt.o->alt_project_pair_gap = 1;
+    std::vector<mem_alnreg_t> regions[2] = {
+        {reg(fb, 0, 1000, 1100, 0, 100, 100, 0, 100),
+         reg(fb, 1, 500, 600, 0, 100, 100, 0, 100),
+         reg(fb, 0, 1500, 1600, 0, 90, 100, 0, 100)},
+        {reg(fb, 0, 1200, 1300, 1, 100, 100, 0, 100),
+         reg(fb, 1, 700, 800, 1, 100, 100, 0, 100),
+         reg(fb, 0, 1700, 1800, 1, 90, 100, 0, 100)}
+    };
+    SUBCASE("an equal paired alternative is not weakened by ordinary hits") {
+        const auto out = project_and_pair(opt.o, fb, regions);
+        REQUIRE(out.paired == 1);
+        CHECK(out.q[0] == 0);
+        CHECK(out.q[1] == 0);
+    }
+    SUBCASE("a three-point pair advantage minus gap two caps MAPQ at six") {
+        regions[0][0] = reg(fb, 1, 0, 100, 0, 100, 100, 0, 100);
+        regions[1][1].score = regions[1][1].truesc = 97;
+        const auto out = project_and_pair(opt.o, fb, regions);
+        REQUIRE(out.paired == 1);
+        CHECK(out.rb[0] == 1000);
+        CHECK(out.q[0] <= 6);
+        CHECK(out.q[1] <= 6);
+        CHECK(out.q[0] > 0);
+    }
+    SUBCASE("match-score scaling preserves the confidence margin") {
+        regions[0][0] = reg(fb, 1, 0, 100, 0, 200, 100, 0, 100);
+        regions[0][1].score = regions[0][1].truesc = 200;
+        regions[0][2].score = regions[0][2].truesc = 180;
+        regions[1][0].score = regions[1][0].truesc = 200;
+        regions[1][1].score = regions[1][1].truesc = 194;
+        regions[1][2].score = regions[1][2].truesc = 180;
+        opt.o->a = 2;
+        opt.o->pen_unpaired *= 2;
+        const auto out = project_and_pair(opt.o, fb, regions);
+        REQUIRE(out.paired == 1);
+        CHECK(out.rb[0] == 1000);
+        CHECK(out.q[0] > 0);
+        CHECK(out.q[0] <= 6);
+        CHECK(out.q[1] <= 6);
+    }
+    SUBCASE("a split-query primary bypasses paired confidence") {
+        regions[0] = {reg(fb, 1, 0, 60, 0, 60, 60, 0, 60),
+                      reg(fb, 0, 10000, 10040, 0, 40, 40, 60, 100)};
+        regions[1].resize(1);
+        const auto out = project_and_pair(opt.o, fb, regions);
+        CHECK(out.paired == 0);
+    }
+    SUBCASE("a unique mate still resolves a single-end tie") {
+        regions[1].resize(1);
+        const auto out = project_and_pair(opt.o, fb, regions);
+        REQUIRE(out.paired == 1);
+        CHECK(out.rb[0] == 1000);
+        CHECK(out.q[0] > 0);
+    }
+    SUBCASE("a pair with no selected lifted hit keeps ordinary confidence") {
+        regions[0].resize(1);
+        regions[1].resize(1);
+        opt.o->alt_project_min_gap = 2147483647;
+        const auto out = project_and_pair(opt.o, fb, regions);
+        REQUIRE(out.paired == 1);
+        CHECK(out.rb[0] == 1000);
+        CHECK(out.q[0] == 60);
+        CHECK(out.q[1] == 60);
+    }
+    SUBCASE("unpaired-preferred ends retain independent confidence") {
+        regions[0] = {reg(fb, 1, 0, 100, 0, 100, 100, 0, 100)};
+        regions[1] = {reg(fb, 0, 1317, 1417, 1, 100, 100, 0, 100)};
+        opt.o->pen_unpaired = 0;
+        const auto out = project_and_pair(opt.o, fb, regions);
+        REQUIRE(out.paired == 1);
+        CHECK((out.flag & 2) == 0);
+        CHECK(out.q[0] == 60);
+        CHECK(out.q[1] == 60);
+    }
+    SUBCASE("no-pairing and failed-pair paths do not read selected indices") {
+        regions[0] = {reg(fb, 1, 0, 100, 0, 100, 100, 0, 100)};
+        SUBCASE("no pairing requested") { opt.o->flag |= MEM_F_NOPAIRING; }
+        SUBCASE("no compatible mate") { regions[1] = {reg(fb, 0, 10000, 10100, 1, 100, 100, 0, 100)}; }
+        const auto out = project_and_pair(opt.o, fb, regions);
+        CHECK(out.paired == 0);
+    }
+    SUBCASE("a wide gap cannot overflow or change the chosen placement") {
+        opt.o->a = 127;
+        regions[0][0] = reg(fb, 1, 0, 100, 0, 100, 100, 0, 100);
+        regions[1].resize(1);
+        opt.o->alt_project_min_gap = 2147483647;
+        const auto out = project_and_pair(opt.o, fb, regions);
+        REQUIRE(out.paired == 1);
+        CHECK(out.rb[0] == 1000);
+        CHECK(out.q[0] == 0);
+        CHECK(out.q[1] == 0);
+    }
+}
+
+TEST_CASE("mem_alt_project: paired-confidence gap only lowers confidence over varied candidates" * doctest::test_suite("unit/alt_lift")) {
+    FakeBns fb({{"chr1", 20000, 0}, {"alt", 4000, 1}});
+    TmpFile f("alt\t0\tchr1\t1001\t60\t4000M\t*\t0\t0\t*\t*\n");
+    LiftGuard lift(alt_lift_load(f.path.c_str(), &fb.bns));
+    OptGuard opt;
+    opt.o->alt_lift = lift.l;
+    opt.o->alt_project_pair_gap = 1;
+    std::mt19937 random(775);
+    int lowered = 0;
+    for (int trial = 0; trial < 200; ++trial) {
+        std::vector<mem_alnreg_t> regions[2];
+        opt.o->a = 1 + (trial % 3);
+        opt.o->pen_unpaired = (trial % 4 == 0 ? 0 : 17 * opt.o->a);
+        for (int locus = 0; locus < 3; ++locus) {
+            const int pos = 1000 + locus * 1000;
+            for (int end = 0; end < 2; ++end) {
+                const bool lifted = (random() % 2) != 0;
+                const int start = pos + (end ? 200 : 0) + (int)(random() % 7);
+                const int score = (80 + (int)(random() % 21)) * opt.o->a;
+                regions[end].push_back(reg(fb, lifted ? 1 : 0,
+                    lifted ? start - 1000 : start, lifted ? start - 900 : start + 100,
+                    end, score, 100, 0, 100));
+            }
+        }
+        opt.o->alt_project_min_gap = 0;
+        const auto baseline = project_and_pair(opt.o, fb, regions);
+        opt.o->alt_project_min_gap = 1 + trial % 5;
+        const auto guarded = project_and_pair(opt.o, fb, regions);
+        CHECK(guarded.paired == baseline.paired);
+        CHECK(guarded.flag == baseline.flag);
+        if (!baseline.paired) continue;
+        for (int end = 0; end < 2; ++end) {
+            CHECK(guarded.rb[end] == baseline.rb[end]);
+            CHECK(guarded.score[end] == baseline.score[end]);
+            CHECK(guarded.q[end] <= baseline.q[end]);
+            lowered += guarded.q[end] < baseline.q[end];
+        }
+    }
+    CHECK(lowered > 0);
+}
+
+TEST_CASE("mem_alt_project: score-gap guard refuses ambiguous cross-locus projections" * doctest::test_suite("unit/alt_lift")) {
+    FakeBns fb(kCtgs);
+    TmpFile tmp(kAlt);
+    LiftGuard l(alt_lift_load(tmp.path.c_str(), &fb.bns));
+    OptGuard o;
+    o.o->alt_lift = l.l;
+    o.o->alt_project_min_gap = 2;
+    // The ALT projects to chr1:3000, while the same query also matches chr1:10000.
+    // Removing the gate, changing <= to <, or ignoring -A must break this test.
+    for (int match : {1, 2}) {
+        o.o->a = match;
+        for (int competitor : {150 - 2 * match - 1, 150 - 2 * match, 150, 151}) {
+            for (int order = 0; order < 2; ++order) {
+                mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1),
+                                    reg(fb, CHR1, 10000, 10150, 0, competitor, 2)};
+                a[0].seedlen0 = 19;
+                const auto original = a[0];
+                if (order) std::swap(a[0], a[1]);
+                REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+                const auto &lift = a[a[0].seedcov == 1 ? 0 : 1];
+                if (competitor >= 150 - 2 * match) CHECK(memcmp(&lift, &original, sizeof(lift)) == 0);
+                CHECK(lift.rid == (competitor >= 150 - 2 * match ? ALT_FWD : CHR1));
+                CHECK(lift.is_alt == (competitor >= 150 - 2 * match));
+            }
+        }
+    }
+}
+
+TEST_CASE("mem_alt_project: gap decisions use projected competitors without suppressing split pieces" * doctest::test_suite("unit/alt_lift")) {
+    FakeBns fb(kCtgs);
+    TmpFile tmp(kAlt);
+    LiftGuard l(alt_lift_load(tmp.path.c_str(), &fb.bns));
+    OptGuard o;
+    o.o->alt_lift = l.l;
+    o.o->alt_project_min_gap = 2;
+    SUBCASE("same-locus hits are not competitors") {
+        mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1), reg(fb, CHR1, 3000, 3150, 0, 149, 2)};
+        REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 1);
+        CHECK(a[0].seedcov == 1);
+        CHECK(a[0].rid == CHR1);
+    }
+    SUBCASE("disjoint query pieces do not veto a lift") {
+        mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 100, 0, 100, 1, 0, 100),
+                            reg(fb, CHR1, 10000, 10100, 0, 100, 2, 100, 200)};
+        REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+        CHECK(a[0].rid == CHR1);
+        CHECK(a[1].rid == CHR1);
+    }
+    SUBCASE("equal projected competitors both refuse in every order") {
+        for (int order = 0; order < 2; ++order) {
+            mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1),
+                                reg(fb, ALT_FWD2, 500, 650, 0, 150, 2)};
+            if (order) std::swap(a[0], a[1]);
+            REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+            CHECK((int) a[0].is_alt == 1);
+            CHECK((int) a[1].is_alt == 1);
+        }
+    }
+    SUBCASE("unprojectable ALT cannot veto a valid lift") {
+        mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1),
+                            reg(fb, ALT_CLIP, 0, 150, 0, 150, 2)};
+        REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+        CHECK(a[0].rid == CHR1);
+        CHECK(a[1].rid == ALT_CLIP);
+    }
+    SUBCASE("opposite-strand placements compete") {
+        mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1),
+                            reg(fb, CHR1, 3000, 3150, 1, 149, 2)};
+        REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+        const auto &lift = a[a[0].seedcov == 1 ? 0 : 1];
+        CHECK(lift.rid == ALT_FWD);
+    }
+    SUBCASE("half query overlap is not a competitor; one base more is") {
+        for (int begin : {74, 75}) {
+            mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1),
+                                reg(fb, CHR1, 10000, 10150, 0, 149, 2, begin, begin + 150)};
+            REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+            const auto &lift = a[a[0].seedcov == 1 ? 0 : 1];
+            CHECK(lift.rid == (begin == 74 ? ALT_FWD : CHR1));
+        }
+    }
+    SUBCASE("wide products do not wrap the margin") {
+        o.o->a = 127;
+        o.o->alt_project_min_gap = 2147483647;
+        mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1), reg(fb, CHR1, 10000, 10150, 0, 1, 2)};
+        REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+        const auto &lift = a[a[0].seedcov == 1 ? 0 : 1];
+        CHECK(lift.rid == ALT_FWD);
+    }
+    SUBCASE("zero disables even an exact cross-locus tie") {
+        o.o->alt_project_min_gap = 0;
+        mem_alnreg_t a[] = {reg(fb, ALT_FWD, 0, 150, 0, 150, 1), reg(fb, CHR1, 10000, 10150, 0, 150, 2)};
+        REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
+        CHECK(a[0].rid == CHR1);
+        CHECK(a[1].rid == CHR1);
+    }
+}
+
+TEST_CASE("mem_alt_project: provenance follows the winning source contig" * doctest::test_suite("unit/alt_lift")) {
+    FakeBns fb(kCtgs);
+    TmpFile tmp(kAlt);
+    LiftGuard l(alt_lift_load(tmp.path.c_str(), &fb.bns));
+    OptGuard o;
+    o.o->alt_lift = l.l;
+    for (int rid : {ALT_FWD, ALT_REV, ALT_FWD2}) {
+        for (int strand : {0, 1}) {
+            auto a = reg(fb, rid, 0, 150, strand, 150, 1);
+            a.seedlen0 = 19;
+            REQUIRE(mem_alt_project(o.o, &fb.bns, 1, &a) == 1);
+            REQUIRE(a.rid == CHR1);
+            CHECK(a.alt_source_rid == rid);
+        }
+    }
 }
 
 TEST_CASE("mem_alt_project: without --alt-project it is a no-op" * doctest::test_suite("unit/alt_lift")) {
