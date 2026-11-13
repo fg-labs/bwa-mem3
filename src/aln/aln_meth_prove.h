@@ -46,7 +46,15 @@ int aln_meth_band_ed(const ubyte_t *q, int n, const uint8_t *t, int m, int dlo, 
 struct aln_meth_verify_scratch_t {
     std::vector<uint8_t> text;
     std::vector<int16_t> dp;
+    std::vector<uint64_t> planes; // the text masks as bit planes (aln_meth_band_ed_bits)
 };
+
+/* aln_meth_band_ed computed on bit vectors, one 64-bit word per distance 0..kmax over the band's
+ * diagonals: the same cells, so the same result. Bands wider than 64 diagonals or kmax above
+ * ALN_METH_BITS_KMAX go to aln_meth_band_ed. */
+enum { ALN_METH_BITS_KMAX = 31 };
+int aln_meth_band_ed_bits(const ubyte_t *q, int n, const uint8_t *t, int m, int dlo, int dhi, bool free_start, int kmax,
+                          aln_meth_verify_scratch_t *s);
 
 /* Whether S[0, len) has no alignment of at most kmax unit edits starting at T position
  * s in [y0, y0 + 2 * kmax] (the text after it is free): the semi-global distance on the band of
