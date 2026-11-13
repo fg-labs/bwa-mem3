@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <new>
 
@@ -158,6 +159,115 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
     } catch (const std::bad_alloc &) {
         return error(aln_meth_eval_status::resource_error, "cannot allocate candidate alignment buffers");
     }
+}
+
+void aln_meth_fast_init(const aln_meth_opt_t &mo, aln_meth_fast_t *f)
+{
+    *f = aln_meth_fast_t();
+    if (mo.m.meth_context == METH_CTX_CPG) return;
+    const int8_t *ot = mo.mat_ot, *ob = mo.mat_ob;
+    const int8_t conv = ot[1 * 5 + 3];
+    const bool collapsed = ot[3 * 5 + 1] == conv && ot[3 * 5 + 1] != ot[0 * 5 + 1];
+    int best = 0;
+    for (int h = 0; h < 2; ++h) {
+        const int8_t *mat = h ? ot : ob;
+        for (int r = 0; r < 5; ++r) for (int q = 0; q < 5; ++q) {
+            const int v = mat[r * 5 + q];
+            if (v < -3 || v > 1) return; // aln_meth_realign_window's model check: leave it the error
+            best = std::max(best, v);
+            const bool is_conv = h ? (r == 1 && q == 3) || (collapsed && r == 3 && q == 1)
+                                   : (r == 2 && q == 0) || (collapsed && r == 0 && q == 2);
+            const int want = (r == 4 || q == 4) ? mat[4 * 5 + 0] : is_conv ? conv : r == q ? mat[0] : mat[0 * 5 + 1];
+            if (v != want) return;
+        }
+    }
+    if (ob[2 * 5 + 0] != conv || conv < 0 || ot[0] < 0 || ot[1] >= 0 || ot[4 * 5 + 0] >= 0) return;
+    f->collapsed = collapsed;
+    f->match = ot[0]; f->mism = ot[1]; f->amb = ot[4 * 5 + 0]; f->conv = conv; f->best_cell = best;
+    f->ok = true;
+}
+
+void aln_meth_read_bits(const ubyte_t *query, int len, aln_meth_read_bits_t *out)
+{
+    const size_t nw = ((size_t)len + 31) / 32;
+    out->len = len;
+    for (auto *v : {&out->code, &out->n, &out->a, &out->c, &out->g, &out->t}) v->assign(nw, 0);
+    for (int k = 0; k < len; ++k) {
+        const int w = k >> 5, sh = 62 - 2 * (k & 31);
+        const int b = query[k];
+        if (b > 3) { out->n[w] |= 1ULL << sh; continue; }
+        out->code[w] |= (uint64_t)b << sh;
+        (b == 0 ? out->a : b == 1 ? out->c : b == 2 ? out->g : out->t)[w] |= 1ULL << sh;
+    }
+}
+
+namespace {
+constexpr uint64_t LANE_LO = 0x5555555555555555ULL;
+// 32 reference bases from forward position q, first base in the top bits (lanes past the
+// reference end are 0).
+inline uint64_t pac_word(const uint8_t *pac, int64_t l_pac, int64_t q)
+{
+    const int64_t b = q >> 2;
+    const int sh = (int)(q & 3) * 2;
+    if (b + 9 <= l_pac / 4 + 1) { // the 9 bytes read lie inside the pac allocation (l_pac/4 + 1)
+        uint64_t v;
+        memcpy(&v, pac + b, 8);
+        v = __builtin_bswap64(v);
+        if (sh) v = v << sh | (uint64_t)pac[b + 8] >> (8 - sh);
+        return v;
+    }
+    uint64_t v = 0;
+    for (int j = 0; j < 32 && q + j < l_pac; ++j) {
+        const int64_t p = q + j;
+        v |= (uint64_t)(pac[p >> 2] >> ((~p & 3) << 1) & 3) << (62 - 2 * j);
+    }
+    return v;
+}
+struct amb_bits_t { uint64_t *bits; int64_t rb; };
+int amb_visit(int64_t begin, int64_t end, void *context)
+{
+    auto *a = static_cast<amb_bits_t *>(context);
+    for (int64_t p = begin; p < end; ++p) {
+        const int64_t k = p - a->rb;
+        a->bits[k >> 5] |= 1ULL << (62 - 2 * (k & 31));
+    }
+    return 0;
+}
+} // namespace
+
+void aln_meth_score_ungapped(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, int hyp, int64_t rb,
+                             const aln_meth_read_bits_t &rd, aln_meth_ungapped_t *out)
+{
+    const int len = rd.len, nw = (len + 31) / 32;
+    uint64_t amb_small[8];
+    std::vector<uint64_t> amb_big;
+    uint64_t *amb = amb_small;
+    if (nw > 8) { amb_big.assign(nw, 0); amb = amb_big.data(); }
+    else std::fill(amb_small, amb_small + 8, 0);
+    amb_bits_t ctx{amb, rb};
+    bns_iter_ambi(ref.bns, rb, len, amb_visit, &ctx);
+    int n_mm = 0, n_conv = 0, n_amb = 0;
+    for (int w = 0; w < nw; ++w) {
+        const uint64_t R = pac_word(ref.pac, ref.bns->l_pac, rb + 32LL * w), Q = rd.code[w];
+        const int rem = len - 32 * w;
+        const uint64_t valid = rem >= 32 ? LANE_LO : LANE_LO & (~0ULL << (64 - 2 * rem));
+        const uint64_t x = R ^ Q, neq = (x | x >> 1) & LANE_LO;
+        const uint64_t lo = R & LANE_LO, hi = R >> 1 & LANE_LO;
+        uint64_t conv;
+        if (hyp) { // OT: reference C / read T (collapsed: and reference T / read C)
+            conv = lo & ~hi & rd.t[w];
+            if (f.collapsed) conv |= lo & hi & rd.c[w];
+        } else {   // OB: reference G / read A (collapsed: and reference A / read G)
+            conv = ~lo & hi & rd.a[w];
+            if (f.collapsed) conv |= ~lo & ~hi & LANE_LO & rd.g[w];
+        }
+        const uint64_t nn = (rd.n[w] | amb[w]) & valid;
+        n_amb += __builtin_popcountll(nn);
+        n_mm += __builtin_popcountll(((neq & ~conv) & valid) | nn);
+        n_conv += __builtin_popcountll(conv & ~nn & valid);
+    }
+    out->n_mm = n_mm; out->n_conv = n_conv;
+    out->reward = (len - n_mm - n_conv) * f.match + n_conv * f.conv + (n_mm - n_amb) * f.mism + n_amb * f.amb;
 }
 
 } // namespace bwa_aln

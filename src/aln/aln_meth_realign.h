@@ -26,5 +26,25 @@ bool aln_meth_window_has_site(const aln_meth_ref_t &ref, int64_t rb, int len, in
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &candidate, const ubyte_t *query, int len, int n_ins, int n_del,
     aln_meth_alignment_t *out, int alt = 0, std::vector<uint8_t> *window = nullptr);
+
+/* The equal-span ungapped scorer: the reward, mismatches and conversions of the [len M] alignment
+ * of a query against the reference window [rb, rb + len), as aln_meth_realign_window (ungapped
+ * reward) and the search's accounting compute them base by base, but 32 bases per 64-bit word.
+ * Only for the 5-letter model (--meth-context all) and the reference haplotype; other settings
+ * keep the base-by-base path (aln_meth_fast_t::ok is false). aln_meth_fast_init fills the
+ * matrix classes (aln_meth.h) from mo's matrices; aln_meth_opt_finish calls it. */
+void aln_meth_fast_init(const aln_meth_opt_t &mo, aln_meth_fast_t *f);
+/* The query as 2-bit codes, 32 bases per word, first base in the top bits, and one-bit-per-base
+ * planes (the low bit of each 2-bit lane) of its N, A, C, G and T positions. */
+struct aln_meth_read_bits_t {
+    int len = 0;
+    std::vector<uint64_t> code, n, a, c, g, t;
+};
+void aln_meth_read_bits(const ubyte_t *query, int len, aln_meth_read_bits_t *out);
+struct aln_meth_ungapped_t { int reward, n_mm, n_conv; };
+/* Scores rd against [rb, rb + rd.len) of the original reference under hypothesis hyp (1: OT,
+ * C->T; 0: OB, G->A). Reference .amb runs count as N. Requires f.ok. */
+void aln_meth_score_ungapped(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, int hyp, int64_t rb,
+                             const aln_meth_read_bits_t &rd, aln_meth_ungapped_t *out);
 }
 #endif
