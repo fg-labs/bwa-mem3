@@ -117,9 +117,16 @@ extern "C" {
 	 * rebuilding the on-disk index.
 	 * n_threads: worker count for the densify pass (the per-sample LF-walks are
 	 * independent); <=0 or 1 runs it serially. Ignored when not densifying. */
+	/* hugetlb_dir: NULL (default) stages into POSIX shared memory. Non-NULL
+	 * asks for the index on 1 GB hugetlb pages (Linux only; see "1 GB hugetlb
+	 * staging" below): "" finds a writable hugetlbfs mount with pagesize=1G in
+	 * /proc/mounts, any other value names such a mount. When that is not
+	 * possible the index is staged in POSIX shared memory as if hugetlb_dir
+	 * were NULL, with an [M::] line saying why. */
 	int       bwa_shm_stage(const char *prefix, bool bns_only = false,
 	                        int target_sa_compx = -1,
-	                        int n_threads = 1); /* loads from disk, packs, stages */
+	                        int n_threads = 1,
+	                        const char *hugetlb_dir = NULL); /* loads from disk, packs, stages */
 	/* Test-only hook (see bwa_shm.cpp): bwa_shm_stage calls it with its
 	 * writable index mapping after it has registered the segment and released
 	 * the stager lock, before the pack fills it, so a unit test can inspect
@@ -130,8 +137,12 @@ extern "C" {
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */
 
-	/* Attach helpers used by FMI_search / indexEle / fastmap. */
-	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out);   /* NULL if not staged */
+	/* Attach helpers used by FMI_search / indexEle / fastmap.
+	 * *len_out is the packed index size (the header's total_size), the bound
+	 * for every section lookup. *map_len_out (optional) is the length of the
+	 * mapping, which is what the caller passes to munmap. */
+	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out,
+	                         size_t *map_len_out = NULL);            /* NULL if not staged */
 	int       bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 	                               uint64_t *offset_out, uint64_t *size_out);
 
@@ -180,8 +191,92 @@ extern "C" {
 	 * caller frees with free(). Returns 0 on success, -1 on error. */
 	int bwa_shm_pack_from_disk(const char *prefix, uint8_t **buf_out, uint64_t *len_out);
 
+	/* ---- 1 GB hugetlb staging (`bwa-mem3 shm --huge-pages`) -------------
+	 *
+	 * /dev/shm is a tmpfs, which backs a segment with 2 MB pages at most. To
+	 * put a staged index on 1 GB pages, the stager writes it to the file
+	 * `<dir>/bwaidx-<name>` on a hugetlbfs mount with pagesize=1G, and the
+	 * POSIX segment `/bwaidx-<name>` holds a redirect stub
+	 * (bwa_shm_hugetlb_stub_t) naming that file. The registry entry is the
+	 * usual one, so `mem`, `shm -l` and `shm -d` find the index by the same
+	 * name, and bwa_shm_attach follows the stub.
+	 *
+	 * The stub's first 64 bytes read as a bwa_shm_header_t: magic 0 while
+	 * staging, the stager PID and stage token where the header keeps them, and
+	 * its own magic published last. A redirect stage is therefore waited on,
+	 * reclaimed and checked for ownership exactly like any other. The stub is
+	 * written before the file is created and removed after the file, so every
+	 * file a stage creates is named by a registered stub, even one left by a
+	 * killed stage, and a restage or `shm -d` frees its pages.
+	 *
+	 * A stub is followed only to `bwaidx-<name>` for its own registry name, as
+	 * a regular file (not a symlink) owned by the stub's owner in a directory
+	 * on a hugetlbfs mount with 1 GB pages; the attach also requires the
+	 * file's header to carry the stub's stage token and size. */
+#define BWA_SHM_HUGETLB_STUB_MAGIC   0x0045475548415742ull /* "BWAHUGE\0" little-endian */
+#define BWA_SHM_HUGETLB_STUB_VERSION 1u
+#define BWA_SHM_HUGETLB_KIND_1G      1u   /* non-zero marks a stub while staging */
+#define BWA_SHM_HUGETLB_PATH_MAX     4096 /* fixed, so the stub size does not vary by OS */
+#define BWA_SHM_HUGETLB_FILE_PREFIX  "bwaidx-"
+
+	typedef struct {
+		uint64_t magic;          /* 0 while staging; BWA_SHM_HUGETLB_STUB_MAGIC once complete */
+		uint32_t version;        /* BWA_SHM_HUGETLB_STUB_VERSION */
+		uint32_t kind;           /* BWA_SHM_HUGETLB_KIND_1G (header n_sections) */
+		uint64_t total_size;     /* packed index bytes (header total_size) */
+		uint64_t stager_pid;     /* header reserved[0] */
+		uint64_t stage_token;    /* header reserved[1] */
+		uint64_t file_size;      /* header reserved[2]: the file's size, whole 1 GiB
+		                          * pages; 0 until the stager has created the file */
+		uint64_t reserved[2];    /* zero */
+		char     path[BWA_SHM_HUGETLB_PATH_MAX]; /* absolute path of the file */
+	} bwa_shm_hugetlb_stub_t;     /* 64 + 4096 bytes */
+
+	/* A complete stub (magic set, PID and token zero) for `path` holding an
+	 * index of `total_size` bytes in a file of `file_size` bytes. Returns 0,
+	 * or -1 when the fields would not decode. Pure. */
+	int bwa_shm_hugetlb_stub_encode(const char *path, uint64_t total_size,
+	                                uint64_t file_size, bwa_shm_hugetlb_stub_t *out);
+
+	/* Validate `len` bytes at `buf` as a complete stub and copy it to *out.
+	 * Returns 0 when the length, magic, version and kind match, the path is
+	 * absolute and NUL-terminated, and 0 < total_size <= file_size with
+	 * file_size a whole number of 1 GiB pages; -1 otherwise. The binding of
+	 * the path to a registry name is the caller's check. Pure. */
+	int bwa_shm_hugetlb_stub_decode(const void *buf, size_t len,
+	                                bwa_shm_hugetlb_stub_t *out);
+
+	/* Parse one line of /proc/mounts ("<src> <dir> <fstype> <opts> ..."). If it
+	 * is a hugetlbfs mount whose page size is 1 GiB (pagesize=1024M, 1G or
+	 * 1048576K), copy its directory, with the octal escapes of /proc/mounts
+	 * (\040 for a space, ...) decoded, into dir_out and return 1. Returns 0 for
+	 * any other line, a malformed one, or a directory that does not fit in
+	 * dir_len bytes. Pure. */
+	int bwa_shm_parse_hugetlbfs_1g_mount(const char *line, char *dir_out, size_t dir_len);
+
 #ifdef __cplusplus
 }
+
+static_assert(sizeof(bwa_shm_header_t) == 64, "index header is 64 bytes");
+static_assert(sizeof(bwa_shm_hugetlb_stub_t) == 64 + BWA_SHM_HUGETLB_PATH_MAX,
+              "stub is a 64-byte header and a fixed-size path");
+static_assert(offsetof(bwa_shm_hugetlb_stub_t, kind) ==
+              offsetof(bwa_shm_header_t, n_sections), "stub kind overlays n_sections");
+static_assert(offsetof(bwa_shm_hugetlb_stub_t, total_size) ==
+              offsetof(bwa_shm_header_t, total_size), "stub total_size overlays the header's");
+static_assert(offsetof(bwa_shm_hugetlb_stub_t, stager_pid) ==
+              offsetof(bwa_shm_header_t, reserved), "stub PID overlays header reserved[0]");
+static_assert(offsetof(bwa_shm_hugetlb_stub_t, stage_token) ==
+              offsetof(bwa_shm_header_t, reserved) + sizeof(uint64_t),
+              "stub token overlays header reserved[1]");
+static_assert(offsetof(bwa_shm_hugetlb_stub_t, file_size) ==
+              offsetof(bwa_shm_header_t, reserved) + 2 * sizeof(uint64_t),
+              "stub file_size overlays header reserved[2]");
+static_assert(offsetof(bwa_shm_hugetlb_stub_t, path) == sizeof(bwa_shm_header_t),
+              "stub path follows the 64-byte header");
+static_assert(PATH_MAX <= BWA_SHM_HUGETLB_PATH_MAX, "a stub holds any path");
+static_assert(BWA_SHM_VERSION != BWA_SHM_HUGETLB_STUB_VERSION,
+              "a staging stub is told from a staging index by its version");
 #endif
 
 #endif /* BWA_SHM_H_ */

@@ -73,6 +73,12 @@ stage with the same basename fails and names it. `shm -d` cannot find such an
 unregistered segment. Remove it with `shm_unlink(3)` (on Linux, unlink its file
 under `/dev/shm`, for example `/dev/shm/bwaidx-ref.fa`), then stage again.
 
+For an index staged with [`--huge-pages`](#--huge-pagesdir--stage-the-index-on-1-gb-huge-pages-linux-opt-in),
+`shm -d` also removes its file on the hugetlbfs mount, which returns its 1 GB
+pages to the pool, and so does the reclaim of an interrupted 1 GB page stage. If
+that file cannot be removed, `shm -d` says so and exits non-zero: its pages stay
+reserved until it is removed.
+
 ### `-l` — list staged indices
 
 Prints the name and size in bytes of each registered segment, tab-separated,
@@ -80,9 +86,11 @@ one per line. A third column flags an entry `mem` will not attach to:
 
 - `incomplete`: its stage is still running or was interrupted;
 - `missing`: the entry has no segment (a stage that lost its lock; the next
-  stage drops the entry);
+  stage drops the entry), or it is a `--huge-pages` redirect whose file is gone
+  (removed by hand, or its hugetlbfs mount is gone; the next stage reclaims it);
 - `unusable`: the segment cannot be opened, is not a bwa-mem3 index of this
-  version, or is shorter than its header declares.
+  version, or is shorter than its header declares; or it is a `--huge-pages`
+  redirect whose file does not check out (see below).
 
 Useful to confirm that staging succeeded before launching alignment jobs.
 
@@ -133,6 +141,84 @@ LF-walks are independent and write disjoint slots, so densification scales
 near-linearly with thread count (on hg38, Graviton4, arm64/NEON tier, the
 densify pass runs ~11 min at `-t 1` and ~40 s at `-t 16`). Meaningful only with
 `-u`; a value `> 1` without `-u` warns and is ignored.
+
+### `--huge-pages[=DIR]` — stage the index on 1 GB huge pages (Linux, opt-in)
+
+Writes the packed index to a file on a `hugetlbfs` mount with 1 GB pages
+instead of into `/dev/shm`, so every `mem` that attaches maps it on 1 GB pages.
+This is the shared-memory counterpart of
+[`mem --huge-pages`](mem.md#--huge-pages--put-the-index-on-1-gb-huge-pages-linux-opt-in),
+which has no effect on an attached index: it cuts data-TLB page walks in
+seeding on hosts whose 1 GB pages reach the TLB. `/dev/shm` is a tmpfs, which
+can back a segment with 2 MB pages at most (see
+[Huge pages](#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size) below).
+
+With no `DIR`, `shm` uses the first `hugetlbfs` mount with `pagesize=1G` in
+`/proc/mounts` that it can create files in. The file is `DIR/bwaidx-<name>`,
+and the whole index goes on 1 GB pages, rounded up to whole pages: 11 pages for
+hg38, about 4 more with `-u 2`. The pages are reserved when the file is mapped
+and faulted in over several threads before the index is written. The registry
+entry and the name are the same as for a `/dev/shm` stage, so `mem`, `shm -l`
+and `shm -d` need no flag: `/dev/shm` holds a small redirect record that points
+at the file, and `shm -d` removes the file too, which returns its pages to the
+pool.
+
+Set up once per boot (as root), then stage as the user who will run `mem`:
+
+```bash
+echo 12 | sudo tee /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages
+sudo mkdir -p /mnt/huge-1g
+sudo mount -t hugetlbfs -o pagesize=1G,uid=$(id -u),gid=$(id -g),mode=0755 none /mnt/huge-1g
+bwa-mem3 shm --huge-pages ref.fa        # or --huge-pages=/mnt/huge-1g
+bwa-mem3 mem -t 16 ref.fa R1.fq R2.fq > out.sam
+bwa-mem3 shm -d                         # removes /mnt/huge-1g/bwaidx-ref.fa too
+```
+
+**Safe by default:** when there is no such mount, the pool has too few free
+pages, the mount's `size=` limit is reached, the pages cannot be faulted in
+(this needs Linux 5.14 or later), or the index is 512 MiB or less, `shm` stages
+into `/dev/shm` as usual and a one-line `[M::bwa_shm_stage]` note says why. The
+staged bytes are the same either way, so **alignments are byte-identical**.
+
+An index already staged stays where it is: `shm --huge-pages` of an index
+already in `/dev/shm` (or `shm` without the flag of one already on 1 GB pages)
+returns at once with a note. Run `shm -d` first to restage it the other way.
+
+The redirect record is written before the file is created and removed after
+it, so a `--huge-pages` stage that is killed or fails leaves a redirect that
+`shm -l` lists as `incomplete`; the next stage of that name (with or without
+`--huge-pages`) or `shm -d` removes the file and frees its pages. A redirect
+is followed only to `bwaidx-<name>` for its own name, as a regular file (not a
+symlink) owned by the redirect's owner, in a directory on a `hugetlbfs` mount
+with 1 GB pages, of the size it records and holding the index it records;
+otherwise `shm -l` lists it as `unusable`, `mem` loads from disk, and `shm -d`
+removes the redirect but leaves the file.
+
+Notes:
+
+- An existing `bwaidx-<name>` on the mount that no registered redirect names
+  is never adopted or removed: the stage fails, names it, and gives the `rm`
+  to run. It may be left by a stage whose redirect was removed (by an older
+  `bwa-mem3`, or because `/dev/shm` was cleared, for example by systemd's
+  `RemoveIPC` at logout), or belong to another registry sharing the mount (a
+  container with its own `/dev/shm`). Such a file pins its pages until it is
+  removed by hand.
+- Do not mix with an older `bwa-mem3` on the same host: one that predates this
+  option sees a complete redirect as `unusable` (and loads from disk), and its
+  `shm -d` or reclaim removes the redirect but not the file.
+- The pages stay reserved, pinned and out of the page cache until `shm -d`.
+  `--huge-pages` stages are not counted against `/dev/shm` by the
+  [capacity preflight](#notes--gotchas) of other stages.
+- hugetlbfs pages are not counted in a process's RSS. To check placement, a
+  running `mem`'s `/proc/<pid>/smaps` entry for the file shows
+  `KernelPageSize: 1048576 kB` and `Shared_Hugetlb` (or `Private_Hugetlb`).
+- As with `mem --huge-pages`, the gain depends on the host: it measured
+  about 0.7 % faster for a disk-loaded index on Intel Sapphire Rapids, and
+  within noise on AMD Zen 4 instances whose hypervisor backs guest memory with
+  2 MB pages. Measure on your own host.
+- NUMA placement of the pages is not controlled, and `DIR` must be given as
+  `--huge-pages=DIR`: `--huge-pages DIR idxbase` is rejected as two positional
+  arguments.
 
 ## Performance
 
@@ -232,7 +318,8 @@ exceed the load time saved.
 > filling it, `bwa-mem3 shm` calls `statvfs("/dev/shm")` and compares the
 > available bytes, less the part of each other stage still in progress that it
 > has not yet written (tmpfs allocates pages only as they are written), against
-> the index's `total_size`. Creating the segment
+> the index's `total_size` (a `--huge-pages` stage in progress takes its pages
+> from the hugetlb pool, not `/dev/shm`, so it is not counted). Creating the segment
 > first means an orphaned segment is reported by name before this check can
 > fail. If `/dev/shm` is too small, the stage unlinks the empty segment and
 > aborts cleanly with an `[E::bwa_shm_stage]` message that names `/dev/shm`,

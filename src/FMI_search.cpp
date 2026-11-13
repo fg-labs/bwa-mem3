@@ -888,10 +888,13 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
      * mapping; the segment lifetime belongs to the shm-loading process. */
     {
-        size_t   shm_attach_len = 0;
-        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
+        size_t   shm_attach_len = 0, shm_map_len = 0;
+        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len, &shm_map_len);
         if (shm_base_local != NULL) {
             load_index_from_shm(shm_base_local, shm_attach_len);
+            /* The destructor unmaps the whole mapping, which can be longer
+             * than the packed index it holds. */
+            shm_len = shm_map_len;
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
@@ -902,7 +905,8 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             if (huge_pages != BWAMEM_HUGETLB_OFF)
                 fprintf(stderr, "[M::load_index] --huge-pages: no effect on an index "
-                        "attached from shared memory; its pages are the segment's\n");
+                        "attached from shared memory; its pages are the segment's "
+                        "(`bwa-mem3 shm --huge-pages` stages it on 1 GB pages)\n");
             return;
         }
     }
