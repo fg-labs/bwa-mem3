@@ -11,8 +11,12 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <string>
 #include <map>
+#include <memory>
+#include <mutex>
 
 #include "../bwa.h"
 #include "../compat_target.h"
@@ -287,6 +291,207 @@ __attribute__((noinline)) int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap
     if (j->len < 1 || j->max_diff - j->width[j->len - 1].bid < 1) return 0;
     long steps = 0, rows = 0;
     return aln_meth_pigeonhole(x->grp->bwt, *x->grp->ref, j->seq, j->len, j->max_diff, j->width, &x->ph, &steps, &rows);
+}
+const aln_meth_ref_t *aln_plain_prove_ref = nullptr;
+
+namespace {
+/* The plain proof's gate. Whether the proof runs changes only how a no-hit read's search ends, never
+ * its result, so the gate is free to follow cost. Two things decide it:
+ * - Per read-length bin (4 bases), the proven rate: reads with a hit elsewhere, or windows that
+ *   survive, are tried for nothing, so a bin is tried while it proves at least half of its recent
+ *   attempts (a window of PG_WIN, halved when full).
+ * - For the run, whether a proof saves more time than it takes. A proof saves the rest of a no-hit
+ *   search, which is long on a large genome and short on a small one, and costs about the same
+ *   either way, so on a small genome the proof can cost more than the search it ends. The gate
+ *   keeps the time attempts take and samples of the time a proven read's search takes, and tries
+ *   the proof while proven rate x saved > time taken, over the bins it tries.
+ * A sample is a probe: a read tried and proven whose search runs anyway (same result), timed from
+ * the proof, before the search starts, to the end. The search interleaves ALN_GROUP reads in turns
+ * of one lookup, so the read's own share is that interval, less the thread's proofs within it, over
+ * ALN_GROUP. The run's estimate starts after PG_LEARN samples; until then the bins that prove most
+ * of their reads are probed at every attempt.
+ *
+ * Some eligible reads are probes whatever the state, so the estimates follow the input: one in
+ * PG_PROBE where the proof runs, and where it does not, from one in PG_PROBE_OFF, doubling after
+ * each probe that leaves it off up to PG_PROBE_MAX, so a bin or a run the proof does not pay for
+ * costs almost nothing. Each thread counts down to its next probe per bin from a random start.
+ *
+ * The windows are the run's, shared by the search threads (relaxed atomics, updated once per
+ * attempt, a small fraction of the reads); a halving can race and lose an update, and the gate is
+ * only a cost model. */
+enum { PG_BINS = 64, PG_BIN_SHIFT = 2, PG_WARM = 8, PG_WIN = 64, PG_LEARN = 256, PG_TWIN = 4096, PG_SWIN = 1024,
+       PG_PROBE = 64, PG_PROBE_OFF = 1024, PG_PROBE_MAX = 16384 };
+// A thread's proof scratch is released after a proof that left it above this many bytes: a few
+// reads grow it far past the usual (nodes up to the step cap), and a kept high-water per thread
+// would raise peak memory.
+constexpr size_t PG_SCRATCH_KEEP = (size_t)1 << 20;
+
+template <class T> T pg_get(const std::atomic<T> &a) { return a.load(std::memory_order_relaxed); }
+template <class T> void pg_set(std::atomic<T> &a, T v) { a.store(v, std::memory_order_relaxed); }
+template <class T> void pg_add(std::atomic<T> &a, T v) { a.fetch_add(v, std::memory_order_relaxed); }
+
+struct pg_bin_t {
+    std::atomic<int> tried{0}, proven{0}; // recent attempts and how many were proven
+    std::atomic<int> gap{PG_PROBE};        // the probe interval
+    bool proves() const { const int t = pg_get(tried); return t < PG_WARM || 2 * pg_get(proven) >= t; }
+};
+struct pg_run_t {
+    std::atomic<int64_t> tried{0}, proven{0}, cost{0}; // attempts in bins that prove, their time (ns)
+    std::atomic<int64_t> sn{0}, saved{0};              // probe samples, the search time they saved (ns)
+    // the proof saves more than it costs (or the estimate has too few samples yet)
+    bool pays() const
+    {
+        const int64_t n = pg_get(sn), t = pg_get(tried);
+        return n < PG_LEARN || (t > 0 && pg_get(proven) * (pg_get(saved) / n) > pg_get(cost));
+    }
+};
+pg_bin_t pg_bins[PG_BINS];
+pg_run_t pg_run;
+unsigned pg_gen = 0; // the run (aln_plain_prove_begin): a thread's counters from another run are reset
+
+inline int64_t pg_now()
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+template <class T> size_t cap_bytes(const std::vector<T> &v) { return v.capacity() * sizeof(T); }
+size_t ph_bytes(const aln_meth_ph_scratch_t &s)
+{
+    return cap_bytes(s.cur) + cap_bytes(s.next) + cap_bytes(s.bid) + cap_bytes(s.occ_k) + cap_bytes(s.occ_l) +
+           cap_bytes(s.occ_a) + cap_bytes(s.rows) + cap_bytes(s.starts) + cap_bytes(s.vs.text) + cap_bytes(s.vs.dp);
+}
+
+// A thread's gate counters (plain data: no thread_local initialisation on the per-read path) and its
+// proof scratch (touched only by an attempt).
+struct pg_thread_t {
+    unsigned gen;
+    uint32_t rng;
+    int left[PG_BINS];  // eligible reads to the next probe, per bin
+    int64_t proof_time; // this thread's proofs so far (ns)
+};
+thread_local pg_thread_t pg_thread;
+
+/* Proof scratch. The search threads are started per batch, so a thread_local scratch would be
+ * allocated anew by every batch's threads, each growing its vectors in its own allocator heap,
+ * and the heaps of finished threads are not all reused before the next batch's grow theirs: peak
+ * memory rose by tens of MB. The run owns the scratch instead: one per search thread, allocated
+ * and sized for the usual proof by aln_plain_prove_begin on the calling thread; a search thread
+ * takes one from the run's free list at its first proof and gives it back when it ends. */
+std::mutex pg_pool_mu;
+std::vector<std::unique_ptr<aln_meth_ph_scratch_t>> pg_pool_all; // every scratch of the run
+std::vector<aln_meth_ph_scratch_t *> pg_pool_free;
+struct pg_scratch_ref_t {
+    aln_meth_ph_scratch_t *p = nullptr;
+    unsigned gen = 0;
+    aln_meth_ph_scratch_t &get()
+    {
+        if (!p || gen != pg_gen) {
+            std::lock_guard<std::mutex> lk(pg_pool_mu);
+            if (pg_pool_free.empty()) {
+                pg_pool_all.emplace_back(new aln_meth_ph_scratch_t());
+                p = pg_pool_all.back().get();
+            } else {
+                p = pg_pool_free.back();
+                pg_pool_free.pop_back();
+            }
+            gen = pg_gen;
+        }
+        return *p;
+    }
+    ~pg_scratch_ref_t()
+    {
+        if (!p) return;
+        std::lock_guard<std::mutex> lk(pg_pool_mu);
+        if (gen == pg_gen) pg_pool_free.push_back(p); // (after the run ended, the run has freed it)
+    }
+};
+thread_local pg_scratch_ref_t pg_scratch;
+
+inline int pg_draw(pg_thread_t &t, int gap) // 1..gap
+{
+    t.rng = t.rng * 1664525u + 1013904223u;
+    return 1 + (int)((t.rng >> 8) % (uint32_t)gap);
+}
+} // namespace
+
+void aln_plain_prove_begin(const aln_meth_ref_t *ref, int n_threads)
+{
+    { // one scratch per search thread, sized for the usual proof, allocated here (see pg_pool_all)
+        std::lock_guard<std::mutex> lk(pg_pool_mu);
+        for (int i = 0; i < std::max(1, n_threads); ++i) {
+            pg_pool_all.emplace_back(new aln_meth_ph_scratch_t());
+            aln_meth_ph_scratch_t &x = *pg_pool_all.back();
+            x.cur.reserve(2048); x.next.reserve(2048); x.bid.reserve(256);
+            x.occ_k.reserve(512); x.occ_l.reserve(512); x.occ_a.reserve(512);
+            x.rows.reserve(ALN_METH_PH_ROWS); x.starts.reserve(ALN_METH_PH_ROWS);
+            x.vs.text.reserve(1024); x.vs.dp.reserve(512);
+            pg_pool_free.push_back(&x);
+        }
+    }
+    for (pg_bin_t &w : pg_bins) { pg_set(w.tried, 0); pg_set(w.proven, 0); pg_set(w.gap, (int)PG_PROBE); }
+    pg_set<int64_t>(pg_run.tried, 0); pg_set<int64_t>(pg_run.proven, 0); pg_set<int64_t>(pg_run.cost, 0);
+    pg_set<int64_t>(pg_run.sn, 0); pg_set<int64_t>(pg_run.saved, 0);
+    ++pg_gen;
+    aln_plain_prove_ref = ref;
+}
+void aln_plain_prove_end(void)
+{
+    aln_plain_prove_ref = nullptr;
+    std::lock_guard<std::mutex> lk(pg_pool_mu); // the search threads have ended
+    ++pg_gen;                                    // a thread's scratch from this run is no longer its own
+    pg_pool_free.clear();
+    pg_pool_all.clear();
+}
+
+__attribute__((noinline)) int aln_plain_prove_nohit(gap_job_t *j, const bwt_t *bwt)
+{
+    if (j->len < 1 || j->max_diff - j->width[j->len - 1].bid < 1) return 0;
+    pg_thread_t &t = pg_thread;
+    if (t.gen != pg_gen) {
+        memset(&t, 0, sizeof(t));
+        t.gen = pg_gen;
+        t.rng = (uint32_t)(uintptr_t)&t ^ (uint32_t)pg_now();
+        for (int b = 0; b < PG_BINS; ++b) t.left[b] = pg_draw(t, pg_get(pg_bins[b].gap));
+    }
+    const int b = std::min(j->len >> PG_BIN_SHIFT, PG_BINS - 1);
+    pg_bin_t &w = pg_bins[b];
+    const bool proves = w.proves(), learn = pg_get(pg_run.sn) < PG_LEARN, on = proves && pg_run.pays();
+    bool probe = proves && learn;
+    if (--t.left[b] <= 0) { probe = true; t.left[b] = pg_draw(t, pg_get(w.gap)); }
+    else if (!on) return 0; // not worth it here
+    aln_meth_ph_scratch_t &ph = pg_scratch.get();
+    long steps = 0, rows = 0;
+    const int64_t t0 = pg_now();
+    const int r = aln_meth_pigeonhole(bwt, *aln_plain_prove_ref, j->seq, j->len, j->max_diff, j->width, &ph, &steps, &rows);
+    const int64_t t1 = pg_now(), dt = t1 - t0;
+    t.proof_time += dt;
+    pg_add(w.tried, 1); pg_add(w.proven, r);
+    if (pg_get(w.tried) > PG_WIN) { pg_set(w.tried, pg_get(w.tried) / 2); pg_set(w.proven, pg_get(w.proven) / 2); }
+    if (proves) {
+        pg_add<int64_t>(pg_run.tried, 1); pg_add<int64_t>(pg_run.proven, r); pg_add(pg_run.cost, dt);
+        if (pg_get(pg_run.tried) > PG_TWIN)
+            for (std::atomic<int64_t> *x : {&pg_run.tried, &pg_run.proven, &pg_run.cost}) pg_set(*x, pg_get(*x) / 2);
+    }
+    // the probe interval: short where the proof runs, backing off where it does not
+    if (w.proves() && pg_run.pays()) pg_set(w.gap, (int)PG_PROBE);
+    else if (probe) {
+        const int g = pg_get(w.gap);
+        pg_set(w.gap, g < PG_PROBE_OFF ? (int)PG_PROBE_OFF : std::min(2 * g, (int)PG_PROBE_MAX));
+    }
+    if (ph_bytes(ph) > PG_SCRATCH_KEEP) ph = aln_meth_ph_scratch_t();
+    if (probe) {
+        if (r) { j->probe_bin = b + 1; j->probe_t0 = t1; j->probe_p0 = t.proof_time; }
+        return 0; // the search runs on, with the same result
+    }
+    return r;
+}
+
+void aln_plain_probe_done(const gap_job_t *j)
+{
+    pg_thread_t &t = pg_thread;
+    if (t.gen != pg_gen || j->n_aln) return; // (a proven read ends with no hit)
+    const int64_t saved = std::max<int64_t>(0, (pg_now() - j->probe_t0 - (t.proof_time - j->probe_p0)) / ALN_GROUP);
+    pg_add<int64_t>(pg_run.sn, 1); pg_add(pg_run.saved, saved);
+    if (pg_get(pg_run.sn) > PG_SWIN) { pg_set(pg_run.sn, pg_get(pg_run.sn) / 2); pg_set(pg_run.saved, pg_get(pg_run.saved) / 2); }
 }
 void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {

@@ -20,6 +20,7 @@
 #include "../../src/kvec.h"
 #include "../../src/read_index_ele.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -1570,4 +1571,33 @@ TEST_CASE("aln_pe: the exact rescue window rounds the insert range outward and i
         CHECK(stock_moves == 3 * exact_moves);
         CHECK(stock_drops == exact_moves);
     }
+}
+
+TEST_CASE("aln_pe: the pairing sort gives the (x, y) order for every array size and key width")
+{
+    uint64_t st = 0x9e3779b97f4a7c15ULL;
+    auto rnd = [&st]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return st; };
+    const size_t sizes[] = {0, 1, 2, 255, 256, 257, 300, 1000, 4097};
+    // x spans and y widths: narrow keys, keys of exactly 63 bits, and keys too wide for the radix
+    const struct { uint64_t x_base, x_span; int y_bits; } shapes[] = {
+        {0, 1, 0}, {5, 3, 2}, {1ULL << 40, 1ULL << 20, 30}, {0, 1ULL << 31, 32}, {7, (1ULL << 33), 30},
+        {0, ~0ULL, 64}, {123, 1, 63}, {0, 1000, 5},
+    };
+    for (const auto &sh : shapes)
+        for (size_t n : sizes) {
+            std::vector<pair64_t> a(n);
+            for (size_t i = 0; i < n; ++i) {
+                a[i].x = sh.x_base + (sh.x_span == ~0ULL ? rnd() : rnd() % sh.x_span);
+                a[i].y = sh.y_bits == 0 ? 0 : sh.y_bits == 64 ? rnd() : rnd() & ((1ULL << sh.y_bits) - 1);
+                if (i && rnd() % 4 == 0) a[i] = a[rnd() % i]; // repeated rows
+            }
+            std::vector<pair64_t> want = a;
+            std::sort(want.begin(), want.end(), [](const pair64_t &l, const pair64_t &r) {
+                return l.x < r.x || (l.x == r.x && l.y < r.y);
+            });
+            ba::aln_pair_sort(n, a.data());
+            bool same = true;
+            for (size_t i = 0; i < n; ++i) same = same && a[i].x == want[i].x && a[i].y == want[i].y;
+            CHECK_MESSAGE(same, "n=" << n << " span=" << sh.x_span << " y_bits=" << sh.y_bits);
+        }
 }

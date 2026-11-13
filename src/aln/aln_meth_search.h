@@ -253,6 +253,20 @@ void aln_meth_slot_finish(aln_meth_slot_t *);
  * its search is cheap. */
 enum { ALN_METH_PH_MIN_DIFF = 3 };
 int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j);
+/* Plain aln: the same pigeonhole proof on the plain index, whose text is the original pac
+ * (aln_meth_ref_t::plain). aln_plain_prove_begin sets it for a plain run's main search and
+ * aln_plain_prove_end clears it; null leaves the stock search as it was. gap_job_start tries a read
+ * with no exact occurrence before its search starts, when a gate on the proof's measured cost and
+ * saving says it is worth trying (aln_meth.cpp). A proof ends the read with no hit, which is what
+ * the stock search would end with: under BWA_MODE_GAPE every stock hit is an alignment within
+ * max_diff unit edits. Some proven reads are probes: their search runs anyway (same result) to time
+ * what a proof saves, and aln_plain_probe_done takes the sample when the read is done
+ * (j->probe_bin set). */
+extern const aln_meth_ref_t *aln_plain_prove_ref;
+void aln_plain_prove_begin(const aln_meth_ref_t *ref, int n_threads);
+void aln_plain_prove_end(void);
+int aln_plain_prove_nohit(gap_job_t *j, const bwt_t *bwt);
+void aln_plain_probe_done(const gap_job_t *j);
 void aln_meth_report(int, int, const aln_meth_read_t *);
 // Finishes a read (stores its occ as hits; see aln_meth_store_loci), then trims it to its main hit
 // (an incomplete read always; a complete one when it has more than max_xa_hits + 1 loci).

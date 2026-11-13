@@ -18,6 +18,20 @@ static inline uint8_t comp_mask(uint8_t m)
 static void fwd_masks(const aln_meth_ref_t &ref, int64_t f0, int64_t f1, uint8_t *out)
 {
     const bntseq_t *cb = ref.conv_bns, *ob = ref.bns;
+    if (ref.plain) { // the index text is the original pac; an ambiguous base may be any base
+        for (int64_t p = f0; p < f1; ++p) out[p - f0] = (uint8_t)(1 << (ref.pac[p >> 2] >> ((~p & 3) << 1) & 3));
+        int lo = 0, hi = ob->n_holes;
+        while (lo < hi) {
+            const int mid = (lo + hi) >> 1;
+            if (ob->ambs[mid].offset + ob->ambs[mid].len <= f0) lo = mid + 1; else hi = mid;
+        }
+        for (int h = lo; h < ob->n_holes && ob->ambs[h].offset < f1; ++h) {
+            const int64_t b0 = std::max<int64_t>(f0, ob->ambs[h].offset);
+            const int64_t b1 = std::min<int64_t>(f1, ob->ambs[h].offset + ob->ambs[h].len);
+            for (int64_t p = b0; p < b1; ++p) out[p - f0] = 0xf;
+        }
+        return;
+    }
     for (int64_t f = f0; f < f1;) {
         const int crid = bns_pos2rid(cb, f);
         const bntann1_t &ca = cb->anns[crid];

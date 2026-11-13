@@ -316,6 +316,7 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 		gap_slot_t &s = slots[H::run(cores.data(), G, &pos, bwt)];
 		if (s.c->state == GAP_SLOT_WIDTHS && !start(s)) continue; // its search runs in the next turns
 		s.p->aln = s.c->job.aln; s.p->n_aln = s.c->job.n_aln; // the read is done
+		if (s.c->job.probe_bin) aln_plain_probe_done(&s.c->job); // a plain no-hit proof's probe (bwtgap.h)
 		H::finish(s.c, s.p);
 		if (!fill(s)) --n_active;
 	}

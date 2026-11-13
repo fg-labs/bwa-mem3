@@ -1,4 +1,5 @@
-// A converted (`index --meth`) test index for the --meth refutation tests (aln_meth_prove.h), and
+// A converted (`index --meth`) test index for the --meth refutation tests (aln_meth_prove.h), or a
+// plain one (`index`, aln_meth_ref_t::plain: plain aln's no-hit proof), and
 // the index text T as the index itself holds it, read back through its suffix array: T[SA[r]] is the
 // first base of row r. The tests compare the refutations with exhaustive computations on that
 // text, so they do not rely on how the text masks are derived from the original reference.
@@ -39,7 +40,9 @@ struct ProveIndex {
     std::vector<uint8_t> text; // T as indexed (0-3), length bwt->seq_len
     std::string repeat_unit;
 
-    ProveIndex()
+    bool plain;
+
+    explicit ProveIndex(bool plain_index = false) : plain(plain_index)
     {
         fa = tmp.path() + "/ref.fa";
         uint32_t st = 20261111;
@@ -61,7 +64,8 @@ struct ProveIndex {
             c4 += u + aln_test::lcg_dna(st, 30);
         }
         REQUIRE(aln_test::write_test_fasta(fa, {{"c1", c1}, {"c2", c2}, {"c3", c3}, {"c4", c4}}));
-        std::vector<std::string> a = {"index", "--meth", fa};
+        std::vector<std::string> a = plain ? std::vector<std::string>{"index", fa}
+                                           : std::vector<std::string>{"index", "--meth", fa};
         std::vector<char *> argv;
         for (std::string &s : a) argv.push_back(&s[0]);
         argv.push_back(nullptr);
@@ -70,10 +74,14 @@ struct ProveIndex {
         optreset = 1;
 #endif
         REQUIRE(bwa_index((int)a.size(), argv.data()) == 0);
-        fmi.reset(new FMI_search((fa + ".meth").c_str()));
-        fmi->load_index(false, 1);
+        fmi.reset(new FMI_search((plain ? fa : fa + ".meth").c_str()));
+        fmi->load_index(plain, 1);
         bwt = ba::bwt_from_fmi(fmi.get());
-        REQUIRE(ba::aln_meth_ref_load(&ref, fa.c_str(), fmi->idx->bns, 1) == 0);
+        if (plain) { // the index's own bns and pac, as plain aln sets them (plain_prove_scope_t)
+            ref.conv_bns = fmi->idx->bns; ref.bns = fmi->idx->bns; ref.pac = fmi->idx->pac; ref.plain = 1;
+        } else {
+            REQUIRE(ba::aln_meth_ref_load(&ref, fa.c_str(), fmi->idx->bns, 1) == 0);
+        }
         // T from the index: row r (1-based in bwa's numbering; row 0 is `$`) starts with base c
         // for L2[c] < r <= L2[c + 1].
         text.assign(bwt->seq_len, 0xff);
@@ -88,7 +96,7 @@ struct ProveIndex {
     }
     ~ProveIndex()
     {
-        ba::aln_meth_ref_free(&ref);
+        if (!plain) ba::aln_meth_ref_free(&ref);
         ba::bwt_destroy(bwt);
     }
     // The SA interval of the exact string s (codes 0-3) in T, by backward search; false when empty.
@@ -110,6 +118,11 @@ struct ProveIndex {
 inline ProveIndex &prove_index()
 {
     static ProveIndex idx;
+    return idx;
+}
+inline ProveIndex &prove_index_plain()
+{
+    static ProveIndex idx(true);
     return idx;
 }
 

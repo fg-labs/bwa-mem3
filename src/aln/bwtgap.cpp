@@ -606,6 +606,7 @@ static GAP_HOT int gap_job_start_t(gap_job_t *j, const bwt_t *bwt)
 	// so allocating here would leak on both early completion and every slot reuse.
 	j->aln = P::meth ? nullptr : (bwt_aln1_t*)aln_calloc(j->m_aln, sizeof(bwt_aln1_t));
 	j->pending = 0;
+	j->probe_bin = 0;
 
 	// reset stack (upstream's gap_reset_stack): a no-op after a finished job, which released it.
 	// Done before the N check so that a read refused there leaves no chunk on the stack either.
@@ -615,6 +616,13 @@ static GAP_HOT int gap_job_start_t(gap_job_t *j, const bwt_t *bwt)
 	for (jj = _j = 0; jj < j->len; ++jj)
 		if (j->seq[jj] > 3) ++_j;
 	if (_j > j->max_diff) return 1;
+
+	// plain aln: a read with no exact occurrence (its width walk restarted) may be proven to have no
+	// hit within max_diff unit edits (aln_plain_prove_nohit); it then ends here with none, as its
+	// search would. Null aln_plain_prove_ref (--meth, --known-snvs windows, other callers): no proof.
+	if (!P::meth && aln_plain_prove_ref && (opt->mode & BWA_MODE_GAPE) && opt->max_diff >= ALN_METH_PH_MIN_DIFF &&
+		j->len > 0 && j->width[j->len - 1].bid >= 1 && aln_plain_prove_nohit(j, bwt))
+		return 1;
 
 	gap_check_len(j->len);
 	gap_cpush<typename P::entry_t>(j->stack, j->len, 0, bwt->seq_len, 0, 0, 0, 0, 0, 0, 0, opt);
