@@ -1,6 +1,7 @@
 /* See aln_bwt.h. bwt_match_exact_alt is from bwa's Apache2 branch (bwt.c). This file
  * is MODIFIED from the original: the function body is unchanged but moved into
- * namespace bwa_aln, and the occ/SA functions (bwt_sa_batch included) are new code.
+ * namespace bwa_aln, and the occ/SA functions (bwt_sa_batch included) are new code
+ * (the occ functions are defined inline in aln_bwt.h).
  *
  * The MIT License
  *
@@ -43,49 +44,13 @@ bwt_t *bwt_from_fmi(FMI_search *fmi)
     bwt->seq_len = (bwtint_t)fmi->reference_seq_len - 1;
     bwt->primary = (bwtint_t)fmi->sentinel_index;
     bwt->fmi = fmi;
+    bwt->cp = (const CP_OCC *)fmi->cp_occ_data();
     return bwt;
 }
 
 void bwt_destroy(bwt_t *bwt)
 {
     free(bwt);
-}
-
-/* Count of c in bwa-mem3 BWT rows [0, p). The `$` row has no base bit set, so
- * it adds nothing, which is exactly bwa's `$`-removed convention. */
-static inline bwtint_t occ_rows_before(const bwt_t *bwt, bwtint_t p, ubyte_t c)
-{
-    const CP_OCC *cp = (const CP_OCC *)bwt->fmi->cp_occ_data();
-    const CP_OCC &blk = cp[p >> CP_SHIFT];
-    const unsigned r = (unsigned)(p & CP_MASK);
-    const uint64_t mask = r ? ~0ULL << (CP_BLOCK_SIZE - r) : 0;
-    return (bwtint_t)blk.cp_count[c] + (bwtint_t)__builtin_popcountll(blk.one_hot_bwt_str[c] & mask);
-}
-
-bwtint_t bwt_occ(const bwt_t *bwt, bwtint_t k, ubyte_t c)
-{
-    if (k == (bwtint_t)(-1)) return 0;
-    return occ_rows_before(bwt, k + 1, c);
-}
-
-void bwt_2occ(const bwt_t *bwt, bwtint_t k, bwtint_t l, ubyte_t c, bwtint_t *ok, bwtint_t *ol)
-{
-    *ok = bwt_occ(bwt, k, c);
-    *ol = bwt_occ(bwt, l, c);
-}
-
-void bwt_2occ4(const bwt_t *bwt, bwtint_t k, bwtint_t l, bwtint_t cntk[4], bwtint_t cntl[4])
-{
-    for (int c = 0; c < 4; ++c) {
-        cntk[c] = bwt_occ(bwt, k, (ubyte_t)c);
-        cntl[c] = bwt_occ(bwt, l, (ubyte_t)c);
-    }
-}
-
-void bwt_prefetch_occ(const bwt_t *bwt, bwtint_t p)
-{
-    const CP_OCC *cp = (const CP_OCC *)bwt->fmi->cp_occ_data();
-    __builtin_prefetch(&cp[p >> CP_SHIFT]);
 }
 
 bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
@@ -105,7 +70,7 @@ bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
 void bwt_sa_batch(const bwt_t *bwt, const bwtint_t *rows, int64_t n, bwtint_t *out)
 {
     FMI_search *fmi = bwt->fmi;
-    const CP_OCC *cp = (const CP_OCC *)fmi->cp_occ_data();
+    const CP_OCC *cp = bwt->cp;
     const int8_t *ms = fmi->sa_ms_byte_data();
     const uint32_t *ls = fmi->sa_ls_word_data();
     const int64_t compx = fmi->sa_compx, compx_mask = fmi->sa_compx_mask;
