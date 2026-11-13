@@ -199,6 +199,25 @@ void emit_tied_regions(int anchor_k, int converted_k) {
 void anchor_own_region() { emit_tied_regions(0, 0); }
 void anchor_tied_region() { emit_tied_regions(0, 1); }
 
+void anchor_wrong_source() {
+    const std::string ref = make_reference(kRefLen);
+    meth_test::OrigRefFixture fx(ref);
+    mem_opt_t *opt = mem_opt_init();
+    Read read;
+    read.add_forward(ref, 300, 60);
+    read.finish();
+    auto reg = make_region(opt, 300, 360, 0, 60, 60);
+    mem_alnreg_v a{};
+    a.n = a.m = 1;
+    a.a = &reg;
+    auto anchor = convert(opt, fx, read, &reg);
+    anchor.alt_source_rid_plus1 = 1; // the region was not lifted
+    mem_reg2sam_anchored(opt, fx.orig_bns, fx.orig_pac, &read.s, &a, 0, NULL, 0, &anchor);
+    free(read.s.sam);
+    free(anchor.cigar);
+    free(opt);
+}
+
 /* The pair path's mistake to guard against: end 0's region anchored with
  * end 1's conversion (the mate), both perfect forward hits of equal score. */
 void anchor_the_mate() {
@@ -366,6 +385,7 @@ TEST_CASE("reg2sam_anchored: an anchor that is not its region's conversion is fa
 
     // Same contig, same score, same strand: only the position differs.
     CHECK(exited_via_err_fatal(run_in_child(anchor_tied_region)));
+    CHECK(exited_via_err_fatal(run_in_child(anchor_wrong_source)));
     // The pair path's own hazard: an end anchored with its mate's conversion.
     CHECK(exited_via_err_fatal(run_in_child(anchor_the_mate)));
 }

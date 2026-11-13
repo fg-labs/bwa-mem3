@@ -455,6 +455,10 @@ int mem_aln_to_bam(struct bam1_t *b,
             if (bam_aux_append(b, "pa", 'f', sizeof(pa_f), (const uint8_t *)&pa_f) < 0) return -1;
         }
     }
+    if (p.alt_source_rid_plus1 > 0 && !(flag16 & BAM_FUNMAP)) {
+        const char *source = bns->anns[p.alt_source_rid_plus1 - 1].name;
+        if (bam_aux_append(b, "XL", 'Z', (int) strlen(source) + 1, (const uint8_t *) source) < 0) return -1;
+    }
     if (p.XA != NULL) {   /* XB under -u, as in the SAM writer */
         if (bam_aux_append(b, (opt->flag & MEM_F_XB) ? "XB" : "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;
     }

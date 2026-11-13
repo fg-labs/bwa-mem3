@@ -325,6 +325,8 @@ typedef struct mem_opt_t {
      * onto the primary assembly before primary marking and pairing, so ALT
      * haplotypes can decide where a read is placed; see mem_alt_project. */
     const struct alt_lift_t *alt_lift;
+    int    alt_project_min_gap; /* required score advantage in -A units; 0 disables */
+    int    alt_project_pair_gap; /* experimental: apply gap to paired confidence, not projection */
     int    md_mode;         // --md: a mem_md_mode value (MEM_MD_FULL default)
     int    supp_rep_hard_cap; // supp alnregs whose chain's seeds share >=this many genome hits are forced to MAPQ=0; 0 disables
     int    smem_dedup;        // 1 = dedup fully-identical SMEMs before SA expansion (--smem-dedup); 0 = off (default, byte-identical to baseline)
@@ -477,7 +479,9 @@ typedef struct mem_alnreg_t {
                     // mate rescue sets it directly
     int secondary;  // index of the parent hit shadowing the current hit; <0 if primary
     int secondary_all;
-    int seedlen0;   // length of the starting seed
+    /* Extension consumes seedlen0 before projection; successful lifts reuse
+     * the word for their source contig, discriminated by alt_bw != 0. */
+    union { int seedlen0; int alt_source_rid; };
     int chain_n_hits; // max SMEM SA-occurrence count across this chain's seeds (1 = no repetitive seed)
     /* n_comp: number of sub-alignments patched together in dedup, counted as
      * 2k - 1 for k pieces (mem_alnreg_add_comp). Nothing reads it but the
@@ -562,6 +566,7 @@ typedef struct { // This struct is only used for the convenience of API.
     int HN;          // total # of hits clustered with this primary under XA_drop_ratio; -1 when not computed (e.g., MEM_F_ALL)
 
     int score, sub, alt_sc;
+    int alt_source_rid_plus1; /* zero unless this record was lifted */
     /* D3 (--meth, PR-5): bisulfite hypothesis (1=OT, 0=OB, -1=non-meth),
      * copied from the source mem_alnreg_t in mem_reg2aln. The output layer
      * (meth_mem_aln_to_bam) sources the XG strand tag and the XM source

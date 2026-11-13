@@ -102,11 +102,22 @@ int alt_lift_interval(const alt_lift_t *l, int rid, int64_t s, int64_t e, alt_li
  * locus survives is decided first by whether each can replace the
  * primary-assembly regions there (see alt_lift.cpp), and only then by that
  * order. Returns the new region count. No-op when no region lifts. C++ only,
- * like bwamem.h. */
+ * like bwamem.h. A positive opt->alt_project_min_gap first refuses a lift whose
+ * score advantage over a different-locus, overlapping-query primary or eligible
+ * projected hit is <= that gap times -A. Decisions use one projected snapshot;
+ * refused hits retain their original ALT region. Zero disables the gate.
+ * The developer-only alt_project_pair_gap alternative bypasses this gate and
+ * instead caps confident paired selection downstream, retaining all candidates. */
 #ifdef __cplusplus
 struct mem_opt_t;
 struct mem_alnreg_t;
-int mem_alt_project(const struct mem_opt_t *opt, const bntseq_t *bns, int n, struct mem_alnreg_t *a);
+/* Bounded developer diagnostics after rescue/primary marking and pair selection.
+ * Each call has its own 64-invocation budget, separate from projection tracing. */
+void mem_alt_trace_pair(const bntseq_t *bns, const char *stage,
+                        const char *name, int read_id, int n, const mem_alnreg_t *a,
+                        int n_primary, int selected = -1, int mapq = -1);
+int mem_alt_project(const struct mem_opt_t *opt, const bntseq_t *bns, int n, struct mem_alnreg_t *a,
+                    const char *read_name = NULL, int read_id = -1);
 #endif
 
 #endif
