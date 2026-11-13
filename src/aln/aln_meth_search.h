@@ -2,6 +2,7 @@
 /* Internal candidate generation hooks; no search ancestry is retained. */
 #ifndef BWA_MEM3_ALN_METH_SEARCH_H
 #define BWA_MEM3_ALN_METH_SEARCH_H
+#include <limits.h>
 #include <map>
 #include <set>
 #include <tuple>
@@ -20,7 +21,9 @@ struct aln_meth_slot_t {
     aln_meth_read_t *res = nullptr;
     // keep (ALN_METH_KEEP_*): 0 trims a finished read to its main hit (plus XA loci); STRATA keeps
     // a complete read's loci for pairing; COPIES keeps them for duplicate copies to redraw over.
-    int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1;
+    // max_diff: the read's -n limit (bwa_cal_maxdiff on its length for a fractional -n), set by
+    // aln_meth_slot_start; a refined window with more differences is dropped (resolve_one).
+    int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     std::vector<ubyte_t> vseq, rd_fwd;
