@@ -74,19 +74,40 @@ int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t
 {
 	r->conv_bns = conv_bns;
 	if (meth_orig_ref_load(orig_prefix, &r->bns, &r->pac, n_threads < 1 ? 1 : n_threads) != 0) return -1;
-	return meth_ref_check(r, orig_prefix, conv_bns, "; rebuild with `bwa-mem3 index --meth`");
+	if (meth_ref_check(r, orig_prefix, conv_bns, "; rebuild with `bwa-mem3 index --meth`") != 0) return -1;
+	aln_meth_ref_index_holes(r);
+	return 0;
 }
 
 int aln_meth_ref_adopt(aln_meth_ref_t *r, bntseq_t *orig_bns, uint8_t *orig_pac, const bntseq_t *conv_bns)
 {
 	r->bns = orig_bns;
 	r->pac = orig_pac;
-	return meth_ref_check(r, "(in-memory windows)", conv_bns, " (internal error: the in-memory window references are inconsistent)");
+	if (meth_ref_check(r, "(in-memory windows)", conv_bns, " (internal error: the in-memory window references are inconsistent)") != 0)
+		return -1;
+	aln_meth_ref_index_holes(r);
+	return 0;
+}
+
+void aln_meth_ref_index_holes(aln_meth_ref_t *r)
+{
+	r->hole_bins.clear();
+	if (!r->bns || r->bns->n_holes <= 0) return; // no run to find: aln_meth_amb_bits searches none
+	const uint64_t n_bins = ((uint64_t)r->bns->l_pac >> ALN_METH_HOLE_SHIFT) + 1;
+	r->hole_bins.assign((n_bins + 63) / 64, 0);
+	for (int i = 0; i < r->bns->n_holes; ++i) {
+		const bntamb1_t &a = r->bns->ambs[i];
+		if (a.len <= 0 || a.offset < 0) continue;
+		const uint64_t first = (uint64_t)a.offset >> ALN_METH_HOLE_SHIFT;
+		const uint64_t last = std::min<uint64_t>(((uint64_t)a.offset + (uint64_t)a.len - 1) >> ALN_METH_HOLE_SHIFT, n_bins - 1);
+		for (uint64_t b = first; b <= last; ++b) r->hole_bins[b >> 6] |= 1ULL << (b & 63);
+	}
 }
 
 void aln_meth_ref_free(aln_meth_ref_t *r)
 {
 	meth_orig_ref_free(&r->bns, &r->pac);
+	std::vector<uint64_t>().swap(r->hole_bins);
 }
 
 int aln_meth_header_check(const char *rg_line)

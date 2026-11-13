@@ -59,7 +59,14 @@ struct aln_meth_ref_t {
 	// the ALT-window search: window i's place on the original reference (ks_windows_t::win), so a
 	// window row's genomic locus is known; null elsewhere
 	const struct ks_window_t *ks_win = nullptr;
+	// One bit per 2^ALN_METH_HOLE_SHIFT bases of the original reference, set where an ambiguity run
+	// (bns->ambs) overlaps that bin, so that a window over clear bins is known to hold no run
+	// without searching the runs (aln_meth_amb_bits). Empty: not built (the runs are searched).
+	std::vector<uint64_t> hole_bins;
 };
+enum { ALN_METH_HOLE_SHIFT = 16 };
+/* Builds r->hole_bins from r->bns (aln_meth_ref_load and aln_meth_ref_adopt call it). */
+void aln_meth_ref_index_holes(aln_meth_ref_t *r);
 int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads);
 /* Takes ownership of an in-memory original reference (bns, pac) and checks it pairs with
  * conv_bns exactly as aln_meth_ref_load does. Returns 0, or -1 with the same error (the reference
