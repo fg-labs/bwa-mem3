@@ -141,7 +141,49 @@ TEST_CASE("aln_realign: trailing and leading deletions adjust display coordinate
     REQUIRE(ba::aln_meth_realign_window(ref3.ref,mo,c,q.data(),q.size(),0,10,&a)==ba::aln_meth_eval_status::ok);
     CHECK(a.rb==0);CHECK(a.re==30);CHECK(a.reward==15);
 }
-TEST_CASE("aln_realign: ambiguous query and original packed reference use stock matrix") {
+TEST_CASE("aln_realign: original ambiguity overrides packed fill in every chemistry matrix") {
+    Ref ref({0,1,2,3});
+    bntamb1_t ambiguity = {}; ambiguity.offset=1; ambiguity.len=2;
+    ref.bns.n_holes=1; ref.bns.ambs=&ambiguity;
+    for (int scoring : {MEM_METH_SCORING_COLLAPSED, MEM_METH_SCORING_GENOMIC, MEM_METH_SCORING_NEUTRAL})
+        for (int context : {METH_CTX_ALL, METH_CTX_CPG})
+            for (int hyp : {0,1}) for (int strand : {0,1}) {
+                ba::aln_meth_opt_t mo; mo.m.meth_scoring=scoring; mo.m.meth_context=context;
+                ba::aln_meth_opt_finish(&mo);
+                const std::vector<uint8_t> query={0,1,2,3};
+                ba::aln_meth_candidate_t c{0,strand,hyp,0,4}; ba::aln_meth_alignment_t a;
+                REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,c,query.data(),4,0,0,&a)==ba::aln_meth_eval_status::ok);
+                CHECK(a.reward==0); // +1, -1, -1, +1; random PAC fill must not match.
+                CHECK(a.raw_cigar==std::vector<uint32_t>{4u<<4});
+            }
+}
+
+TEST_CASE("aln_realign: retained ungapped cost bounds converted mismatches independently of N fills") {
+    // Exhaustive length-three columns over A/C/G/T/N; ambiguity fills are independent.
+    for (int scoring : {MEM_METH_SCORING_COLLAPSED,MEM_METH_SCORING_GENOMIC,MEM_METH_SCORING_NEUTRAL})
+        for (int context : {METH_CTX_ALL,METH_CTX_CPG}) for (int hyp : {0,1}) {
+            ba::aln_meth_opt_t mo; mo.m.meth_scoring=scoring; mo.m.meth_context=context;
+            ba::aln_meth_opt_finish(&mo);
+            const int m=context==METH_CTX_CPG?7:5;
+            const int8_t *mat=context==METH_CTX_CPG?(hyp?mo.mat7_ot:mo.mat7_ob):(hyp?mo.mat_ot:mo.mat_ob);
+            for (int code=0;code<15625;++code) {
+                int rest=code, strict=0,converted=0;
+                for (int k=0;k<3;++k) {
+                    const int q=rest%5; rest/=5;
+                    const int r=rest%5; rest/=5;
+                    strict += q==4 || r==4 || mat[r*m+q]<0;
+                    const int from=hyp?1:2, to=hyp?3:0;
+                    const int cq=q==from?to:q;
+                    // An N's converted PAC fill can differ from the original in any way.
+                    const int cr=r==4?(k+code)%4:(r==from?to:r);
+                    converted += cq==4 || cq!=cr;
+                }
+                if (strict<=1) CHECK(converted<=1);
+            }
+        }
+}
+
+TEST_CASE("aln_realign: ambiguous query uses stock ambiguity reward without becoming a match") {
     Ref ref({0,1,2,3});std::vector<uint8_t> q={0,4,2,3};
     ba::aln_meth_opt_t mo;ba::aln_meth_opt_finish(&mo);
     ba::aln_meth_candidate_t c{0,0,1,0,4};ba::aln_meth_alignment_t a;

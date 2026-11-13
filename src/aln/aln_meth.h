@@ -65,7 +65,8 @@ struct aln_meth_alignment_t {
     std::vector<uint32_t> raw_cigar, cigar;
 };
 /* A final locus is (original contig, hypothesis, strand, normalized start). All windows
- * reaching it compete by cost, then normalized CIGAR/end and raw CIGAR for deterministic ties.
+ * reaching it compete by cost, then neutral TAPS conversion count when enabled,
+ * then normalized CIGAR/end and raw CIGAR for deterministic ties.
  * Counts/cost describe the raw scored alignment, before terminal display normalization. */
 struct aln_meth_occ_t {
     bwtint_t pos;
@@ -80,6 +81,8 @@ struct aln_meth_read_t {
     std::vector<aln_meth_occ_t> occ; // best and all retained worse-cost loci, canonical order
     int main = -1;
     int c1 = 0, c2 = 0;
+    // Equal-cost loci displaced from c1 to c2, and their nearest conversion disadvantage.
+    int n_conv_moved = 0, conv_gap = 0;
     int flags = 0, hyp = -1;
     // Search work (aln_meth_report); zero on a duplicate that copied another read's search.
     long n_lookups = 0, n_wrong_copy = 0, n_rescored = 0, n_flushes = 0;

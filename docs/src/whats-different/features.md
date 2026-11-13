@@ -15,6 +15,10 @@ fixed chemistry-aware reward refinement and stock chemistry-aware cost/strata/MA
 accounting on stored CIGARs. All chemistries require both original and converted
 indices from `index --meth`. CpG-only refinement uses a full-band scalar fallback.
 The command page documents discovery/resource limits and incomplete confidence.
+TAPS/5base neutral scoring ranks equal-cost loci by fewest conversions, paired
+ends pair over every retained locus up to `--max-occ` when neither end was cut off,
+and a lookup-capped end can be rescued near its mate for placement only (MAPQ 0).
+([PR #751](https://github.com/fg-labs/bwa-mem3/pull/751))
 
 The MEM methylation placement, performance and accuracy measurements in the
 following sections do not validate `aln --meth`. Its revised candidate-refinement
