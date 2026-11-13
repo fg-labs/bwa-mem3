@@ -17,7 +17,11 @@
 #include <algorithm>
 #include <atomic>
 #include <stdarg.h>
+#include <map>
+#include <string>
+#include <utility>
 #include <vector>
+#include <zlib.h>
 
 #include "bwamem.h"
 #include "khash.h"
@@ -99,9 +103,134 @@ static void build_offsets(alt_lift1_t *a)
     }
 }
 
+namespace {
+using ExcludeInterval = std::pair<int64_t, int64_t>;
+using ExcludeBed = std::map<int, std::vector<ExcludeInterval>>;
+
+static void exclude_error(char *error, size_t size, const char *format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vsnprintf(error, size, format, args);
+    va_end(args);
+}
+
+// Whole decimal fields only, with checked signed-64-bit accumulation.
+static bool bed_coordinate(const std::string &text, int64_t *value)
+{
+    if (text.empty()) return false;
+    int64_t n = 0;
+    for (unsigned char c : text) {
+        if (c < '0' || c > '9' || n > (INT64_MAX - (c - '0')) / 10) return false;
+        n = n * 10 + c - '0';
+    }
+    *value = n;
+    return true;
+}
+
+static bool bed_directive(const std::string &line, const char *word)
+{
+    const size_t n = strlen(word);
+    return line.compare(0, n, word) == 0 &&
+        (line.size() == n || line[n] == ' ' || line[n] == '\t');
+}
+
+/* Parse complete lines rather than gzgets-sized fragments. gzread's status is
+ * checked even after the final text line: a missing gzip trailer is an error. */
+static bool load_exclude_bed(const char *path, const bntseq_t *bns, ExcludeBed *bed,
+                             alt_lift_exclude_stats_t *stats, char *error, size_t size)
+{
+    gzFile fp = gzopen(path, "rb");
+    if (!fp) { exclude_error(error, size, "%s: cannot open BED: %s", path, strerror(errno)); return false; }
+    std::map<std::string, int> names;
+    for (int i = 0; i < bns->n_seqs; ++i) names.emplace(bns->anns[i].name, i);
+    long lineno = 0;
+    auto parse_line = [&](std::string &line) {
+        ++lineno;
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.find_first_not_of(" \t\r") == std::string::npos || line[0] == '#' ||
+            bed_directive(line, "track") || bed_directive(line, "browser")) return true;
+        const size_t t1 = line.find('\t');
+        const size_t t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+        const size_t t3 = t2 == std::string::npos ? t2 : line.find('\t', t2 + 1);
+        int64_t start, end;
+        const char *reason = NULL;
+        int rid = -1;
+        if (line.find('\0') != std::string::npos) reason = "embedded NUL";
+        else if (t1 == std::string::npos || t2 == std::string::npos) reason = "expected tab-delimited CHROM, start, end";
+        else if (!bed_coordinate(line.substr(t1 + 1, t2 - t1 - 1), &start) ||
+                 !bed_coordinate(line.substr(t2 + 1, t3 == std::string::npos ? t3 : t3 - t2 - 1), &end) || start > end)
+            reason = "expected decimal coordinates with 0 <= start <= end";
+        else {
+            const auto it = names.find(line.substr(0, t1));
+            if (it == names.end()) reason = "unknown reference contig";
+            else {
+                rid = it->second;
+                if (bns->anns[rid].is_alt) reason = "BED contig is an ALT contig";
+                else if (end > bns->anns[rid].len) reason = "interval exceeds reference contig length";
+            }
+        }
+        if (reason) { exclude_error(error, size, "%s line %ld: %s", path, lineno, reason); return false; }
+        if (start == end) ++stats->zero_width_intervals;
+        else { (*bed)[rid].emplace_back(start, end); ++stats->input_intervals; }
+        return true;
+    };
+    bool ok = true;
+    std::string line;
+    char buffer[8192];
+    int n;
+    while (ok && (n = gzread(fp, buffer, sizeof(buffer))) > 0) {
+        for (int i = 0; i < n && ok; ++i) {
+            if (buffer[i] == '\n') { ok = parse_line(line); line.clear(); }
+            else line.push_back(buffer[i]);
+        }
+    }
+    if (ok) {
+        int status;
+        const char *message = gzerror(fp, &status);
+        if (status != Z_OK && status != Z_STREAM_END) {
+            exclude_error(error, size, "%s: BED decompression/read failure: %s", path, message);
+            ok = false;
+        } else if (!line.empty()) ok = parse_line(line);
+    }
+    const int closed = gzclose(fp);
+    if (ok && closed != Z_OK) {
+        exclude_error(error, size, "%s: BED close/decompression failure (%d)", path, closed);
+        ok = false;
+    }
+    if (!ok) return false;
+    for (auto &entry : *bed) {
+        auto &intervals = entry.second;
+        std::sort(intervals.begin(), intervals.end());
+        size_t kept = 0;
+        for (const auto interval : intervals) {
+            if (kept && interval.first <= intervals[kept - 1].second)
+                intervals[kept - 1].second = std::max(intervals[kept - 1].second, interval.second);
+            else intervals[kept++] = interval;
+        }
+        intervals.resize(kept);
+        stats->merged_intervals += (long) kept;
+    }
+    return true;
+}
+
+static bool excluded_footprint(const ExcludeBed &bed, int rid, int64_t start, int64_t end)
+{
+    if (end <= start) return false;
+    const auto found = bed.find(rid);
+    if (found == bed.end()) return false;
+    const auto &intervals = found->second;
+    const auto it = std::lower_bound(intervals.begin(), intervals.end(), start,
+        [](const ExcludeInterval &interval, int64_t pos) { return interval.second <= pos; });
+    return it != intervals.end() && it->first < end;
+}
+} // namespace
+
 /* bns_restore reads the same file for the ALT contig names alone (to set is_alt)
  * and keeps nothing else; this pass keeps the alignments, so it reads it again. */
-alt_lift_t *alt_lift_load(const char *path, const bntseq_t *bns)
+static alt_lift_t *alt_lift_load_impl(const char *path, const bntseq_t *bns,
+                                     const ExcludeBed *bed, alt_lift_exclude_stats_t *stats,
+                                     char *error, size_t error_size)
 {
     FILE *fp = fopen(path, "r");
     if (fp == NULL) return NULL;
@@ -129,7 +258,7 @@ alt_lift_t *alt_lift_load(const char *path, const bntseq_t *bns)
      * counted. */
 #define ALT_LIFT_BAD(...) do { \
         if (sk->bad < ALT_LIFT_MAX_LINE_WARNINGS) { \
-            fprintf(stderr, "[W::%s] %s line %ld: skipping ", __func__, path, lineno); \
+            fprintf(stderr, "[W::%s] %s line %ld: skipping ", "alt_lift_load", path, lineno); \
             fprintf(stderr, __VA_ARGS__); \
             fputc('\n', stderr); \
         } \
@@ -190,6 +319,11 @@ alt_lift_t *alt_lift_load(const char *path, const bntseq_t *bns)
             ok = 0;
         }
         if (!ok) { free(a->cigar); a->cigar = NULL; a->n_cigar = 0; a->qlen = 0; continue; }
+        if (bed && excluded_footprint(*bed, trid, pos - 1, pos - 1 + rspan)) {
+            ++stats->excluded;
+            free(a->cigar); a->cigar = NULL; a->n_cigar = 0; a->qlen = 0;
+            continue;
+        }
         a->trid = trid;
         a->rev = (flag & 0x10) ? 1 : 0;
         a->tpos = pos - 1;
@@ -199,19 +333,45 @@ alt_lift_t *alt_lift_load(const char *path, const bntseq_t *bns)
     }
 #undef ALT_LIFT_BAD
     free(line);
-    fclose(fp);
+    const bool read_failed = ferror(fp) != 0;
+    const int close_status = fclose(fp);
     kh_destroy(alt_name, h);
+    if (bed && (read_failed || close_status != 0)) {
+        exclude_error(error, error_size, "%s: sidecar read/close failure", path);
+        alt_lift_destroy(l);
+        return NULL;
+    }
     if (sk->bad > ALT_LIFT_MAX_LINE_WARNINGS)
         fprintf(stderr, "[W::%s] %s: %ld more malformed line(s) not named above\n",
-                __func__, path, sk->bad - ALT_LIFT_MAX_LINE_WARNINGS);
+                "alt_lift_load", path, sk->bad - ALT_LIFT_MAX_LINE_WARNINGS);
     const long n_skip = sk->no_ctg + sk->no_target + sk->alt_target + sk->unmapped + sk->not_primary
         + sk->dup + sk->bad;
     if (n_skip)
         fprintf(stderr, "[W::%s] %s: skipped %ld line(s): %ld ALT contig not in the index, "
                 "%ld target not in the index, %ld target is an ALT contig, %ld unmapped, "
                 "%ld secondary/supplementary, %ld duplicate, %ld malformed\n",
-                __func__, path, n_skip, sk->no_ctg, sk->no_target, sk->alt_target, sk->unmapped,
+                "alt_lift_load", path, n_skip, sk->no_ctg, sk->no_target, sk->alt_target, sk->unmapped,
                 sk->not_primary, sk->dup, sk->bad);
+    return l;
+}
+
+alt_lift_t *alt_lift_load(const char *path, const bntseq_t *bns)
+{
+    return alt_lift_load_impl(path, bns, NULL, NULL, NULL, 0);
+}
+
+alt_lift_t *alt_lift_load_excluded(const char *path, const bntseq_t *bns,
+                                  const char *bed_path,
+                                  alt_lift_exclude_stats_t *stats,
+                                  char *error, size_t error_size)
+{
+    memset(stats, 0, sizeof(*stats));
+    memset(error, 0, error_size);
+    ExcludeBed bed;
+    if (!load_exclude_bed(bed_path, bns, &bed, stats, error, error_size)) return NULL;
+    alt_lift_t *l = alt_lift_load_impl(path, bns, &bed, stats, error, error_size);
+    if (!l && error[0] == 0)
+        exclude_error(error, error_size, "%s: cannot open sidecar: %s", path, strerror(errno));
     return l;
 }
 

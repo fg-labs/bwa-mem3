@@ -661,6 +661,75 @@ reads hits on the allele contigs needs a run without `--alt-project`.
   (overridable via `--compat-allow-divergent`).
 - When on, the startup log reports how many ALT contigs lift.
 
+#### `--alt-project-exclude-bed FILE` - restrict which `.alt` alignments lift
+
+Off by default. With `--alt-project`, an otherwise usable `.alt` line is not
+used for projection when its primary footprint overlaps an interval in `FILE`
+by at least one base. The footprint is the whole reference span of the line on
+its RNAME: from POS (1-based in the `.alt`, so `POS - 1` half-open) through the
+bases its `M`, `D`, `N`, `=` and `X` operations consume, including deletions and
+skipped regions. `I`, `S`, `H` and `P` do not extend it, and FLAG 16 does not
+change it. The whole line is excluded, not individual reads or bases; there is
+no padding, score threshold, MAPQ rule or contig-name filter.
+
+Exclusion happens while the `.alt` is read, before a contig's line is chosen.
+When a contig has several usable lines, the first line that is not excluded
+wins, so a later line for a contig whose first line overlaps the BED is still
+used. The result is the lift table you would get from a copy of the `.alt` in
+which each overlapping line were marked unmapped. Excluded contigs stay ALT
+contigs: the index, the `.alt` file and ALT-aware mapping of their hits are
+unchanged, and their hits are handled as without projection. Nothing is written
+to the `.alt`, the index or the alignment records; `@PG` keeps the command line,
+including the BED path.
+
+`FILE` is BED, plain or gzip-compressed (detected automatically; no tabix index
+is needed). It must be a named file, not `-` (stdin), and may be given once.
+Each data line needs tab-separated CHROM, start and end; extra columns are
+ignored, as are blank lines, `#` comments and `track`/`browser` lines. Start and
+end are 0-based half-open decimal integers with `0 <= start <= end`; zero-width
+intervals are ignored and counted, and overlapping or adjacent intervals are
+merged. CHROM must be a non-ALT contig of the index, named exactly as there
+(no `chr` prefix guessing or assembly conversion), and the end must not pass
+the contig's length. A primary contig need not have any interval.
+
+Errors, all before any read is aligned:
+
+- the option without `--alt-project`, a repeated option, or a missing, empty or
+  `-` argument;
+- with a positive `--alt-project-min-gap` or `BWAMEM3_ALT_PROJECT_PAIR_GAP=1`.
+  `--alt-project-min-gap 0` is accepted. The experimental controls below are
+  not part of a restricted run;
+- a file that cannot be opened, read or decompressed (including a truncated
+  gzip file), or a malformed line; the message names the file and line;
+- a BED file that cannot be read, reported before the index loads;
+- a BED with no nonempty interval, or one that excludes no usable `.alt` line:
+  either would make the option a no-op, so omit it for unrestricted projection;
+- a BED that excludes every usable `.alt` line. Projection would do nothing.
+  Running without `--alt-project` gives ordinary ALT-aware mapping, not mapping
+  to the primary assembly alone.
+
+When more than one of the last three applies, the first that holds is
+reported, in this order: a `.alt` with no usable line in the first place (and
+nothing excluded) gives the ordinary `--alt-project` error; then the empty BED;
+then the no-effect BED; then the all-excluded BED.
+
+The `-j`, `--meth` and missing-`.alt` errors of `--alt-project` still apply,
+and `--compat` refuses it as it refuses `--alt-project` (overridable via
+`--compat-allow-divergent`). The startup log names the BED and reports its
+nonempty input, merged and zero-width interval counts and the number of usable
+`.alt` lines excluded and retained (`excluded=` counts lines seen before a
+contig's line is chosen; a line after the chosen one is a duplicate).
+
+**Provenance.** The option records a path, not file contents, and bwa-mem3
+carries no exclusion annotation and fetches none. A reproducible run needs a
+manifest of SHA-256 digests for the reference FASTA and index files, the `.alt`
+and the BED, the bwa-mem3 version, and the command line and environment, plus
+the annotation's assembly and release. Editing the BED in place invalidates
+that record. Name checks catch some mistakes, but a BED from another assembly
+can share contig names. Accuracy evidence for one validated BED and reference
+does not carry over to an arbitrary BED, reference or `.alt`; validate a new
+combination on independent data before relying on it.
+
 #### `--alt-project-min-gap INT` - experimental cross-locus ambiguity guard
 
 Default 0 (disabled). Requires `--alt-project`, even when explicitly set to 0.

@@ -12,6 +12,7 @@
 #define ALT_LIFT_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include "bntseq.h"
 
 #ifdef __cplusplus
@@ -81,6 +82,23 @@ typedef struct {
  * counts every skipped line by reason (also returned in ->skip). */
 alt_lift_t *alt_lift_load(const char *path, const bntseq_t *bns);
 void alt_lift_destroy(alt_lift_t *l);
+
+/* BED rows and otherwise-usable alignments excluded by restricted loading. */
+typedef struct {
+    long input_intervals;       /* nonempty validated rows before merge */
+    long merged_intervals;
+    long zero_width_intervals;
+    long excluded;              /* excluded before first-retained selection */
+} alt_lift_exclude_stats_t;
+
+/* Load with whole-primary-footprint BED exclusion, preserving bns ALT flags.
+ * stats and error are required, with error_size > 0, and initialized on entry.
+ * Returns NULL with a bounded diagnostic on input failure. A successful table
+ * may have zero retained/excluded entries; the CLI decides whether to refuse it. */
+alt_lift_t *alt_lift_load_excluded(const char *path, const bntseq_t *bns,
+                                  const char *bed_path,
+                                  alt_lift_exclude_stats_t *stats,
+                                  char *error, size_t error_size);
 
 /* Lift the half-open interval [s, e) of ALT contig `rid` (0-based, forward contig
  * coordinates) onto the primary assembly. Returns 0 and fills *out, or -1 if rid

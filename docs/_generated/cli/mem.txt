@@ -273,6 +273,15 @@ ALT projection (fg-labs extension):
                  (capped by the hit's length: about 35 for 150 bp at the default
                  -A/-O/-E). Needs a .alt sidecar. Incompatible with -j and --meth;
                  --compat refuses it (override with --compat-allow-divergent) [off]
+   --alt-project-exclude-bed FILE
+                 with --alt-project, skip each .alt alignment whose primary-assembly
+                 footprint (the full reference span of its CIGAR: POS through its
+                 M/D/N/=/X bases) overlaps any FILE interval by at least 1 bp; a
+                 later usable line for that contig may lift
+                 instead. FILE is BED (plain or gzip, not stdin) on primary contigs
+                 named exactly as in the index. ALT contigs stay ALT. Errors if FILE
+                 excludes nothing or every lift, or with a positive
+                 --alt-project-min-gap or BWAMEM3_ALT_PROJECT_PAIR_GAP=1 [none]
 Seed ordering (fg-labs extension):
    --seed-order STR
                  seed emission order before chaining: off|local-longest [off]

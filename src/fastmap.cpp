@@ -2025,6 +2025,15 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 (capped by the hit's length: about 35 for 150 bp at the default\n");
     fprintf(stderr, "                 -A/-O/-E). Needs a .alt sidecar. Incompatible with -j and --meth;\n");
     fprintf(stderr, "                 --compat refuses it (override with --compat-allow-divergent) [off]\n");
+    fprintf(stderr, "   --alt-project-exclude-bed FILE\n");
+    fprintf(stderr, "                 with --alt-project, skip each .alt alignment whose primary-assembly\n");
+    fprintf(stderr, "                 footprint (the full reference span of its CIGAR: POS through its\n");
+    fprintf(stderr, "                 M/D/N/=/X bases) overlaps any FILE interval by at least 1 bp; a\n");
+    fprintf(stderr, "                 later usable line for that contig may lift\n");
+    fprintf(stderr, "                 instead. FILE is BED (plain or gzip, not stdin) on primary contigs\n");
+    fprintf(stderr, "                 named exactly as in the index. ALT contigs stay ALT. Errors if FILE\n");
+    fprintf(stderr, "                 excludes nothing or every lift, or with a positive\n");
+    fprintf(stderr, "                 --alt-project-min-gap or BWAMEM3_ALT_PROJECT_PAIR_GAP=1 [none]\n");
     fprintf(stderr, "Seed ordering (fg-labs extension):\n");
     fprintf(stderr, "   --seed-order STR\n");
     fprintf(stderr, "                 seed emission order before chaining: off|local-longest [off]\n");
@@ -2125,6 +2134,7 @@ int main_mem(int argc, char *argv[])
 {
     int          i, c, ignore_alt = 0, no_mt_io = 0, alt_project = 0;
     bool         alt_project_gap_set = false;
+    const char  *alt_project_exclude_bed = NULL;
     int          fixed_chunk_size          = -1;
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
@@ -2275,6 +2285,7 @@ int main_mem(int argc, char *argv[])
         OPT_TIE_BREAK,
         OPT_ALT_PROJECT,
         OPT_ALT_PROJECT_MIN_GAP,
+        OPT_ALT_PROJECT_EXCLUDE_BED,
         OPT_MD,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
@@ -2344,6 +2355,7 @@ int main_mem(int argc, char *argv[])
         {"tie-break",                required_argument, 0, OPT_TIE_BREAK},
         {"alt-project",              no_argument,       0, OPT_ALT_PROJECT},
         {"alt-project-min-gap",      required_argument, 0, OPT_ALT_PROJECT_MIN_GAP},
+        {"alt-project-exclude-bed",  required_argument, 0, OPT_ALT_PROJECT_EXCLUDE_BED},
         {"md",                       required_argument, 0, OPT_MD},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
@@ -2859,6 +2871,21 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
         else if (c == OPT_ALT_PROJECT) alt_project = 1;
+        else if (c == OPT_ALT_PROJECT_EXCLUDE_BED) {
+            if (alt_project_exclude_bed) {
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed may be supplied only once\n", __func__);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            if (!*optarg || strcmp(optarg, "-") == 0) {
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed requires a named BED file (not stdin)\n", __func__);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            alt_project_exclude_bed = optarg;
+        }
         else if (c == OPT_ALT_PROJECT_MIN_GAP) {
             int64_t gap;
             if (parse_bounded_i64(optarg, 0, INT_MAX, &gap) != 0) {
@@ -3202,6 +3229,34 @@ int main_mem(int argc, char *argv[])
         if (out_opened)
             fclose(aux.fp);
         return 1;
+    }
+    /* --alt-project-exclude-bed: refuse misuse before any index work. The
+     * restricted recipe excludes whole .alt alignments only; the experimental
+     * ambiguity guards are not part of it. */
+    if (alt_project_exclude_bed) {
+        const char *pair_gap = getenv("BWAMEM3_ALT_PROJECT_PAIR_GAP");
+        const char *conflict = NULL;
+        if (!alt_project)
+            conflict = "requires --alt-project";
+        else if (opt->alt_project_min_gap > 0)
+            conflict = "cannot be combined with a positive --alt-project-min-gap (use 0 or omit it)";
+        else if (pair_gap && strcmp(pair_gap, "1") == 0)
+            conflict = "cannot be combined with BWAMEM3_ALT_PROJECT_PAIR_GAP=1 (unset it)";
+        if (!conflict && access(alt_project_exclude_bed, R_OK) != 0) {
+            /* A mistyped path fails here, not after the index load. The loader
+             * still checks its own open/read, which a race could fail. */
+            fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s: cannot read: %s\n", __func__,
+                    alt_project_exclude_bed, strerror(errno));
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
+        if (conflict) {
+            fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s\n", __func__, conflict);
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
     }
     /* --alt-project reads <idxbase>.alt after the index loads (it needs the contig
      * names); check that the file is there first so a missing sidecar fails fast. */
@@ -4044,7 +4099,44 @@ int main_mem(int argc, char *argv[])
      * opt->alt_lift only points at it. */
     std::unique_ptr<alt_lift_t, decltype(&alt_lift_destroy)> alt_lift(nullptr, alt_lift_destroy);
     if (alt_project) {
-        alt_lift.reset(alt_lift_load(alt_path, aux.fmi->idx->bns));
+        alt_lift_exclude_stats_t exclude_stats = {0, 0, 0, 0};
+        if (alt_project_exclude_bed) {
+            char exclude_error[512];
+            alt_lift.reset(alt_lift_load_excluded(alt_path, aux.fmi->idx->bns, alt_project_exclude_bed,
+                                                  &exclude_stats, exclude_error, sizeof(exclude_error)));
+            bool refused = true;
+            if (!alt_lift)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed: %s\n", __func__, exclude_error);
+            else if (alt_lift->n_lift == 0 && exclude_stats.excluded == 0)
+                refused = false;   /* no usable line at all: the established error below, ahead of the
+                                  * empty-BED check so that error is not masked */
+            else if (exclude_stats.merged_intervals == 0)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s has no nonempty intervals "
+                        "(%ld zero-width ignored), so it would exclude nothing; omit the option "
+                        "for unrestricted projection\n", __func__, alt_project_exclude_bed,
+                        exclude_stats.zero_width_intervals);
+            else if (alt_lift->n_lift == 0)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s excludes all %ld usable ALT "
+                        "alignments in %s, so nothing would be projected. Omitting --alt-project "
+                        "gives ordinary ALT-aware mapping, not primary-only mapping\n", __func__,
+                        alt_project_exclude_bed, exclude_stats.excluded, alt_path);
+            else if (exclude_stats.excluded == 0)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s excludes no usable ALT "
+                        "alignment in %s (no primary footprint overlaps its %ld merged interval(s)); "
+                        "omit the option for unrestricted projection\n", __func__,
+                        alt_project_exclude_bed, alt_path, exclude_stats.merged_intervals);
+            else
+                refused = false;
+            if (refused) {
+                delete aux.fmi;
+                free(opt);
+                if (out_opened)
+                    fclose(aux.fp);
+                return 1;
+            }
+        } else {
+            alt_lift.reset(alt_lift_load(alt_path, aux.fmi->idx->bns));
+        }
         if (!alt_lift || alt_lift->n_lift == 0) {
             if (!alt_lift)
                 fprintf(stderr, "[E::%s] --alt-project: cannot open %s: %s\n", __func__, alt_path, strerror(errno));
@@ -4059,6 +4151,11 @@ int main_mem(int argc, char *argv[])
             return 1;
         }
         fprintf(stderr, "[M::%s] alt-project: %d ALT contigs lift onto the primary assembly\n", __func__, alt_lift->n_lift);
+        if (alt_project_exclude_bed)
+            fprintf(stderr, "[M::%s] alt-project: exclusion BED %s: input=%ld merged=%ld zero_width=%ld "
+                    "excluded=%ld retained=%d\n", __func__, alt_project_exclude_bed,
+                    exclude_stats.input_intervals, exclude_stats.merged_intervals,
+                    exclude_stats.zero_width_intervals, exclude_stats.excluded, alt_lift->n_lift);
         opt->alt_lift = alt_lift.get();
         const char *pair_gap = getenv("BWAMEM3_ALT_PROJECT_PAIR_GAP");
         opt->alt_project_pair_gap = pair_gap && strcmp(pair_gap, "1") == 0;
