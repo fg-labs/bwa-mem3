@@ -832,7 +832,13 @@ static void resolve_located(aln_meth_slot_t *x, const aln_meth_pend_t &h, const 
     if (layout_span(key.lay, x->len) != span) {
         fprintf(stderr, "ERROR: --meth search path's gaps (%d) do not give its reference span\n", (int)h.e.n_gapo); exit(1);
     }
-    if (!x->windows.insert(key, 0).second) return;
+    // An ungapped row's window cannot repeat within a read: the read's ungapped hits are distinct
+    // strings of its length (aln_meth_hit keeps one per interval), so their SA rows, and the windows
+    // those rows locate, are distinct; and a gapped key never equals an ungapped one. Under
+    // --known-snvs the read's ALT-window candidates are deduplicated against these keys, so there
+    // every row's key goes into the set.
+    const bool dedup = key.lay.n != 0 || g->ref->known_snvs || g->ref->ks_window;
+    if (dedup && !x->windows.insert(key, 0).second) return;
     // A 65535-base read with a deletion spans more than a window holds. Drop the window as
     // unrepresentable, with cost 0 as its bound: any retained placement is then incomplete.
     if (span > ALN_MAX_READ_LEN) {

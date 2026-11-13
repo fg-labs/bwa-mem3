@@ -1936,7 +1936,12 @@ TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few 
     }
     SUBCASE("the binding rows are spread over the pending intervals in order") {
         // The windows of the rows that were looked up, and the rows that were a wrong copy:
-        // together they tell which SA rows the flush resolved.
+        // together they tell which SA rows the flush resolved. An ungapped row's window key is kept
+        // only under --known-snvs (resolve_located), so give the reference an empty site set.
+        ba::ks_sites_t no_sites;
+        no_sites.by_contig.assign(mr.bns->n_seqs,{});
+        struct restore_t { ba::aln_meth_ref_t &r; ~restore_t() { r.known_snvs=nullptr; } } restore{mr};
+        mr.known_snvs=&no_sites;
         using seen_t=std::pair<decltype(slot.windows.key),long>;
         // as sets: a flush may resolve a batch's rows in any order
         auto same=[](const seen_t &a,const seen_t &b) {
@@ -2024,7 +2029,8 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::aln_meth_hit(&slot,&longer,row,row);
     REQUIRE(slot.pend.size()==2);
     core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
-    CHECK(result.n_rescored==2);CHECK(slot.windows.size()==2);
+    // Only the gapped row's window key is kept: an ungapped row's window cannot repeat (resolve_located).
+    CHECK(result.n_rescored==2);CHECK(slot.windows.size()==1);
     // The two spans have the same normalized start; their minimum-cost alignment wins.
     REQUIRE(result.occ.size()==1);
     CHECK(result.occ[0].pos==500);CHECK(result.occ[0].strand==0); // the row's own locus
