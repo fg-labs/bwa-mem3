@@ -8,6 +8,7 @@
 #include "doctest/doctest.h"
 
 #include "aln_test_ref.h"
+#include "temp_index.h"
 #include "../../src/FMI_search.h"
 #include "../../src/aln/aln_main.h"
 #include "../../src/aln/bwape.h"
@@ -15,6 +16,7 @@
 #include "../../src/aln/bwaseqio.h"
 #include "../../src/aln/bwtgap.h"
 #include "../../src/bwa.h"
+#include "../../src/kvec.h"
 #include "../../src/read_index_ele.h"
 
 #include <cstdio>
@@ -261,6 +263,442 @@ TEST_CASE("aln_pe: the gap-open cap is per file (helper values) and mixed read l
         CHECK((flags[2 * i + 1] & 0xc1) == 0x81); // paired, second in pair
     }
     free(gap);
+}
+
+// ---- SA lookups made in batches (bwt_sa_batch in bwa_pe_se_pos, bwa_pe_pair, bwa_cal_pac_pos) ----
+
+namespace {
+
+// A contig built to give reads many hits: random sequence with a 300 bp segment copied 20
+// times forward and 10 times reverse-complemented, and a 160 bp "AC" tandem repeat. The index
+// files are deleted as soon as it is loaded.
+struct RepIndex {
+    std::string contig;
+    std::unique_ptr<bwa_tests::TempIndex> idx;
+    ba::bwt_t *bwt = nullptr;
+
+    RepIndex()
+    {
+        uint32_t state = 91;
+        const std::string seg = aln_test::lcg_dna(state, 300);
+        contig = aln_test::lcg_dna(state, 1500);
+        for (int i = 0; i < 20; ++i) contig += seg + aln_test::lcg_dna(state, 400 + 37 * (i % 6));
+        for (int i = 0; i < 10; ++i) contig += aln_test::revcomp(seg) + aln_test::lcg_dna(state, 500);
+        for (int i = 0; i < 80; ++i) contig += "AC";
+        contig += aln_test::lcg_dna(state, 1500);
+        idx.reset(new bwa_tests::TempIndex({{"r1", contig}}));
+        idx->drop_files();
+        bwt = ba::bwt_from_fmi(idx->fmi());
+    }
+    ~RepIndex() { ba::bwt_destroy(bwt); }
+    const bntseq_t *bns() const { return idx->bns(); }
+};
+
+RepIndex &rep_fixture()
+{
+    static RepIndex idx;
+    return idx;
+}
+
+// Pairs of 36 bp (read 1) and 40 bp (read 2) from 260-340 bp fragments starting every 25 bp along
+// the whole contig (so many land in the repeats). Every fifth read 2 has a mismatch, every third
+// read 1 a 1 bp deletion and every fourth read 2 a 1 bp insertion, so the ends' reference lengths
+// (len + ref_shift) differ between the ends and between hits; every seventh pair, the first
+// included, is random (unmapped), and every eleventh has only read 1 placed. Written as
+// rep1.fq and rep2.fq in `tmp`.
+void rep_pairs(const bwa_tests::TempDir &tmp, std::string *f1, std::string *f2)
+{
+    RepIndex &ix = rep_fixture();
+    std::vector<std::string> r1, r2;
+    const int len1 = 36, len2 = 40;
+    uint32_t state = 3;
+    for (int pos = 0, i = 0; pos + 342 < (int)ix.contig.size(); pos += 25, ++i) {
+        if (i % 7 == 0) {
+            r1.push_back(aln_test::lcg_dna(state, len1));
+            r2.push_back(aln_test::lcg_dna(state, len2));
+        }
+        const int frag = 260 + (i * 11) % 81;
+        // read 1: with a deletion, 37 reference bases give 36 read bases (ref_shift +1)
+        std::string a = ix.contig.substr(pos, len1 + (i % 3 == 0));
+        if (i % 3 == 0) a.erase(len1 / 2, 1);
+        r1.push_back(a);
+        // read 2: with an insertion, 39 reference bases give 40 read bases (ref_shift -1)
+        const int span2 = len2 - (i % 4 == 0);
+        std::string m = ix.contig.substr(pos + frag - span2, span2);
+        if (i % 4 == 0) m.insert((size_t)span2 / 2, 1, m[span2 / 2] == 'A' ? 'G' : 'A');
+        m = aln_test::revcomp(m);
+        if (i % 5 == 0) m[len2 / 4] = m[len2 / 4] == 'A' ? 'C' : 'A';
+        r2.push_back(i % 11 == 0 ? aln_test::lcg_dna(state, len2) : m);
+    }
+    *f1 = write_fastq(tmp.file("rep1.fq"), r1);
+    *f2 = write_fastq(tmp.file("rep2.fq"), r2);
+}
+
+// Reads the two files into *b; with `searched` (the same files, already loaded and searched with
+// the same options) its search results are copied in, else the reads are searched. The search is
+// deterministic, and repeating it would dominate the tests' run time.
+void load_rep_batch(const ba::gap_opt_t &gap, const std::string &f1, const std::string &f2, Batch *b,
+                    const Batch *searched = nullptr)
+{
+    ba::bwa_seqio_t *ks1 = ba::bwa_seq_open(f1.c_str()), *ks2 = ba::bwa_seq_open(f2.c_str());
+    REQUIRE(ks1 != nullptr);
+    REQUIRE(ks2 != nullptr);
+    int n1 = 0, n2 = 0;
+    b->seqs[0] = ba::bwa_read_seq(ks1, 0x40000, &n1, gap.mode, gap.trim_qual);
+    b->seqs[1] = ba::bwa_read_seq(ks2, 0x40000, &n2, gap.mode, gap.trim_qual);
+    REQUIRE(n1 == n2);
+    b->n = n1;
+    ba::bwa_seq_close(ks1);
+    ba::bwa_seq_close(ks2);
+    if (searched) {
+        REQUIRE(searched->n == b->n);
+        for (int j = 0; j < 2; ++j)
+            for (int i = 0; i < b->n; ++i) { // what aln_search_batch sets on each read
+                ba::bwa_seq_t *q = b->seqs[j] + i;
+                const ba::bwa_seq_t *s = searched->seqs[j] + i;
+                q->sa = 0, q->type = BWA_TYPE_NO_MATCH, q->c1 = q->c2 = 0;
+                q->n_aln = s->n_aln;
+                q->aln = nullptr;
+                if (s->n_aln) {
+                    q->aln = (ba::bwt_aln1_t *)malloc((size_t)s->n_aln * sizeof(ba::bwt_aln1_t));
+                    if (q->aln == nullptr) FAIL("out of memory copying the search results");
+                    memcpy(q->aln, s->aln, (size_t)s->n_aln * sizeof(ba::bwt_aln1_t));
+                }
+            }
+        return;
+    }
+    RepIndex &ix = rep_fixture();
+    ba::aln_search_batch(ix.bwt, b->n, b->seqs[0], &gap, 1);
+    ba::aln_search_batch(ix.bwt, b->n, b->seqs[1], &gap, 1);
+}
+
+// The rep_pairs reads searched with the default gap options, once for every case that needs them.
+const Batch &rep_searched()
+{
+    static Batch searched;
+    static const bool loaded = [] {
+        bwa_tests::TempDir tmp("aln_pe_rep_unit");
+        std::string f1, f2;
+        rep_pairs(tmp, &f1, &f2);
+        ba::gap_opt_t *gap = ba::gap_init_opt();
+        load_rep_batch(*gap, f1, f2, &searched);
+        free(gap);
+        return true;
+    }();
+    (void)loaded;
+    return searched;
+}
+
+// Every field the position, pairing and extra-hit stages write, for one read.
+typedef std::vector<long long> ReadState;
+ReadState read_state(const ba::bwa_seq_t *p)
+{
+    ReadState v = {p->type, (long long)p->pos, p->strand, p->mapQ, (long long)p->seQ, p->extra_flag, p->n_mm,
+                   p->n_gapo, p->n_gape, p->score, (long long)p->c1, (long long)p->c2, (long long)p->sa, p->n_multi};
+    for (int k = 0; k < p->n_multi; ++k) {
+        const ba::bwt_multi1_t *q = p->multi + k;
+        v.insert(v.end(), {(long long)q->pos, q->strand, q->gap, q->mm, q->ref_shift});
+    }
+    return v;
+}
+
+// read_state of every read, read 1 and read 2 of each pair in turn.
+std::vector<ReadState> batch_state(const Batch &b)
+{
+    std::vector<ReadState> v;
+    v.reserve((size_t)b.n * 2);
+    for (int i = 0; i < b.n; ++i)
+        for (int j = 0; j < 2; ++j) v.push_back(read_state(b.seqs[j] + i));
+    return v;
+}
+
+// The index of the first read whose state differs between a and b, or -1 if none does (one
+// assertion per comparison rather than one per read keeps the cases fast).
+long long first_diff(const std::vector<ReadState> &a, const std::vector<ReadState> &b)
+{
+    for (size_t r = 0; r < a.size() || r < b.size(); ++r)
+        if (r >= a.size() || r >= b.size() || a[r] != b[r]) return (long long)r;
+    return -1;
+}
+
+// Reference: upstream's bwa_sa2pos body as one function (bwt_sa, then its position tail), written
+// out here so the references do not share bwa_pos_from_sa with the code under test.
+ba::bwtint_t ref_sa2pos(const bntseq_t *bns, const ba::bwt_t *bwt, ba::bwtint_t sapos, int ref_len, int *strand)
+{
+    ba::bwtint_t pos_f = ba::bwt_sa(bwt, sapos); // position on the forward-reverse coordinate
+    int is_rev;
+    *strand = 0;
+    if (pos_f < (ba::bwtint_t)bns->l_pac && (ba::bwtint_t)bns->l_pac < pos_f + ref_len) return (ba::bwtint_t)-1;
+    pos_f = bns_depos(bns, pos_f, &is_rev);
+    *strand = !is_rev;
+    if (is_rev) pos_f = pos_f + 1 < (ba::bwtint_t)ref_len ? 0 : pos_f - ref_len + 1;
+    return pos_f;
+}
+
+// Reference: bwa_pe_se_pos as upstream wrote it, one bwa_sa2pos per read.
+void ref_pe_se_pos(const bntseq_t *bns, const ba::bwt_t *bwt, int n_seqs, ba::bwa_seq_t *seqs[2], const ba::gap_opt_t *gopt)
+{
+    for (int i = 0; i != n_seqs; ++i)
+        for (int j = 0; j < 2; ++j) {
+            ba::bwa_seq_t *p = seqs[j] + i;
+            if (p->type == BWA_TYPE_UNIQUE || p->type == BWA_TYPE_REPEAT) {
+                int strand;
+                int max_diff = gopt->fnr > 0.0 ? ba::bwa_cal_maxdiff(p->len, BWA_AVG_ERR, gopt->fnr) : gopt->max_diff;
+                p->seQ = p->mapQ = ba::bwa_approx_mapQ(p, max_diff);
+                p->pos = ref_sa2pos(bns, bwt, p->sa, p->len + p->ref_shift, &strand);
+                p->strand = strand;
+                if (p->pos == (ba::bwtint_t)-1) p->type = BWA_TYPE_NO_MATCH;
+            }
+        }
+}
+
+// Reference: bwa_cal_pac_pos as upstream wrote it.
+void ref_cal_pac_pos(const bntseq_t *bns, const ba::bwt_t *bwt, int n_seqs, ba::bwa_seq_t *seqs, int max_mm, float fnr)
+{
+    for (int i = 0; i != n_seqs; ++i) {
+        ba::bwa_seq_t *p = &seqs[i];
+        if (p->type == BWA_TYPE_UNIQUE || p->type == BWA_TYPE_REPEAT) { // upstream's bwa_cal_pac_pos_core
+            int strand;
+            const int max_diff = fnr > 0.0 ? ba::bwa_cal_maxdiff(p->len, BWA_AVG_ERR, fnr) : max_mm;
+            p->seQ = p->mapQ = ba::bwa_approx_mapQ(p, max_diff);
+            p->pos = ref_sa2pos(bns, bwt, p->sa, p->len + p->ref_shift, &strand);
+            p->strand = strand;
+            p->seQ = p->mapQ = ba::bwa_approx_mapQ(p, max_diff);
+            if (p->pos == (ba::bwtint_t)-1) p->type = BWA_TYPE_NO_MATCH;
+        }
+        int n_multi = 0;
+        for (int j = 0; j < p->n_multi; ++j) {
+            int strand;
+            ba::bwt_multi1_t *q = p->multi + j;
+            q->pos = ref_sa2pos(bns, bwt, q->pos, p->len + q->ref_shift, &strand);
+            q->strand = strand;
+            if (q->pos != p->pos && q->pos != (ba::bwtint_t)-1) p->multi[n_multi++] = *q;
+        }
+        p->n_multi = n_multi;
+    }
+}
+
+// Reference: bwa_pe_pair as upstream wrote it (its loop over the pairs, one bwa_sa2pos per row).
+int ref_pe_pair(const bntseq_t *bns, const ba::bwt_t *bwt, int n_seqs, ba::bwa_seq_t *seqs[2],
+                const ba::isize_info_t *ii, const ba::pe_opt_t *opt, const ba::gap_opt_t *gopt)
+{
+    int cnt_chg = 0;
+    pair64_v arr = {0, 0, 0};
+    for (int i = 0; i != n_seqs; ++i) {
+        ba::bwa_seq_t *p[2] = {seqs[0] + i, seqs[1] + i};
+        if ((p[0]->type == BWA_TYPE_UNIQUE || p[0]->type == BWA_TYPE_REPEAT)
+            && (p[1]->type == BWA_TYPE_UNIQUE || p[1]->type == BWA_TYPE_REPEAT)) {
+            long long n_occ[2];
+            for (int j = 0; j < 2; ++j) {
+                n_occ[j] = 0;
+                for (int k = 0; k < p[j]->n_aln; ++k) n_occ[j] += p[j]->aln[k].l - p[j]->aln[k].k + 1;
+            }
+            if (n_occ[0] > opt->max_occ || n_occ[1] > opt->max_occ) continue;
+            arr.n = 0;
+            for (int j = 0; j < 2; ++j)
+                for (int k = 0; k < p[j]->n_aln; ++k) {
+                    const ba::bwt_aln1_t *r = p[j]->aln + k;
+                    for (ba::bwtint_t l = r->k; l <= r->l; ++l) {
+                        int strand;
+                        pair64_t x;
+                        x.x = ref_sa2pos(bns, bwt, l, p[j]->len + p[j]->ref_shift, &strand);
+                        x.y = k << 2 | strand << 1 | j;
+                        kv_push(pair64_t, arr, x);
+                    }
+                }
+            cnt_chg += ba::bwa_pe_pairing(p, &arr, opt, gopt->s_mm, ii);
+        }
+        if (opt->N_multi || opt->n_multi) {
+            for (int j = 0; j < 2; ++j) {
+                if (p[j]->type != BWA_TYPE_NO_MATCH) {
+                    if (!(p[j]->extra_flag & SAM_FPP) && p[1 - j]->type != BWA_TYPE_NO_MATCH)
+                        ba::bwa_aln2seq_core(p[j]->n_aln, p[j]->aln, p[j], 0, p[j]->c1 + p[j]->c2 - 1 > opt->N_multi ? opt->n_multi : opt->N_multi);
+                    else ba::bwa_aln2seq_core(p[j]->n_aln, p[j]->aln, p[j], 0, opt->n_multi);
+                    int n_multi = 0;
+                    for (int k = 0; k < p[j]->n_multi; ++k) {
+                        int strand;
+                        ba::bwt_multi1_t *q = p[j]->multi + k;
+                        q->pos = ref_sa2pos(bns, bwt, q->pos, p[j]->len + q->ref_shift, &strand);
+                        q->strand = strand;
+                        if (q->pos != p[j]->pos && q->pos != (ba::bwtint_t)-1) p[j]->multi[n_multi++] = *q;
+                    }
+                    p[j]->n_multi = n_multi;
+                }
+            }
+        }
+    }
+    kv_destroy(arr);
+    return cnt_chg;
+}
+
+} // namespace
+
+TEST_CASE("aln_pe: batched single-end positions equal one bwa_sa2pos per read"
+          * doctest::test_suite("unit/aln_pe")) {
+    RepIndex &ix = rep_fixture();
+    ba::bwase_initialize();
+    ba::gap_opt_t *gap = ba::gap_init_opt();
+    bwa_tests::TempDir tmp("aln_pe_rep_unit");
+    std::string f1, f2;
+    rep_pairs(tmp, &f1, &f2);
+    Batch a, b;
+    load_rep_batch(*gap, f1, f2, &a, &rep_searched());
+    load_rep_batch(*gap, f1, f2, &b, &rep_searched());
+    srand48(ix.bns()->seed);
+    ba::bwa_pe_aln2seq(a.n, a.seqs);
+    srand48(ix.bns()->seed);
+    ba::bwa_pe_aln2seq(b.n, b.seqs);
+    REQUIRE(first_diff(batch_state(a), batch_state(b)) == -1);
+    ref_pe_se_pos(ix.bns(), ix.bwt, a.n, a.seqs, gap);
+    ba::bwa_pe_se_pos(ix.bns(), ix.bwt, b.n, b.seqs, gap);
+    int n_mapped = 0;
+    for (int i = 0; i < a.n; ++i) n_mapped += a.seqs[0][i].type != BWA_TYPE_NO_MATCH;
+    CHECK(n_mapped > a.n / 2);
+    CHECK(first_diff(batch_state(a), batch_state(b)) == -1);
+    free(gap);
+}
+
+TEST_CASE("aln_se: batched bwa_cal_pac_pos equals upstream's loop"
+          * doctest::test_suite("unit/aln_pe")) {
+    RepIndex &ix = rep_fixture();
+    ba::bwase_initialize();
+    ba::gap_opt_t *gap = ba::gap_init_opt();
+    bwa_tests::TempDir tmp("aln_pe_rep_unit");
+    std::string f1, f2;
+    rep_pairs(tmp, &f1, &f2);
+    const Batch &searched = rep_searched();
+    for (int max_xa : {3, 0, 50}) {
+        Batch a, b; // fresh reads for each max_xa, so no pass starts from another's extra hits
+        load_rep_batch(*gap, f1, f2, &a, &searched);
+        load_rep_batch(*gap, f1, f2, &b, &searched);
+        for (int j = 0; j < 2; ++j) { // each file as a single-end batch
+            srand48(ix.bns()->seed);
+            for (int i = 0; i < a.n; ++i) ba::bwa_aln2seq_core(a.seqs[j][i].n_aln, a.seqs[j][i].aln, &a.seqs[j][i], 1, max_xa);
+            srand48(ix.bns()->seed);
+            for (int i = 0; i < b.n; ++i) ba::bwa_aln2seq_core(b.seqs[j][i].n_aln, b.seqs[j][i].aln, &b.seqs[j][i], 1, max_xa);
+            int n_multi = 0;
+            for (int i = 0; i < a.n; ++i) n_multi += a.seqs[j][i].n_multi;
+            if (max_xa == 50) CHECK(n_multi > a.n); // repeats give extra hits
+            if (max_xa == 0) CHECK(n_multi == 0);
+            ref_cal_pac_pos(ix.bns(), ix.bwt, a.n, a.seqs[j], gap->max_diff, gap->fnr);
+            ba::bwa_cal_pac_pos(ix.bns(), ix.bwt, b.n, b.seqs[j], gap->max_diff, gap->fnr);
+            int n_shift = 0; // reads and extra hits whose reference length differs from the read's
+            for (int i = 0; i < a.n; ++i) {
+                n_shift += a.seqs[j][i].ref_shift != 0;
+                for (int k = 0; k < a.seqs[j][i].n_multi; ++k) n_shift += a.seqs[j][i].multi[k].ref_shift != 0;
+            }
+            CHECK(n_shift > 0);
+            long long diff = -1;
+            for (int i = 0; i < a.n && diff < 0; ++i)
+                if (read_state(a.seqs[j] + i) != read_state(b.seqs[j] + i)) diff = i;
+            REQUIRE_MESSAGE(diff == -1, "max_xa " << max_xa << " file " << j << " read " << diff);
+        }
+    }
+    free(gap);
+}
+
+namespace {
+
+struct GroupOpts { int max_occ, n_multi, N_multi; };
+
+// bwa_pe_pair, and bwa_pe_pair_grouped at group weights from one pair per group to the whole
+// batch, against upstream's loop (ref_pe_pair) under the pairing options `op`. One case per
+// option set keeps each case fast.
+void check_grouping(const GroupOpts &op)
+{
+    RepIndex &ix = rep_fixture();
+    ba::bwase_initialize();
+    ba::gap_opt_t *gap = ba::gap_init_opt();
+    bwa_tests::TempDir tmp("aln_pe_rep_unit");
+    std::string f1, f2;
+    rep_pairs(tmp, &f1, &f2);
+    const Batch &searched = rep_searched(); // every run below starts from a fresh copy of its results
+    ba::pe_opt_t *pe = ba::bwa_init_pe_opt();
+    pe->max_occ = op.max_occ, pe->n_multi = op.n_multi, pe->N_multi = op.N_multi;
+    std::vector<ReadState> want;
+    int want_chg = 0;
+    // rows 0: upstream's loop (ref_pe_pair), the reference; -1: bwa_pe_pair itself (group weight
+    // ALN_PE_GROUP_ROWS); then group weights from one (every pair its own group) to the batch
+    for (long long rows : {0LL, -1LL, 1LL, 333LL, 1LL << 20}) {
+        Batch b;
+        load_rep_batch(*gap, f1, f2, &b, &searched);
+        srand48(ix.bns()->seed);
+        ba::isize_info_t ii, last;
+        last.avg = -1.0;
+        ba::bwa_pe_aln2seq(b.n, b.seqs);
+        ba::bwa_pe_se_pos(ix.bns(), ix.bwt, b.n, b.seqs, gap);
+        ba::bwa_pe_isize(ix.bwt, b.n, b.seqs, &ii, pe, &last);
+        // pairing rows (both ends mapped, within max_occ), as the pairing stage sees them
+        long long n_pair_rows = 0;
+        for (int i = 0; i < b.n; ++i) {
+            long long occ[2] = {0, 0};
+            bool mapped = true;
+            for (int j = 0; j < 2; ++j) {
+                const ba::bwa_seq_t *q = b.seqs[j] + i;
+                mapped = mapped && (q->type == BWA_TYPE_UNIQUE || q->type == BWA_TYPE_REPEAT);
+                for (int k = 0; k < q->n_aln; ++k) occ[j] += q->aln[k].l - q->aln[k].k + 1;
+            }
+            if (mapped && occ[0] <= op.max_occ && occ[1] <= op.max_occ) n_pair_rows += occ[0] + occ[1];
+        }
+        // with the default max_occ, the default group size (ALN_PE_GROUP_ROWS) splits the batch
+        if (op.max_occ == 100000) CHECK_MESSAGE(n_pair_rows > ba::ALN_PE_GROUP_ROWS, n_pair_rows << " pairing rows");
+        const int chg = rows == 0 ? ref_pe_pair(ix.bns(), ix.bwt, b.n, b.seqs, &ii, pe, gap)
+                                  : rows == -1 ? ba::bwa_pe_pair(ix.bns(), ix.bwt, b.n, b.seqs, &ii, pe, gap)
+                                                 : ba::bwa_pe_pair_grouped(ix.bns(), ix.bwt, b.n, b.seqs, &ii, pe, gap, rows);
+        std::vector<ReadState> got = batch_state(b);
+        if (rows == 0) {
+            want = got, want_chg = chg;
+            // the input exercises what the grouping must preserve
+            int n_big = 0, n_fpp = 0, n_multi = 0;
+            for (int i = 0; i < b.n; ++i) {
+                long long occ = 0;
+                for (int j = 0; j < 2; ++j)
+                    for (int k = 0; k < b.seqs[j][i].n_aln; ++k) occ += b.seqs[j][i].aln[k].l - b.seqs[j][i].aln[k].k + 1;
+                n_big += occ > 50;
+                n_fpp += (b.seqs[0][i].extra_flag & SAM_FPP) != 0;
+                n_multi += b.seqs[0][i].n_multi + b.seqs[1][i].n_multi;
+            }
+            CHECK(ii.avg > 0.0);
+            CHECK(n_big > 0);
+            CHECK(n_fpp > b.n / 4);
+            if (op.n_multi + op.N_multi) CHECK(n_multi > 0);
+            continue;
+        }
+        CHECK_MESSAGE(chg == want_chg, "group rows " << rows << " max_occ " << op.max_occ);
+        const long long diff = first_diff(got, want);
+        REQUIRE_MESSAGE(diff == -1, "group rows " << rows << " max_occ " << op.max_occ << " read " << diff);
+    }
+    free(pe);
+    free(gap);
+}
+
+} // namespace
+
+TEST_CASE("aln_pe: batched pairing equals upstream's loop for every grouping (default options)"
+          * doctest::test_suite("unit/aln_pe")) {
+    check_grouping({100000, 3, 10});
+}
+
+// a max_occ that sends the repeat pairs down upstream's `continue` (which also skips their
+// extra hits), with few and with many extra hits allowed
+TEST_CASE("aln_pe: batched pairing equals upstream's loop for every grouping (low max_occ)"
+          * doctest::test_suite("unit/aln_pe")) {
+    check_grouping({20, 3, 10});
+}
+
+TEST_CASE("aln_pe: batched pairing equals upstream's loop for every grouping (low max_occ, many extra hits)"
+          * doctest::test_suite("unit/aln_pe")) {
+    check_grouping({20, 30, 200});
+}
+
+TEST_CASE("aln_pe: batched pairing equals upstream's loop for every grouping (no extra hits)"
+          * doctest::test_suite("unit/aln_pe")) {
+    check_grouping({100000, 0, 0});
+}
+
+TEST_CASE("aln_pe: batched pairing equals upstream's loop for every grouping (many extra hits)"
+          * doctest::test_suite("unit/aln_pe")) {
+    check_grouping({100000, 30, 200});
 }
 
 namespace {

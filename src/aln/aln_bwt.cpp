@@ -1,6 +1,6 @@
 /* See aln_bwt.h. bwt_match_exact_alt is from bwa's Apache2 branch (bwt.c). This file
  * is MODIFIED from the original: the function body is unchanged but moved into
- * namespace bwa_aln, and the occ/SA functions are new code.
+ * namespace bwa_aln, and the occ/SA functions (bwt_sa_batch included) are new code.
  *
  * The MIT License
  *
@@ -97,6 +97,67 @@ bwtint_t bwt_sa(const bwt_t *bwt, bwtint_t k)
     // branchless NEON symbol select, which the scalar get_sa_entry_compressed chain lacks.
     while (!bwt->fmi->call_one_step(pos, sa_entry, offset, 0)) pos = sa_entry;
     return (bwtint_t)sa_entry;
+}
+
+/* Lanes walked at once: mem's resolver's count, SA_RESOLVE_LANES_DEFAULT (FMI_search.h). It only
+ * sets how many fetches are in flight; each output depends on its row alone. */
+
+void bwt_sa_batch(const bwt_t *bwt, const bwtint_t *rows, int64_t n, bwtint_t *out)
+{
+    FMI_search *fmi = bwt->fmi;
+    const CP_OCC *cp = (const CP_OCC *)fmi->cp_occ_data();
+    const int8_t *ms = fmi->sa_ms_byte_data();
+    const uint32_t *ls = fmi->sa_ls_word_data();
+    const int64_t compx = fmi->sa_compx, compx_mask = fmi->sa_compx_mask;
+    // What the next call_one_step on row p reads: the SA sample for a sampled row, else
+    // the row's Occ block (the selection mem's resolver makes).
+    auto prefetch_row = [&](int64_t p) {
+#ifdef ENABLE_PREFETCH
+        if ((p & compx_mask) == 0) {
+            __builtin_prefetch(&ms[p >> compx]);
+            __builtin_prefetch(&ls[p >> compx]);
+        } else {
+            __builtin_prefetch(&cp[p >> CP_SHIFT]);
+        }
+#else
+        (void)p, (void)cp, (void)ms, (void)ls, (void)compx, (void)compx_mask;
+#endif
+    };
+    int64_t row[SA_RESOLVE_LANES_DEFAULT], off[SA_RESOLVE_LANES_DEFAULT], dst[SA_RESOLVE_LANES_DEFAULT];
+    int64_t next = 0, n_live = 0;
+    // Stages the next row needing a walk into lane j; row 0 is bwt_sa's special case.
+    // A row is read before its own output is written, so out may alias rows.
+    auto stage = [&](int j) -> bool {
+        while (next < n) {
+            const int64_t i = next++;
+            const bwtint_t k = rows[i];
+            if (k == 0) {
+                out[i] = (bwtint_t)(-1);
+                continue;
+            }
+            row[j] = (int64_t)k, off[j] = 0, dst[j] = i;
+            prefetch_row((int64_t)k);
+            return true;
+        }
+        return false;
+    };
+    int lim = 0;
+    while (lim < SA_RESOLVE_LANES_DEFAULT && stage(lim)) ++lim;
+    n_live = lim;
+    while (n_live > 0) {
+        for (int j = 0; j < lim; ++j) {
+            if (off[j] < 0) continue;
+            int64_t sa_entry = 0;
+            // drop_sentinel_offset = 0, as bwt_sa
+            if (fmi->call_one_step(row[j], sa_entry, off[j], 0)) {
+                out[dst[j]] = (bwtint_t)sa_entry;
+                if (!stage(j)) off[j] = -1, --n_live;
+            } else {
+                row[j] = sa_entry;
+                prefetch_row(sa_entry);
+            }
+        }
+    }
 }
 
 int bwt_match_exact_alt(const bwt_t *bwt, int len, const ubyte_t *str, bwtint_t *k0, bwtint_t *l0)
