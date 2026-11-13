@@ -287,6 +287,144 @@ void window_overlap_case(bool meth)
 
 TEST_SUITE_BEGIN("unit/aln_ks_cuts");
 
+namespace {
+// A record's loci, its primary and its XA alternatives, each as contig, strand and position, and
+// CIGAR (no NM, as summary), sorted: which loci a tie reported, whichever is primary.
+std::vector<std::string> loci(const std::vector<std::string> &r)
+{
+    std::vector<std::string> out;
+    if (std::stoi(r[1]) & 4) return out;
+    out.push_back(r[2] + "," + ((std::stoi(r[1]) & 16) ? "-" : "+") + r[3] + "," + r[5]);
+    const std::string xa = tag(r, "XA:Z");
+    for (size_t a = 0, b; xa != "-" && a < xa.size(); a = b + 1) {
+        b = xa.find(';', a);
+        if (b == std::string::npos) b = xa.size();
+        if (b > a) out.push_back(xa.substr(a, xa.rfind(',', b - 1) - a));
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+// Every read's summary under --known-snvs equals the oracle's (no --known-snvs, ALT substituted).
+// The oracle's own primary among equal-best loci is a draw, so a tie compares the locus sets
+// (primary and XA together) instead of which one is primary.
+void same_as_oracle(const KsCase &k, std::vector<std::string> opts, const std::string &label)
+{
+    auto ks_opts = opts;
+    ks_opts.insert(ks_opts.end(), {"--known-snvs", k.vcf});
+    const auto got = k.run(ks_opts, k.ref, label + ".ks");
+    const auto oracle = k.run(opts, k.oracle, label + ".oracle");
+    REQUIRE(got.size() == oracle.size());
+    for (size_t i = 0; i < got.size(); ++i) {
+        CAPTURE(label); CAPTURE(i); CAPTURE(summary(got[i])); CAPTURE(summary(oracle[i]));
+        CHECK((std::stoi(got[i][1]) & 4) == (std::stoi(oracle[i][1]) & 4));
+        CHECK(got[i][4] == oracle[i][4]);
+        CHECK(tag(got[i], "X0:i") == tag(oracle[i], "X0:i"));
+        CHECK(tag(got[i], "X1:i") == tag(oracle[i], "X1:i"));
+        if (tag(oracle[i], "X0:i") == "1") CHECK(summary(got[i]) == summary(oracle[i]));
+        else CHECK(loci(got[i]) == loci(oracle[i]));
+    }
+}
+} // namespace
+
+TEST_CASE("aln_ks_cuts: a site near reference Ns: window fill cannot hide an equal-cost competitor")
+{
+    // The ALT windows are cut from the packed reference, whose N runs hold arbitrary fill bases; the
+    // main scorer counts an N as a mismatch. Each read has two Ns under it at P (cost 6 on the
+    // reference, possibly 0 in its window if the fill happens to match) and a site needing its ALT,
+    // plus a competitor Q with two plain mismatches (cost 6, no site). The oracle ties them.
+    uint32_t st = 424242;
+    std::string c1 = aln_test::lcg_dna(st, 48000);
+    std::vector<std::string> reads;
+    std::vector<site_t> sites;
+    for (int v = 0; v < 16; ++v) {
+        std::string read = no_c(st, 60);
+        const int p = 1000 + v * 2800, q = p + 1400;
+        std::string seg_p = with_mm(read, {40});
+        seg_p[20] = seg_p[21] = 'N';
+        c1.replace(p, 60, seg_p);
+        c1.replace(q, 60, with_mm(read, {10, 50}));
+        sites.push_back({p + 40, seg_p[40], std::string(1, read[40]), read[40]});
+        reads.push_back(read);
+    }
+    const KsCase k(c1, sites, reads);
+    same_as_oracle(k, {"--meth", "-n", "3"}, "nfill");
+}
+
+TEST_CASE("aln_ks_cuts: a long read with two gaps and a distant site matches the one-ALT oracle")
+{
+    // 150 bases (within the windows' reach), a site 140 bases in, an insertion and a 2-base
+    // deletion (-o 2): three differences with the ALT credited, four on the reference.
+    uint32_t st = 515151;
+    const std::string read = no_c(st, 150);
+    std::string c1 = aln_test::lcg_dna(st, 12000);
+    const int p = 3000;
+    std::string seg_p = read.substr(0, 50) + read.substr(51, 50) + "GA" + read.substr(101); // ins at 50, del after 100
+    const int site_in_seg = 140 - 1 + 2;
+    seg_p[site_in_seg] = mm_base(seg_p[site_in_seg]);
+    c1.replace(p, seg_p.size(), seg_p);
+    const KsCase k(c1, {{p + site_in_seg, seg_p[site_in_seg], std::string(1, read[140]), read[140]}}, {read});
+    same_as_oracle(k, {"--meth", "-n", "6", "-o", "2", "-e", "2"}, "long");
+}
+
+TEST_CASE("aln_ks_cuts: a terminal gap with a site matches the one-ALT oracle")
+{
+    // -i 0 lets a gap sit at the read's end; display turns a terminal insertion into a soft clip,
+    // while the ALT-window candidate carries that display CIGAR. The locus starts the contig, so no
+    // shifted ungapped path with a mismatch instead of the insertion exists.
+    uint32_t st = 616161;
+    const std::string read = no_c(st, 60);
+    std::string c1 = aln_test::lcg_dna(st, 8000);
+    const int p = 0;
+    std::string seg_p = read.substr(1); // read base 0 is an insertion
+    seg_p[30] = mm_base(seg_p[30]);
+    c1.replace(p, seg_p.size(), seg_p);
+    const KsCase k(c1, {{p + 30, seg_p[30], std::string(1, read[31]), read[31]}}, {read});
+    same_as_oracle(k, {"--meth", "-n", "3", "-i", "0"}, "terminal");
+}
+
+TEST_CASE("aln_ks_cuts: two sites' windows over one terminal-gap locus each refine it with their own ALT")
+{
+    // T starts the contig with read base 0 inserted (-i 0), so the ALT-window candidates for it carry
+    // a display CIGAR that is not a search path and are refined by the window DP. Its two sites:
+    // a (C>T at T's base 10, where the read has T: a conversion on the reference, a match with the
+    // ALT, no mismatch either way) and b (at T's base 30, whose ALT is the read's base). T costs 11
+    // with b's ALT and 14 on the reference. P (three mismatches, 9) is the read's best, so the main
+    // search stops at 12 and never reaches T's reference path: only b's window finds T at 11. a's
+    // window finds T at 14 too, over the same span, and must not stand in for b's.
+    uint32_t st = 818181;
+    std::string read = no_c(st, 60);
+    std::string c1 = aln_test::lcg_dna(st, 8000);
+    std::string seg_t = read.substr(1); // read base 0 is an insertion
+    read[11] = 'T';
+    seg_t[10] = 'C';
+    seg_t[30] = mm_base(seg_t[30]);
+    c1.replace(0, seg_t.size(), seg_t);
+    const int p = 4000;
+    c1.replace(p, 60, with_mm(read, {15, 35, 50}));
+    const KsCase k(c1, {{10, 'C', "T", 'C'}, {30, seg_t[30], std::string(1, read[31]), read[31]}}, {read});
+    same_as_oracle(k, {"--meth", "-n", "3", "-i", "0"}, "terminal2");
+    const auto oracle = k.run({"--meth", "-n", "3", "-i", "0"}, k.oracle, "terminal2.check");
+    REQUIRE(oracle.size() == 1);
+    CHECK(tag(oracle[0], "X1:i") == "1"); // T is retained, so the case exercises b's window
+}
+
+TEST_CASE("aln_ks_cuts: one ALT needed beside a second site in the same CpG matches the oracle")
+{
+    // Read CG over reference CA; the site at the A (A>G) makes the CpG the read needs; a second
+    // site at the C (C>T) is not needed. Only one ALT is credited, so the contract applies.
+    uint32_t st = 717171;
+    std::string read = no_c(st, 80);
+    read[40] = 'C'; read[41] = 'G';
+    std::string c1 = aln_test::lcg_dna(st, 8000);
+    const int p = 2500;
+    std::string seg_p = read; seg_p[41] = 'A';
+    c1.replace(p, 80, seg_p);
+    const KsCase k(c1, {{p + 40, 'C', "T", 'C'}, {p + 41, 'A', "G", 'G'}}, {read});
+    for (const std::string scoring : {"genomic", "neutral"})
+        same_as_oracle(k, {"--meth=taps", "--meth-context", "cpg", "--meth-scoring", scoring, "-n", "3"}, "cpg2." + scoring);
+}
+
 TEST_CASE("aln_ks_cuts: --meth: the ALT-window search does not take a ceiling from its own gapped best")
 {
     window_ceiling_case(true);

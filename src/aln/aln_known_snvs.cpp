@@ -200,6 +200,37 @@ void ks_windows_ref(const std::vector<ks_window_t> &win, const bntseq_t *bns, co
 			_set_pac(p, o, j == w.site_pos - w.beg ? w.alt : (pac[k >> 2] >> ((~k & 3) << 1)) & 3);
 		}
 	}
+	// The windows keep the reference's ambiguity holes (N runs), translated to window coordinates.
+	// Their packed bases are arbitrary fill: without the holes a window row would score that fill
+	// as matches, cheaper than the same row on the reference, and the window search's cuts would
+	// then start from a best the main search can never confirm.
+	std::vector<bntamb1_t> holes;
+	if (bns->n_holes > 0) {
+		const bntamb1_t *h0 = bns->ambs, *h1 = bns->ambs + bns->n_holes; // sorted by offset
+		int64_t wo = 0;
+		for (size_t i = 0; i < win.size(); ++i) {
+			const ks_window_t &w = win[i];
+			const int64_t beg = bns->anns[w.rid].offset + w.beg, end = beg + w.len;
+			// the first hole that ends after beg
+			const bntamb1_t *h = std::lower_bound(h0, h1, beg, [](const bntamb1_t &a, int64_t x) {
+				return a.offset + a.len <= x;
+			});
+			int32_t n = 0;
+			for (; h != h1 && h->offset < end; ++h) {
+				const int64_t a = std::max(beg, h->offset), z = std::min(end, h->offset + (int64_t)h->len);
+				if (z <= a) continue;
+				holes.push_back({wo + (a - beg), (int32_t)(z - a), h->amb});
+				++n;
+			}
+			b->anns[i].n_ambs = n;
+			wo += w.len;
+		}
+	}
+	if (!holes.empty()) {
+		b->n_holes = (int32_t)holes.size();
+		b->ambs = (bntamb1_t *)aln_calloc(holes.size(), sizeof(bntamb1_t));
+		std::copy(holes.begin(), holes.end(), b->ambs);
+	}
 	bns_build_pos2rid(b);
 	*out_bns = b;
 	*out_pac = p;
