@@ -248,3 +248,46 @@ TEST_CASE("aln_realign: m7 context cannot borrow contig neighbors or original N 
     REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,{1,0,1,2,3},&n,1,0,0,&a)==ba::aln_meth_eval_status::ok);
     CHECK(a.reward==-1); // original query ambiguity uses the N matrix column
 }
+
+TEST_CASE("aln_realign: equal-length windows match the full-band DP on both sides of the ungapped bound") {
+    // An equal-length window whose ungapped reward beats every gapped path skips the DP; every
+    // other window (rewards at or below the bound, or a gapped optimum) runs it. Both must give
+    // the full-band scalar DP's reward and CIGAR, and hand back the window they aligned against.
+    const int len=40;
+    int n_fast=0,n_dp=0,n_gapped=0;
+    for(int context:{METH_CTX_ALL,METH_CTX_CPG})
+    for(int scoring:{MEM_METH_SCORING_GENOMIC,MEM_METH_SCORING_NEUTRAL})
+    for(int hyp:{0,1}) {
+        ba::aln_meth_opt_t mo;mo.m.meth_context=context;mo.m.meth_scoring=scoring;ba::aln_meth_opt_finish(&mo);
+        const int m=context==METH_CTX_CPG?7:5;
+        const int8_t *mat=m==7?(hyp?mo.mat7_ot:mo.mat7_ob):(hyp?mo.mat_ot:mo.mat_ob);
+        std::vector<uint8_t> t;uint32_t seed=7919u+hyp;
+        for(int i=0;i<len;++i){seed=seed*1664525u+1013904223u;t.push_back(seed>>30);}
+        Ref ref(t);
+        std::vector<std::vector<uint8_t>> queries;
+        for(int k=0;k<=8;++k) { // k strict mismatches: A->C, C->G, G->T, T->A are never conversions
+            std::vector<uint8_t> q=t;
+            for(int j=0;j<k;++j) q[3+4*j]=(q[3+4*j]+1)&3;
+            queries.push_back(q);
+        }
+        std::vector<uint8_t> gapped=t; // one deletion and one insertion: same length, gapped optimum
+        gapped.erase(gapped.begin()+12);gapped.insert(gapped.begin()+30,(uint8_t)((t[30]+1)&3));
+        queries.push_back(gapped);
+        for(const auto &q:queries) {
+            ba::aln_meth_candidate_t c{0,0,hyp,0,len};ba::aln_meth_alignment_t a;std::vector<uint8_t> window;
+            REQUIRE(ba::aln_meth_realign_window(ref.ref,mo,c,q.data(),len,0,0,&a,0,&window)==ba::aln_meth_eval_status::ok);
+            std::vector<uint8_t> fetched;ba::aln_meth_fetch_window(ref.ref,mo,0,len,0,fetched);
+            CHECK(window==fetched);
+            int ungapped=0;for(int i=0;i<len;++i)ungapped+=mat[fetched[i]*m+q[i]];
+            int n=0;uint32_t *raw=nullptr;
+            const int exact=ksw_global2_scalar_ref(len,q.data(),len,fetched.data(),m,mat,5,1,5,1,len,&n,&raw);
+            const std::vector<uint32_t> expected(raw,raw+n);free(raw);
+            CHECK(a.reward==exact);CHECK(a.raw_cigar==expected);
+            CHECK(a.reward==cigar_score(q,fetched,mat,m,a.raw_cigar));
+            if(ungapped>len-13) { ++n_fast;CHECK(a.raw_cigar==std::vector<uint32_t>{(uint32_t)len<<4}); }
+            else ++n_dp;
+            if(expected.size()>1) ++n_gapped;
+        }
+    }
+    CHECK(n_fast>0);CHECK(n_dp>0);CHECK(n_gapped>0);
+}

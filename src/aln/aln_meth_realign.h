@@ -18,9 +18,13 @@ bool aln_meth_window_has_site(const aln_meth_ref_t &ref, int64_t rb, int len, in
  * Invalid/resource failures print ERROR and must not be interpreted as an absent candidate.
  * Fixed scoring uses the existing meth matrices and ksw_global; hints never certify a band.
  * Active-backend allocation estimate is capped at 64 MiB; existing retained TLS scratch is separate.
- * Query/window lengths are limited to 65535. No silent coordinate clipping or legacy bitfield casts. */
+ * Query/window lengths are limited to 65535. No silent coordinate clipping or legacy bitfield casts.
+ * An equal-length window whose ungapped alignment provably beats every gapped one skips the DP; the
+ * result (and band) is what ksw_global would have returned. window, when set, gets the fetched
+ * window (aln_meth_fetch_window's bases for the candidate and alt), for a caller that reads it
+ * again. */
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &candidate, const ubyte_t *query, int len, int n_ins, int n_del,
-    aln_meth_alignment_t *out, int alt = 0);
+    aln_meth_alignment_t *out, int alt = 0, std::vector<uint8_t> *window = nullptr);
 }
 #endif

@@ -31,6 +31,8 @@ struct aln_meth_slot_t {
     std::map<std::tuple<int,int,int,int64_t>, size_t> loci;
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
+    // Scratch: the reference window of the candidate being resolved (refined, then accounted).
+    std::vector<uint8_t> win;
 };
 struct aln_meth_group_t {
     const bwt_t *bwt = nullptr;

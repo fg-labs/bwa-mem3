@@ -22,6 +22,27 @@ aln_meth_eval_status error(aln_meth_eval_status status, const char *message)
     return status;
 }
 
+// The refinement's gap model: a gap of length k costs gap_open + k * gap_extend, for both
+// insertions and deletions.
+constexpr int gap_open = 5, gap_extend = 1;
+
+/* Whether the ungapped alignment of an equal-length query and window is the unique optimum of the
+ * global alignment, so ksw_global would return it ([len M]) at any band. *reward gets its reward.
+ * With equal lengths, any gapped path has at least one insertion and one deletion (each at least
+ * gap_open + gap_extend) and at most len - 1 aligned columns, each worth at most the matrix's
+ * largest entry (or 0 when that is negative), so an ungapped reward above that bound wins
+ * strictly. */
+bool ungapped_is_optimal(const int8_t *mat, int m, const ubyte_t *query, const uint8_t *target, int len,
+                         int *reward)
+{
+    int best_cell = 0, sum = 0;
+    for (int i = 0; i < m * m; ++i) best_cell = std::max<int>(best_cell, mat[i]);
+    for (int i = 0; i < len; ++i) sum += mat[target[i] * m + query[i]];
+    *reward = sum;
+    const int gapped_bound = best_cell * (len - 1) - 2 * (gap_open + gap_extend);
+    return sum > gapped_bound;
+}
+
 struct ambiguity_window_t { uint8_t *bases; int64_t rb; };
 
 int mask_ambiguity(int64_t begin, int64_t end, void *context)
@@ -65,7 +86,7 @@ void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
 
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &c, const ubyte_t *query, int len, int n_ins, int n_del,
-    aln_meth_alignment_t *out, int alt)
+    aln_meth_alignment_t *out, int alt, std::vector<uint8_t> *window)
 {
     if (out) *out = aln_meth_alignment_t();
     if (!out || !query || !ref.bns || !ref.pac || !ref.bns->anns || len <= 0 || len > 65535 ||
@@ -87,11 +108,13 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
         if (mat[i] < -3 || mat[i] > 1)
             return error(aln_meth_eval_status::invalid_input, "matrix is not the initialized match-1/mismatch-3 model");
     try {
-        std::vector<uint8_t> target;
+        std::vector<uint8_t> local;
+        std::vector<uint8_t> &target = window ? *window : local;
         aln_meth_fetch_window(ref, mo, c.rb, span, c.rid, target, alt);
         const int full = std::max(len, span), delta = std::abs(len - span);
         int band = std::min<int64_t>(full, std::max<int64_t>((int64_t)delta + 3, std::max(n_ins, n_del)));
-        const int certificate = m == 5 ? bwa_global_cert_band(mat, 5, 1, 5, 1, len, query, span, target.data()) : -1;
+        const int certificate = m == 5 ? bwa_global_cert_band(mat, gap_open, gap_extend, gap_open, gap_extend,
+                                                              len, query, span, target.data()) : -1;
         band = certificate < 0 ? full : std::min(full, std::max(band, certificate));
         // Inputs <=65535 make these products fit uint64_t. This bounds both scalar and wave
         // active arrays conservatively; backend TLS retained from earlier calls is not this budget.
@@ -99,18 +122,23 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
         const uint64_t bytes = columns * ((uint64_t)len + span) + 64 + 128 * (longest + 128) + 8 * ((uint64_t)len + span);
         if (bytes > (64ULL << 20))
             return error(aln_meth_eval_status::resource_error, "certified/full window exceeds the 64 MiB active-allocation budget");
-        int n = 0;
-        uint32_t *raw = nullptr;
-        const int reward = ksw_global(len, query, span, target.data(), m, mat, 5, 1, band, &n, &raw);
-        std::unique_ptr<uint32_t, decltype(&std::free)> owner(raw, &std::free);
-        if (n <= 0 || !raw)
-            return error(aln_meth_eval_status::no_alignment, "global alignment returned no CIGAR");
         aln_meth_alignment_t result;
-        result.reward = reward;
         result.rb = c.rb;
         result.re = c.re;
         result.band = band;
-        result.raw_cigar.assign(raw, raw + n);
+        int ungapped = 0;
+        if (span == len && ungapped_is_optimal(mat, m, query, target.data(), len, &ungapped)) {
+            result.reward = ungapped;
+            result.raw_cigar.assign(1, (uint32_t)len << 4);
+        } else {
+            int n = 0;
+            uint32_t *raw = nullptr;
+            result.reward = ksw_global(len, query, span, target.data(), m, mat, gap_open, gap_extend, band, &n, &raw);
+            std::unique_ptr<uint32_t, decltype(&std::free)> owner(raw, &std::free);
+            if (n <= 0 || !raw)
+                return error(aln_meth_eval_status::no_alignment, "global alignment returned no CIGAR");
+            result.raw_cigar.assign(raw, raw + n);
+        }
         result.cigar = result.raw_cigar;
         // Keep stock display normalization separate from the scored raw global alignment.
         if ((result.cigar.back() & 15) == 1) result.cigar.back() = (result.cigar.back() & ~15u) | 4;
