@@ -107,6 +107,23 @@ int64_t aln_rescue_anchor_end(const bwa_seq_t *anchor, const pe_opt_t *opt);
 int64_t aln_rescue_window_ceiling(const bwa_seq_t *anchor, const pe_opt_t *opt);
 bool aln_rescue_within_fragment(const bwa_seq_t *anchor, int64_t mate_beg, const bwa_cigar_t *cigar,
                                 int n_cigar);
+/* The mate-rescue search window [*beg, *end) for a mate of `len` bases, before the floor, ceiling
+ * and contig clamps. `base` is the anchor's start when the mate is reverse (it lies after the
+ * anchor), or aln_rescue_anchor_end when the mate is forward. The window is the insert range
+ * avg +/- 3 std plus the mate's length: [base + avg - 3std - 1.5len, base + avg + 3std + 0.5len)
+ * for a reverse mate, [base - avg - 3std - 0.5len, base - avg + 3std + 1.5len) for a forward one.
+ *
+ * Stock (exact == 0) truncates the start to an integer and then truncates start + 6std + 2len, as
+ * sampe does: the end inherits the start's discarded fraction, so it falls up to two bases short of
+ * the real bound, and it moves with floor(6std) on its own. Every pair with the same anchor and
+ * mate geometry shares those offsets, so a change of std across a multiple of 1/6 moves the end of
+ * all their windows by a base at once, wherever the stated bound lies; the end is not monotone in
+ * std. With exact (--exact-rescue-window), each bound is the offset from `base` rounded outward
+ * (floor for the start, ceiling for the end), so the window is the smallest one holding the stated
+ * range, each bound is monotone in avg and std, and a bound moves only when the stated bound itself
+ * crosses a base. */
+void aln_rescue_window(int64_t base, bool mate_reverse, int len, const isize_info_t *ii, bool exact,
+                       int64_t *beg, int64_t *end);
 /* The largest weight of a group of pairs in bwa_pe_pair (see bwa_pe_pair_grouped). */
 constexpr long long ALN_PE_GROUP_ROWS = 8192;
 /* bwa_pe_pair with the group size as a parameter (bwa_pe_pair passes ALN_PE_GROUP_ROWS); the unit

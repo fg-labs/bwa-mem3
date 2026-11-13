@@ -820,6 +820,22 @@ bool aln_rescue_within_fragment(const bwa_seq_t *anchor, int64_t mate_beg, const
 	return mate_beg <= anchor_beg && mate_end <= anchor_end;                          // forward mate
 }
 
+void aln_rescue_window(int64_t base, bool mate_reverse, int len, const isize_info_t *ii, bool exact,
+                       int64_t *beg, int64_t *end)
+{
+	if (!exact) { // sampe's arithmetic, operation for operation (each assignment truncates)
+		*beg = mate_reverse ? (int64_t)(base + ii->avg - 3 * ii->std - len * 1.5)
+		                    : (int64_t)(base - ii->avg - 3 * ii->std - len * 0.5);
+		*end = (int64_t)(*beg + 6 * ii->std + 2 * len);
+		return;
+	}
+	// Offsets from the integer base, so the rounding does not depend on where the anchor lies.
+	const double lo = mate_reverse ? ii->avg - 3 * ii->std - len * 1.5 : -ii->avg - 3 * ii->std - len * 0.5;
+	const double hi = mate_reverse ? ii->avg + 3 * ii->std + len * 0.5 : -ii->avg + 3 * ii->std + len * 1.5;
+	*beg = base + (int64_t)floor(lo);
+	*end = base + (int64_t)ceil(hi);
+}
+
 void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,
 						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2],
 						const pe_alt_sites_t *alt, int64_t *const alt_site[2])
@@ -845,15 +861,14 @@ void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *_pacseq, int n_seqs,
 			 * considered to be modified. */
 
 #define __set_rght_coor(_a, _b, _pref, _pmate) do {						\
-				(_a) = (int64_t)_pref->pos + ii->avg - 3 * ii->std - _pmate->len * 1.5; \
-				(_b) = (_a) + 6 * ii->std + 2 * _pmate->len;			\
+				aln_rescue_window((int64_t)_pref->pos, true, _pmate->len, ii, popt->exact_rescue_window, &(_a), &(_b)); \
 				if ((_a) < aln_rescue_window_floor(_pref, popt)) (_a) = aln_rescue_window_floor(_pref, popt); \
 				if ((_b) > bns->l_pac) (_b) = bns->l_pac;				\
 			} while (0)
 
 #define __set_left_coor(_a, _b, _pref, _pmate) do {						\
-				(_a) = aln_rescue_anchor_end(_pref, popt) - ii->avg - 3 * ii->std - _pmate->len * 0.5; \
-				(_b) = (_a) + 6 * ii->std + 2 * _pmate->len;			\
+				aln_rescue_window(aln_rescue_anchor_end(_pref, popt), false, _pmate->len, ii, popt->exact_rescue_window, \
+								  &(_a), &(_b));						\
 				if ((_a) < 0) (_a) = 0;									\
 				if ((_b) > aln_rescue_window_ceiling(_pref, popt)) (_b) = aln_rescue_window_ceiling(_pref, popt); \
 			} while (0)

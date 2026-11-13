@@ -845,7 +845,7 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
 static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
                           const gap_opt_t *opt, const isize_info_t *ii,
                           bwa_seq_t *p[2], aln_meth_read_t *r[2], int end, bool short_insert,
-                          bool ref_span) try
+                          bool ref_span, bool exact_window) try
 {
     const int mate=1-end;
     auto *pm=p[end];auto *pa=p[mate];auto *ra=r[mate];auto *rm=r[end];
@@ -893,6 +893,8 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
             fprintf(stderr,"ERROR: --meth cap-rescue window out of range\n");exit(1);
         }
         int64_t beg=(int64_t)begin,last=(int64_t)finish;
+        // --exact-rescue-window: the same window as mate rescue's, rounded outward from the anchor.
+        if(exact_window) aln_rescue_window(a.strand?a_re:(int64_t)a.pos,!a.strand,pm->len,ii,true,&beg,&last);
         // As in mate rescue, --short-insert lets the window cover the anchor's own span.
         if(a.strand) last=std::min<int64_t>(last,short_insert?a_re:(int64_t)a.pos);
         else beg=std::max<int64_t>(beg,short_insert?(int64_t)a.pos:a_re);
@@ -1064,7 +1066,7 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
             aln_meth_read_t *r[2]={res[0]+i,res[1]+i};
             const bool cap0=r[0]->flags&ALN_METH_BIND_BEST,cap1=r[1]->flags&ALN_METH_BIND_BEST;
             if(cap0!=cap1) cnt_chg+=meth_cap_rescue(ref,mo,gopt,ii,p,r,cap0?0:1,popt->short_insert,
-                                                popt->ref_span_insert);
+                                                popt->ref_span_insert,popt->exact_rescue_window);
         }
 	// mate rescue (bwa_paired_sw_core with the anchor's matrix; the rescued mate takes its hypothesis)
 	if (popt->is_sw && ii->avg >= 0.0) {
@@ -1086,14 +1088,13 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 				if (pref->type == BWA_TYPE_NO_MATCH) continue;
 				ubyte_t *seq;
 				if (pref->strand == 0) {
-					beg[k] = (int64_t)pref->pos + ii->avg - 3 * ii->std - pmate->len * 1.5;
-					end[k] = beg[k] + 6 * ii->std + 2 * pmate->len;
+					aln_rescue_window((int64_t)pref->pos, true, pmate->len, ii, popt->exact_rescue_window, &beg[k], &end[k]);
 					if (beg[k] < aln_rescue_window_floor(pref, popt)) beg[k] = aln_rescue_window_floor(pref, popt);
 					if (end[k] > l_pac) end[k] = l_pac;
 					seq = pmate->rseq;
 				} else {
-					beg[k] = aln_rescue_anchor_end(pref, popt) - ii->avg - 3 * ii->std - pmate->len * 0.5;
-					end[k] = beg[k] + 6 * ii->std + 2 * pmate->len;
+					aln_rescue_window(aln_rescue_anchor_end(pref, popt), false, pmate->len, ii, popt->exact_rescue_window,
+									  &beg[k], &end[k]);
 					if (beg[k] < 0) beg[k] = 0;
 					if (end[k] > aln_rescue_window_ceiling(pref, popt)) end[k] = aln_rescue_window_ceiling(pref, popt);
 					seq = pmate->seq;

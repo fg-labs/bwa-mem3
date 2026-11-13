@@ -31,7 +31,7 @@ bwa-mem3 aln ref.fa r.fq > out.sam            # bwa aln + samse
 bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 ```
 
-**Byte-identity without `--meth`, `--short-insert` or `--ref-span-insert`.** The tested SAM records and headers matched the output of stock
+**Byte-identity without `--meth`, `--short-insert`, `--ref-span-insert` or `--exact-rescue-window`.** The tested SAM records and headers matched the output of stock
 bwa 0.7.19 `aln` + `samse`/`sampe`, except for the `@PG` line, which names the
 program that ran. The comparison uses generated single-end and paired-end reads
 (a phiX plus synthetic-contig reference, a few thousand reads per case) with every
@@ -100,6 +100,7 @@ and the name it has there when it differs.
 | `-s`, `-A` | sampe | off | Skip Smith-Waterman for an unmapped mate; skip the insert size estimate (which also skips that Smith-Waterman, as in stock) |
 | `--short-insert` | new | off | Estimate short inserts without a batch-wide minimum set by the longest read; paired input required |
 | `--ref-span-insert` | new | off | Measure inserts from the alignments' reference spans, not read lengths, so indels count; paired input required |
+| `--exact-rescue-window` | new | off; on under `--meth` | Round the mate-rescue window outward from the insert range instead of truncating it as sampe does (see [Mate-rescue window bounds](#mate-rescue-window-bounds)); paired input required. `--no-exact-rescue-window` turns it off, including under `--meth` |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
 | `--known-snvs FILE` | new | off | Place reads carrying a known SNV's ALT allele as on a genome holding both alleles, and tag reads over a site with `XV:Z` (see [Known SNVs](#known-snvs---known-snvs)) |
 | `-v INT` | new | 3 | 0-2 suppress progress, 3 reports progress, 4 adds lookup/window/incomplete diagnostics; some errors and warnings still print at 0 |
@@ -112,8 +113,9 @@ limits must be below 2,147,483,647 (`INT_MAX`) to leave room for the extra candi
 used internally.
 
 The stock paired-end options are ignored, with a warning, when only one input file is
-given. `--short-insert` and `--ref-span-insert` instead require two input files and reject
-single-end use before loading the index or creating output.
+given. `--short-insert`, `--ref-span-insert` and `--exact-rescue-window` instead require two
+input files and reject single-end use before loading the index or creating output
+(`--no-exact-rescue-window` is accepted with one).
 
 ### Short, overlapping fragments
 
@@ -186,6 +188,39 @@ still measures the insert it compares to `-a` from the spans.
 This is an opt-in departure from stock output: it can change the inferred distribution, pair
 selection, proper-pair flags, MAPQ, rescue windows and, for reads pairing moves to a gapped
 hit, their position and CIGAR. Without the option the output is unchanged.
+
+### Mate-rescue window bounds
+
+Mate rescue searches for an anchor's mate in a window placed from the batch's inferred insert
+size: for a forward anchor at `pos`, its reverse mate of `len` bases is searched from
+`pos + avg - 3 std - 1.5 len` to `pos + avg + 3 std + 0.5 len` (mirrored for a reverse anchor).
+Stock `sampe` truncates the start to an integer and then truncates start + `6 std + 2 len`, so the
+end carries the start's discarded fraction and falls up to two bases short of the stated bound.
+It also moves with `floor(6 std)` alone: every pair with the same anchor and mate geometry has
+the same window offsets, so when the batch's inferred std crosses a multiple of 1/6 (for
+example from 12.6685 to 12.6646, across 76/6), the end of all of their windows moves by a base
+at once, and it can move back as std grows. For a cohort of pairs whose mate sits at the window's
+edge, such as a spike-in with inserts well above the batch's, a 0.004 change in std can change
+how every one of them is rescued.
+
+`--exact-rescue-window` computes each bound as its offset from the anchor and rounds it outward
+(the start down, the end up), so the window is the smallest one that holds the stated range:
+
+```bash
+bwa-mem3 aln --exact-rescue-window ref.fa r1.fq r2.fq > out.sam
+```
+
+The start is the same as stock's; the end is up to two bases later. Each bound is monotone in
+the inferred mean and std, and it moves only when the stated bound itself crosses a base, which
+for the end happens once per 1/3 of a unit of std rather than up to three times as often. A
+cohort whose mate sits exactly at a bound still moves with it there: an integer window must
+step somewhere. The same window is used by `--meth` cap rescue. The option combines with
+`--short-insert` and `--ref-span-insert`, which only move the clamps and the anchor's end.
+
+The option is on by default under `--meth` (whose output has no stock counterpart), and
+`--no-exact-rescue-window` turns it off there. Plain `aln` keeps stock's window unless the option
+is given. Enabling it can change which mates are rescued and their CIGARs, MAPQ and proper-pair
+flags.
 
 ### Known SNVs (`--known-snvs`)
 
