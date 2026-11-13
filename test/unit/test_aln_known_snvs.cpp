@@ -638,3 +638,71 @@ TEST_CASE("aln_known_snvs: in-memory window index equals the file-built one")
                 bwa_aln::ks_windows_free(&got);
             }
 }
+
+TEST_CASE("aln_known_snvs: --known-snvs-cache reads back the same index and rebuilds a stale or damaged one")
+{
+    for (bool meth : {false, true}) {
+        CAPTURE(meth);
+        KsWinFixture f;
+        auto sites_of = [&](size_t n_win) {
+            bwa_aln::ks_sites_t sites;
+            sites.by_contig.assign(f.bns->n_seqs, {});
+            for (size_t i = 0; i < n_win; ++i) {
+                const auto &w = f.win[i];
+                const int64_t k = f.bns->anns[w.rid].offset + w.site_pos;
+                const uint8_t refc = (f.pac[k >> 2] >> ((~k & 3) << 1)) & 3;
+                sites.by_contig[w.rid].push_back({w.site_pos, refc, w.alt});
+                ++sites.n_sites;
+            }
+            return sites;
+        };
+        const bwa_aln::ks_sites_t all = sites_of(f.win.size()), fewer = sites_of(f.win.size() - 1);
+        const int m = meth ? 1 : 0;
+        bwa_aln::ks_windows_t want, want_fewer;
+        REQUIRE(bwa_aln::ks_windows_build(&all, f.bns, f.pac, 2, m, &want) == 0);
+        REQUIRE(bwa_aln::ks_windows_build(&fewer, f.bns, f.pac, 2, m, &want_fewer) == 0);
+        CHECK_FALSE(want.from_cache);
+        const std::string cache = f.dir + "/ks.cache";
+        auto build = [&](const bwa_aln::ks_sites_t &s, const bwa_aln::ks_windows_t &oracle, const std::string &path,
+                         bool expect_loaded) {
+            bwa_aln::ks_windows_t got;
+            REQUIRE(bwa_aln::ks_windows_build(&s, f.bns, f.pac, 2, m, &got, path.c_str()) == 0);
+            CHECK(got.from_cache == expect_loaded);
+            expect_fmi_equal(got.fmi, oracle.fmi, !meth);
+            CHECK(got.bwt->primary == oracle.bwt->primary);
+            CHECK(got.bwt->seq_len == oracle.bwt->seq_len);
+            bwa_aln::ks_windows_free(&got);
+        };
+        build(all, want, cache, false); // no file yet: built and written
+        REQUIRE(access(cache.c_str(), R_OK) == 0);
+        build(all, want, cache, true);  // read back
+        build(fewer, want_fewer, cache, false); // stale: other sites
+        build(fewer, want_fewer, cache, true);
+        build(all, want, cache, false);
+        { // a damaged payload byte
+            FILE *fp = fopen(cache.c_str(), "r+b");
+            REQUIRE(fp != nullptr);
+            REQUIRE(fseek(fp, 200, SEEK_SET) == 0);
+            const int c = fgetc(fp);
+            REQUIRE(fseek(fp, 200, SEEK_SET) == 0);
+            fputc(c ^ 0x10, fp);
+            REQUIRE(fclose(fp) == 0);
+        }
+        build(all, want, cache, false);
+        build(all, want, cache, true);
+        REQUIRE(truncate(cache.c_str(), 300) == 0); // a truncated file
+        build(all, want, cache, false);
+        build(all, want, cache, true);
+        { // not an index at all
+            FILE *fp = fopen(cache.c_str(), "wb");
+            REQUIRE(fp != nullptr);
+            fputs("not an index\n", fp);
+            REQUIRE(fclose(fp) == 0);
+        }
+        build(all, want, cache, false);
+        build(all, want, cache, true);
+        build(all, want, f.dir + "/no/such/dir/ks.cache", false); // an unwritable path: a warning only
+        bwa_aln::ks_windows_free(&want);
+        bwa_aln::ks_windows_free(&want_fewer);
+    }
+}

@@ -1301,6 +1301,8 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	            "                   placed as on a genome with both alleles, and every read over a site\n"
 	            "                   gets XV:Z (allele, differences elsewhere, budget, allele-swapped twin's\n"
 	            "                   placement) [off]; single-end, paired-end and --meth\n");
+	fprintf(fp, "  --known-snvs-cache FILE  keep the ALT-window index in FILE: read when it was built for\n"
+	            "                   the same windows and options, else built and (re)written [off]\n");
 	fprintf(fp, "\nNew in bwa-mem3 aln:\n");
 	fprintf(fp, "  -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]\n");
 	fprintf(fp, "            (some errors and warnings still print at 0)\n");
@@ -1445,7 +1447,7 @@ static int aln_parse_double(const char *flag, const char *s, double lo, double *
 	return 1;
 }
 
-enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP, OPT_SHORT_INSERT, OPT_REF_SPAN_INSERT, OPT_KNOWN_SNVS,
+enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP, OPT_SHORT_INSERT, OPT_REF_SPAN_INSERT, OPT_KNOWN_SNVS, OPT_KNOWN_SNVS_CACHE,
 	   OPT_EXACT_RESCUE_WINDOW, OPT_NO_EXACT_RESCUE_WINDOW };
 
 int main_aln(int argc, char *argv[])
@@ -1457,6 +1459,7 @@ int main_aln(int argc, char *argv[])
 	int exact_rescue_window = -1; // -1: not given (on under --meth, off otherwise); else the last given form
 	const char *out_path = NULL;
 	const char *ks_path = NULL;
+	const char *ks_cache_path = NULL;
 	ks_sites_t ks_sites;
 	ks_windows_t ks_windows;
 	std::unique_ptr<char, decltype(&free)> rg_line(NULL, &free);
@@ -1473,6 +1476,7 @@ int main_aln(int argc, char *argv[])
 		{"exact-rescue-window", no_argument, 0, OPT_EXACT_RESCUE_WINDOW},
 		{"no-exact-rescue-window", no_argument, 0, OPT_NO_EXACT_RESCUE_WINDOW},
 		{"known-snvs", required_argument, 0, OPT_KNOWN_SNVS},
+		{"known-snvs-cache", required_argument, 0, OPT_KNOWN_SNVS_CACHE},
 		{"bam", no_argument, 0, OPT_BAM},
 		{"bam-level", required_argument, 0, OPT_BAM_LEVEL},
 		{"help", no_argument, 0, OPT_HELP},
@@ -1578,6 +1582,7 @@ int main_aln(int argc, char *argv[])
 		case OPT_EXACT_RESCUE_WINDOW: exact_rescue_window = 1; break;
 		case OPT_NO_EXACT_RESCUE_WINDOW: exact_rescue_window = 0; break;
 		case OPT_KNOWN_SNVS: ks_path = optarg; break;
+		case OPT_KNOWN_SNVS_CACHE: ks_cache_path = optarg; break;
 		case OPT_BAM: bam = 1; break;
 		case OPT_BAM_LEVEL:
 			if (!aln_parse_int("--bam-level", optarg, 0, 9, &bam_level)) return 1;
@@ -1787,6 +1792,10 @@ int main_aln(int argc, char *argv[])
 			if (refused) return 1;
 		}
 	}
+	if (ks_cache_path && !ks_path) {
+		fprintf(stderr, "[E::aln] --known-snvs-cache needs --known-snvs\n");
+		return 1;
+	}
 	if (!aln_output_ok(out_path)) return 1;
 	FMI_search *fmi = new FMI_search(prefix);
 	// aln searches with bwt_2occ4/call_one_step and never reads mem's seed jump table, so
@@ -1824,7 +1833,8 @@ int main_aln(int argc, char *argv[])
 				o.known_snvs = &ks_sites;
 			}
 			const double t0 = realtime();
-			if (ks_windows_build(&ks_sites, ks_bns, ks_pac, opt->n_threads, o.meth != nullptr, &ks_windows) != 0) {
+			if (ks_windows_build(&ks_sites, ks_bns, ks_pac, opt->n_threads, o.meth != nullptr, &ks_windows,
+			                     ks_cache_path) != 0) {
 				free(meth_hdr_lines);
 				if (o.meth) aln_meth_ref_free(&meth_ref);
 				bwt_destroy(bwt);
@@ -1832,8 +1842,8 @@ int main_aln(int argc, char *argv[])
 				return 1;
 			}
 			if (bwa_verbose >= 3)
-				fprintf(stderr, "[M::aln] --known-snvs: indexed %zu ALT windows in %.1f s\n",
-						ks_windows.win.size(), realtime() - t0);
+				fprintf(stderr, "[M::aln] --known-snvs: %s %zu ALT windows in %.1f s\n",
+						ks_windows.from_cache ? "loaded the index of" : "indexed", ks_windows.win.size(), realtime() - t0);
 			o.known_snvs = &ks_sites;
 			o.ks_windows = &ks_windows;
 		}

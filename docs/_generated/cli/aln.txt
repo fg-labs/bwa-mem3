@@ -128,6 +128,8 @@ Known SNVs:
                    placed as on a genome with both alleles, and every read over a site
                    gets XV:Z (allele, differences elsewhere, budget, allele-swapped twin's
                    placement) [off]; single-end, paired-end and --meth
+  --known-snvs-cache FILE  keep the ALT-window index in FILE: read when it was built for
+                   the same windows and options, else built and (re)written [off]
 
 New in bwa-mem3 aln:
   -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]

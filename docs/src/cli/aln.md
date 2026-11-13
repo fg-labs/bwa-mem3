@@ -103,6 +103,7 @@ and the name it has there when it differs.
 | `--exact-rescue-window` | new | off; on under `--meth` | Round the mate-rescue window outward from the insert range instead of truncating it as sampe does (see [Mate-rescue window bounds](#mate-rescue-window-bounds)); paired input required. `--no-exact-rescue-window` turns it off, including under `--meth` |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
 | `--known-snvs FILE` | new | off | Place reads carrying a known SNV's ALT allele as on a genome holding both alleles, and tag reads over a site with `XV:Z` (see [Known SNVs](#known-snvs---known-snvs)) |
+| `--known-snvs-cache FILE` | new | off | Keep the `--known-snvs` ALT-window index in FILE, so later runs with the same sites, reference and options read it instead of rebuilding it (see [Known SNVs](#known-snvs---known-snvs)) |
 | `-v INT` | new | 3 | 0-2 suppress progress, 3 reports progress, 4 adds lookup/window/incomplete diagnostics; some errors and warnings still print at 0 |
 | `--bam` | new | off | Write BAM instead of SAM |
 | `--bam-level INT` | new | 1 | BAM compression level (0-9; other values are an error) |
@@ -242,6 +243,14 @@ How it works:
 
 - A window of 160 bases either side of each site, with the ALT in place, is indexed when the run
   starts, in memory, with `-t` threads (no files are written).
+- `--known-snvs-cache FILE` keeps that index in FILE. A run reads FILE when it was written for
+  the same indexed windows: its key is a 128-bit hash of the exact text indexed (the windows with
+  their ALTs, converted under `--meth`), its length, the SA sample rate and the mode, and the
+  file's contents must also match a checksum. Otherwise (no file, other sites, reference or
+  mode, or a damaged file) the index is built in memory as without the option and FILE is
+  rewritten through a temporary file and a rename; a failed write is a warning. The index, and so
+  the output, is the same either way. FILE is about 6.5 bytes per window base under `--meth`
+  (about 0.5 GB for 250k sites).
 - Each read is also searched against the windows. A hit there that covers its window's site is
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual
