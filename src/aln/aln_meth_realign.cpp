@@ -235,6 +235,55 @@ int amb_visit(int64_t begin, int64_t end, void *context)
 }
 } // namespace
 
+namespace {
+// 32 lanes of a plane starting at base index b (lanes past the plane's end are 0)
+inline uint64_t plane_at(const uint64_t *p, size_t nw, int64_t b)
+{
+    const int64_t a = b >> 5;
+    const int s = (int)(b & 31) * 2;
+    const uint64_t hi = (size_t)a < nw ? p[a] : 0;
+    if (!s) return hi;
+    const uint64_t lo = (size_t)(a + 1) < nw ? p[a + 1] : 0;
+    return hi << s | lo >> (64 - s);
+}
+} // namespace
+
+void aln_meth_amb_bits(const aln_meth_ref_t &ref, int64_t rb, int len, std::vector<uint64_t> *bits)
+{
+    bits->assign(((size_t)len + 31) / 32, 0);
+    amb_bits_t ctx{bits->data(), rb};
+    bns_iter_ambi(ref.bns, rb, len, amb_visit, &ctx);
+}
+
+void aln_meth_score_block(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, int hyp, int64_t rpos, int qs, int n,
+                          const aln_meth_read_bits_t &rd, const uint64_t *amb, int wo, aln_meth_block_counts_t *out)
+{
+    const size_t nq = rd.code.size(), na = ((size_t)wo + n + 31) / 32;
+    const bool seed = !rd.seed.empty();
+    for (int w = 0; 32 * w < n; ++w) {
+        const int64_t q = qs + 32LL * w;
+        const uint64_t R = pac_word(ref.pac, ref.bns->l_pac, rpos + 32LL * w), Q = plane_at(rd.code.data(), nq, q);
+        const int rem = n - 32 * w;
+        const uint64_t valid = rem >= 32 ? LANE_LO : LANE_LO & (~0ULL << (64 - 2 * rem));
+        const uint64_t x = R ^ Q, neq = (x | x >> 1) & LANE_LO;
+        const uint64_t lo = R & LANE_LO, hi = R >> 1 & LANE_LO;
+        uint64_t conv;
+        if (hyp) {
+            conv = lo & ~hi & plane_at(rd.t.data(), nq, q);
+            if (f.collapsed) conv |= lo & hi & plane_at(rd.c.data(), nq, q);
+        } else {
+            conv = ~lo & hi & plane_at(rd.a.data(), nq, q);
+            if (f.collapsed) conv |= ~lo & ~hi & LANE_LO & plane_at(rd.g.data(), nq, q);
+        }
+        const uint64_t nn = (plane_at(rd.n.data(), nq, q) | plane_at(amb, na, wo + 32LL * w)) & valid;
+        const uint64_t mm = ((neq & ~conv) & valid) | nn;
+        out->n_amb += __builtin_popcountll(nn);
+        out->n_mm += __builtin_popcountll(mm);
+        out->n_conv += __builtin_popcountll(conv & ~nn & valid);
+        if (seed) out->n_seed_mm += __builtin_popcountll(mm & plane_at(rd.seed.data(), rd.seed.size(), q));
+    }
+}
+
 void aln_meth_score_ungapped(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, int hyp, int64_t rb,
                              const aln_meth_read_bits_t &rd, aln_meth_ungapped_t *out)
 {

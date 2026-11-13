@@ -4,7 +4,9 @@
 #include "aln_meth.h"
 namespace bwa_aln {
 /* Original forward-reference half-open window. Query is already oriented to this strand. */
-struct aln_meth_candidate_t { int rid, strand, hyp; int64_t rb, re; };
+/* cig, when set: the raw CIGAR of a search path to the window (a --known-snvs window hit's), which
+ * the main search scores as one of its own paths. */
+struct aln_meth_candidate_t { int rid, strand, hyp; int64_t rb, re; std::vector<uint32_t> cig; };
 enum class aln_meth_eval_status { ok, invalid_input, resource_error, no_alignment };
 /* Fetch a validated forward-reference window (length <=65535), masking .amb runs to code N
  * before CpG labelling. Used only by aln's methylation refinement, accounting and emission. */
@@ -39,6 +41,7 @@ void aln_meth_fast_init(const aln_meth_opt_t &mo, aln_meth_fast_t *f);
 struct aln_meth_read_bits_t {
     int len = 0;
     std::vector<uint64_t> code, n, a, c, g, t;
+    std::vector<uint64_t> seed; // the caller's mask of positions whose differences count toward -k
 };
 void aln_meth_read_bits(const ubyte_t *query, int len, aln_meth_read_bits_t *out);
 struct aln_meth_ungapped_t { int reward, n_mm, n_conv; };
@@ -46,5 +49,14 @@ struct aln_meth_ungapped_t { int reward, n_mm, n_conv; };
  * C->T; 0: OB, G->A). Reference .amb runs count as N. Requires f.ok. */
 void aln_meth_score_ungapped(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, int hyp, int64_t rb,
                              const aln_meth_read_bits_t &rd, aln_meth_ungapped_t *out);
+/* The path scorer's ungapped block: query [qs, qs + n) against the original reference [rpos, rpos +
+ * n), which starts at offset wo of a window whose ambiguity runs are amb (aln_meth_amb_bits; one bit
+ * per base in the low bit of a 2-bit lane, as the read's planes). Adds the block's strict
+ * mismatches (an N on either side included), conversions, ambiguous columns and, when rd.seed is
+ * set, strict mismatches at the seed mask's positions. Requires f.ok. */
+struct aln_meth_block_counts_t { int n_mm = 0, n_conv = 0, n_amb = 0, n_seed_mm = 0; };
+void aln_meth_amb_bits(const aln_meth_ref_t &ref, int64_t rb, int len, std::vector<uint64_t> *bits);
+void aln_meth_score_block(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, int hyp, int64_t rpos, int qs, int n,
+                          const aln_meth_read_bits_t &rd, const uint64_t *amb, int wo, aln_meth_block_counts_t *out);
 }
 #endif

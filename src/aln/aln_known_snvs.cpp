@@ -623,7 +623,8 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 		const int64_t beg = win.beg + off;
 		if (win.site_pos < beg || win.site_pos >= beg + h.span) continue; // misses its site
 		const int64_t rb = bns->anns[win.rid].offset + beg;
-		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb, rb + h.span});
+		const uint32_t *c = aln_meth_hit_cigar(wres, h);
+		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb, rb + h.span, std::vector<uint32_t>(c, c + h.n_cig)});
 	}
 }
 

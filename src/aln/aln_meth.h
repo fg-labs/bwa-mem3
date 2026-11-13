@@ -132,7 +132,8 @@ struct aln_meth_read_t {
     std::vector<aln_meth_hit_t> hits;
     std::vector<uint32_t> cig;
     int ks_alt = 0; // --known-snvs: mate rescue placed the read against its window's ALTs
-    long n_over_diff = 0; // refined windows dropped for more differences than the read's -n allows
+    long n_over_diff = 0; // rows dropped for more strict differences than the read's -n allows
+    long n_over_seed = 0; // rows dropped for more strict differences in the seed than -k allows
 };
 // The pointer is into h itself (one operation) or into r.cig, so it is valid while both are.
 static inline const uint32_t *aln_meth_hit_cigar(const aln_meth_read_t &r, const aln_meth_hit_t &h)

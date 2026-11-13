@@ -730,7 +730,7 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			res[i] = aln_meth_read_t(res[first]); // a fresh copy, so res[i]'s old buffers are freed
 			// a copy ran no search: the work counters (aln_meth_report) stay with its first copy
 			res[i].n_lookups = res[i].n_wrong_copy = res[i].n_rescored = res[i].n_flushes = 0;
-			res[i].n_unrepresentable = res[i].n_over_diff = 0;
+			res[i].n_unrepresentable = res[i].n_over_diff = res[i].n_over_seed = 0;
 			if (res[i].main >= 0) aln_meth_redraw_hits(&res[i], aln_meth_draw_seed(ref, read_no, ord0 + i));
 			// Pairing never reads an incomplete read past its main hit.
 			if (!keep_strata || res[i].flags) aln_meth_trim(&res[i], max_xa_hits);

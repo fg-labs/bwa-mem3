@@ -13,7 +13,8 @@
 #include <vector>
 #include "bwtgap.h"
 namespace bwa_aln {
-struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; };
+// A hit waiting for the next flush: its interval, entry and the path's gaps (aln_meth_hit unpacks them).
+struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; uint32_t gap[ALN_METH_MAX_GAPS]; };
 /* A flat, open-addressed index of distinct keys (insertion order kept in key, a value per key),
  * cleared per read. Only membership and lookup are used, as the std::set / std::map it replaces
  * were, so the results do not depend on the container. K needs operator== and a hash(). */
@@ -60,18 +61,53 @@ template <class K> struct aln_flat_index_t {
 static inline uint64_t aln_flat_mix(uint64_t h) {
     h ^= h >> 33; h *= 0xff51afd7ed558ccdULL; h ^= h >> 33; h *= 0xc4ceb9fe1a85ec53ULL; return h ^ (h >> 33);
 }
+// A hit interval and the gap events of the path that reached it: two paths with different gap
+// placements can reach the same interval (a gap in a tandem repeat) and score differently on the
+// original reference, so each is resolved.
 struct aln_meth_iv_key_t {
-    bwtint_t k, l; int span;
-    bool operator==(const aln_meth_iv_key_t &o) const { return k == o.k && l == o.l && span == o.span; }
-    uint64_t hash() const { return aln_flat_mix((uint64_t)k * 0x9e3779b97f4a7c15ULL ^ (uint64_t)l ^ ((uint64_t)span << 48)); }
+    bwtint_t k, l; uint32_t n; uint32_t gap[ALN_METH_MAX_GAPS];
+    bool operator==(const aln_meth_iv_key_t &o) const {
+        if (k != o.k || l != o.l || n != o.n) return false;
+        for (uint32_t g = 0; g < n; ++g) if (gap[g] != o.gap[g]) return false;
+        return true;
+    }
+    uint64_t hash() const {
+        uint64_t h = (uint64_t)k * 0x9e3779b97f4a7c15ULL ^ (uint64_t)l ^ (uint64_t)n << 56;
+        for (uint32_t g = 0; g < n; ++g) h = h * 0x100000001b3ULL ^ gap[g];
+        return aln_flat_mix(h);
+    }
+};
+struct aln_meth_kl_key_t {
+    bwtint_t k, l;
+    bool operator==(const aln_meth_kl_key_t &o) const { return k == o.k && l == o.l; }
+    uint64_t hash() const { return aln_flat_mix((uint64_t)k * 0x9e3779b97f4a7c15ULL ^ (uint64_t)l); }
+};
+/* A path's alignment in the orientation the rows are scored in (the query as resolve passes it,
+ * against the forward reference window): n gaps, ascending by qpos. An insertion covers query
+ * [qpos, qpos + len); a deletion of len reference bases follows query base qpos - 1. */
+struct aln_meth_layout_t {
+    int n = 0;
+    int qpos[ALN_METH_MAX_GAPS], len[ALN_METH_MAX_GAPS], del[ALN_METH_MAX_GAPS];
+    bool operator==(const aln_meth_layout_t &o) const {
+        if (n != o.n) return false;
+        for (int g = 0; g < n; ++g)
+            if (qpos[g] != o.qpos[g] || len[g] != o.len[g] || del[g] != o.del[g]) return false;
+        return true;
+    }
+    uint64_t hash() const {
+        uint64_t h = (uint64_t)n;
+        for (int g = 0; g < n; ++g) h = h * 0x100000001b3ULL ^ ((uint64_t)qpos[g] << 32 | (uint64_t)len[g] << 1 | (uint64_t)del[g]);
+        return h;
+    }
 };
 struct aln_meth_win_key_t {
     int rid, hyp, strand; int64_t rb, re;
+    aln_meth_layout_t lay; // n = -1: a window without a path (refined by DP)
     bool operator==(const aln_meth_win_key_t &o) const {
-        return rid == o.rid && hyp == o.hyp && strand == o.strand && rb == o.rb && re == o.re;
+        return rid == o.rid && hyp == o.hyp && strand == o.strand && rb == o.rb && re == o.re && lay == o.lay;
     }
     uint64_t hash() const {
-        return aln_flat_mix((uint64_t)rb * 0x9e3779b97f4a7c15ULL ^ (uint64_t)re ^ ((uint64_t)(hyp * 2 + strand) << 60) ^ (uint64_t)rid << 40);
+        return aln_flat_mix((uint64_t)rb * 0x9e3779b97f4a7c15ULL ^ (uint64_t)re ^ ((uint64_t)(hyp * 2 + strand) << 60) ^ (uint64_t)rid << 40 ^ lay.hash());
     }
 };
 struct aln_meth_locus_key_t {
@@ -95,6 +131,13 @@ struct aln_meth_slot_t {
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
+    // Gap lists of the search's paths with more than one gap, ALN_METH_MAX_GAPS words each (see
+    // ALN_METH_GAP; an entry's last_diff_pos indexes its path's list). Cleared per read.
+    std::vector<uint32_t> garena;
+    // The SA rows of each interval resolved in full (sa_ix: its offset in sa_rows), for an interval
+    // that a path with other gaps reaches again. Cleared per read.
+    aln_flat_index_t<aln_meth_kl_key_t> sa_ix;
+    std::vector<bwtint_t> sa_rows;
     std::vector<ubyte_t> vseq, rd_fwd;
     std::vector<aln_meth_pend_t> pend;
     aln_flat_index_t<aln_meth_iv_key_t> intervals;
@@ -106,8 +149,10 @@ struct aln_meth_slot_t {
     int bits_ready = 0;
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
-    // Scratch: the reference window of the candidate being resolved (refined, then accounted).
+    // Scratch: the reference window of the candidate being resolved (refined, then accounted), and
+    // the ambiguity bits of a row's window (score_path).
     std::vector<uint8_t> win;
+    std::vector<uint64_t> amb;
 };
 struct aln_meth_group_t {
     const bwt_t *bwt = nullptr;
@@ -165,6 +210,9 @@ static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t 
 static inline int aln_meth_resume(void *, gap_job_t *, gap_entry_t *) { return 1; }
 void aln_meth_hit(aln_meth_slot_t *, const gap_entry_t *, bwtint_t, bwtint_t);
 static inline void aln_meth_hit(void *, const gap_entry_t *, bwtint_t, bwtint_t) {}
+// A child of entry p (n_gapo >= 1) whose gaps need an arena list: p's gaps with the last one a base
+// longer (ext), or plus the new gap w. Returns the list's index.
+int aln_meth_gap_arena(aln_meth_slot_t *, const gap_entry_t &p, bool ext, uint32_t w);
 // has_copy: the read has duplicate copies that will redraw over its loci.
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
