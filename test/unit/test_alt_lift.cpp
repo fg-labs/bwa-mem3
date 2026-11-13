@@ -18,18 +18,27 @@
 // test_gen_cigar_no_md.cpp pins bwa_gen_cigar_band's values.
 
 #include "doctest/doctest.h"
+#include "temp_index.h"
 #include "temp_path.h"
 #include "alt_lift.h"
+#include "bntseq.h"
 #include "bwamem.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <functional>
 #include <random>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <unistd.h>
 #include <vector>
+#include <zlib.h>
+#include <sys/stat.h>
 
 namespace {
 struct Ctg {
@@ -79,6 +88,37 @@ struct LiftGuard {
     explicit LiftGuard(alt_lift_t *x) : l(x) {}
     ~LiftGuard() { alt_lift_destroy(l); }
 };
+
+// Compare lift data, never allocation addresses or struct padding.
+void check_lift_tables(const alt_lift_t *actual, const alt_lift_t *expected) {
+    REQUIRE(actual != nullptr);
+    REQUIRE(expected != nullptr);
+    REQUIRE(actual->n_seqs == expected->n_seqs);
+    CHECK(actual->n_lift == expected->n_lift);
+    for (int rid = 0; rid < actual->n_seqs; ++rid) {
+        CAPTURE(rid);
+        const auto &a = actual->a[rid], &b = expected->a[rid];
+        REQUIRE(a.trid == b.trid);
+        if (a.trid < 0) continue;
+        CHECK(a.rev == b.rev);
+        CHECK(a.tpos == b.tpos);
+        CHECK(a.tlen == b.tlen);
+        CHECK(a.qlen == b.qlen);
+        REQUIRE(a.n_cigar == b.n_cigar);
+        for (int i = 0; i < a.n_cigar; ++i) CHECK(a.cigar[i] == b.cigar[i]);
+        for (int i = 0; i <= a.n_cigar; ++i) {
+            CHECK(a.qoff[i] == b.qoff[i]);
+            CHECK(a.roff[i] == b.roff[i]);
+        }
+    }
+}
+
+void write_gzip(const std::string &path, const std::string &text) {
+    gzFile fp = gzopen(path.c_str(), "wb");
+    REQUIRE(fp != nullptr);
+    CHECK(gzwrite(fp, text.data(), (unsigned) text.size()) == (int) text.size());
+    REQUIRE(gzclose(fp) == Z_OK);
+}
 
 struct OptGuard {
     mem_opt_t *o;
@@ -1270,4 +1310,720 @@ TEST_CASE("mem_alt_project: without --alt-project it is a no-op" * doctest::test
     memcpy(b, a, sizeof(a));
     REQUIRE(mem_alt_project(o.o, &fb.bns, 2, a) == 2);
     CHECK(memcmp(a, b, sizeof(a)) == 0);
+}
+
+
+// Omitting exclusion, using aligned blocks, or filtering only after first-wins
+// selection must break these hand-derived tables.
+TEST_CASE("exclude BED footprint boundaries and CIGAR" * doctest::test_suite("unit/alt_lift")) {
+    struct Case { const char *cigar; int pos, qlen; bool excluded; };
+    const Case cases[] = {
+        {"100M", 1, 100, false}, {"100M", 100, 100, true},
+        {"100M", 201, 100, false}, {"100M", 100, 100, true},
+        {"50M100D50M", 1, 100, true}, {"50M100N50M", 1, 100, true},
+        {"50=1X49=", 100, 100, true}, {"50M100I50M", 1, 200, false},
+        {"100S100M", 1, 200, false}, {"100H100M", 1, 200, false},
+        {"50M100P50M", 1, 100, false}, {"100S", 101, 100, false},
+        {"100M", 901, 100, false},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        const auto &c = cases[i];
+        CAPTURE(i);
+        FakeBns fb({{"chr1", 1000, 0}, {"tile", c.qlen, 1}});
+        // D/N cases intersect only the deleted/skipped portion.
+        TmpFile bed(i == 4 || i == 5 ? "chr1\t75\t76\n" : "chr1\t100\t200\n");
+        const int flag = i == 3 ? 16 : 0;
+        const std::string suffix = "\tchr1\t" + std::to_string(c.pos) + "\t60\t" + c.cigar + "\t*\t0\t0\t*\t*\n";
+        TmpFile source(("tile\t" + std::to_string(flag) + suffix).c_str());
+        TmpFile masked(("tile\t" + std::to_string(flag | (c.excluded ? 4 : 0)) + suffix).c_str());
+        alt_lift_exclude_stats_t stats = {};
+        char error[1024] = {};
+        LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, bed.path.c_str(), &stats, error, sizeof(error)));
+        LiftGuard expected(alt_lift_load(masked.path.c_str(), &fb.bns));
+        CAPTURE(error);
+        check_lift_tables(actual.l, expected.l);
+        CHECK(stats.input_intervals == 1);
+        CHECK(stats.merged_intervals == 1);
+        CHECK(stats.zero_width_intervals == 0);
+        CHECK(stats.excluded == (c.excluded ? 1 : 0));
+        CHECK(fb.bns.anns[1].is_alt == 1);
+        if (!c.excluded) {
+            REQUIRE(actual.l->n_lift == 1);
+            CHECK(actual.l->a[1].tpos == c.pos - 1);
+            CHECK(actual.l->a[1].rev == (flag == 16));
+        }
+    }
+}
+
+TEST_CASE("exclude BED duplicate fallback equals FLAG masking" * doctest::test_suite("unit/alt_lift")) {
+    FakeBns fb({{"chr1", 1000, 0}, {"tile", 100, 1}});
+    TmpFile bed("chr1\t100\t200\n");
+    const char *source_cases[] = {
+        "tile\t0\tchr1\t101\t60\t100M\ntile\t16\tchr1\t301\t60\t100M\n",
+        "tile\t16\tchr1\t301\t60\t100M\ntile\t0\tchr1\t101\t60\t100M\n",
+        "tile\t0\tchr1\t101\t60\t100M\ntile\t16\tchr1\t101\t60\t100M\n",
+    };
+    const char *masked_cases[] = {
+        "tile\t4\tchr1\t101\t60\t100M\ntile\t16\tchr1\t301\t60\t100M\n",
+        "tile\t16\tchr1\t301\t60\t100M\ntile\t4\tchr1\t101\t60\t100M\n",
+        "tile\t4\tchr1\t101\t60\t100M\ntile\t20\tchr1\t101\t60\t100M\n",
+    };
+    for (int i = 0; i < 3; ++i) {
+        CAPTURE(i);
+        const std::string prefix =
+            "tile\t4\tchr1\t101\t60\tbad\n"
+            "tile\t0\t*\t0\t60\t*\n"
+            "tile\t256\tchr1\t101\t60\t100M\n"
+            "tile\t2048\tchr1\t101\t60\t100M\n"
+            "tile\t0\tchr1\t101\t60\t50M\n"
+            "tile\t0\tchr1\t101\t60\tbad\n";
+        TmpFile source((prefix + source_cases[i]).c_str());
+        TmpFile masked((prefix + masked_cases[i]).c_str());
+        alt_lift_exclude_stats_t stats = {};
+        char error[1024] = {};
+        LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, bed.path.c_str(), &stats, error, sizeof(error)));
+        LiftGuard expected(alt_lift_load(masked.path.c_str(), &fb.bns));
+        check_lift_tables(actual.l, expected.l);
+        CHECK(stats.excluded == (i == 0 ? 1 : i == 1 ? 0 : 2));
+        CHECK(actual.l->skip.bad == 2);
+        CHECK(actual.l->skip.unmapped == 2);
+        CHECK(actual.l->skip.not_primary == 2);
+        CHECK(actual.l->n_lift == (i == 2 ? 0 : 1));
+        if (i != 2) CHECK(actual.l->a[1].tpos == 300);
+        CHECK(fb.bns.anns[1].is_alt == 1);
+    }
+}
+
+TEST_CASE("exclude BED reads every member of a multi-member gzip" * doctest::test_suite("unit/alt_lift")) {
+    // bgzip output is a run of concatenated gzip members; build the same
+    // structure with zlib (append mode starts a new member).
+    FakeBns fb({{"chr1", 1000, 0}, {"tileA", 100, 1}, {"tileB", 100, 1}});
+    TmpFile source("tileA\t0\tchr1\t101\t60\t100M\ntileB\t0\tchr1\t501\t60\t100M\n");
+    TmpFile multi("");
+    write_gzip(multi.path, "chr1\t150\t160\n");
+    {
+        gzFile fp = gzopen(multi.path.c_str(), "ab");
+        REQUIRE(fp != nullptr);
+        const std::string second = "chr1\t550\t560\n";
+        CHECK(gzwrite(fp, second.data(), (unsigned) second.size()) == (int) second.size());
+        REQUIRE(gzclose(fp) == Z_OK);
+    }
+    alt_lift_exclude_stats_t stats = {};
+    char error[1024] = {'x'};
+    LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, multi.path.c_str(), &stats, error, sizeof(error)));
+    REQUIRE(actual.l != nullptr);
+    CHECK(error[0] == 0);
+    CHECK(stats.input_intervals == 2);
+    CHECK(stats.merged_intervals == 2);
+    CHECK(stats.excluded == 2);
+    CHECK(actual.l->n_lift == 0);
+}
+
+TEST_CASE("exclude BED dictionary and compressed errors" * doctest::test_suite("unit/alt_lift")) {
+    FakeBns fb({{"chr1", 1000, 0}, {"tile", 100, 1}, {"track_chr", 1000, 0}, {"browser_chr", 1000, 0}});
+    TmpFile source("tile\t0\tchr1\t101\t60\t100M\n");
+    const std::string text = "# comment\r\ntrack name=exclude\nbrowser position chr1\n\nchr1\t150\t200\textra\r\nchr1\t100\t150\nchr1\t125\t175\nchr1\t220\t220\ntrack_chr\t0\t1\nbrowser_chr\t0\t1";
+    TmpFile plain(text.c_str()), compressed("");
+    write_gzip(compressed.path, text);
+    for (const auto &path : {plain.path, compressed.path}) {
+        alt_lift_exclude_stats_t stats = {};
+        char error[1024] = {'x'};
+        LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, path.c_str(), &stats, error, sizeof(error)));
+        REQUIRE(actual.l != nullptr);
+        CHECK(actual.l->n_lift == 0);
+        CHECK(error[0] == 0);
+        CHECK(stats.input_intervals == 5);
+        CHECK(stats.merged_intervals == 3);
+        CHECK(stats.zero_width_intervals == 1);
+        CHECK(stats.excluded == 1);
+    }
+    const char *bad_rows[] = {
+        "chr1\t-1\t10", "chr1\t+1\t10", "chr1\t1x\t10", "chr1\t20\t10",
+        "chr1\t1\t1001", "chr1\t1\t9223372036854775808", "chr1\t1", "chr1\t\t10",
+        "chrZ\t1\t10", "tile\t1\t10", "chr1 1 10", "chr1\t1\t10x",
+        "track_bad\t1\t10", "browser_bad\t1\t10",
+    };
+    for (const auto row : bad_rows) {
+        CAPTURE(row);
+        for (bool gzip : {false, true}) {
+            const std::string content = std::string("# comment\n") + row + "\n";
+            TmpFile bad(content.c_str());
+            if (gzip) write_gzip(bad.path, content);
+            alt_lift_exclude_stats_t stats = {};
+            char error[1024] = {};
+            LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, bad.path.c_str(), &stats, error, sizeof(error)));
+            CHECK(actual.l == nullptr);
+            CHECK(std::string(error).find(bad.path) != std::string::npos);
+            CHECK(std::string(error).find("line 2") != std::string::npos);
+        }
+    }
+    SUBCASE("truncated gzip after valid BED rows fails") {
+        // Missing trailer can surface only after the last complete text line.
+        struct stat info = {};
+        REQUIRE(stat(compressed.path.c_str(), &info) == 0);
+        REQUIRE(info.st_size > 8);
+        REQUIRE(truncate(compressed.path.c_str(), info.st_size - 8) == 0);
+        alt_lift_exclude_stats_t stats = {};
+        char error[1024] = {};
+        LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, compressed.path.c_str(), &stats, error, sizeof(error)));
+        CHECK(actual.l == nullptr);
+        CHECK(std::string(error).find(compressed.path) != std::string::npos);
+    }
+    SUBCASE("missing BED and missing sidecar diagnose correct path") {
+        for (bool missing_bed : {false, true}) {
+            const char *missing = "/nonexistent/alt_exclude_test";
+            alt_lift_exclude_stats_t stats = {};
+            char error[32];
+            memset(error, 'x', sizeof(error));
+            LiftGuard actual(alt_lift_load_excluded(missing_bed ? source.path.c_str() : missing, &fb.bns,
+                                                  missing_bed ? missing : plain.path.c_str(), &stats, error, sizeof(error)));
+            CHECK(actual.l == nullptr);
+            CHECK(error[sizeof(error) - 1] == 0);
+            CHECK(std::string(error).find(missing) != std::string::npos);
+        }
+    }
+    SUBCASE("empty and no-effect BED remain inspectable by the loader") {
+        for (const char *content : {"# empty\nchr1\t10\t10\n", "chr1\t500\t600\n"}) {
+            TmpFile bed(content);
+            alt_lift_exclude_stats_t stats = {};
+            char error[1024] = {};
+            LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, bed.path.c_str(), &stats, error, sizeof(error)));
+            REQUIRE(actual.l != nullptr);
+            CHECK(actual.l->n_lift == 1);
+            CHECK(stats.excluded == 0);
+        }
+    }
+}
+
+namespace {
+struct BnsGuard {
+    bntseq_t *b;
+    explicit BnsGuard(bntseq_t *x) : b(x) {}
+    ~BnsGuard() { if (b) bns_destroy(b); }
+    BnsGuard(const BnsGuard &) = delete;
+    BnsGuard &operator=(const BnsGuard &) = delete;
+};
+
+void write_text(const std::string &path, const std::string &text) {
+    FILE *fp = fopen(path.c_str(), "wb");
+    REQUIRE(fp != nullptr);
+    CHECK(fwrite(text.data(), 1, text.size(), fp) == text.size());
+    REQUIRE(fclose(fp) == 0);
+}
+
+std::vector<std::vector<std::string>> sam_fields(const std::string &text) {
+    std::vector<std::vector<std::string>> rows;
+    size_t at = 0;
+    while (at < text.size()) {
+        size_t end = text.find('\n', at);
+        if (end == std::string::npos) end = text.size();
+        std::vector<std::string> row;
+        size_t f = at;
+        while (true) {
+            const size_t tab = text.find('\t', f);
+            if (tab == std::string::npos || tab > end) { row.push_back(text.substr(f, end - f)); break; }
+            row.push_back(text.substr(f, tab - f));
+            f = tab + 1;
+        }
+        rows.push_back(row);
+        at = end + 1;
+    }
+    return rows;
+}
+} // namespace
+
+// The real index loader marks ALT contigs from the sidecar's QNAMEs alone
+// (bns_restore), so neither runtime exclusion nor FLAG-masking the excluded line
+// may change which contigs are ALT. Generated index; one ALT name has the
+// conventional alt_ prefix and one (an HLA-style name) has no prefix or suffix,
+// so prefix-based filtering would be caught. Each tile is excluded in turn.
+TEST_CASE("exclude BED preserves real ALT marking" * doctest::test_suite("unit/alt_lift")) {
+    std::mt19937 rng(775);
+    std::string chr1(2000, 'A');
+    for (char &c : chr1) c = "ACGT"[rng() % 4];
+    const std::string tile_a = chr1.substr(100, 200);
+    const std::string tile_b = bwa_tests::revcomp(chr1.substr(1000, 200));
+    const char *name_a = "alt_chr1_tile";
+    const char *name_b = "HLA-A*01:01:01:01";
+    // The index is built and loaded before any sidecar exists, so its own bns
+    // marks nothing: every ALT bit below comes from a sidecar's names.
+    bwa_tests::TempIndex idx({{"chr1", chr1}, {name_a, tile_a}, {name_b, tile_b}});
+    for (int rid = 0; rid < idx.bns()->n_seqs; ++rid) CHECK(idx.bns()->anns[rid].is_alt == 0);
+    const std::string prefix = idx.prefix();
+    const std::string alt_path = prefix + ".alt";
+    const std::string source = std::string(name_a) + "\t0\tchr1\t101\t60\t200M\t*\t0\t0\t*\t*\n" +
+                               name_b + "\t16\tchr1\t1001\t60\t200M\t*\t0\t0\t*\t*\n";
+    for (int excluded = 1; excluded <= 2; ++excluded) {
+        CAPTURE(excluded);
+        // One base inside the excluded tile's footprint (BED is 0-based).
+        TmpFile bed(excluded == 1 ? "chr1\t250\t251\n" : "chr1\t1000\t1001\n");
+        // The oracle: the excluded line's FLAG gains 0x4, nothing else changes.
+        std::string masked = source;
+        const std::string flag_from = excluded == 1 ? std::string(name_a) + "\t0\t" : std::string(name_b) + "\t16\t";
+        const std::string flag_to = excluded == 1 ? std::string(name_a) + "\t4\t" : std::string(name_b) + "\t20\t";
+        REQUIRE(masked.find(flag_from) != std::string::npos);
+        masked.replace(masked.find(flag_from), flag_from.size(), flag_to);
+        const auto src_rows = sam_fields(source), mask_rows = sam_fields(masked);
+        REQUIRE(src_rows.size() == 2);
+        REQUIRE(mask_rows.size() == 2);
+        for (size_t i = 0; i < 2; ++i) {
+            CAPTURE(i);
+            CHECK(src_rows[i][0] == mask_rows[i][0]);  // same QNAME sequence
+            CHECK((src_rows[i][1] != mask_rows[i][1]) == ((int) i + 1 == excluded));
+            for (size_t f = 2; f < src_rows[i].size(); ++f) CHECK(src_rows[i][f] == mask_rows[i][f]);
+        }
+
+        write_text(alt_path, source);
+        BnsGuard src_bns(bns_restore(prefix.c_str()));
+        REQUIRE(src_bns.b != nullptr);
+        REQUIRE(src_bns.b->n_seqs == 3);
+        CHECK(std::string(src_bns.b->anns[0].name) == "chr1");
+        CHECK(std::string(src_bns.b->anns[1].name) == name_a);
+        CHECK(std::string(src_bns.b->anns[2].name) == name_b);
+        const int want_alt[3] = {0, 1, 1};
+        for (int rid = 0; rid < 3; ++rid) CHECK(src_bns.b->anns[rid].is_alt == want_alt[rid]);
+
+        // Ordinary projection (no BED) lifts both and leaves the bits alone.
+        LiftGuard off(alt_lift_load(alt_path.c_str(), src_bns.b));
+        REQUIRE(off.l != nullptr);
+        CHECK(off.l->n_lift == 2);
+        CHECK(off.l->a[1].trid == 0);
+        CHECK(off.l->a[2].trid == 0);
+        alt_lift_exclude_stats_t stats = {};
+        char error[1024] = {};
+        LiftGuard runtime(alt_lift_load_excluded(alt_path.c_str(), src_bns.b, bed.path.c_str(), &stats, error, sizeof(error)));
+        CAPTURE(error);
+        REQUIRE(runtime.l != nullptr);
+        CHECK(stats.excluded == 1);
+        CHECK(runtime.l->n_lift == 1);
+        CHECK(runtime.l->a[excluded].trid == -1);
+        CHECK(runtime.l->a[3 - excluded].trid == 0);
+        for (int rid = 0; rid < 3; ++rid) CHECK(src_bns.b->anns[rid].is_alt == want_alt[rid]);
+
+        write_text(alt_path, masked);
+        BnsGuard mask_bns(bns_restore(prefix.c_str()));
+        REQUIRE(mask_bns.b != nullptr);
+        REQUIRE(mask_bns.b->n_seqs == src_bns.b->n_seqs);
+        for (int rid = 0; rid < 3; ++rid) {
+            CAPTURE(rid);
+            CHECK(std::string(mask_bns.b->anns[rid].name) == src_bns.b->anns[rid].name);
+            CHECK(mask_bns.b->anns[rid].len == src_bns.b->anns[rid].len);
+            CHECK(mask_bns.b->anns[rid].offset == src_bns.b->anns[rid].offset);
+            CHECK(mask_bns.b->anns[rid].is_alt == src_bns.b->anns[rid].is_alt);
+        }
+        LiftGuard oracle(alt_lift_load(alt_path.c_str(), mask_bns.b));
+        check_lift_tables(runtime.l, oracle.l);
+        CHECK(oracle.l->skip.unmapped == 1);
+        for (int rid = 0; rid < 3; ++rid) CHECK(mask_bns.b->anns[rid].is_alt == want_alt[rid]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Table gate: restricted loading versus a FLAG-masked sidecar.
+//
+// The masked sidecar is the source with FLAG 0x4 OR-ed into every record whose
+// primary footprint overlaps the BED, as an independent overlap oracle writes
+// it. Loading source + BED must give the same lift table, field by field, as
+// loading the masked sidecar without a BED, against a bns that each sidecar's
+// own names marked. The gate also checks the inputs it relies on to equate
+// per-record decisions with table entries: identical QNAME order and non-FLAG
+// bytes, unique QNAMEs, and every source record usable when loaded unfiltered.
+// ---------------------------------------------------------------------------
+namespace {
+struct AltGateInputs {
+    std::string prefix, source, masked, bed;
+};
+
+struct AltGateCounts {
+    long n_seqs = 0, alt_contigs = 0, rows = 0, excluded = 0, retained = 0;
+    long input_intervals = 0, merged_intervals = 0;
+};
+
+struct SidecarRow {
+    std::string qname;
+    long flag;
+    std::string rest;  // every byte after FLAG up to the newline
+};
+
+bool file_exists(const std::string &path) {
+    struct stat st;
+    return stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
+}
+
+std::vector<SidecarRow> read_sidecar(const std::string &path) {
+    std::ifstream in(path, std::ios::binary);
+    REQUIRE(in.good());
+    std::vector<SidecarRow> rows;
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t t1 = line.find('\t');
+        const size_t t2 = t1 == std::string::npos ? t1 : line.find('\t', t1 + 1);
+        REQUIRE(t2 != std::string::npos);
+        REQUIRE(line[0] != '@');
+        char *end = nullptr;
+        const std::string flag = line.substr(t1 + 1, t2 - t1 - 1);
+        const long f = strtol(flag.c_str(), &end, 10);
+        REQUIRE((!flag.empty() && *end == '\0'));
+        rows.push_back({line.substr(0, t1), f, line.substr(t2)});
+    }
+    return rows;
+}
+
+// bns_restore a private prefix whose .ann/.amb/.pac link to `prefix` and whose
+// .alt links to `alt`, so ALT marking comes from that sidecar's names and the
+// shared index directory is never written.
+bntseq_t *restore_with_alt(const std::string &dir, const char *tag, const std::string &prefix,
+                           const std::string &alt) {
+    const std::string base = dir + "/" + tag;
+    auto link = [](const std::string &target, const std::string &at) {
+        char *abs = realpath(target.c_str(), nullptr);
+        REQUIRE(abs != nullptr);
+        const int rc = symlink(abs, at.c_str());
+        free(abs);
+        REQUIRE(rc == 0);
+    };
+    for (const char *ext : {".ann", ".amb", ".pac"}) link(prefix + ext, base + ext);
+    link(alt, base + ".alt");
+    return bns_restore(base.c_str());
+}
+
+// Compare contig dictionaries and ALT bits. Returns the number of differing contigs.
+long count_bns_differences(const bntseq_t *a, const bntseq_t *b) {
+    long diff = 0;
+    for (int rid = 0; rid < a->n_seqs; ++rid) {
+        const bntann1_t &x = a->anns[rid], &y = b->anns[rid];
+        if (strcmp(x.name, y.name) != 0 || x.len != y.len || x.offset != y.offset || x.is_alt != y.is_alt) {
+            if (diff == 0) MESSAGE("first differing contig: rid " << rid << " " << x.name);
+            ++diff;
+        }
+    }
+    return diff;
+}
+
+// The whole gate. `tamper`, if given, edits the oracle table after loading; the
+// generated cases use it to prove a single wrong field is caught.
+AltGateCounts run_alt_table_gate(const AltGateInputs &in,
+                                 const std::function<void(alt_lift_t *)> &tamper = nullptr) {
+    for (const char *ext : {".ann", ".amb", ".pac"}) {
+        INFO("missing index file " << in.prefix << ext);
+        REQUIRE(file_exists(in.prefix + ext));
+    }
+    for (const auto &path : {in.source, in.masked, in.bed}) {
+        INFO("missing gate input " << path);
+        REQUIRE(file_exists(path));
+    }
+    AltGateCounts counts;
+
+    // Real ALT marking from each sidecar's names, against the same index.
+    char dir[4096];
+    REQUIRE(bwa_test_mkdtemp(dir, sizeof(dir), "alt_gate") == 0);
+    struct DirGuard {
+        const char *d;
+        ~DirGuard() { bwa_test_remove_flat_dir(d); }
+    } dir_guard{dir};
+    BnsGuard src_bns(restore_with_alt(dir, "source", in.prefix, in.source));
+    BnsGuard mask_bns(restore_with_alt(dir, "masked", in.prefix, in.masked));
+    REQUIRE(src_bns.b != nullptr);
+    REQUIRE(mask_bns.b != nullptr);
+    REQUIRE(src_bns.b->n_seqs == mask_bns.b->n_seqs);
+    CHECK(count_bns_differences(src_bns.b, mask_bns.b) == 0);
+    // The deployed layout: the index's own sidecar, read by bns_restore(prefix).
+    if (file_exists(in.prefix + ".alt")) {
+        BnsGuard own_bns(bns_restore(in.prefix.c_str()));
+        REQUIRE(own_bns.b != nullptr);
+        REQUIRE(own_bns.b->n_seqs == src_bns.b->n_seqs);
+        CHECK(count_bns_differences(own_bns.b, src_bns.b) == 0);
+    }
+    counts.n_seqs = src_bns.b->n_seqs;
+    std::vector<int> alt_bits(counts.n_seqs);
+    for (int rid = 0; rid < counts.n_seqs; ++rid) {
+        alt_bits[rid] = src_bns.b->anns[rid].is_alt;
+        counts.alt_contigs += alt_bits[rid] != 0;
+    }
+
+    // Row-level oracle shape: same QNAME order and non-FLAG bytes, FLAG either
+    // unchanged or exactly FLAG | 4 on a record that lacked 0x4, unique ALT names.
+    const auto src_rows = read_sidecar(in.source), mask_rows = read_sidecar(in.masked);
+    REQUIRE(src_rows.size() == mask_rows.size());
+    std::unordered_map<std::string, int> rid_of;
+    rid_of.reserve(counts.n_seqs);
+    for (int rid = 0; rid < counts.n_seqs; ++rid) rid_of.emplace(src_bns.b->anns[rid].name, rid);
+    std::vector<int> row_rid(src_rows.size());
+    std::vector<char> row_masked(src_rows.size());
+    std::unordered_set<std::string> seen;
+    seen.reserve(src_rows.size());
+    long bad_shape = 0, bad_name = 0;
+    for (size_t i = 0; i < src_rows.size(); ++i) {
+        const auto &s = src_rows[i], &m = mask_rows[i];
+        const bool shape_ok = s.qname == m.qname && s.rest == m.rest && !(s.flag & 4) &&
+                              (m.flag == s.flag || m.flag == (s.flag | 4));
+        if (!shape_ok) {
+            if (bad_shape == 0) MESSAGE("first bad masked row " << i << " " << s.qname);
+            ++bad_shape;
+        }
+        const auto it = rid_of.find(s.qname);
+        const bool name_ok = it != rid_of.end() && alt_bits[it->second] && seen.insert(s.qname).second;
+        if (!name_ok) {
+            if (bad_name == 0) MESSAGE("first unknown, non-ALT or repeated QNAME at row " << i << " " << s.qname);
+            ++bad_name;
+        }
+        row_rid[i] = it == rid_of.end() ? -1 : it->second;
+        row_masked[i] = m.flag != s.flag;
+    }
+    CHECK(bad_shape == 0);
+    REQUIRE(bad_name == 0);
+    counts.rows = (long) src_rows.size();
+
+    // Usability: unfiltered, every record is a table entry, so with unique names
+    // each per-record decision is exactly one table entry's presence.
+    LiftGuard plain(alt_lift_load(in.source.c_str(), src_bns.b));
+    REQUIRE(plain.l != nullptr);
+    const alt_lift_skips_t &ps = plain.l->skip;
+    CHECK(ps.no_ctg + ps.no_target + ps.alt_target + ps.unmapped + ps.not_primary + ps.dup + ps.bad == 0);
+    REQUIRE(plain.l->n_lift == counts.rows);
+
+    alt_lift_exclude_stats_t stats = {};
+    char error[1024] = {};
+    LiftGuard runtime(alt_lift_load_excluded(in.source.c_str(), src_bns.b, in.bed.c_str(), &stats, error,
+                                             sizeof(error)));
+    INFO("restricted load error: " << error);
+    REQUIRE(runtime.l != nullptr);  // unknown or out-of-bounds BED rows stop here
+    LiftGuard oracle(alt_lift_load(in.masked.c_str(), mask_bns.b));
+    REQUIRE(oracle.l != nullptr);
+    if (tamper) tamper(oracle.l);
+
+    // Per-record decisions against the oracle's FLAG bit.
+    long bad_decision = 0;
+    for (size_t i = 0; i < src_rows.size(); ++i) {
+        const int rid = row_rid[i];
+        const bool runtime_excluded = runtime.l->a[rid].trid < 0;
+        const bool oracle_excluded = oracle.l->a[rid].trid < 0;
+        if (runtime_excluded != (bool) row_masked[i] || oracle_excluded != (bool) row_masked[i]) {
+            if (bad_decision == 0) MESSAGE("first differing decision at row " << i << " " << src_rows[i].qname);
+            ++bad_decision;
+        }
+        if (row_masked[i]) ++counts.excluded; else ++counts.retained;
+    }
+    CHECK(bad_decision == 0);
+    CHECK(stats.excluded == counts.excluded);
+    CHECK(runtime.l->n_lift == counts.retained);
+    CHECK(oracle.l->skip.unmapped == counts.excluded);
+
+    // The full table, every contig, field by field.
+    check_lift_tables(runtime.l, oracle.l);
+
+    // Loading never changes ALT marking.
+    for (const bntseq_t *b : {(const bntseq_t *) src_bns.b, (const bntseq_t *) mask_bns.b}) {
+        long changed = 0;
+        for (int rid = 0; rid < counts.n_seqs; ++rid) changed += b->anns[rid].is_alt != alt_bits[rid];
+        CHECK(changed == 0);
+    }
+    counts.input_intervals = stats.input_intervals;
+    counts.merged_intervals = stats.merged_intervals;
+    return counts;
+}
+
+// A generated index with four ALT tiles: a forward tile and a tile whose
+// deletion holds the only BED base in its footprint are excluded; a reverse tile
+// and a tile with an insertion whose footprint ends where a BED interval starts
+// are retained. Names include the alt_/altc_ prefixes and an HLA-style name.
+struct AltGateFixture {
+    std::string chr1, chr2;
+    bwa_tests::TempIndex idx;
+    TmpFile source, masked, bed;
+    static std::string random_seq(std::mt19937 &rng, size_t n) {
+        std::string s(n, 'A');
+        for (char &c : s) c = "ACGT"[rng() % 4];
+        return s;
+    }
+    static std::string sidecar(bool masked, int wrong_flag_row) {
+        const int flags[4] = {0, 16, 0, 0};
+        const bool excluded[4] = {true, false, true, false};
+        const char *rest[4] = {
+            "\tchr1\t101\t60\t200M\t*\t0\t0\t*\t*\n",
+            "\tchr1\t1001\t60\t200M\t*\t0\t0\t*\t*\n",
+            "\tchr2\t501\t60\t100M10D100M\t*\t0\t0\t*\t*\n",
+            "\tchr1\t2001\t60\t75M5I75M\t*\t0\t0\t*\t*\n",
+        };
+        const char *names[4] = {"alt_chr1_t1", "alt_chr1_t2", "altc_chr2_t3", "HLA-A*02:01:01:01"};
+        std::string out;
+        for (int i = 0; i < 4; ++i) {
+            const bool mask = masked && (excluded[i] != (i == wrong_flag_row));
+            out += std::string(names[i]) + "\t" + std::to_string(flags[i] | (mask ? 4 : 0)) + rest[i];
+        }
+        return out;
+    }
+    static std::vector<bwa_tests::Contig> contigs(const std::string &c1, const std::string &c2) {
+        return {{"chr1", c1},
+                {"chr2", c2},
+                {"alt_chr1_t1", c1.substr(100, 200)},
+                {"alt_chr1_t2", bwa_tests::revcomp(c1.substr(1000, 200))},
+                {"altc_chr2_t3", c2.substr(500, 100) + c2.substr(610, 100)},
+                {"HLA-A*02:01:01:01", c1.substr(2000, 75) + "ACGTA" + c1.substr(2075, 75)}};
+    }
+    explicit AltGateFixture(int wrong_flag_row = -1, std::mt19937 rng = std::mt19937(7754))
+        : chr1(random_seq(rng, 3000)), chr2(random_seq(rng, 2000)), idx(contigs(chr1, chr2)),
+          source(sidecar(false, -1).c_str()), masked(sidecar(true, wrong_flag_row).c_str()),
+          bed("chr1\t250\t260\nchr2\t605\t606\nchr1\t2150\t2200\n") {}
+    AltGateInputs inputs() const { return {idx.prefix(), source.path, masked.path, bed.path}; }
+};
+
+const char *const kAltGateEnv[4] = {"BWAMEM3_ALT_GATE_PREFIX", "BWAMEM3_ALT_GATE_SOURCE",
+                                    "BWAMEM3_ALT_GATE_MASKED", "BWAMEM3_ALT_GATE_BED"};
+
+bool alt_gate_any_env_set() {
+    for (const char *name : kAltGateEnv) {
+        const char *v = getenv(name);
+        if (v && *v) return true;
+    }
+    return false;
+}
+
+// Counts failed CHECK/REQUIRE assertions (not WARNs) over the whole run, so a
+// test case can tell whether any assertion failed since a given point. doctest
+// reports every assertion to listeners, including non-fatal CHECK failures that
+// do not stop the case.
+std::atomic<long> g_alt_gate_failed_asserts{0};
+
+struct AltGateFailureCounter : doctest::IReporter {
+    explicit AltGateFailureCounter(const doctest::ContextOptions &) {}
+    void report_query(const doctest::QueryData &) override {}
+    void test_run_start() override {}
+    void test_run_end(const doctest::TestRunStats &) override {}
+    void test_case_start(const doctest::TestCaseData &) override {}
+    void test_case_reenter(const doctest::TestCaseData &) override {}
+    void test_case_end(const doctest::CurrentTestCaseStats &) override {}
+    void test_case_exception(const doctest::TestCaseException &) override {}
+    void subcase_start(const doctest::SubcaseSignature &) override {}
+    void subcase_end() override {}
+    void log_assert(const doctest::AssertData &ad) override {
+        if (ad.m_failed && !(ad.m_at & doctest::assertType::is_warn)) ++g_alt_gate_failed_asserts;
+    }
+    void log_message(const doctest::MessageData &) override {}
+    void test_case_skipped(const doctest::TestCaseData &) override {}
+};
+
+// Writes the ALT_GATE_FROZEN_COMPLETE line to `out` only if no assertion has
+// failed since `failed_before` was read; returns whether it wrote the line.
+bool alt_gate_emit_marker(FILE *out, long failed_before, const AltGateCounts &c) {
+    if (g_alt_gate_failed_asserts.load() != failed_before) return false;
+    fprintf(out,
+            "ALT_GATE_FROZEN_COMPLETE n_seqs=%ld alt_contigs=%ld rows=%ld excluded=%ld retained=%ld "
+            "bed_intervals=%ld merged_intervals=%ld\n",
+            c.n_seqs, c.alt_contigs, c.rows, c.excluded, c.retained, c.input_intervals, c.merged_intervals);
+    fflush(out);
+    return true;
+}
+
+// Reads back what alt_gate_emit_marker wrote to a temporary file.
+std::string alt_gate_marker_text(long failed_before, const AltGateCounts &c, bool *emitted) {
+    FILE *f = tmpfile();
+    REQUIRE(f != nullptr);
+    *emitted = alt_gate_emit_marker(f, failed_before, c);
+    rewind(f);
+    std::string text;
+    char buf[256];
+    while (fgets(buf, sizeof(buf), f)) text += buf;
+    fclose(f);
+    return text;
+}
+} // namespace
+
+DOCTEST_REGISTER_LISTENER("alt_gate_failure_counter", 1, AltGateFailureCounter);
+
+TEST_CASE("exclude BED table gate on a generated index" * doctest::test_suite("unit/alt_lift")) {
+    AltGateFixture fx;
+    const long failed_before = g_alt_gate_failed_asserts.load();
+    const AltGateCounts c = run_alt_table_gate(fx.inputs());
+    CHECK(g_alt_gate_failed_asserts.load() == failed_before);
+    bool emitted = false;
+    const std::string marker = alt_gate_marker_text(failed_before, c, &emitted);
+    CHECK(emitted);
+    CHECK(marker.rfind("ALT_GATE_FROZEN_COMPLETE n_seqs=6 alt_contigs=4 rows=4 excluded=2 retained=2 ", 0) == 0);
+    CHECK(c.n_seqs == 6);
+    CHECK(c.alt_contigs == 4);
+    CHECK(c.rows == 4);
+    CHECK(c.excluded == 2);
+    CHECK(c.retained == 2);
+    CHECK(c.input_intervals == 3);
+    CHECK(c.merged_intervals == 3);
+}
+
+// The gate must fail on a single wrong masked FLAG, in either direction. Each
+// direction fails exactly five assertions: the row decision, the excluded and
+// retained counts, the comparator's n_lift and its fatal per-entry trid check.
+TEST_CASE("exclude BED table gate catches a masked FLAG wrongly set" * doctest::test_suite("unit/alt_lift") *
+          doctest::expected_failures(5)) {
+    AltGateFixture fx(/*wrong_flag_row=*/1);
+    run_alt_table_gate(fx.inputs());
+}
+
+TEST_CASE("exclude BED table gate catches a masked FLAG wrongly clear" * doctest::test_suite("unit/alt_lift") *
+          doctest::expected_failures(5)) {
+    AltGateFixture fx(/*wrong_flag_row=*/2);
+    run_alt_table_gate(fx.inputs());
+}
+
+// One differing selected target or offset is exactly one failed assertion.
+TEST_CASE("exclude BED table gate catches one differing target" * doctest::test_suite("unit/alt_lift") *
+          doctest::expected_failures(1)) {
+    AltGateFixture fx;
+    // alt_chr1_t2 (rid 3) is retained on chr1; were it not, more checks would fail.
+    run_alt_table_gate(fx.inputs(), [](alt_lift_t *l) { l->a[3].trid = 1; });
+}
+
+TEST_CASE("exclude BED table gate catches one differing offset" * doctest::test_suite("unit/alt_lift") *
+          doctest::expected_failures(1)) {
+    AltGateFixture fx;
+    // The HLA-style tile (rid 5, 75M5I75M) is retained: reference bases before op 2.
+    run_alt_table_gate(fx.inputs(), [](alt_lift_t *l) {
+        if (l->a[5].n_cigar == 3) l->a[5].roff[2] += 1;
+    });
+}
+
+TEST_CASE("exclude BED table gate catches one differing position" * doctest::test_suite("unit/alt_lift") *
+          doctest::expected_failures(1)) {
+    AltGateFixture fx;
+    run_alt_table_gate(fx.inputs(), [](alt_lift_t *l) { l->a[5].tpos += 1; });
+}
+
+// A non-fatal (CHECK) gate failure must withhold the completion marker. The
+// offset tamper fails exactly one CHECK and lets the gate run to the end; any
+// extra failure here (counter missed it, or the marker was written) makes the
+// case fail its expected count.
+TEST_CASE("exclude BED frozen marker is withheld after a non-fatal gate failure" *
+          doctest::test_suite("unit/alt_lift") * doctest::expected_failures(1)) {
+    AltGateFixture fx;
+    const long failed_before = g_alt_gate_failed_asserts.load();
+    const AltGateCounts c = run_alt_table_gate(fx.inputs(), [](alt_lift_t *l) {
+        if (l->a[5].n_cigar == 3) l->a[5].roff[2] += 1;
+    });
+    const long failed_after = g_alt_gate_failed_asserts.load();
+    bool emitted = true;
+    const std::string marker = alt_gate_marker_text(failed_before, c, &emitted);
+    if (failed_after - failed_before != 1) FAIL("failure counter saw " << failed_after - failed_before);
+    if (emitted || !marker.empty()) FAIL("marker written after a failed gate: " << marker);
+}
+
+// Release gate on a real index, configured only by environment: unset, the case
+// is skipped; set, all four inputs are required. Only when no assertion in the
+// case has failed does it print one ALT_GATE_FROZEN_COMPLETE line with the counts
+// it checked, so a release run can tell a completed gate from a skipped or
+// failed one.
+TEST_CASE("exclude BED frozen table gate" * doctest::test_suite("unit/alt_lift_frozen") *
+          doctest::skip(!alt_gate_any_env_set())) {
+    const long failed_before = g_alt_gate_failed_asserts.load();
+    std::string value[4];
+    for (int i = 0; i < 4; ++i) {
+        const char *v = getenv(kAltGateEnv[i]);
+        INFO("partial configuration: " << std::string(kAltGateEnv[i]) << " is unset");
+        REQUIRE((v != nullptr && *v != '\0'));
+        value[i] = v;
+    }
+    const AltGateCounts c = run_alt_table_gate({value[0], value[1], value[2], value[3]});
+    REQUIRE(c.rows > 0);
+    REQUIRE(c.excluded > 0);
+    REQUIRE(c.retained > 0);
+    REQUIRE(c.input_intervals > 0);
+    alt_gate_emit_marker(stdout, failed_before, c);
 }

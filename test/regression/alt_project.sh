@@ -68,9 +68,38 @@
 #   * --alt-project is refused with -j, with --meth, without a .alt and with a
 #     .alt that has no usable line, and --compat-allow-divergent admits it under
 #     --compat (the --compat refusal itself is checked in compat_byte_identical.sh)
+#   * --alt-project-exclude-bed: help lists it; a BED that excludes a .alt line
+#     whose later duplicate line is usable is accepted (plain, gzip and with
+#     --alt-project-min-gap 0, records identical apart from @PG; and under
+#     --compat-allow-divergent) and logs exact counts, while plain --alt-project
+#     logs no BED; it is refused, with a message naming the cause and no
+#     alignment record, without --alt-project, when repeated, with a missing,
+#     empty or stdin argument, with -j, --meth, --compat, a positive gap or
+#     BWAMEM3_ALT_PROJECT_PAIR_GAP=1, for a missing, malformed or truncated gzip
+#     BED, a BED naming an unknown contig or an ALT contig or reaching past a
+#     contig's end (each message carries the option, the BED path and the line),
+#     a BED with no nonempty interval, one that excludes nothing, one that
+#     excludes every usable line, and a .alt with no usable line (keeping the
+#     ordinary error)
+#   * mixed exclusion (two independent ALT haplotypes, one excluded by a BED
+#     interval inside its primary footprint but away from its informative reads,
+#     one retained): every informative end from the retained ALT is lifted to its
+#     chrA position with XL:Z, and none from the excluded ALT carries its XL:Z
+#     while its records still name that ALT; the check fails on unrestricted
+#     --alt-project (for the excluded reads) and without projection (for the
+#     retained ones). The runtime BED run equals the run with a FLAG-masked copy
+#     of the .alt (decided by the script, beside the same index), every header
+#     line, record, field and tag in order apart from @PG CL, single-end and
+#     paired at -t 1, 2 and 4, --fast at -t 1 and 4, and --dedup-reads on and off
+#     over duplicated pairs, with -K and -I fixed; with projection off the masked
+#     .alt maps as the original; and direct BAM decodes to the runtime SAM and to
+#     the masked run's BAM (OPEN without samtools, a failure with
+#     ALT_PROJECT_REQUIRE_SAMTOOLS=1)
 #
 # Inputs:
 #   BWA_MEM3 — path to the bwa-mem3 binary under test
+#   ALT_PROJECT_REQUIRE_SAMTOOLS (optional) — 1 makes a missing samtools a
+#     failure instead of an OPEN mixed-exclusion BAM check
 set -euo pipefail
 
 if [[ -z ${BWA_MEM3:-} ]]; then
@@ -738,6 +767,327 @@ else:
     raise AssertionError("symmetric uncertainty check accepts a missing haplotype hypothesis")
 EOF
 
+# CLI restriction fixture: the original line is excluded and a later usable
+# alignment for the same ALT is retained. This proves acceptance and fallback;
+# mixed excluded/retained mapping is checked on its own fixture below.
+for f in fwd.fa.*; do
+    case "$f" in
+        *.alt) ;;
+        *) ln -s "$f" "exclude.fa${f#fwd.fa}" ;;
+    esac
+done
+ln -s fwd.fa exclude.fa
+cp fwd.fa.alt exclude.fa.alt
+printf 'chrA_alt1\t0\tchrA\t1\t60\t1500M3D497M\t*\t0\t0\t*\t*\n' >> exclude.fa.alt
+printf 'chrA\t3000\t3001\n' > exclude.bed
+printf 'chrA\t0\t8000\n' > all.bed
+printf 'chrA\t7000\t7001\n' > noeffect.bed
+printf '# no intervals\nchrA\t1\t1\n' > empty.bed
+printf 'chrA\t-1\t2\n' > invalid.bed
+python3 - << 'EOF'
+import gzip
+with gzip.open("exclude.bed.gz", "wb") as out:
+    out.write(open("exclude.bed", "rb").read())
+raw = open("exclude.bed.gz", "rb").read()
+open("truncated.bed.gz", "wb").write(raw[:-8])
+EOF
+"$BIN" mem --help > exclude.help 2>&1 || fail "mem --help failed"
+"$BIN" mem -t 1 -I 400,10 --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq > exclude.sam 2> exclude.log \
+    || fail "valid exclusion BED was rejected"
+grep -q -- '--alt-project-exclude-bed FILE' exclude.help || fail "help omits exclusion BED option"
+grep -q 'exclusion BED exclude.bed: input=1 merged=1 zero_width=0 excluded=1 retained=1$' exclude.log \
+    || fail "restriction counts missing or wrong"
+grep -q -v '^@' exclude.sam || fail "restricted run emitted no alignment records"
+# det.t1.log is a real --alt-project log (its lift line), so the absence check
+# below cannot pass on a missing or empty file.
+grep -q 'alt-project: 1 ALT contigs' det.t1.log || fail "det.t1.log is not an --alt-project log"
+grep -q 'exclusion BED' det.t1.log && fail "unrestricted --alt-project logged an exclusion BED"
+"$BIN" mem -t 1 -I 400,10 --alt-project --alt-project-min-gap 0 --alt-project-exclude-bed exclude.bed.gz exclude.fa r1.fq r2.fq > exclude.zero.sam 2> exclude.zero.log \
+    || fail "explicit gap zero or gzip BED was rejected"
+grep -q 'exclusion BED exclude.bed.gz: input=1 merged=1 zero_width=0 excluded=1 retained=1$' exclude.zero.log \
+    || fail "gzip restriction counts missing or wrong"
+cmp -s <(nopg exclude.sam) <(nopg exclude.zero.sam) || fail "gap zero/gzip changed restricted records"
+"$BIN" mem -t 1 --compat bwa-mem --compat-allow-divergent --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq > exclude.compat.sam 2> exclude.compat.log \
+    || fail "compat override did not admit exclusion BED"
+
+exclude_refuse() {
+    local label=$1 message=$2
+    shift 2
+    if "$BIN" mem "$@" > "$label.sam" 2> "$label.log"; then
+        fail "$label was accepted"
+    fi
+    grep -q -e "$message" "$label.log" || fail "$label gave the wrong error"
+    if grep -q -v '^@' "$label.sam"; then
+        fail "$label emitted alignment records"
+    fi
+}
+exclude_refuse exclude.requires 'requires --alt-project' --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.repeat 'only once' --alt-project --alt-project-exclude-bed exclude.bed --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+# getopt words this differently across C libraries ("option '--x' requires an
+# argument", "option requires an argument: x"); both name the option and say
+# it needs an argument, and neither says the option is unrecognized.
+exclude_refuse exclude.argument 'alt-project-exclude-bed' --alt-project-exclude-bed
+grep -q 'requires an argument' exclude.argument.log || fail "exclude.argument did not report the missing argument"
+grep -q -i 'unrecognized' exclude.argument.log && fail "exclude.argument reported an unrecognized option"
+exclude_refuse exclude.stdin 'requires a named BED file (not stdin)' --alt-project --alt-project-exclude-bed - exclude.fa r1.fq r2.fq
+exclude_refuse exclude.emptyarg 'requires a named BED file (not stdin)' --alt-project --alt-project-exclude-bed '' exclude.fa r1.fq r2.fq
+exclude_refuse exclude.j 'cannot be combined with -j' -j --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.meth 'cannot be combined with --meth' --meth --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.compat 'mutually exclusive: --alt-project' --compat bwa-mem --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.gap 'positive --alt-project-min-gap' --alt-project --alt-project-min-gap 1 --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 exclude_refuse exclude.pairgap 'BWAMEM3_ALT_PROJECT_PAIR_GAP=1' --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.missing 'missing.bed' --alt-project --alt-project-exclude-bed missing.bed exclude.fa r1.fq r2.fq
+# A mistyped BED path fails before the index is touched: pointing at an index
+# that does not exist still yields the BED error, not an index error.
+exclude_refuse exclude.missing.early '^\[E::main_mem\] --alt-project-exclude-bed missing.bed: cannot read: No such file' \
+    --alt-project --alt-project-exclude-bed missing.bed no-such-index.fa r1.fq r2.fq
+exclude_refuse exclude.invalid 'invalid.bed line 1' --alt-project --alt-project-exclude-bed invalid.bed exclude.fa r1.fq r2.fq
+# Dictionary errors reach the user through the option's prefix with the BED's
+# path and line: a contig the index lacks, an ALT contig, and a span past the
+# contig's end.
+printf 'chrZ\t0\t10\n' > unknown.bed
+printf 'chrA_alt1\t0\t10\n' > altctg.bed
+printf 'chrA\t0\t8001\n' > beyond.bed
+exclude_refuse exclude.unknown '^\[E::main_mem\] --alt-project-exclude-bed: unknown.bed line 1: unknown reference contig' \
+    --alt-project --alt-project-exclude-bed unknown.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.altctg '^\[E::main_mem\] --alt-project-exclude-bed: altctg.bed line 1: BED contig is an ALT contig' \
+    --alt-project --alt-project-exclude-bed altctg.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.beyond '^\[E::main_mem\] --alt-project-exclude-bed: beyond.bed line 1: interval exceeds reference contig length' \
+    --alt-project --alt-project-exclude-bed beyond.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.truncated 'truncated.bed.gz.*failure' --alt-project --alt-project-exclude-bed truncated.bed.gz exclude.fa r1.fq r2.fq
+exclude_refuse exclude.empty 'no nonempty intervals' --alt-project --alt-project-exclude-bed empty.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.noeffect 'excludes no usable' --alt-project --alt-project-exclude-bed noeffect.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.all 'excludes all 2 usable ALT alignments' --alt-project --alt-project-exclude-bed all.bed exclude.fa r1.fq r2.fq
+grep -q 'ordinary ALT-aware mapping, not primary-only' exclude.all.log || fail "all-excluded error does not explain omitting --alt-project"
+# An empty BED over a .alt with no usable line keeps the ordinary zero-usable
+# error (the order is: zero-usable, empty BED, no effect, all excluded).
+exclude_refuse exclude.empty.unusable 'no ALT contig in bad.fa.alt has a usable alignment' --alt-project --alt-project-exclude-bed empty.bed bad.fa r1.fq r2.fq
+grep -q 'no nonempty intervals' exclude.empty.unusable.log && fail "empty BED masked the zero-usable error"
+exclude_refuse exclude.unusable 'no ALT contig in bad.fa.alt has a usable alignment' --alt-project --alt-project-exclude-bed exclude.bed bad.fa r1.fq r2.fq
+grep -q 'excludes all' exclude.unusable.log && fail "an unusable sidecar was reported as all-excluded"
+
+# Mixed exclusion fixture: two independent loci, each a copy (X1, X2 on chrA)
+# with a paralog (Y1, Y2 on chrB) and an ALT haplotype carrying gene-converted
+# paralog bases and a private SNP at ALT position 1000, like the fixture above.
+# The ALT of X1 (a conventional *_alt name) is retained; the ALT of X2 (an
+# HLA-style name with no ALT prefix or suffix, stored reverse-complemented,
+# .alt FLAG 16) is excluded by a BED interval 100 bp from its footprint's end,
+# away from every informative read: exclusion takes the whole primary footprint,
+# not the read's aligned span. Two more intervals touch the retained footprint at
+# its start and end without overlapping it. The oracle is a copy of the .alt
+# whose excluded line has FLAG 0x4 added, decided here from the CIGAR's
+# reference span (M/D/N/=/X) and half-open overlap, not by the aligner's parser,
+# and loaded beside the same index files (symlinks, no rebuild) as mixmask.fa.
+python3 - << 'EOF'
+import random, re
+rng = random.Random(77501)
+B = "ACGT"
+r = lambda n: "".join(rng.choice(B) for _ in range(n))
+mut = lambda c: rng.choice([x for x in B if x != c])
+RC = str.maketrans("ACGT", "TGCA")
+rc = lambda s: s.translate(RC)[::-1]
+def locus():
+    X = r(2000)
+    psv = sorted(rng.sample(range(200, 1800), 8))
+    Y, H = list(X), list(X)
+    for p in psv: Y[p] = mut(X[p])
+    for p in psv[:6]: H[p] = Y[p]
+    H[1000] = mut(X[1000])
+    return X, "".join(Y), "".join(H)
+X1, Y1, HR = locus()
+X2, Y2, HE = locus()
+chrA = r(3000) + X1 + r(3000) + X2 + r(3000)   # X1 at 3000, X2 at 8000 (0-based)
+chrB = r(3000) + Y1 + r(3000) + Y2 + r(3000)
+RN, EN = "chrA_KI000001v1_alt", "HLA-Z*01:01"
+open("mix.fa", "w").write(f">chrA\n{chrA}\n>chrB\n{chrB}\n>{RN}\n{HR}\n>{EN}\n{rc(HE)}\n")
+alt = [[RN, "0", "chrA", "3001", "60", "2000M", "*", "0", "0", "*", "*"],
+       [EN, "16", "chrA", "8001", "60", "2000M", "*", "0", "0", "*", "*"]]
+open("mix.fa.alt", "w").write("".join("\t".join(x) + "\n" for x in alt))
+bed = [("chrA", 9900, 9910), ("chrA", 2990, 3000), ("chrA", 5000, 5010)]
+open("mix.bed", "w").write("".join(f"{c}\t{s}\t{e}\n" for c, s, e in bed))
+masked = []
+for x in alt:
+    a = int(x[3]) - 1
+    b = a + sum(int(n) for n, op in re.findall(r"(\d+)([MIDNSHP=X])", x[5]) if op in "MDN=X")
+    hit = any(c == x[2] and s < b and a < e for c, s, e in bed)
+    masked.append([x[0], str(int(x[1]) | (4 if hit else 0))] + x[2:])
+assert [x[1] for x in masked] == ["0", "20"], "the oracle must mask exactly the excluded line"
+open("mixmask.fa.alt", "w").write("".join("\t".join(x) + "\n" for x in masked))
+# Pairs from both haplotypes (R1 = ALT [s, s+150), R2 = [s+250, s+400)), the
+# same pairs each followed by a duplicate (new name) for --dedup-reads, and
+# single-end reads around the private SNP. Names: <m|s>_<r|e>_<ALT start>.
+with open("mix1.fq", "w") as r1, open("mix2.fq", "w") as r2, \
+        open("mixd1.fq", "w") as d1, open("mixd2.fq", "w") as d2:
+    for tag, h in (("r", HR), ("e", HE)):
+        for s in range(0, 1600, 20):
+            f, q = h[s:s + 400], "I" * 150
+            for o1, o2, sfx in ((r1, r2, ""), (d1, d2, ""), (d1, d2, "_dup")):
+                o1.write(f"@m_{tag}_{s}{sfx}\n{f[:150]}\n+\n{q}\n")
+                o2.write(f"@m_{tag}_{s}{sfx}\n{rc(f[-150:])}\n+\n{q}\n")
+with open("mixse.fq", "w") as fq:
+    for tag, h in (("r", HR), ("e", HE)):
+        for s in range(700, 1001, 10):
+            fq.write(f"@s_{tag}_{s}\n{h[s:s + 150]}\n+\n{'I' * 150}\n")
+# The mixed-exclusion oracle. An informative read end has the private SNP at
+# least 10 bases inside it. Each retained one is lifted: primary on chrA at
+# 3001 + its ALT start, 150M, MAPQ > 0, XL:Z naming the retained ALT. No
+# excluded one names the excluded ALT in XL:Z (it was not projected), and its
+# records still name that ALT elsewhere (RNAME or XA: the unprojected ALT hit
+# stays an ordinary ALT-aware candidate); where it is finally placed is not
+# checked, as a primary hit may win. Both ALTs keep AH:* in the header. Prints
+# the counts, and fails unless each is at least 10.
+open("mixcheck.py", "w").write(f'''import sys
+from samrecs import records
+RN, EN = {RN!r}, {EN!r}
+sq = [l.rstrip("\\n").split("\\t") for l in open(sys.argv[1]) if l.startswith("@SQ")]
+if sorted((t[1][3:], "AH:*" in t) for t in sq) != sorted([("chrA", False), ("chrB", False), (RN, True), (EN, True)]):
+    sys.exit(f"header ALT marking: {{sq}}")
+ends = {{}}
+for t in records(sys.argv[1]):
+    ends.setdefault((t[0], int(t[1]) & 0xC0), []).append(t)
+n = {{"retained": 0, "excluded": 0, "excluded_alt": 0}}
+for (name, mate), rs in ends.items():
+    tag, s = name.split("_")[1], int(name.split("_")[2])
+    a = s + (250 if mate == 0x80 else 0)
+    if not a + 10 <= 1000 < a + 140: continue
+    p = [t for t in rs if not int(t[1]) & 0x900]
+    if len(p) != 1: sys.exit(f"{{name}}/{{mate}}: {{len(p)}} primary records")
+    p = p[0]
+    xl = [x[5:] for t in rs for x in t[11:] if x.startswith("XL:Z:")]
+    body = "\\t".join(x for t in rs for x in t if not x.startswith("XL:Z:"))
+    if tag == "r":
+        n["retained"] += 1
+        if (p[2], int(p[3]), p[5]) != ("chrA", 3001 + a, "150M") or int(p[4]) == 0 or "XL:Z:" + RN not in p[11:]:
+            sys.exit(f"{{name}}/{{mate}}: retained ALT read at {{p[2]}}:{{p[3]}} {{p[5]}} MAPQ {{p[4]}}, want chrA:{{3001 + a}} 150M MAPQ > 0 XL:Z:{{RN}}")
+    else:
+        assert 8000 + a + 150 <= 9900, "an informative excluded read overlaps the BED (fixture)"
+        n["excluded"] += 1
+        if EN in xl: sys.exit(f"{{name}}/{{mate}}: projected from the excluded ALT ({{p[2]}}:{{p[3]}})")
+        if EN in body: n["excluded_alt"] += 1
+print(" ".join(f"{{k}}={{v}}" for k, v in n.items()))
+if min(n.values()) < 10: sys.exit(f"too few informative records: {{n}}")
+''')
+# Runtime and oracle outputs must be equal: header lines in order, @PG apart
+# from its CL (the argv), and every record, field and tag in order. A decoded
+# BAM's samtools @PG is dropped.
+open("samecmp.py", "w").write('''import sys
+def split(path):
+    head, pg, body = [], [], []
+    for l in open(path):
+        l = l.rstrip("\\n")
+        if l.startswith("@PG"):
+            if "\\tPN:samtools" not in l: pg.append([x for x in l.split("\\t") if not x.startswith("CL:")])
+        elif l.startswith("@"): head.append(l)
+        else: body.append(l)
+    return head, pg, body
+a, b = split(sys.argv[1]), split(sys.argv[2])
+if a[0] != b[0]: sys.exit("header dictionaries differ")
+if a[1] != b[1]: sys.exit(f"@PG differs beyond its CL: {a[1]} vs {b[1]}")
+if not a[2]: sys.exit("no records")
+for i, (x, y) in enumerate(zip(a[2], b[2])):
+    if x != y: sys.exit(f"record {i + 1} differs:\\n  {x}\\n  {y}")
+if len(a[2]) != len(b[2]): sys.exit(f"{len(a[2])} records vs {len(b[2])}")
+''')
+EOF
+"$BIN" index mix.fa > idx.mix.log 2>&1 || fail "index mix failed"
+for f in mix.fa.*; do
+    case "$f" in
+        *.alt) ;;
+        *) ln -s "$f" "mixmask.fa${f#mix.fa}" ;;
+    esac
+done
+ln -s mix.fa mixmask.fa
+mixrun() { # out ref se|pe|dup extra...
+    local out=$1 ref=$2 mode=$3
+    shift 3
+    case "$mode" in
+        se) set -- "$@" "$ref.fa" mixse.fq ;;
+        pe) set -- -I 400,10 "$@" "$ref.fa" mix1.fq mix2.fq ;;
+        dup) set -- -I 400,10 "$@" "$ref.fa" mixd1.fq mixd2.fq ;;
+    esac
+    "$BIN" mem -K 20000 "$@" > "$out" 2> "$out.log" || fail "mem $* failed (see $out.log)"
+}
+# Negative controls: unrestricted projection lifts the excluded ALT's reads, and
+# the default (no projection) does not lift the retained ALT's, so the oracle
+# check fails on each, for that reason.
+for mode in se pe; do
+    mixrun "mix.unr.$mode.sam" mix "$mode" -t 2 --alt-project
+    python3 mixcheck.py "mix.unr.$mode.sam" > /dev/null 2> "mix.unr.$mode.chk" \
+        && fail "the mixed-exclusion check passes on unrestricted --alt-project ($mode, vacuous)"
+    grep -q 'projected from the excluded ALT' "mix.unr.$mode.chk" \
+        || fail "the mixed-exclusion check fails on unrestricted --alt-project for another reason (see mix.unr.$mode.chk)"
+done
+mixrun mix.off.pe.sam mix pe -t 2
+python3 mixcheck.py mix.off.pe.sam > /dev/null 2> mix.off.pe.chk && fail "the mixed-exclusion check passes without projection (vacuous)"
+grep -q 'retained ALT read at' mix.off.pe.chk || fail "the mixed-exclusion check fails without projection for another reason (see mix.off.pe.chk)"
+# Runtime BED and FLAG-masked sidecar, each checked against the oracle and equal
+# to each other: SE and PE at -t 1, 2 and 4, --fast at -t 1 and 4, and
+# --dedup-reads on and off over duplicated pairs (memo shown to engage), all
+# with -K fixed (and -I for pairs).
+: > mix.counts
+mixpair() { # label se|pe|dup extra...
+    local label=$1 mode=$2 counts
+    shift 2
+    mixrun "mix.$label.rt.sam" mix "$mode" "$@" --alt-project --alt-project-exclude-bed mix.bed
+    mixrun "mix.$label.mask.sam" mixmask "$mode" "$@" --alt-project
+    grep -q 'exclusion BED mix.bed: input=3 merged=3 zero_width=0 excluded=1 retained=1$' "mix.$label.rt.sam.log" \
+        || fail "mixed $label: restriction counts missing or wrong"
+    grep -q 'exclusion BED' "mix.$label.mask.sam.log" && fail "mixed $label: the masked-sidecar run logged a BED"
+    counts=$(python3 mixcheck.py "mix.$label.rt.sam" 2> "mix.$label.chk") \
+        || fail "mixed $label: runtime exclusion failed the oracle (see mix.$label.chk)"
+    echo "$label $counts" >> mix.counts
+    python3 samecmp.py "mix.$label.rt.sam" "mix.$label.mask.sam" 2> "mix.$label.cmp" \
+        || fail "mixed $label: runtime BED and FLAG-masked sidecar outputs differ (see mix.$label.cmp)"
+}
+for mode in se pe; do
+    for t in 1 2 4; do
+        mixpair "$mode.t$t" "$mode" -t "$t"
+    done
+    for t in 2 4; do
+        python3 samecmp.py "mix.$mode.t1.rt.sam" "mix.$mode.t$t.rt.sam" || fail "mixed $mode: runtime output differs between -t 1 and -t $t"
+    done
+    for t in 1 4; do
+        mixpair "$mode.fast.t$t" "$mode" -t "$t" --fast
+    done
+done
+for t in 1 4; do
+    BWAMEM3_DEDUP_READS_STATS=1 mixpair "dup.on.t$t" dup -t "$t" --dedup-reads on
+    grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* .*final=ON' "mix.dup.on.t$t.rt.sam.log" \
+        || fail "mixed --dedup-reads on did not memoize any pair (-t $t)"
+    mixpair "dup.off.t$t" dup -t "$t" --dedup-reads off
+    python3 samecmp.py "mix.dup.on.t$t.rt.sam" "mix.dup.off.t$t.rt.sam" || fail "mixed: --dedup-reads on and off differ (-t $t)"
+done
+# Projection off: the masked sidecar is the original for ALT-aware mapping (only
+# QNAMEs mark ALT contigs), and the output names both ALTs (not vacuous).
+for mode in se pe; do
+    [[ $mode == pe ]] || mixrun mix.off.se.sam mix se -t 2
+    mixrun "mixmask.off.$mode.sam" mixmask "$mode" -t 2
+    python3 samecmp.py "mix.off.$mode.sam" "mixmask.off.$mode.sam" || fail "masked sidecar changes ALT-aware mapping ($mode)"
+    grep -v '^@' "mix.off.$mode.sam" > "mix.off.$mode.body"
+    grep -q 'chrA_KI000001v1_alt' "mix.off.$mode.body" || fail "the projection-off run names no retained ALT (vacuous, $mode)"
+    grep -q 'HLA-Z\*01:01' "mix.off.$mode.body" || fail "the projection-off run names no excluded ALT (vacuous, $mode)"
+done
+# Direct BAM: decoded runtime BAM equals the runtime SAM, and the oracle's BAM.
+# Without samtools this check is OPEN (reported, not passed);
+# ALT_PROJECT_REQUIRE_SAMTOOLS=1 makes that a failure.
+if command -v samtools > /dev/null 2>&1; then
+    mixrun mix.rt.bam mix pe -t 2 --bam=0 --alt-project --alt-project-exclude-bed mix.bed
+    mixrun mix.mask.bam mixmask pe -t 2 --bam=0 --alt-project
+    for b in rt mask; do
+        samtools quickcheck "mix.$b.bam" || fail "mixed $b BAM failed quickcheck"
+        samtools view -h "mix.$b.bam" > "mix.$b.bam.sam" || fail "samtools view mix.$b.bam failed"
+    done
+    python3 samecmp.py mix.pe.t2.rt.sam mix.rt.bam.sam || fail "mixed runtime SAM and decoded BAM differ"
+    python3 samecmp.py mix.rt.bam.sam mix.mask.bam.sam || fail "mixed runtime and masked-sidecar BAMs differ"
+    mix_bam="BAM parity checked"
+elif [[ ${ALT_PROJECT_REQUIRE_SAMTOOLS:-0} == 1 ]]; then
+    fail "samtools not on PATH (ALT_PROJECT_REQUIRE_SAMTOOLS=1)"
+else
+    echo "OPEN: samtools not on PATH; mixed-exclusion direct BAM parity not checked" >&2
+    mix_bam="BAM parity OPEN (no samtools)"
+fi
+mix_min=$(awk '{ for (i = 2; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (m == "" || v < m) m = v } } END { print m }' mix.counts)
+
 # Refusals
 "$BIN" mem -j --alt-project fwd.fa r1.fq r2.fq > /dev/null 2> j.log && fail "-j --alt-project was accepted"
 grep -q -e "cannot be combined with -j (it needs" j.log || fail "-j --alt-project gave the wrong error"
@@ -752,4 +1102,4 @@ grep -q "no ALT contig in bad.fa.alt has a usable alignment" b.log || fail "--al
 "$BIN" mem --compat bwa-mem --compat-allow-divergent --alt-project fwd.fa r1.fq r2.fq > /dev/null 2> ca.log \
     || fail "--compat-allow-divergent did not admit --alt-project (see ca.log)"
 
-echo "PASS: alt_project ($((n_snp)) SNP reads on chrA as proper pairs, FLAG 16 identical, ALT indels kept across a lift, past-band indels kept on the ALT, full primary hits kept, a clearly better clipped lifted hit placed, tandem placements kept, ALT clip kept on the ALT, byte-identical across -t, --fast and --dedup-reads)"
+echo "PASS: alt_project ($((n_snp)) SNP reads on chrA as proper pairs, FLAG 16 identical, ALT indels kept across a lift, past-band indels kept on the ALT, full primary hits kept, a clearly better clipped lifted hit placed, tandem placements kept, ALT clip kept on the ALT, byte-identical across -t, --fast and --dedup-reads; mixed exclusion equals its FLAG-masked oracle in $(($(wc -l < mix.counts))) runs, at least $((mix_min)) informative records of each kind per run, $mix_bam)"
