@@ -18,10 +18,11 @@
 // s1 + s2 + .721 * log(2 * erfc(|z| / sqrt 2)) * a + .499, truncated and floored
 // at 0, with z = (distance - mean) / std; ties go to the larger
 // hash_64((k << 32 | i) ^ id << 8), k < i the two hits' ranks in that position
-// order. hash_64 is bwa's 64-bit integer hash (Thomas Wang's mix, bwa utils.h);
-// the oracle carries its own copy (wang_hash64.h), so that a change to the
-// library's hash, which would move every tie-break in the output, is caught
-// rather than followed. The oracle enumerates all pairs instead of sweeping, so
+// order, with id << 8 taken as bwa's compilers compute it: a 32-bit shift, then
+// sign extension to 64 bits (oracle_id_bits). hash_64 is bwa's 64-bit integer
+// hash (Thomas Wang's mix, bwa utils.h); the oracle carries its own copy
+// (wang_hash64.h), so that a change to the library's hash, which would move
+// every tie-break in the output, is caught rather than followed. The oracle enumerates all pairs instead of sweeping, so
 // a sweep that stops early or skips a hit disagrees with it.
 //
 // The MAPQ cases are worked by hand from the same model (bwa's mem_sam_pe):
@@ -123,9 +124,21 @@ struct PairResult {
     int z[2];
 };
 
+// The bits `id << 8` contributes to the tie key: the low 32 bits of id * 256,
+// sign-extended from bit 31 (what every supported compiler emits for bwa's
+// overflowing int shift). Written with a mask and an explicit bit-31 test,
+// independently of mem_pair_tie_key's casts. With zero_extend, bit 31 is not
+// propagated: the plausible-but-wrong reading the boundary test must reject.
+uint64_t oracle_id_bits(int id, bool zero_extend = false) {
+    uint64_t v = ((uint64_t)(uint32_t)id * 256u) & 0xffffffffu;
+    if (!zero_extend && (v & 0x80000000u)) v |= 0xffffffff00000000ULL;
+    return v;
+}
+
 // Only each end's first n_pri[r] hits (the primary-assembly ones) can pair.
 PairResult oracle_pair(const mem_opt_t *opt, const Bns &B, const mem_pestat_t pes[4],
-                       const std::vector<mem_alnreg_t> regs[2], int id, const int n_pri[2]) {
+                       const std::vector<mem_alnreg_t> regs[2], int id, const int n_pri[2],
+                       bool zero_extend = false) {
     const int64_t l_pac = B.b.l_pac;
     std::vector<Hit> h;
     for (int r = 0; r < 2; ++r) {
@@ -162,7 +175,7 @@ PairResult oracle_pair(const mem_opt_t *opt, const Bns &B, const mem_pestat_t pe
             const int q = qd > 0. ? (int)qd : 0;
             const uint64_t y = (uint64_t)k << 32 | i;
             Cand c;
-            c.key = (uint64_t)q << 32 | (bwa_tests::wang_hash64(y ^ (uint64_t)(int64_t)(id << 8)) & 0xffffffffu);
+            c.key = (uint64_t)q << 32 | (bwa_tests::wang_hash64(y ^ oracle_id_bits(id, zero_extend)) & 0xffffffffu);
             c.k = k;
             c.i = i;
             u.push_back(c);
@@ -313,6 +326,43 @@ TEST_CASE("mem_pair: random hit sets agree with an all-pairs oracle"
     // Both outcomes must be common, or the comparison proves little.
     CHECK(paired > 100);
     CHECK(with_sub > 50);
+}
+
+TEST_CASE("mem_pair: equal-score ties at and past id 2^23 follow the sign-extended key"
+          * doctest::test_suite("unit/pair")) {
+    // Read 1 forward at [1000, 1100); read 2 has two reverse hits whose last
+    // bases sit at FR distances 270 and 330: equally far from the -I 300,30 mean
+    // and equally scored, so both candidate pairs get the same q and the tie
+    // key alone picks the winner. From id 2^23 on, id << 8 reaches bit 31 of an
+    // int, so the key depends on how that bit is extended to 64 bits.
+    OptGuard g;
+    Bns B(1, 100000);
+    mem_pestat_t pes[4];
+    pes_i300(pes);
+    const int ids[] = {(1 << 23) - 1, 1 << 23, (1 << 23) + 1, (1 << 23) + 2, (1 << 23) + 3,
+                       (1 << 23) + 4, (1 << 23) + 5, (1 << 23) + 6, (1 << 23) + 7,
+                       0x00FFFFFF, 0x01234567, INT32_MAX, -1, INT32_MIN};
+    const int n_pri[2] = {1, 2};
+    int discriminating = 0;
+    for (int id : ids) {
+        CAPTURE(id);
+        std::vector<mem_alnreg_t> regs[2];
+        regs[0].push_back(B.fwd(0, 1000, 100));
+        regs[1].push_back(B.rev(0, 1000 + 270 - 99, 100));
+        regs[1].push_back(B.rev(0, 1000 + 330 - 99, 100));
+        const PairResult want = oracle_pair(g.o, B, pes, regs, id, n_pri);
+        const PairResult zext = oracle_pair(g.o, B, pes, regs, id, n_pri, true);
+        // Both candidates pair and tie: the runner-up scores the same as the best.
+        REQUIRE(want.ret > 0);
+        CHECK(want.sub == want.ret);
+        check_pair(run_pair(g.o, B, pes, regs, id), want);
+        // Below 2^23 bit 31 is clear and the two readings agree.
+        if (id >= 0 && id < (1 << 23)) CHECK(zext.z[1] == want.z[1]);
+        discriminating += zext.z[1] != want.z[1];
+    }
+    // At least one id must pick a different pair under the zero-extended key,
+    // or this test could not tell the two readings apart.
+    CHECK(discriminating > 0);
 }
 
 TEST_CASE("mem_pair: the pair window is inclusive at both ends"
