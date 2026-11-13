@@ -100,6 +100,9 @@ struct aln_meth_hit_t {
 static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record");
 // incomplete: lookup budget, an unrepresentable competitor, CIGAR storage, -m work budget
 enum { ALN_METH_BIND_BEST = 1, ALN_METH_BIND_UNREP = 2, ALN_METH_BIND_CIGAR = 4, ALN_METH_BIND_M = 8 };
+// SA rows a read resolves at the flush that binds its lookup budget (at most what is left of it),
+// to pick its best-known placement: that flush makes the read incomplete either way.
+enum { ALN_METH_BIND_ROWS = 64 };
 struct aln_meth_read_t {
     // The search's candidate loci; finishing the read moves the retained ones to hits and frees it.
     std::vector<aln_meth_occ_t> occ;
