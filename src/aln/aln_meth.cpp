@@ -109,9 +109,9 @@ static inline const int8_t *meth_mat(const aln_meth_opt_t *mo, int hyp, int *m)
     return *m == 5 ? (hyp ? mo->mat_ot : mo->mat_ob) : (hyp ? mo->mat7_ot : mo->mat7_ob);
 }
 static void fetch_window(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int64_t rb, int64_t len,
-                         int rid, std::vector<uint8_t> &win)
+                         int rid, std::vector<uint8_t> &win, int alt = 0)
 {
-    aln_meth_fetch_window(*ref, *mo, rb, (int)len, rid, win);
+    aln_meth_fetch_window(*ref, *mo, rb, (int)len, rid, win, alt);
 }
 static inline uint64_t splitmix64(uint64_t *x)
 {
@@ -202,12 +202,12 @@ static bool alignment_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, b
  * candidate could have competed (cost within the retained window) is marked incomplete. */
 static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
                               const gap_opt_t *opt, int64_t rb, int64_t re,
-                              const ubyte_t *query, int len, aln_meth_occ_t *o)
+                              const ubyte_t *query, int len, aln_meth_occ_t *o, int alt = 0)
 {
     int m;
     const int8_t *mat = meth_mat(mo, o->hyp, &m);
     std::vector<uint8_t> win;
-    fetch_window(ref, mo, rb, re - rb, o->rid, win);
+    fetch_window(ref, mo, rb, re - rb, o->rid, win, alt);
     int q = 0, t = 0;
     for (uint32_t item : o->alignment.raw_cigar) {
         const int op = item & 15, n = item >> 4;
@@ -235,6 +235,8 @@ static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *m
               (int64_t)opt->s_gape * o->n_gape;
     return o->cost <= INT_MAX && o->n_mm <= 255 && o->n_gapo <= 255 && o->n_gape <= 255;
 }
+static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
+                        int alt, int n_ins, int n_del);
 static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_t sa)
 {
     aln_meth_group_t *g = x->grp;
@@ -253,18 +255,30 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
     const int64_t rb = g->ref->bns->anns[rid].offset + (pos - ca.offset);
     const auto key = std::make_tuple(rid, hyp, strand, rb, rb + span);
     if (!x->windows.insert(key).second) return;
-    aln_meth_occ_t o;
-    o.rid = rid; o.hyp = hyp; o.strand = strand;
     const aln_meth_candidate_t candidate{rid, strand, hyp, rb, rb + span};
     const ubyte_t *query = strand ? x->p->rseq : x->rd_fwd.data();
+    // --known-snvs: a window holding a site is also aligned with the ALTs in place; the locus
+    // keeps the cheaper of the two (the replace-if-better below).
+    const int n_hap = aln_meth_window_has_site(*g->ref, rb, span, rid) ? 2 : 1;
+    for (int alt = 0; alt < n_hap; ++alt)
+        resolve_one(x, candidate, query, alt, h.e.n_ins, h.e.n_del);
+}
+static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
+                        int alt, int n_ins, int n_del)
+{
+    aln_meth_group_t *g = x->grp;
+    const int rid = candidate.rid, hyp = candidate.hyp, strand = candidate.strand;
+    const int64_t rb = candidate.rb, span = candidate.re - candidate.rb;
+    aln_meth_occ_t o;
+    o.rid = rid; o.hyp = hyp; o.strand = strand; o.alt = alt;
     const auto status = aln_meth_realign_window(*g->ref, *g->mo, candidate, query, x->len,
-                                               h.e.n_ins, h.e.n_del, &o.alignment);
+                                               n_ins, n_del, &o.alignment, alt);
     // Invalid/resource/empty normalized alignments must never be silently omitted competitors.
     if (status != aln_meth_eval_status::ok) {
         fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
         exit(1);
     }
-    if (!account_alignment(g->ref, g->mo, g->opt, rb, rb + span, query, x->len, &o)) {
+    if (!account_alignment(g->ref, g->mo, g->opt, rb, rb + span, query, x->len, &o, alt)) {
         ++x->res->n_unrepresentable;
         x->unrep_cost = std::min(x->unrep_cost, o.cost);
         return;
@@ -355,6 +369,7 @@ static aln_meth_hit_t meth_hit(const aln_meth_occ_t &o, std::vector<uint32_t> &c
     else h.cig = 0; // no CIGAR: no table offset to go stale
     h.strand = (uint8_t)o.strand; h.hyp = (uint8_t)o.hyp;
     h.n_mm = (uint8_t)o.n_mm; h.n_gapo = (uint8_t)o.n_gapo; h.n_gape = (uint8_t)o.n_gape;
+    h.alt = (uint8_t)o.alt;
     return h;
 }
 void aln_meth_store_loci(aln_meth_read_t *res)
@@ -446,6 +461,16 @@ static __attribute__((noinline)) void meth_slot_finish_tail(aln_meth_read_t *res
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
     aln_meth_read_t *r = x->res;
+    if (x->extra) { // --known-snvs: windows the ALT-window search found, as both haplotypes
+        for (const aln_meth_candidate_t &c : *x->extra) {
+            if ((c.hyp ^ c.strand) != x->grp->read_no) continue;
+            if (!x->windows.insert(std::make_tuple(c.rid, c.hyp, c.strand, c.rb, c.re)).second) continue;
+            const int span = (int)(c.re - c.rb);
+            const ubyte_t *query = c.strand ? x->p->rseq : x->rd_fwd.data();
+            for (int alt = 0; alt < 2; ++alt)
+                resolve_one(x, c, query, alt, std::max(0, x->len - span), std::max(0, span - x->len));
+        }
+    }
     if (r->occ.empty()) return;
     int64_t best = INT64_MAX;
     for (const auto &o : r->occ) best = std::min(best, o.cost);
@@ -699,11 +724,13 @@ void aln_meth_pe_stage1(const gap_opt_t *opt, int n, bwa_seq_t *seqs[2], aln_met
 #define SW_MIN_MAPQ 17
 
 /* bwape.cpp's bwa_sw_core with the anchor's matrix (labelled window under cpg) on the original
- * reference; *_cnt's n_mm counts only the mismatches the mode does not free. */
+ * reference; *_cnt's n_mm counts only the mismatches the mode does not free. --known-snvs: with alt
+ * set the window carries its sites' ALTs (aln_meth_fetch_window), and *score gets the local score. */
 static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int hyp, int rid,
                                  int len, const ubyte_t *seq, int64_t *beg, int64_t end,
                                  int *n_cigar, uint32_t *_cnt,
-                                 const gap_opt_t *account_opt = nullptr, aln_meth_occ_t *owned = nullptr)
+                                 const gap_opt_t *account_opt = nullptr, aln_meth_occ_t *owned = nullptr,
+                                 int alt = 0, int *score = nullptr)
 {
     *n_cigar = 0;
     if (len <= 0 || len > 65535 || rid < 0 || rid >= ref->bns->n_seqs) return nullptr;
@@ -724,7 +751,7 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
     int m;
     const int8_t *mat = meth_mat(mo, hyp, &m);
     std::vector<uint8_t> target;
-    fetch_window(ref, mo, *beg, span, rid, target);
+    fetch_window(ref, mo, *beg, span, rid, target, alt);
     const int xtra = KSW_XSUBO | KSW_XSTART | (len < 250 ? KSW_XBYTE : 0);
     const kswr_t r = ksw_align(len, const_cast<uint8_t*>(seq), (int)span, target.data(), m, mat, 5, 1, xtra, nullptr);
     if (r.score < SW_MIN_MATCH_LEN || r.score2 == r.score || r.qb < 0 || r.tb < 0 ||
@@ -733,7 +760,7 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
     // Reuse the bounded, certified global refiner for the selected local rescue segment.
     const aln_meth_candidate_t candidate{rid, 0, hyp, *beg+r.tb, *beg+r.te+1};
     aln_meth_alignment_t alignment;
-    if (aln_meth_realign_window(*ref, *mo, candidate, seq+r.qb, r.qe-r.qb+1, 0, 0, &alignment)
+    if (aln_meth_realign_window(*ref, *mo, candidate, seq+r.qb, r.qe-r.qb+1, 0, 0, &alignment, alt)
         != aln_meth_eval_status::ok) {
         fprintf(stderr, "ERROR: --meth cannot evaluate mate rescue\n"); exit(1);
     }
@@ -776,6 +803,7 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
         owned->alignment.cigar=cigar;
     }
     *beg=alignment.rb;
+    if (score) *score = r.score;
     return legacy_cigar(cigar,n_cigar,len,len,0);
 }
 
@@ -1012,7 +1040,7 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 			aln_meth_read_t *r[2] = {res[0] + i, res[1] + i};
 			if (r[0]->flags || r[1]->flags) continue;
 			if (!((p[0]->mapQ >= SW_MIN_MAPQ || p[1]->mapQ >= SW_MIN_MAPQ) && (p[0]->extra_flag & SAM_FPP) == 0)) continue;
-			int n_cigar[2] = {0, 0}, mapQ = 0, mq_adjust[2] = {255, 255};
+			int n_cigar[2] = {0, 0}, mapQ = 0, mq_adjust[2] = {255, 255}, alt_used[2] = {0, 0};
 			int64_t beg[2], end[2];
 			bwa_cigar_t *cigar[2] = {0, 0};
 			uint32_t cnt[2];
@@ -1038,8 +1066,23 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 					seq_reverse(pmate->len, seq, 0);
 				}
                 const int anchor_rid = bns_pos2rid(ref->bns, pref->pos);
+                const int64_t beg0 = beg[k];
+                int sc = 0;
                 cigar[k] = meth_sw_core(ref, mo, r[1-k]->hyp, anchor_rid, pmate->len, seq,
-                                        &beg[k], end[k], &n_cigar[k], &cnt[k]);
+                                        &beg[k], end[k], &n_cigar[k], &cnt[k], nullptr, nullptr, 0, &sc);
+                // --known-snvs: the window with its sites' ALTs too; the better score wins (REF on a tie)
+                if (ref->known_snvs && end[k] > beg0 &&
+                    aln_meth_window_has_site(*ref, beg0, (int)std::min<int64_t>(end[k] - beg0, INT_MAX), anchor_rid)) {
+                    int64_t b = beg0;
+                    int nc = 0, sa = 0;
+                    uint32_t cn = 0;
+                    bwa_cigar_t *c = meth_sw_core(ref, mo, r[1-k]->hyp, anchor_rid, pmate->len, seq,
+                                                  &b, end[k], &nc, &cn, nullptr, nullptr, 1, &sa);
+                    if (c && (!cigar[k] || sa > sc)) {
+                        free(cigar[k]);
+                        cigar[k] = c, n_cigar[k] = nc, cnt[k] = cn, beg[k] = b, alt_used[k] = 1;
+                    } else free(c);
+                }
 				if (cigar[k] && popt->short_insert && !aln_rescue_within_fragment(pref, beg[k], cigar[k], n_cigar[k])) {
 					free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
 				}
@@ -1090,6 +1133,7 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 				p[k]->extra_flag |= SAM_FPP;
 				p[1 - k]->extra_flag |= SAM_FPP;
 				r[k]->hyp = r[1 - k]->hyp; // the rescued mate is on the anchor's genome strand
+				r[k]->ks_alt = alt_used[k];
 			}
 			free(cigar[0]); free(cigar[1]);
 		}

@@ -13,7 +13,24 @@
 #include "../bntseq.h"
 #include "../utils.h"
 
+#include <vector>
+
 namespace bwa_aln {
+
+/* One alignment of a read given by position rather than SA row (--known-snvs: an end whose hits
+ * were recomputed with the ALT credited): forward-strand packed start, strand, search score and
+ * counts, and ref_shift (deletions minus insertions). */
+struct pe_hit_t {
+	int64_t pos;
+	int strand, score, n_mm, n_gapo, n_gape, ref_shift;
+};
+
+/* --known-snvs mate rescue: list(ctx, beg, end, out) fills `out` with (packed position, ALT code)
+ * for every site allele in the packed range [beg, end). */
+struct pe_alt_sites_t {
+	void (*list)(const void *ctx, int64_t beg, int64_t end, std::vector<std::pair<int64_t, uint8_t>> *out);
+	const void *ctx;
+};
 
 typedef struct {
 	double avg, std, ap_prior;
@@ -64,8 +81,11 @@ void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t
 void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
                       const pe_opt_t *opt, const isize_info_t *last_ii,
                       const bntseq_t *bns = nullptr, int report = 1);
+/* With `hits` (--known-snvs), a pair where hits[j][i] is non-empty for either end pairs that end on
+ * those hits, by position, instead of its SA rows; its extra hits come from the same list. */
 int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt);
+				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt,
+				const std::vector<pe_hit_t> *const hits[2] = nullptr);
 /* sampe's pairing of one pair, for the unit tests' reference: `arr` holds upstream's
  * (position, k<<2 | strand<<1 | end) array for the pair (sorted in place); the alignments are
  * p[0]->aln and p[1]->aln. Returns the number of alignments whose position changed. */
@@ -94,14 +114,20 @@ constexpr long long ALN_PE_GROUP_ROWS = 8192;
  * pairs of weight up to group_rows: pairing rows, plus a bound on extra hits, plus one per pair;
  * a heavier pair is a group alone. The output does not depend on group_rows. */
 int bwa_pe_pair_grouped(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2],
-						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows);
+						const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt, long long group_rows,
+						const std::vector<pe_hit_t> *const hits[2] = nullptr);
 
 /* Mate Smith-Waterman for unpaired reads: upstream's bwa_paired_sw without its stderr report
  * (the driver calls these two directly; upstream's wrapper is not kept). Does nothing unless popt->is_sw and ii->avg >= 0;
  * otherwise adds its singleton (index 1) and discordant (index 0) counts to n_tot and
- * n_mapped. Independent per pair; no RNG. bwa_paired_sw_report prints the counts. */
+ * n_mapped. Independent per pair; no RNG. bwa_paired_sw_report prints the counts.
+ * With `alt` (--known-snvs), the mate is also aligned against the window with each site allele in
+ * it substituted, one at a time, and the best score wins (the reference on a tie); its counts are
+ * against that window. alt_site[j][i] is then set for every read the rescue moves: the packed
+ * position of the substituted site, or -1. */
 void bwa_paired_sw_core(const bntseq_t *bns, const ubyte_t *pacseq, int n_seqs, bwa_seq_t *seqs[2], const pe_opt_t *popt,
-						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2]);
+						const isize_info_t *ii, uint64_t n_tot[2], uint64_t n_mapped[2],
+						const pe_alt_sites_t *alt = nullptr, int64_t *const alt_site[2] = nullptr);
 void bwa_paired_sw_report(const uint64_t n_tot[2], const uint64_t n_mapped[2]);
 
 } // namespace bwa_aln

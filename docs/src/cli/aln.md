@@ -101,6 +101,7 @@ and the name it has there when it differs.
 | `--short-insert` | new | off | Estimate short inserts without a batch-wide minimum set by the longest read; paired input required |
 | `--ref-span-insert` | new | off | Measure inserts from the alignments' reference spans, not read lengths, so indels count; paired input required |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
+| `--known-snvs FILE` | new | off | Place reads carrying a known SNV's ALT allele as on a genome holding both alleles, and tag reads over a site with `XV:Z` (see [Known SNVs](#known-snvs---known-snvs)) |
 | `-v INT` | new | 3 | 0-2 suppress progress, 3 reports progress, 4 adds lookup/window/incomplete diagnostics; some errors and warnings still print at 0 |
 | `--bam` | new | off | Write BAM instead of SAM |
 | `--bam-level INT` | new | 1 | BAM compression level (0-9; other values are an error) |
@@ -185,6 +186,66 @@ still measures the insert it compares to `-a` from the spans.
 This is an opt-in departure from stock output: it can change the inferred distribution, pair
 selection, proper-pair flags, MAPQ, rescue windows and, for reads pairing moves to a gapped
 hit, their position and CIGAR. Without the option the output is unchanged.
+
+### Known SNVs (`--known-snvs`)
+
+Short reads that carry the ALT allele of an SNV have one more mismatch against the reference
+than reads carrying REF. For reads of 20-30 bases that mismatch often costs the read its
+placement: it ties with a paralog, drops below MAPQ 20, or goes over the mismatch budget. Allele
+counts at those sites are then biased toward REF. `--known-snvs FILE` places reads as on a genome
+that holds both alleles of every SNV in FILE:
+
+```bash
+bwa-mem3 aln --known-snvs sites.vcf.gz ref.fa reads.fq.gz > out.sam
+```
+
+FILE is a VCF or BCF (plain or compressed). Its single-base substitutions are used, multi-allelic
+ones as alternatives (never combined); other records are skipped, and FILTER is ignored. A record
+whose contig is not in the reference, or whose REF differs from it, is an error naming the record.
+
+How it works:
+
+- A window of 160 bases either side of each site, with the ALT in place, is indexed when the run
+  starts (in a temporary directory under `$TMPDIR`, removed at exit).
+- Each read is also searched against the windows. A hit there that covers its window's site is
+  a hit at the same reference position with the ALT credited, and the cheaper of the two costs
+  wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual
+  cuts. The stock primary is kept while it is still among the best.
+- Paired end: the insert size is estimated from stock placements first. Mate rescue also aligns
+  the mate against its window with each site's ALT substituted, and keeps the better score.
+- `--meth`: the converted search also resolves the windows that the ALT-window search finds, with
+  the ALTs in place. A pair whose placement assumes an ALT is left out of the insert-size estimate.
+- Reads longer than about 160 bases, and reads with more than 256 candidate loci, keep their
+  stock result.
+
+CIGAR, MD and NM are still against the reference, so an ALT read shows its mismatch; `XM:i` is the
+mismatch count with the ALT credited. A read that does not touch a site is unchanged.
+
+Every record over a site gets `XV:Z`, one entry per site separated by `;`:
+
+```text
+contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq
+```
+
+- `allele`: `R` (REF), `A` (ALT), `O` (another base), or under `--meth` `H` (the conversion can
+  explain both alleles on that strand).
+- `away`: the read's differences outside the site.
+- `max_diff`: the read's mismatch budget.
+- `twin_same`, `twin_mapq`: for the first `R` or `A` site only (`NA` otherwise), the read is
+  realigned with REF and ALT swapped at that site (as a pair, with its mate, for paired input).
+  `twin_same` is 1 when that twin lands on the same strand within 5 bases, and `twin_mapq` is
+  the twin's MAPQ. The twin never changes the read's own record or the run's random draws.
+
+To count alleles without reference bias, count a read at a site only when it passes the MAPQ
+cut-off, its twin also passes (`twin_same` 1 and `twin_mapq` at or above the cut-off), and
+`away` is at most `max_diff - 1`. The last rule matters: a read already at its mismatch budget
+places only when an error at the site matches the ALT, so without it errors become ALT counts.
+See [Counting alleles at known SNVs](../user-guide/known-snvs.md) for worked examples, paired-end
+fragments and the limits.
+
+This is an opt-in departure from stock output. It can change the position, MAPQ, flags and
+alternative hits of reads at the sites. Without the option the output is unchanged. With a VCF
+that has no SNV, the output is also unchanged.
 
 **Option values.** Numbers must be well formed: where stock's `atoi` reads `abc` as 0 and
 `20x` as 20, `aln` stops with an error naming the option. Values that stock accepts but

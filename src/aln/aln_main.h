@@ -18,6 +18,8 @@ struct aln_opt_t {
 	                            // is the same either way); a test hook, not a CLI option
 	const struct aln_meth_opt_t *meth = nullptr;     // --meth settings (null without --meth)
 	const struct aln_meth_ref_t *meth_ref = nullptr; // --meth references (null without --meth)
+	const struct ks_sites_t *known_snvs = nullptr;   // --known-snvs sites (null without it or when empty)
+	const struct ks_windows_t *ks_windows = nullptr; // their ALT windows and index (with known_snvs)
 };
 
 /* Stock defaults: gap_init_opt(), max_xa_hits 3, batch_size 0x40000, share_dup_search 1. */
