@@ -183,10 +183,11 @@ template <> struct gap_group<AlnMeth> {
 		const int64_t *ord;      // per read of the (possibly compacted) batch: its ordinal in the stream
 		const uint8_t *keep;     // per read: keep both strata (others share its search), or null
 		aln_meth_read_t *res;    // per read of the (possibly compacted) batch
-		// extra is per read of the caller's batch: read r of a compacted batch reads entry src[r]
-		// (src null: entry r).
+		// extra and caps are per read of the caller's batch: read r of a compacted batch reads entry
+		// src[r] of each (src null: entry r).
 		const int *src;
 		const aln_meth_extra_t *extra; // per read: --known-snvs candidates, or null
+		const int64_t *caps;     // per read: the ALT-window generator's seed (aln_meth_slot_t::cap_best), or null
 		const std::vector<std::vector<int64_t>> *copies; // per read: its duplicate copies' ordinals, or null
 	};
 
@@ -215,8 +216,9 @@ template <> struct gap_group<AlnMeth> {
 	{
 		const gap_opt_t *opt = group->opt;
 		const int max_diff = opt->fnr > 0.0 ? bwa_cal_maxdiff(p->len, BWA_AVG_ERR, opt->fnr) : opt->max_diff;
-		aln_meth_slot_start(slot(c), p, ctx->res + r, ctx->ord[r], max_diff, ctx->keep ? ctx->keep[r] : 0);
 		const int s = ctx->src ? ctx->src[r] : r;
+		aln_meth_slot_start(slot(c), p, ctx->res + r, ctx->ord[r], max_diff, ctx->keep ? ctx->keep[r] : 0,
+							ctx->caps ? ctx->caps[s] : INT64_MAX);
 		slot(c)->extra = ctx->extra ? ctx->extra + s : nullptr;
 		slot(c)->copy_ords = ctx->copies ? &(*ctx->copies)[r] : nullptr;
 	}
@@ -738,13 +740,14 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res,
-						  const aln_meth_extra_t *extra)
+						  const aln_meth_extra_t *extra, const int64_t *caps)
 {
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	gap_group<AlnMeth>::ctx_t mc;
 	mc.ref = ref; mc.mo = mo; mc.read_no = read_no; mc.keep_strata = keep_strata; mc.max_xa_hits = max_xa_hits;
 	mc.keep = nullptr; mc.src = nullptr;
 	mc.extra = extra;
+	mc.caps = caps;
 	mc.copies = nullptr;
 	std::vector<int64_t> ord(n_seqs);
 	std::vector<uint8_t> has_copy(n_seqs, 0);
@@ -784,8 +787,10 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 							  ref->ks_window || (keep_strata && !res[first].flags), max_xa_hits, ord[i]);
 		},
 		// --known-snvs: a copy shares only with the same candidate windows and paths, horizon and
-		// flags (one window reached along two paths scores differently)
+		// flags (one window reached along two paths scores differently), and (the ALT-window search)
+		// the same seed
 		[&](int i, int first) {
+			if (caps && caps[i] != caps[first]) return false;
 			if (!extra) return true;
 			const aln_meth_extra_t &a = extra[i], &b = extra[first];
 			return a.horizon == b.horizon && a.flags == b.flags && a.rows.size() == b.rows.size() &&

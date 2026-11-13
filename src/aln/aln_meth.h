@@ -184,14 +184,16 @@ struct aln_meth_group_t;
  * strata (paired-end pairs on them; an incomplete read, which never pairs, keeps only its main
  * hit); otherwise a read keeps its main hit, and the other loci only when they will be printed as
  * XA (at most max_xa_hits + 1 occurrences). extra (--known-snvs, or null): per read, the ALT-window
- * search's candidates (aln_meth_extra_t), windows the search did not have to propose, resolved (as
- * the reference and with each site allele in place) before the read finishes; identical reads share
- * a search only with equal extras. */
+ * search's candidates (aln_meth_extra_t), windows the search did not have to propose, scored (as
+ * the reference and with each site allele in place) before the read's search starts
+ * (aln_meth_score_extras); identical reads share a search only with equal extras. caps (the
+ * --known-snvs ALT-window search, or null): per read, an upper bound on that read's final best
+ * (INT64_MAX: none), the seed its generator search starts from (aln_meth_slot_t::cap_best). */
 struct aln_meth_extra_t;
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, struct aln_dup_state_t *dup, aln_meth_read_t *res,
-						  const aln_meth_extra_t *extra = nullptr);
+						  const aln_meth_extra_t *extra = nullptr, const int64_t *caps = nullptr);
 
 /* samse under --meth for reads [0, n). Caller must run bwase_initialize once
  * before dispatching any finish workers (as aln_run_se_meth does). */
