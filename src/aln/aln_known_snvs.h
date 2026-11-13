@@ -90,13 +90,15 @@ struct ks_windows_t {
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
 					 int meth, ks_windows_t *out, const char *cache_path = nullptr);
 
-/* The windows as a forward-only reference: bns (one contig `w<i>` per window, no ambiguity
- * holes, fields as bns_restore gives for today's windows.fa) and pac (l_pac/4+1 bytes, as
- * bwa_idx_load_ele loads). Caller owns both (bns_destroy / free). */
+/* The windows as a forward-only reference: bns (one contig `w<i>` per window, with the
+ * reference's ambiguity holes that fall in it, translated to window coordinates; other fields as
+ * bns_restore gives) and pac (l_pac/4+1 bytes, as bwa_idx_load_ele loads; a hole's bases are the
+ * main index's fill). Caller owns both (bns_destroy / free). */
 void ks_windows_ref(const std::vector<ks_window_t> &win, const bntseq_t *bns, const uint8_t *pac,
 					bntseq_t **out_bns, uint8_t **out_pac);
 /* --meth: per window `r<name>` (G->A) then `f<name>` (C->T), the layout aln_meth_ref_load checks.
- * Windows only: valid because window text has no ambiguity holes (the 2-bit codes are exact). */
+ * Converts the packed codes as stored, a hole's fill included (as `index --meth` converts the
+ * main index's fill); the holes themselves are kept on the original windows, for scoring. */
 void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, bntseq_t **conv_bns,
 							 uint8_t **conv_pac);
 
