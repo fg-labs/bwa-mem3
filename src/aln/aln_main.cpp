@@ -652,8 +652,8 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one\n");
 	fprintf(fp, "step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe\n");
 	fprintf(fp, "(two files), with no .sai files. On the tested inputs its records match bwa 0.7.19's\n");
-	fprintf(fp, "(@PG differs) unless --meth or --short-insert is given; `-n 1e-2` is a probability\n");
-	fprintf(fp, "here and the integer 1 in stock.\n");
+	fprintf(fp, "(@PG differs) unless --meth, --short-insert or --ref-span-insert is given; `-n 1e-2` is\n");
+	fprintf(fp, "a probability here and the integer 1 in stock.\n");
 	fprintf(fp, "<prefix> is an index made by `bwa-mem3 index` (also one made with --meth, or one staged\n");
 	fprintf(fp, "by `bwa-mem3 shm`).\n");
 	fprintf(fp, "Each option shows its default and the stock command it comes from.\n\n");
@@ -691,6 +691,11 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  --short-insert   estimate short inserts without a batch-wide read-length floor, pair mates\n"
 	            "                   that start at the same base, and let mate rescue overlap the anchor [off]\n");
 	fprintf(fp, "                   paired only, including --meth; -A overrides\n");
+	fprintf(fp, "  --ref-span-insert\n"
+	            "                   measure inserts from each alignment's reference span (read length\n"
+	            "                   plus deletions minus insertions), not its read length, in insert-size\n"
+	            "                   estimation, pairing (and -a) and mate rescue windows [off]\n");
+	fprintf(fp, "                   paired only, including --meth\n");
 	fprintf(fp, "  -P        accepted and ignored (sampe -P loads the index into memory; always so here)\n");
 	fprintf(fp, "\nMethylation (shared with bwa-mem3 mem):\n");
 	meth_opts_usage_shared(fp);
@@ -847,7 +852,7 @@ static int aln_parse_double(const char *flag, const char *s, double lo, double *
 	return 1;
 }
 
-enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP, OPT_SHORT_INSERT };
+enum { OPT_MAX_XA = 256, OPT_MAX_XA_DISC, OPT_MAX_OCC, OPT_BAM, OPT_BAM_LEVEL, OPT_HELP, OPT_SHORT_INSERT, OPT_REF_SPAN_INSERT };
 
 int main_aln(int argc, char *argv[])
 {
@@ -866,6 +871,7 @@ int main_aln(int argc, char *argv[])
 		{"max-xa-hits-discordant", required_argument, 0, OPT_MAX_XA_DISC},
 		{"max-occ", required_argument, 0, OPT_MAX_OCC},
 		{"short-insert", no_argument, 0, OPT_SHORT_INSERT},
+		{"ref-span-insert", no_argument, 0, OPT_REF_SPAN_INSERT},
 		{"bam", no_argument, 0, OPT_BAM},
 		{"bam-level", required_argument, 0, OPT_BAM_LEVEL},
 		{"help", no_argument, 0, OPT_HELP},
@@ -967,6 +973,7 @@ int main_aln(int argc, char *argv[])
 			break;
 		case OPT_MAX_OCC: ALN_INT("--max-occ", INT_MIN, &o.pe.max_occ); pe_flag = 1; break;
 		case OPT_SHORT_INSERT: o.pe.short_insert = 1; break;
+		case OPT_REF_SPAN_INSERT: o.pe.ref_span_insert = 1; break;
 		case OPT_BAM: bam = 1; break;
 		case OPT_BAM_LEVEL:
 			if (!aln_parse_int("--bam-level", optarg, 0, 9, &bam_level)) return 1;
@@ -1032,6 +1039,10 @@ int main_aln(int argc, char *argv[])
 	const int paired = optind + 3 == argc;
 	if (o.pe.short_insert && !paired) {
 		fprintf(stderr, "[E::aln] --short-insert requires paired-end input\n");
+		return 1;
+	}
+	if (o.pe.ref_span_insert && !paired) {
+		fprintf(stderr, "[E::aln] --ref-span-insert requires paired-end input\n");
 		return 1;
 	}
 	if (pe_flag && !paired)

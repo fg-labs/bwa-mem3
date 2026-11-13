@@ -26,11 +26,14 @@ pe_opt_t *bwa_init_pe_opt(void);
 /* Estimates the insert-size distribution from the pairs where both ends are unique enough.
  * With short_insert, the lower fence is floored at 1 rather than the longest read, and failed
  * estimates have avg/std = -1 and all bounds zero. (Pairing then also accepts coincident starts, and rescue may overlap the anchor.)
+ * With ref_span (--ref-span-insert), each observation ends at the later read's reference end, its
+ * position plus len + ref_shift (the span of its chosen alignment), instead of position plus len.
  * Returns 0, or -1 (ii->avg = -1) when it cannot; prints its findings to stderr when `report`
  * is set. With `bns` (--meth), pairs whose ends lie on different contigs are not counted;
  * the defaults are stock's. */
 int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
-                const bntseq_t *bns = nullptr, int report = 1, bool short_insert = false);
+                const bntseq_t *bns = nullptr, int report = 1, bool short_insert = false,
+                bool ref_span = false);
 
 /* Single-end positions, then pairing, for one batch. Each read's alignments are its aln /
  * n_aln. Consumes drand48(): call serially, in read order. When the batch gives no estimate
@@ -67,14 +70,20 @@ int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *se
  * (position, k<<2 | strand<<1 | end) array for the pair (sorted in place); the alignments are
  * p[0]->aln and p[1]->aln. Returns the number of alignments whose position changed. */
 int bwa_pe_pairing(bwa_seq_t *p[2], pair64_v *arr, const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
-/* Stock scoring/count aggregation, restricted to same-contig candidates before selection. */
+/* Stock scoring/count aggregation, restricted to same-contig candidates before selection.
+ * With opt->ref_span_insert, span[j][k] (when span is given) is the reference span of end j's
+ * hit k; otherwise spans come from p[j]->aln[k]'s n_del and n_ins. */
 int bwa_pe_pairing_same_contig(const bntseq_t *bns, bwa_seq_t *p[2], pair64_v *arr,
-                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii);
+                               const pe_opt_t *opt, int s_mm, const isize_info_t *ii,
+                               const int32_t *const span[2] = nullptr);
 /* Mate rescue under --short-insert may search the anchor's own span, because both reads of a
  * fragment shorter than the reads start (or end) where their mate does. These keep a rescued mate
  * inside the fragment the anchor implies: the forward read may neither start nor end after the
  * reverse read. Soft-clipped bases are not part of the alignment, so a clipped overhang passes. */
 int64_t aln_rescue_window_floor(const bwa_seq_t *anchor, const pe_opt_t *opt);
+/* The anchor's reference end that places the rescue window: pos + len (stock), or, with
+ * --ref-span-insert, pos + len + ref_shift (the end of its alignment's reference span). */
+int64_t aln_rescue_anchor_end(const bwa_seq_t *anchor, const pe_opt_t *opt);
 int64_t aln_rescue_window_ceiling(const bwa_seq_t *anchor, const pe_opt_t *opt);
 bool aln_rescue_within_fragment(const bwa_seq_t *anchor, int64_t mate_beg, const bwa_cigar_t *cigar,
                                 int n_cigar);

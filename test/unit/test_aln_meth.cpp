@@ -3466,3 +3466,108 @@ TEST_CASE("aln_meth: mate rescue drops a candidate whose counts overflow a recor
     }
     free(pe);free(opt);ba::aln_meth_ref_free(&mr);
 }
+
+namespace {
+// Read 2 of a planted pair: the reverse complement of the fragment's last reference bases, with
+// `shift` bases deleted from the read (shift > 0, so it spans 50 + shift reference bases) or
+// -shift bases inserted (it spans 50 + shift), always 50 bases long. The fragment, from read 1's
+// start to read 2's reference end, is `frag` bases.
+std::string gapped_read2(const std::string &genome, int start, int frag, int shift)
+{
+    const int span = 50 + shift;
+    std::string g = genome.substr(start + frag - span, span);
+    if (shift > 0) g.erase(25, shift);
+    else g.insert(23, std::string("GATTACA").substr(0, -shift));
+    REQUIRE(g.size() == 50);
+    return aln_test::revcomp(g);
+}
+
+// The mean the "[infer_isize] inferred external isize" report prints (3 decimals), or -1.
+double reported_isize(const std::string &err)
+{
+    const std::string key = "inferred external isize from ";
+    const size_t at = err.find(key);
+    if (at == std::string::npos) return -1;
+    const size_t colon = err.find(": ", at);
+    return colon == std::string::npos ? -1 : std::strtod(err.c_str() + colon + 2, nullptr);
+}
+} // namespace
+
+TEST_CASE("aln_meth: ref-span-insert holds a gapped mate's reference span, not its read length, to -a"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // With -A -a 200, a pair is proper when its insert is at most 200. Read 2 of pair 0 has a
+    // 4-base deletion: its insert is 202 by reference span, 198 by read length. Read 2 of pair 1
+    // has a 4-base insertion: 198 by span, 202 by read length. TLEN is from the CIGAR either way.
+    bool meth = false, converted = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth exact") { meth = true; }
+    SUBCASE("meth converted") { meth = converted = true; }
+    const int start[2] = {500, 1500}, frag[2] = {202, 198}, shift[2] = {4, -4};
+    std::vector<std::string> reads[2];
+    for (int i = 0; i < 2; ++i) {
+        std::string one = ref().c1.substr(start[i], 50), two = gapped_read2(ref().c1, start[i], frag[i], shift[i]);
+        if (converted) { one = conv(one, 'C', 'T'); two = conv(two, 'G', 'A'); }
+        reads[0].push_back(one); reads[1].push_back(two);
+    }
+    const std::vector<std::string> input = {write_fq("span-a1.fq", reads[0]), write_fq("span-a2.fq", reads[1])};
+    std::vector<std::string> args = {"-A", "-a", "200", "-n", "3", "-e", "10", "-l", "1024"};
+    if (meth) args.push_back("--meth");
+    for (bool option : {false, true}) {
+        CAPTURE(option);
+        std::vector<std::string> a = args;
+        if (option) a.push_back("--ref-span-insert");
+        const auto out = run_aln(a, input);
+        REQUIRE(out.size() == 4);
+        for (int i = 0; i < 2; ++i) {
+            CAPTURE(i);
+            const Rec &r1 = out[2 * i], &r2 = out[2 * i + 1];
+            const bool proper = option ? frag[i] <= 200 : frag[i] - shift[i] <= 200;
+            CHECK(r1.flag == (proper ? 99 : 97)); CHECK(r2.flag == (proper ? 147 : 145));
+            CHECK(r1.rname == "c1"); CHECK(r2.rname == "c1");
+            CHECK(r1.pos == start[i] + 1); CHECK(r1.cigar == "50M");
+            CHECK(r2.pos == start[i] + frag[i] - (50 + shift[i]) + 1);
+            CHECK(r2.cigar.find(shift[i] > 0 ? "4D" : "4I") != std::string::npos);
+            CHECK(r1.tlen == frag[i]); CHECK(r2.tlen == -frag[i]);
+        }
+    }
+}
+
+TEST_CASE("aln_meth: ref-span-insert estimates the insert size from gapped mates' reference spans"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // 30 planted pairs whose read 2 has a 4-base deletion: each fragment (read 1's start to read
+    // 2's reference end) is 4 bases longer than the read-length measurement of it.
+    bool meth = false, converted = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth exact") { meth = true; }
+    SUBCASE("meth converted") { meth = converted = true; }
+    std::vector<std::string> reads[2];
+    double sum = 0;
+    for (int i = 0; i < 30; ++i) {
+        const int start = 100 + 80 * i, frag = 180 + i % 21;
+        std::string one = ref().c1.substr(start, 50), two = gapped_read2(ref().c1, start, frag, 4);
+        if (converted) { one = conv(one, 'C', 'T'); two = conv(two, 'G', 'A'); }
+        reads[0].push_back(one); reads[1].push_back(two);
+        sum += frag;
+    }
+    const std::vector<std::string> input = {write_fq("span-ii1.fq", reads[0]), write_fq("span-ii2.fq", reads[1])};
+    std::vector<std::string> args = {"-n", "2", "-e", "10", "-l", "1024"};
+    if (meth) args.push_back("--meth");
+    const int verbose = bwa_verbose;
+    for (bool option : {false, true}) {
+        CAPTURE(option);
+        std::vector<std::string> a = args;
+        if (option) a.push_back("--ref-span-insert");
+        std::string err;
+        {
+            bwa_tests::StderrCapture capture;
+            const auto out = run_aln(a, input);
+            err = capture.text();
+            REQUIRE(out.size() == 60);
+            for (const auto &r : out) CHECK((r.flag & 2) != 0);
+        }
+        bwa_verbose = verbose;
+        CHECK(reported_isize(err) == doctest::Approx(sum / 30 - (option ? 0 : 4)).epsilon(1e-5));
+    }
+}
