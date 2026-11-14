@@ -186,6 +186,114 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
   reported and exits 1 too, after the output (BAM included) is completed
   ([#689](https://github.com/fg-labs/bwa-mem3/pull/689)).
 
+## Memory and parallel jobs
+
+On hg38 (3.2 Gbp with alternate contigs and decoys) `aln` holds about 10.5 GiB of
+index: the occurrence table (6.0 GiB), the suffix-array samples at one row in 8
+(3.75 GiB) and the packed reference (0.75 GiB). A run adds about 0.4-1 GiB to that
+with the default options at `-t 16`, and more on deep searches such as
+`-l 1024 -n 0.04 -o 2`.
+
+To run several `aln` jobs on one machine, for example one sample split into
+chunks, stage the index once in shared memory with [`shm`](shm.md) (Linux only).
+Every job then attaches to the one staged copy instead of loading its own:
+
+```bash
+sudo mount -o remount,huge=advise,size=20g /dev/shm   # room for the segment, 2 MB pages
+bwa-mem3 shm ref.fa || exit $?                        # launch no jobs if staging fails
+bwa-mem3 aln -t 8 ref.fa chunk1.fq.gz > chunk1.sam & pid1=$!
+bwa-mem3 aln -t 8 ref.fa chunk2.fq.gz > chunk2.sam & pid2=$!
+rc=0
+wait "$pid1" || rc=1
+wait "$pid2" || rc=1
+exit "$rc"                                            # in a script: exit 1 if either job failed
+```
+
+A job attaches only to a complete segment. One started while `shm` is still
+staging, or after a stage was interrupted, prints `'ref.fa' is not fully staged`
+and loads the index from disk, so start the jobs only after `shm` succeeds.
+
+A successful `shm` does not show that the staged index is the one on disk: if a
+complete segment for `ref.fa` is already staged, `shm` prints `already in shm` and
+exits 0 without checking its contents or replacing it. If the index files have
+changed since that segment was staged, remove it and stage again before launching
+the jobs.
+
+The example leaves the segment staged, for later jobs to reuse. Remove it, whether
+stale or no longer needed, with `bwa-mem3 shm -d`. That removes every staged
+segment on the machine, not only this one, so run it only once no other `aln` or
+`mem` job relies on a staged index.
+
+Measured on hg38 with two jobs each aligning the first 5M single-end reads of
+ERR5343087 with default options and `-t 8`, on 16 vCPU and 32 GB (Sapphire Rapids,
+x86_64; clang 19.1.7 LTO build at its default AVX-512BW runtime tier). For these
+runs, SAM output matched after removing the `@PG` line:
+
+| | system memory in use, peak | wall time for both jobs |
+| --- | --- | --- |
+| each job loads its own index | 23.1 GiB | 53.7 s |
+| both attach to one `shm` copy | 12.4 GiB (10.5 GiB of it the segment) | 40.3 s |
+
+Each attached job also costs no index load: a single run attached to the segment
+took the same time as one loading the index from the page cache (24.0 s against
+24.5 s wall). The private pair was slower because two copies did not fit in the
+page cache next to the jobs, so index pages were read again from disk. Each job's
+own RSS still shows about 10 GiB, because the shared pages it touches count in
+every process's RSS; the saving shows in the machine's total (`free`).
+
+The caveats are those of [`shm`](shm.md):
+
+- **Linux only.** macOS limits shared-memory names and segment sizes, and a
+  whole-genome index does not stage there.
+- **No staleness check.** A segment is found by the index's file name alone, so
+  `ref.fa` and `other/ref.fa` find the same one, and nothing checks the files'
+  contents. A job attaches to it even if the index files were rebuilt since, and
+  then gives wrong alignments. Run `bwa-mem3 shm -d` before rebuilding an index.
+- **Size and page size of `/dev/shm`.** The segment must fit in `/dev/shm`
+  (`size=`; containers often have a small one), and without `huge=advise` (or
+  `huge=within_size`) it sits on 4 KB pages, which costs CPU on every lookup.
+  Re-stage after a remount.
+- **The segment stays** until `bwa-mem3 shm -d` or a reboot. `shm -d` removes
+  every staged segment on the machine, not only this one; jobs already attached
+  keep their mapping and finish.
+
+### Smaller index: sparser suffix array (opt-in)
+
+To save memory per process at a small CPU cost, `aln` can use an index whose
+suffix-array samples are one row in 16 instead of the default one in 8. Make a
+copy of the index and resample the copy with [`re-sa`](re-sa.md), which rewrites
+`<idxbase>.bwt.2bit.64` in place:
+
+```bash
+mkdir -p aln-idx || exit $?
+cp -L ref.fa.* aln-idx/ || exit $?               # copy every index file, dereferencing symlinks
+bwa-mem3 re-sa -u 4 aln-idx/ref.fa || exit $?    # suffix-array samples 1 in 16
+bwa-mem3 aln -t 16 aln-idx/ref.fa reads.fq.gz > out.sam
+```
+
+The rate is stored in the index file, so the index describes itself: `aln` (and
+`mem`, `shm`) read it at load, no option needed, and `bwa-mem3 re-sa aln-idx/ref.fa`
+reports it. The one-in-8 and one-in-16 indexes were compared on hg38 at `-t 16`
+on 16 vCPU and 128 GB (Sapphire Rapids, x86_64; clang 19.1.7 LTO build at its
+default AVX-512BW runtime tier), with five runs per index for each workload:
+
+- The first 5M single-end reads of ERR5343087, with default options.
+- The paired-end reads from ERR13475328 and ERR13475329 combined (1,362,990 pairs),
+  with default options.
+- The same pairs with `-l 1024 -n 0.04 -o 2`.
+
+On these workloads, SAM output matched after removing the `@PG` line. Median peak
+memory was 1.87 GiB lower for each workload. Median paired-run CPU increases were
+0.2% for single-end reads, 1.3% for default paired-end reads and 0.5% for the deeper
+paired-end search; individual runs varied. Keep the copy for `aln` only. These
+measurements do not cover `mem`.
+
+The copy has the same file name as the original, so while `ref.fa` is staged with
+`shm`, `aln aln-idx/ref.fa` attaches to that staged one-in-8 segment instead. To
+share the sparser copy, coordinate with other users of shared memory, run
+`bwa-mem3 shm -d` to remove every staged segment, then stage the copy with
+`bwa-mem3 shm aln-idx/ref.fa`. Start alignment jobs only after staging succeeds.
+
 ## Notes
 
 - **Unequal pair counts.** If the second file has fewer reads than the first,
