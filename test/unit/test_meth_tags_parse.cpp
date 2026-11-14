@@ -137,6 +137,6 @@ TEST_CASE("a NULL spec is rejected rather than dereferenced")
 TEST_CASE("the default opt emits the full Bismark set")
 {
     mem_opt_t *o = mem_opt_init();
-    CHECK(o->meth_tags == MEM_METH_TAGS_ALL);
+    CHECK(o->meth.meth_tags == MEM_METH_TAGS_ALL);
     free(o);
 }

@@ -67,6 +67,17 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         int compression_level,
                                         int n_bgzf_threads);
 
+/* The --meth header text, appended to `out`: hd_line (unless NULL or the
+ * user text has an @HD), @SQ from the ORIGINAL `bns` (AH:* for ALT contigs,
+ * enriched with M5/UR/AS/SP from orig_idx_hdr_lines), the sidecar's other
+ * records, the user text (hdr_line), the subcommand's @PG (bwa_pg), and the
+ * second @PG, ID:bwa-mem3-meth, with CL meth_pg_cl (default_cl when NULL or
+ * empty). Every line ends with a newline. mem's writer and `aln --meth` both
+ * use it. Returns 0, or -1 on an allocation failure. */
+int meth_hdr_text(kstring_t *out, const bntseq_t *bns, const char *hd_line,
+                  const char *hdr_line, const char *orig_idx_hdr_lines,
+                  const char *bwa_pg, const char *meth_pg_cl, const char *default_cl);
+
 /* Write one bam1_t. Returns 0 on success, -1 on error. */
 int meth_bam_writer_write(meth_bam_writer_t *w, struct bam1_t *b);
 
@@ -86,7 +97,7 @@ int meth_bam_writer_close(meth_bam_writer_t *w);
  *   - XM:Z built against the original bns/pac with strand from the hypothesis.
  *   - chimera QC (only when opt->meth_chimera_qc is set): if longest M/=/X run < 44%
  *     of l_seq, set 0x200, clear 0x2, cap mapq at 1
- *   - opt->meth_set_as_failed forces 0x200 on the matching strand ('f'=OT, 'r'=OB)
+ *   - opt->meth.meth_set_as_failed forces 0x200 on the matching strand ('f'=OT, 'r'=OB)
  * Caller owns `b`. Returns 0 on success, -1 on error. */
 int meth_mem_aln_to_bam(struct bam1_t *b,
                         const mem_opt_t *opt, const bntseq_t *bns,
