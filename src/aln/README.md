@@ -110,6 +110,14 @@ Each change to upstream-derived code adds a line here.
   `-r` text; the release prints `@HD` first (unless a line of the `-r` text starts `@HD<tab>`),
   then `@SQ`, then the `-r` text. The release is the parity target, so its order is used. The
   `@PG` line is bwa-mem3's own (same builder as `mem`); parity checks drop `@PG` lines.
+  One deliberate divergence: when a line of the `-r` text starts `@HD<tab>`, the release writes
+  it after `@SQ`, which breaks the SAM rule that `@HD` comes first. `aln_print_sam_hdr` writes
+  the first such line first instead, in place of the default, and drops it and any other `@HD`
+  from the `-r` text it writes after `@SQ`, as `mem`'s header builder does.
+  The release's warning for it is kept (`aln_warn_user_hd`, at `bwa_verbose >= 2`, once per
+  run), naming `-r` and with aln's `[W::aln]` prefix where the release's names `-H` and
+  `[W::bwa_print_sam_hdr]`. Without an `@HD` in `-r`, the
+  header is the release's byte for byte.
 - `bwa-mem3 aln` differs from running `bwa aln` then `bwa samse` in its command line: it takes
   `aln`'s options, `-f` and `-r` (samse's and sampe's), and `--max-xa-hits` for samse's and
   sampe's `-n`. `-b`, `-0`, `-1` and `-2` (BAM input) are not accepted. `-r` with a literal tab
@@ -153,7 +161,8 @@ Each change to upstream-derived code adds a line here.
   difference still allowed, so its gap opens stay below `min(-o, differences allowed for the file's longest read)`,
   and a larger cap never lets a further entry in. The driver still searches each file as its own batch, as stock does.
 - `bwase.cpp`: `aln_print_sam_hdr` is new code that follows the 0.7.19 release's header
-  order; its line-start counting is a small helper (`count_line_start`).
+  order, except that a `-r` `@HD` is written first. Its record tests use bwa-mem3's
+  `bwa_hdr_text_has_type`, `bwa_hdr_first_HD` and `bwa_hdr_append_without_HD`, shared with `mem`.
 - `aln_main.cpp`: new code. Inputs and existing `-f` paths are checked before the index loads.
   Absent output paths are left untouched until the real open after loading the index, which
   reports creation failures. Help text lists each option with its stock default and source command.

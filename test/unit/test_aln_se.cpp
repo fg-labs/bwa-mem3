@@ -154,16 +154,67 @@ TEST_CASE("aln_se: header is @HD, @SQ lines, then RG, then PG"
     CHECK(l[4] == "@PG\tID:p");
 }
 
-TEST_CASE("aln_se: @HD in -r text suppresses the default @HD"
+TEST_CASE("aln_se: an @HD in the -r text replaces the default and is the first line"
           * doctest::test_suite("unit/aln_se")) {
-    std::vector<std::string> l = lines(header("@HD\tVN:1.6\tSO:coordinate\n@RG\tID:x", nullptr));
-    REQUIRE(l.size() == 5);
-    CHECK(l[0] == "@SQ\tSN:c1\tLN:600");
-    CHECK(l[3] == "@HD\tVN:1.6\tSO:coordinate");
-    CHECK(l[4] == "@RG\tID:x");
-    int n_hd = 0;
-    for (const std::string &s : l) n_hd += s.compare(0, 3, "@HD") == 0;
-    CHECK(n_hd == 1);
+    // The SAM spec requires @HD first. Stock bwa 0.7.19 writes a user @HD after @SQ; this is
+    // the one header divergence from it, and it applies only when -r carries an @HD.
+    struct Case { const char *desc; const char *hdr_line; };
+    const Case cases[] = {
+        { "leading @HD",     "@HD\tVN:1.6\tSO:coordinate\n@RG\tID:x" },
+        { "non-leading @HD", "@RG\tID:x\n@HD\tVN:1.6\tSO:coordinate" },
+    };
+    for (const Case &c : cases) {
+        CAPTURE(c.desc);
+        CHECK(header(c.hdr_line, "@PG\tID:p\n") ==
+              "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:c1\tLN:600\n@SQ\tSN:c2\tLN:550\n"
+              "@SQ\tSN:c3\tLN:128\n@RG\tID:x\n@PG\tID:p\n");
+    }
+}
+
+TEST_CASE("aln_se: of several @HD lines in the -r text the first wins, the rest are dropped"
+          * doctest::test_suite("unit/aln_se")) {
+    CHECK(header("@RG\tID:x\n@HD\tVN:1.6\tSO:coordinate\n@CO\tc\n@HD\tVN:1.5", "@PG\tID:p\n") ==
+          "@HD\tVN:1.6\tSO:coordinate\n@SQ\tSN:c1\tLN:600\n@SQ\tSN:c2\tLN:550\n"
+          "@SQ\tSN:c3\tLN:128\n@RG\tID:x\n@CO\tc\n@PG\tID:p\n");
+}
+
+TEST_CASE("aln_se: -r text without @HD is written verbatim after @SQ, as stock does"
+          * doctest::test_suite("unit/aln_se")) {
+    // Byte parity with stock for every -r without @HD, including a mid-line "@HD<tab>".
+    const std::string h = header("@RG\tID:x\tDS:@HD\tz\n@CO\tc", nullptr);
+    CHECK(h == "@HD\tVN:1.5\tSO:unsorted\tGO:query\n@SQ\tSN:c1\tLN:600\n@SQ\tSN:c2\tLN:550\n"
+               "@SQ\tSN:c3\tLN:128\n@RG\tID:x\tDS:@HD\tz\n@CO\tc\n");
+}
+
+// What aln_warn_user_hd writes to a stream, at verbosity `verbose`.
+static std::string user_hd_warning(const char *hdr_line, int verbose)
+{
+    char *buf = NULL; size_t len = 0;
+    FILE *fp = open_memstream(&buf, &len);
+    REQUIRE(fp != NULL);
+    const int saved = bwa_verbose;
+    bwa_verbose = verbose;
+    ba::aln_warn_user_hd(fp, hdr_line);
+    bwa_verbose = saved;
+    fclose(fp);
+    std::string s(buf ? buf : "", len);
+    free(buf);
+    return s;
+}
+
+TEST_CASE("aln_se: an @HD line in the -r text is warned about, as stock does"
+          * doctest::test_suite("unit/aln_se")) {
+    const std::string warning = "[W::aln] please don't include @HD with option -r. Continue anyway.\n";
+    // Warned once, wherever the @HD sits and however many there are.
+    CHECK(user_hd_warning("@HD\tVN:1.6", 3) == warning);
+    CHECK(user_hd_warning("@RG\tID:x\n@HD\tVN:1.6\n@HD\tVN:1.5", 3) == warning);
+    CHECK(user_hd_warning("@RG\tID:x\n@HD\tVN:1.6", 2) == warning);
+    // Not without an @HD line: none, a read group only, or "@HD<tab>" in mid-line.
+    CHECK(user_hd_warning(nullptr, 3).empty());
+    CHECK(user_hd_warning("@RG\tID:x\tSM:y", 3).empty());
+    CHECK(user_hd_warning("@RG\tID:x\tDS:@HD\tz", 3).empty());
+    // Stock's gate: silent below verbosity 2.
+    CHECK(user_hd_warning("@HD\tVN:1.6", 1).empty());
 }
 
 TEST_CASE("aln_se: drand48 is seeded once per run, not per batch"

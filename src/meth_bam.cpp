@@ -155,8 +155,13 @@ int meth_hdr_text(kstring_t *out, const bntseq_t *bns, const char *hd_line,
                   const char *hdr_line, const char *orig_idx_hdr_lines,
                   const char *bwa_pg, const char *meth_pg_cl, const char *default_cl)
 {
-    /* @HD — skip the default when the user's -H already supplies one, else
-     * htslib would write two @HD lines (it does not de-dup @HD).
+    /* @HD — the first line, as the SAM spec requires. The user's first @HD
+     * (from -H/-R/-r, wherever it sits in their text) wins over the default
+     * and is written here; every user @HD is left out of the user text appended
+     * below, so exactly one @HD is written. bwa_build_sam_hdr treats a user @HD
+     * the same way (unlike it, a sidecar @HD is not used here). htslib would
+     * move a lone @HD to the front for mem's writer anyway, but a caller that
+     * writes the text verbatim (the planned aln --meth) relies on this order.
      *
      * mem's writer does not consult a compat target, unlike bwa.cpp and
      * bam_writer.cpp: --compat with --meth is a hard error (rejected in
@@ -164,8 +169,15 @@ int meth_hdr_text(kstring_t *out, const bntseq_t *bns, const char *hd_line,
      * and OFF's hd_line IS BWAMEM3_DEFAULT_HD_LINE. A future target that
      * relaxes the --meth exclusion must plumb compat->emit_hd/hd_line through
      * here too. */
-    if (hd_line != NULL && !bwa_hdr_text_has_type(hdr_line, "@HD\t") &&
-        hdr_put_lines(out, hd_line, strlen(hd_line)) < 0) return -1;
+    {
+        size_t user_hd_len = 0;
+        const char *user_hd = bwa_hdr_first_HD(hdr_line, &user_hd_len);
+        if (user_hd != NULL) {
+            if (hdr_put_lines(out, user_hd, user_hd_len) < 0) return -1;
+        } else if (hd_line != NULL && hdr_put_lines(out, hd_line, strlen(hd_line)) < 0) {
+            return -1;
+        }
+    }
 
     /* @SQ directly from the ORIGINAL (un-converted) bns contigs (D3 PR-5: no
      * f/r consolidation — alignments already carry original rids). Each @SQ is
@@ -205,15 +217,14 @@ int meth_hdr_text(kstring_t *out, const bntseq_t *bns, const char *hd_line,
     if (orig_idx_hdr_lines != NULL && orig_idx_hdr_lines[0] != '\0' &&
         meth_append_passthrough_records(orig_idx_hdr_lines, out) < 0) return -1;
 
-    /* User header text (-R/-r read group, -H lines). After @SQ and the
-     * forwarded sidecar records, before the @PG lines, matching the default
-     * writer's precedence (user > index > default) so a read group becomes an
-     * @RG header that the per-record RG:Z tags actually reference. A user -H
-     * that re-supplies @SQ for an already-emitted contig makes htslib reject
-     * the header and the open fail loudly rather than emit duplicate
-     * references. */
-    if (hdr_line != NULL && hdr_line[0] != '\0' &&
-        hdr_put_lines(out, hdr_line, strlen(hdr_line)) < 0) return -1;
+    /* User header text (-R/-r read group, -H lines) without its @HD records
+     * (written first, above) and empty lines. After @SQ and the forwarded
+     * sidecar records, before the @PG lines, matching the default writer's
+     * precedence (user > index > default) so a read group becomes an @RG
+     * header that the per-record RG:Z tags actually reference. A user -H that
+     * re-supplies @SQ for an already-emitted contig makes htslib reject the
+     * header and the open fail loudly rather than emit duplicate references. */
+    if (bwa_hdr_append_without_HD(out, hdr_line) < 0) return -1;
 
     /* The subcommand's own @PG */
     if (bwa_pg != NULL && bwa_pg[0] != '\0' &&

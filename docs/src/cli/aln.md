@@ -33,7 +33,8 @@ bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 
 **Byte-identity.** The tested SAM records and headers matched the output of stock
 bwa 0.7.19 `aln` + `samse`/`sampe`, except for the `@PG` line, which names the
-program that ran. The comparison uses generated single-end and paired-end reads
+program that ran, and an `-r` text that carries an `@HD` line (see **Header**
+under [Notes](#notes)). The comparison uses generated single-end and paired-end reads
 (a phiX plus synthetic-contig reference, a few thousand reads per case) with every
 option below, at one and at four threads (the input, output and index forms are
 checked at one thread). It runs in CI on two GitHub-hosted runners, each at the
@@ -328,8 +329,19 @@ share the sparser copy, coordinate with other users of shared memory, run
   trim) ends the run after that pair is written, with an error and exit 1, as
   `bwa sampe` stops.
 - **No `.sai` files.** Nothing is written between the search and the SAM stage.
-- **Header.** `@HD` (unless the `-r` text has an `@HD` line), `@SQ` (unless
-  the `-r` text has an `@SQ` line), the `-r` line, then `@PG`.
+- **Header.** `@HD`, `@SQ` (unless the `-r` text has an `@SQ` line), the `-r`
+  line, then `@PG`. The `@HD` is the default `@HD VN:1.5 SO:unsorted GO:query`
+  unless the `-r` text has a line that starts `@HD<tab>`: then that line, the
+  first if there are several, is written first in its place, and the `-r` text
+  after `@SQ` omits its `@HD` lines. This is the one header
+  difference from stock: bwa 0.7.19 writes a `-r` `@HD` where it sits in the
+  text, after `@SQ`, but the SAM specification requires `@HD` to be the first
+  line (bwa 0.7.19 moved only its default `@HD` first;
+  [lh3/bwa#442](https://github.com/lh3/bwa/issues/442);
+  [#797](https://github.com/fg-labs/bwa-mem3/pull/797)). The input is still
+  warned about, as in stock: `[W::aln] please don't include @HD with option -r.
+  Continue anyway.` on standard error (stock's text names `-H`, which `aln` does
+  not have). A header with no `-r` `@HD` is the same as stock's.
 
 ---
 
