@@ -40,6 +40,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include <getopt.h>
 #include <cmath>      /* std::isfinite: reject non-finite -I insert-size values */
 #include <sys/stat.h> /* stat(): the pre-load input existence check */
+#include <memory>     /* std::unique_ptr: the --alt-project table */
 #include <errno.h>    /* errno/ERANGE: strtoll validation of the INT options */
 #include <unistd.h>   /* access(): --compat's "you passed a file" diagnostic */
 #ifdef BWA_MEM3_DEBUG_RESCUE_STATS
@@ -62,6 +63,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #include "bwa_hugepages.h"
 #include "fast_reader_bseq.h"
 #include "rescue_band.h"
+#include "alt_lift.h"   /* --alt-project */
 
 /* --cohort-slices / BWA_MEM3_COHORT_SLICES. Named here rather than repeated at
  * each site because the value is needed in four places -- the ramp's shift
@@ -305,6 +307,7 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
 
     /* Mem allocation section for core kernels */
     w.regs = NULL; w.chain_scratch = NULL; w.seed_scratch = NULL;
+    w.alt_oa = NULL;  /* --alt-project primary only; grows with regs */
     w.memo = NULL;   /* [dedup-reads] armed per-chunk by mem_process_seqs when the
                       * controller latches ON; NULL elsewhere (unarmed = no memo) */
     w.emit_prefix = NULL; w.emit_prefix_ctx = NULL;   /* no output streaming
@@ -324,6 +327,12 @@ void worker_alloc(const mem_opt_t *opt, worker_t &w, int32_t nreads, int32_t nth
     if (memSize > 0) {
         w.regs = (mem_alnreg_v *) calloc(memSize, sizeof(mem_alnreg_v));
         xassert(w.regs != NULL, "out of memory: w.regs");
+        /* --alt-project primary: the OA:Z side array, parallel to regs. Not
+         * allocated in any other mode, which pays nothing for it. */
+        if (opt->alt_project_primary) {
+            w.alt_oa = (mem_alnreg_t *) calloc(memSize, sizeof(mem_alnreg_t));
+            xassert(w.alt_oa != NULL, "out of memory: w.alt_oa");
+        }
     }
 
     /* chain_scratch / seed_scratch are PER-THREAD scratch, not per-read arrays.
@@ -488,6 +497,8 @@ void worker_free(worker_t &w, int32_t nthreads)
 
     free(w.chain_scratch);
     free(w.regs);
+    free(w.alt_oa);
+    w.alt_oa = NULL;
     free(w.seed_scratch);
 
     for(int l=0; l<nthreads; l++) {
@@ -1065,6 +1076,17 @@ ktp_data_t *kt_pipeline(void *shared, int step, void *data, mem_opt_t *opt, work
                 err_fatal(__func__, "failed to grow the cohort's regs array to %d reads",
                           regs_want);
             w.regs = regs_tmp;
+            /* --alt-project primary: the OA:Z side array is parallel to regs and
+             * grows with it, preserving the earlier slices' entries the same way.
+             * NULL (never allocated) in every other mode. */
+            if (opt->alt_project_primary) {
+                mem_alnreg_t *oa_tmp = (mem_alnreg_t *) realloc(w.alt_oa,
+                                              (size_t) regs_want * sizeof(mem_alnreg_t));
+                if (oa_tmp == NULL)
+                    err_fatal(__func__, "failed to grow the cohort's OA:Z array to %d reads",
+                              regs_want);
+                w.alt_oa = oa_tmp;
+            }
             w.nreads = regs_want;
         }
 
@@ -1888,7 +1910,8 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                  (run-specific); exclude it when comparing.\n");
     fprintf(stderr, "                  To stay byte-identical, --compat refuses bwa-mem3-only levers that\n");
     fprintf(stderr, "                  change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,\n");
-    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name), --md none\n");
+    fprintf(stderr, "                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name,\n");
+    fprintf(stderr, "                  --alt-project), --md none\n");
     fprintf(stderr, "                  (the targets always write MD), and -u under bwa-mem2 (no XB:Z before\n");
     fprintf(stderr, "                  bwa 0.7.18); --fast and --meth are always refused.\n");
     fprintf(stderr, "                  Override the forceable ones with --compat-allow-divergent.\n");
@@ -2003,6 +2026,38 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 needs -I; see the docs for the remaining caveats). name deviates from\n");
     fprintf(stderr, "                 both upstreams; --compat refuses it (override with\n");
     fprintf(stderr, "                 --compat-allow-divergent) [index]\n");
+    fprintf(stderr, "ALT projection (fg-labs extension):\n");
+    fprintf(stderr, "   --alt-project-min-gap INT\n");
+    fprintf(stderr, "                 refuse a lift unless it beats every different-locus hit covering\n");
+    fprintf(stderr, "                 the same query segment by more than INT times -A. Requires\n");
+    fprintf(stderr, "                 --alt-project; 0 disables this experimental ambiguity guard [0]\n");
+    fprintf(stderr, "   --alt-project MODE\n");
+    fprintf(stderr, "                 let ALT haplotypes decide placement: lift alignments to ALT contigs\n");
+    fprintf(stderr, "                 onto the primary assembly through <idxbase>.alt before pairing and\n");
+    fprintf(stderr, "                 MAPQ, keep one hit per locus, and write the read on the primary\n");
+    fprintf(stderr, "                 assembly (re-aligned there; AS keeps the ALT score). A lifted hit\n");
+    fprintf(stderr, "                 replaces a primary hit at its locus only if it outscores it by more\n");
+    fprintf(stderr, "                 than -A times the primary hit's read bases it leaves out; a tie\n");
+    fprintf(stderr, "                 keeps the primary hit. A hit stays on the ALT if any of it is in a\n");
+    fprintf(stderr, "                 .alt clip, it starts or ends in an ALT insertion, less than half of\n");
+    fprintf(stderr, "                 it is in aligned bases, or its ALT indels move it off its diagonal\n");
+    fprintf(stderr, "                 by more than -w, more than 1022, or more than the re-alignment band\n");
+    fprintf(stderr, "                 (capped by the hit's length: about 35 for 150 bp at the default\n");
+    fprintf(stderr, "                 -A/-O/-E). MODE keep-alt writes such a hit on its ALT, as without\n");
+    fprintf(stderr, "                 projection; MODE primary drops it, so no record, mate, SA or XA\n");
+    fprintf(stderr, "                 names an ALT contig and the header has no ALT @SQ: a read left with\n");
+    fprintf(stderr, "                 no hit is written unmapped, with OA:Z giving its best ALT hit. Needs\n");
+    fprintf(stderr, "                 a .alt sidecar. Incompatible with -j and --meth; --compat refuses it\n");
+    fprintf(stderr, "                 (override with --compat-allow-divergent) [off]\n");
+    fprintf(stderr, "   --alt-project-exclude-bed FILE\n");
+    fprintf(stderr, "                 with --alt-project, skip each .alt alignment whose primary-assembly\n");
+    fprintf(stderr, "                 footprint (the full reference span of its CIGAR: POS through its\n");
+    fprintf(stderr, "                 M/D/N/=/X bases) overlaps any FILE interval by at least 1 bp; a\n");
+    fprintf(stderr, "                 later usable line for that contig may lift\n");
+    fprintf(stderr, "                 instead. FILE is BED (plain or gzip, not stdin) on primary contigs\n");
+    fprintf(stderr, "                 named exactly as in the index. ALT contigs stay ALT. Errors if FILE\n");
+    fprintf(stderr, "                 excludes nothing or every lift, or with a positive\n");
+    fprintf(stderr, "                 --alt-project-min-gap or BWAMEM3_ALT_PROJECT_PAIR_GAP=1 [none]\n");
     fprintf(stderr, "Seed ordering (fg-labs extension):\n");
     fprintf(stderr, "   --seed-order STR\n");
     fprintf(stderr, "                 seed emission order before chaining: off|local-longest [off]\n");
@@ -2101,7 +2156,9 @@ static void mem_close_input_readers(ktp_aux_t &aux, gzFile fp, gzFile fp2,
 
 int main_mem(int argc, char *argv[])
 {
-    int          i, c, ignore_alt = 0, no_mt_io = 0;
+    int          i, c, ignore_alt = 0, no_mt_io = 0, alt_project = 0;
+    bool         alt_project_gap_set = false;
+    const char  *alt_project_exclude_bed = NULL;
     int          fixed_chunk_size          = -1;
     char        *p, *rg_line               = 0, *hdr_line = 0;
     const char  *mode                      = 0;
@@ -2250,6 +2307,9 @@ int main_mem(int argc, char *argv[])
         OPT_SUPP_REP_HARD_CAP,
         OPT_PROPER_PAIR_FROM_EMITTED,
         OPT_TIE_BREAK,
+        OPT_ALT_PROJECT,
+        OPT_ALT_PROJECT_MIN_GAP,
+        OPT_ALT_PROJECT_EXCLUDE_BED,
         OPT_MD,
         OPT_LEGACY_READER,
         OPT_MIN_EXT_LEN,
@@ -2317,6 +2377,9 @@ int main_mem(int argc, char *argv[])
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},
         {"tie-break",                required_argument, 0, OPT_TIE_BREAK},
+        {"alt-project",              required_argument, 0, OPT_ALT_PROJECT},
+        {"alt-project-min-gap",      required_argument, 0, OPT_ALT_PROJECT_MIN_GAP},
+        {"alt-project-exclude-bed",  required_argument, 0, OPT_ALT_PROJECT_EXCLUDE_BED},
         {"md",                       required_argument, 0, OPT_MD},
         {"seed-order",               required_argument, 0, OPT_SEED_ORDER},
         {"compat",                   required_argument, 0, OPT_COMPAT},
@@ -2831,6 +2894,51 @@ int main_mem(int argc, char *argv[])
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
+        else if (c == OPT_ALT_PROJECT) {
+            /* keep-alt: lifted hits move, unliftable ALT hits stay on their ALT;
+             * primary: those are dropped, so the output names no ALT contig. */
+            if (alt_project) {
+                fprintf(stderr, "[E::%s] --alt-project may be supplied only once\n", __func__);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            if (strcmp(optarg, "keep-alt") == 0) alt_project = 1;
+            else if (strcmp(optarg, "primary") == 0) alt_project = 2;
+            else {
+                fprintf(stderr, "[E::%s] --alt-project takes a mode, keep-alt or primary "
+                        "(got '%s'; e.g. --alt-project keep-alt <idxbase> <reads>)\n", __func__, optarg);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+        }
+        else if (c == OPT_ALT_PROJECT_EXCLUDE_BED) {
+            if (alt_project_exclude_bed) {
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed may be supplied only once\n", __func__);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            if (!*optarg || strcmp(optarg, "-") == 0) {
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed requires a named BED file (not stdin)\n", __func__);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            alt_project_exclude_bed = optarg;
+        }
+        else if (c == OPT_ALT_PROJECT_MIN_GAP) {
+            int64_t gap;
+            if (parse_bounded_i64(optarg, 0, INT_MAX, &gap) != 0) {
+                fprintf(stderr, "[E::%s] --alt-project-min-gap expects an integer in [0, %d]\n", __func__, INT_MAX);
+                free(opt);
+                if (out_opened) fclose(aux.fp);
+                return 1;
+            }
+            opt->alt_project_min_gap = (int) gap;
+            alt_project_gap_set = true;
+        }
         else if (c == OPT_TIE_BREAK) {
             if (strcmp(optarg, "index") == 0) opt->tie_break_mode = MEM_TIE_BREAK_INDEX;
             else if (strcmp(optarg, "name") == 0) opt->tie_break_mode = MEM_TIE_BREAK_NAME;
@@ -3150,6 +3258,68 @@ int main_mem(int argc, char *argv[])
             fclose(aux.fp);
         return 1;
     }
+    if (alt_project_gap_set && !alt_project) {
+        fprintf(stderr, "[E::%s] --alt-project-min-gap requires --alt-project\n", __func__);
+        free(opt);
+        if (out_opened) fclose(aux.fp);
+        return 1;
+    }
+    if (alt_project && (ignore_alt || opt->meth_mode)) {
+        fprintf(stderr, "[E::%s] --alt-project cannot be combined with %s\n", __func__,
+                ignore_alt ? "-j (it needs the ALT contigs)" : "--meth");
+        free(opt);
+        if (out_opened)
+            fclose(aux.fp);
+        return 1;
+    }
+    /* --alt-project-exclude-bed: refuse misuse before any index work. The
+     * restricted recipe excludes whole .alt alignments only; the experimental
+     * ambiguity guards are not part of it. */
+    if (alt_project_exclude_bed) {
+        const char *pair_gap = getenv("BWAMEM3_ALT_PROJECT_PAIR_GAP");
+        const char *conflict = NULL;
+        if (!alt_project)
+            conflict = "requires --alt-project";
+        else if (opt->alt_project_min_gap > 0)
+            conflict = "cannot be combined with a positive --alt-project-min-gap (use 0 or omit it)";
+        else if (pair_gap && strcmp(pair_gap, "1") == 0)
+            conflict = "cannot be combined with BWAMEM3_ALT_PROJECT_PAIR_GAP=1 (unset it)";
+        if (!conflict && access(alt_project_exclude_bed, R_OK) != 0) {
+            /* A mistyped path fails here, not after the index load. The loader
+             * still checks its own open/read, which a race could fail. */
+            fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s: cannot read: %s\n", __func__,
+                    alt_project_exclude_bed, strerror(errno));
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
+        if (conflict) {
+            fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s\n", __func__, conflict);
+            free(opt);
+            if (out_opened) fclose(aux.fp);
+            return 1;
+        }
+    }
+    /* --alt-project reads <idxbase>.alt after the index loads (it needs the contig
+     * names); check that the file is there first so a missing sidecar fails fast. */
+    char alt_path[PATH_MAX];
+    /* --alt-project primary: both header writers leave out the ALT @SQ, and the
+     * demoted-read-end count starts from zero for this run. */
+    bwa_hdr_primary_only = alt_project == 2;
+    mem_alt_primary_demoted_reset();
+    if (alt_project) {
+        bns_alt_path(alt_path, sizeof(alt_path), argv[optind]);  /* the path bns_restore reads */
+        if (access(alt_path, R_OK) != 0) {
+            fprintf(stderr, "[E::%s] --alt-project needs %s.alt: %s (it reads the ALT contigs' "
+                    "alignments to the primary assembly from that file, which must sit next to "
+                    "the index; drop --alt-project to align without it)\n", __func__, argv[optind],
+                    strerror(errno));
+            free(opt);
+            if (out_opened)
+                fclose(aux.fp);
+            return 1;
+        }
+    }
 
     /* Resolve --bam-threads (the BGZF deflate pool for --bam output). Done here,
      * after parsing, so n_threads and bam_level are final. Deflate work is fixed
@@ -3356,6 +3526,7 @@ int main_mem(int argc, char *argv[])
             { chunk_cap_set && chunk_cap > 0,         "--chunk-cap" },
             { opt->proper_pair_from_emitted != 0,     "--proper-pair-from-emitted" },
             { opt->tie_break_mode == MEM_TIE_BREAK_NAME, "--tie-break name" },
+            { alt_project != 0,                       "--alt-project" },
             /* Output, not alignment: both targets always write MD. --md short
              * needs no row: without --meth (which --compat refuses) it is full. */
             { opt->md_mode == MEM_MD_NONE,            "--md none" },
@@ -3969,6 +4140,75 @@ int main_mem(int argc, char *argv[])
     if (ignore_alt)
         for (i = 0; i < aux.fmi->idx->bns->n_seqs; ++i)
             aux.fmi->idx->bns->anns[i].is_alt = 0;
+    /* --alt-project: load the full .alt alignments (bns only kept the names).
+     * alt_lift owns the table and frees it when main_mem returns, on every path;
+     * opt->alt_lift only points at it. */
+    std::unique_ptr<alt_lift_t, decltype(&alt_lift_destroy)> alt_lift(nullptr, alt_lift_destroy);
+    if (alt_project) {
+        alt_lift_exclude_stats_t exclude_stats = {0, 0, 0, 0};
+        if (alt_project_exclude_bed) {
+            char exclude_error[512];
+            alt_lift.reset(alt_lift_load_excluded(alt_path, aux.fmi->idx->bns, alt_project_exclude_bed,
+                                                  &exclude_stats, exclude_error, sizeof(exclude_error)));
+            bool refused = true;
+            if (!alt_lift)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed: %s\n", __func__, exclude_error);
+            else if (alt_lift->n_lift == 0 && exclude_stats.excluded == 0)
+                refused = false;   /* no usable line at all: the established error below, ahead of the
+                                  * empty-BED check so that error is not masked */
+            else if (exclude_stats.merged_intervals == 0)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s has no nonempty intervals "
+                        "(%ld zero-width ignored), so it would exclude nothing; omit the option "
+                        "for unrestricted projection\n", __func__, alt_project_exclude_bed,
+                        exclude_stats.zero_width_intervals);
+            else if (alt_lift->n_lift == 0)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s excludes all %ld usable ALT "
+                        "alignments in %s, so nothing would be projected. Omitting --alt-project "
+                        "gives ordinary ALT-aware mapping, not primary-only mapping\n", __func__,
+                        alt_project_exclude_bed, exclude_stats.excluded, alt_path);
+            else if (exclude_stats.excluded == 0)
+                fprintf(stderr, "[E::%s] --alt-project-exclude-bed %s excludes no usable ALT "
+                        "alignment in %s (no primary footprint overlaps its %ld merged interval(s)); "
+                        "omit the option for unrestricted projection\n", __func__,
+                        alt_project_exclude_bed, alt_path, exclude_stats.merged_intervals);
+            else
+                refused = false;
+            if (refused) {
+                delete aux.fmi;
+                free(opt);
+                if (out_opened)
+                    fclose(aux.fp);
+                return 1;
+            }
+        } else {
+            alt_lift.reset(alt_lift_load(alt_path, aux.fmi->idx->bns));
+        }
+        if (!alt_lift || alt_lift->n_lift == 0) {
+            if (!alt_lift)
+                fprintf(stderr, "[E::%s] --alt-project: cannot open %s: %s\n", __func__, alt_path, strerror(errno));
+            else
+                fprintf(stderr, "[E::%s] --alt-project: no ALT contig in %s has a usable alignment "
+                        "(see any [W::alt_lift_load] warnings above for the lines it skipped)\n",
+                        __func__, alt_path);
+            delete aux.fmi;
+            free(opt);
+            if (out_opened)
+                fclose(aux.fp);
+            return 1;
+        }
+        fprintf(stderr, "[M::%s] alt-project: %d ALT contigs lift onto the primary assembly\n", __func__, alt_lift->n_lift);
+        if (alt_project_exclude_bed)
+            fprintf(stderr, "[M::%s] alt-project: exclusion BED %s: input=%ld merged=%ld zero_width=%ld "
+                    "excluded=%ld retained=%d\n", __func__, alt_project_exclude_bed,
+                    exclude_stats.input_intervals, exclude_stats.merged_intervals,
+                    exclude_stats.zero_width_intervals, exclude_stats.excluded, alt_lift->n_lift);
+        opt->alt_lift = alt_lift.get();
+        opt->alt_project_primary = alt_project == 2;
+        const char *pair_gap = getenv("BWAMEM3_ALT_PROJECT_PAIR_GAP");
+        opt->alt_project_pair_gap = pair_gap && strcmp(pair_gap, "1") == 0;
+        if (opt->alt_project_pair_gap)
+            fprintf(stderr, "[M::%s] experimental alt-project: paired confidence gap\n", __func__);
+    }
     /* D3 (--meth, PR-3): --ignore-alt clears is_alt on the SEED bns above, but
      * --meth chaining/extension/output read is_alt from the ORIGINAL bns
      * (aux.meth_orig_bns) — mirror the clear there so --ignore-alt takes effect
@@ -4091,8 +4331,9 @@ int main_mem(int argc, char *argv[])
      * status from the output. We do not rewrite it (it is authoritative --
      * see the function's comment), but we do say so. Not reached under a
      * compat target: idx_hdr_lines is NULL there and @SQ is regenerated from
-     * bns, AH included. */
-    if (idx_hdr_lines != NULL && !opt->meth_mode)
+     * bns, AH included. Skipped under --alt-project primary, whose header
+     * leaves the ALT @SQ out, so their AH does not matter. */
+    if (idx_hdr_lines != NULL && !opt->meth_mode && !bwa_hdr_primary_only)
         bwa_warn_sidecar_missing_AH(aux.fmi->idx->bns, idx_hdr_lines, ref_prefix);
     /* --meth only: the original (pre-c2t) reference's .hdr/.dict sidecar, for
      * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open.
@@ -4521,6 +4762,14 @@ int main_mem(int argc, char *argv[])
      * Reached only after the worker pipeline has joined, so no live thread can
      * touch it; without this the one-shot buffers stay reachable-but-unfreed. */
     mem_readmemo_teardown();
+
+    if (alt_project == 2) {
+        /* Read ends, not reads: a pair with both ends demoted counts 2. */
+        const long n_demoted = mem_alt_primary_demoted();
+        fprintf(stderr, "[M::%s] alt-project primary: %ld read end%s had only unlifted ALT hits "
+                "and %s written unmapped with OA:Z\n", __func__, n_demoted,
+                n_demoted == 1 ? "" : "s", n_demoted == 1 ? "was" : "were");
+    }
 
     /* Display runtime profiling stats */
     tprof[MEM][0] = __rdtsc() - tprof[MEM][0];

@@ -20,7 +20,7 @@ no such knob and so cannot reproduce the output at any setting. `--fast` and `--
 refused — category errors, not divergences: `--fast` is an opaque multi-flag bundle, and no target
 has a bisulfite mode. The rest — `--smem-dedup`, `--adaptive-band`, `--max-extend-chains`,
 `--min-ext-len`, `--extend-tie-frac`, `--rescue-kmer`, `--supp-rep-hard-cap`, `--seed-order`,
-`--chunk-cap`, `--proper-pair-from-emitted` and `--tie-break name` — are a hard error too, as is
+`--chunk-cap`, `--proper-pair-from-emitted`, `--tie-break name` and `--alt-project` — are a hard error too, as is
 the output-only `--md none` (both targets always write `MD`), but they
 can be forced with **`--compat-allow-divergent`**, which keeps the target's output *conventions*
 with a lever engaged (output is then not byte-identical). Shared knobs the upstream also has

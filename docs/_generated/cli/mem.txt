@@ -75,7 +75,8 @@ Options:
                   (run-specific); exclude it when comparing.
                   To stay byte-identical, --compat refuses bwa-mem3-only levers that
                   change alignments/MAPQ (--smem-dedup, --adaptive-band, --max-extend-chains,
-                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name), --md none
+                  --min-ext-len, --rescue-kmer, --seed-order, --tie-break name,
+                  --alt-project), --md none
                   (the targets always write MD), and -u under bwa-mem2 (no XB:Z before
                   bwa 0.7.18); --fast and --meth are always refused.
                   Override the forceable ones with --compat-allow-divergent.
@@ -253,6 +254,38 @@ Tie-breaking (fg-labs extension):
                  needs -I; see the docs for the remaining caveats). name deviates from
                  both upstreams; --compat refuses it (override with
                  --compat-allow-divergent) [index]
+ALT projection (fg-labs extension):
+   --alt-project-min-gap INT
+                 refuse a lift unless it beats every different-locus hit covering
+                 the same query segment by more than INT times -A. Requires
+                 --alt-project; 0 disables this experimental ambiguity guard [0]
+   --alt-project MODE
+                 let ALT haplotypes decide placement: lift alignments to ALT contigs
+                 onto the primary assembly through <idxbase>.alt before pairing and
+                 MAPQ, keep one hit per locus, and write the read on the primary
+                 assembly (re-aligned there; AS keeps the ALT score). A lifted hit
+                 replaces a primary hit at its locus only if it outscores it by more
+                 than -A times the primary hit's read bases it leaves out; a tie
+                 keeps the primary hit. A hit stays on the ALT if any of it is in a
+                 .alt clip, it starts or ends in an ALT insertion, less than half of
+                 it is in aligned bases, or its ALT indels move it off its diagonal
+                 by more than -w, more than 1022, or more than the re-alignment band
+                 (capped by the hit's length: about 35 for 150 bp at the default
+                 -A/-O/-E). MODE keep-alt writes such a hit on its ALT, as without
+                 projection; MODE primary drops it, so no record, mate, SA or XA
+                 names an ALT contig and the header has no ALT @SQ: a read left with
+                 no hit is written unmapped, with OA:Z giving its best ALT hit. Needs
+                 a .alt sidecar. Incompatible with -j and --meth; --compat refuses it
+                 (override with --compat-allow-divergent) [off]
+   --alt-project-exclude-bed FILE
+                 with --alt-project, skip each .alt alignment whose primary-assembly
+                 footprint (the full reference span of its CIGAR: POS through its
+                 M/D/N/=/X bases) overlaps any FILE interval by at least 1 bp; a
+                 later usable line for that contig may lift
+                 instead. FILE is BED (plain or gzip, not stdin) on primary contigs
+                 named exactly as in the index. ALT contigs stay ALT. Errors if FILE
+                 excludes nothing or every lift, or with a positive
+                 --alt-project-min-gap or BWAMEM3_ALT_PROJECT_PAIR_GAP=1 [none]
 Seed ordering (fg-labs extension):
    --seed-order STR
                  seed emission order before chaining: off|local-longest [off]

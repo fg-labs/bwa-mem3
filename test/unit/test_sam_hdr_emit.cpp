@@ -21,8 +21,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <string>
 #include <vector>
+#include <unistd.h>
 #include "doctest/doctest.h"
 #include "bwa.h"
 #include "compat_target.h"
@@ -318,4 +320,119 @@ TEST_CASE("@HD/@SQ: blank records in -H text are dropped, not emitted" * doctest
     CHECK(out.find("\n@RG\tID:b\n") != std::string::npos);
     CHECK(out.find("\n@RG\tID:a\n") < out.find("\n@RG\tID:b\n"));
     CHECK(out.find("\n\n") == std::string::npos);
+}
+
+// --alt-project primary: the header names no ALT contig. bwa_hdr_primary_only is
+// the process-wide switch main_mem sets; the guard restores it so other cases
+// see the default.
+namespace {
+struct PrimaryOnly {
+    PrimaryOnly() { bwa_hdr_primary_only = 1; }
+    ~PrimaryOnly() { bwa_hdr_primary_only = 0; }
+};
+}
+
+TEST_CASE("@SQ primary-only: generation skips ALT contigs and writes no AH" * doctest::test_suite("unit/sam_hdr_emit")) {
+    PrimaryOnly on;
+    const std::string out = render(NULL, NULL, &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@SQ\t") == 1);
+    CHECK(out.find("@SQ\tSN:chr1\tLN:1000\n") != std::string::npos);
+    CHECK(out.find("chr1_alt") == std::string::npos);
+    CHECK(out.find("AH:") == std::string::npos);
+}
+
+TEST_CASE("@SQ primary-only: ALT @SQ supplied by -H are dropped, every other record kept in order" * doctest::test_suite("unit/sam_hdr_emit")) {
+    PrimaryOnly on;
+    const std::string out = render(NULL,
+                                   "@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1_alt\tLN:500\tAH:*\n@RG\tID:r\n@SQ\tSN:chr1_altX\tLN:4",
+                                   &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@SQ\t") == 2);
+    CHECK(out.find("@SQ\tSN:chr1\tLN:1000\n") != std::string::npos);
+    // Whole-token match: a name that only starts like an ALT one is not dropped.
+    CHECK(out.find("@SQ\tSN:chr1_altX\tLN:4\n") != std::string::npos);
+    CHECK(out.find("SN:chr1_alt\t") == std::string::npos);
+    CHECK(out.find("@RG\tID:r\n") != std::string::npos);
+    CHECK(line_index_of(out, "@SQ\tSN:chr1\t") < line_index_of(out, "@SQ\tSN:chr1_altX\t"));
+}
+
+TEST_CASE("@SQ primary-only: ALT @SQ in the index sidecar are dropped" * doctest::test_suite("unit/sam_hdr_emit")) {
+    PrimaryOnly on;
+    const std::string out = render("@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1_alt\tLN:500\n@CO\tsidecar",
+                                   NULL, &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@SQ\t") == 1);
+    CHECK(out.find("@SQ\tSN:chr1\tLN:1000\n") != std::string::npos);
+    CHECK(out.find("chr1_alt") == std::string::npos);
+    CHECK(out.find("@CO\tsidecar\n") != std::string::npos);
+}
+
+TEST_CASE("@SQ primary-only: a -H whose only @SQ is ALT falls back to the sidecar, then generation" * doctest::test_suite("unit/sam_hdr_emit")) {
+    PrimaryOnly on;
+    // Dropping the ALT record leaves -H with no @SQ, so the precedence rules see
+    // none there, exactly as if the user had not supplied it.
+    const std::string out = render(NULL, "@SQ\tSN:chr1_alt\tLN:500", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@SQ\t") == 1);
+    CHECK(out.find("@SQ\tSN:chr1\tLN:1000\n") != std::string::npos);
+}
+
+TEST_CASE("@SQ primary-only off: the same inputs keep their ALT @SQ" * doctest::test_suite("unit/sam_hdr_emit")) {
+    // Guard against the switch leaking: with it at its default, ALT records stay.
+    REQUIRE(bwa_hdr_primary_only == 0);
+    const std::string gen = render(NULL, NULL, &COMPAT_TARGET_OFF);
+    CHECK(gen.find("@SQ\tSN:chr1_alt\tLN:500\tAH:*\n") != std::string::npos);
+    const std::string user = render(NULL, "@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1_alt\tLN:500", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(user, "@SQ\t") == 2);
+}
+
+namespace {
+// What `f` writes to stderr (fd 2), via a temporary file.
+std::string stderr_of(const std::function<void()> &f) {
+    fflush(stderr);
+    FILE *tmp = tmpfile();
+    REQUIRE(tmp != NULL);
+    const int saved = dup(2);
+    REQUIRE(saved >= 0);
+    REQUIRE(dup2(fileno(tmp), 2) >= 0);
+    f();
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    std::string out;
+    rewind(tmp);
+    for (int c; (c = fgetc(tmp)) != EOF;) out += (char) c;
+    fclose(tmp);
+    return out;
+}
+}  // namespace
+
+TEST_CASE("@SQ primary-only: AH on a non-ALT @SQ is kept, with a note" * doctest::test_suite("unit/sam_hdr_emit")) {
+    PrimaryOnly on;
+    const int verbose = bwa_verbose;
+    bwa_verbose = 3;
+    std::string out;
+    const std::string err = stderr_of([&] {
+        out = render(NULL, "@SQ\tSN:chr1\tLN:1000\tAH:*\n@SQ\tSN:chr1_alt\tLN:500\tAH:*", &COMPAT_TARGET_OFF);
+    });
+    // The .alt decides what is ALT: chr1 stays, AH and all; chr1_alt goes.
+    CHECK(count_lines_starting(out, "@SQ\t") == 1);
+    CHECK(out.find("@SQ\tSN:chr1\tLN:1000\tAH:*\n") != std::string::npos);
+    CHECK(err.find("kept AH on 1 @SQ record supplied by -H") != std::string::npos);
+    // Same from the sidecar; and no note when no kept @SQ carries AH.
+    const std::string err_sc = stderr_of([&] { render("@SQ\tSN:chr1\tLN:1000\tAH:chr2", NULL, &COMPAT_TARGET_OFF); });
+    CHECK(err_sc.find("kept AH on 1 @SQ record") != std::string::npos);
+    const std::string err_none = stderr_of([&] {
+        render(NULL, "@SQ\tSN:chr1\tLN:1000\n@SQ\tSN:chr1_alt\tLN:500\tAH:*", &COMPAT_TARGET_OFF);
+    });
+    CHECK(err_none.find("kept AH") == std::string::npos);
+    bwa_verbose = verbose;
+}
+
+TEST_CASE("@SQ primary-only off: AH on a non-ALT @SQ gets no note" * doctest::test_suite("unit/sam_hdr_emit")) {
+    REQUIRE(bwa_hdr_primary_only == 0);
+    const int verbose = bwa_verbose;
+    bwa_verbose = 3;
+    std::string out;
+    const std::string err = stderr_of([&] { out = render(NULL, "@SQ\tSN:chr1\tLN:1000\tAH:*", &COMPAT_TARGET_OFF); });
+    CHECK(out.find("@SQ\tSN:chr1\tLN:1000\tAH:*\n") != std::string::npos);
+    CHECK(err.find("kept AH") == std::string::npos);
+    bwa_verbose = verbose;
 }
