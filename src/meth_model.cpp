@@ -2,19 +2,37 @@
 
 #include "meth_model.h"
 
-void meth_model_fill_mats(mem_opt_t *o)
+#include <string.h>
+
+void meth_fill_mats(const int8_t *mat, int a, const meth_opt_t *m,
+                    int8_t ot[25], int8_t ob[25], int8_t ot7[49], int8_t ob7[49])
 {
+    memcpy(ot, mat, 25);
+    memcpy(ob, mat, 25);
+    /* Conversion cell: +a (rewarded) for COLLAPSED/GENOMIC, 0 (tolerated but not
+     * rewarded) for NEUTRAL. See enum mem_meth_scoring for the rationale. */
+    int8_t conv = (m->meth_scoring == MEM_METH_SCORING_NEUTRAL) ? 0 : (int8_t)a;
+    ot[1 * 5 + 3] = conv;   /* OT: ref C / read T (C→T conversion)   */
+    ob[2 * 5 + 0] = conv;   /* OB: ref G / read A (G→A conversion)   */
+    if (m->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
+        /* bwameth-compatible: free the MIRROR cell too so C/T (and G/A) are
+         * mutually interchangeable (collapsed 3-letter space). Two freed cells ⇒
+         * bandedSWA general path, not the rank-1 fast path. Loses variant vs.
+         * conversion discrimination; reproduces bwameth placement. */
+        ot[3 * 5 + 1] = (int8_t)a;   /* OT: ref T / read C → match */
+        ob[0 * 5 + 2] = (int8_t)a;   /* OB: ref A / read G → match */
+    }
+    /* The 7-code matrices: rows and columns 0..4 copy mat; rows/columns 5/6
+     * copy those of C/G; the same conversion value on the CpG rows only. */
     for (int r = 0; r < METH_M; ++r) {
         for (int c = 0; c < METH_M; ++c) {
-            int8_t v = o->mat[meth_code_base((uint8_t)r) * 5 + meth_code_base((uint8_t)c)];
-            o->mat7_ot[r * METH_M + c] = v;
-            o->mat7_ob[r * METH_M + c] = v;
+            int8_t v = mat[meth_code_base((uint8_t)r) * 5 + meth_code_base((uint8_t)c)];
+            ot7[r * METH_M + c] = v;
+            ob7[r * METH_M + c] = v;
         }
     }
-    /* Same conversion value as mem_opt_fill_meth_mat, on the CpG rows only. */
-    int8_t conv = (o->meth_scoring == MEM_METH_SCORING_NEUTRAL) ? 0 : (int8_t)o->a;
-    o->mat7_ot[METH_C5 * METH_M + METH_T] = conv;   /* OT: ref CpG C / read T */
-    o->mat7_ob[METH_G6 * METH_M + METH_A] = conv;   /* OB: ref CpG G / read A */
+    ot7[METH_C5 * METH_M + METH_T] = conv;   /* OT: ref CpG C / read T */
+    ob7[METH_G6 * METH_M + METH_A] = conv;   /* OB: ref CpG G / read A */
 }
 
 void meth_unlabel(uint8_t *win, int64_t len)

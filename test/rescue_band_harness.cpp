@@ -518,8 +518,8 @@ static int batch_matrix(const rescue_prune_params &p, int kind, int hyp, int8_t 
     o->b = p.b;
     bwa_fill_scmat(o->a, o->b, o->mat);
     if (kind != METH_NONE) {
-        o->meth_mode = 1;
-        o->meth_scoring = kind == METH_GENOMIC   ? MEM_METH_SCORING_GENOMIC
+        o->meth.meth_mode = 1;
+        o->meth.meth_scoring = kind == METH_GENOMIC   ? MEM_METH_SCORING_GENOMIC
                           : kind == METH_NEUTRAL ? MEM_METH_SCORING_NEUTRAL
                                                  : MEM_METH_SCORING_COLLAPSED;
         mem_opt_fill_meth_mat(o);

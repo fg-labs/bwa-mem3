@@ -366,7 +366,7 @@ static int rescue_prune_max_hits(const mem_opt_t *opt, bool band_parents)
 {
     static const int env = rescue_env_int("BWA3_RESCUE_PRUNE_MAX_HITS", -1);
     if (env >= 0) return env;
-    return rescue_prune_max_hits_default(rescue_band_enabled(), opt->meth_mode && !band_parents);
+    return rescue_prune_max_hits_default(rescue_band_enabled(), opt->meth.meth_mode && !band_parents);
 }
 /* Whether the exact rescue shortcuts are built and enabled at all: they need a SIMD filter (NEON on
  * aarch64, its SSE4.1 / SSSE3 port on the AVX2 and AVX-512 builds; RESCUE_PRUNE_HAVE_SIMD), since
@@ -553,7 +553,7 @@ static rb_scoring rescue_band_scoring_for(const mem_opt_t *opt)
  * or not the pruning lemma does, so -B 3 or -O 6,2 -E 1 band pass 1 too). */
 static bool rescue_band_runs(const mem_opt_t *opt)
 {
-    return rescue_prune_on() && !opt->meth_mode && rescue_band_scoring_for(opt).valid();
+    return rescue_prune_on() && !opt->meth.meth_mode && rescue_band_scoring_for(opt).valid();
 }
 
 /* Whether --meth filters under the relation-expanded filter (rescue_prune_params::set_meth_rel)
@@ -565,7 +565,7 @@ static bool rescue_band_runs(const mem_opt_t *opt)
 static bool rescue_meth_rel(const mem_opt_t *opt)
 {
     static const int mode = rescue_env_int("BWA3_RESCUE_PRUNE_REL", 1);
-    if (!opt->meth_mode || mode == 0 || (mode == 1 && opt->meth_chem != METH_CHEM_TAPS)) return false;
+    if (!opt->meth.meth_mode || mode == 0 || (mode == 1 && opt->meth.meth_chem != METH_CHEM_TAPS)) return false;
     /* --meth-context cpg frees the conversion only at a CpG, which the
      * relation (a 5-code matrix property) does not model. */
     if (meth_cpg_on(opt)) return false;
@@ -595,8 +595,8 @@ static bool rescue_prune_runs(const mem_opt_t *opt, const rescue_prune_params &p
      * gate refuses every cpg run anyway: cpg excludes EM-seq and the relation.) */
     if (meth_cpg_on(opt)) return false;
     return rescue_prune_on() && p.valid
-        && rescue_prune_cost_ok(p, opt->meth_mode != 0,
-                                opt->meth_chem == METH_CHEM_EMSEQ || rescue_meth_rel(opt), avx512);
+        && rescue_prune_cost_ok(p, opt->meth.meth_mode != 0,
+                                opt->meth.meth_chem == METH_CHEM_EMSEQ || rescue_meth_rel(opt), avx512);
 }
 
 /* --meth banding (both passes, the group's matrix) where --meth pruning is off or filters under the
@@ -664,8 +664,8 @@ struct rescue_run_t {
 static void rescue_run_key(const mem_opt_t *opt, int key[rescue_run_t::RESCUE_RUN_KEYS])
 {
     key[0] = opt->a; key[1] = opt->b; key[2] = opt->o_del; key[3] = opt->e_del; key[4] = opt->o_ins;
-    key[5] = opt->e_ins; key[6] = opt->min_seed_len; key[7] = opt->meth_mode; key[8] = opt->meth_chem;
-    key[9] = opt->rescue_kmer; key[10] = opt->meth_context;
+    key[5] = opt->e_ins; key[6] = opt->min_seed_len; key[7] = opt->meth.meth_mode; key[8] = opt->meth.meth_chem;
+    key[9] = opt->rescue_kmer; key[10] = opt->meth.meth_context;
 }
 static void rescue_run_derive(rescue_run_t &r, const mem_opt_t *opt, const int key[rescue_run_t::RESCUE_RUN_KEYS])
 {
@@ -678,13 +678,13 @@ static void rescue_run_derive(rescue_run_t &r, const mem_opt_t *opt, const int k
     r.record_narrow = opt->rescue_kmer || r.prunes;
     r.meth_rel = rescue_meth_rel(opt);
     r.band_parents = r.prunes && rescue_band_enabled()
-                     && (!opt->meth_mode || rescue_band_meth_on(opt, r.prunes));
+                     && (!opt->meth.meth_mode || rescue_band_meth_on(opt, r.prunes));
     r.band_sc = rb_scoring::from(r.pp);
     r.band_runs = rescue_band_runs(opt);
     r.max_hits = r.prunes ? rescue_prune_max_hits(opt, r.band_parents) : 0;
     r.pp_ot = r.pp; r.pp_ob = r.pp;
     if (r.meth_rel) { r.pp_ot.set_meth_rel(1); r.pp_ob.set_meth_rel(0); }
-    else if (opt->meth_mode) { r.pp_ot.set_meth(1); r.pp_ob.set_meth(0); }
+    else if (opt->meth.meth_mode) { r.pp_ot.set_meth(1); r.pp_ob.set_meth(0); }
 }
 /* The decisions for opt: this thread's copy, derived when opt or the fields they read change (one
  * run has one mem_opt_t, so once per thread). _pre and _post may run on different threads for the
@@ -695,7 +695,7 @@ static const rescue_run_t &rescue_run(const mem_opt_t *opt)
     int key[rescue_run_t::RESCUE_RUN_KEYS];
     rescue_run_key(opt, key);
     if (r.opt != opt || memcmp(key, r.key, sizeof key) != 0
-        || (opt->meth_mode && (memcmp(r.mat_ot, opt->mat_ot, sizeof r.mat_ot) != 0
+        || (opt->meth.meth_mode && (memcmp(r.mat_ot, opt->mat_ot, sizeof r.mat_ot) != 0
                                || memcmp(r.mat_ob, opt->mat_ob, sizeof r.mat_ob) != 0)))
         rescue_run_derive(r, opt, key);
     return r;
@@ -1391,10 +1391,10 @@ int mem_sam_pe_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 }
                 int64_t val = mem_matesw_batch_pre(opt, bns, pac, pes, &b[i].a[j],
                                                    s[!i].l_seq, (uint8_t*)s[!i].seq,
-                                                   opt->meth_mode ? s[!i].meth_orig_seq : NULL,
+                                                   opt->meth.meth_mode ? s[!i].meth_orig_seq : NULL,
                                                    &a[!i], mmc, pcnt, gcnt,
                                                    maxRefLen, maxQerLen, tid,
-                                                   opt->meth_mode ? i : -1, known_skip);
+                                                   opt->meth.meth_mode ? i : -1, known_skip);
 
                 pcnt = val;
                 gcnt += 4;
@@ -1417,7 +1417,7 @@ static inline void revseq(int l, uint8_t *s)
 /* Task 5: Read the BWAMEM3_METH_BATCHED_RESCUE escape hatch once. Default ON
  * (batched meth mate rescue). Set to "0" to force the legacy scalar ksw_align2
  * rescue path (used by the regression to A/B the same binary). Only consulted
- * under opt->meth_mode; the non-meth path is unaffected. */
+ * under opt->meth.meth_mode; the non-meth path is unaffected. */
 static bool meth_batched_rescue_enabled()
 {
     static const bool enabled = []() {
@@ -1618,7 +1618,7 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
      * ksw_align2 score with the asymmetric matrix. Non-meth and the env-OFF
      * escape hatch fall through to the single-object path below, byte-identical
      * to the pre-Task-5 code. */
-    if (opt->meth_mode && meth_batched_rescue_enabled()
+    if (opt->meth.meth_mode && meth_batched_rescue_enabled()
             && meth_scoring_batched_expressible(opt)) {
         // Scratch slice (Right128 is free here; sort_classify only used it as
         // a transient and the final layout lives in Left128). Sized
@@ -1819,13 +1819,13 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                  * (set in mem_matesw_batch_pre), and the scalar index==-1 fallback
                  * derives its matrix from the mate's own read# chemistry
                  * (mate_meth_ot ^ is_rev). So rmat is dead code under --meth. */
-                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
-                const int8_t *rmat    = opt->meth_mode
+                const char  *ms_orig = opt->meth.meth_mode ? s[!i].meth_orig_seq : NULL;
+                const int8_t *rmat    = opt->meth.meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
                 val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc, tid,
-                                                ms_orig, rmat, opt->meth_mode ? i : -1);
+                                                ms_orig, rmat, opt->meth.meth_mode ? i : -1);
                 n += val;
                 swcount += val;
                 gcnt += 4;
@@ -1863,8 +1863,8 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             mem_rescue_pushed_rb_t pushed_rb;
             for (j = 0; j < b[i].n && j < opt->max_matesw; ++j) {
                 /* D3 (--meth, PR-6, B3): see MATE_SORT branch above. */
-                const char  *ms_orig = opt->meth_mode ? s[!i].meth_orig_seq : NULL;
-                const int8_t *rmat    = opt->meth_mode
+                const char  *ms_orig = opt->meth.meth_mode ? s[!i].meth_orig_seq : NULL;
+                const int8_t *rmat    = opt->meth.meth_mode
                     ? mem_opt_meth_mat(opt, !b[i].a[j].meth_hypothesis) : NULL;
                 int known_skip = ma_unchanged && (gcnt >> 2) < mmc->rescue_skip_set_cap[tid]
                                ? (int)mmc->rescue_skip_set[tid][gcnt >> 2] : -1;
@@ -1878,7 +1878,7 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 int val = mem_matesw_batch_post(opt, bns, pac, pes, &b[i].a[j],
                                                 s[!i].l_seq, (uint8_t*)s[!i].seq,
                                                 &a[!i], myaln, gcnt, gar, mmc, tid,
-                                                ms_orig, rmat, opt->meth_mode ? i : -1,
+                                                ms_orig, rmat, opt->meth.meth_mode ? i : -1,
                                                 &ma_dedup_state, known_skip, &pushed_rb);
                 if (post_rb.live) {
                     if (!post_rb.update(n_before, a[!i].n, pushed_rb) && st)
@@ -1949,7 +1949,7 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
          * either end deflates confidence even when one paired alignment looks
          * clean. Meth-gated so non-meth PE MAPQ is byte-identical. */
         int64_t qdiff = (int64_t)o - subo_wide;
-        if (opt->meth_mode) {
+        if (opt->meth.meth_mode) {
             int se2_0 = (n_pri[0] > 1) ? a[0].a[1].score : 0;
             int se2_1 = (n_pri[1] > 1) ? a[1].a[1].score : 0;
             int64_t cap = (int64_t)o + 4LL * opt->a - ((int64_t)se2_0 + se2_1);
@@ -2452,7 +2452,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
              * below; the k-mer anchor scan and --rescue-kmer narrowing before that read
              * the plain window, and rescue pruning never runs under cpg
              * (rescue_prune_runs). */
-            if (opt->meth_mode && (!meth_batched_rescue_enabled()
+            if (opt->meth.meth_mode && (!meth_batched_rescue_enabled()
                     || !meth_scoring_batched_expressible(opt))) {
                 // Escape hatch (env=0) or freed-less tier: keep the legacy scalar
                 // rescue. Leave gar = -1 so mem_matesw_batch_post re-runs this
@@ -2467,7 +2467,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
             int narrow_ob = 0;
             if (opt->rescue_kmer) {
                 int collapse = 0;
-                if (opt->meth_mode) { int hyp = (mate_meth_ot ^ is_rev) & 1; collapse = hyp ? 1 : 2; }
+                if (opt->meth.meth_mode) { int hyp = (mate_meth_ot ^ is_rev) & 1; collapse = hyp ? 1 : 2; }
                 matesw_anchor_t anc = matesw_kmer_anchor(opt, ref, (int)(re - rb),
                                                          ms, l_ms, is_rev, collapse);
                 const bool declined = matesw_anchor_declines_rescue(opt, anc);
@@ -2522,7 +2522,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                  * parameter set with the relation (rescue_prune_params::set_meth_rel) or the
                  * conversion (set_meth) the filter applies (run.pp_ot / pp_ob); only the batched meth
                  * rescue reaches here, since the scalar escape hatch returns earlier. */
-                const rescue_prune_params &pp = !opt->meth_mode ? run.pp
+                const rescue_prune_params &pp = !opt->meth.meth_mode ? run.pp
                                               : ((mate_meth_ot ^ is_rev) & 1) ? run.pp_ot : run.pp_ob;
                 int hb, he;
                 rescue_prune_view view;
@@ -2543,7 +2543,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                 if (view.keyed && kind != RESCUE_PRUNE_B1 && rescue_repeat_enabled()) {
                     const int ob = kind == RESCUE_PRUNE_B2 ? hb : 0;
                     const int l1 = kind == RESCUE_PRUNE_B2 ? he - hb + 1 : (int)(re - rb);
-                    const int8_t hyp = opt->meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
+                    const int8_t hyp = opt->meth.meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
                     for (int c = 0; c < RECENT && reuse < 0; c++) {
                         const int32_t j = recent[c].regid;
                         if (recent[c].key != view.key || j < 0 || j >= pcnt) continue;
@@ -2746,8 +2746,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                  * the OT/OB partition requires; the assert (and the runtime guard
                  * in mem_sam_pe_batch) documents that invariant so a future
                  * violation fails loud instead of silently dropping a pair. */
-                sp.meth_hyp = opt->meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
-                assert(!opt->meth_mode || sp.meth_hyp == 0 || sp.meth_hyp == 1);
+                sp.meth_hyp = opt->meth.meth_mode ? (int8_t)((mate_meth_ot ^ is_rev) & 1) : (int8_t)-1;
+                assert(!opt->meth.meth_mode || sp.meth_hyp == 0 || sp.meth_hyp == 1);
 
                 /* gar[gcnt+r] points at this rescue's single enqueued regid. */
                 if (hi == 0) gar[gcnt + r] = pcnt;
@@ -2938,7 +2938,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 uint8_t *ref_rw = (uint8_t*) malloc((size_t)ref_len);
                 xassert(ref_rw != NULL, "out of memory: ref_rw");
                 memcpy(ref_rw, ref, (size_t)ref_len);
-                if (opt->meth_mode && mate_meth_ot >= 0) {
+                if (opt->meth.meth_mode && mate_meth_ot >= 0) {
                     /* D3: score the rescued mate under ITS OWN read-number chemistry
                      * (mate_meth_ot) flipped by the rescue strand (this path RC's
                      * the READ). One SW pass with the correct matrix — the matrix
@@ -2963,7 +2963,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 }
                 free(ref_rw);
             }
-            else if (opt->meth_mode && mate_meth_ot >= 0) {
+            else if (opt->meth.meth_mode && mate_meth_ot >= 0) {
                 /* Single-hypothesis batched rescue: mem_matesw_batch_pre enqueued
                  * ONE pair at `index`, scored by the kswv OT/OB partition under the
                  * mate's read# chemistry (XOR rescue strand). Read it and note the

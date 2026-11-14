@@ -267,7 +267,7 @@ TEST_CASE("mem_pair_resolve_batch_post: high pair scores have defined MAPQ arith
         CAPTURE(c.s0); CAPTURE(c.s1); CAPTURE(c.penalty); CAPTURE(meth); CAPTURE(legacy);
         PairFixture f;
         f.g.o->flag |= MEM_F_NO_RESCUE;
-        f.g.o->meth_mode = meth;
+        f.g.o->meth.meth_mode = meth;
         f.g.o->pen_unpaired = c.penalty;
         if (legacy) f.g.o->mapQ_coef_len = 0;
         mem_alnreg_t regs[2] = { region(1000, c.s0), region(1300, c.s1) };
@@ -300,7 +300,7 @@ TEST_CASE("mem_pair_resolve_batch_post: high pair scores have defined MAPQ arith
 TEST_CASE("mem_pair_resolve_batch_post: meth second-best sum stays wide") {
     PairFixture f;
     f.g.o->flag |= MEM_F_NO_RESCUE;
-    f.g.o->meth_mode = 1;
+    f.g.o->meth.meth_mode = 1;
     f.g.o->pen_unpaired = 100000000;
     f.g.o->mapQ_coef_len = 0;
     mem_alnreg_t r0[2] = { region(1000, 1100000000), region(10000, 1099999990) };
@@ -393,7 +393,7 @@ TEST_CASE("mem_pair_resolve_batch_post: tandem caps cannot produce negative MAPQ
         CAPTURE(meth); CAPTURE(capped); CAPTURE(legacy);
         PairFixture f;
         f.g.o->flag |= MEM_F_NO_RESCUE;
-        f.g.o->meth_mode = meth;
+        f.g.o->meth.meth_mode = meth;
         if (legacy) f.g.o->mapQ_coef_len = 0;
         mem_alnreg_t regs[2] = { region(1000, 100), region(1300, 100) };
         mem_alnreg_v a[2] = {};

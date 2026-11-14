@@ -716,6 +716,15 @@ jobs:
       - name: Verify binary
         run: ./bwa-mem3 version
 
+      # The aln disassembly gate (test/tools/disasm_identity.sh) is a manual
+      # pre-release comparison of two builds, but its negative controls need
+      # only this one: a gate that stopped detecting differences, or failing
+      # on bad inputs, fails here. One row: the no-LTO AVX2 build, where the
+      # batch and group drivers the gate requires are not inlined away.
+      - name: aln disassembly gate negative controls
+        if: matrix.artifact_slug == 'linux-x86_64-avx2-no-mimalloc'
+        run: bash test/tools/disasm_identity_test.sh ./bwa-mem3
+
       - name: Verify LTO mode
         # The default build links bwa-mem3 with LTO only when the toolchain can
         # (Makefile LTO block), and otherwise builds without it after a NOTE --

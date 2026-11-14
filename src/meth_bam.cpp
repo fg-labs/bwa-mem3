@@ -141,6 +141,98 @@ static int meth_append_passthrough_records(const char *hdr_text, kstring_t *out)
     return 0;
 }
 
+/* Appends `line` (one or more header lines, with or without a final
+ * newline) to `out`, ending it with a newline. */
+static int hdr_put_lines(kstring_t *out, const char *line, size_t len)
+{
+    if (len == 0) return 0;
+    if (kputsn(line, (int)len, out) < 0) return -1;
+    if (line[len - 1] != '\n' && kputc('\n', out) < 0) return -1;
+    return 0;
+}
+
+int meth_hdr_text(kstring_t *out, const bntseq_t *bns, const char *hd_line,
+                  const char *hdr_line, const char *orig_idx_hdr_lines,
+                  const char *bwa_pg, const char *meth_pg_cl, const char *default_cl)
+{
+    /* @HD — skip the default when the user's -H already supplies one, else
+     * htslib would write two @HD lines (it does not de-dup @HD).
+     *
+     * mem's writer does not consult a compat target, unlike bwa.cpp and
+     * bam_writer.cpp: --compat with --meth is a hard error (rejected in
+     * main_mem's option validation), so only COMPAT_TARGET_OFF can reach here,
+     * and OFF's hd_line IS BWAMEM3_DEFAULT_HD_LINE. A future target that
+     * relaxes the --meth exclusion must plumb compat->emit_hd/hd_line through
+     * here too. */
+    if (hd_line != NULL && !bwa_hdr_text_has_type(hdr_line, "@HD\t") &&
+        hdr_put_lines(out, hd_line, strlen(hd_line)) < 0) return -1;
+
+    /* @SQ directly from the ORIGINAL (un-converted) bns contigs (D3 PR-5: no
+     * f/r consolidation — alignments already carry original rids). Each @SQ is
+     * enriched by SN with the original reference's identity tags (M5/UR/AS/SP)
+     * from its .hdr/.dict sidecar when available; the extra tags are appended
+     * verbatim, gated on a matching SN+LN.
+     *
+     * AH:* on ALT contigs is appended from the ORIGINAL bns, matching both
+     * upstreams' generated @SQ (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and
+     * our SAM text path. It cannot collide with the sidecar enrichment:
+     * meth_append_sq_extra_tags copies only M5/UR/AS/SP, never AH. Appended
+     * BEFORE those tags so the line reads SN, LN, AH, then identity tags --
+     * the order bwa emits. */
+    {
+        kstring_t sq = {0, 0, NULL};
+        for (int i = 0; i < bns->n_seqs; ++i) {
+            sq.l = 0;                    /* reuse the buffer across contigs */
+            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0 ||
+                meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
+                                          bns->anns[i].len, &sq) < 0 ||
+                hdr_put_lines(out, sq.s, sq.l) < 0) {
+                free(sq.s);
+                return -1;
+            }
+        }
+        free(sq.s);
+    }
+
+    /* Original reference's non-@HD/@SQ sidecar records (@CO/@PG/@RG),
+     * forwarded after @SQ and before the user header — mirroring the index
+     * tier of bam_writer_open's precedence (index > default, below user). Its
+     * @SQ is consumed into the enriched @SQ block above and its @HD is the
+     * writer's own, so both are dropped here. `orig_idx_hdr_lines` is loaded
+     * from the *original* (pre-c2t) reference prefix; the c2t index's own
+     * sidecar (which describes the doubled f/r converted contigs) is never
+     * consulted. */
+    if (orig_idx_hdr_lines != NULL && orig_idx_hdr_lines[0] != '\0' &&
+        meth_append_passthrough_records(orig_idx_hdr_lines, out) < 0) return -1;
+
+    /* User header text (-R/-r read group, -H lines). After @SQ and the
+     * forwarded sidecar records, before the @PG lines, matching the default
+     * writer's precedence (user > index > default) so a read group becomes an
+     * @RG header that the per-record RG:Z tags actually reference. A user -H
+     * that re-supplies @SQ for an already-emitted contig makes htslib reject
+     * the header and the open fail loudly rather than emit duplicate
+     * references. */
+    if (hdr_line != NULL && hdr_line[0] != '\0' &&
+        hdr_put_lines(out, hdr_line, strlen(hdr_line)) < 0) return -1;
+
+    /* The subcommand's own @PG */
+    if (bwa_pg != NULL && bwa_pg[0] != '\0' &&
+        hdr_put_lines(out, bwa_pg, strlen(bwa_pg)) < 0) return -1;
+
+    /* bwa-mem3-meth @PG — grow as needed so very long CLs aren't truncated. */
+    {
+        const char *cl_in = (meth_pg_cl && meth_pg_cl[0]) ? meth_pg_cl : default_cl;
+        char *cl_copy = strdup(cl_in);
+        if (cl_copy == NULL) return -1;
+        sanitize_cl(cl_copy);
+        int rc = ksprintf(out, "@PG\tID:bwa-mem3-meth\tPN:bwa-mem3-meth\tVN:%s-meth\tCL:%s\n",
+                          PACKAGE_VERSION, cl_copy);
+        free(cl_copy);
+        if (rc < 0) return -1;
+    }
+    return 0;
+}
+
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         const bntseq_t *bns,
                                         const char *bwa_pg,
@@ -181,100 +273,12 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
     w->hdr = sam_hdr_init();
     if (w->hdr == NULL) { hts_close(w->fp); free(w); return NULL; }
 
-    /* @HD — skip the default when the user's -H already supplies one, else
-     * htslib would write two @HD lines (it does not de-dup @HD).
-     *
-     * This writer does not consult a compat target, unlike bwa.cpp and
-     * bam_writer.cpp: --compat with --meth is a hard error (rejected in
-     * main_mem's option validation), so only COMPAT_TARGET_OFF can reach here,
-     * and OFF's hd_line IS BWAMEM3_DEFAULT_HD_LINE. A future target that
-     * relaxes the --meth exclusion must plumb compat->emit_hd/hd_line through
-     * here too. */
-    if (!bwa_hdr_text_has_type(hdr_line, "@HD\t") &&
-        sam_hdr_add_lines(w->hdr, BWAMEM3_DEFAULT_HD_LINE, 0) < 0) goto fail;
-
-    /* @SQ directly from the ORIGINAL (un-converted) bns contigs (D3 PR-5: no
-     * f/r consolidation — alignments already carry original rids). Each @SQ is
-     * enriched by SN with the original reference's identity tags (M5/UR/AS/SP)
-     * from its .hdr/.dict sidecar when available; the extra tags are appended
-     * verbatim, gated on a matching SN+LN.
-     *
-     * AH:* on ALT contigs is appended from the ORIGINAL bns, matching both
-     * upstreams' generated @SQ (bwa/bwa.c:432, bwa-mem2/src/bwa.cpp:538) and
-     * our SAM text path; this block was written without it and
-     * dropped ALT status for every ALT-aware reference. It cannot collide with
-     * the sidecar enrichment: meth_append_sq_extra_tags copies only
-     * M5/UR/AS/SP, never AH. Appended BEFORE those tags so the line reads
-     * SN, LN, AH, then identity tags -- the order bwa emits. */
     {
-        kstring_t sq = {0, 0, NULL};
-        for (int i = 0; i < bns->n_seqs; ++i) {
-            sq.l = 0;                    /* reuse the buffer across contigs */
-            if (bwa_format_sq_line(&sq, &bns->anns[i]) < 0) { free(sq.s); goto fail; }
-            if (meth_append_sq_extra_tags(orig_idx_hdr_lines, bns->anns[i].name,
-                                          bns->anns[i].len, &sq) < 0) {
-                free(sq.s);
-                goto fail;
-            }
-            /* No `sq.s != NULL` guard: that check existed because the old
-             * inline ksprintf could leave sq.s NULL with no way to say so.
-             * bwa_format_sq_line reports that as -1 above, and a failed
-             * enrichment append is reported as -1 too -- so by here sq holds a
-             * complete record. bam_writer.cpp's copy of this loop never had it. */
-            int rc = sam_hdr_add_lines(w->hdr, sq.s, sq.l);
-            if (rc < 0) { free(sq.s); goto fail; }
-        }
-        free(sq.s);
-    }
-
-    /* Original reference's non-@HD/@SQ sidecar records (@CO/@PG/@RG),
-     * forwarded after @SQ and before the user header — mirroring the index
-     * tier of bam_writer_open's precedence (index > default, below user). Its
-     * @SQ is consumed into the enriched @SQ block above and its @HD
-     * is the writer's own, so both are dropped here. `orig_idx_hdr_lines` is
-     * loaded from the *original* (pre-c2t) reference prefix by main_mem; the
-     * c2t index's own sidecar (which describes the doubled f/r converted
-     * contigs) is never consulted. */
-    if (orig_idx_hdr_lines != NULL && orig_idx_hdr_lines[0] != '\0') {
-        kstring_t pt = {0, 0, NULL};
-        if (meth_append_passthrough_records(orig_idx_hdr_lines, &pt) < 0) {
-            free(pt.s);
-            goto fail;
-        }
-        int rc = (pt.l > 0) ? sam_hdr_add_lines(w->hdr, pt.s, pt.l) : 0;
-        free(pt.s);
-        if (rc < 0) goto fail;
-    }
-
-    /* User header text (-R read group, -H lines). Emitted after @SQ and the
-     * forwarded sidecar records, before the @PG lines, matching the default
-     * writer's precedence (user > index > default) so a -R read group becomes
-     * an @RG header that the per-record RG:Z tags (stamped from bwa_rg_id
-     * below) actually reference. The @SQ block above is authoritative
-     * for --meth, so a user -H that re-supplies @SQ for an already-emitted
-     * contig will make htslib reject the add and the open fails loudly rather
-     * than emitting duplicate references. */
-    if (hdr_line != NULL && hdr_line[0] != '\0' &&
-        sam_hdr_add_lines(w->hdr, hdr_line, 0) < 0) goto fail;
-
-    /* Original bwa-mem3 @PG */
-    if (bwa_pg != NULL && bwa_pg[0] != '\0') {
-        if (sam_hdr_add_lines(w->hdr, bwa_pg, 0) < 0) goto fail;
-    }
-
-    /* bwa-mem3-meth @PG — grow as needed so very long CLs aren't truncated. */
-    {
-        const char *cl_in = (meth_pg_cl && meth_pg_cl[0]) ? meth_pg_cl
-                                                          : "bwa-mem3 mem --meth";
-        char *cl_copy = strdup(cl_in);
-        if (cl_copy == NULL) goto fail;
-        sanitize_cl(cl_copy);
-        kstring_t pg = {0, 0, NULL};
-        ksprintf(&pg, "@PG\tID:bwa-mem3-meth\tPN:bwa-mem3-meth\tVN:%s-meth\tCL:%s\n",
-                 PACKAGE_VERSION, cl_copy);
-        free(cl_copy);
-        int rc = (pg.s != NULL) ? sam_hdr_add_lines(w->hdr, pg.s, 0) : -1;
-        free(pg.s);
+        kstring_t text = {0, 0, NULL};
+        int rc = meth_hdr_text(&text, bns, BWAMEM3_DEFAULT_HD_LINE, hdr_line, orig_idx_hdr_lines,
+                               bwa_pg, meth_pg_cl, "bwa-mem3 mem --meth");
+        if (rc == 0 && text.l > 0) rc = sam_hdr_add_lines(w->hdr, text.s, text.l);
+        free(text.s);
         if (rc < 0) goto fail;
     }
 
@@ -365,7 +369,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * map). The genome-strand call ('f'=OT/top, 'r'=OB/bottom) is sourced from
      * the winning hypothesis (p.meth_hypothesis: 1=OT, 0=OB), NOT from a contig
      * name prefix. `direction` is retained as the legacy 'f'/'r' char only so
-     * the XG:Z text and the opt->meth_set_as_failed strand filter keep their
+     * the XG:Z text and the opt->meth.meth_set_as_failed strand filter keep their
      * existing encoding. */
     int32_t tid = (p.rid >= 0 && p.rid < bns->n_seqs) ? p.rid : -1;
     int32_t mtid = (mp && mp->rid >= 0 && mp->rid < bns->n_seqs) ? mp->rid : -1;
@@ -498,7 +502,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
     uint8_t mapq = p.mapq;
     int mapped = !(flag16 & 0x4) && direction != 0;
     if (mapped) {
-        if (opt->meth_set_as_failed != 0 && opt->meth_set_as_failed == direction) {
+        if (opt->meth.meth_set_as_failed != 0 && opt->meth.meth_set_as_failed == direction) {
             flag16 |= 0x200;
         }
         if (opt->meth_chimera_qc && p.n_cigar > 0 && s->l_seq > 0) {
@@ -522,7 +526,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * the original rid); meth_build_xm reads the original read-C-vs-T at ref-C
      * from `seq_text`, which is restored from meth_orig_seq above. */
     char *xm = NULL;
-    if ((opt->meth_tags & MEM_METH_TAG_XM)
+    if ((opt->meth.meth_tags & MEM_METH_TAG_XM)
         && mapped && seq_text != NULL && bam_cigar != NULL && l_emit > 0) {
         /* The `>= 0` term cannot fire here: this block is gated on `mapped`,
          * which requires `direction != 0`, and `direction` is only set when
@@ -541,7 +545,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
                            is_top_strand,
                            bam_cigar, (int)bam_n_cigar,
                            seq_text, (int)l_emit,
-                           (meth_chem_t)opt->meth_chem);
+                           (meth_chem_t)opt->meth.meth_chem);
     }
 
     /* Build the bam1_t. bam_set1 handles 4-bit packing, name storage, etc. */
@@ -687,7 +691,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
      * the gate wraps the value's derivation rather than just the append, so a
      * deselected tag costs nothing to compute -- the contract --help and the
      * methylation docs state. */
-    if (opt->meth_tags & MEM_METH_TAG_XR) {
+    if (opt->meth.meth_tags & MEM_METH_TAG_XR) {
         /* XR:Z is the read's conversion: R1 (meth_base_ot 1, OT) is C->T, R2
          * (0, OB) is G->A. -1 marks a non---meth read, which gets no XR. */
         const char *xr = s->meth_base_ot == 1 ? "CT"
@@ -697,7 +701,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
         }
     }
     if (mapped) {
-        if (opt->meth_tags & MEM_METH_TAG_XG) {
+        if (opt->meth.meth_tags & MEM_METH_TAG_XG) {
             /* XG:Z genome strand from the winning hypothesis: OT→CT, OB→GA
              * (direction is the 'f'/'r' encoding of p.meth_hypothesis above). */
             const char *xg = (direction == 'f') ? "CT" : "GA";
@@ -712,7 +716,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
 
     /* Generic aux shared with the --bam path so --meth -C emits FASTQ tags.
      * The YS:Z/YC:Z meth carriers in s->comment are filtered inside
-     * append_sam_aux_tokens under opt->meth_mode so they don't leak into
+     * append_sam_aux_tokens under opt->meth.meth_mode so they don't leak into
      * the BAM output (they're internal carriers only — XR:Z replaces YC,
      * SEQ restoration replaces YS). D3 (PR-5): p.rid is the ORIGINAL contig
      * index, which is what the original `bns` passed here uses. */

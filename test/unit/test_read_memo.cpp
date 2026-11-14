@@ -376,9 +376,9 @@ TEST_CASE("pre-pass eligibility: PE, not --meth, even n > 0, dedup not off"
     CHECK(mem_read_memo_prepass_eligible(opt, 7) == 0);
     mem_dedup_reads_configure("auto");
     CHECK(mem_read_memo_prepass_eligible(opt, 2) == 1);
-    opt->meth_mode = 1;
+    opt->meth.meth_mode = 1;
     CHECK(mem_read_memo_prepass_eligible(opt, 2) == 0);
-    opt->meth_mode = 0;
+    opt->meth.meth_mode = 0;
     opt->flag &= ~MEM_F_PE;
     CHECK(mem_read_memo_prepass_eligible(opt, 2) == 0);
     opt->flag |= MEM_F_PE;

@@ -20,7 +20,7 @@ namespace {
 mem_opt_t *opt_for(int scoring)
 {
     mem_opt_t *o = mem_opt_init();   // a=1, b=4, symmetric mat filled
-    o->meth_scoring = scoring;
+    o->meth.meth_scoring = scoring;
     mem_opt_fill_meth_mat(o);
     return o;
 }
@@ -68,7 +68,7 @@ TEST_CASE("genomic is the default scoring mode"
           * doctest::test_suite("unit/meth_scoring"))
 {
     mem_opt_t *o = mem_opt_init();
-    CHECK(o->meth_scoring == MEM_METH_SCORING_GENOMIC);
+    CHECK(o->meth.meth_scoring == MEM_METH_SCORING_GENOMIC);
     // The default-built matrices therefore free the conversion cell only; the
     // mirror cell (ref T x read C on OT) stays a mismatch.
     CHECK(o->mat_ot[1 * 5 + 3] == o->a);

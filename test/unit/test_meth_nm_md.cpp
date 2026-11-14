@@ -226,7 +226,7 @@ int count_cigar_gaps(const std::vector<uint32_t> &cigar)
 mem_opt_t *meth_opt(int scoring)
 {
     mem_opt_t *o = mem_opt_init();
-    o->meth_scoring = scoring;
+    o->meth.meth_scoring = scoring;
     mem_opt_fill_meth_mat(o);
     return o;
 }
@@ -580,9 +580,9 @@ TEST_CASE("--md short: under --meth-context cpg only a CpG conversion drops out"
     // keeps it, and its mismatch count is NM.
     OtReadCase c;
     mem_opt_t *o = mem_opt_init();
-    o->meth_mode = 1;
-    o->meth_context = METH_CTX_CPG;
-    o->meth_scoring = MEM_METH_SCORING_GENOMIC;
+    o->meth.meth_mode = 1;
+    o->meth.meth_context = METH_CTX_CPG;
+    o->meth.meth_scoring = MEM_METH_SCORING_GENOMIC;
     mem_opt_fill_meth_mat(o);
     const size_t cpg = c.region.find("CG");
     REQUIRE(cpg != std::string::npos);

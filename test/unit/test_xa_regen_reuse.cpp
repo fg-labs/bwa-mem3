@@ -427,8 +427,8 @@ void check_cpg_flank(mem_opt_t *opt) {
 // A --meth option set scored with the genomic matrix, as the cases above use.
 mem_opt_t *meth_genomic_opt() {
     mem_opt_t *meth = mem_opt_init();
-    meth->meth_mode = 1;
-    meth->meth_scoring = MEM_METH_SCORING_GENOMIC;
+    meth->meth.meth_mode = 1;
+    meth->meth.meth_scoring = MEM_METH_SCORING_GENOMIC;
     mem_opt_fill_meth_mat(meth);
     return meth;
 }
@@ -491,8 +491,8 @@ TEST_CASE("mem_gen_alt: a reused duplicate hit gives the XA entry of a fresh reg
     SUBCASE("without --meth") { check_duplicates(nullptr); }
     SUBCASE("--meth") {
         mem_opt_t *meth = mem_opt_init();
-        meth->meth_mode = 1;
-        meth->meth_scoring = MEM_METH_SCORING_GENOMIC;
+        meth->meth.meth_mode = 1;
+        meth->meth.meth_scoring = MEM_METH_SCORING_GENOMIC;
         mem_opt_fill_meth_mat(meth);
         check_duplicates(meth);
         check_meth_hypothesis(meth);
@@ -500,9 +500,9 @@ TEST_CASE("mem_gen_alt: a reused duplicate hit gives the XA entry of a fresh reg
     }
     SUBCASE("--meth-context cpg") {
         mem_opt_t *meth = mem_opt_init();
-        meth->meth_mode = 1;
-        meth->meth_scoring = MEM_METH_SCORING_GENOMIC;
-        meth->meth_context = METH_CTX_CPG;
+        meth->meth.meth_mode = 1;
+        meth->meth.meth_scoring = MEM_METH_SCORING_GENOMIC;
+        meth->meth.meth_context = METH_CTX_CPG;
         mem_opt_fill_meth_mat(meth);
         check_cpg_flank(meth);
         free(meth);

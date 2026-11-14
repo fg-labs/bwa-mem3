@@ -151,7 +151,7 @@ mem_opt_t *opt_for(int scoring, int a, int b)
     mem_opt_t *o = mem_opt_init();
     o->a = a; o->b = b;
     bwa_fill_scmat(a, b, o->mat);
-    o->meth_scoring = scoring;
+    o->meth.meth_scoring = scoring;
     mem_opt_fill_meth_mat(o);
     return o;
 }
@@ -720,15 +720,15 @@ TEST_CASE("meth_model_mat and the u8 rescue admission under cpg"
           * doctest::test_suite("unit/meth_model"))
 {
     mem_opt_t *o = opt_for(MEM_METH_SCORING_NEUTRAL, 1, 4);
-    o->meth_mode = 1;
+    o->meth.meth_mode = 1;
     int m = 0;
-    o->meth_context = METH_CTX_ALL;
+    o->meth.meth_context = METH_CTX_ALL;
     CHECK(meth_model_mat(o, 1, &m) == o->mat_ot);
     CHECK(m == 5);
     CHECK(meth_model_mat(o, -1, &m) == o->mat);
     CHECK(m == 5);
     const int shift_all = matesw_u8_shift_for(o, o->mat), qmax_all = matesw_u8_qmax_for(o, o->mat);
-    o->meth_context = METH_CTX_CPG;
+    o->meth.meth_context = METH_CTX_CPG;
     CHECK(meth_model_mat(o, 1, &m) == o->mat7_ot);
     CHECK(m == 7);
     CHECK(meth_model_mat(o, 0, &m) == o->mat7_ob);
@@ -742,7 +742,7 @@ TEST_CASE("meth_model_mat and the u8 rescue admission under cpg"
     CHECK(matesw_u8_qmax(o->mat7_ot, 7) == matesw_u8_qmax(o->mat_ot));
     CHECK(matesw_u8_shift_for(o, o->mat) == shift_all);
     CHECK(matesw_u8_qmax_for(o, o->mat) == qmax_all);
-    o->meth_mode = 0;
+    o->meth.meth_mode = 0;
     CHECK(meth_model_mat(o, 1, &m) == o->mat);   // cpg is a --meth option
     CHECK(m == 5);
     free(o);
