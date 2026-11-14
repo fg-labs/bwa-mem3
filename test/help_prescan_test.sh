@@ -9,11 +9,44 @@
 # wrongly short-circuit to `main_mem` and suppress the banner.
 #
 # Usage: test/help_prescan_test.sh <bwa-mem3-binary> <fixtures-dir>
+#        test/help_prescan_test.sh --list-only   (source check only)
 
 set -euo pipefail
 
+# The pre-scan list covers every required_argument mem long option.
+# main.cpp's MEM_LONG_OPTS_WITH_ARG must name each `{"<name>", required_argument,
+# ...}` entry of main_mem's long_opts (fastmap.cpp, plus the METH_LONG_OPTIONS_*
+# macros in meth_opts.h); a missing one makes `mem --<name> --help` short-circuit
+# to the help text instead of rejecting --help as the option's value. Checked
+# against the sources so a new option cannot drift out of the list unnoticed.
+# Source-only, so `make test` runs it alone with --list-only (no binary,
+# no fixture index).
+check_prescan_list() {
+    src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
+    required_opts="$(grep -hoE '\{"[a-z0-9-]+",[[:space:]]*required_argument' \
+        "$src_dir/fastmap.cpp" "$src_dir/meth_opts.h" \
+        | sed -E 's/^\{"([^"]+)".*/--\1/' | sort -u)"
+    [[ -n "$required_opts" ]] || {
+        echo "FAIL: found no required_argument long options in fastmap.cpp/meth_opts.h; the extraction pattern no longer matches" >&2
+        exit 1
+    }
+    prescan_opts="$(sed -n '/MEM_LONG_OPTS_WITH_ARG\[\] = {/,/NULL,/p' "$src_dir/main.cpp" \
+        | grep -oE '"--[a-z0-9-]+"' | tr -d '"' | sort -u)"
+    missing="$(comm -23 <(printf '%s\n' "$required_opts") <(printf '%s\n' "$prescan_opts"))"
+    [[ -z "$missing" ]] || {
+        echo "FAIL: required_argument mem options missing from MEM_LONG_OPTS_WITH_ARG (src/main.cpp): $(echo "$missing" | tr '\n' ' ')" >&2
+        exit 1
+    }
+}
+
+if [[ $# -eq 1 && $1 == --list-only ]]; then
+    check_prescan_list
+    echo "PASS: MEM_LONG_OPTS_WITH_ARG names every required_argument mem option"
+    exit 0
+fi
+
 if [[ $# -ne 2 ]]; then
-    echo "usage: $0 <bwa-mem3-binary> <fixtures-dir>" >&2
+    echo "usage: $0 <bwa-mem3-binary> <fixtures-dir> | --list-only" >&2
     exit 2
 fi
 
@@ -178,25 +211,6 @@ grep -q 'Executing in' "$tmpdir/tb.err" \
     }
 
 # --- 6. The pre-scan list covers every required_argument mem long option. ---
-# main.cpp's MEM_LONG_OPTS_WITH_ARG must name each `{"<name>", required_argument,
-# ...}` entry of main_mem's long_opts (fastmap.cpp, plus the METH_LONG_OPTIONS_*
-# macros in meth_opts.h); a missing one makes `mem --<name> --help` short-circuit
-# to the help text instead of rejecting --help as the option's value. Checked
-# against the sources so a new option cannot drift out of the list unnoticed.
-src_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../src" && pwd)"
-required_opts="$(grep -hoE '\{"[a-z0-9-]+",[[:space:]]*required_argument' \
-    "$src_dir/fastmap.cpp" "$src_dir/meth_opts.h" \
-    | sed -E 's/^\{"([^"]+)".*/--\1/' | sort -u)"
-[[ -n "$required_opts" ]] || {
-    echo "FAIL: found no required_argument long options in fastmap.cpp/meth_opts.h; the extraction pattern no longer matches" >&2
-    exit 1
-}
-prescan_opts="$(sed -n '/MEM_LONG_OPTS_WITH_ARG\[\] = {/,/NULL,/p' "$src_dir/main.cpp" \
-    | grep -oE '"--[a-z0-9-]+"' | tr -d '"' | sort -u)"
-missing="$(comm -23 <(printf '%s\n' "$required_opts") <(printf '%s\n' "$prescan_opts"))"
-[[ -z "$missing" ]] || {
-    echo "FAIL: required_argument mem options missing from MEM_LONG_OPTS_WITH_ARG (src/main.cpp): $(echo "$missing" | tr '\n' ' ')" >&2
-    exit 1
-}
+check_prescan_list
 
 echo "PASS: mem --help short-circuits; mem <opt-with-arg> --help does not"
