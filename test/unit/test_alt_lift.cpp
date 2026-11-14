@@ -2027,3 +2027,90 @@ TEST_CASE("exclude BED frozen table gate" * doctest::test_suite("unit/alt_lift_f
     REQUIRE(c.input_intervals > 0);
     alt_gate_emit_marker(stdout, failed_before, c);
 }
+
+// --alt-project primary: mem_alt_drop_unlifted removes every region still on an
+// ALT contig, keeps the rest in order, and sets the best ALT region aside for
+// OA:Z with the sub/sub_n primary marking would give it among the ALT hits.
+namespace {
+mem_alnreg_t drop_reg(int rid, int is_alt, int score, int qb, int qe, int64_t rb) {
+    mem_alnreg_t r;
+    memset(&r, 0, sizeof(r));
+    r.rid = rid; r.is_alt = is_alt; r.score = r.truesc = score;
+    r.qb = qb; r.qe = qe; r.rb = rb; r.re = rb + (qe - qb);
+    r.secondary = r.secondary_all = 7;  // must be reset on the OA region
+    r.sub = 3; r.sub_n = 9;
+    return r;
+}
+}  // namespace
+
+TEST_CASE("mem_alt_drop_unlifted: no regions, no ALT, all ALT, interleaved" * doctest::test_suite("unit/alt_lift")) {
+    mem_opt_t *opt = mem_opt_init();
+    mem_alnreg_t oa;
+    oa.rid = 99;  // must be reset when there is no candidate
+
+    CHECK(mem_alt_drop_unlifted(opt, 0, NULL, &oa) == 0);
+    CHECK(oa.rid == -1);
+
+    oa.rid = 99;
+    std::vector<mem_alnreg_t> none = {drop_reg(0, 0, 100, 0, 100, 10), drop_reg(1, 0, 90, 0, 100, 20)};
+    CHECK(mem_alt_drop_unlifted(opt, 2, none.data(), &oa) == 2);
+    CHECK(oa.rid == -1);
+    CHECK(none[0].rb == 10);
+    CHECK(none[1].rb == 20);
+
+    std::vector<mem_alnreg_t> all = {drop_reg(5, 1, 100, 0, 100, 10), drop_reg(6, 1, 120, 0, 100, 20)};
+    CHECK(mem_alt_drop_unlifted(opt, 2, all.data(), &oa) == 0);
+    CHECK(oa.rid >= 0);
+    CHECK(oa.rid == 6);
+    CHECK(oa.score == 120);
+    CHECK(oa.secondary == -1);
+    CHECK(oa.secondary_all == -1);
+    CHECK(oa.sub == 100);      // the other ALT hit overlaps it on the read
+    CHECK(oa.sub_n == 0);      // 20 below it: more than one mismatch+gap apart
+
+    std::vector<mem_alnreg_t> mix = {drop_reg(0, 0, 150, 0, 150, 1), drop_reg(5, 1, 140, 0, 140, 2),
+                                     drop_reg(1, 0, 80, 0, 80, 3), drop_reg(6, 1, 30, 140, 150, 4),
+                                     drop_reg(2, 0, 60, 0, 60, 5)};
+    CHECK(mem_alt_drop_unlifted(opt, 5, mix.data(), &oa) == 3);
+    CHECK(mix[0].rb == 1);
+    CHECK(mix[1].rb == 3);
+    CHECK(mix[2].rb == 5);
+    CHECK(oa.rid >= 0);
+    CHECK(oa.rid == 5);
+    CHECK(oa.sub == 0);        // the other ALT hit covers the read elsewhere
+    free(opt);
+}
+
+TEST_CASE("mem_alt_drop_unlifted: the OA region needs -T and ties break by position, not order" * doctest::test_suite("unit/alt_lift")) {
+    mem_opt_t *opt = mem_opt_init();
+    mem_alnreg_t oa;
+    oa.rid = 99;  // must be reset when there is no candidate
+
+    // Below -T: dropped, but not a hit the read could have been written with.
+    std::vector<mem_alnreg_t> low = {drop_reg(5, 1, opt->T - 1, 0, 100, 10)};
+    CHECK(mem_alt_drop_unlifted(opt, 1, low.data(), &oa) == 0);
+    CHECK(oa.rid == -1);
+
+    // Equal scores: the lower rid wins, then the lower rb, in either input order.
+    for (int order = 0; order < 2; ++order) {
+        std::vector<mem_alnreg_t> tie = {drop_reg(7, 1, 100, 0, 100, 50), drop_reg(6, 1, 100, 0, 100, 90),
+                                         drop_reg(6, 1, 100, 0, 100, 40)};
+        if (order) std::reverse(tie.begin(), tie.end());
+        CHECK(mem_alt_drop_unlifted(opt, 3, tie.data(), &oa) == 0);
+        CHECK(oa.rid >= 0);
+        CHECK(oa.rid == 6);
+        CHECK(oa.rb == 40);
+        CHECK(oa.sub == 100);
+        CHECK(oa.sub_n == 2);  // both others are equal-scoring overlaps
+    }
+    free(opt);
+}
+
+// The OA:Z candidate lives in a side array allocated only under --alt-project
+// primary, not in mem_alnreg_v: that vector is one slot per read in every mode,
+// so it must stay at its 32 bytes (n, m, a, capped_w).
+TEST_CASE("mem_alnreg_v carries no per-mode payload" * doctest::test_suite("unit/alt_lift")) {
+    static_assert(sizeof(mem_alnreg_v) == 2 * sizeof(size_t) + sizeof(mem_alnreg_t *) + sizeof(int) + 4,
+                  "mem_alnreg_v grew");
+    CHECK(sizeof(mem_alnreg_v) == 32);
+}

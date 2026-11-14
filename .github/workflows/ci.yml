@@ -2162,6 +2162,14 @@ jobs:
           ALT_PROJECT_REQUIRE_SAMTOOLS=1 \
           bash test/regression/alt_project.sh
 
+      - name: ALT projection writes only the primary assembly (--alt-project primary)
+        # samtools is installed above, so a missing samtools fails the BAM
+        # check instead of reporting it as not checked.
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          ALT_PROJECT_REQUIRE_SAMTOOLS=1 \
+          bash test/regression/alt_project_primary.sh
+
       - name: default @HD parity across output paths
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \

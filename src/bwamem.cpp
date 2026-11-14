@@ -4364,7 +4364,8 @@ int mem_kernel2_core(FMI_search *fmi,
                      uint8_t *ref_string,
                      int tid,
                      const bntseq_t *meth_orig_bns,
-                     const uint8_t  *meth_orig_pac)
+                     const uint8_t  *meth_orig_pac,
+                     mem_alnreg_t *alt_oa)
 {
     int i;
     /* D3 (--meth, PR-3): extension/dedup must run in ORIGINAL coords. ref_string
@@ -4496,6 +4497,14 @@ int mem_kernel2_core(FMI_search *fmi,
          * lift can drop regions). Off by default (alt_lift == NULL). */
         if (opt->alt_lift)
             regs[l].n = mem_alt_project(opt, aln_bns, regs[l].n, regs[l].a, seq_[l].name, seq_[l].id);
+        /* --alt-project primary: nothing downstream (primary marking, pestat,
+         * rescue, pairing, XA/SA, the writers) may see a region still on an ALT
+         * contig, so drop them here, keeping the best aside for OA:Z in the
+         * side array (alt_oa is NULL in every other mode). */
+        if (opt->alt_project_primary) {
+            xassert(alt_oa != NULL, "--alt-project primary: no OA:Z side array");
+            regs[l].n = mem_alt_drop_unlifted(opt, (int) regs[l].n, regs[l].a, &alt_oa[l]);
+        }
         /* Paired-end: give back the slack in this read's regions now that dedup
          * has settled their count. av->a was sized to the total seeds of the
          * read's chains, and the regions are held until the batch's SAM pass
@@ -4539,7 +4548,8 @@ static void worker_aln(void *data, int seq_id, int batch_size, int tid)
                      &w->mmc,
                      mem_aln_ref_string(w),
                      tid,
-                     w->meth_orig_bns, w->meth_orig_pac);
+                     w->meth_orig_bns, w->meth_orig_pac,
+                     w->alt_oa ? w->alt_oa + seq_id : NULL);
     printf_(VER, "11. Done mem_kernel2_core....\n");
 
 }
@@ -4744,6 +4754,21 @@ static void read_memo_verify_regs(const mem_alnreg_v *dup, const mem_alnreg_v *r
     }
 }
 
+/* [dedup-reads] VERIFY of the --alt-project primary OA:Z candidates (the
+ * w->alt_oa side array): a DUP's must equal its representative's. */
+static void read_memo_verify_oa(const mem_alnreg_t *dup, const mem_alnreg_t *rep, int read_idx)
+{
+    if ((dup->rid >= 0) != (rep->rid >= 0))
+        err_fatal(__func__, "dedup-reads VERIFY: read %d has %s OA:Z candidate but its representative has %s",
+                  read_idx, dup->rid >= 0 ? "an" : "no", rep->rid >= 0 ? "one" : "none");
+    if (dup->rid >= 0) {
+        const char *f = read_memo_alnreg_field_diff(dup, rep);
+        if (f)
+            err_fatal(__func__, "dedup-reads VERIFY: read %d OA region field '%s' diverges from its representative",
+                      read_idx, f);
+    }
+}
+
 /* [dedup-reads] CHECK_BASES: assert a duplicate read's 2-bit bases equal its
  * representative's. They were byte-identical ASCII (the pre-pass byte-verifies
  * every group), so a difference means the armed seed stage converted one of
@@ -4786,9 +4811,18 @@ static void worker_copy_regs(void *data, int seq_id, int batch_size, int tid)
         if (verify) {
             read_memo_verify_regs(&w->regs[gr],     &w->regs[rep_r1],     gr);
             read_memo_verify_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1], gr + 1);
+            if (w->alt_oa) {
+                read_memo_verify_oa(&w->alt_oa[gr],     &w->alt_oa[rep_r1],     gr);
+                read_memo_verify_oa(&w->alt_oa[gr + 1], &w->alt_oa[rep_r1 + 1], gr + 1);
+            }
         } else {
             read_memo_copy_regs(&w->regs[gr],     &w->regs[rep_r1]);
             read_memo_copy_regs(&w->regs[gr + 1], &w->regs[rep_r1 + 1]);
+            /* --alt-project primary: the OA:Z candidates ride along. */
+            if (w->alt_oa) {
+                w->alt_oa[gr]     = w->alt_oa[rep_r1];
+                w->alt_oa[gr + 1] = w->alt_oa[rep_r1 + 1];
+            }
         }
     }
     (void) tid;
@@ -4895,7 +4929,8 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
                                   &myaln,
                                   &w->mmc,
                                   gcnt,
-                                  tid);
+                                  tid,
+                                  w->alt_oa ? &w->alt_oa[i] : NULL);
 
             free(w->regs[i].a);
             free(w->regs[i+1].a);
@@ -4924,7 +4959,7 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
             mem_seed_capped_sub(&w->regs[i], w->opt->a);  /* --extend-csub (no-op when off) */
             /* D3 (--meth): emit in ORIGINAL coords/alphabet via mem_aln_bns/pac. */
             mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
-                        &w->regs[i], 0, 0);
+                        &w->regs[i], 0, 0, w->alt_oa ? &w->alt_oa[i] : NULL);
             free(w->regs[i].a);
         }
     }
@@ -5021,11 +5056,15 @@ void mem_align_cohort_slice(mem_opt_t *opt,
     const mem_pestat_t *saved_pes = w.pes;
     mem_pestat_t pes[4];
     mem_alnreg_v *saved_regs = w.regs;
+    mem_alnreg_t *saved_alt_oa = w.alt_oa;
     int64_t       saved_np   = w.n_processed;
 
     w.opt = opt;
     w.seqs = seqs;
     w.regs = regs;
+    /* --alt-project primary: the OA:Z side array is parallel to the cohort's
+     * regs, so the slice's part of it starts at the same offset. */
+    if (w.alt_oa) w.alt_oa = saved_alt_oa + (regs - saved_regs);
     w.n_processed = n_processed;
     /* [dedup-reads] the cohort-slice align path is not memoized in this version
      * (a DUP's representative can live in another slice, so the copy pass would
@@ -5062,6 +5101,7 @@ void mem_align_cohort_slice(mem_opt_t *opt,
     w.pes = saved_pes;
     w.seqs = saved_seqs;
     w.regs = saved_regs;
+    w.alt_oa = saved_alt_oa;
     w.n_processed = saved_np;
 }
 
@@ -5558,10 +5598,49 @@ static int mem_aln_is_conversion_of(const mem_opt_t *opt, const bntseq_t *bns,
            anchor->meth_hypothesis == p->meth_hypothesis;
 }
 
-void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
-                 bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m)
+/* --alt-project primary: read ends (records) written unmapped because their
+ * only usable hits were unlifted ALT hits (each carries OA:Z); a pair with both
+ * ends demoted counts 2. Summed over all worker threads; the count does not
+ * depend on the thread count or batch layout. */
+static std::atomic<long> g_alt_primary_demoted{0};
+
+long mem_alt_primary_demoted(void)
 {
-    mem_reg2sam_anchored(opt, bns, pac, s, a, extra_flag, m, -1, NULL);
+    return g_alt_primary_demoted.load(std::memory_order_relaxed);
+}
+
+void mem_alt_primary_demoted_reset(void)
+{
+    g_alt_primary_demoted.store(0, std::memory_order_relaxed);
+}
+
+/* Append the OA:Z value (no tag prefix) for ALT region `ar` of read `s` to `out`:
+ * "RNAME,POS,strand,CIGAR,MAPQ,NM;" in the SAM-tags convention, POS 1-based and
+ * the CIGAR with soft clips, as mem_reg2aln aligns it on the ALT contig. */
+void mem_aln_oa_string(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                       const bseq1_t *s, const mem_alnreg_t *ar, kstring_t *out)
+{
+    mem_aln_t o = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, ar, s->meth_orig_seq);
+    kputs(bns->anns[o.rid].name, out);
+    kputc(',', out); kputl((long) o.pos + 1, out);
+    kputc(',', out); kputc(o.is_rev ? '-' : '+', out);
+    kputc(',', out);
+    for (int i = 0; i < o.n_cigar; ++i) {
+        kputw(o.cigar[i] >> 4, out);
+        kputc("MIDSH"[o.cigar[i] & 0xf], out);
+    }
+    if (o.n_cigar == 0) kputc('*', out);
+    kputc(',', out); kputw(o.mapq, out);
+    kputc(',', out); kputw(o.NM, out);
+    kputc(';', out);
+    free(o.cigar);
+}
+
+void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                 bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
+                 const mem_alnreg_t *oa)
+{
+    mem_reg2sam_anchored(opt, bns, pac, s, a, extra_flag, m, -1, NULL, oa);
 }
 
 // TODO (future plan): group hits into a uint64_t[] array. This will be cleaner and more flexible
@@ -5574,7 +5653,8 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
  * error (err_fatal) rather than emitting another region's alignment. */
 void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                           bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
-                          int anchor_k, const mem_aln_t *anchor)
+                          int anchor_k, const mem_aln_t *anchor,
+                          const mem_alnreg_t *alt_oa)
 {
     kstring_t str;
     kvec_t(mem_aln_t) aa;
@@ -5632,7 +5712,16 @@ void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8
         mem_aln_t t;
         t = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, 0);
         t.flag |= extra_flag;
+        /* --alt-project primary: the read's only usable hits were on ALT contigs
+         * the output leaves out, so it is unmapped; OA:Z records the best one. */
+        kstring_t oa = {0, 0, NULL};
+        if (opt->alt_project_primary && alt_oa != NULL && alt_oa->rid >= 0) {
+            mem_aln_oa_string(opt, bns, pac, s, alt_oa, &oa);
+            t.OA = oa.s;
+            g_alt_primary_demoted.fetch_add(1, std::memory_order_relaxed);
+        }
         mem_aln2sam(opt, bns, &str, s, 1, &t, 0, m);
+        free(oa.s);
     } else {
         for (k = 0; k < aa.n; ++k)
             mem_aln2sam(opt, bns, &str, s, aa.n, aa.a, k, m);
@@ -5705,6 +5794,11 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
         m->rid = p->rid, m->pos = p->pos, m->is_rev = p->is_rev, m->n_cigar = 0;
     p->flag |= p->is_rev? 0x10 : 0; // is on the reverse strand
     p->flag |= m && m->is_rev? 0x20 : 0; // is mate on the reverse strand
+    /* --alt-project primary leaves out every ALT contig; a record or mate still
+     * naming one is an aligner bug, not output to write. */
+    if (opt->alt_project_primary &&
+        ((p->rid >= 0 && bns->anns[p->rid].is_alt) || (m && m->rid >= 0 && bns->anns[m->rid].is_alt)))
+        err_fatal(__func__, "--alt-project primary: read \"%s\" would name an ALT contig", s->name);
 
     /* ─── Pre-size kstring once for the worst-case record length, then use
      * unsafe (no-realloc, no-bound-check) writes throughout. The estimate
@@ -5735,6 +5829,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                           ? strlen(bns->anns[p->rid].anno) : 0;
         size_t xl_len = p->alt_source_rid_plus1 > 0 && !(p->flag & 4)
                       ? strlen(bns->anns[p->alt_source_rid_plus1 - 1].name) + 6 : 0;
+        size_t oa_len = p->OA ? strlen(p->OA) + 6 : 0;
         size_t xa_len   = p->XA ? strlen(p->XA) : 0;
         size_t rg_len   = bwa_rg_id[0] ? strlen(bwa_rg_id) : 0;
         size_t mate_cigar_len = (m && m->n_cigar) ? (size_t)m->n_cigar * 16 : 0;
@@ -5752,7 +5847,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
                     + (size_t)p->n_cigar * 16  /* primary CIGAR */
                     + mate_cigar_len           /* MC:Z mate CIGAR */
                     + rname_len + rnext_len    /* RNAME + RNEXT */
-                    + md_len + xa_len + xl_len + rg_len + comm_len + anno_len
+                    + md_len + xa_len + xl_len + oa_len + rg_len + comm_len + anno_len
                     + sa_need                  /* SA:Z (multi-supp) */
                     + 256;                      /* slack for ints + tags
                                                  * (incl. pa:f:, bounded by
@@ -5882,6 +5977,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str,
         kputsn_u("\tXL:Z:", 6, str);
         kputs_u(bns->anns[p->alt_source_rid_plus1 - 1].name, str);
     }
+    if (p->OA) { kputsn_u("\tOA:Z:", 6, str); kputs_u(p->OA, str); }
     if (p->XA) { kputsn_u((opt->flag & MEM_F_XB)? "\tXB:Z:" : "\tXA:Z:", 6, str); kputs_u(p->XA, str); }
     if (p->HN >= 0 && opt->compat->emit_hn) { kputsn_u("\tHN:i:", 6, str); kputw_u(p->HN, str); }
 

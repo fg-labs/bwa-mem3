@@ -49,6 +49,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 int bwa_verbose = 3;
 char bwa_rg_id[256];
 char *bwa_pg;
+int bwa_hdr_primary_only = 0;
 
 /************************
  * Batch FASTA/Q reader *
@@ -1225,6 +1226,60 @@ static const char *first_HD(const char *lines, size_t *len)
     return NULL;
 }
 
+static int build_sam_hdr_core(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
+                              const char *hdr_line, const char *pg,
+                              const compat_target_t *compat, int n_seqs_out);
+
+/* --alt-project primary: a copy of the newline-separated header text `lines`
+ * without its @SQ records whose SN names an ALT contig of `bns` (contigs named
+ * in <idxbase>.alt), adding the number dropped to *n_dropped. Every other record
+ * is kept byte for byte, including AH on an @SQ that is not an ALT of `bns`
+ * (the .alt decides what is ALT); those are added to *n_ah_kept. Returns NULL
+ * for NULL `lines`, and on allocation failure sets *failed. The caller frees
+ * the result. */
+static char *drop_alt_SQ(const char *lines, const bntseq_t *bns, int *n_dropped, int *n_ah_kept,
+                         int *failed)
+{
+    if (lines == NULL) return NULL;
+    khash_t(sqname) *alt = kh_init(sqname);
+    if (alt == NULL) { *failed = 1; return NULL; }
+    for (int i = 0; i < bns->n_seqs; ++i) {
+        if (!bns->anns[i].is_alt) continue;
+        int absent;
+        khiter_t k = kh_put(sqname, alt, bns->anns[i].name, &absent);
+        if (absent < 0) { kh_destroy(sqname, alt); *failed = 1; return NULL; }
+        kh_val(alt, k) = i;
+    }
+    kstring_t out = {0, 0, NULL};
+    kstring_t key = {0, 0, NULL};
+    const char *p = lines;
+    int bad = 0;
+    while (*p) {
+        const char *eol = strchr(p, '\n');
+        const size_t len = eol ? (size_t)(eol - p) : strlen(p);
+        const char *sn; size_t sn_len; int has_ah;
+        int drop = 0;
+        if (sq_scan(p, len, &sn, &sn_len, &has_ah)) {
+            key.l = 0;
+            if (kputsn(sn, (int)sn_len, &key) < 0) { bad = 1; break; }
+            drop = kh_get(sqname, alt, key.s) != kh_end(alt);
+            if (!drop && has_ah) ++*n_ah_kept;
+        }
+        if (drop) {
+            ++*n_dropped;
+        } else if (kputsn(p, (int)len, &out) < 0 || (eol && kputc('\n', &out) < 0)) {
+            bad = 1; break;
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    kh_destroy(sqname, alt);
+    free(key.s);
+    if (bad) { free(out.s); *failed = 1; return NULL; }
+    if (out.s == NULL && kputs("", &out) < 0) { *failed = 1; return NULL; }
+    return out.s;
+}
+
 /* Build the complete output header -- the one definition the SAM-text writer
  * prints and the --bam writer hands to htslib, so the two containers cannot
  * carry different headers. It merges, in precedence order, the user's -H text
@@ -1241,25 +1296,63 @@ static const char *first_HD(const char *lines, size_t *len)
  *         text, newline-terminated; NULL for none).
  * The @SQ block is authoritative as given: it is not reordered or completed
  * against the index. The --bam writer maps its records' contigs onto it by
- * name (bam_writer_open). Returns 0, or -1 if `out` could not be grown. */
+ * name (bam_writer_open). Under bwa_hdr_primary_only (--alt-project primary)
+ * no @SQ names an ALT contig: they are dropped from -H and the sidecar and not
+ * generated. Returns 0, or -1 if `out` could not be grown. */
 int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
                       const char *hdr_line, const char *pg, const compat_target_t *compat)
 {
     if (compat == NULL) compat = &COMPAT_TARGET_OFF;
+    /* --alt-project primary: the output names no ALT contig, so drop their @SQ
+     * from -H and the sidecar here, before the precedence rules below see them,
+     * and skip them when generating. The note says so when any were supplied. */
+    char *hdr_line_pri = NULL, *idx_hdr_pri = NULL;
+    int n_seqs_out = bns->n_seqs;
+    if (bwa_hdr_primary_only) {
+        int dropped = 0, ah_kept = 0, failed = 0;
+        hdr_line_pri = drop_alt_SQ(hdr_line, bns, &dropped, &ah_kept, &failed);
+        idx_hdr_pri = failed ? NULL : drop_alt_SQ(idx_hdr_lines, bns, &dropped, &ah_kept, &failed);
+        if (failed) { free(hdr_line_pri); free(idx_hdr_pri); return -1; }
+        if (hdr_line) hdr_line = hdr_line_pri;
+        if (idx_hdr_lines) idx_hdr_lines = idx_hdr_pri;
+        for (int i = 0; i < bns->n_seqs; ++i) n_seqs_out -= bns->anns[i].is_alt != 0;
+        if (dropped > 0 && bwa_verbose >= 3)
+            fprintf(stderr, "[M::%s] --alt-project primary: left out %d ALT @SQ record%s "
+                    "supplied by -H or the index's .hdr/.dict sidecar\n", __func__, dropped,
+                    dropped == 1 ? "" : "s");
+        /* The .alt, not AH, decides what is ALT: an AH on any other @SQ is kept
+         * as supplied (and that contig's records are written as usual). */
+        if (ah_kept > 0 && bwa_verbose >= 3)
+            fprintf(stderr, "[M::%s] --alt-project primary: kept AH on %d @SQ record%s supplied by "
+                    "-H or the index's .hdr/.dict sidecar for contigs the index's .alt does not "
+                    "list; they are not treated as ALT\n", __func__, ah_kept, ah_kept == 1 ? "" : "s");
+    }
+    const int rc = build_sam_hdr_core(out, bns, idx_hdr_lines, hdr_line, pg, compat, n_seqs_out);
+    free(hdr_line_pri);
+    free(idx_hdr_pri);
+    return rc;
+}
+
+/* bwa_build_sam_hdr after the primary-only @SQ filter; `n_seqs_out` is the
+ * number of index contigs the header is expected to describe. */
+static int build_sam_hdr_core(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_lines,
+                              const char *hdr_line, const char *pg,
+                              const compat_target_t *compat, int n_seqs_out)
+{
     const int n_SQ = count_SQ(hdr_line);
     // If the user's -H supplies any @SQ, ignore the sidecar entirely: the user
     // has taken responsibility for the @SQ block.
     const char *bns_hdr = n_SQ > 0 ? NULL : idx_hdr_lines;
     if (bns_hdr) {
         const int idx_SQ = count_SQ(bns_hdr);
-        if (idx_SQ != 0 && idx_SQ != bns->n_seqs && bwa_verbose >= 2)
+        if (idx_SQ != 0 && idx_SQ != n_seqs_out && bwa_verbose >= 2)
             fprintf(stderr,
                     "[W::%s] %d @SQ lines loaded from index; %d sequences in the index. "
-                    "Continue anyway.\n", __func__, idx_SQ, bns->n_seqs);
+                    "Continue anyway.\n", "bwa_build_sam_hdr", idx_SQ, n_seqs_out);
     }
-    if (n_SQ != 0 && n_SQ != bns->n_seqs && bwa_verbose >= 2)
+    if (n_SQ != 0 && n_SQ != n_seqs_out && bwa_verbose >= 2)
         fprintf(stderr, "[W::%s] %d @SQ lines provided with -H; %d sequences in the index. "
-                "Continue anyway.\n", __func__, n_SQ, bns->n_seqs);
+                "Continue anyway.\n", "bwa_build_sam_hdr", n_SQ, n_seqs_out);
 
     /* @HD policy for the default comes from the selected compat target; the
      * evidence for each row is in src/compat_target.cpp. DO NOT "fix" the
@@ -1276,6 +1369,7 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
     // Generate @SQ from bns only when neither -H nor the sidecar supplies any.
     if (n_SQ == 0 && !has_SQ(bns_hdr)) {
         for (int i = 0; i < bns->n_seqs; ++i) {
+            if (bwa_hdr_primary_only && bns->anns[i].is_alt) continue;
             // Formatted apart: bwa_format_sq_line grows its buffer through
             // kstring.h, which drops the buffer when the realloc fails.
             kstring_t sq = {0, 0, NULL};

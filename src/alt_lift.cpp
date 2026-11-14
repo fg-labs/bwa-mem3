@@ -823,3 +823,47 @@ int mem_alt_project(const mem_opt_t *opt, const bntseq_t *bns, int n, mem_alnreg
     std::copy(out.begin(), out.end(), a);
     return (int) out.size();
 }
+
+int mem_alt_drop_unlifted(const mem_opt_t *opt, int n, mem_alnreg_t *a, mem_alnreg_t *oa)
+{
+    int best = -1;
+    oa->rid = -1;
+    for (int i = 0; i < n; ++i) {
+        const mem_alnreg_t *p = &a[i];
+        if (!p->is_alt || p->score < opt->T) continue;
+        if (best < 0) { best = i; continue; }
+        const mem_alnreg_t *b = &a[best];
+        if (p->score > b->score ||
+            (p->score == b->score && (p->rid < b->rid || (p->rid == b->rid &&
+             (p->rb < b->rb || (p->rb == b->rb && p->qb < b->qb))))))
+            best = i;
+    }
+    if (best >= 0) {
+        /* sub/sub_n as mem_mark_primary_se_core would set them on the best ALT
+         * region if the read's ALT regions were its only hits. */
+        int tmp = opt->a + opt->b;
+        tmp = opt->o_del + opt->e_del > tmp ? opt->o_del + opt->e_del : tmp;
+        tmp = opt->o_ins + opt->e_ins > tmp ? opt->o_ins + opt->e_ins : tmp;
+        *oa = a[best];
+        oa->sub = 0; oa->sub_n = 0; oa->alt_sc = 0;
+        oa->secondary = oa->secondary_all = -1;
+        for (int j = 0; j < n; ++j) {
+            if (j == best || !a[j].is_alt) continue;
+            const int b_max = a[j].qb > oa->qb ? a[j].qb : oa->qb;
+            const int e_min = a[j].qe < oa->qe ? a[j].qe : oa->qe;
+            if (e_min <= b_max) continue;
+            const int lj = a[j].qe - a[j].qb, lb = oa->qe - oa->qb;
+            const int min_l = lj < lb ? lj : lb;
+            if (e_min - b_max < min_l * opt->mask_level) continue;
+            if (a[j].score > oa->sub) oa->sub = a[j].score;
+            if (oa->score - a[j].score <= tmp) ++oa->sub_n;
+        }
+    }
+    int m = 0;
+    for (int i = 0; i < n; ++i)
+        if (!a[i].is_alt) {
+            if (m != i) a[m] = a[i];
+            ++m;
+        }
+    return m;
+}

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # test/regression/alt_project.sh
 #
-# End-to-end behavior of --alt-project.
+# End-to-end behavior of --alt-project keep-alt. (--alt-project primary, which
+# leaves ALT contigs out of the output, is covered by alt_project_primary.sh.)
 #
 # ALT-aware mapping keeps a primary-assembly hit primary whatever an ALT contig
 # scores, so a read whose haplotype exists only as an ALT is placed by the
@@ -296,9 +297,9 @@ grep -v '^@PG' def2.sam > def2.nopg
 cmp -s def1.nopg def2.nopg || fail "default output is not deterministic"
 grep -q "alt-project" def1.sam.log && fail "default run reports alt-project"
 
-aln fwd proj.sam --alt-project
-grep -q "alt-project: 1 ALT contigs" proj.sam.log || fail "--alt-project did not report the lift table"
-aln rev projr.sam --alt-project
+aln fwd proj.sam --alt-project keep-alt
+grep -q "alt-project: 1 ALT contigs" proj.sam.log || fail "--alt-project keep-alt did not report the lift table"
+aln rev projr.sam --alt-project keep-alt
 
 # Trace only selected complete read groups, without changing any SAM records.
 trace_name=$(
@@ -307,7 +308,7 @@ with open("r1.fq") as fq:
     print(fq.readline().strip()[1:])
 EOF
 )
-BWAMEM3_ALT_PROJECT_TRACE="$trace_name" aln fwd trace.sam --alt-project
+BWAMEM3_ALT_PROJECT_TRACE="$trace_name" aln fwd trace.sam --alt-project keep-alt
 python3 - "$trace_name" << 'EOF'
 import sys
 from samrecs import records
@@ -325,7 +326,7 @@ for mate in (1, 2):
     with open(f"trace{mate}.fq", "w") as fq:
         fq.write(record * 40)
 EOF
-BWAMEM3_ALT_PROJECT_TRACE="absent,$trace_name" "$BIN" mem -t 4 -I 400,10 --dedup-reads off --alt-project fwd.fa trace1.fq trace2.fq > trace.cap.sam 2> trace.cap.log
+BWAMEM3_ALT_PROJECT_TRACE="absent,$trace_name" "$BIN" mem -t 4 -I 400,10 --dedup-reads off --alt-project keep-alt fwd.fa trace1.fq trace2.fq > trace.cap.sam 2> trace.cap.log
 python3 - << 'EOF'
 rows = [l.rstrip().split("\t") for l in open("trace.cap.log") if l.startswith("[alt-project-trace]\t")]
 assert sum(r[3] == "begin" for r in rows) == 64, "read invocation cap failed"
@@ -341,7 +342,7 @@ summ projr.sam > projr.tsv
 n_snp=$(awk '$10 <= 1000 && 1000 < $11' proj.tsv | wc -l)
 [[ $n_snp -ge 5 ]] || fail "fixture has only $((n_snp)) SNP-covering reads"
 bad=$(awk '$10 <= 1000 && 1000 < $11 && ($3 != "chrA" || $5 == 0)' proj.tsv | wc -l)
-[[ $bad -eq 0 ]] || fail "--alt-project left $((bad)) SNP-covering reads off chrA or at MAPQ 0"
+[[ $bad -eq 0 ]] || fail "--alt-project keep-alt left $((bad)) SNP-covering reads off chrA or at MAPQ 0"
 def_ok=$(awk '$10 <= 1000 && 1000 < $11 && $3 == "chrA" && $5 > 0' def.tsv | wc -l)
 [[ $def_ok -lt $n_snp ]] || fail "default already places every SNP read at chrA with MAPQ > 0 (test is vacuous)"
 # AS is the ALT score that placed the read; the read is 150M at its lifted
@@ -370,7 +371,7 @@ bad=$(awk 'NR == FNR { n[$1] = 1; next } ($1 in n) && ($3 != "chrA" || int($7 / 
 [[ $bad -eq 0 ]] || fail "$((bad)) mates of SNP fragments are off chrA or not a proper pair"
 # No alignment field names the ALT contig; XL records historical provenance.
 awk -F '\t' '!/^@/ {for(i=1;i<=NF;i++) if($i !~ /^XL:Z:/) print $i}' proj.sam > proj.body
-grep -q 'chrA_alt1' proj.body && fail "--alt-project wrote a record that names the ALT contig"
+grep -q 'chrA_alt1' proj.body && fail "--alt-project keep-alt wrote a record that names the ALT contig"
 # Deletion: X:1500 is chrA 0-based 4500, so the D starts at 1-based 4501. Every
 # mate with at least 10 ALT bases on each side of it must carry it there.
 python3 - proj.tsv << 'EOF' || fail "a read spanning the ALT deletion lacks the 3D at chrA:4501"
@@ -397,10 +398,10 @@ cmp -s proj.tsv projr.tsv || fail "reverse-complemented ALT (.alt FLAG 16) place
 # from AS (the ALT score) and the tags that name the ALT hit (at 35 bp the
 # default run soft-clips the read on chrA instead of paying for two gaps).
 for ref in bal1 bal2 bal5 bal35 wide; do
-    "$BIN" mem -t 2 --alt-project "$ref.fa" "$ref.fq" > "$ref.proj.sam" 2> "$ref.proj.log" \
-        || fail "mem --alt-project on $ref failed"
+    "$BIN" mem -t 2 --alt-project keep-alt "$ref.fa" "$ref.fq" > "$ref.proj.sam" 2> "$ref.proj.log" \
+        || fail "mem --alt-project keep-alt on $ref failed"
     "$BIN" mem -t 2 "$ref.fa" "$ref.fq" > "$ref.def.sam" 2> "$ref.def.log" || fail "mem on $ref failed"
-    python3 - "$ref.proj.sam" "$ref.def.sam" "$ref" << 'EOF' || fail "--alt-project misaligned a read across the ALT indels of $ref"
+    python3 - "$ref.proj.sam" "$ref.def.sam" "$ref" << 'EOF' || fail "--alt-project keep-alt misaligned a read across the ALT indels of $ref"
 import re, sys
 from samrecs import prim, tags
 proj, dflt = prim(sys.argv[1]), prim(sys.argv[2])
@@ -424,11 +425,11 @@ done
 # Past the band: a 40I...40D ALT needs a band of 40, more than the 35 the
 # re-alignment of a 150 bp read can have, so its reads stay on the ALT and their
 # records equal the default run's.
-"$BIN" mem -t 2 --alt-project bal40.fa bal40.fq > bal40.proj.sam 2> bal40.proj.log || fail "mem --alt-project on bal40 failed"
+"$BIN" mem -t 2 --alt-project keep-alt bal40.fa bal40.fq > bal40.proj.sam 2> bal40.proj.log || fail "mem --alt-project keep-alt on bal40 failed"
 "$BIN" mem -t 2 bal40.fa bal40.fq > bal40.def.sam 2> bal40.def.log || fail "mem on bal40 failed"
 grep -v '^@PG' bal40.proj.sam > bal40.proj.nopg
 grep -v '^@PG' bal40.def.sam > bal40.def.nopg
-cmp -s bal40.proj.nopg bal40.def.nopg || fail "--alt-project changed reads whose ALT indels are past the re-alignment band (bal40)"
+cmp -s bal40.proj.nopg bal40.def.nopg || fail "--alt-project keep-alt changed reads whose ALT indels are past the re-alignment band (bal40)"
 grep -q $'\tchrA_alt1\t' bal40.def.nopg || fail "bal40: the default run has no ALT record (test is vacuous)"
 
 # End fixture (single-end): for read e_<900 + k> (k = 0, 2, 4) the ALT hit is
@@ -442,9 +443,9 @@ grep -q $'\tchrA_alt1\t' bal40.def.nopg || fail "bal40: the default run has no A
 # hit: its SA tag (to the default's ALT supplementary record, which is gone too)
 # and its pa tag. The default run must have that supplementary record and those
 # tags, so the comparison is not vacuous.
-"$BIN" mem -t 2 --alt-project end.fa end.fq > end.proj.sam 2> end.proj.log || fail "mem --alt-project on end failed"
+"$BIN" mem -t 2 --alt-project keep-alt end.fa end.fq > end.proj.sam 2> end.proj.log || fail "mem --alt-project keep-alt on end failed"
 "$BIN" mem -t 2 end.fa end.fq > end.def.sam 2> end.def.log || fail "mem on end failed"
-python3 - end.proj.sam end.def.sam << 'EOF' || fail "--alt-project let a shorter lifted hit replace a full chrA hit"
+python3 - end.proj.sam end.def.sam << 'EOF' || fail "--alt-project keep-alt let a shorter lifted hit replace a full chrA hit"
 import sys
 from samrecs import recs, tags
 got, dflt = recs(sys.argv[1]), recs(sys.argv[2])
@@ -468,9 +469,9 @@ EOF
 # all 150 (AS 120); 146 beats 120 + 4, so the lifted hit replaces it, and the read
 # is written at chrA:3405 (3001 + 400 + 4) rather than at the paralog (chrA:8001,
 # AS 130), where the default run places it.
-"$BIN" mem -t 2 --alt-project par.fa par.fq > par.proj.sam 2> par.proj.log || fail "mem --alt-project on par failed"
+"$BIN" mem -t 2 --alt-project keep-alt par.fa par.fq > par.proj.sam 2> par.proj.log || fail "mem --alt-project keep-alt on par failed"
 "$BIN" mem -t 2 par.fa par.fq > par.def.sam 2> par.def.log || fail "mem on par failed"
-python3 - par.proj.sam par.def.sam << 'EOF' || fail "--alt-project did not let a much better lifted hit that clips 4 bases replace a full chrA hit"
+python3 - par.proj.sam par.def.sam << 'EOF' || fail "--alt-project keep-alt did not let a much better lifted hit that clips 4 bases replace a full chrA hit"
 import sys
 from samrecs import recs, prim, tags
 got, d = recs(sys.argv[1]), prim(sys.argv[2])
@@ -489,22 +490,22 @@ EOF
 # Tandem fixture (single-end): the lifted hit and the chrA placement one repeat
 # unit away score the same, so both survive: MAPQ 0, XS equal to AS, and under
 # -a a secondary at the other placement.
-"$BIN" mem -t 2 -a --alt-project tan.fa tan.fq > tan.sam 2> tan.log || fail "mem -a --alt-project on tan failed"
-BWAMEM3_ALT_PROJECT_TRACE=t_500 "$BIN" mem -t 2 -a --alt-project --alt-project-min-gap 2 tan.fa tan.fq > tan.gap.sam 2> tan.gap.log
+"$BIN" mem -t 2 -a --alt-project keep-alt tan.fa tan.fq > tan.sam 2> tan.log || fail "mem -a --alt-project keep-alt on tan failed"
+BWAMEM3_ALT_PROJECT_TRACE=t_500 "$BIN" mem -t 2 -a --alt-project keep-alt --alt-project-min-gap 2 tan.fa tan.fq > tan.gap.sam 2> tan.gap.log
 python3 - << 'EOF'
 rows = [l.rstrip().split("\t") for l in open("tan.gap.log") if l.startswith("[alt-project-trace]\t")]
 assert rows and {r[1] for r in rows} == {"t_500"}, "trace must match exact names"
 assert any(r[3] == "veto" for r in rows), "tandem competitor did not veto the lift"
 assert any(r[3] == "gate" and "decision=refuse" in r for r in rows), "missing refused-candidate trace"
 EOF
-BWAMEM3_ALT_PROJECT_PAIR_GAP=1 BWAMEM3_ALT_PROJECT_TRACE=t_500 "$BIN" mem -t 2 -a --alt-project --alt-project-min-gap 2 tan.fa tan.fq > tan.pair.sam 2> tan.pair.log
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 BWAMEM3_ALT_PROJECT_TRACE=t_500 "$BIN" mem -t 2 -a --alt-project keep-alt --alt-project-min-gap 2 tan.fa tan.fq > tan.pair.sam 2> tan.pair.log
 python3 - << 'EOF'
 from samrecs import records
 rows = [l.rstrip().split("\t") for l in open("tan.pair.log") if l.startswith("[alt-project-trace]\t")]
 assert any(r[3] == "gate" and "decision=defer_to_pair" in r for r in rows), "pair-confidence selector not enabled"
 assert list(records("tan.pair.sam")) == list(records("tan.sam")), "pair-only confidence experiment changed single-end records"
 EOF
-python3 - tan.sam << 'EOF' || fail "--alt-project dropped a competing placement in a tandem repeat"
+python3 - tan.sam << 'EOF' || fail "--alt-project keep-alt dropped a competing placement in a tandem repeat"
 import sys
 from samrecs import recs, tags
 by_name = recs(sys.argv[1])
@@ -532,7 +533,7 @@ EOF
 # chrA and merged with chrA's own. The default run names the ALT on those reads
 # (as XA), so that last check fails there and is not vacuous. An unmapped read is
 # a failure.
-"$BIN" mem -t 2 --alt-project clip.fa clip.fq > clip.sam 2> clip.log || fail "mem --alt-project on clip failed"
+"$BIN" mem -t 2 --alt-project keep-alt clip.fa clip.fq > clip.sam 2> clip.log || fail "mem --alt-project keep-alt on clip failed"
 "$BIN" mem -t 2 clip.fa clip.fq > clip.def.sam 2> clip.def.log || fail "mem on clip failed"
 cat > clipcheck.py << 'EOF'
 import re, sys
@@ -560,7 +561,7 @@ for name, rs in got.items():
         if any("chrA_alt2" in "\t".join(x for x in t if not x.startswith("XL:Z:")) for t in rs): sys.exit(f"{name}: a record names chrA_alt2")
 if n_in < 10 or n_edge < 10 or n_past < 10: sys.exit(f"only {n_in} clip / {n_edge} edge / {n_past} past reads")
 EOF
-python3 clipcheck.py clip.sam clip.def.sam || fail "--alt-project mishandled reads in, across or past an ALT clip"
+python3 clipcheck.py clip.sam clip.def.sam || fail "--alt-project keep-alt mishandled reads in, across or past an ALT clip"
 # The same check on the default run must fail, and for the reason it exists:
 # a past-the-clip read whose records name the ALT.
 python3 clipcheck.py clip.def.sam clip.def.sam 2> clipvac.log && fail "the clip check passes on the default run (vacuous)"
@@ -572,37 +573,37 @@ grep -q "a record names chrA_alt2" clipvac.log || fail "the clip check fails on 
 # duplicated, so memoization replays records.
 nopg() { grep -v '^@PG' "$1"; }
 for t in 1 4; do
-    "$BIN" mem -t "$t" -I 400,10 --alt-project fwd.fa r1.fq r2.fq > "det.t$t.sam" 2> "det.t$t.log" || fail "mem -t $t --alt-project failed"
-    "$BIN" mem -t "$t" -I 400,10 --fast --alt-project fwd.fa r1.fq r2.fq > "detf.t$t.sam" 2> "detf.t$t.log" || fail "mem -t $t --fast --alt-project failed"
-    BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --dedup-reads on --alt-project fwd.fa r1d.fq r2d.fq \
-        > "detd.on.t$t.sam" 2> "detd.on.t$t.log" || fail "mem -t $t --dedup-reads on --alt-project failed"
-    "$BIN" mem -t "$t" -I 400,10 --dedup-reads off --alt-project fwd.fa r1d.fq r2d.fq > "detd.off.t$t.sam" 2> "detd.off.t$t.log" \
-        || fail "mem -t $t --dedup-reads off --alt-project failed"
+    "$BIN" mem -t "$t" -I 400,10 --alt-project keep-alt fwd.fa r1.fq r2.fq > "det.t$t.sam" 2> "det.t$t.log" || fail "mem -t $t --alt-project keep-alt failed"
+    "$BIN" mem -t "$t" -I 400,10 --fast --alt-project keep-alt fwd.fa r1.fq r2.fq > "detf.t$t.sam" 2> "detf.t$t.log" || fail "mem -t $t --fast --alt-project keep-alt failed"
+    BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --dedup-reads on --alt-project keep-alt fwd.fa r1d.fq r2d.fq \
+        > "detd.on.t$t.sam" 2> "detd.on.t$t.log" || fail "mem -t $t --dedup-reads on --alt-project keep-alt failed"
+    "$BIN" mem -t "$t" -I 400,10 --dedup-reads off --alt-project keep-alt fwd.fa r1d.fq r2d.fq > "detd.off.t$t.sam" 2> "detd.off.t$t.log" \
+        || fail "mem -t $t --dedup-reads off --alt-project keep-alt failed"
 done
-cmp -s <(nopg det.t1.sam) <(nopg det.t4.sam) || fail "--alt-project output differs between -t 1 and -t 4"
-cmp -s <(nopg det.t1.sam) <(nopg proj.sam) || fail "--alt-project output differs between -t 1 and -t 2"
-cmp -s <(nopg detf.t1.sam) <(nopg detf.t4.sam) || fail "--fast --alt-project output differs between -t 1 and -t 4"
+cmp -s <(nopg det.t1.sam) <(nopg det.t4.sam) || fail "--alt-project keep-alt output differs between -t 1 and -t 4"
+cmp -s <(nopg det.t1.sam) <(nopg proj.sam) || fail "--alt-project keep-alt output differs between -t 1 and -t 2"
+cmp -s <(nopg detf.t1.sam) <(nopg detf.t4.sam) || fail "--fast --alt-project keep-alt output differs between -t 1 and -t 4"
 # --fast lifts too: its SNP reads pass the same placement check as the default
 # mode's (which also rules out an empty or unmapped output), and no record names
 # the ALT (a file, not a pipe into grep -q, whose early exit could SIGPIPE the
 # producer and, under pipefail, hide a match).
 summ detf.t1.sam > detf.tsv
-python3 snpcheck.py detf.tsv diffs.txt || fail "--fast --alt-project did not lift the SNP reads to their chrA positions"
+python3 snpcheck.py detf.tsv diffs.txt || fail "--fast --alt-project keep-alt did not lift the SNP reads to their chrA positions"
 awk -F '\t' '!/^@/ {for(i=1;i<=NF;i++) if($i !~ /^XL:Z:/) print $i}' detf.t1.sam > detf.body
-grep -q 'chrA_alt1' detf.body && fail "--fast --alt-project wrote a record that names the ALT contig"
+grep -q 'chrA_alt1' detf.body && fail "--fast --alt-project keep-alt wrote a record that names the ALT contig"
 # --dedup-reads: byte-identical on and off (its documented contract), and the
 # memo must engage, or on == off is vacuous: its stats line reports duplicate
 # pairs and the final state ON.
 for t in 1 4; do
-    cmp -s <(nopg "detd.on.t$t.sam") <(nopg "detd.off.t$t.sam") || fail "--alt-project output differs with --dedup-reads on and off (-t $t)"
+    cmp -s <(nopg "detd.on.t$t.sam") <(nopg "detd.off.t$t.sam") || fail "--alt-project keep-alt output differs with --dedup-reads on and off (-t $t)"
     grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* .*final=ON' "detd.on.t$t.log" \
-        || fail "--dedup-reads on --alt-project did not memoize any pair (-t $t, see detd.on.t$t.log)"
+        || fail "--dedup-reads on --alt-project keep-alt did not memoize any pair (-t $t, see detd.on.t$t.log)"
 done
-cmp -s <(nopg detd.on.t1.sam) <(nopg detd.on.t4.sam) || fail "--dedup-reads on --alt-project output differs between -t 1 and -t 4"
+cmp -s <(nopg detd.on.t1.sam) <(nopg detd.on.t4.sam) || fail "--dedup-reads on --alt-project keep-alt output differs between -t 1 and -t 4"
 # The VERIFY diagnostic aligns each duplicate itself and aborts if its regions
 # (lifted ones and their band floor included) differ from its representative's;
 # its output must equal the off run's, and it must have compared duplicates.
-BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t 4 -I 400,10 --dedup-reads on --alt-project fwd.fa r1d.fq r2d.fq \
+BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t 4 -I 400,10 --dedup-reads on --alt-project keep-alt fwd.fa r1d.fq r2d.fq \
     > detd.verify.sam 2> detd.verify.log || fail "--dedup-reads VERIFY found a duplicate whose regions differ (see detd.verify.log)"
 grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* ' detd.verify.log \
     || fail "--dedup-reads VERIFY compared no duplicate pair (see detd.verify.log)"
@@ -620,7 +621,7 @@ EOF
 
 # Direct BAM must retain the same source tags and alignment content as SAM.
 if command -v samtools > /dev/null 2>&1; then
-    "$BIN" mem -t 2 -I 400,10 --alt-project --bam=0 fwd.fa r1.fq r2.fq > proj.bam 2> proj.bam.log || fail "direct BAM projection failed"
+    "$BIN" mem -t 2 -I 400,10 --alt-project keep-alt --bam=0 fwd.fa r1.fq r2.fq > proj.bam 2> proj.bam.log || fail "direct BAM projection failed"
     samtools quickcheck proj.bam || fail "projected BAM failed quickcheck"
     samtools view proj.bam > proj.bam.sam
     python3 - << 'EOF'
@@ -636,15 +637,15 @@ fi
 
 # The gap is explicit, nonnegative, and meaningless without projection.
 for gap in -1 1x 2147483648; do
-    "$BIN" mem --alt-project --alt-project-min-gap "$gap" fwd.fa r1.fq r2.fq > /dev/null 2> gap.bad.log && fail "invalid gap $gap accepted"
+    "$BIN" mem --alt-project keep-alt --alt-project-min-gap "$gap" fwd.fa r1.fq r2.fq > /dev/null 2> gap.bad.log && fail "invalid gap $gap accepted"
     grep -q 'alt-project-min-gap' gap.bad.log || fail "invalid gap gave unrelated error"
 done
 "$BIN" mem --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > /dev/null 2> gap.dep.log && fail "gap accepted without projection"
 grep -q 'requires --alt-project' gap.dep.log || fail "gap dependency gave wrong error"
-"$BIN" mem -t 2 -I 400,10 --alt-project --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > gap.zero.sam 2> gap.zero.log || fail "zero gap failed"
+"$BIN" mem -t 2 -I 400,10 --alt-project keep-alt --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > gap.zero.sam 2> gap.zero.log || fail "zero gap failed"
 cmp -s <(nopg gap.zero.sam) <(nopg proj.sam) || fail "zero gap changes projection output"
 for t in 1 4; do
-    BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --alt-project --alt-project-min-gap 2 --dedup-reads on fwd.fa r1d.fq r2d.fq > "gap.t$t.sam" 2> "gap.t$t.log" || fail "positive gap failed with dedup verification"
+    BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --alt-project keep-alt --alt-project-min-gap 2 --dedup-reads on fwd.fa r1d.fq r2d.fq > "gap.t$t.sam" 2> "gap.t$t.log" || fail "positive gap failed with dedup verification"
     grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* ' "gap.t$t.log" || fail "positive gap compared no duplicate pairs"
 done
 cmp -s <(nopg gap.t1.sam) <(nopg gap.t4.sam) || fail "positive gap differs across thread counts"
@@ -652,11 +653,11 @@ cmp -s <(nopg gap.t1.sam) <(nopg gap.t4.sam) || fail "positive gap differs acros
 # Confidence-only experiment must leave placement untouched, remain deterministic,
 # replay duplicate pairs correctly, and agree between direct SAM and BAM output.
 for t in 1 4; do
-    BWAMEM3_ALT_PROJECT_PAIR_GAP=1 BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --alt-project --alt-project-min-gap 2 --dedup-reads on fwd.fa r1d.fq r2d.fq > "pairgap.t$t.sam" 2> "pairgap.t$t.log"
+    BWAMEM3_ALT_PROJECT_PAIR_GAP=1 BWAMEM3_DEDUP_READS_VERIFY=1 BWAMEM3_DEDUP_READS_STATS=1 "$BIN" mem -t "$t" -I 400,10 --alt-project keep-alt --alt-project-min-gap 2 --dedup-reads on fwd.fa r1d.fq r2d.fq > "pairgap.t$t.sam" 2> "pairgap.t$t.log"
     grep -q -E '^\[dedup-reads-stats\] pairs=[0-9]+ dup=[1-9][0-9]* ' "pairgap.t$t.log" || fail "pair confidence compared no duplicate pairs"
 done
 cmp -s <(nopg pairgap.t1.sam) <(nopg pairgap.t4.sam) || fail "pair confidence differs across threads"
-BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 2 -I 400,10 --alt-project --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > pairgap.zero.sam 2> pairgap.zero.log
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 2 -I 400,10 --alt-project keep-alt --alt-project-min-gap 0 fwd.fa r1.fq r2.fq > pairgap.zero.sam 2> pairgap.zero.log
 cmp -s <(nopg pairgap.zero.sam) <(nopg proj.sam) || fail "zero pair confidence gap changes records"
 python3 - << 'EOF'
 from samrecs import records
@@ -668,7 +669,7 @@ for b, r in zip(base, current):
     assert [t for t in r[11:] if t[:3] in ("AS:", "XS:", "XL:", "NM:")] == [t for t in b[11:] if t[:3] in ("AS:", "XS:", "XL:", "NM:")]
 EOF
 if command -v samtools > /dev/null 2>&1; then
-    BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 4 -I 400,10 --alt-project --alt-project-min-gap 2 --dedup-reads on --bam=0 fwd.fa r1d.fq r2d.fq > pairgap.bam 2> pairgap.bam.log
+    BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 4 -I 400,10 --alt-project keep-alt --alt-project-min-gap 2 --dedup-reads on --bam=0 fwd.fa r1d.fq r2d.fq > pairgap.bam 2> pairgap.bam.log
     samtools quickcheck pairgap.bam
     samtools view pairgap.bam > pairgap.bam.sam
     python3 - << 'EOF'
@@ -722,9 +723,9 @@ open("sym.fa.alt", "w").write("".join(placements))
 EOF
 for ref in asym sym; do
     "$BIN" index "$ref.fa" > "$ref.index.log" 2>&1
-    "$BIN" mem -t 2 -I 575,175,1100,100 --alt-project "$ref.fa" sym.r1.fq sym.r2.fq > "$ref.sam" 2> "$ref.log"
+    "$BIN" mem -t 2 -I 575,175,1100,100 --alt-project keep-alt "$ref.fa" sym.r1.fq sym.r2.fq > "$ref.sam" 2> "$ref.log"
 done
-BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 2 -I 575,175,1100,100 --alt-project --alt-project-min-gap 2 sym.fa sym.r1.fq sym.r2.fq > sym.pair.sam 2> sym.pair.log
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 "$BIN" mem -t 2 -I 575,175,1100,100 --alt-project keep-alt --alt-project-min-gap 2 sym.fa sym.r1.fq sym.r2.fq > sym.pair.sam 2> sym.pair.log
 python3 - << 'EOF'
 from samrecs import records, tags
 
@@ -792,7 +793,7 @@ raw = open("exclude.bed.gz", "rb").read()
 open("truncated.bed.gz", "wb").write(raw[:-8])
 EOF
 "$BIN" mem --help > exclude.help 2>&1 || fail "mem --help failed"
-"$BIN" mem -t 1 -I 400,10 --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq > exclude.sam 2> exclude.log \
+"$BIN" mem -t 1 -I 400,10 --alt-project keep-alt --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq > exclude.sam 2> exclude.log \
     || fail "valid exclusion BED was rejected"
 grep -q -- '--alt-project-exclude-bed FILE' exclude.help || fail "help omits exclusion BED option"
 grep -q 'exclusion BED exclude.bed: input=1 merged=1 zero_width=0 excluded=1 retained=1$' exclude.log \
@@ -800,14 +801,14 @@ grep -q 'exclusion BED exclude.bed: input=1 merged=1 zero_width=0 excluded=1 ret
 grep -q -v '^@' exclude.sam || fail "restricted run emitted no alignment records"
 # det.t1.log is a real --alt-project log (its lift line), so the absence check
 # below cannot pass on a missing or empty file.
-grep -q 'alt-project: 1 ALT contigs' det.t1.log || fail "det.t1.log is not an --alt-project log"
-grep -q 'exclusion BED' det.t1.log && fail "unrestricted --alt-project logged an exclusion BED"
-"$BIN" mem -t 1 -I 400,10 --alt-project --alt-project-min-gap 0 --alt-project-exclude-bed exclude.bed.gz exclude.fa r1.fq r2.fq > exclude.zero.sam 2> exclude.zero.log \
+grep -q 'alt-project: 1 ALT contigs' det.t1.log || fail "det.t1.log is not an --alt-project keep-alt log"
+grep -q 'exclusion BED' det.t1.log && fail "unrestricted --alt-project keep-alt logged an exclusion BED"
+"$BIN" mem -t 1 -I 400,10 --alt-project keep-alt --alt-project-min-gap 0 --alt-project-exclude-bed exclude.bed.gz exclude.fa r1.fq r2.fq > exclude.zero.sam 2> exclude.zero.log \
     || fail "explicit gap zero or gzip BED was rejected"
 grep -q 'exclusion BED exclude.bed.gz: input=1 merged=1 zero_width=0 excluded=1 retained=1$' exclude.zero.log \
     || fail "gzip restriction counts missing or wrong"
 cmp -s <(nopg exclude.sam) <(nopg exclude.zero.sam) || fail "gap zero/gzip changed restricted records"
-"$BIN" mem -t 1 --compat bwa-mem --compat-allow-divergent --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq > exclude.compat.sam 2> exclude.compat.log \
+"$BIN" mem -t 1 --compat bwa-mem --compat-allow-divergent --alt-project keep-alt --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq > exclude.compat.sam 2> exclude.compat.log \
     || fail "compat override did not admit exclusion BED"
 
 exclude_refuse() {
@@ -822,26 +823,26 @@ exclude_refuse() {
     fi
 }
 exclude_refuse exclude.requires 'requires --alt-project' --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.repeat 'only once' --alt-project --alt-project-exclude-bed exclude.bed --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.repeat 'only once' --alt-project keep-alt --alt-project-exclude-bed exclude.bed --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
 # getopt words this differently across C libraries ("option '--x' requires an
 # argument", "option requires an argument: x"); both name the option and say
 # it needs an argument, and neither says the option is unrecognized.
 exclude_refuse exclude.argument 'alt-project-exclude-bed' --alt-project-exclude-bed
 grep -q 'requires an argument' exclude.argument.log || fail "exclude.argument did not report the missing argument"
 grep -q -i 'unrecognized' exclude.argument.log && fail "exclude.argument reported an unrecognized option"
-exclude_refuse exclude.stdin 'requires a named BED file (not stdin)' --alt-project --alt-project-exclude-bed - exclude.fa r1.fq r2.fq
-exclude_refuse exclude.emptyarg 'requires a named BED file (not stdin)' --alt-project --alt-project-exclude-bed '' exclude.fa r1.fq r2.fq
-exclude_refuse exclude.j 'cannot be combined with -j' -j --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.meth 'cannot be combined with --meth' --meth --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.compat 'mutually exclusive: --alt-project' --compat bwa-mem --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.gap 'positive --alt-project-min-gap' --alt-project --alt-project-min-gap 1 --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
-BWAMEM3_ALT_PROJECT_PAIR_GAP=1 exclude_refuse exclude.pairgap 'BWAMEM3_ALT_PROJECT_PAIR_GAP=1' --alt-project --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.missing 'missing.bed' --alt-project --alt-project-exclude-bed missing.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.stdin 'requires a named BED file (not stdin)' --alt-project keep-alt --alt-project-exclude-bed - exclude.fa r1.fq r2.fq
+exclude_refuse exclude.emptyarg 'requires a named BED file (not stdin)' --alt-project keep-alt --alt-project-exclude-bed '' exclude.fa r1.fq r2.fq
+exclude_refuse exclude.j 'cannot be combined with -j' -j --alt-project keep-alt --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.meth 'cannot be combined with --meth' --meth --alt-project keep-alt --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.compat 'mutually exclusive: --alt-project' --compat bwa-mem --alt-project keep-alt --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.gap 'positive --alt-project-min-gap' --alt-project keep-alt --alt-project-min-gap 1 --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+BWAMEM3_ALT_PROJECT_PAIR_GAP=1 exclude_refuse exclude.pairgap 'BWAMEM3_ALT_PROJECT_PAIR_GAP=1' --alt-project keep-alt --alt-project-exclude-bed exclude.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.missing 'missing.bed' --alt-project keep-alt --alt-project-exclude-bed missing.bed exclude.fa r1.fq r2.fq
 # A mistyped BED path fails before the index is touched: pointing at an index
 # that does not exist still yields the BED error, not an index error.
 exclude_refuse exclude.missing.early '^\[E::main_mem\] --alt-project-exclude-bed missing.bed: cannot read: No such file' \
-    --alt-project --alt-project-exclude-bed missing.bed no-such-index.fa r1.fq r2.fq
-exclude_refuse exclude.invalid 'invalid.bed line 1' --alt-project --alt-project-exclude-bed invalid.bed exclude.fa r1.fq r2.fq
+    --alt-project keep-alt --alt-project-exclude-bed missing.bed no-such-index.fa r1.fq r2.fq
+exclude_refuse exclude.invalid 'invalid.bed line 1' --alt-project keep-alt --alt-project-exclude-bed invalid.bed exclude.fa r1.fq r2.fq
 # Dictionary errors reach the user through the option's prefix with the BED's
 # path and line: a contig the index lacks, an ALT contig, and a span past the
 # contig's end.
@@ -849,21 +850,21 @@ printf 'chrZ\t0\t10\n' > unknown.bed
 printf 'chrA_alt1\t0\t10\n' > altctg.bed
 printf 'chrA\t0\t8001\n' > beyond.bed
 exclude_refuse exclude.unknown '^\[E::main_mem\] --alt-project-exclude-bed: unknown.bed line 1: unknown reference contig' \
-    --alt-project --alt-project-exclude-bed unknown.bed exclude.fa r1.fq r2.fq
+    --alt-project keep-alt --alt-project-exclude-bed unknown.bed exclude.fa r1.fq r2.fq
 exclude_refuse exclude.altctg '^\[E::main_mem\] --alt-project-exclude-bed: altctg.bed line 1: BED contig is an ALT contig' \
-    --alt-project --alt-project-exclude-bed altctg.bed exclude.fa r1.fq r2.fq
+    --alt-project keep-alt --alt-project-exclude-bed altctg.bed exclude.fa r1.fq r2.fq
 exclude_refuse exclude.beyond '^\[E::main_mem\] --alt-project-exclude-bed: beyond.bed line 1: interval exceeds reference contig length' \
-    --alt-project --alt-project-exclude-bed beyond.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.truncated 'truncated.bed.gz.*failure' --alt-project --alt-project-exclude-bed truncated.bed.gz exclude.fa r1.fq r2.fq
-exclude_refuse exclude.empty 'no nonempty intervals' --alt-project --alt-project-exclude-bed empty.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.noeffect 'excludes no usable' --alt-project --alt-project-exclude-bed noeffect.bed exclude.fa r1.fq r2.fq
-exclude_refuse exclude.all 'excludes all 2 usable ALT alignments' --alt-project --alt-project-exclude-bed all.bed exclude.fa r1.fq r2.fq
+    --alt-project keep-alt --alt-project-exclude-bed beyond.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.truncated 'truncated.bed.gz.*failure' --alt-project keep-alt --alt-project-exclude-bed truncated.bed.gz exclude.fa r1.fq r2.fq
+exclude_refuse exclude.empty 'no nonempty intervals' --alt-project keep-alt --alt-project-exclude-bed empty.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.noeffect 'excludes no usable' --alt-project keep-alt --alt-project-exclude-bed noeffect.bed exclude.fa r1.fq r2.fq
+exclude_refuse exclude.all 'excludes all 2 usable ALT alignments' --alt-project keep-alt --alt-project-exclude-bed all.bed exclude.fa r1.fq r2.fq
 grep -q 'ordinary ALT-aware mapping, not primary-only' exclude.all.log || fail "all-excluded error does not explain omitting --alt-project"
 # An empty BED over a .alt with no usable line keeps the ordinary zero-usable
 # error (the order is: zero-usable, empty BED, no effect, all excluded).
-exclude_refuse exclude.empty.unusable 'no ALT contig in bad.fa.alt has a usable alignment' --alt-project --alt-project-exclude-bed empty.bed bad.fa r1.fq r2.fq
+exclude_refuse exclude.empty.unusable 'no ALT contig in bad.fa.alt has a usable alignment' --alt-project keep-alt --alt-project-exclude-bed empty.bed bad.fa r1.fq r2.fq
 grep -q 'no nonempty intervals' exclude.empty.unusable.log && fail "empty BED masked the zero-usable error"
-exclude_refuse exclude.unusable 'no ALT contig in bad.fa.alt has a usable alignment' --alt-project --alt-project-exclude-bed exclude.bed bad.fa r1.fq r2.fq
+exclude_refuse exclude.unusable 'no ALT contig in bad.fa.alt has a usable alignment' --alt-project keep-alt --alt-project-exclude-bed exclude.bed bad.fa r1.fq r2.fq
 grep -q 'excludes all' exclude.unusable.log && fail "an unusable sidecar was reported as all-excluded"
 
 # Mixed exclusion fixture: two independent loci, each a copy (X1, X2 on chrA)
@@ -1011,11 +1012,11 @@ mixrun() { # out ref se|pe|dup extra...
 # the default (no projection) does not lift the retained ALT's, so the oracle
 # check fails on each, for that reason.
 for mode in se pe; do
-    mixrun "mix.unr.$mode.sam" mix "$mode" -t 2 --alt-project
+    mixrun "mix.unr.$mode.sam" mix "$mode" -t 2 --alt-project keep-alt
     python3 mixcheck.py "mix.unr.$mode.sam" > /dev/null 2> "mix.unr.$mode.chk" \
-        && fail "the mixed-exclusion check passes on unrestricted --alt-project ($mode, vacuous)"
+        && fail "the mixed-exclusion check passes on unrestricted --alt-project keep-alt ($mode, vacuous)"
     grep -q 'projected from the excluded ALT' "mix.unr.$mode.chk" \
-        || fail "the mixed-exclusion check fails on unrestricted --alt-project for another reason (see mix.unr.$mode.chk)"
+        || fail "the mixed-exclusion check fails on unrestricted --alt-project keep-alt for another reason (see mix.unr.$mode.chk)"
 done
 mixrun mix.off.pe.sam mix pe -t 2
 python3 mixcheck.py mix.off.pe.sam > /dev/null 2> mix.off.pe.chk && fail "the mixed-exclusion check passes without projection (vacuous)"
@@ -1028,8 +1029,8 @@ grep -q 'retained ALT read at' mix.off.pe.chk || fail "the mixed-exclusion check
 mixpair() { # label se|pe|dup extra...
     local label=$1 mode=$2 counts
     shift 2
-    mixrun "mix.$label.rt.sam" mix "$mode" "$@" --alt-project --alt-project-exclude-bed mix.bed
-    mixrun "mix.$label.mask.sam" mixmask "$mode" "$@" --alt-project
+    mixrun "mix.$label.rt.sam" mix "$mode" "$@" --alt-project keep-alt --alt-project-exclude-bed mix.bed
+    mixrun "mix.$label.mask.sam" mixmask "$mode" "$@" --alt-project keep-alt
     grep -q 'exclusion BED mix.bed: input=3 merged=3 zero_width=0 excluded=1 retained=1$' "mix.$label.rt.sam.log" \
         || fail "mixed $label: restriction counts missing or wrong"
     grep -q 'exclusion BED' "mix.$label.mask.sam.log" && fail "mixed $label: the masked-sidecar run logged a BED"
@@ -1071,8 +1072,8 @@ done
 # Without samtools this check is OPEN (reported, not passed);
 # ALT_PROJECT_REQUIRE_SAMTOOLS=1 makes that a failure.
 if command -v samtools > /dev/null 2>&1; then
-    mixrun mix.rt.bam mix pe -t 2 --bam=0 --alt-project --alt-project-exclude-bed mix.bed
-    mixrun mix.mask.bam mixmask pe -t 2 --bam=0 --alt-project
+    mixrun mix.rt.bam mix pe -t 2 --bam=0 --alt-project keep-alt --alt-project-exclude-bed mix.bed
+    mixrun mix.mask.bam mixmask pe -t 2 --bam=0 --alt-project keep-alt
     for b in rt mask; do
         samtools quickcheck "mix.$b.bam" || fail "mixed $b BAM failed quickcheck"
         samtools view -h "mix.$b.bam" > "mix.$b.bam.sam" || fail "samtools view mix.$b.bam failed"
@@ -1089,17 +1090,17 @@ fi
 mix_min=$(awk '{ for (i = 2; i <= NF; i++) { split($i, kv, "="); v = kv[2] + 0; if (m == "" || v < m) m = v } } END { print m }' mix.counts)
 
 # Refusals
-"$BIN" mem -j --alt-project fwd.fa r1.fq r2.fq > /dev/null 2> j.log && fail "-j --alt-project was accepted"
-grep -q -e "cannot be combined with -j (it needs" j.log || fail "-j --alt-project gave the wrong error"
-"$BIN" mem --meth --alt-project fwd.fa r1.fq r2.fq > /dev/null 2> m.log && fail "--meth --alt-project was accepted"
-grep -q -e "cannot be combined with --meth" m.log || fail "--meth --alt-project gave the wrong error"
-"$BIN" mem --alt-project noalt.fa r1.fq r2.fq > /dev/null 2> n.log && fail "--alt-project without a .alt was accepted"
-grep -q "needs noalt.fa.alt" n.log || fail "--alt-project without a .alt gave the wrong error"
-"$BIN" mem --alt-project bad.fa r1.fq r2.fq > /dev/null 2> b.log && fail "--alt-project with no usable .alt line was accepted"
-grep -q "no ALT contig in bad.fa.alt has a usable alignment" b.log || fail "--alt-project with no usable .alt line gave the wrong error"
+"$BIN" mem -j --alt-project keep-alt fwd.fa r1.fq r2.fq > /dev/null 2> j.log && fail "-j --alt-project keep-alt was accepted"
+grep -q -e "cannot be combined with -j (it needs" j.log || fail "-j --alt-project keep-alt gave the wrong error"
+"$BIN" mem --meth --alt-project keep-alt fwd.fa r1.fq r2.fq > /dev/null 2> m.log && fail "--meth --alt-project keep-alt was accepted"
+grep -q -e "cannot be combined with --meth" m.log || fail "--meth --alt-project keep-alt gave the wrong error"
+"$BIN" mem --alt-project keep-alt noalt.fa r1.fq r2.fq > /dev/null 2> n.log && fail "--alt-project keep-alt without a .alt was accepted"
+grep -q "needs noalt.fa.alt" n.log || fail "--alt-project keep-alt without a .alt gave the wrong error"
+"$BIN" mem --alt-project keep-alt bad.fa r1.fq r2.fq > /dev/null 2> b.log && fail "--alt-project keep-alt with no usable .alt line was accepted"
+grep -q "no ALT contig in bad.fa.alt has a usable alignment" b.log || fail "--alt-project keep-alt with no usable .alt line gave the wrong error"
 # The --compat refusal (both targets) is checked in compat_byte_identical.sh,
 # with the other levers --compat refuses; only the override is checked here.
-"$BIN" mem --compat bwa-mem --compat-allow-divergent --alt-project fwd.fa r1.fq r2.fq > /dev/null 2> ca.log \
-    || fail "--compat-allow-divergent did not admit --alt-project (see ca.log)"
+"$BIN" mem --compat bwa-mem --compat-allow-divergent --alt-project keep-alt fwd.fa r1.fq r2.fq > /dev/null 2> ca.log \
+    || fail "--compat-allow-divergent did not admit --alt-project keep-alt (see ca.log)"
 
 echo "PASS: alt_project ($((n_snp)) SNP reads on chrA as proper pairs, FLAG 16 identical, ALT indels kept across a lift, past-band indels kept on the ALT, full primary hits kept, a clearly better clipped lifted hit placed, tandem placements kept, ALT clip kept on the ALT, byte-identical across -t, --fast and --dedup-reads; mixed exclusion equals its FLAG-masked oracle in $(($(wc -l < mix.counts))) runs, at least $((mix_min)) informative records of each kind per run, $mix_bam)"

@@ -246,7 +246,7 @@ Notes and caveats:
   `--seed-order`, `--chunk-cap`,
   [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment),
   [`--tie-break name`](#--tie-break-str--what-seeds-equal-score-tie-breaks)
-  and [`--alt-project`](#--alt-project--let-alt-haplotypes-decide-placement).
+  and [`--alt-project`](#--alt-project-mode--let-alt-haplotypes-decide-placement).
   [`--md none`](#--md-str--which-md-tag-to-write) is refused the same way: it
   changes no alignment, but both upstreams always write `MD`.
   The error names the offending flags (`--compat and these levers are mutually
@@ -536,9 +536,10 @@ Treats ALT contigs as part of the primary assembly by ignoring the
 `<idxbase>.alt` file. Use when your workflow does not include ALT-aware
 postprocessing.
 
-#### `--alt-project` — let ALT haplotypes decide placement
+#### `--alt-project MODE` — let ALT haplotypes decide placement
 
-Off by default. ALT-aware mapping (an index with an `<idxbase>.alt` sidecar) keeps
+Off by default. `MODE` is required, and is `keep-alt` or `primary`; they differ
+only in what happens to ALT hits the lift cannot describe (below). ALT-aware mapping (an index with an `<idxbase>.alt` sidecar) keeps
 a primary-assembly hit primary however well an ALT contig scores: ALT hits only
 lower MAPQ, so a read whose haplotype exists only as an ALT is placed by the
 primary assembly alone. With `--alt-project`, alignments to ALT contigs are
@@ -631,11 +632,41 @@ that supported the locus; it does not encode the original source interval.
 Unlifted and mate-rescued records do not inherit a mate's source. `XA`/`XB`
 entries retain their existing format and do not include source provenance.
 
-The header still lists the ALT contigs; records reach them for hits that were
-not lifted (including score-gap refusals) and for ALT contigs with no usable
-`.alt` line. This is not a primary-only output mode. Large ALT dictionaries can
-increase downstream memory use even when few records remain on ALTs; deleting
-`@SQ` lines alone is unsafe while records or alignment tags still refer to them.
+The two modes differ only in the ALT hits that were not lifted (refused by the
+rules above, by `--alt-project-min-gap`, or on a contig with no usable `.alt` line,
+including one `--alt-project-exclude-bed` excludes):
+
+- **`keep-alt`** leaves them to ordinary ALT-aware handling: they can be written
+  on their ALT contig, and the header still lists every ALT contig. Large ALT
+  dictionaries can increase downstream memory use even when few records remain
+  on ALTs; deleting `@SQ` lines afterwards is unsafe while records or alignment
+  tags still refer to them.
+- **`primary`** drops them right after projection, before primary marking,
+  insert-size estimation, mate rescue, pairing and MAPQ, so the output names no
+  ALT contig: the `@SQ` block has none (any supplied with `-H` or in the index's
+  `.hdr`/`.dict` sidecar are left out, with a note; the `.alt` decides which
+  contigs are ALT, so `AH` on any other `@SQ` is kept, also with a note), and no
+  RNAME, RNEXT, `SA` or `XA` names one. A read whose primary-assembly hits all score below `-T` is
+  written as an ordinary unmapped record (placed at its mate when the mate is
+  mapped), with `OA:Z:RNAME,POS,strand,CIGAR,MAPQ,NM;` describing its best
+  unlifted ALT hit scoring at least `-T`: the alignment on the ALT contig, POS
+  1-based, with the MAPQ that hit would have had if the read's ALT hits were its
+  only hits. That MAPQ does not apply the `--extend-csub` competitor floor
+  (the score of chains dropped before extension), which only the read's own
+  primary record gets. In paired-end input, pairing can still write an end whose
+  own primary-assembly hits all score below `-T` mapped, at a hit that pairs
+  with its mate's; such an end has no `OA:Z` and is not counted. The run ends by logging how many read ends
+  were written unmapped with `OA:Z` (each end of a pair counts once, so a pair
+  with both ends demoted counts 2). `XL:Z` still names a lifted record's source
+  ALT, a contig the header does not list.
+  Because the dropped hits no longer compete, the rest of the output can differ
+  from `keep-alt` as well: `pa:f:` is never written, the `XA` cap is
+  [`-h`](#-h-intint--secondary-alignment-reporting)'s first value (as on an index without ALT contigs), and
+  the insert-size estimate and mate rescue no longer see ALT hits. A read whose
+  best match is an ALT region excluded by `--alt-project-exclude-bed` is unmapped
+  if its own primary-assembly hits score below `-T`; the excluded ALT stays in
+  the index, so that can happen to more reads than with an index built without it.
+
 Models and filters trained on ordinary alignments may need reevaluation or
 retraining on projected alignments.
 

@@ -42,6 +42,14 @@ static int map_index_contigs(const sam_hdr_t *hdr, const bntseq_t *bns, int32_t 
     if (map == NULL) return -1;
     int identity = 1;
     for (int i = 0; i < bns->n_seqs; ++i) {
+        /* --alt-project primary: the header has no ALT @SQ, so an ALT contig maps
+         * to none (-1) and bam_writer_write refuses any record that still names
+         * one. The map is then always kept, so that check runs on every record. */
+        if (bwa_hdr_primary_only && bns->anns[i].is_alt) {
+            map[i] = -1;
+            identity = 0;
+            continue;
+        }
         const int tid = sam_hdr_name2tid((sam_hdr_t *)hdr, bns->anns[i].name);
         if (tid < 0) {
             if (tid == -1)
@@ -144,8 +152,16 @@ int bam_writer_write(bam_writer_t *w, struct bam1_t *b)
 {
     if (w == NULL || b == NULL) return -1;
     if (w->tid_map != NULL) {
-        if (b->core.tid >= 0)  b->core.tid  = w->tid_map[b->core.tid];
-        if (b->core.mtid >= 0) b->core.mtid = w->tid_map[b->core.mtid];
+        const int32_t tid = b->core.tid, mtid = b->core.mtid;
+        if (tid >= 0)  b->core.tid  = w->tid_map[tid];
+        if (mtid >= 0) b->core.mtid = w->tid_map[mtid];
+        /* Only --alt-project primary maps a contig to -1 (an ALT): a record or
+         * mate still naming one is an aligner bug, not output to write. */
+        if ((tid >= 0 && b->core.tid < 0) || (mtid >= 0 && b->core.mtid < 0)) {
+            fprintf(stderr, "ERROR: --alt-project primary: record '%s' names an ALT contig "
+                    "absent from the output header\n", bam_get_qname(b));
+            return -1;
+        }
     }
     if (sam_write1(w->fp, w->hdr, b) < 0) return -1;
     return hts_periodic_sync(&w->sync, w->fp);
@@ -458,6 +474,9 @@ int mem_aln_to_bam(struct bam1_t *b,
     if (p.alt_source_rid_plus1 > 0 && !(flag16 & BAM_FUNMAP)) {
         const char *source = bns->anns[p.alt_source_rid_plus1 - 1].name;
         if (bam_aux_append(b, "XL", 'Z', (int) strlen(source) + 1, (const uint8_t *) source) < 0) return -1;
+    }
+    if (p.OA != NULL) {   /* --alt-project primary: a demoted read's ALT hit */
+        if (bam_aux_append(b, "OA", 'Z', (int) strlen(p.OA) + 1, (const uint8_t *) p.OA) < 0) return -1;
     }
     if (p.XA != NULL) {   /* XB under -u, as in the SAM writer */
         if (bam_aux_append(b, (opt->flag & MEM_F_XB) ? "XB" : "XA", 'Z', (int)strlen(p.XA) + 1, (const uint8_t *)p.XA) < 0) return -1;

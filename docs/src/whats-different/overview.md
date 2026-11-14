@@ -104,13 +104,14 @@ The exhaustive per-PR record is git history and the [GitHub PR list](https://git
   (overridable via `--compat-allow-divergent`). See
   [CLI → mem `--tie-break`](../cli/mem.md#--tie-break-str--what-seeds-equal-score-tie-breaks).
 
-- **`--alt-project`** (opt-in, default off): with an ALT-aware index, lifts
+- **`--alt-project MODE`** (opt-in, default off): with an ALT-aware index, lifts
   alignments to ALT contigs onto the primary assembly before pairing and MAPQ,
   where the `.alt` CIGAR describes them, so ALT haplotypes can decide where a read
   is placed; lifted reads are written on the primary assembly, and other ALT hits
-  stay on the ALT. Neither upstream can do this; it is a hard error with
+  stay on the ALT (`--alt-project keep-alt`) or are dropped so the output names no
+  ALT contig (`--alt-project primary`). Neither upstream can do this; it is a hard error with
   `--compat` (overridable via `--compat-allow-divergent`). See
-  [CLI → mem `--alt-project`](../cli/mem.md#--alt-project--let-alt-haplotypes-decide-placement).
+  [CLI → mem `--alt-project`](../cli/mem.md#--alt-project-mode--let-alt-haplotypes-decide-placement).
 
 ## Version stamping
 

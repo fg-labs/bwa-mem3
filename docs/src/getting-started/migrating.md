@@ -42,9 +42,9 @@ and `--min-ext-len` (opt-in tuning), and `--proper-pair-from-emitted` (opt-in;
 moves `FLAG` `0x2` away from what bwa and bwa-mem2 emit, so it is a hard error
 with `--compat`, overridable via `--compat-allow-divergent`), and `--tie-break name`
 (opt-in; seeds equal-score tie-breaks from the read name instead of its input
-position, also a hard error with `--compat`), and `--alt-project` (opt-in; lets ALT
-haplotypes decide where a read is placed, writing it on the primary assembly; also a hard
-error with `--compat`). See the
+position, also a hard error with `--compat`), and `--alt-project keep-alt|primary` (opt-in; lets ALT
+haplotypes decide where a read is placed, writing it on the primary assembly, and with
+`primary` leaves every ALT contig out of the output; also a hard error with `--compat`). See the
 [CLI reference](../cli/mem.md).
 
 Other opt-in flags that leave default output unchanged: `--md short|none` (a

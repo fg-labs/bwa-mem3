@@ -136,6 +136,19 @@ void mem_alt_trace_pair(const bntseq_t *bns, const char *stage,
                         int n_primary, int selected = -1, int mapq = -1);
 int mem_alt_project(const struct mem_opt_t *opt, const bntseq_t *bns, int n, struct mem_alnreg_t *a,
                     const char *read_name = NULL, int read_id = -1);
+
+/* --alt-project primary: remove every region of a[0..n) still on an ALT contig
+ * (those mem_alt_project did not lift), keeping the others in order, and return
+ * the new count. Before removing them, set *oa to the best one scoring at least
+ * opt->T -- highest score, then lowest rid, rb and qb, so the choice does not
+ * depend on where the read sits in the input; when there is none, only
+ * oa->rid is written, to -1. *oa is marked primary, with sub and sub_n
+ * computed among the read's other ALT regions as primary marking would
+ * (mask_level overlap), so mem_reg2aln gives it the MAPQ it would have had if
+ * those were its only hits. Only reads whose record ends up unmapped use it
+ * (OA:Z). */
+int mem_alt_drop_unlifted(const struct mem_opt_t *opt, int n, struct mem_alnreg_t *a,
+                          struct mem_alnreg_t *oa);
 #endif
 
 #endif
