@@ -14,15 +14,19 @@
  * (bwtgap.cpp), bwt_cal_width's loop as a resumable walk; gap_slots_run (bwtgap.cpp) steps the
  * slots; and each slot's search stack is a gap_cstack_t drawing chunks from a per-thread pool.
  * The threads claim chunks of reads from a shared counter (read_claim_t), not i % n_threads == tid.
- * The BAM input, .sai writer and command-line parser are not ported. */
+ * Identical reads in a batch share one search (detail::find_dup_reads, the detail::dup_sample_*
+ * checks and the compaction in aln_search_batch, all new). The BAM input, .sai writer and
+ * command-line parser are not ported. */
 #include "bwtgap.h"
 #include "aln_alloc.h"
+#include "../kthread.h"
 
 #include <math.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <atomic>
+#include <memory>
 #include <vector>
 
 namespace bwa_aln {
@@ -240,12 +244,11 @@ static void *worker(void *data)
  * (stacks, width buffers) would have to become per-tid state and the interleave would drain at
  * every range boundary. One thread spawn per thread per batch of 0x40000 reads is small next to
  * the search. */
-void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads)
+static void search_reads(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *bopt, int n_threads)
 {
-	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	read_claim_t claim(n_seqs);
 	if (n_threads <= 1) { // no multi-threading at all (bwa aln's -t 0 too)
-		bwa_cal_sa_reg_gap_group(&claim, bwt, n_seqs, seqs, &bopt);
+		bwa_cal_sa_reg_gap_group(&claim, bwt, n_seqs, seqs, bopt);
 	} else {
 		pthread_t *tid;
 		pthread_attr_t attr;
@@ -259,7 +262,7 @@ void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_o
 		bool any_failed = false;
 		for (j = 0; j < n_threads; ++j) {
 			data[j].claim = &claim; data[j].bwt = bwt;
-			data[j].n_seqs = n_seqs; data[j].seqs = seqs; data[j].opt = &bopt;
+			data[j].n_seqs = n_seqs; data[j].seqs = seqs; data[j].opt = bopt;
 			started[j] = aln_thread_create(&tid[j], &attr, worker, data + j) == 0;
 			any_failed = any_failed || !started[j];
 		}
@@ -272,6 +275,283 @@ void aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_o
 		free(data); free(tid);
 		pthread_attr_destroy(&attr);
 	}
+}
+
+/* New code: identical reads in a batch share one search. A read's hits depend only on its bases,
+ * its length and the batch's options (the per-read max_diff and seed_len follow the length; the
+ * batch-wide max_gapo cap is computed from every read before the search), so a read whose bases
+ * and length equal an earlier read's in the same batch gets a copy of that read's hits instead of
+ * a search of its own. Everything after the search (the drand48 pass included) still runs per
+ * read, so the output is unchanged.
+ *
+ * The search itself is not changed: when a batch has duplicates, aln_search_batch moves its
+ * distinct reads to the front of the batch, searches them there with search_reads and moves
+ * every read back, so a batch without duplicates runs exactly the code it ran before. Finding
+ * duplicates costs a pass over the batch, so samples decide first whether the pass is worth
+ * running (detail::dup_sample_check). */
+namespace {
+
+static inline uint64_t load_u64(const ubyte_t *p)
+{
+	uint64_t x;
+	memcpy(&x, p, 8);
+	return x;
+}
+
+static inline uint64_t mix_u64(uint64_t h, uint64_t x)
+{
+	h ^= x;
+	h *= 0xbf58476d1ce4e5b9ULL;
+	return h ^ (h >> 31);
+}
+
+/* A fingerprint of the read's length and all its bases, read 8 at a time as 64-bit words (the
+ * last, partial word zero-padded). It covers the whole read, not only its ends: reads of one
+ * length that share their ends and differ in the middle (an amplicon with errors, constant flanks
+ * around a variable insert) would otherwise all share a fingerprint and one probe chain, and the
+ * table would compare each new one against every earlier one. A match is still confirmed with a
+ * full compare. */
+static inline uint64_t read_fingerprint(const bwa_seq_t *p)
+{
+	const int len = p->len;
+	uint64_t h = mix_u64(0x9e3779b97f4a7c15ULL, (uint64_t)len);
+	int i = 0;
+	for (; i + 8 <= len; i += 8) h = mix_u64(h, load_u64(p->seq + i));
+	if (i < len) {
+		uint64_t t = 0;
+		memcpy(&t, p->seq + i, (size_t)(len - i));
+		h = mix_u64(h, t);
+	}
+	return mix_u64(h, 0);
+}
+
+/* A cheap key of the read's length and three 8-base words (start, middle, end; the whole read
+ * when it is shorter than 8). Identical reads have equal keys, so sampling reads by key keeps or
+ * drops every copy of a read together: the sample's share of duplicates estimates the batch's. */
+static inline uint64_t read_sample_key(const bwa_seq_t *p)
+{
+	const int len = p->len;
+	uint64_t h = mix_u64(0x2545f4914f6cdd1dULL, (uint64_t)len);
+	if (len >= 8) {
+		h = mix_u64(h, load_u64(p->seq));
+		h = mix_u64(h, load_u64(p->seq + (len - 8) / 2));
+		h = mix_u64(h, load_u64(p->seq + len - 8));
+	} else if (len > 0) {
+		uint64_t t = 0;
+		memcpy(&t, p->seq, (size_t)len);
+		h = mix_u64(h, t);
+	}
+	return mix_u64(h, 0);
+}
+
+struct dup_slot_t {
+	uint32_t tag; // the fingerprint's low 32 bits
+	int32_t idx;  // the first item with this slot's fingerprint, or -1 if the slot is empty
+};
+
+// The smallest power of two of at least 64 and at least 2 * n: a table of that many slots is at
+// most half full with n items, so every probe ends.
+static inline size_t dup_table_slots(int64_t n)
+{
+	size_t slots = 64;
+	while ((int64_t)slots < 2 * n) slots <<= 1;
+	return slots;
+}
+
+/* The table pass shared by the full pass and both samples: items k in [0, n), item k being read
+ * seq_at(k) with fingerprint fp[k], in order. Sets rep[k] (if rep is not null) to the first item
+ * with the same length and bases, and returns the number of items that are not the first copy.
+ * `table` has dup_table_slots(n) slots, so it is at most half full and every probe ends. */
+template <class SeqAt>
+static inline int dup_table_pass(int n, SeqAt seq_at, const uint64_t *fp, int *rep, dup_slot_t *table)
+{
+	const size_t mask = dup_table_slots(n) - 1;
+	for (size_t s = 0; s <= mask; ++s) table[s].tag = 0, table[s].idx = -1;
+	int n_dups = 0;
+	for (int k = 0; k < n; ++k) {
+		const uint64_t h = fp[k];
+		const uint32_t tag = (uint32_t)h;
+		const bwa_seq_t *b = seq_at(k);
+		int first = k;
+		for (size_t at = (size_t)(h ^ (h >> 47)) & mask;; at = (at + 1) & mask) {
+			dup_slot_t &e = table[at];
+			if (e.idx < 0) { e.tag = tag, e.idx = k; break; }
+			if (e.tag != tag || fp[e.idx] != h) continue;
+			const bwa_seq_t *a = seq_at(e.idx);
+			if (a->len == b->len && memcmp(a->seq, b->seq, b->len) == 0) {
+				first = e.idx;
+				++n_dups;
+				break;
+			}
+		}
+		if (rep) rep[k] = first;
+	}
+	return n_dups;
+}
+
+struct fp_ctx_t {
+	const bwa_seq_t *seqs;
+	uint64_t *fp;
+};
+
+static void fp_worker(void *data, int st, int n, int)
+{
+	const fp_ctx_t *c = (const fp_ctx_t*)data;
+	for (int i = st; i < st + n; ++i) c->fp[i] = read_fingerprint(c->seqs + i);
+}
+
+/* The samples' buffers: fixed arrays allocated once per calling thread (under 1 MB), sized for a
+ * sample of up to DUP_SAMPLE_CAP reads, 4x the expected sample of a 0x40000-read batch; a larger
+ * key sample is out of range anyway (it sends the batch to the full pass), and the position
+ * sample widens its stride to stay under the cap. */
+constexpr int DUP_SAMPLE_CAP = 1 << 15;
+struct dup_sample_buffers_t {
+	uint64_t fp[DUP_SAMPLE_CAP];
+	int idx[DUP_SAMPLE_CAP];
+	dup_slot_t table[2 * DUP_SAMPLE_CAP];
+};
+static thread_local std::unique_ptr<dup_sample_buffers_t> dup_sample_buf;
+
+static dup_sample_buffers_t &sample_buffers()
+{
+	if (!dup_sample_buf) dup_sample_buf.reset(new dup_sample_buffers_t);
+	return *dup_sample_buf;
+}
+
+// Whether the n_s reads seqs[idx[0..n_s)] have at least one duplicate per ALN_DUP_MIN_RATIO reads.
+static int sample_has_dups(const bwa_seq_t *seqs, dup_sample_buffers_t &sb, int n_s)
+{
+	for (int k = 0; k < n_s; ++k) sb.fp[k] = read_fingerprint(seqs + sb.idx[k]);
+	auto seq_at = [&](int k) { return seqs + sb.idx[k]; };
+	const int n_dups = dup_table_pass(n_s, seq_at, sb.fp, nullptr, sb.table);
+	return (int64_t)n_dups * ALN_DUP_MIN_RATIO >= n_s;
+}
+
+} // namespace
+
+namespace detail {
+
+int find_dup_reads(int n_seqs, const bwa_seq_t *seqs, int *rep, int n_threads)
+{
+	if (n_seqs <= 1) {
+		for (int i = 0; i < n_seqs; ++i) rep[i] = i;
+		return 0;
+	}
+	std::vector<uint64_t> fp(n_seqs);
+	fp_ctx_t c = {seqs, fp.data()};
+	if (n_threads > 1 && n_seqs >= 4096) kt_for_nt(fp_worker, &c, n_seqs, n_threads);
+	else fp_worker(&c, 0, n_seqs, 0);
+	std::vector<dup_slot_t> table(dup_table_slots(n_seqs));
+	return dup_table_pass(n_seqs, [seqs](int k) { return seqs + k; }, fp.data(), rep, table.data());
+}
+
+bool dup_key_sampled(const bwa_seq_t *p)
+{
+	return read_sample_key(p) >> (64 - ALN_DUP_SAMPLE_SHIFT) == 0;
+}
+
+int dup_sample_by_key(int n_seqs, const bwa_seq_t *seqs)
+{
+	dup_sample_buffers_t &sb = sample_buffers();
+	// identical reads share a key, so a batch of few distinct reads samples all or none of a
+	// read's copies; when the sample is far from its expected size, it cannot speak for the batch
+	const int64_t expect = (int64_t)n_seqs >> ALN_DUP_SAMPLE_SHIFT;
+	const int64_t most = expect * 4 < DUP_SAMPLE_CAP? expect * 4 : DUP_SAMPLE_CAP;
+	int n_s = 0;
+	for (int i = 0; i < n_seqs; ++i) {
+		if (!dup_key_sampled(seqs + i)) continue;
+		if (n_s == most) return 1; // over-full: also keeps idx[] within DUP_SAMPLE_CAP
+		sb.idx[n_s++] = i;
+	}
+	if (n_s < expect / 4) return 1;
+	return sample_has_dups(seqs, sb, n_s);
+}
+
+int dup_sample_by_position(int n_seqs, const bwa_seq_t *seqs)
+{
+	dup_sample_buffers_t &sb = sample_buffers();
+	int64_t stride = (int64_t)1 << ALN_DUP_SAMPLE_SHIFT;
+	while ((n_seqs + stride - 1) / stride > DUP_SAMPLE_CAP) stride <<= 1;
+	int n_s = 0;
+	for (int64_t i = 0; i < n_seqs; i += stride) sb.idx[n_s++] = (int)i;
+	return sample_has_dups(seqs, sb, n_s);
+}
+
+int dup_sample_check(int n_seqs, const bwa_seq_t *seqs)
+{
+	if (n_seqs < ALN_DUP_SAMPLE_MIN) return 1; // too few reads to sample; the full pass is small
+	return dup_sample_by_key(n_seqs, seqs) || dup_sample_by_position(n_seqs, seqs);
+}
+
+} // namespace detail
+
+/* When aln_search_batch looks for duplicates. Samples (detail::dup_sample_check) decide first,
+ * so a batch without duplicates costs one key per read and a small sample, not the full pass. A
+ * batch the samples or the full pass find with fewer than one duplicate in ALN_DUP_MIN_RATIO reads
+ * turns the check off for the stream's next ALN_DUP_RECHECK - 1 batches (aln_dup_state_t; the
+ * check itself is a serial pass over the batch while the search threads wait). Only the work
+ * changes: a read searched instead of copied gets the same hits. */
+int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads,
+					 aln_dup_state_t *dup)
+{
+	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
+	if (!dup || n_seqs < 2) {
+		if (dup && n_seqs == 1 && dup->skip_left > 0) --dup->skip_left; // a batch of the stream too
+		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		return 0;
+	}
+	if (dup->skip_left > 0) {
+		--dup->skip_left;
+		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		return 0;
+	}
+	if (!detail::dup_sample_check(n_seqs, seqs)) {
+		dup->skip_left = ALN_DUP_RECHECK - 1;
+		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		return 0;
+	}
+	std::vector<int> rep(n_seqs);
+	const int n_dups = detail::find_dup_reads(n_seqs, seqs, rep.data(), n_threads);
+	if ((int64_t)n_dups * ALN_DUP_MIN_RATIO < n_seqs) {
+		// too few to be worth the compaction (the samples were wrong for this batch)
+		dup->skip_left = ALN_DUP_RECHECK - 1;
+		search_reads(bwt, n_seqs, seqs, &bopt, n_threads);
+		return 0;
+	}
+	// Compact the batch in place: the distinct reads move to its front, in order, and the
+	// duplicates' entries are set aside (only they take extra memory). The front is searched, then
+	// every entry goes back to its own index, so the batch's order and its pointers are as before.
+	std::vector<int> uniq;
+	std::vector<bwa_seq_t> dups;
+	uniq.reserve(n_seqs - n_dups);
+	dups.reserve(n_dups);
+	for (int i = 0; i < n_seqs; ++i) {
+		if (rep[i] != i) {
+			dups.push_back(seqs[i]);
+			continue;
+		}
+		// forward: never past an unread entry
+		if (i != (int)uniq.size()) seqs[uniq.size()] = seqs[i];
+		uniq.push_back(i);
+	}
+	const int n_u = (int)uniq.size();
+	search_reads(bwt, n_u, seqs, &bopt, n_threads);
+	for (int k = n_u - 1; k >= 0; --k) // backward: uniq[k] >= k, past every entry still to move
+		if (uniq[k] != k) seqs[uniq[k]] = seqs[k];
+	// Every duplicate gets an aln array of its own (its entry held none before the search), a copy
+	// of its first copy's, so each read's aln can be freed with the read as before.
+	for (int i = 0, j = 0; i < n_seqs; ++i) {
+		if (rep[i] == i) continue;
+		bwa_seq_t *d = seqs + i;
+		*d = dups[j++];
+		const bwa_seq_t *r = seqs + rep[i];
+		d->sa = 0; d->type = BWA_TYPE_NO_MATCH; d->c1 = d->c2 = 0;
+		const size_t n = r->n_aln > 0? r->n_aln : 1;
+		d->aln = (bwt_aln1_t*)aln_malloc(n * sizeof(bwt_aln1_t));
+		if (r->n_aln > 0) memcpy(d->aln, r->aln, r->n_aln * sizeof(bwt_aln1_t));
+		d->n_aln = r->n_aln;
+	}
+	return n_dups;
 }
 
 } // namespace bwa_aln

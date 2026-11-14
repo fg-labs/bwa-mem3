@@ -49,6 +49,7 @@ void aln_opt_init(aln_opt_t *o)
 	o->pe = *pe;
 	free(pe);
 	o->batch_size = 0x40000;
+	o->share_dup_search = 1;
 }
 
 /* The next batch is read on a helper thread while the current one is processed (background_task_t). */
@@ -268,13 +269,16 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 	read_batch(&cur);
 	if (bwa_seq_report_read_error(ks)) ret = 1; // cur.seqs is then 0: no batch is processed
 	background_task_t ahead;
+	aln_dup_state_t dup_state; // this run's duplicate check (see aln_search_batch)
+	aln_dup_state_t *dup = o->share_dup_search? &dup_state : nullptr;
 	while (cur.seqs) {
 		next = {}; // stays empty if the read is abandoned before it runs
 		ahead.start([&] { read_batch(&next); }); // the next batch is read while this one is aligned
 		bwa_seq_t *seqs = cur.seqs;
 		const int n_seqs = cur.n;
 		tot += n_seqs;
-		aln_search_batch(bwt, n_seqs, seqs, &o->gap, o->gap.n_threads);
+		const int n_shared = aln_search_batch(bwt, n_seqs, seqs, &o->gap, o->gap.n_threads, dup);
+		if (bwa_verbose >= 4) fprintf(stderr, "[M::aln] %d of %d reads shared an identical read's search.\n", n_shared, n_seqs);
 		// serial and in read order: bwa_aln2seq_core draws from drand48
 		for (int i = 0; i < n_seqs; ++i)
 			bwa_aln2seq_core(seqs[i].n_aln, seqs[i].aln, &seqs[i], 1, o->max_xa_hits);
@@ -350,6 +354,10 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		ret = 1;
 	}
 	background_task_t ahead;
+	// each file's own duplicate check: one mate's batches need not look like the other's
+	aln_dup_state_t dup_state[2];
+	aln_dup_state_t *dup[2] = {nullptr, nullptr};
+	if (o->share_dup_search) dup[0] = &dup_state[0], dup[1] = &dup_state[1];
 	while (!ret) {
 		seqs[0] = cur.seqs[0], seqs[1] = cur.seqs[1], n_in[0] = cur.n[0], n_in[1] = cur.n[1];
 		if (seqs[0] == 0) {
@@ -375,8 +383,11 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		}
 		tot += n_seqs;
 		// each file is its own batch: the gap-open cap follows that file's longest read
-		aln_search_batch(bwt, n_in[0], seqs[0], &o->gap, o->gap.n_threads);
-		aln_search_batch(bwt, n_in[1], seqs[1], &o->gap, o->gap.n_threads);
+		for (int m = 0; m < 2; ++m) {
+			const int n_shared = aln_search_batch(bwt, n_in[m], seqs[m], &o->gap, o->gap.n_threads, dup[m]);
+			if (bwa_verbose >= 4)
+				fprintf(stderr, "[M::aln] read %d: %d of %d reads shared an identical read's search.\n", m + 1, n_shared, n_in[m]);
+		}
 		// bwa_cal_pac_pos_pe, stage by stage: the drand48 pass serially in stock order, then
 		// positions in parallel, the insert-size barrier, then the per-pair work in parallel
 		bwa_pe_aln2seq(n_seqs, seqs);
