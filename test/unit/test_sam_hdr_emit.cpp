@@ -17,6 +17,8 @@
 //         and inputs (user -H and sidecar) supply none.
 //   @SQ : user's -H block alone if it supplies any; else the sidecar's;
 //         else generated from bns.
+//   @RG/@PG: IDs are unique per type; a user -R/-H record replaces the
+//         sidecar's record of the same type and ID.
 
 #include <cstdio>
 #include <cstdlib>
@@ -318,4 +320,100 @@ TEST_CASE("@HD/@SQ: blank records in -H text are dropped, not emitted" * doctest
     CHECK(out.find("\n@RG\tID:b\n") != std::string::npos);
     CHECK(out.find("\n@RG\tID:a\n") < out.find("\n@RG\tID:b\n"));
     CHECK(out.find("\n\n") == std::string::npos);
+}
+
+// @RG and @PG IDs must be unique within a header (SAM spec 1.3). When the
+// user's -H/-R text and the index sidecar both declare a record of the same
+// type with the same ID, the user's wins (the same user > sidecar precedence
+// as @HD and @SQ): the sidecar's copy is dropped and only the user's is kept.
+TEST_CASE("@RG: a user -R/-H @RG replaces the sidecar @RG with the same ID" * doctest::test_suite("unit/sam_hdr_emit")) {
+    const std::string out = render("@RG\tID:g\tSM:old",
+                                   "@RG\tID:g\tSM:new", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@RG\t") == 1);
+    CHECK(out.find("@RG\tID:g\tSM:new\n") != std::string::npos);
+    CHECK(out.find("SM:old") == std::string::npos);
+}
+
+TEST_CASE("@RG: sidecar @RGs with other IDs are kept, in their original order" * doctest::test_suite("unit/sam_hdr_emit")) {
+    const std::string out =
+        render("@RG\tID:a\tSM:s1\n@RG\tID:g\tSM:old\n@CO\tkeep me\n@RG\tID:b\tSM:s2",
+               "@RG\tID:g\tSM:new", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@RG\t") == 3);
+    CHECK(out.find("SM:old") == std::string::npos);
+    const size_t a = out.find("@RG\tID:a\tSM:s1\n");
+    const size_t co = out.find("@CO\tkeep me\n");
+    const size_t b = out.find("@RG\tID:b\tSM:s2\n");
+    const size_t g = out.find("@RG\tID:g\tSM:new\n");
+    REQUIRE(a != std::string::npos);
+    REQUIRE(co != std::string::npos);
+    REQUIRE(b != std::string::npos);
+    REQUIRE(g != std::string::npos);
+    CHECK(a < co);
+    CHECK(co < b);
+    CHECK(b < g);                                // sidecar records, then user's
+}
+
+TEST_CASE("@RG: IDs are compared whole, wherever the ID tag sits" * doctest::test_suite("unit/sam_hdr_emit")) {
+    // ID:g is a prefix of ID:g2 and of ID:gg; neither collides with it. ID
+    // need not be the first tag on either side.
+    const std::string out =
+        render("@RG\tID:g2\tSM:x\n@RG\tSM:old\tID:g\n@RG\tID:gg\tSM:y",
+               "@RG\tPL:ILLUMINA\tID:g\tSM:new", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@RG\t") == 3);
+    CHECK(out.find("@RG\tID:g2\tSM:x\n") != std::string::npos);
+    CHECK(out.find("@RG\tID:gg\tSM:y\n") != std::string::npos);
+    CHECK(out.find("SM:old") == std::string::npos);
+    CHECK(out.find("@RG\tPL:ILLUMINA\tID:g\tSM:new\n") != std::string::npos);
+}
+
+TEST_CASE("@RG/@PG: an ID is unique per record type, not across types" * doctest::test_suite("unit/sam_hdr_emit")) {
+    // A sidecar @PG ID:g does not collide with a user @RG ID:g.
+    const std::string out = render("@PG\tID:g\tPN:old",
+                                   "@RG\tID:g\tSM:new", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@PG\t") == 1);
+    CHECK(count_lines_starting(out, "@RG\t") == 1);
+    CHECK(out.find("@PG\tID:g\tPN:old\n") != std::string::npos);
+    CHECK(out.find("@RG\tID:g\tSM:new\n") != std::string::npos);
+}
+
+TEST_CASE("@PG: a user -H @PG replaces the sidecar @PG with the same ID" * doctest::test_suite("unit/sam_hdr_emit")) {
+    const std::string out =
+        render("@PG\tID:p\tPN:old\n@PG\tID:q\tPN:keep",
+               "@PG\tID:p\tPN:new", &COMPAT_TARGET_OFF);
+    CHECK(count_lines_starting(out, "@PG\tID:p\t") == 1);
+    CHECK(out.find("PN:old") == std::string::npos);
+    CHECK(out.find("@PG\tID:p\tPN:new\n") != std::string::npos);
+    CHECK(out.find("@PG\tID:q\tPN:keep\n") != std::string::npos);
+}
+
+// bwa_hdr_record_overridden directly, for the record shapes render() does not
+// reach naturally.
+static int overridden(const char *line, const char *user_hdr) {
+    return bwa_hdr_record_overridden(line, strlen(line), user_hdr);
+}
+
+TEST_CASE("bwa_hdr_record_overridden: only @RG/@PG with a same-type, same-ID user record" * doctest::test_suite("unit/sam_hdr_emit")) {
+    CHECK(overridden("@RG\tID:g\tSM:old", "@RG\tID:g\tSM:new") == 1);
+    CHECK(overridden("@PG\tID:g\tPN:old", "@PG\tID:g\tPN:new") == 1);
+    CHECK(overridden("@RG\tID:g\tSM:old", NULL) == 0);
+    CHECK(overridden("@RG\tID:g\tSM:old", "") == 0);
+    // A record type other than @RG/@PG is never overridden, ID or not.
+    CHECK(overridden("@CO\tID:g", "@CO\tID:g") == 0);
+    // The user's matching record may sit anywhere in a multi-record text.
+    CHECK(overridden("@RG\tID:g", "@CO\tx\n@SQ\tSN:c\tLN:1\n@RG\tID:g\n") == 1);
+}
+
+TEST_CASE("bwa_hdr_record_overridden: records without an ID, or too short, never match" * doctest::test_suite("unit/sam_hdr_emit")) {
+    CHECK(overridden("@RG\tSM:old", "@RG\tSM:old") == 0);     // no ID either side
+    CHECK(overridden("@RG\tSM:old", "@RG\tID:g") == 0);       // sidecar has none
+    CHECK(overridden("@RG\tID:g", "@RG\tSM:new") == 0);       // user has none
+    CHECK(overridden("@RG", "@RG\tID:g") == 0);
+    CHECK(overridden("@RG\t", "@RG\tID:g") == 0);
+    CHECK(overridden("@RG\tXID:g", "@RG\tID:g") == 0);        // ID: must start a tag
+}
+
+TEST_CASE("bwa_hdr_record_overridden: the first ID tag of a record is its ID" * doctest::test_suite("unit/sam_hdr_emit")) {
+    CHECK(overridden("@RG\tID:a\tID:b", "@RG\tID:a") == 1);
+    CHECK(overridden("@RG\tID:a\tID:b", "@RG\tID:b") == 0);
+    CHECK(overridden("@RG\tID:b", "@RG\tID:a\tID:b") == 0);
 }

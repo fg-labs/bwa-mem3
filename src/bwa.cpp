@@ -1032,6 +1032,45 @@ int bwa_hdr_text_has_type(const char *s, const char *tag)
     return 0;
 }
 
+/* The value of the first ID: tag of header record `line` (`len` bytes, no
+ * newline): sets *id/*id_len and returns 1, or returns 0 if it has none. The
+ * first wins, as in htslib's header parser. */
+static int hdr_record_id(const char *line, size_t len, const char **id, size_t *id_len)
+{
+    const char *end = line + len;
+    const char *p = (const char *)memchr(line, '\t', len);
+    while (p != NULL) {
+        const char *tok = p + 1;
+        const char *tok_end = (const char *)memchr(tok, '\t', (size_t)(end - tok));
+        if (tok_end == NULL) tok_end = end;
+        if (tok_end - tok >= 3 && strncmp(tok, "ID:", 3) == 0) {
+            *id = tok + 3;
+            *id_len = (size_t)(tok_end - tok - 3);
+            return 1;
+        }
+        p = tok_end < end ? tok_end : NULL;
+    }
+    return 0;
+}
+
+/* Whether a sidecar @RG/@PG record yields to one in the user's header text;
+ * contract at the declaration in bwa.h. */
+int bwa_hdr_record_overridden(const char *line, size_t len, const char *user_hdr)
+{
+    if (user_hdr == NULL || len < 4) return 0;
+    if (strncmp(line, "@RG\t", 4) != 0 && strncmp(line, "@PG\t", 4) != 0) return 0;
+    const char *id, *user_id; size_t id_len, user_id_len;
+    if (!hdr_record_id(line, len, &id, &id_len)) return 0;
+    const char *cur = user_hdr, *u; size_t u_len;
+    while (bwa_hdr_next_line(&cur, &u, &u_len)) {
+        if (u_len >= 4 && strncmp(u, line, 4) == 0 &&
+            hdr_record_id(u, u_len, &user_id, &user_id_len) &&
+            user_id_len == id_len && memcmp(user_id, id, id_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
 // Return 1 iff `lines` contains any @SQ header records.
 static int has_SQ(const char *lines)
 {
@@ -1193,12 +1232,15 @@ static int hdr_put(kstring_t *out, const char *p, size_t len, int nl)
 
 /* Append the records of `lines` (newline-separated, terminated or not) to
  * `out`, one per line, dropping every @HD -- the builder emits the one that
- * wins itself, first -- and every empty line, which is not a header record. */
-static int append_records_without_HD(kstring_t *out, const char *lines)
+ * wins itself, first -- every empty line, which is not a header record, and
+ * every @RG/@PG whose ID the user header text `user_hdr` also declares (NULL
+ * for none; see bwa_hdr_record_overridden). */
+static int append_records_without_HD(kstring_t *out, const char *lines, const char *user_hdr)
 {
     const char *cur = lines, *line; size_t len;
     while (bwa_hdr_next_line(&cur, &line, &len)) {
         if (len == 0 || (len >= 4 && strncmp(line, "@HD\t", 4) == 0)) continue;
+        if (bwa_hdr_record_overridden(line, len, user_hdr)) continue;
         if (hdr_put(out, line, len, 1) < 0) return -1;
     }
     return 0;
@@ -1225,6 +1267,8 @@ static const char *first_HD(const char *lines, size_t *len)
  *         wherever it sat in its source; every other @HD is dropped.
  *   @SQ : if -H supplies any, the user's alone (the sidecar is then ignored
  *         entirely); else the sidecar's; else generated from bns.
+ *   @RG/@PG: IDs must be unique, so a sidecar record whose type and ID
+ *         -H also declares is dropped and only the user's is emitted.
  *   Other: the sidecar's remaining records, then -H's, then `pg` (the @PG
  *         text, newline-terminated; NULL for none).
  * The @SQ block is authoritative as given: it is not reordered or completed
@@ -1273,8 +1317,8 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
             if (r) return -1;
         }
     }
-    if (bns_hdr && append_records_without_HD(out, bns_hdr) < 0) return -1;
-    if (hdr_line && append_records_without_HD(out, hdr_line) < 0) return -1;
+    if (bns_hdr && append_records_without_HD(out, bns_hdr, hdr_line) < 0) return -1;
+    if (hdr_line && append_records_without_HD(out, hdr_line, NULL) < 0) return -1;
     if (pg && hdr_put(out, pg, strlen(pg), 0) < 0) return -1;
     return 0;
 }

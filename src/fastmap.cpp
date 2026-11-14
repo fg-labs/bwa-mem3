@@ -4095,7 +4095,8 @@ int main_mem(int argc, char *argv[])
     if (idx_hdr_lines != NULL && !opt->meth_mode)
         bwa_warn_sidecar_missing_AH(aux.fmi->idx->bns, idx_hdr_lines, ref_prefix);
     /* --meth only: the original (pre-c2t) reference's .hdr/.dict sidecar, for
-     * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open.
+     * @SQ M5/UR enrichment and @CO/@PG/@RG pass-through in meth_bam_writer_open
+     * (minus any @RG/@PG the user's -R/-H redeclares by ID).
      * NULL outside --meth or when the original has no sidecar.
      *
      * Deliberately NOT gated on opt->compat->read_sidecar, unlike the load
@@ -4170,7 +4171,8 @@ int main_mem(int argc, char *argv[])
         extern char *bwa_pg;
         /* meth_orig_hdr_lines is the *original* reference's .hdr/.dict sidecar;
          * the writer enriches each @SQ with its M5/UR tags and forwards
-         * @CO/@PG/@RG provenance. */
+         * @CO/@PG/@RG provenance, except an @RG/@PG that hdr_line redeclares
+         * by ID. */
         g_meth_bam_writer = meth_bam_writer_open(meth_out_path, aux.meth_orig_bns,
                                                  bwa_pg, NULL,
                                                  hdr_line, meth_orig_hdr_lines,

@@ -137,7 +137,8 @@ want_tag $'\tSP:'"$SP"
 grep -qE $'\tLN:'"$LN"$'(\t|$)' <<< "$sq" || fail "@SQ LN is not $LN (chrom map); got: ${sq//$'\t'/<TAB>}"
 
 # @CO/@PG/@RG provenance from the original sidecar is forwarded (the writer
-# passes through every non-@HD/non-@SQ record, not just @CO).
+# passes through every non-@HD/non-@SQ record, not just @CO; this run has no
+# -R/-H, so no @RG/@PG is overridden by a same-ID user record).
 grep -qF -- "$(printf '@CO\t%s' "$CO")" "$tmp/hdr" || fail "forwarded @CO provenance missing"
 grep -qE $'^@PG\t.*\tID:'"$PG_ID"$'(\t|$)' "$tmp/hdr" \
     || grep -qE $'^@PG\tID:'"$PG_ID"$'(\t|$)' "$tmp/hdr" \

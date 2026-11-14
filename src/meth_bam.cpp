@@ -121,18 +121,22 @@ static int meth_append_sq_extra_tags(const char *hdr_text, const char *sn,
  * because the @SQ block built from the original reference is authoritative
  * (its identity tags are merged separately by meth_append_sq_extra_tags); @HD
  * is skipped because the
- * writer emits its own.
+ * writer emits its own. An @RG/@PG whose ID the user's header text `user_hdr`
+ * also declares is skipped too: IDs must be unique, and the user's wins
+ * (bwa_hdr_record_overridden, shared with the default writers).
  *
  * Returns 0 on success, -1 if a kstring append failed -- the same contract as
  * meth_append_sq_extra_tags above, and for the same reason: on -1 `out` holds a
  * truncated record set, so the caller must not pass it to sam_hdr_add_lines. */
-static int meth_append_passthrough_records(const char *hdr_text, kstring_t *out)
+static int meth_append_passthrough_records(const char *hdr_text, const char *user_hdr,
+                                           kstring_t *out)
 {
     if (hdr_text == NULL) return 0;
     const char *cur = hdr_text, *line; size_t line_len;
     while (bwa_hdr_next_line(&cur, &line, &line_len)) {
         int skip = (line_len >= 4 && (strncmp(line, "@HD\t", 4) == 0 ||
-                                      strncmp(line, "@SQ\t", 4) == 0));
+                                      strncmp(line, "@SQ\t", 4) == 0)) ||
+                   bwa_hdr_record_overridden(line, line_len, user_hdr);
         if (!skip && line_len > 0) {
             if (kputsn(line, (int)line_len, out) < 0 || kputc('\n', out) < 0)
                 return -1;
@@ -231,13 +235,14 @@ meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
      * forwarded after @SQ and before the user header — mirroring the index
      * tier of bam_writer_open's precedence (index > default, below user). Its
      * @SQ is consumed into the enriched @SQ block above and its @HD
-     * is the writer's own, so both are dropped here. `orig_idx_hdr_lines` is
+     * is the writer's own, so both are dropped here, as is any @RG/@PG the
+     * user header below redeclares by ID. `orig_idx_hdr_lines` is
      * loaded from the *original* (pre-c2t) reference prefix by main_mem; the
      * c2t index's own sidecar (which describes the doubled f/r converted
      * contigs) is never consulted. */
     if (orig_idx_hdr_lines != NULL && orig_idx_hdr_lines[0] != '\0') {
         kstring_t pt = {0, 0, NULL};
-        if (meth_append_passthrough_records(orig_idx_hdr_lines, &pt) < 0) {
+        if (meth_append_passthrough_records(orig_idx_hdr_lines, hdr_line, &pt) < 0) {
             free(pt.s);
             goto fail;
         }

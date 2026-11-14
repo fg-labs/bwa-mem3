@@ -230,6 +230,15 @@ extern "C" {
 	 * sets *line/*len to the next record (no newline) and advances *p, returning
 	 * 1, or returns 0 at end of text. */
 	int bwa_hdr_next_line(const char **p, const char **line, size_t *len);
+	/* True if the header record `line` (`len` bytes, no newline) is an @RG or
+	 * @PG whose ID: also names a record of the same type in `user_hdr`, the
+	 * user's -R/-H header text (NULL for none). SAM requires those IDs to be
+	 * unique, so a writer forwarding index-sidecar records drops each one the
+	 * user's text redeclares: user > sidecar, as for @HD and @SQ. Only the
+	 * first ID: tag of a record counts, as in htslib; a record without one is
+	 * never overridden. The single definition shared by the SAM-text, --bam
+	 * and --meth writers. */
+	int bwa_hdr_record_overridden(const char *line, size_t len, const char *user_hdr);
 	/* Allocate the dictionary fallback path; caller frees the result. */
 	char *bwa_dict_path(const char *prefix);
 	/* Open .hdr then dictionary. strict rejects existing unreadable/nonregular
