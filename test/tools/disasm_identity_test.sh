@@ -102,3 +102,56 @@ compare 0 adrp-addend '1000:\tadrp\tx0, 0x5000 <foo+0x10>\n1004:\tldr\tx1, [x0, 
 # but a call can return anything in x0: an offset from it afterwards is compared, not normalised
 compare 1 adrp-then-call '1000:\tadrp\tx0, 0x5000\n1004:\tbl\t0x5000 <foo>\n1008:\tldr\tx1, [x0, #8]\n' \
     '1000:\tadrp\tx0, 0x5000\n1004:\tbl\t0x5000 <foo>\n1008:\tldr\tx1, [x0, #16]\n'
+# a direct call's absolute target moves with the layout (its callee is compared by symbol)
+compare 0 direct-call-moved '1000:\tcall\t0x5000 <malloc@plt>\n' '1000:\tcall\t0x6000 <malloc@plt>\n'
+# but an indirect call's memory displacement is a different memory access, not an address
+compare 1 indirect-call-displacement '1000:\tcall\t*0x1234(%rax)\n' '1000:\tcall\t*0x5678(%rax)\n'
+# a conditional branch's fall-through still holds the adrp page
+compare 0 adrp-branch-fallthrough '1000:\tadrp\tx0, 0x5000\n1004:\tcbz\tx1, 0x1010 <SELF+0x10>\n1008:\tldr\tx1, [x0, #8]\n100c:\tret\n1010:\tret\n' \
+    '1000:\tadrp\tx0, 0x6000\n1004:\tcbz\tx1, 0x1010 <SELF+0x10>\n1008:\tldr\tx1, [x0, #16]\n100c:\tret\n1010:\tret\n'
+# a branch that skips the adrp block reaches its target with x0's incoming value
+compare 1 adrp-skipped-by-branch '1000:\tcbz\tx1, 0x100c <SELF+0xc>\n1004:\tadrp\tx0, 0x5000\n1008:\tret\n100c:\tldr\tx1, [x0, #8]\n' \
+    '1000:\tcbz\tx1, 0x100c <SELF+0xc>\n1004:\tadrp\tx0, 0x5000\n1008:\tret\n100c:\tldr\tx1, [x0, #16]\n'
+# a loop's back edge brings x0 back to a load the linear scan reached holding the page
+compare 1 adrp-loop-back-edge '1000:\tadrp\tx0, 0x5000\n1004:\tldr\tx1, [x0, #8]\n1008:\tmov\tx0, x2\n100c:\tb\t0x1004 <SELF+0x4>\n' \
+    '1000:\tadrp\tx0, 0x5000\n1004:\tldr\tx1, [x0, #16]\n1008:\tmov\tx0, x2\n100c:\tb\t0x1004 <SELF+0x4>\n'
+# code after a return is reached only by a jump, possibly an indirect one with no annotated target
+compare 1 adrp-after-return '1000:\tadrp\tx0, 0x5000\n1004:\tret\n1008:\tldr\tx1, [x0, #8]\n' \
+    '1000:\tadrp\tx0, 0x5000\n1004:\tret\n1008:\tldr\tx1, [x0, #16]\n'
+# the same join without the return: only the branch target ends the page
+compare 1 adrp-branch-join '1000:\tcbz\tx1, 0x100c <SELF+0xc>\n1004:\tadrp\tx0, 0x5000\n1008:\tnop\n100c:\tldr\tx1, [x0, #8]\n' \
+    '1000:\tcbz\tx1, 0x100c <SELF+0xc>\n1004:\tadrp\tx0, 0x5000\n1008:\tnop\n100c:\tldr\tx1, [x0, #16]\n'
+# and code after an unconditional branch, which is not itself a branch target
+compare 1 adrp-after-branch '1000:\tadrp\tx0, 0x5000\n1004:\tb\t0x1010 <SELF+0x10>\n1008:\tldr\tx1, [x0, #8]\n100c:\tret\n1010:\tret\n' \
+    '1000:\tadrp\tx0, 0x5000\n1004:\tb\t0x1010 <SELF+0x10>\n1008:\tldr\tx1, [x0, #16]\n100c:\tret\n1010:\tret\n'
+# an indirect call's register is an operand, not an address
+compare 1 indirect-register-call '1000:\tblr\tx8\n' '1000:\tblr\tx9\n'
+# a pointer-authenticated call clobbers the caller-saved registers like any other call
+compare 1 adrp-then-pac-call '1000:\tadrp\tx0, 0x5000\n1004:\tblraa\tx8, x9\n1008:\tldr\tx1, [x0, #8]\n' \
+    '1000:\tadrp\tx0, 0x5000\n1004:\tblraa\tx8, x9\n1008:\tldr\tx1, [x0, #16]\n'
+# every register write ends the page: a 32-bit write, a pair load's second register, and a
+# pre- or post-indexed base
+compare 1 adrp-w-write '1000:\tadrp\tx8, 0x5000\n1004:\tldr\tw8, [x9]\n1008:\tadd\tx10, x8, #0x10\n' \
+    '1000:\tadrp\tx8, 0x5000\n1004:\tldr\tw8, [x9]\n1008:\tadd\tx10, x8, #0x20\n'
+compare 1 adrp-pair-load '1000:\tadrp\tx1, 0x5000\n1004:\tldp\tx0, x1, [x9]\n1008:\tldr\tx2, [x1, #0x8]\n' \
+    '1000:\tadrp\tx1, 0x5000\n1004:\tldp\tx0, x1, [x9]\n1008:\tldr\tx2, [x1, #0x10]\n'
+compare 1 adrp-pre-index '1000:\tadrp\tx8, 0x5000\n1004:\tldr\tx0, [x8, #0x10]!\n1008:\tldr\tx2, [x8, #0x8]\n' \
+    '1000:\tadrp\tx8, 0x5000\n1004:\tldr\tx0, [x8, #0x10]!\n1008:\tldr\tx2, [x8, #0x18]\n'
+compare 1 adrp-post-index '1000:\tadrp\tx8, 0x5000\n1004:\tldr\tx9, [x8], #0x10\n1008:\tldr\tx2, [x8, #0x8]\n' \
+    '1000:\tadrp\tx8, 0x5000\n1004:\tldr\tx9, [x8], #0x10\n1008:\tldr\tx2, [x8, #0x18]\n'
+# a zero addend prints no offset, and a literal load's address moves with the layout
+compare 0 adrp-zero-addend '1000:\tadrp\tx8, 0x5000\n1004:\tldr\tx8, [x8]\n' '1000:\tadrp\tx8, 0x6000\n1004:\tldr\tx8, [x8, #0x8]\n'
+compare 0 literal-load-moved '1000:\tldr\tx0, 0x5000 <foo>\n' '1000:\tldr\tx0, 0x6000 <bar>\n'
+# an LSE atomic writes the value loaded from memory to its second operand (both of a casp pair)
+compare 1 adrp-lse-swap '1000:\tadrp\tx8, 0x5000\n1004:\tswp\tx0, x8, [x9]\n1008:\tldr\tx1, [x8]\n' \
+    '1000:\tadrp\tx8, 0x5000\n1004:\tswp\tx0, x8, [x9]\n1008:\tldr\tx1, [x8, #0x8]\n'
+compare 1 adrp-lse-ldadd '1000:\tadrp\tx8, 0x5000\n1004:\tldaddal\tw0, w8, [x9]\n1008:\tldr\tx1, [x8]\n' \
+    '1000:\tadrp\tx8, 0x5000\n1004:\tldaddal\tw0, w8, [x9]\n1008:\tldr\tx1, [x8, #0x8]\n'
+compare 1 adrp-lse-casp '1000:\tadrp\tx1, 0x5000\n1004:\tcaspal\tx0, x1, x2, x3, [x10]\n1008:\tldr\tx4, [x1]\n' \
+    '1000:\tadrp\tx1, 0x5000\n1004:\tcaspal\tx0, x1, x2, x3, [x10]\n1008:\tldr\tx4, [x1, #0x8]\n'
+# an LSE atomic only reads its first operand: a page held there survives
+compare 0 adrp-lse-source '1000:\tadrp\tx0, 0x5000\n1004:\tswp\tx0, x8, [x9]\n1008:\tldr\tx1, [x0, #0x8]\n' \
+    '1000:\tadrp\tx0, 0x6000\n1004:\tswp\tx0, x8, [x9]\n1008:\tldr\tx1, [x0, #0x10]\n'
+# a store-form atomic (stadd: no result register) leaves the page in place
+compare 0 adrp-lse-store '1000:\tadrp\tx8, 0x5000\n1004:\tstadd\tx0, [x9]\n1008:\tldr\tx1, [x8, #0x8]\n' \
+    '1000:\tadrp\tx8, 0x6000\n1004:\tstadd\tx0, [x9]\n1008:\tldr\tx1, [x8, #0x10]\n'
