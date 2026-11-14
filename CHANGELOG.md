@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.18.0](https://github.com/fg-labs/bwa-mem3/compare/v0.17.0...v0.18.0) (2026-11-14)
+
+
+### Features
+
+* **index:** support prefixed minimal methylation indexes ([#794](https://github.com/fg-labs/bwa-mem3/issues/794)) ([3f4035c](https://github.com/fg-labs/bwa-mem3/commit/3f4035cfd41cb14886700d0fc8abfd68091bfeab))
+* **mem:** add --tie-break name for input-order-independent tie-breaks ([#767](https://github.com/fg-labs/bwa-mem3/issues/767)) ([d7c34ee](https://github.com/fg-labs/bwa-mem3/commit/d7c34ee926134e8365a9400294169edc7418708e))
+
+
+### Bug Fixes
+
+* **mem:** honor -I in the first sliced batch's mate-concordant chain cap ([#768](https://github.com/fg-labs/bwa-mem3/issues/768)) ([ec195b2](https://github.com/fg-labs/bwa-mem3/commit/ec195b2027f51bff0480c87a75535df93cb418cb))
+* **pair:** compute mem_pair's tie key without signed shift overflow ([#771](https://github.com/fg-labs/bwa-mem3/issues/771)) ([9fe2f94](https://github.com/fg-labs/bwa-mem3/commit/9fe2f940a11fa5fa27037542848ef24676d4862c))
+
+
+### Documentation
+
+* **mem,regression:** complete the fork-flag lists and the regression script table ([#772](https://github.com/fg-labs/bwa-mem3/issues/772)) ([3f0f6c4](https://github.com/fg-labs/bwa-mem3/commit/3f0f6c4aec4e0288a4caed3956a205325f4e66d1))
+* **meth:** clarify directional library requirements ([#793](https://github.com/fg-labs/bwa-mem3/issues/793)) ([16ea0e8](https://github.com/fg-labs/bwa-mem3/commit/16ea0e86d8fec51e0d0cbd23c8b548bfe0a46889))
+* **readme:** update performance tables for v0.17.0 ([#766](https://github.com/fg-labs/bwa-mem3/issues/766)) ([b078208](https://github.com/fg-labs/bwa-mem3/commit/b078208506faeec7673235bc19461df4cf8066dd))
+
 ## [0.17.0](https://github.com/fg-labs/bwa-mem3/compare/v0.16.0...v0.17.0) (2026-11-07)
 
 
