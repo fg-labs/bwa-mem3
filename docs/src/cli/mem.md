@@ -358,7 +358,11 @@ As in bwa, `-H` `@SQ` records replace the index's `@SQ` block (and the
 `<prefix>.hdr` / `<baseprefix>.dict` sidecar is then ignored), verbatim and in
 the order given. At most one `@HD` is written, always as the first line: the
 first one in `-H`, else the sidecar's, else the default, which
-`--compat=bwa-mem2` suppresses (that target then writes no `@HD`). SAM text
+`--compat=bwa-mem2` suppresses (that target then writes no `@HD`). SAM requires
+`@RG` and `@PG` IDs to be unique, so a sidecar `@RG` or `@PG` whose type and
+`ID` an `-R`/`-H` record also declares is dropped and only the user's record is
+written; the sidecar's other records are kept, in order. This holds with and
+without `--meth`. SAM text
 and `--bam` get the same header, except that each run's `@PG` line records its
 own command line. A `--bam` record refers to its contig by position in the
 header's `@SQ` list, so `--bam` maps each contig by name onto the `@SQ` block

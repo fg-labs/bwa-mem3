@@ -138,6 +138,13 @@ ok "meth_rg_header_test"
 "$HERE/meth_sidecar_enrich_test.sh" "$BWAMEM3" "$FIXTURES" || fail "meth_sidecar_enrich_test failed"
 ok "meth_sidecar_enrich_test"
 
+# --- sidecar_id_collision_test --------------------------------------------
+# A user @RG/@PG (-R/-H) must replace the index sidecar's record of the same
+# type and ID on every writer (SAM, --bam, --meth, --meth --bam), not be
+# emitted beside it: SAM requires @RG and @PG IDs to be unique.
+"$HERE/sidecar_id_collision_test.sh" "$BWAMEM3" "$FIXTURES" || fail "sidecar_id_collision_test failed"
+ok "sidecar_id_collision_test"
+
 # --- index_alt_sidecar_warn_test ------------------------------------------
 # `index` must warn when the reference has ALT contigs (<prefix>.alt) but the
 # header sidecar supplies @SQ with no AH tag -- the Picard/GATK .dict case,

@@ -55,7 +55,8 @@ extern const uint8_t *g_meth_orig_pac;
  * or NULL: its @SQ identity tags (M5/UR/AS/SP) are merged into the @SQ for
  * each contig whose SN and LN both match (an LN mismatch means a
  * stale/foreign sidecar and is skipped), and its @CO/@PG/@RG records are
- * forwarded after @SQ; its @HD and @SQ lines are dropped. Returns NULL on
+ * forwarded after @SQ, except an @RG/@PG whose ID `hdr_line` also declares
+ * (the user's replaces it); its @HD and @SQ lines are dropped. Returns NULL on
  * failure. */
 meth_bam_writer_t *meth_bam_writer_open(const char *path_or_dash,
                                         const bntseq_t *bns,
