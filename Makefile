@@ -1479,6 +1479,7 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh
+	./test/help_prescan_test.sh --list-only
 	./test/regression/mem_cli_selftest.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_cli_basics.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_io_cli.sh
