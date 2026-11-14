@@ -246,7 +246,7 @@ Notes and caveats:
   `--seed-order`, `--chunk-cap`,
   [`--proper-pair-from-emitted`](#--proper-pair-from-emitted--derive-flag-0x2-from-the-emitted-alignment),
   [`--tie-break name`](#--tie-break-str--what-seeds-equal-score-tie-breaks)
-  and [`--alt-project`](#--alt-project--let-alt-haplotypes-decide-placement).
+  and [`--alt-project`](#--alt-project-mode--let-alt-haplotypes-decide-placement).
   [`--md none`](#--md-str--which-md-tag-to-write) is refused the same way: it
   changes no alignment, but both upstreams always write `MD`.
   The error names the offending flags (`--compat and these levers are mutually
@@ -540,27 +540,147 @@ Treats ALT contigs as part of the primary assembly by ignoring the
 `<idxbase>.alt` file. Use when your workflow does not include ALT-aware
 postprocessing.
 
-#### `--alt-project` — let ALT haplotypes decide placement
+#### `--alt-project MODE` — let ALT haplotypes decide placement
 
-Off by default. ALT-aware mapping (an index with an `<idxbase>.alt` sidecar) keeps
-a primary-assembly hit primary however well an ALT contig scores: ALT hits only
-lower MAPQ, so a read whose haplotype exists only as an ALT is placed by the
-primary assembly alone. With `--alt-project`, alignments to ALT contigs are
-lifted onto the primary assembly before primary marking, pairing and MAPQ:
+Off by default. Use it when you align to a reference with ALT contigs (an
+index with an `<idxbase>.alt` sidecar, such as GRCh38 with its ALT scaffolds)
+and want reads from non-reference haplotypes placed on the primary assembly.
+ALT-aware mapping keeps a primary-assembly hit primary however well an ALT
+contig scores; ALT hits only lower MAPQ. A read whose haplotype exists only on
+an ALT is therefore placed by the primary assembly alone. `--alt-project` lifts
+alignments to ALT contigs onto the primary assembly through the `.alt` CIGAR,
+before primary marking, pairing and MAPQ, so the ALT match decides where the
+read goes, and writes lifted reads on the primary assembly.
 
-**Placement trust:** projection checks whether the `.alt` alignment describes
-an interval, not whether it names the correct biological locus. An ALT placed
-at the wrong copy of a duplicated region can move matching reads there. Curate
-ambiguous placements before use. The `.alt` MAPQ field is not used; MAPQ 255
-means confidence is unavailable, not that the placement is certain. The
-optional score-gap guard below can refuse some ambiguous lifts, but cannot
-establish the correct locus when no competing hit was found. Even a correctly
-placed ALT can attract reads from another paralog if that copy's matching
-haplotype is absent from the reference. Identical read pairs from different
-copies cannot be separated by an alignment-score cutoff alone; informative
-mate sequence can resolve some cases, but a larger gap can also discard useful
-haplotype evidence. Validate the reference's competing haplotype representation,
-not just each ALT's placement.
+`MODE` is required. The two modes differ only in the ALT hits the lift cannot
+describe:
+
+- `primary` drops them, so the output names no ALT contig: no `@SQ`, RNAME,
+  RNEXT, `SA` or `XA` does. Use it when downstream tools expect alignments to
+  the primary assembly only, in place of ALT-aware mapping followed by a filter
+  that removes ALT records.
+- `keep-alt` leaves them on their ALT contigs, as ALT-aware mapping writes them,
+  and the header keeps every ALT `@SQ`.
+
+The configuration benchmarked in
+[#775](https://github.com/fg-labs/bwa-mem3/pull/775) is `primary` with a BED of
+the reference's segmental duplications, which keeps ALTs that overlap
+duplicated regions from lifting (see [`--alt-project-exclude-bed`](#--alt-project-exclude-bed-file--restrict-which-alt-alignments-lift)
+and the placement caveats below):
+
+```bash
+bwa-mem3 mem -t 16 --alt-project primary \
+    --alt-project-exclude-bed segdups.bed.gz \
+    GRCh38_alt.fa R1.fq.gz R2.fq.gz > out.sam
+```
+
+Models and filters trained on ordinary alignments may need reevaluation or
+retraining on projected alignments.
+
+- It cannot be combined with [`-j`](#-j--treat-alt-contigs-as-primary) or `--meth`.
+- It deviates from both upstreams
+  ([#775](https://github.com/fg-labs/bwa-mem3/pull/775)), so it is a **hard error** with
+  [`--compat`](#--compattarget--byte-identical-output-for-another-aligner)
+  (overridable via `--compat-allow-divergent`).
+- When on, the startup log reports how many ALT contigs lift.
+
+##### ALT projection output
+
+A lifted read is written on the primary assembly, aligned to the primary
+reference at the lifted position with a band at least as wide as the ALT's
+indels need (the lift rules below guarantee the re-alignment has it), so CIGAR,
+`NM` and `MD` describe that alignment, ALT insertions and deletions included.
+`AS` stays the score that placed the read (the ALT alignment's), consistent with
+`XS` and MAPQ, so it can exceed what the CIGAR and `NM` imply. Lifted records
+carry `XL:Z:<source-contig>`, naming the ALT contig from which that record was
+projected. It names the selected source, not every ALT that supported the
+locus, and does not encode the original source interval. Unlifted and
+mate-rescued records do not inherit a mate's source. `XA`/`XB` entries keep
+their existing format and carry no source provenance.
+
+A lifted hit never appears as an ALT hit, whether it was kept or dropped. When
+it replaces a primary-assembly hit, that hit is gone. When it is dropped, the
+read loses what the default run writes for the ALT hit: the `pa:f:` tag, the
+ALT hit's `XA` entry and, where the default writes the ALT hit as a
+supplementary record (a read that runs off the end of the ALT, say), that record
+and the `SA:Z` tag linking to it. `XA` and `HN` on the remaining record list and
+count the read's other hits, so they can change with the set of hits that remain.
+
+The unlifted ALT hits are those refused by the lift rules, by
+`--alt-project-min-gap`, or on a contig with no usable `.alt` line, including
+one `--alt-project-exclude-bed` excludes. What each mode does with them:
+
+- `keep-alt` leaves them to ordinary ALT-aware handling: they can be written on
+  their ALT contig, and the header still lists every ALT contig. Large ALT
+  dictionaries can increase downstream memory use even when few records remain
+  on ALTs; deleting `@SQ` lines afterwards is unsafe while records or alignment
+  tags still refer to them.
+- `primary` drops them right after projection, before primary marking,
+  insert-size estimation, mate rescue, pairing and MAPQ. The `@SQ` block lists
+  no ALT contig: any supplied with `-H` or in the index's `.hdr`/`.dict` sidecar
+  are left out, with a note. The `.alt` decides which contigs are ALT, so `AH`
+  on any other `@SQ` is kept, also with a note.
+
+Under `primary`, a read whose primary-assembly hits all score below `-T` is
+written as an ordinary unmapped record (placed at its mate when the mate is
+mapped), with `OA:Z:RNAME,POS,strand,CIGAR,MAPQ,NM;` describing its best
+unlifted ALT hit scoring at least `-T`: the alignment on the ALT contig, POS
+1-based, with the MAPQ that hit would have had if the read's ALT hits were its
+only hits. That MAPQ does not apply the `--extend-csub` competitor floor (the
+score of chains dropped before extension), which only the read's own primary
+record gets. In paired-end input, pairing can still write an end whose own
+primary-assembly hits all score below `-T` mapped, at a hit that pairs with its
+mate's; such an end has no `OA:Z` and is not counted. The run ends by logging
+how many read ends were written unmapped with `OA:Z` (each end of a pair counts
+once, so a pair with both ends demoted counts 2). `XL:Z` still names a lifted
+record's source ALT, a contig the header does not list.
+
+Because the dropped hits no longer compete, the rest of a `primary` run can
+differ from `keep-alt` as well: `pa:f:` is never written, the `XA` cap is
+[`-h`](#-h-intint--secondary-alignment-reporting)'s first value (as on an index
+without ALT contigs), and the insert-size estimate and mate rescue no longer see
+ALT hits. A read whose best match is an ALT region excluded by
+`--alt-project-exclude-bed` is unmapped if its own primary-assembly hits score
+below `-T` (unless, paired, pairing writes it at a hit that pairs with its
+mate's, as above). The excluded ALT stays in the index, so this can happen to
+more reads than with an index built without it.
+
+##### ALT projection placement caveats
+
+Projection checks whether the `.alt` alignment describes an interval, not
+whether it names the correct biological locus. An ALT placed at the wrong copy
+of a duplicated region can move matching reads there, so curate ambiguous
+placements before use. The `.alt` MAPQ field is not used; MAPQ 255 means
+confidence is unavailable, not that the placement is certain. The optional
+score-gap guard (`--alt-project-min-gap`) can refuse some ambiguous lifts, but
+cannot establish the correct locus when no competing hit was found.
+
+Even a correctly placed ALT can attract reads from another paralog if that
+copy's matching haplotype is absent from the reference. Identical read pairs
+from different copies cannot be separated by an alignment-score cutoff alone.
+Informative mate sequence can resolve some cases, but a larger gap can also
+discard useful haplotype evidence. Validate how the reference represents
+competing haplotypes as well as each ALT's placement.
+
+##### Which `.alt` lines lift
+
+`--alt-project` needs a `.alt` sidecar whose lines carry alignments (RNAME, POS,
+CIGAR). A usable line is a primary alignment (no FLAG `0x4`, `0x100` or `0x800`)
+of a contig in the index onto a non-ALT contig in the index, with a CIGAR whose
+query length equals the contig's and which ends within the target; for a contig
+with several usable lines the first wins. Other lines are skipped, and the
+startup log counts them by reason. A missing `.alt` file, or one with no usable
+line, is an error.
+
+Every usable line lifts, whatever the contig. In bwakit's hs38DH `.alt` that
+includes the HLA allele contigs (`HLA-*`) as well as the `_alt` scaffolds. A hit
+on an allele contig is lifted to the primary locus its `.alt` line names, so an
+allele group whose contigs align to several primary loci (HLA-DRB1's paralogs,
+for example) lifts each hit to its own contig's locus, and reads that match an
+allele best are written there instead of on the allele contig. HLA typing that
+reads hits on the allele contigs needs a run without `--alt-project`.
+
+##### ALT projection rules (reference)
 
 - **Lift.** The hit's reference interval is mapped through that ALT's `.alt`
   CIGAR (FLAG 16 flips the strand). It keeps its score and query span. A hit is
@@ -572,8 +692,8 @@ not just each ALT's placement.
   off its diagonal (its excursion) must be at most the band width
   [`-w`](#scoring), at most 1022 bases whatever `-w` is (the most a hit can
   carry; this caps the excursion, not the band), and at most the band the
-  re-alignment (below) will use. That band is capped by the hit's length, as for
-  any re-alignment: at the default `-A`/`-O`/`-E`, about 35 bases for a 150 bp hit
+  re-alignment will use. That band is capped by the hit's length, as for any
+  re-alignment: at the default `-A`/`-O`/`-E`, about 35 bases for a 150 bp hit
   and 23 for a 100 bp one when its indels cancel, plus half the net length change
   otherwise, and never below the net length change plus 3. Any other hit stays
   on its ALT contig with ALT-aware handling, as it would without the flag.
@@ -581,92 +701,45 @@ not just each ALT's placement.
   more than 95% of the shorter one (the redundancy threshold ordinary
   deduplication uses, so a placement one repeat unit away in a tandem repeat
   stays a separate hit) and their read intervals by more than half of the
-  shorter one. A lifted hit can replace the primary-assembly hits at its locus
+  shorter one.
+- **Replace.** A lifted hit can replace the primary-assembly hits at its locus
   only if it outscores each of them by more than `-A` times the number of that
   hit's read bases it leaves out (the bases it aligns outside the lifted hit's
   read interval, which the lifted record would soft-clip). So a tie goes to the
-  primary assembly; a shorter lifted hit (say, a read that runs off the end of a
+  primary assembly. A shorter lifted hit (say, a read that runs off the end of a
   divergent ALT) does not replace a primary-assembly hit that aligns the bases
-  it misses unless it beats it by more than those bases are worth; and a lifted
+  it misses unless it beats it by more than those bases are worth, and a lifted
   hit that is clearly better but misses a few clipped end bases does replace it.
-  A lifted hit that can replace them does, and of two such hits at one locus the
-  higher-scoring one is kept. A lifted hit that cannot replace every
-  primary-assembly hit at its locus replaces none of them: it is dropped when a
-  hit that is kept is at its locus (a primary-assembly hit or another lifted
-  hit), and kept otherwise, for instance when another lifted hit replaced the
-  primary-assembly hit it could not. A lifted hit is therefore only ever dropped
-  for a hit kept at its locus. The `-A` credit applies only when a lifted hit
-  would replace a primary-assembly hit: between two lifted hits at one locus the
+- **Keep.** A lifted hit that can replace the primary-assembly hits at its locus
+  does, and of two such hits at one locus the higher-scoring one is kept. A
+  lifted hit that cannot replace every primary-assembly hit at its locus
+  replaces none of them. It is dropped when a hit that is kept (a
+  primary-assembly hit or another lifted hit) is at its locus, and kept
+  otherwise, for instance when another lifted hit replaced the primary-assembly
+  hit it could not. A lifted hit is therefore only ever dropped for a hit kept
+  at its locus.
+- **Ties between lifted hits.** The `-A` credit applies only when a lifted hit
+  would replace a primary-assembly hit. Between two lifted hits at one locus the
   higher score wins, as in ordinary deduplication, with no credit for read bases
-  one aligns and the other leaves out. So whether a primary-assembly hit is at
-  the locus can change which lifted hit is kept: if the higher-scoring lifted
-  hit cannot replace that primary-assembly hit and a lower-scoring one that
-  aligns more of the read can, the lower-scoring one is kept, and without the
-  primary-assembly hit the higher-scoring one is. Of two lifted hits that tie on
-  score, position and read start, one that can replace the primary-assembly hits
-  at their locus is kept over one that cannot; when both can, or both cannot,
-  the one from the ALT contig that comes first in the index is kept. The result
-  does not depend on the order hits are compared in. Pairs of unlifted hits are
-  left as without the flag, and a lifted hit is not merged with a colinear
-  primary-assembly hit it does not overlap (the read then has a primary and a
-  supplementary record, as without the flag).
-- Everything after that is unchanged. ALT hits that land at other loci count as
-  suboptimal hits for MAPQ, pairs are scored with the usual insert-size model,
-  and mate rescue searches near the mate's alignment: on the primary assembly
-  when that mate is on it, lifted or not, and on the ALT contig when the mate's
-  hit stayed there.
+  one aligns and the other leaves out. So a primary-assembly hit at the locus can
+  change which lifted hit is kept: if the higher-scoring lifted hit cannot
+  replace it and a lower-scoring one that aligns more of the read can, the
+  lower-scoring one is kept; without the primary-assembly hit, the
+  higher-scoring one is. Of two lifted hits that tie on score, position and read
+  start, one that can replace the primary-assembly hits at their locus is kept
+  over one that cannot; when both can, or both cannot, the one from the ALT
+  contig that comes first in the index is kept. The result does not depend on
+  the order hits are compared in.
+- **Everything else.** Pairs of unlifted hits are left as without the flag, and
+  a lifted hit is not merged with a colinear primary-assembly hit it does not
+  overlap (the read then has a primary and a supplementary record, as without
+  the flag). After projection the pipeline is unchanged. ALT hits that land at
+  other loci count as suboptimal hits for MAPQ, pairs are scored with the usual
+  insert-size model, and mate rescue searches near the mate's alignment: on the
+  primary assembly when that mate is on it, lifted or not, and on the ALT contig
+  when the mate's hit stayed there.
 
-A lifted read is written on the primary assembly, aligned to the primary
-reference at the lifted position with a band at least as wide as the ALT's
-indels need (the lift rule above guarantees the re-alignment has it), so CIGAR,
-`NM` and `MD` describe that alignment, ALT insertions and deletions included.
-`AS` stays the score that placed the read (the ALT alignment's), consistent with
-`XS` and MAPQ, so it can exceed what the CIGAR and `NM` imply. A lifted hit
-never appears as an ALT hit, whether it was kept or dropped. When it replaces a
-primary-assembly hit (above), that hit is gone. When it is dropped, the read
-loses what the default run writes for the ALT hit: the `pa:f:` tag, the ALT
-hit's `XA` entry and, where the default writes the ALT hit as a supplementary
-record (a read that runs off the end of the ALT, say), that record and the
-`SA:Z` tag linking to it. `XA` and `HN` on the remaining record list and count
-the read's other hits, so they can change with the set of hits that remain.
-Lifted records carry `XL:Z:<source-contig>`, naming the ALT contig from which
-that record was projected. It describes the selected source, not every ALT
-that supported the locus; it does not encode the original source interval.
-Unlifted and mate-rescued records do not inherit a mate's source. `XA`/`XB`
-entries retain their existing format and do not include source provenance.
-
-The header still lists the ALT contigs; records reach them for hits that were
-not lifted (including score-gap refusals) and for ALT contigs with no usable
-`.alt` line. This is not a primary-only output mode. Large ALT dictionaries can
-increase downstream memory use even when few records remain on ALTs; deleting
-`@SQ` lines alone is unsafe while records or alignment tags still refer to them.
-Models and filters trained on ordinary alignments may need reevaluation or
-retraining on projected alignments.
-
-`--alt-project` needs a `.alt` sidecar whose lines carry alignments (RNAME, POS,
-CIGAR). A usable line is a primary alignment (no FLAG `0x4`, `0x100` or `0x800`)
-of a contig in the index onto a non-ALT contig in the index, with a CIGAR whose
-query length equals the contig's and which ends within the target; for a contig
-with several usable lines the first wins. Other lines are skipped, and the startup
-log counts them by reason. A missing `.alt` file, or one with no usable line, is
-an error.
-
-Every usable line lifts, whatever the contig: in bwakit's hs38DH `.alt` that
-includes the HLA allele contigs (`HLA-*`) as well as the `_alt` scaffolds. A hit
-on an allele contig is lifted to the primary locus its `.alt` line names, so an
-allele group whose contigs align to several primary loci (HLA-DRB1's paralogs,
-for example) lifts each hit to its own contig's locus, and reads that match an
-allele best are written there instead of on the allele contig. HLA typing that
-reads hits on the allele contigs needs a run without `--alt-project`.
-
-- It cannot be combined with [`-j`](#-j--treat-alt-contigs-as-primary) or `--meth`.
-- It deviates from both upstreams
-  ([#775](https://github.com/fg-labs/bwa-mem3/pull/775)), so it is a **hard error** with
-  [`--compat`](#--compattarget--byte-identical-output-for-another-aligner)
-  (overridable via `--compat-allow-divergent`).
-- When on, the startup log reports how many ALT contigs lift.
-
-#### `--alt-project-exclude-bed FILE` - restrict which `.alt` alignments lift
+#### `--alt-project-exclude-bed FILE` — restrict which `.alt` alignments lift
 
 Off by default. With `--alt-project`, an otherwise usable `.alt` line is not
 used for projection when its primary footprint overlaps an interval in `FILE`
@@ -735,7 +808,7 @@ can share contig names. Accuracy evidence for one validated BED and reference
 does not carry over to an arbitrary BED, reference or `.alt`; validate a new
 combination on independent data before relying on it.
 
-#### `--alt-project-min-gap INT` - experimental cross-locus ambiguity guard
+#### `--alt-project-min-gap INT` — experimental cross-locus ambiguity guard
 
 Default 0 (disabled). Requires `--alt-project`, even when explicitly set to 0.
 For a positive value, an otherwise eligible lift must score **more than**
@@ -753,16 +826,23 @@ alignment scores, without length normalization.
 
 All decisions use the same projected candidate snapshot, before replacement
 and grouping, so refusing one lift does not change another lift's competitor
-set. Refusal leaves the original ALT hit available for normal ALT-aware
-handling; it does not delete the hit, force an unmapped record, or guarantee
-the placement of a run without projection. Pairing and MAPQ still follow the
-usual pipeline. Refusing a projection can remove its score from primary-locus
-pair competition, so the selected placement can change or become more confident.
+set. Under `keep-alt`, refusal leaves the original ALT hit available for normal
+ALT-aware handling; it does not delete the hit, force an unmapped record, or
+guarantee the placement of a run without projection. Under `primary`, a refused
+hit is dropped like any other unlifted ALT hit, and the rules above apply: a
+read whose primary-assembly hits all score below `-T` is written unmapped,
+carrying `OA:Z` only if its best unlifted ALT hit scores at least `-T`, except
+that pairing can still write a paired end mapped at a hit that pairs with its
+mate's. Pairing and MAPQ still follow the usual pipeline. Refusing a projection
+can remove its score from primary-locus pair competition, so the selected
+placement can change or become more confident.
 The guard does not promise to lower MAPQ, and an ALT hit left behind is not a
 safe fallback to the correct locus. This guard is experimental: choosing a
 larger gap can suppress useful haplotype placements as well as ambiguous ones.
 Validate both errors and true-positive retention on independent data before
 selecting a value.
+
+##### ALT projection tracing and the pair-gap experiment
 
 For read-level debugging, set `BWAMEM3_ALT_PROJECT_TRACE` to an exact QNAME or
 comma-separated QNAMEs. With `--alt-project`, stderr reports tab-separated
@@ -789,8 +869,9 @@ but labels the ambiguity gate disabled.
 
 A developer-only alternative, `BWAMEM3_ALT_PROJECT_PAIR_GAP=1`, defers the positive
 gap to paired confidence instead of refusing projections. Projection and pair
-selection then match gap 0. If the paired alignment beats the independently selected ends and either selected
-end is lifted, both MAPQs are capped at `min(60, round(6.02 * max(0, pair_score - competitor_score - INT * -A) / -A))`.
+selection then match gap 0. If the paired alignment beats the independently
+selected ends and either selected end is lifted, both MAPQs are capped at
+`min(60, round(6.02 * max(0, pair_score - competitor_score - INT * -A) / -A))`.
 The competitor score is the greatest of the best alternative pair, the unpaired
 score and, with `--extend-csub`, the estimated pair score of a competitor whose
 chains were pruned before extension, so that estimate can set the competitor score

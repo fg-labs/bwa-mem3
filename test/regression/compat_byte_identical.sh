@@ -346,8 +346,9 @@ for f in "$ref" "$ref".*; do ln -sf "$f" "$alt_dir/${f##*/}"; done
 printf 'phix_alt\t0\tphix\t1\t60\t10M\t*\t0\t0\t*\t*\n' > "$alt_dir/phix.fa.alt"
 ref_main="$ref"
 ref="$alt_dir/phix.fa"
-compat_err "mutually exclusive: --alt-project" --compat=bwa-mem2 --alt-project
-compat_err "mutually exclusive: --alt-project" --compat=bwa-mem --alt-project
+compat_err "mutually exclusive: --alt-project" --compat=bwa-mem2 --alt-project keep-alt
+compat_err "mutually exclusive: --alt-project" --compat=bwa-mem --alt-project keep-alt
+compat_err "mutually exclusive: --alt-project" --compat=bwa-mem2 --alt-project primary
 ref="$ref_main"
 # --skip-contained-ext is now the default (byte-identical) and deprecated to an accepted
 # no-op, and --compat keeps the skip (proven byte-identical), so it is accepted, not a hard

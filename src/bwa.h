@@ -97,6 +97,10 @@ typedef struct {
 
 extern int bwa_verbose;
 extern char bwa_rg_id[256];
+/* `--alt-project primary`: when nonzero, bwa_build_sam_hdr writes no @SQ for an
+ * ALT contig (generated, sidecar or -H) and the --bam writer maps ALT contigs
+ * to no header entry. 0 (every other mode) leaves the header untouched. */
+extern int bwa_hdr_primary_only;
 
 #ifdef __cplusplus
 extern "C" {
