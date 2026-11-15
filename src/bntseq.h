@@ -124,6 +124,9 @@ extern "C" {
 	/* Build the .pac path bns_restore opens for `prefix` ("<prefix>.pac") into
 	 * `out` (sized `outsz`, e.g. PATH_MAX); aborts if it would not fit. */
 	void bns_pac_path(char *out, size_t outsz, const char *prefix);
+	/* The same for the .alt sidecar bns_restore reads the ALT contig names from
+	 * ("<prefix>.alt"); `mem --alt-project` reads the alignments from it too. */
+	void bns_alt_path(char *out, size_t outsz, const char *prefix);
 	bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, const char* pac_filename);
 	void bns_destroy(bntseq_t *bns);
 	int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only);

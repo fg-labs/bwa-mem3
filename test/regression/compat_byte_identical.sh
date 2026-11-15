@@ -334,6 +334,22 @@ compat_err "mutually exclusive" --compat=bwa-mem2 --supp-rep-hard-cap=10
 compat_err "mutually exclusive" --compat=bwa-mem2 --seed-order local-longest
 compat_err "tie-break name" --compat=bwa-mem2 --tie-break name
 compat_err "tie-break name" --compat=bwa-mem --tie-break name
+# --alt-project fails on a missing <idxbase>.alt before --compat sees it, and the
+# phix index has none, so its refusal is checked on a prefix that has one:
+# symlinks to the phix index plus a one-line .alt (the refusal comes before the
+# .alt is read). Not beside $ref: a .alt there would make later runs ALT-aware.
+# This is the only check of that refusal; alt_project.sh checks the rest of the
+# option, including that --compat-allow-divergent admits it.
+alt_dir="$COMPAT_WORK_DIR/alt-project"
+mkdir -p "$alt_dir"
+for f in "$ref" "$ref".*; do ln -sf "$f" "$alt_dir/${f##*/}"; done
+printf 'phix_alt\t0\tphix\t1\t60\t10M\t*\t0\t0\t*\t*\n' > "$alt_dir/phix.fa.alt"
+ref_main="$ref"
+ref="$alt_dir/phix.fa"
+compat_err "mutually exclusive: --alt-project" --compat=bwa-mem2 --alt-project keep-alt
+compat_err "mutually exclusive: --alt-project" --compat=bwa-mem --alt-project keep-alt
+compat_err "mutually exclusive: --alt-project" --compat=bwa-mem2 --alt-project primary
+ref="$ref_main"
 # --skip-contained-ext is now the default (byte-identical) and deprecated to an accepted
 # no-op, and --compat keeps the skip (proven byte-identical), so it is accepted, not a hard
 # error; --keep-contained-ext is the opt-out and stays accepted under --compat too (the

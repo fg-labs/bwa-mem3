@@ -289,6 +289,7 @@ int main(int argc, char* argv[])
             "--meth-tags", "--meth-context", "--set-as-failed", "--supp-rep-hard-cap",
             "--seed-order", "--compat", "--md", "--tie-break", "--bam-threads",
             "--ks-dedup", "--extend-tie-frac", "--extend-tie-floor",
+            "--alt-project", "--alt-project-min-gap", "--alt-project-exclude-bed",
 #ifdef STAGE_PROF
             "--profile",
 #endif

@@ -246,6 +246,46 @@ TEST_CASE("pa: the --bam value is the float32 of the SAM text token"
     free(opt);
 }
 
+TEST_CASE("XL: source provenance is identical in SAM and BAM, including long names"
+          * doctest::test_suite("unit/bam_pa_tag_parity")) {
+    mem_opt_t *opt = mem_opt_init();
+    ReadFixture read;
+    CigarFixture cig;
+    // The record is placed on contig 0 ("chr1"); its source is contig 1, an
+    // ALT with a long name, so a writer that emitted the destination's name
+    // (or any other contig's) for XL would fail. The expected value is the
+    // literal source name, not anything read back from a writer.
+    const std::string name(8192, 'x');
+    bntann1_t anns[2]{};
+    anns[0].len = 1000; anns[0].name = const_cast<char *>("chr1"); anns[0].anno = const_cast<char *>("");
+    anns[1].offset = 1000; anns[1].len = 1000; anns[1].is_alt = 1;
+    anns[1].name = const_cast<char *>(name.c_str()); anns[1].anno = const_cast<char *>("");
+    bntseq_t bns{};
+    bns.l_pac = 2000; bns.n_seqs = 2; bns.anns = anns;
+    auto aln = make_aln(cig.buf, 10, 0);
+    for (int source_plus1 : {0, 2}) {
+        aln.alt_source_rid_plus1 = source_plus1;
+        const std::string sam = emit_sam(opt, &bns, &read.s, &aln);
+        REQUIRE(sam.find("\tchr1\t") != std::string::npos);
+        bam1_t *b = bam_writer_alloc();
+        REQUIRE(mem_aln_to_bam(b, opt, &bns, &read.s, 1, &aln, 0, NULL) == 0);
+        CHECK(b->core.tid == 0);
+        uint8_t *tag = bam_aux_get(b, "XL");
+        if (source_plus1) {
+            REQUIRE(tag != nullptr);
+            CHECK(std::string(bam_aux2Z(tag)) == name);
+            CHECK(sam.find("\tXL:Z:" + name) != std::string::npos);
+            CHECK(sam.find("\tXL:Z:chr1") == std::string::npos);
+        } else {
+            CHECK(tag == nullptr);
+            CHECK(sam.find("\tXL:") == std::string::npos);
+        }
+        CHECK(sam_tag_names(sam) == bam_tag_names(b));
+        bam_writer_free(b);
+    }
+    free(opt);
+}
+
 TEST_CASE("pa: ties at the fourth decimal round the way the SAM text does"
           * doctest::test_suite("unit/bam_pa_tag_parity")) {
     // 39/48 == 0.8125 exactly, so this is a genuine halfway case. printf's
