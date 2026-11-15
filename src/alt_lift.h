@@ -84,12 +84,17 @@ typedef struct {
 alt_lift_t *alt_lift_load(const char *path, const bntseq_t *bns);
 void alt_lift_destroy(alt_lift_t *l);
 
-/* BED rows and otherwise-usable alignments excluded by restricted loading. */
+/* Which input a restricted load failed on, so the caller names the right one. */
+typedef enum { ALT_LIFT_INPUT_NONE = 0, ALT_LIFT_INPUT_BED, ALT_LIFT_INPUT_SIDECAR } alt_lift_input_t;
+
+/* BED rows and otherwise-usable alignments excluded by restricted loading, and
+ * on failure the input that failed. */
 typedef struct {
     long input_intervals;       /* nonempty validated rows before merge */
     long merged_intervals;
     long zero_width_intervals;
     long excluded;              /* excluded before first-retained selection */
+    alt_lift_input_t failed;    /* ALT_LIFT_INPUT_NONE unless NULL was returned */
 } alt_lift_exclude_stats_t;
 
 /* Load with whole-primary-footprint BED exclusion, preserving bns ALT flags.

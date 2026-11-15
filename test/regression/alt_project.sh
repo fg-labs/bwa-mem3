@@ -81,7 +81,8 @@
 #     contig's end (each message carries the option, the BED path and the line),
 #     a BED with no nonempty interval, one that excludes nothing, one that
 #     excludes every usable line, and a .alt with no usable line (keeping the
-#     ordinary error)
+#     ordinary error); a .alt that fails to read is reported under --alt-project,
+#     not the BED option
 #   * mixed exclusion (two independent ALT haplotypes, one excluded by a BED
 #     interval inside its primary footprint but away from its informative reads,
 #     one retained): every informative end from the retained ALT is lifted to its
@@ -878,6 +879,15 @@ exclude_refuse exclude.empty.unusable 'no ALT contig in bad.fa.alt has a usable 
 grep -q 'no nonempty intervals' exclude.empty.unusable.log && fail "empty BED masked the zero-usable error"
 exclude_refuse exclude.unusable 'no ALT contig in bad.fa.alt has a usable alignment' --alt-project keep-alt --alt-project-exclude-bed exclude.bed bad.fa r1.fq r2.fq
 grep -q 'excludes all' exclude.unusable.log && fail "an unusable sidecar was reported as all-excluded"
+# A sidecar that fails to read under the BED option is reported under --alt-project,
+# not under the BED option: a directory opens but its first read fails.
+for f in exclude.fa.*; do
+    [ "$f" = exclude.fa.alt ] || cp "$f" "dirsidecar.fa.${f#exclude.fa.}"
+done
+cp exclude.fa dirsidecar.fa
+mkdir -p dirsidecar.fa.alt
+exclude_refuse exclude.sidecar.read '^\[E::main_mem\] --alt-project: dirsidecar.fa.alt: sidecar read/close failure' \
+    --alt-project keep-alt --alt-project-exclude-bed exclude.bed dirsidecar.fa r1.fq r2.fq
 
 # Mixed exclusion fixture: two independent loci, each a copy (X1, X2 on chrA)
 # with a paralog (Y1, Y2 on chrB) and an ALT haplotype carrying gene-converted

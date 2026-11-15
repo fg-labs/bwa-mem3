@@ -1275,6 +1275,113 @@ TEST_CASE("exclude BED reads every member of a multi-member gzip" * doctest::tes
     CHECK(actual.l->n_lift == 0);
 }
 
+// One BGZF block (SAM spec section 4.1): a gzip member with FEXTRA holding the
+// BC subfield (BSIZE = block size - 1), raw-deflated data, CRC32 and ISIZE.
+// Empty data gives the standard 28-byte EOF block.
+static std::string bgzf_block(const std::string &data) {
+    z_stream zs = {};
+    REQUIRE(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, -15, 8, Z_DEFAULT_STRATEGY) == Z_OK);
+    std::string cdata(deflateBound(&zs, (uLong) data.size()) + 16, '\0');
+    zs.next_in = (Bytef *) data.data();
+    zs.avail_in = (uInt) data.size();
+    zs.next_out = (Bytef *) &cdata[0];
+    zs.avail_out = (uInt) cdata.size();
+    REQUIRE(deflate(&zs, Z_FINISH) == Z_STREAM_END);
+    cdata.resize(zs.total_out);
+    deflateEnd(&zs);
+    auto le = [](std::string &out, uint32_t v, int n) { for (int i = 0; i < n; ++i) out.push_back((char) ((v >> (8 * i)) & 0xff)); };
+    std::string block = {'\x1f', '\x8b', '\x08', '\x04', 0, 0, 0, 0, 0, '\xff', 6, 0, 'B', 'C', 2, 0};
+    le(block, (uint32_t) (18 + cdata.size() + 8 - 1), 2);
+    block += cdata;
+    le(block, (uint32_t) crc32(0L, (const Bytef *) data.data(), (uInt) data.size()), 4);
+    le(block, (uint32_t) data.size(), 4);
+    return block;
+}
+
+TEST_CASE("exclude BED reads a real BGZF file" * doctest::test_suite("unit/alt_lift")) {
+    // Each row in its own BGZF block, then the EOF block, as bgzip writes them.
+    FakeBns fb({{"chr1", 1000, 0}, {"tileA", 100, 1}, {"tileB", 100, 1}});
+    TmpFile source("tileA\t0\tchr1\t101\t60\t100M\ntileB\t0\tchr1\t501\t60\t100M\n");
+    TmpFile bed("");
+    const std::string eof = bgzf_block("");
+    REQUIRE(eof == std::string("\x1f\x8b\x08\x04\0\0\0\0\0\xff\x06\0BC\x02\0\x1b\0\x03\0\0\0\0\0\0\0\0\0", 28));
+    {
+        std::ofstream out(bed.path, std::ios::binary);
+        out << bgzf_block("chr1\t150\t160\n") << bgzf_block("chr1\t550\t560\n") << eof;
+        REQUIRE(out.good());
+    }
+    alt_lift_exclude_stats_t stats = {};
+    char error[1024] = {'x'};
+    LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, bed.path.c_str(), &stats, error, sizeof(error)));
+    REQUIRE(actual.l != nullptr);
+    CHECK(error[0] == 0);
+    CHECK(stats.input_intervals == 2);
+    CHECK(stats.excluded == 2);
+    CHECK(stats.failed == ALT_LIFT_INPUT_NONE);
+    // Both tiles excluded: no lift entries are kept, not only counted.
+    CHECK(actual.l->n_lift == 0);
+    CHECK(actual.l->a[1].trid == -1); // tileA
+    CHECK(actual.l->a[2].trid == -1); // tileB
+}
+
+TEST_CASE("exclude BED parses lines longer than the read buffer" * doctest::test_suite("unit/alt_lift")) {
+    // The loader reads 8192 bytes at a time; a 20000-byte name column makes the
+    // first row span three reads and puts the second row's start mid-buffer.
+    FakeBns fb({{"chr1", 1000, 0}, {"tileA", 100, 1}, {"tileB", 100, 1}});
+    TmpFile source("tileA\t0\tchr1\t101\t60\t100M\ntileB\t0\tchr1\t501\t60\t100M\n");
+    const std::string text = "chr1\t150\t160\t" + std::string(20000, 'n') + "\nchr1\t550\t560\n";
+    TmpFile plain(text.c_str()), compressed("");
+    write_gzip(compressed.path, text);
+    for (const auto &path : {plain.path, compressed.path}) {
+        CAPTURE(path);
+        alt_lift_exclude_stats_t stats = {};
+        char error[1024] = {'x'};
+        LiftGuard actual(alt_lift_load_excluded(source.path.c_str(), &fb.bns, path.c_str(), &stats, error, sizeof(error)));
+        REQUIRE(actual.l != nullptr);
+        CHECK(error[0] == 0);
+        CHECK(stats.input_intervals == 2);
+        CHECK(stats.excluded == 2);
+        CHECK(actual.l->n_lift == 0);
+        CHECK(actual.l->a[1].trid == -1); // tileA
+        CHECK(actual.l->a[2].trid == -1); // tileB
+    }
+}
+
+TEST_CASE("exclude BED loading reports which input failed" * doctest::test_suite("unit/alt_lift")) {
+    // The CLI names the option that failed from stats.failed, so a sidecar
+    // failure is not reported as a BED failure.
+    FakeBns fb({{"chr1", 1000, 0}, {"tile", 100, 1}});
+    TmpFile source("tile\t0\tchr1\t101\t60\t100M\n");
+    TmpFile bed("chr1\t500\t600\n");
+    const char *missing = "/nonexistent/alt_exclude_failed_test";
+    char dir_buf[4096];
+    REQUIRE(bwa_test_mkdtemp(dir_buf, sizeof(dir_buf), "alt_lift_sidecar_dir") == 0);
+    const std::string dir = dir_buf;
+    struct Case { const char *name; std::string sidecar, bed; alt_lift_input_t failed; const char *message; };
+    const Case cases[] = {
+        {"loaded", source.path, bed.path, ALT_LIFT_INPUT_NONE, ""},
+        {"missing BED", source.path, missing, ALT_LIFT_INPUT_BED, "cannot open BED"},
+        {"bad BED row", source.path, source.path, ALT_LIFT_INPUT_BED, "line 1"},
+        {"missing sidecar", missing, bed.path, ALT_LIFT_INPUT_SIDECAR, "cannot open sidecar"},
+        // fopen succeeds on a directory and the first read fails (EISDIR)
+        {"sidecar read failure", dir, bed.path, ALT_LIFT_INPUT_SIDECAR, "sidecar read/close failure"},
+    };
+    for (const auto &c : cases) {
+        CAPTURE(c.name);
+        alt_lift_exclude_stats_t stats = {};
+        stats.failed = ALT_LIFT_INPUT_BED;   // initialized on entry
+        char error[1024] = {'x'};
+        LiftGuard actual(alt_lift_load_excluded(c.sidecar.c_str(), &fb.bns, c.bed.c_str(), &stats, error, sizeof(error)));
+        CHECK((actual.l != nullptr) == (c.failed == ALT_LIFT_INPUT_NONE));
+        // The BED row lies outside the tile's chr1 footprint, so a load keeps its lift entry.
+        if (actual.l) { CHECK(actual.l->n_lift == 1); CHECK(actual.l->a[1].trid == 0); }
+        CHECK(stats.failed == c.failed);
+        CHECK(std::string(error).find(c.message) != std::string::npos);
+        if (c.failed == ALT_LIFT_INPUT_SIDECAR) CHECK(std::string(error).find(c.sidecar) != std::string::npos);
+    }
+    rmdir(dir.c_str());
+}
+
 TEST_CASE("exclude BED dictionary and compressed errors" * doctest::test_suite("unit/alt_lift")) {
     FakeBns fb({{"chr1", 1000, 0}, {"tile", 100, 1}, {"track_chr", 1000, 0}, {"browser_chr", 1000, 0}});
     TmpFile source("tile\t0\tchr1\t101\t60\t100M\n");

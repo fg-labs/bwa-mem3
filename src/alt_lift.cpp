@@ -373,10 +373,16 @@ alt_lift_t *alt_lift_load_excluded(const char *path, const bntseq_t *bns,
     memset(stats, 0, sizeof(*stats));
     memset(error, 0, error_size);
     ExcludeBed bed;
-    if (!load_exclude_bed(bed_path, bns, &bed, stats, error, error_size)) return NULL;
+    if (!load_exclude_bed(bed_path, bns, &bed, stats, error, error_size)) {
+        stats->failed = ALT_LIFT_INPUT_BED;
+        return NULL;
+    }
     alt_lift_t *l = alt_lift_load_impl(path, bns, &bed, stats, error, error_size);
-    if (!l && error[0] == 0)
-        exclude_error(error, error_size, "%s: cannot open sidecar: %s", path, strerror(errno));
+    if (!l) {
+        stats->failed = ALT_LIFT_INPUT_SIDECAR;
+        if (error[0] == 0)
+            exclude_error(error, error_size, "%s: cannot open sidecar: %s", path, strerror(errno));
+    }
     return l;
 }
 

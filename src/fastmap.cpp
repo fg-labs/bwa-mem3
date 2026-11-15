@@ -4145,14 +4145,16 @@ int main_mem(int argc, char *argv[])
      * opt->alt_lift only points at it. */
     std::unique_ptr<alt_lift_t, decltype(&alt_lift_destroy)> alt_lift(nullptr, alt_lift_destroy);
     if (alt_project) {
-        alt_lift_exclude_stats_t exclude_stats = {0, 0, 0, 0};
+        alt_lift_exclude_stats_t exclude_stats = {};
         if (alt_project_exclude_bed) {
             char exclude_error[512];
             alt_lift.reset(alt_lift_load_excluded(alt_path, aux.fmi->idx->bns, alt_project_exclude_bed,
                                                   &exclude_stats, exclude_error, sizeof(exclude_error)));
             bool refused = true;
             if (!alt_lift)
-                fprintf(stderr, "[E::%s] --alt-project-exclude-bed: %s\n", __func__, exclude_error);
+                fprintf(stderr, "[E::%s] %s: %s\n", __func__,
+                        exclude_stats.failed == ALT_LIFT_INPUT_SIDECAR ? "--alt-project" : "--alt-project-exclude-bed",
+                        exclude_error);
             else if (alt_lift->n_lift == 0 && exclude_stats.excluded == 0)
                 refused = false;   /* no usable line at all: the established error below, ahead of the
                                   * empty-BED check so that error is not masked */
