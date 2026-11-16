@@ -1189,10 +1189,11 @@ static int hdr_put(kstring_t *out, const char *p, size_t len, int nl)
     return 0;
 }
 
-/* Append the records of `lines` (newline-separated, terminated or not) to
- * `out`, one per line, dropping every @HD -- the builder emits the one that
- * wins itself, first -- and every empty line, which is not a header record. */
-static int append_records_without_HD(kstring_t *out, const char *lines)
+/* Append the records of `lines` (newline-separated, terminated or not; NULL
+ * for none) to `out`, one per line, dropping every @HD -- the header builders
+ * emit the one that wins themselves, first -- and every empty line, which is
+ * not a header record. Returns 0, or -1 if `out` could not be grown. */
+int bwa_hdr_append_without_HD(kstring_t *out, const char *lines)
 {
     const char *cur = lines, *line; size_t len;
     while (bwa_hdr_next_line(&cur, &line, &len)) {
@@ -1202,8 +1203,9 @@ static int append_records_without_HD(kstring_t *out, const char *lines)
     return 0;
 }
 
-/* The first @HD record of `lines`, or NULL; its length in *len. */
-static const char *first_HD(const char *lines, size_t *len)
+/* The first @HD record of `lines`, or NULL if it has none or `lines` is NULL;
+ * its length, without the newline, in *len. */
+const char *bwa_hdr_first_HD(const char *lines, size_t *len)
 {
     const char *cur = lines, *line;
     while (bwa_hdr_next_line(&cur, &line, len))
@@ -1251,8 +1253,8 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
      * evidence for each row is in src/compat_target.cpp. DO NOT "fix" the
      * missing @HD under a compat target -- suppressing it is deliberate. */
     size_t hd_len = 0;
-    const char *hd = first_HD(hdr_line, &hd_len);
-    if (hd == NULL) hd = first_HD(bns_hdr, &hd_len);
+    const char *hd = bwa_hdr_first_HD(hdr_line, &hd_len);
+    if (hd == NULL) hd = bwa_hdr_first_HD(bns_hdr, &hd_len);
     if (hd != NULL) {
         if (hdr_put(out, hd, hd_len, 1) < 0) return -1;
     } else if (compat->emit_hd) {
@@ -1271,8 +1273,8 @@ int bwa_build_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *idx_hdr_l
             if (r) return -1;
         }
     }
-    if (bns_hdr && append_records_without_HD(out, bns_hdr) < 0) return -1;
-    if (hdr_line && append_records_without_HD(out, hdr_line) < 0) return -1;
+    if (bns_hdr && bwa_hdr_append_without_HD(out, bns_hdr) < 0) return -1;
+    if (hdr_line && bwa_hdr_append_without_HD(out, hdr_line) < 0) return -1;
     if (pg && hdr_put(out, pg, strlen(pg), 0) < 0) return -1;
     return 0;
 }

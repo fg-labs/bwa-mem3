@@ -583,44 +583,54 @@ void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa
 	}
 }
 
-// Number of lines in `text` (may be NULL) that begin with `tag`; a tag in mid-line does not count.
-static int count_line_start(const char *text, const char *tag)
-{
-	int n = 0;
-	const size_t len = strlen(tag);
-	for (const char *line = text; line && *line; ) {
-		if (strncmp(line, tag, len) == 0) ++n;
-		const char *nl = strchr(line, '\n');
-		line = nl ? nl + 1 : NULL;
-	}
-	return n;
-}
-
-// The header stock bwa 0.7.19 samse prints. The Apache2 branch's bwa_print_sam_hdr differs
-// from the release in two ways that show in the output: it prints @SQ before @HD and it
-// looks for "@HD" anywhere in the -r text. The release is the parity target, so this
-// follows the release's observable behaviour: @HD (unless the -r text has a line that
-// starts "@HD<tab>"), then @SQ (unless the text has its own), then the -r text, then
-// pg_line. A newline is added to pg_line only if it lacks one (bwa-mem3's @PG line has one).
+// The header stock bwa 0.7.19 samse prints, with one deliberate exception for a user @HD.
+// The Apache2 branch's bwa_print_sam_hdr differs from the release in two ways that show in
+// the output: it prints @SQ before @HD and it looks for "@HD" anywhere in the -r text. The
+// release is the parity target, so this follows the release's observable behaviour: the
+// default @HD, then @SQ (unless the -r text has its own), then the -r text, then pg_line.
+// A newline is added to pg_line only if it lacks one (bwa-mem3's @PG line has one).
+//
+// The exception: when the -r text has a line that starts "@HD<tab>", stock writes that line
+// where it sits in the text, after @SQ, which breaks the SAM rule that @HD comes first. Here
+// the first such line replaces the default @HD as the first line, and the -r text follows @SQ
+// without its @HD lines. This is how mem's header builder (bwa_build_sam_hdr) and
+// meth_hdr_text treat a user @HD. The input is still warned about, as in stock, by
+// aln_warn_user_hd. A -r text with no @HD line is written verbatim, so the header matches
+// stock's byte for byte.
 void aln_print_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *hdr_line, const char *pg_line)
 {
 	int i;
-	const int n_HD = count_line_start(hdr_line, "@HD\t");
-	const int n_SQ = count_line_start(hdr_line, "@SQ\t");
-	if (n_HD == 0) kputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", out);
-	if (n_SQ == 0) {
+	size_t user_hd_len = 0;
+	const char *user_hd = bwa_hdr_first_HD(hdr_line, &user_hd_len);
+	const int has_SQ = bwa_hdr_text_has_type(hdr_line, "@SQ\t");
+	if (user_hd) { kputsn(user_hd, (int)user_hd_len, out); kputc('\n', out); }
+	else kputs("@HD\tVN:1.5\tSO:unsorted\tGO:query\n", out);
+	if (!has_SQ) {
 		for (i = 0; i < bns->n_seqs; ++i) {
 			kputs("@SQ\tSN:", out); kputs(bns->anns[i].name, out); kputs("\tLN:", out); put_int(out, bns->anns[i].len);
 			if (bns->anns[i].is_alt) kputs("\tAH:*\n", out);
 			else kputc('\n', out);
 		}
 	}
-	if (hdr_line) { kputs(hdr_line, out); kputc('\n', out); }
+	if (user_hd) {
+		if (bwa_hdr_append_without_HD(out, hdr_line) < 0) _err_fatal_simple_core("aln", "out of memory");
+	} else if (hdr_line) {
+		kputs(hdr_line, out); kputc('\n', out);
+	}
 	if (pg_line && pg_line[0]) {
 		size_t n = strlen(pg_line);
 		kputs(pg_line, out);
 		if (pg_line[n-1] != '\n') kputc('\n', out);
 	}
+}
+
+// Stock's text names -H and its own function ("[W::bwa_print_sam_hdr] please don't include @HD
+// with option -H."), even for samse/sampe -r. aln has no -H, so this names -r and uses aln's
+// own message prefix; the test for an @HD line is stock's (a line that starts "@HD<tab>").
+void aln_warn_user_hd(FILE *fp, const char *hdr_line)
+{
+	if (bwa_verbose >= 2 && bwa_hdr_text_has_type(hdr_line, "@HD\t"))
+		fprintf(fp, "[W::aln] please don't include @HD with option -r. Continue anyway.\n");
 }
 
 void bwase_initialize(void)

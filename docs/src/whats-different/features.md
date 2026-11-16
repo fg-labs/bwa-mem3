@@ -262,7 +262,9 @@ stride-8 index and is the recommended speed-per-GB operating point; `-u 1`
 `bwa-mem3 aln` ports bwa's backtracking aligner for ultrashort, ancient and degraded DNA: it runs
 `bwa aln` followed by `bwa samse` (one read file) or `bwa sampe` (two) in one command, with no
 `.sai` files, on the index `bwa-mem3 index` writes. Its SAM records are byte-identical to stock
-bwa 0.7.19's (the `@PG` line differs) on the generated reads the parity checks use, at one and
+bwa 0.7.19's (the `@PG` line differs, and an `@HD` given in `-r` is written first, as the SAM
+specification requires, where stock writes it after `@SQ`, and is still warned about;
+[#797](https://github.com/fg-labs/bwa-mem3/pull/797)) on the generated reads the parity checks use, at one and
 four threads, in CI on Linux x86-64 (AVX2 build) and Linux arm64 (NEON), against a stock bwa built
 without floating-point contraction (a stock build with its default flags on arm64 can differ at rare
 rounding boundaries). `--bam` and

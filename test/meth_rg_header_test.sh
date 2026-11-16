@@ -19,7 +19,7 @@
 #   * every alignment record carries RG:Z:<rg>, and
 #   * the RG:Z value matches the declared @RG ID.
 #
-# --meth output is BAM, so reading its header back needs samtools. When
+# The --meth output is read back with samtools (it parses the SAM or BAM container). When
 # samtools is absent (minimal dev boxes) the --meth half is skipped with a
 # warning rather than failing; CI always has samtools, so the regression
 # stays enforced there.
@@ -152,13 +152,13 @@ samtools view "$tmp/meth.bam" > "$tmp/meth.recs" 2> /dev/null \
 assert_rg_consistent "--meth" "$tmp/meth.hdr" "$tmp/meth.recs"
 
 # --- --meth @HD de-dup: a user -H @HD must suppress the default @HD ---------
-# meth_bam_writer_open emits a default @HD (BWAMEM3_DEFAULT_HD_LINE,
-# "@HD VN:1.5 SO:unsorted GO:query") UNLESS the
-# user's -H already supplies an @HD (the hdr_text_has_type() guard). Without
-# that guard htslib would write two @HD lines (it does not de-dup @HD). Pass a
+# The --meth header text (meth_hdr_text) starts with a default @HD
+# (BWAMEM3_DEFAULT_HD_LINE, "@HD VN:1.5 SO:unsorted GO:query") UNLESS the
+# user's -H/-R text supplies an @HD, whose first one is written there instead.
+# Writing both would give two @HD lines (htslib does not de-dup @HD). Pass a
 # DISTINCT @HD (SO:coordinate) alongside -R and assert the output carries
 # exactly one @HD line and it is the user's — proving the default was
-# suppressed and the user's line survived. This pins the guard that the -R
+# suppressed and the user's line survived. This pins the policy that the -R
 # assertions above never exercise (an @RG line carries no @HD).
 USER_HD=$'@HD\tVN:1.6\tSO:coordinate'
 "$bin" mem --meth -R "$RG" -H "$USER_HD" "$ref" "$reads" \
@@ -187,5 +187,58 @@ if ! grep -qE $'^@HD\t.*\tSO:coordinate(\t|$)' "$tmp/meth_hd.hdr"; then
     exit 1
 fi
 echo "OK:   [--meth @HD dedup] exactly one @HD line, user's SO:coordinate preserved"
+
+# --- --meth with several -H @HD lines: the first wins, as the first line ------
+# The SAM spec requires @HD first and allows only one. The --meth header text
+# writes the user's first @HD as its first line and drops every later one (the
+# default writer's policy). htslib alone would keep a second @HD where it sat
+# in the user text, so this pins the text-level de-dup.
+"$bin" mem --meth -R "$RG" -H $'@CO\tbefore\n@HD\tVN:1.6\tSO:coordinate\n@HD\tVN:1.5\tSO:unsorted' \
+    "$ref" "$reads" > "$tmp/meth_hd2.bam" 2> "$tmp/meth_hd2.err" || {
+    echo "FAIL: bwa-mem3 mem --meth with two -H @HD lines exited non-zero" >&2
+    cat "$tmp/meth_hd2.err" >&2
+    exit 1
+}
+samtools view -H "$tmp/meth_hd2.bam" > "$tmp/meth_hd2.hdr" 2> /dev/null \
+    || {
+        echo "FAIL: samtools could not read --meth two-@HD header" >&2
+        exit 1
+    }
+n_hd="$(grep -c $'^@HD\t' "$tmp/meth_hd2.hdr" || true)"
+first_line="$(head -n 1 "$tmp/meth_hd2.hdr")"
+if [[ "$n_hd" -ne 1 || "$first_line" != $'@HD\tVN:1.6\tSO:coordinate' ]]; then
+    echo "FAIL [--meth two @HD]: expected one @HD, the user's first, as line 1" >&2
+    grep -n '^@' "$tmp/meth_hd2.hdr" | sed $'s/\t/<TAB>/g' >&2
+    exit 1
+fi
+if [[ "$(grep -c $'^@CO\tbefore$' "$tmp/meth_hd2.hdr" || true)" -ne 1 ]]; then
+    echo "FAIL [--meth two @HD]: the user's @CO record before the @HD lines is not kept exactly once" >&2
+    exit 1
+fi
+echo "OK:   [--meth two @HD] one @HD, the user's first, written as line 1"
+
+# --- --meth with an empty line in -H: dropped, as in plain mem -----------------
+# An empty line is not a header record. The --meth header text drops it, as the
+# default writer does; handed to htslib it was rejected and the run exited 1.
+"$bin" mem --meth -H $'@CO	x
+
+@CO	y' "$ref" "$reads" \
+    > "$tmp/meth_blank.out" 2> "$tmp/meth_blank.err" || {
+    echo "FAIL: bwa-mem3 mem --meth with an empty -H line exited non-zero" >&2
+    cat "$tmp/meth_blank.err" >&2
+    exit 1
+}
+samtools view -H "$tmp/meth_blank.out" > "$tmp/meth_blank.hdr" 2> /dev/null \
+    || {
+        echo "FAIL: samtools could not read --meth empty-line header" >&2
+        exit 1
+    }
+for co in x y; do
+    if [[ "$(grep -c "^@CO"$'\t'"$co\$" "$tmp/meth_blank.hdr" || true)" -ne 1 ]]; then
+        echo "FAIL [--meth empty -H line]: the @CO record '$co' around it is not kept exactly once" >&2
+        exit 1
+    fi
+done
+echo "OK:   [--meth empty -H line] dropped; the records around it kept"
 
 echo "PASS: -R read group emitted as @RG header in both default and --meth modes"

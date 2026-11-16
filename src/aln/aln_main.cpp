@@ -1069,6 +1069,8 @@ int main_aln(int argc, char *argv[])
 		}
 		meth_hdr_lines = bwa_load_hdr_from_index(meth_orig.c_str()); // the original reference's sidecar
 	}
+
+	aln_warn_user_hd(stderr, rg_line.get()); // once per run, for every header path
 	kstring_t hdr = {0, 0, 0};
 	if (o.meth) {
 		if (aln_meth_header(&hdr, &meth_ref, rg_line.get(), bwa_pg, meth_hdr_lines) != 0) {

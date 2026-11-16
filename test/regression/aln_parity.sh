@@ -3,7 +3,8 @@
 #
 # Regression: `bwa-mem3 aln` writes the same SAM as stock bwa 0.7.19's `aln` followed by
 # `samse` (single-end) or `sampe` (paired-end) -- every record, byte for byte; only the @PG line differs (it names
-# the program that ran) and is dropped from both sides before the diff.
+# the program that ran) and is dropped from both sides before the diff. One header case diverges on purpose: an -r
+# with an @HD line, which aln writes first (stock writes it after @SQ); see the case below.
 #
 # The reference is phiX plus the synthetic contigs the unit tests use (an N run, a
 # reverse-complement copy, a tandem repeat), indexed once by stock bwa and once by
@@ -335,6 +336,44 @@ if ! grep -aq '^@HD' "$work/mem3.nopg"; then
     exit 1
 fi
 
+# An -r with an @HD line: the one deliberate divergence from stock. Stock writes the user @HD
+# where it sits in the -r text, after @SQ (the SAM spec requires @HD first); aln writes it as
+# the first line instead. Everything else must match stock: its output with that @HD line
+# moved to the top. The default @HD (no @HD in -r) is covered by every case above.
+rg_hd='@RG\tID:x\tSM:y\n@HD\tVN:1.6\tSO:unsorted'
+"$BWA_ORACLE" aln -t 1 "$ref_stock" "$form_fq" > "$work/form.sai" 2> /dev/null
+"$BWA_ORACLE" samse -r "$rg_hd" "$ref_stock" "$work/form.sai" "$form_fq" > "$work/rg_hd.stock.sam" 2> "$work/rg_hd.stock.err"
+if [ "$(grep -ac '^@HD' "$work/rg_hd.stock.sam" || true)" -ne 1 ] \
+    || head -n 1 "$work/rg_hd.stock.sam" | grep -aq '^@HD'; then
+    echo "FAIL: aln_parity: stock no longer writes one -r @HD after @SQ; revisit this case" >&2
+    exit 1
+fi
+{
+    grep -a '^@HD' "$work/rg_hd.stock.sam"
+    grep -av '^@HD' "$work/rg_hd.stock.sam"
+} > "$work/rg_hd.expected.sam"
+"$BWA_MEM3" aln -t 1 -r "$rg_hd" "$ref_mem3" "$form_fq" > "$work/rg_hd.mem3.sam" 2> "$work/rg_hd.mem3.err"
+same_records "-r @HD written first" "$work/rg_hd.expected.sam" "$work/rg_hd.mem3.sam"
+# The input is still warned about, as stock does (aln's text names -r, which is the option it
+# has, where stock's names -H). Without an @HD line in -r, neither warns.
+hd_warn="please don't include @HD with option"
+if ! grep -q "$hd_warn -H" "$work/rg_hd.stock.err"; then
+    echo "FAIL: aln_parity: stock no longer warns about an -r @HD; revisit this case" >&2
+    exit 1
+fi
+if [ "$(grep -c "^\[W::aln\] $hd_warn -r\. Continue anyway\.$" "$work/rg_hd.mem3.err" || true)" -ne 1 ]; then
+    echo "FAIL: aln_parity: aln did not warn exactly once about the -r @HD" >&2
+    cat "$work/rg_hd.mem3.err" >&2
+    exit 1
+fi
+"$BWA_ORACLE" samse -r '@RG\tID:x\tSM:y' "$ref_stock" "$work/form.sai" "$form_fq" > /dev/null 2> "$work/rg_nohd.stock.err"
+"$BWA_MEM3" aln -t 1 -r '@RG\tID:x\tSM:y' "$ref_mem3" "$form_fq" > /dev/null 2> "$work/rg_nohd.mem3.err"
+if grep -q "$hd_warn" "$work/rg_nohd.stock.err" "$work/rg_nohd.mem3.err"; then
+    echo "FAIL: aln_parity: an @HD warning was printed for an -r with no @HD line" >&2
+    exit 1
+fi
+echo "aln_parity: ok -r @HD warned about (and not without one)"
+
 # -f equals standard output (and nothing goes to standard output with -f)
 "$BWA_MEM3" aln -t 1 "$ref_mem3" "$form_fq" > "$work/form.stdout.sam" 2> /dev/null
 "$BWA_MEM3" aln -t 1 -f "$work/form.f.sam" "$ref_mem3" "$form_fq" > "$work/form.f.stdout" 2> /dev/null
@@ -594,6 +633,31 @@ run_pe pe_comment 513 800 36 0 comment "" ""
 run_pe pe_rg 514 500 36 0 plain "-r @RG\\tID:x\\tSM:y" "-r @RG\\tID:x\\tSM:y"
 need_pe pe_rg 'RG:Z:x'
 run_pe pe_P 522 500 36 0 plain "-P" "-P" # sampe -P preloads the index; ours accepts and ignores it
+
+# Paired end with an -r @HD line: as the single-end case, stock sampe's output with its @HD moved
+# to the top, and the warning once (sampe shares samse's header writer, so stock warns too).
+"$BWA_ORACLE" aln -t 1 "$work/plain/stock/ref.fa" "$work/pe36.1.fq" > "$work/stock.1.sai" 2> /dev/null
+"$BWA_ORACLE" aln -t 1 "$work/plain/stock/ref.fa" "$work/pe36.2.fq" > "$work/stock.2.sai" 2> /dev/null
+"$BWA_ORACLE" sampe -r "$rg_hd" "$work/plain/stock/ref.fa" "$work/stock.1.sai" "$work/stock.2.sai" \
+    "$work/pe36.1.fq" "$work/pe36.2.fq" > "$work/pe_rg_hd.stock.sam" 2> "$work/pe_rg_hd.stock.err"
+if [ "$(grep -ac '^@HD' "$work/pe_rg_hd.stock.sam" || true)" -ne 1 ] \
+    || head -n 1 "$work/pe_rg_hd.stock.sam" | grep -aq '^@HD' \
+    || ! grep -q "$hd_warn -H" "$work/pe_rg_hd.stock.err"; then
+    echo "FAIL: aln_parity: stock sampe no longer writes and warns about an -r @HD after @SQ" >&2
+    exit 1
+fi
+{
+    grep -a '^@HD' "$work/pe_rg_hd.stock.sam"
+    grep -av '^@HD' "$work/pe_rg_hd.stock.sam"
+} > "$work/pe_rg_hd.expected.sam"
+"$BWA_MEM3" aln -t 1 -r "$rg_hd" "$work/plain/mem3/ref.fa" "$work/pe36.1.fq" "$work/pe36.2.fq" \
+    > "$work/pe_rg_hd.mem3.sam" 2> "$work/pe_rg_hd.mem3.err"
+same_records "PE -r @HD written first" "$work/pe_rg_hd.expected.sam" "$work/pe_rg_hd.mem3.sam"
+if [ "$(grep -c "^\[W::aln\] $hd_warn -r\. Continue anyway\.$" "$work/pe_rg_hd.mem3.err" || true)" -ne 1 ]; then
+    echo "FAIL: aln_parity: paired-end aln did not warn exactly once about the -r @HD" >&2
+    cat "$work/pe_rg_hd.mem3.err" >&2
+    exit 1
+fi
 
 # Repeats: contigs of five and of twelve exact copies of a 200 bp unit, 40 bp apart, so each end
 # has five (twelve) equally good places and XA lists depend on --max-xa-hits and

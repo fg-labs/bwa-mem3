@@ -13,6 +13,8 @@
 #include "../bntseq.h"
 #include "../kstring.h"
 
+#include <stdio.h>
+
 namespace bwa_aln {
 
 /* log table (4.343 * ln n, rounded) that bwa_approx_mapQ and sampe's pairing read; filled by bwase_initialize. */
@@ -47,10 +49,16 @@ void bwa_print_seq(kstring_t *out, const bwa_seq_t *seq);
 /* Appends the record(s) stock bwa samse prints for one read, newline included. */
 void bwa_print_sam1(kstring_t *out, const bntseq_t *bns, bwa_seq_t *p, const bwa_seq_t *mate,
 					int mode, int max_top2);
-/* Appends the header stock bwa 0.7.19 samse prints: the default @HD (unless hdr_line has
- * one), the @SQ lines (unless hdr_line has its own), hdr_line, then pg_line. hdr_line and
+/* Appends the header stock bwa 0.7.19 samse prints: the default @HD, the @SQ lines (unless
+ * hdr_line has its own), hdr_line, then pg_line. One divergence from stock: if hdr_line has an
+ * @HD line, its first one replaces the default as the first line and hdr_line is written
+ * without its @HD lines (stock writes the @HD after @SQ, against the SAM spec). hdr_line and
  * pg_line may be NULL; pg_line gets a newline if it lacks one. */
 void aln_print_sam_hdr(kstring_t *out, const bntseq_t *bns, const char *hdr_line, const char *pg_line);
+/* Writes stock's warning for an @HD line in the -r text to `fp`, once, when hdr_line has one
+ * and bwa_verbose >= 2 (stock samse/sampe print it while writing the header). Every aln header
+ * path calls it once per run. */
+void aln_warn_user_hd(FILE *fp, const char *hdr_line);
 
 } // namespace bwa_aln
 

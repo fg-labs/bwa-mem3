@@ -230,6 +230,15 @@ extern "C" {
 	 * sets *line/*len to the next record (no newline) and advances *p, returning
 	 * 1, or returns 0 at end of text. */
 	int bwa_hdr_next_line(const char **p, const char **line, size_t *len);
+	/* The first @HD record of header text `lines`, or NULL if it has none or
+	 * `lines` is NULL; its length, without the newline, in *len. With bwa_hdr_append_without_HD, the
+	 * header builders use it to write a user's @HD first, as the SAM spec
+	 * requires, wherever it sat in the user's text. */
+	const char *bwa_hdr_first_HD(const char *lines, size_t *len);
+	/* Append every record of `lines` (NULL for none) except @HD records and
+	 * empty lines to `out`, each newline-terminated. Returns 0, or -1 if `out`
+	 * could not be grown. */
+	int bwa_hdr_append_without_HD(kstring_t *out, const char *lines);
 	char *bwa_load_hdr_from_index(const char *prefix);
 	/* The `.dict` path bwa_load_hdr_from_index falls back to for index
 	 * `prefix` (malloc'd; the caller frees it). */

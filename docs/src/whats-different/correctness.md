@@ -826,6 +826,38 @@ release wrote `MAPQ` above 60 or no `AS` on 2.6–3.2% of reads, and those were 
 the fix changes. Pinned by `test/unit/test_mem_pair_negative_score.cpp`, which fails on aarch64
 without the fix.
 
+## `aln`: a user `@HD` in `-r` is written as the first header line (PR #797)
+
+The SAM specification requires `@HD`, when present, to be the first header line. bwa 0.7.19's
+`bwa_print_sam_hdr` writes its default `@HD` first, but when the `-r` (samse/sampe) or `-H` text
+has an `@HD` line it skips the default and writes the user's line where it sits in that text,
+after the `@SQ` block ([lh3/bwa#442](https://github.com/lh3/bwa/issues/442)), and warns
+`please don't include @HD with option -H` instead.
+
+`bwa-mem3 aln` writes the user's first `@HD` as the first header line, in place of the default, and
+leaves every `@HD` out of the `-r` text it writes after `@SQ`. That is how `mem`
+(`bwa_build_sam_hdr`) already treats a user `@HD`; `aln` and `--meth` (`meth_hdr_text`) now use the
+same helpers. The input is still warned about, as in stock, once per run at the default verbosity:
+`[W::aln] please don't include @HD with option -r. Continue anyway.` (stock's text names `-H` and
+its own function; `aln` names the option it has).
+
+The same change reaches `mem --meth`, whose header text now goes through those helpers too. A single
+user `@HD` was already written first there (htslib moves it), so that output is unchanged. Two
+cases change, both now matching plain `mem`: with several `@HD` lines in `-H`, only the first is
+kept (htslib kept the others where they sat in the user text, so the header had two), and an
+empty line in the `-H` text is dropped (htslib rejected it, and the run exited 1).
+
+Scope: **`aln` with an `@HD` line in `-r`, and `mem --meth` with several `@HD` lines or an empty
+line in `-H`.** The header lines change; the records do not. Without an `@HD` line in `-r`
+(including an `@HD<tab>` in mid-line, which bwa does not count either), `aln`'s records and every
+header line but `@PG` (which names the program that ran) are byte-identical to bwa 0.7.19 on the
+parity regression's reference (phiX plus synthetic contigs; single- and paired-end, `-t 1` and
+`-t 4`), run in CI on x86-64 Linux (AVX2) and on arm64 Linux and macOS (NEON). Pinned by
+`test/unit/test_aln_se.cpp` (header text and warning), `test/unit/test_meth_hdr_text.cpp` (the
+`--meth` header text), `test/meth_rg_header_test.sh` (the `mem --meth` cases) and
+`test/regression/aln_parity.sh` (stock's single- and paired-end output with its `@HD` moved to the
+top, and its warning).
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -882,6 +914,7 @@ shipped, because parity with that release is its contract (see
 | Suffix-array sentinel offset in the prefetch lookup | [#469](https://github.com/fg-labs/bwa-mem3/pull/469) | — | fork-only; `--compat=bwa-mem2` reproduces bwa-mem2 |
 | A read base `-` is scored as `N` | [#639](https://github.com/fg-labs/bwa-mem3/pull/639) | — | fork-only, also under `--compat` (reads containing `-` only; upstream scores it by an out-of-row matrix read and prints a NUL in SEQ; input with no `-` byte-identical by construction; other pairs in a batch with `-` reads can change only through the insert-size estimate) |
 | `--meth` pair with a negative-score end on aarch64 | [#659](https://github.com/fg-labs/bwa-mem3/pull/659) | — | fork-only (`--meth` paired-end on aarch64 only, where a read with a negative-score end paired at `MAPQ` 191/209 with no `AS`; it now scores as x86 builds did; x86 and non-`--meth` output byte-identical by construction — see the correctness note above) |
+| `aln`: a user `@HD` in `-r` is written first | [#797](https://github.com/fg-labs/bwa-mem3/pull/797) | [lh3/bwa#442](https://github.com/lh3/bwa/issues/442) | fork-only (`aln` with an `@HD` line in `-r`: it replaces the default and moves to the first line, and bwa's warning is kept; records and every other header line but `@PG` byte-identical to bwa 0.7.19 on the parity regression (phiX plus synthetic contigs; x86-64 AVX2, arm64 NEON). `mem --meth`: several `-H` `@HD` lines keep only the first, and an empty `-H` line is dropped instead of failing the run, as in plain `mem`) |
 
 ---
 
