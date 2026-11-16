@@ -445,7 +445,9 @@ FMI_search::FMI_search(const char *fname)
     sa_compx = SA_COMPX;
     sa_compx_mask = SA_COMPX_MASK;
     sa_ls_word = NULL;
-    sa_ms_byte = NULL;
+    sa_hi = NULL;
+    sa_hi_log2 = 0;
+    sa_hi_mask = 1;
     cp_occ = NULL;
     shm_base = NULL;
     shm_len = 0;
@@ -459,7 +461,7 @@ FMI_search::FMI_search(const char *fname)
 
 FMI_search::~FMI_search()
 {
-    /* When attached from shm, cp_occ/sa_*_byte/sa_*_word alias mmap'd pages
+    /* When attached from shm, cp_occ/sa_hi/sa_ls_word alias mmap'd pages
      * owned by the shm segment, so we don't _mm_free them. We do unmap the
      * mapping itself — leaving it would leak VA in long-lived processes that
      * construct and destroy FMI_search repeatedly. */
@@ -468,7 +470,7 @@ FMI_search::~FMI_search()
         shm_base = NULL;
         shm_len  = 0;
     } else {
-        if (sa_ms_byte) _mm_free(sa_ms_byte);
+        if (sa_hi) _mm_free(sa_hi);
         if (sa_ls_word) _mm_free(sa_ls_word);
         if (cp_occ_huge.base != NULL) bwamem_hugetlb_unmap(&cp_occ_huge);
         else if (cp_occ)              _mm_free(cp_occ);
@@ -548,7 +550,7 @@ bool FMI_search::shm_scalars_ok(const uint8_t *scalars, int64_t sizes[3],
         return false;
     }
     sizes[0] = cp_occ_bytes_for(ref_len);
-    sizes[1] = sa_count_for(ref_len, compx) * (int64_t)sizeof(int8_t);
+    sizes[1] = sa_hi_bytes_for(ref_len, compx);
     sizes[2] = sa_count_for(ref_len, compx) * (int64_t)sizeof(uint32_t);
     return true;
 }
@@ -722,7 +724,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
      * IMPORTANT FIX: this used to stay at the constructor's compile-time
      * default (SA_COMPX) because nothing here overrode it, so a non-default
      * `-u`-built index attached via shm was mis-sized (sa_sample_count() and
-     * every sa_ms_byte/sa_ls_word index below used the wrong shift). Reading
+     * every sa_hi/sa_ls_word index below used the wrong shift). Reading
      * it from the packed scalars (see BWA_SHM_FMI_SCALARS_BYTES / the PACK
      * side in bwa_shm.cpp) makes shm-attach agree with the disk loader's
      * tail-detected rate. */
@@ -731,6 +733,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
     /* Only compute the mask once sa_compx is known to be in [0,6]; shifting by
      * an out-of-range value (e.g. a corrupt -1 or 64) would be UB. */
     sa_compx_mask = (1LL << sa_compx) - 1;
+    set_sa_hi_geometry();
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
         || (int64_t)sz != sizes[0] || off % alignof(CP_OCC) != 0) {
@@ -740,11 +743,12 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
     cp_occ = (CP_OCC *)(base + off);
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_MS, &off, &sz) != 0
-        || (int64_t)sz != sizes[1]) {
-        fprintf(stderr, "ERROR! shm segment missing or sized FMI_SA_MS\n");
+        || (int64_t)sz != sizes[1] || off % alignof(uint64_t) != 0) {
+        fprintf(stderr, "ERROR! shm segment missing, misaligned or mis-sized FMI_SA_MS "
+                        "(staged by an older bwa-mem3? run `bwa-mem3 shm -d` and stage again)\n");
         exit(EXIT_FAILURE);
     }
-    sa_ms_byte = (int8_t *)(base + off);
+    sa_hi = (uint64_t *)(base + off);
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_LS, &off, &sz) != 0
         || (int64_t)sz != sizes[2] || off % alignof(uint32_t) != 0) {
@@ -760,12 +764,12 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
             (long)reference_seq_len, (long)sentinel_index);
 }
 
-void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
+bool FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
                                  int64_t ref_seq_len, int64_t sentinel_idx,
                                  const int8_t *src_ms, const uint32_t *src_ls,
                                  int64_t src_compx,
-                                 int8_t *dst_ms, uint32_t *dst_ls, int64_t dst_compx,
-                                 int n_threads)
+                                 int8_t *dst_ms, uint64_t *dst_hi, uint32_t *dst_ls,
+                                 int64_t dst_compx, int n_threads)
 {
     /* Stride validity: the resolver reads a sample at (row >> sa_compx), so a
      * denser destination (smaller shift) is required for this to add samples,
@@ -783,7 +787,7 @@ void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_s
      * owns no loaded buffers -- otherwise those buffers would leak. Both current
      * callers (bwa_shm_pack_into, main_resa) pass a freshly-constructed object;
      * guard the precondition so a future caller on a loaded index fails loudly. */
-    xassert(cp_occ == NULL && sa_ms_byte == NULL && sa_ls_word == NULL,
+    xassert(cp_occ == NULL && sa_hi == NULL && sa_ls_word == NULL,
             "densify_sa_into called on an FMI_search with loaded index buffers");
 
     /* Validate count_src (the +1-adjusted cumulative C[]) before it drives the
@@ -810,10 +814,33 @@ void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_s
     sentinel_index    = sentinel_idx;
     memcpy(count, count_src, sizeof(int64_t) * 5);
     cp_occ        = const_cast<CP_OCC *>(cp_occ_src);
-    sa_ms_byte    = const_cast<int8_t *>(src_ms);
     sa_ls_word    = const_cast<uint32_t *>(src_ls);
     sa_compx      = src_compx;
     sa_compx_mask = (1LL << src_compx) - 1;
+    /* The resolver reads the packed high parts: pack the source bytes into a temporary
+     * (1/8 of the source byte array at 1 bit per sample). */
+    auto release = [&]() {   /* drop the borrowed pointers; free the one owned temporary */
+        cp_occ = NULL;
+        free(sa_hi);
+        sa_hi = NULL;
+        sa_ls_word = NULL;
+    };
+    set_sa_hi_geometry();
+    const int64_t src_count = (ref_seq_len >> src_compx) + 1;
+    const int64_t src_words = sa_hi_words(src_count, sa_hi_log2);
+    sa_hi = (uint64_t *)malloc((size_t)src_words * sizeof(uint64_t));
+    if (sa_hi == NULL) {
+        fprintf(stderr, "ERROR! densify_sa_into: out of memory packing %lld source SA samples\n",
+                (long long)src_count);
+        release();
+        return false;
+    }
+    if (!sa_hi_pack(src_ms, 0, src_count, sa_hi_log2, sa_hi, n_threads)) {
+        fprintf(stderr, "ERROR! densify_sa_into: a source SA sample high part does not fit in "
+                        "%d bit(s) (corrupt or mismatched .bwt.2bit.64?)\n", 1 << sa_hi_log2);
+        release();
+        return false;
+    }
 
     const int64_t src_mask = (1LL << src_compx) - 1;
     const int64_t dst_count = (ref_seq_len >> dst_compx) + 1;
@@ -825,35 +852,61 @@ void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_s
      * bit-for-bit on shared rows. Otherwise recover it by the resolver's own
      * LF-walk against the source stride.
      *
+     * The loop runs over packed words of the destination: iteration w fills
+     * samples [w * per_word, (w + 1) * per_word), so a packed dst_hi word is
+     * built in a register and stored once, with no byte temporary.
+     *
      * Parallel-safe: each iteration reads only shared, immutable index state
-     * (cp_occ / count / sa_*_byte / masks via get_sa_entry_compressed) and
-     * writes disjoint dst_ms[j]/dst_ls[j] slots — no shared mutable state, so
-     * no locking. schedule(dynamic) balances the uneven per-row walk lengths
-     * (already-sampled rows are O(1); added rows walk up to 2^src_compx-1
-     * LF steps). Output is independent of thread count and scheduling. */
+     * (cp_occ / count / sa_hi / sa_ls_word / masks via get_sa_entry_compressed)
+     * and writes disjoint dst_ms[j]/dst_ls[j] slots and its own dst_hi[w] word —
+     * no shared mutable state, so no locking. schedule(dynamic) balances the
+     * uneven per-row walk lengths (already-sampled rows are O(1); added rows walk
+     * up to 2^src_compx-1 LF steps); a chunk is about 4096 samples at any width.
+     * Output is independent of thread count and scheduling. */
+    const int64_t per_word = 64 >> sa_hi_log2;
+    const int64_t n_words  = sa_hi_words(dst_count, sa_hi_log2);
+    const int64_t w_chunk  = 4096 / per_word;
+    const int     hi_shift = sa_hi_log2;
+    const uint64_t hi_mask = sa_hi_mask;
+    int bad = 0;
 #ifdef _OPENMP
-    #pragma omp parallel for num_threads(T) schedule(dynamic, 4096)
+    #pragma omp parallel for num_threads(T) schedule(dynamic, w_chunk) reduction(|:bad)
 #else
     (void)T;
+    (void)w_chunk;
 #endif
-    for (int64_t j = 0; j < dst_count; ++j) {
-        const int64_t row = j << dst_compx;
-        int64_t v;
-        if ((row & src_mask) == 0) {
-            const int64_t s = row >> src_compx;
-            v = ((int64_t)src_ms[s] << 32) + (int64_t)src_ls[s];
-        } else {
-            v = get_sa_entry_compressed(row, /*tid=*/0);
+    for (int64_t w = 0; w < n_words; ++w) {
+        const int64_t j0 = w * per_word;
+        const int64_t j1 = (j0 + per_word < dst_count) ? j0 + per_word : dst_count;
+        uint64_t word = 0;
+        for (int64_t j = j0; j < j1; ++j) {
+            const int64_t row = j << dst_compx;
+            int64_t v;
+            if ((row & src_mask) == 0) {
+                const int64_t s = row >> src_compx;
+                v = ((int64_t)src_ms[s] << 32) + (int64_t)src_ls[s];
+            } else {
+                v = get_sa_entry_compressed(row, /*tid=*/0);
+            }
+            const uint64_t hi = (uint64_t)(v >> 32) & 0xff;
+            if (dst_ms != NULL) dst_ms[j] = (int8_t)hi;
+            bad |= (hi & ~hi_mask) != 0;
+            word |= (hi & hi_mask) << ((j - j0) << hi_shift);
+            dst_ls[j] = (uint32_t)(v & 0xffffffffULL);
         }
-        dst_ms[j] = (int8_t)((v >> 32) & 0xff);
-        dst_ls[j] = (uint32_t)(v & 0xffffffffULL);
+        if (dst_hi != NULL) dst_hi[w] = word;
+    }
+    if (dst_hi != NULL && bad) {
+        fprintf(stderr, "ERROR! densify_sa_into: a densified SA sample high part does not fit in "
+                        "%d bit(s) (corrupt or mismatched .bwt.2bit.64?)\n", 1 << sa_hi_log2);
+        release();
+        return false;
     }
 
     /* Drop the borrowed pointers so ~FMI_search() frees nothing (they alias
      * the caller's shm buffer / heap temporaries). */
-    cp_occ     = NULL;
-    sa_ms_byte = NULL;
-    sa_ls_word = NULL;
+    release();
+    return true;
 }
 
 int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
@@ -1074,17 +1127,32 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     #else
     const int64_t sa_count = reference_seq_len;
     #endif
-    const int64_t sa_ms_bytes = sa_count * (int64_t)sizeof(int8_t);
     const int64_t sa_ls_bytes = sa_count * (int64_t)sizeof(uint32_t);
-    sa_ms_byte = (int8_t *)_mm_malloc(sa_ms_bytes, 64);
-    index_alloc += sa_ms_bytes;
-    assert_not_null(sa_ms_byte, sa_ms_bytes, index_alloc);
+    set_sa_hi_geometry();
+    /* sa_count, not sa_hi_bytes_for(): the uncompressed (simulation) build keeps every row. */
+    const int64_t sa_hi_bytes = sa_hi_words(sa_count, sa_hi_log2) * (int64_t)sizeof(uint64_t);
+    sa_hi = (uint64_t *)_mm_malloc(sa_hi_bytes, 64);
+    index_alloc += sa_hi_bytes;
+    assert_not_null(sa_hi, sa_hi_bytes, index_alloc);
     sa_ls_word = (uint32_t *)_mm_malloc(sa_ls_bytes, 64);
     index_alloc += sa_ls_bytes;
     assert_not_null(sa_ls_word, sa_ls_bytes, index_alloc);
-    bwamem_madv_hugepage(sa_ms_byte, sa_ms_bytes);
+    bwamem_madv_hugepage(sa_hi, sa_hi_bytes);
     bwamem_madv_hugepage(sa_ls_word, sa_ls_bytes);
-    fmi_pread_from_stream(cpstream, cp_file_name, sa_ms_byte, (size_t)sa_ms_bytes, load_nt);
+    {
+        /* One byte per sample on disk, read and packed in parallel a small piece at a time,
+         * so the byte array is never resident. The pack assigns every word, so the first
+         * touch of sa_hi is here, after the huge-page hint above. */
+        const off_t sa_off = ftello(cpstream);
+        xassert(sa_off >= 0, "ftello failed during index load");
+        const int rc = sa_hi_pread_pack(fileno(cpstream), cp_file_name, sa_off, sa_count,
+                                        sa_hi_log2, sa_hi, load_nt);
+        xassert(fseeko(cpstream, sa_off + (off_t)sa_count, SEEK_SET) == 0,
+                "fseeko failed during index load");
+        xassert(rc != SA_HI_READ_OOM, "out of memory: SA sample read buffer");
+        xassert(rc != SA_HI_READ_RANGE,
+                "FMI index: SA sample high part out of range (corrupt .bwt.2bit.64?)");
+    }
     fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
 
     sentinel_index = -1;
@@ -1805,7 +1873,7 @@ inline void FMI_search::ls_prefetch_sa_row(int64_t p) const
     uintptr_t m = (uintptr_t)0 - (uintptr_t)((p & sa_compx_mask) == 0);
     BWA_OPAQUE(m);
     const uintptr_t cp = (uintptr_t)&cp_occ[p >> CP_SHIFT];
-    const uintptr_t ms = (uintptr_t)&sa_ms_byte[p >> sa_compx];
+    const uintptr_t ms = (uintptr_t)sa_hi_addr(p >> sa_compx);
     const uintptr_t ls = (uintptr_t)&sa_ls_word[p >> sa_compx];
     _mm_prefetch((const char *)((ms & m) | (cp & ~m)), _MM_HINT_T0);
     _mm_prefetch((const char *)((ls & m) | (cp & ~m)), _MM_HINT_T0);
@@ -3169,7 +3237,7 @@ void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch)
  * the SysV-ABI struct-by-value pass and return-slot store that dominate
  * self-time on gcc 12+. */
 
-/* Uncompressed SA accessors: these index sa_ms_byte[pos] / sa_ls_word[pos] by the
+/* Uncompressed SA accessors: these index sa_hi_at(pos) / sa_ls_word[pos] by the
  * raw BWT row. Under SA_COMPRESSION (the shipped build) those arrays are sized to
  * reference_seq_len >> SA_COMPX, so a raw-row index reads ~SA_COMPX-fold out of
  * bounds. They are only correct for a full (uncompressed) SA, and every in-tree
@@ -3181,7 +3249,7 @@ void smem_sort_rid_mn(SMEM *a, int64_t n, SmemSortScratch &scratch)
 #if !SA_COMPRESSION
 int64_t FMI_search::get_sa_entry(int64_t pos)
 {
-    int64_t sa_entry = sa_ms_byte[pos];
+    int64_t sa_entry = sa_hi_at(pos);
     sa_entry = sa_entry << 32;
     sa_entry = sa_entry + sa_ls_word[pos];
     return sa_entry;
@@ -3194,15 +3262,16 @@ void FMI_search::get_sa_entries(int64_t *posArray, int64_t *coordArray, uint32_t
     for(i = 0; i < count; i++)
     {
         /* Prefetch the SAL slot SAL_PFD iterations ahead. Both
-         * sa_ms_byte and sa_ls_word are large random-access arrays
-         * (separate cache lines), so issue two prefetches per slot. */
+         * sa_hi and sa_ls_word are random-access arrays (separate
+         * cache lines; sa_hi is 8x to 64x smaller and often cached),
+         * so issue two prefetches per slot. */
         if (i + SAL_PFD < count) {
             int64_t pf_pos = posArray[i + SAL_PFD];
-            _mm_prefetch((const char *)(sa_ms_byte + pf_pos), _MM_HINT_T0);
+            _mm_prefetch(sa_hi_addr(pf_pos), _MM_HINT_T0);
             _mm_prefetch((const char *)(sa_ls_word + pf_pos), _MM_HINT_T0);
         }
         int64_t pos = posArray[i];
-        int64_t sa_entry = sa_ms_byte[pos];
+        int64_t sa_entry = sa_hi_at(pos);
         sa_entry = sa_entry << 32;
         sa_entry = sa_entry + sa_ls_word[pos];
         coordArray[i] = sa_entry;
@@ -3227,10 +3296,10 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
              * separate cache lines, so issue both prefetches per slot. */
             int64_t pf_pos = pos + SAL_PFD * step;
             if (pf_pos < hi) {
-                _mm_prefetch((const char *)(sa_ms_byte + pf_pos), _MM_HINT_T0);
+                _mm_prefetch(sa_hi_addr(pf_pos), _MM_HINT_T0);
                 _mm_prefetch((const char *)(sa_ls_word + pf_pos), _MM_HINT_T0);
             }
-            int64_t sa_entry = sa_ms_byte[pos];
+            int64_t sa_entry = sa_hi_at(pos);
             sa_entry = sa_entry << 32;
             sa_entry = sa_entry + sa_ls_word[pos];
             coordArray[totalCoordCount + c] = sa_entry;
@@ -3247,9 +3316,9 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
     if ((pos & sa_compx_mask) == 0) {
         
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[pos >> sa_compx];
+        int64_t sa_entry = sa_hi_at(pos >> sa_compx);
         #else
-        int64_t sa_entry = sa_ms_byte[pos];     // simulation
+        int64_t sa_entry = sa_hi_at(pos);     // simulation
         #endif
         
         sa_entry = sa_entry << 32;
@@ -3298,9 +3367,9 @@ int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
         }
         // assert((reference_seq_len >> sa_compx) - 1 >= (sp >> sa_compx));
         #if  SA_COMPRESSION
-        int64_t sa_entry = sa_ms_byte[sp >> sa_compx];
+        int64_t sa_entry = sa_hi_at(sp >> sa_compx);
         #else
-        int64_t sa_entry = sa_ms_byte[sp];      // simultion
+        int64_t sa_entry = sa_hi_at(sp);      // simultion
         #endif
         
         sa_entry = sa_entry << 32;
@@ -3348,7 +3417,7 @@ int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offse
         // A sampled row: either freshly staged (offset 0) or reached by an LF
         // step on this lane's previous visit (offset = steps walked), whose
         // sample lines the caller has since prefetched.
-        sa_entry = sa_ms_byte[pos >> sa_compx];
+        sa_entry = sa_hi_at(pos >> sa_compx);
         sa_entry = sa_entry << 32;
         sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];
         sa_entry += offset;
@@ -4057,7 +4126,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
     // defers that read to the next visit), else the row's checkpoint block.
     auto prefetch_row = [&](int64_t p) {
         if ((p & sa_compx_mask) == 0) {
-            _mm_prefetch(&sa_ms_byte[p >> sa_compx], _MM_HINT_T0);
+            _mm_prefetch(sa_hi_addr(p >> sa_compx), _MM_HINT_T0);
             _mm_prefetch(&sa_ls_word[p >> sa_compx], _MM_HINT_T0);
         }
         else
@@ -4154,4 +4223,142 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
         ks_net_observe(overhead_ns - benefit_ns, ks_distinct_positions + ks_dup_positions);
     }
     /* pos_ar is the reused thread-local scratch — no free here. */
+}
+
+/* One worker's share of sa_hi_pack: words [w_begin, w_end) of the call. */
+struct SaHiPackJob {
+    const int8_t *src; int64_t n, per_word, w0, w_begin, w_end; int log2; uint64_t mask; uint64_t *dst; int bad;
+};
+
+static void *sa_hi_pack_worker(void *arg)
+{
+    SaHiPackJob *j = static_cast<SaHiPackJob *>(arg);
+    int bad = 0;
+    for (int64_t w = j->w_begin; w < j->w_end; ++w) {
+        const int64_t b = w * j->per_word;
+        const int64_t e = (b + j->per_word < j->n) ? b + j->per_word : j->n;
+        if (j->log2 == 0 && e - b == 64) {
+            /* 1 bit per sample, a whole word: gather 8 bytes at a time. Each byte must be 0
+             * or 1; multiplying by 0x0102040810204080 moves byte k's low bit to bit 56 + k
+             * (every other partial product lands below bit 56 at a distinct position, or
+             * above bit 63, so nothing carries into the top byte). */
+            uint64_t word = 0, any_high = 0;
+            for (int k = 0; k < 8; ++k) {
+                uint64_t x;
+                memcpy(&x, j->src + b + 8 * k, sizeof(x));
+                any_high |= x & 0xfefefefefefefefeull;
+                word |= ((x * 0x0102040810204080ull) >> 56) << (8 * k);
+            }
+            bad |= any_high != 0;
+            j->dst[j->w0 + w] = word;
+            continue;
+        }
+        uint64_t word = 0;
+        for (int64_t i = b; i < e; ++i) {
+            const uint64_t v = (uint8_t)j->src[i];
+            bad |= (v & ~j->mask) != 0;
+            word |= (v & j->mask) << ((i - b) << j->log2);
+        }
+        j->dst[j->w0 + w] = word;
+    }
+    j->bad = bad;
+    return NULL;
+}
+
+bool FMI_search::sa_hi_pack(const int8_t *src, int64_t first, int64_t n, int log2, uint64_t *dst,
+                            int nthreads)
+{
+    const int64_t per_word = 64 >> log2;
+    xassert(first % per_word == 0, "sa_hi_pack: first sample is not on a word boundary");
+    const uint64_t mask = sa_hi_mask_for(log2);
+    const int64_t nw = (n + per_word - 1) / per_word;
+    /* Pthreads, as the index load's parallel reads use, with the same inline fallback when a
+     * thread cannot be spawned. This file is compiled with OpenMP, but its OpenMP loop
+     * (densify_sa_into) is #ifdef _OPENMP; the pack does not depend on it either way. Each worker
+     * owns whole words, so the result does not depend on the split. */
+    int T = nthreads > 1 ? nthreads : 1;
+    if (T > 64) T = 64;
+    if ((int64_t)T > nw / 4096) T = nw / 4096 > 1 ? (int)(nw / 4096) : 1;
+    std::vector<SaHiPackJob> jobs((size_t)T);
+    std::vector<pthread_t> tids((size_t)T);
+    std::vector<bool> spawned((size_t)T, false);
+    for (int t = 0; t < T; ++t)
+        jobs[t] = SaHiPackJob{ src, n, per_word, first / per_word, nw * t / T, nw * (t + 1) / T, log2, mask, dst, 0 };
+    for (int t = 1; t < T; ++t) {
+        if (pthread_create(&tids[t], NULL, sa_hi_pack_worker, &jobs[t]) == 0) spawned[t] = true;
+        else sa_hi_pack_worker(&jobs[t]);
+    }
+    sa_hi_pack_worker(&jobs[0]);
+    int bad = 0;
+    for (int t = 0; t < T; ++t) {
+        if (t > 0 && spawned[t]) pthread_join(tids[t], NULL);
+        bad |= jobs[t].bad;
+    }
+    return bad == 0;
+}
+
+static int64_t g_sa_hi_read_chunk = (int64_t)1 << 20;
+
+/* One worker of sa_hi_pread_pack: samples [first, first + n) of the call, read a piece at a
+ * time into a small private buffer and packed while the piece is still in cache. */
+struct SaHiPreadJob {
+    int fd; off_t off; int64_t first, n, piece; int log2; uint64_t *dst; int bad, oom;
+};
+
+static void *sa_hi_pread_worker(void *arg)
+{
+    SaHiPreadJob *j = static_cast<SaHiPreadJob *>(arg);
+    if (j->n <= 0) return NULL;
+    int8_t *buf = (int8_t *)malloc((size_t)(j->n < j->piece ? j->n : j->piece));
+    if (buf == NULL) { j->oom = 1; return NULL; }
+    for (int64_t s = 0; s < j->n; s += j->piece) {
+        const int64_t m = (j->n - s < j->piece) ? j->n - s : j->piece;
+        PreadChunk c{ j->fd, (char *)buf, (size_t)m, j->off + (off_t)s };
+        pread_chunk_worker(&c);   /* exits on an I/O error or a short file, as the load does */
+        if (!FMI_search::sa_hi_pack(buf, j->first + s, m, j->log2, j->dst, 1)) { j->bad = 1; break; }
+    }
+    free(buf);
+    return NULL;
+}
+
+int FMI_search::sa_hi_pread_pack(int fd, const char *path, off_t off, int64_t n, int log2,
+                                 uint64_t *dst, int nthreads)
+{
+    /* Split the samples into up to nthreads whole-word ranges (the index load's worker
+     * count for this many bytes); each worker reads its range a piece at a time and packs
+     * it at once, so the bytes are read from cache and never resident in full. */
+    const int T = n > 0 ? fmi_pread_worker_count((size_t)n, nthreads) : 1;
+    const int64_t per = ((n + T - 1) / T + 63) / 64 * 64;
+    std::vector<SaHiPreadJob> jobs((size_t)T);
+    std::vector<pthread_t> tids((size_t)T);
+    std::vector<bool> spawned((size_t)T, false);
+    for (int t = 0; t < T; ++t) {
+        const int64_t b = (int64_t)t * per < n ? (int64_t)t * per : n;
+        const int64_t e = b + per < n ? b + per : n;
+        const int wfd = (t == 0 || e <= b) ? fd : open_worker_fd(path, fd);
+        jobs[(size_t)t] = SaHiPreadJob{ wfd, off + (off_t)b, b, e - b, g_sa_hi_read_chunk, log2, dst, 0, 0 };
+    }
+    for (int t = 1; t < T; ++t) {
+        if (pthread_create(&tids[(size_t)t], NULL, sa_hi_pread_worker, &jobs[(size_t)t]) == 0)
+            spawned[(size_t)t] = true;
+        else
+            sa_hi_pread_worker(&jobs[(size_t)t]);
+    }
+    sa_hi_pread_worker(&jobs[0]);
+    int bad = 0, oom = 0;
+    for (int t = 0; t < T; ++t) {
+        if (t > 0 && spawned[(size_t)t]) pthread_join(tids[(size_t)t], NULL);
+        if (jobs[(size_t)t].fd != fd) close(jobs[(size_t)t].fd);
+        bad |= jobs[(size_t)t].bad;
+        oom |= jobs[(size_t)t].oom;
+    }
+    return oom ? SA_HI_READ_OOM : bad ? SA_HI_READ_RANGE : 0;
+}
+
+int64_t FMI_search::sa_hi_read_chunk() { return g_sa_hi_read_chunk; }
+
+void FMI_search::set_sa_hi_read_chunk(int64_t n)
+{
+    xassert(n > 0 && n % 64 == 0, "set_sa_hi_read_chunk: chunk must be a positive multiple of 64");
+    g_sa_hi_read_chunk = n;
 }

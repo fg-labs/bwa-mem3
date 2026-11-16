@@ -19,6 +19,7 @@
 #include "bntseq.h"
 #include "utils.h"
 #include "framework/shm_registry_guard.h"
+#include "framework/temp_dir.h"
 
 #include <cerrno>
 #include <cstdint>
@@ -27,8 +28,11 @@
 #include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <string>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <vector>
 
 #define CHECK(cond) do { \
     if (!(cond)) { \
@@ -47,6 +51,53 @@
         std::abort(); \
     } \
 } while (0)
+
+/* The .bwt.2bit.64 header before CP_OCC: reference_seq_len + count[5]. */
+static const int64_t BWT_2BIT_HEADER_BYTES = (int64_t)sizeof(int64_t) * 6;
+
+/* The raw one-byte-per-sample SA high parts of <prefix>.bwt.2bit.64, which follow
+ * the header and CP_OCC. */
+static std::vector<uint8_t> read_disk_sa_ms(const char *prefix, int64_t cp_occ_bytes, int64_t n) {
+    const std::string path = std::string(prefix) + ".bwt.2bit.64";
+    FILE *f = std::fopen(path.c_str(), "rb");
+    CHECK(f != NULL);
+    CHECK_EQ(fseeko(f, (off_t)(BWT_2BIT_HEADER_BYTES + cp_occ_bytes), SEEK_SET), 0);
+    std::vector<uint8_t> v((size_t)n);
+    CHECK_EQ(std::fread(v.data(), 1, v.size(), f), v.size());
+    std::fclose(f);
+    return v;
+}
+
+/* Overwrite SA high-part byte i of <prefix>.bwt.2bit.64 in place. */
+static void poke_disk_sa_ms(const char *prefix, int64_t cp_occ_bytes, int64_t i, uint8_t b) {
+    const std::string path = std::string(prefix) + ".bwt.2bit.64";
+    FILE *f = std::fopen(path.c_str(), "r+b");
+    CHECK(f != NULL);
+    CHECK_EQ(fseeko(f, (off_t)(BWT_2BIT_HEADER_BYTES + cp_occ_bytes + i), SEEK_SET), 0);
+    CHECK_EQ(std::fwrite(&b, 1, 1, f), (size_t)1);
+    CHECK_EQ(std::fclose(f), 0);
+}
+
+/* Sample i of a packed SA_MS array, decoded independently of FMI_search's accessor. */
+static int64_t packed_at(const uint8_t *sec, int log2, int64_t i) {
+    const int bits = 1 << log2;
+    const int64_t per_word = 64 / bits;
+    uint64_t w;
+    std::memcpy(&w, sec + (size_t)(i / per_word) * sizeof(uint64_t), sizeof(w));
+    return (int64_t)((w >> ((i % per_word) * bits)) & ((1ull << bits) - 1));
+}
+
+static void copy_file(const std::string &from, const std::string &to) {
+    FILE *in = std::fopen(from.c_str(), "rb");
+    CHECK(in != NULL);
+    FILE *out = std::fopen(to.c_str(), "wb");
+    CHECK(out != NULL);
+    char b[1 << 16];
+    size_t r;
+    while ((r = std::fread(b, 1, sizeof(b), in)) > 0) CHECK_EQ(std::fwrite(b, 1, r, out), r);
+    std::fclose(in);
+    CHECK_EQ(std::fclose(out), 0);
+}
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
@@ -102,8 +153,19 @@ int main(int argc, char *argv[]) {
 
     /* SA_MS. */
     section(BWA_SHM_SEC_FMI_SA_MS, &off, &sz);
-    CHECK_EQ((int64_t)sz, ref.sa_ms_byte_size_bytes());
-    CHECK_EQ(std::memcmp(buf + off, ref.sa_ms_byte_data(), (size_t)sz), 0);
+    CHECK_EQ((int64_t)sz, ref.sa_hi_size_bytes());
+    CHECK_EQ(std::memcmp(buf + off, ref.sa_hi_data(), (size_t)sz), 0);
+    /* Oracle: the loader and the stager share sa_hi_pack, so also check both packed
+     * arrays against the raw bytes on disk. */
+    const int hi_log2 = FMI_search::sa_hi_log2_for(ref.reference_seq_len);
+    {
+        const int64_t n = ref.sa_sample_count();
+        const std::vector<uint8_t> raw = read_disk_sa_ms(prefix, ref.cp_occ_size_bytes(), n);
+        for (int64_t i = 0; i < n; ++i) {
+            CHECK_EQ(packed_at((const uint8_t *)ref.sa_hi_data(), hi_log2, i), (int64_t)raw[(size_t)i]);
+            CHECK_EQ(packed_at(buf + off, hi_log2, i), (int64_t)raw[(size_t)i]);
+        }
+    }
 
     /* SA_LS. */
     section(BWA_SHM_SEC_FMI_SA_LS, &off, &sz);
@@ -184,6 +246,109 @@ int main(int argc, char *argv[]) {
     /* Cleanup. */
     std::free(buf);
 
+    /* Chunked loads and corrupt high parts, on a scratch copy of the index. phiX needs
+     * 1 bit per sample, so its high parts are all zero: set every third one to 1 (in
+     * range) so a misplaced sample shows, and lower the read chunk to 128 samples so
+     * the loader and the stager both cross many chunk boundaries. The staged segment is
+     * then attached (load_index_from_shm) and read back through the resolver. Then set
+     * one byte in a later chunk to a value that does not fit in 1 bit (2, and the
+     * sign-bit bytes 0x80 and 0xff): the stager, with and without densify, must fail and
+     * the disk loader must exit with an error. */
+    {
+        CHECK_EQ(hi_log2, 0);
+        /* Removed with its files when the block ends, whether or not a check failed. */
+        const bwa_tests::TempDir tdir("sa_hi_chunk");
+        const std::string &dir = tdir.path();
+        /* A basename unique to this run: shm segments are keyed by the index basename, so a
+         * staged phix.fa must not be attached in place of this modified copy. */
+        const std::string tprefix = dir + "/" + dir.substr(dir.rfind('/') + 1) + ".fa";
+        static const char *const exts[] = {".amb", ".ann", ".bwt.2bit.64", ".pac"};
+        for (const char *e : exts) copy_file(std::string(prefix) + e, tprefix + e);
+
+        const int64_t n = ref.sa_sample_count();
+        const int64_t cp_bytes = ref.cp_occ_size_bytes();
+        const int64_t chunk = 128;
+        CHECK(n > 4 * chunk);
+        for (int64_t i = 0; i < n; i += 3) poke_disk_sa_ms(tprefix.c_str(), cp_bytes, i, 1);
+        const std::vector<uint8_t> raw = read_disk_sa_ms(tprefix.c_str(), cp_bytes, n);
+        FMI_search::set_sa_hi_read_chunk(chunk);
+
+        FMI_search t(tprefix.c_str());
+        t.load_index();
+        const uint8_t *loaded = (const uint8_t *)t.sa_hi_data();
+        for (int64_t i = 0; i < n; ++i) CHECK_EQ(packed_at(loaded, hi_log2, i), (int64_t)raw[(size_t)i]);
+        uint8_t *tbuf = NULL;
+        uint64_t tlen = 0, toff = 0, tsz = 0;
+        CHECK_EQ(bwa_shm_pack_from_disk(tprefix.c_str(), &tbuf, &tlen), 0);
+        CHECK_EQ(bwa_shm_section_find(tbuf, BWA_SHM_SEC_FMI_SA_MS, &toff, &tsz), 0);
+        CHECK_EQ((int64_t)tsz, t.sa_hi_size_bytes());
+        CHECK_EQ(std::memcmp(tbuf + toff, loaded, (size_t)tsz), 0);
+        for (int64_t i = 0; i < n; ++i)
+            CHECK_EQ(packed_at(tbuf + toff, hi_log2, i), (int64_t)raw[(size_t)i]);
+        {
+            /* Attach a copy of the staged index as `mem` would (the object unmaps it) and
+             * resolve every sampled row: each must match the disk loader's coordinate. */
+            void *m = mmap(NULL, (size_t)tlen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            CHECK(m != MAP_FAILED);
+            std::memcpy(m, tbuf, (size_t)tlen);
+            FMI_search a(tprefix.c_str());
+            a.load_index_from_shm((uint8_t *)m, (size_t)tlen, (size_t)tlen);
+            CHECK_EQ((const uint8_t *)a.sa_hi_data(), (const uint8_t *)m + toff);
+            for (int64_t i = 0; i < n; ++i) {
+                const int64_t row = i << t.sa_compx;
+                CHECK_EQ(a.get_sa_entry_compressed(row, 0), t.get_sa_entry_compressed(row, 0));
+                CHECK_EQ(a.get_sa_entry_compressed(row, 0) >> 32, (int64_t)raw[(size_t)i]);
+            }
+        }
+        std::free(tbuf);
+
+        const int64_t bad_at = 2 * chunk + 45;
+        const std::string err_path = dir + "/load.err";
+        for (int b : {2, 0x80, 0xff}) {
+            std::printf("shm_pack_round_trip_test: corrupt high byte 0x%02x\n", b);
+            std::fflush(stdout);
+            poke_disk_sa_ms(tprefix.c_str(), cp_bytes, bad_at, (uint8_t)b);
+            tbuf = NULL;
+            CHECK(bwa_shm_pack_from_disk(tprefix.c_str(), &tbuf, &tlen) != 0);
+            CHECK(tbuf == NULL);
+            /* The densify path (`shm -u`) rejects it as well, by returning an error. */
+            bwa_shm_layout_t dl;
+            CHECK_EQ(bwa_shm_compute(tprefix.c_str(), &dl, /*bns_only=*/false,
+                                     (int)t.sa_compx - 1, /*n_threads=*/2), 0);
+            CHECK(dl.sa_compx < dl.disk_sa_compx);
+            uint8_t *dbuf2 = (uint8_t *)std::calloc(1, dl.total_size);
+            CHECK(dbuf2 != NULL);
+            CHECK(bwa_shm_pack_into(&dl, dbuf2) != 0);
+            std::free(dbuf2);
+            bwa_shm_layout_free(&dl);
+            std::fflush(NULL);
+            const pid_t pid = fork();
+            CHECK(pid >= 0);
+            if (pid == 0) {
+                /* dup2, not freopen: a reopened stderr may be fully buffered, and the
+                 * loader's fatal error aborts without flushing it. */
+                const int efd = open(err_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                if (efd < 0 || dup2(efd, STDERR_FILENO) < 0) _exit(3);
+                FMI_search c(tprefix.c_str());
+                c.load_index();
+                _exit(0);   /* loaded a corrupt index: the parent fails the test */
+            }
+            int status = 0;
+            CHECK_EQ(waitpid(pid, &status, 0), pid);
+            CHECK(!(WIFEXITED(status) && WEXITSTATUS(status) == 0));
+            FILE *ef = std::fopen(err_path.c_str(), "r");
+            CHECK(ef != NULL);
+            std::string err;
+            char eb[4096];
+            size_t r;
+            while ((r = std::fread(eb, 1, sizeof(eb), ef)) > 0) err.append(eb, r);
+            std::fclose(ef);
+            CHECK(err.find("SA sample high part out of range") != std::string::npos);
+        }
+        FMI_search::set_sa_hi_read_chunk((int64_t)1 << 20);   /* the default */
+        std::printf("shm_pack_round_trip_test: chunked load and corrupt high part OK\n");
+    }
+
     /* Densify parity (only when an oracle prefix is given): pack THIS index
      * densified via the `shm -u` path to the oracle's rate, and confirm the
      * staged SA sample arrays are byte-identical to the oracle -- an index
@@ -209,8 +374,8 @@ int main(int argc, char *argv[]) {
 
         uint64_t doff = 0, dsz = 0;
         CHECK_EQ(bwa_shm_section_find(dbuf, BWA_SHM_SEC_FMI_SA_MS, &doff, &dsz), 0);
-        CHECK_EQ((int64_t)dsz, oracle.sa_ms_byte_size_bytes());
-        CHECK_EQ(std::memcmp(dbuf + doff, oracle.sa_ms_byte_data(), (size_t)dsz), 0);
+        CHECK_EQ((int64_t)dsz, oracle.sa_hi_size_bytes());
+        CHECK_EQ(std::memcmp(dbuf + doff, oracle.sa_hi_data(), (size_t)dsz), 0);
         CHECK_EQ(bwa_shm_section_find(dbuf, BWA_SHM_SEC_FMI_SA_LS, &doff, &dsz), 0);
         CHECK_EQ((int64_t)dsz, oracle.sa_ls_word_size_bytes());
         CHECK_EQ(std::memcmp(dbuf + doff, oracle.sa_ls_word_data(), (size_t)dsz), 0);

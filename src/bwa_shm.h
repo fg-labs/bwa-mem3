@@ -43,9 +43,11 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * A stale v1 segment would otherwise pass bwa_shm_attach() and then hard-fail
  * the 64-byte FMI_SCALARS size check in load_index_from_shm() with no disk
  * fallback; rejecting it at attach lets load_index() fall back to disk.
+ * Bumped 2 -> 3 when FMI_SA_MS changed from one byte per SA sample to the packed
+ * high parts (FMI_search::sa_hi_size_bytes()).
  * Increment whenever any packed section layout (e.g. BWA_SHM_FMI_SCALARS_BYTES)
  * changes. */
-#define BWA_SHM_VERSION        2u
+#define BWA_SHM_VERSION        3u
 #define BWA_SHM_CTL_NAME       "/bwactl"
 /* Named POSIX semaphore guarding read-modify-write sequences against
  * /bwactl. A stager holds it only for the few milliseconds of registry and

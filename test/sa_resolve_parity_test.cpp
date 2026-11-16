@@ -56,7 +56,7 @@ static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel
         sp = fmi->count[b] + occ;
         offset++;
     }
-    int64_t sa = fmi->sa_ms_byte[sp >> fmi->sa_compx];
+    int64_t sa = fmi->sa_hi_at(sp >> fmi->sa_compx);
     sa = (sa << 32) + fmi->sa_ls_word[sp >> fmi->sa_compx];
     return sa + offset;
 }
