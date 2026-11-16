@@ -3101,7 +3101,8 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
 // function rather than burning a stepping-pass on housekeeping), except at a
 // walk's start when a jump is planned: that visit only prefetches the jump
 // table entry, and the next one loads it in place of the walk's first
-// jd - 1 steps.
+// jd - 1 steps. A walk whose interval is empty makes no cp_occ access: its
+// visit scans the read's bases to the walk's end instead (below).
 //
 // The semantics are identical to the scalar bwtSeedStrategyAllPosOneThread
 // inner-j body + outer-x advancement:
@@ -3163,6 +3164,28 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
             if (s->jump != nullptr) return;   // jump on the next visit
         }
         // Fall through to inner-j step.
+    }
+
+    // An empty interval stays empty: every later forward step gives s == 0, which is below
+    // max_intv and never emitted, so the walk's end depends only on the read. Find it by
+    // scanning bases, with no FM steps: the first j that reaches the read's end, an N, or
+    // minSeedLen (the same checks, in the same order, as the steps below).
+    if (s->smem.s == 0 && s->max_intv > 0) {
+        int32_t j = s->j;
+        while (j < s->readlength && enc_qdb[s->offset + j] < 4 &&
+               (j - s->smem.m + 1) < minSeedLen)
+            j++;
+        if (j >= s->readlength) {
+            s->x = s->readlength;
+        } else {
+            s->x = j + 1;   // an N at j, or the walk reached minSeedLen at j without a match
+        }
+        s->j = -1;
+        if (s->x >= s->x_end) {
+            s->phase = BSD_DONE;
+            s->ready = true;
+        }
+        return;
     }
 
     // Inner-j step.
