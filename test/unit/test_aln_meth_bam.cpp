@@ -3,6 +3,7 @@
 #include "htslib/kstring.h"
 #include "doctest/doctest.h"
 #include "aln_test_ref.h"
+#include "temp_dir.h"
 #include "../../src/aln/aln_main.h"
 #include "../../src/main.h"
 #include <cstdio>
@@ -36,7 +37,7 @@ std::vector<std::string> records(const std::string &path) {
         uint8_t *xr = bam_aux_get(rec, "XR");
         REQUIRE(xr != nullptr);
         CHECK(xr[0] == 'Z');
-        CHECK(std::string(bam_aux2Z(xr)) == "CT");
+        CHECK(std::string(bam_aux2Z(xr)) == ((rec->core.flag & BAM_FREAD2) ? "GA" : "CT"));
         if (!(rec->core.flag & BAM_FUNMAP)) {
             CHECK(bam_cigar2qlen(rec->core.n_cigar, bam_get_cigar(rec)) == rec->core.l_qseq);
             if (uint8_t *xa = bam_aux_get(rec, "XA")) {
@@ -182,4 +183,97 @@ TEST_CASE("aln_meth: SAM and BAM agree for both strands unmapped and QC-fail rec
         CHECK(a[2].substr(0, tab) == "r2");
         CHECK((std::stoi(a[2].substr(tab + 1)) & BAM_FUNMAP) != 0);
     }
+}
+
+TEST_CASE("aln_meth: paired trimmed mates and orphan records agree in SAM and BAM"
+          * doctest::test_suite("unit/aln_meth_bam")) {
+    bwa_tests::TempDir dir("aln_meth_pe_bam");
+    const std::string fa=dir.file("ref.fa"),f1=dir.file("r1.fq"),f2=dir.file("r2.fq");
+    uint32_t seed=918;const std::string genome=aln_test::lcg_dna(seed,4000);
+    REQUIRE(aln_test::write_test_fasta(fa,{{"one",genome}}));
+    REQUIRE(invoke({"index","--meth",fa},true)==0);
+    FILE *fp[2]={fopen(f1.c_str(),"w"),fopen(f2.c_str(),"w")};
+    REQUIRE(fp[0]!=nullptr);REQUIRE(fp[1]!=nullptr);
+    for(int i=0;i<42;++i) {
+        const int start=100+60*i,span=180+i%11;
+        for(int j=0;j<2;++j) {
+            std::string read=j?aln_test::revcomp(genome.substr(start+span-60,60)):genome.substr(start,60);
+            if(i==40&&j==1) read=std::string(60,'N');
+            if(i==41) read=std::string(60,'N');
+            const int trim=i%2?17000:5;
+            read+=std::string(trim,'A');
+            const std::string qual=std::string(60,'I')+std::string(trim,'!');
+            fprintf(fp[j],"@p%d\n%s\n+\n%s\n",i,read.c_str(),qual.c_str());
+        }
+    }
+    REQUIRE(fclose(fp[0])==0);REQUIRE(fclose(fp[1])==0);
+    const std::string sam=dir.file("out.sam"),bam=dir.file("out.bam");
+    // The planted records, from the layout above: pair i's read 1 is forward at start+1 and read 2
+    // reverse at start+span-59, each 60M with its trimmed tail soft-clipped (at the read's 3'
+    // end); pair 40's read 2 and both of pair 41 are all N. A pair is proper only when its
+    // insert is at least the longest untrimmed read, as sampe requires: so not the 17000-base
+    // tails of the odd pairs.
+    auto check_planted=[&](const std::vector<std::string> &recs) {
+        REQUIRE(recs.size()==84);
+        for(int i=0;i<42;++i) for(int j=0;j<2;++j) {
+            CAPTURE(i);CAPTURE(j);
+            std::vector<std::string> f;
+            const std::string &line=recs[2*i+j];
+            for(size_t at=0;;) {
+                const size_t tab=line.find('\t',at);
+                f.push_back(line.substr(at,tab==std::string::npos?tab:tab-at));
+                if(tab==std::string::npos) break;
+                at=tab+1;
+            }
+            REQUIRE(f.size()>=11);
+            CHECK(f[0]=="p"+std::to_string(i));
+            const int flag=std::stoi(f[1]),start=100+60*i,span=180+i%11,trim=i%2?17000:5;
+            const int pos[2]={start+1,start+span-59};
+            const std::string clip=std::to_string(trim)+"S";
+            // SEQ and QUAL: the planted read (as written to the FASTQ, tail included), reverse
+            // complemented and reversed on a reverse-strand record
+            std::string seq=j?aln_test::revcomp(genome.substr(start+span-60,60)):genome.substr(start,60);
+            if((i==40&&j==1)||i==41) seq=std::string(60,'N');
+            seq+=std::string(trim,'A');
+            std::string qual=std::string(60,'I')+std::string(trim,'!');
+            if(flag&BAM_FREVERSE) {seq=aln_test::revcomp(seq);qual.assign(qual.rbegin(),qual.rend());}
+            CHECK(f[9]==seq);CHECK(f[10]==qual);
+            CHECK((flag&(BAM_FPAIRED|BAM_FREAD1|BAM_FREAD2))==(BAM_FPAIRED|(j?BAM_FREAD2:BAM_FREAD1)));
+            if(i<40) {
+                CHECK((flag&(BAM_FUNMAP|BAM_FMUNMAP))==0);
+                CHECK(bool(flag&BAM_FPROPER_PAIR)==(i%2==0));
+                CHECK(bool(flag&BAM_FREVERSE)==(j==1));CHECK(bool(flag&BAM_FMREVERSE)==(j==0));
+                CHECK(f[2]=="one");CHECK(f[3]==std::to_string(pos[j]));CHECK(std::stoi(f[4])>0);
+                CHECK(f[5]==(j?clip+"60M":"60M"+clip));
+                CHECK(f[6]=="=");CHECK(f[7]==std::to_string(pos[1-j]));
+                CHECK(f[8]==std::to_string(j?-span:span));
+            } else if(i==40) {
+                CHECK(f[2]=="one");CHECK(f[3]==std::to_string(pos[0]));CHECK(f[6]=="=");CHECK(f[7]==f[3]);
+                CHECK(f[8]=="0");CHECK((flag&BAM_FPROPER_PAIR)==0);
+                if(j==0) {
+                    CHECK((flag&(BAM_FUNMAP|BAM_FMUNMAP|BAM_FREVERSE))==BAM_FMUNMAP);
+                    CHECK(std::stoi(f[4])>0);CHECK(f[5]=="60M"+clip);
+                } else {
+                    CHECK((flag&(BAM_FUNMAP|BAM_FMUNMAP|BAM_FMREVERSE))==BAM_FUNMAP);
+                    CHECK(f[4]=="0");CHECK(f[5]=="*");
+                }
+            } else {
+                CHECK((flag&(BAM_FUNMAP|BAM_FMUNMAP|BAM_FPROPER_PAIR))==(BAM_FUNMAP|BAM_FMUNMAP));
+                CHECK(f[2]=="*");CHECK(f[3]=="0");CHECK(f[5]=="*");CHECK(f[6]=="*");CHECK(f[7]=="0");
+            }
+        }
+    };
+    const std::vector<std::string> common={"aln","--meth","-q","20","-n","2","-l","1024","-s"};
+    auto run=[&](bool binary,int threads) {
+        auto args=common;args.insert(args.end(),{"-t",std::to_string(threads),"-f",binary?bam:sam});
+        if(binary) args.push_back("--bam");
+        args.insert(args.end(),{fa,f1,f2});return invoke(args);
+    };
+    REQUIRE(run(false,1)==0);const auto a=records(sam);check_planted(a);
+    REQUIRE(run(true,3)==0);CHECK(records(bam)==a);
+    REQUIRE(run(false,3)==0);CHECK(records(sam)==a);
+    auto cpg=common;cpg.insert(cpg.end(),{"--meth=taps","--meth-context","cpg","-f",sam,fa,f1,f2});
+    REQUIRE(invoke(cpg)==0);const auto context=records(sam);check_planted(context);
+    cpg=common;cpg.insert(cpg.end(),{"--meth=taps","--meth-context","cpg","--bam","-f",bam,fa,f1,f2});
+    REQUIRE(invoke(cpg)==0);CHECK(records(bam)==context);
 }
