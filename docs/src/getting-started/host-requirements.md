@@ -4,7 +4,7 @@ bwa-mem3 runs on the hosts in the table below. Verify your host with `bwa-mem3 v
 
 | Platform | Default build floor | Earliest supported CPU | Notes |
 |---|---|---|---|
-| Linux x86_64 | AVX2 (`BASELINE_ARCH=avx2`) | Intel Haswell (2013); AMD Zen / Naples (2017) | AVX2 is the minimum floor; kernels self-dispatch to the best of `avx2 / avx512bw` at runtime |
+| Linux x86_64 | AVX2 (`BASELINE_ARCH=avx2`) | Intel Haswell (2013); AMD Zen / Naples (2017) | AVX2 is the minimum floor; kernels self-dispatch to the best of `avx2 / avx512bw` at runtime (`avx512bw` needs the AVX-512BW, VL and DQ subsets) |
 | Linux arm64 | NEON (aarch64 ABI baseline) | Any aarch64 host | Single tier; NEON is mandatory in the aarch64 ABI |
 | macOS arm64 | NEON | Apple M1 (2020) | Apple Silicon only; macOS x86_64 is unsupported |
 

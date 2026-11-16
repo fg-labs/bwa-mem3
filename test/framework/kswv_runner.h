@@ -12,6 +12,7 @@
 #include "ksw_runner.h"  // DEFAULT_* constants
 #include "scoring.h"
 #include "seqpair.h"
+#include "simd_dispatch.h"  // BWAMEM3_TIER_*
 
 // Mirrors the ifdef logic at src/kswv.cpp:175 / 1182 / 1692 that gates
 // kswv::getScores8 definitions. On SSE4.1-only x86 no SIMD branch compiles,
@@ -27,8 +28,18 @@
 
 namespace bwa_tests {
 
-// Run kswv::getScores8 over `pairs` through the full two-pass sequence
-// production uses for mate rescue. Returns one kswr_t per pair (same order
+// The SIMD tier whose kswv kernel run_kswv_batch and run_kswv_batch_gaps run: the
+// runtime tier (bwamem3_simd_tier(), which honors BWAMEM3_FORCE_TIER), raised to
+// avx2 on x86, where the sse41 / sse42 / avx tiers have no batched kswv kernel. On
+// x86 the kernel comes from that tier's kernel object (make_kswv_kernel_<tier>), the
+// same object production dispatches to, not from the kswv class compiled into this
+// test binary at its build floor. kswv_batch_tier_name() is its display name
+// ("AVX-512BW", "AVX2" or "NEON") for test messages.
+int kswv_batch_tier();
+const char *kswv_batch_tier_name();
+
+// Run getScores8 over `pairs`, at kswv_batch_tier(), through the full two-pass
+// sequence production uses for mate rescue. Returns one kswr_t per pair (same order
 // as input). xtra_flags = 0 is a sentinel meaning "derive from mat[0]" via
 // default_xtra_flags(match_score); pass an explicit non-zero value to
 // override. When use16 is true the batch is driven through getScores16
@@ -51,8 +62,8 @@ std::vector<kswr_t> run_kswv_batch_gaps(const std::vector<TestPair> &pairs,
                                         bool use16     = false);
 
 // As run_kswv_batch_gaps with the default gaps, but built through make_kswv:
-// the kernel is the RUNTIME tier's (it honors BWAMEM3_FORCE_TIER), not the one
-// this test binary was compiled for, and a non-null mat25 selects the mat-aware
+// the kernel is whichever one make_kswv picks for the runtime tier, with no raise
+// to avx2 (callers gate on the tier), and a non-null mat25 selects the mat-aware
 // (--meth freed-cell) kernel. maxRefLen / maxQerLen are the kswv capacities.
 // Returns {} when the kernel reports needsScalar(), so callers must REQUIRE the
 // result's size.

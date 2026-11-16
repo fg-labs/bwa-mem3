@@ -46,6 +46,7 @@
 
 #include "doctest/doctest.h"
 #include "scoring.h"
+#include "x86_tier_caps.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -102,11 +103,11 @@ std::vector<Tier> runnable_tiers() {
                       ksw_g2_wave_wmin_avx2, ksw_g2_wave16_wmin_avx2});
     else
         MESSAGE("ksw_global2 oracle: no AVX2 on this host; the avx2 tier is skipped");
-    if (__builtin_cpu_supports("avx512bw"))
+    if (bwa_tests::host_runs_avx512bw_kernels())
         ts.push_back({"avx512bw", ksw_global2_avx512bw, ksw_g2_wave_exec_count_avx512bw,
                       ksw_g2_wave16_exec_count_avx512bw, ksw_g2_wave_wmin_avx512bw, ksw_g2_wave16_wmin_avx512bw});
     else
-        MESSAGE("ksw_global2 oracle: no AVX-512BW on this host; the avx512bw tier is skipped");
+        MESSAGE("ksw_global2 oracle: this host lacks AVX-512BW, VL or DQ; the avx512bw tier is skipped");
 #else
     ts.push_back({"neon", ksw_global2, ksw_g2_wave_exec_count, ksw_g2_wave16_exec_count, ksw_g2_wave_wmin,
                   ksw_g2_wave16_wmin});

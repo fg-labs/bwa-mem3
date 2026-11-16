@@ -22,6 +22,7 @@
 #include "bandedSWA.h"
 #include "bsw_batch.h"
 #include "ext_ladder.h"
+#include "x86_tier_caps.h"
 
 TEST_CASE("bsw8: the signed-domain chooser follows each gap penalty byte at the int8 boundary"
           * doctest::test_suite("unit/bandedswa-signed8")) {
@@ -59,7 +60,7 @@ std::vector<Tier> tiers_8bit()
     std::vector<Tier> ts;
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2")) ts.push_back({"avx2", make_bsw_kernel_avx2});
-    if (__builtin_cpu_supports("avx512bw")) ts.push_back({"avx512bw", make_bsw_kernel_avx512bw});
+    if (bwa_tests::host_runs_avx512bw_kernels()) ts.push_back({"avx512bw", make_bsw_kernel_avx512bw});
     return ts;
 }
 
@@ -151,14 +152,15 @@ TEST_CASE("bsw8: both score-domain instantiations match the scalar reference on 
     for (const Tier &t : ts) has512 = has512 || std::string(t.name) == "avx512bw";
     const bool require512 = env_set("BWA_REQUIRE_SIGNED8");
     if (!has512 && require512)
-        FAIL("bandedSWA signed8: BWA_REQUIRE_SIGNED8 is set but this host has no AVX-512BW; the "
+        FAIL("bandedSWA signed8: BWA_REQUIRE_SIGNED8 is set but this host lacks AVX-512BW, VL or DQ; the "
              "signed-domain instantiation cannot run");
     if (ts.empty()) {
         MESSAGE("bandedSWA signed8: this host has no x86 8-bit SIMD tier (needs avx2 or avx512bw); skipped");
         return;
     }
     if (!has512)
-        MESSAGE("bandedSWA signed8: no AVX-512BW on this host; the signed-domain instantiation is not exercised");
+        MESSAGE("bandedSWA signed8: this host lacks AVX-512BW, VL or DQ; the signed-domain instantiation "
+                "is not exercised");
 
     const Row rows[] = {
         {"production -O 6 -E 1, symmetric",            6,   1,   6,   1, 0, 40,  40,  40, 150, true},

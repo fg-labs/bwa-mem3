@@ -75,6 +75,7 @@
 
 #include "doctest/doctest.h"
 #include "scoring.h"
+#include "x86_tier_caps.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -220,8 +221,8 @@ std::vector<Kernel> runnable_kernels() {
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2")) ks.push_back({"avx2", make_bsw_kernel_avx2});
     else MESSAGE("banded SW oracle: no AVX2 on this host; the avx2 tier is skipped");
-    if (__builtin_cpu_supports("avx512bw")) ks.push_back({"avx512bw", make_bsw_kernel_avx512bw});
-    else MESSAGE("banded SW oracle: no AVX-512BW on this host; the avx512bw tier is skipped");
+    if (bwa_tests::host_runs_avx512bw_kernels()) ks.push_back({"avx512bw", make_bsw_kernel_avx512bw});
+    else MESSAGE("banded SW oracle: this host lacks AVX-512BW, VL or DQ; the avx512bw tier is skipped");
 #elif defined(__aarch64__)
     ks.push_back({"neon", make_native});
 #endif

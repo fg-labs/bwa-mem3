@@ -117,9 +117,9 @@ performance, specify the architecture that matches your deployment target:
 
 | Flag | Requires | Notes |
 |------|----------|-------|
-| `make` | SSE4.1 or better (x86), any (ARM) | Default; selects best dispatch at runtime on x86 |
+| `make` | AVX2 (x86), any (ARM) | Default (`BASELINE_ARCH=avx2`); kernels dispatch to the best tier at runtime on x86 |
 | `make arch=avx2` | AVX2 (e.g. Haswell, Zen 2) | Recommended for modern x86 servers |
-| `make arch=avx512bw` | AVX-512BW (e.g. Skylake-X, Ice Lake, Sapphire Rapids) | Maximum x86 performance |
+| `make arch=avx512bw` | AVX-512BW (e.g. Skylake-X, Ice Lake, Sapphire Rapids) | Maximum x86 performance; the `avx512bw` kernels also need AVX-512VL and DQ, which these CPUs have |
 | `make arch=arm64` | Apple Silicon / AWS Graviton | NEON-vectorized build |
 
 See [Performance — SIMD dispatch matrix](../performance/simd-dispatch.md) for the full matrix

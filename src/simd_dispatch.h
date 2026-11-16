@@ -51,6 +51,19 @@ const char *bwamem3_simd_tier_name(int tier);
  * forward-declare it (which would let signature drift go undetected). */
 int bwamem3_check_host_floor(int host_tier, int build_tier);
 
+/* Pure helpers: rank a set of x86 CPU features (each 0 or 1) as a tier.
+ * bwamem3_x86_floor_tier is what the host-floor precheck compares against the
+ * build tier: the non-kernel code of an avx512bw build needs AVX-512 F and BW
+ * only, so VL and DQ are ignored. bwamem3_x86_kernel_tier is the tier the
+ * kernels dispatch to: the avx512bw kernels are also built with VL and DQ, so
+ * that tier needs AVX-512BW, VL and DQ, and a host missing VL or DQ gets the
+ * avx2 kernels. Below avx512bw both return the highest of avx2, avx, sse42 and
+ * sse41 present, or BWAMEM3_TIER_NONE. Defined on every architecture. */
+int bwamem3_x86_floor_tier(int avx512bw, int avx512vl, int avx512dq,
+                           int avx2, int avx, int sse42, int sse41);
+int bwamem3_x86_kernel_tier(int avx512bw, int avx512vl, int avx512dq,
+                            int avx2, int avx, int sse42, int sse41);
+
 /* Pure formatter: writes the host-floor refusal message into a caller-
  * provided buffer. Returns the byte count written (excluding terminator),
  * or -1 on truncation/null-buffer. Buffer is NUL-terminated within its

@@ -50,7 +50,10 @@ transition unchanged, and the `arch=avx512bw` build target remains the
 single-arch fallback for clusters with uniform AVX-512BW hardware. The
 pre-#16 mismatch between selector, guard, and suffix is therefore
 resolved in both the historical multi-binary layout and the current
-single-binary layout.
+single-binary layout. The tier's kernel objects have since also gained
+`-mavx512vl -mavx512dq`, and the dispatcher picks them only on a CPU with
+AVX-512BW, VL and DQ (see
+[SIMD dispatch](../performance/simd-dispatch.md)).
 
 This is a pure build-correctness fix: before PR #16, `arch=avx512bw`
 and the legacy multi-binary build on AVX-512BW hardware silently

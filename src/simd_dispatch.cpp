@@ -10,9 +10,11 @@
 #endif
 
 static int g_tier = BWAMEM3_TIER_NONE;
-static int g_host_capability = BWAMEM3_TIER_NONE;  /* raw detect_x86_tier(),
-                                                      preserved before
-                                                      BWAMEM3_FORCE_TIER */
+/* The host's floor capability: the highest tier whose non-kernel instruction
+ * set (ARCH_FLAGS) the host has, which the host-floor precheck compares against
+ * the build tier. Independent of BWAMEM3_FORCE_TIER, and of the extra subsets
+ * only the kernel objects need (see bwamem3_x86_kernel_tier). */
+static int g_host_capability = BWAMEM3_TIER_NONE;
 static std::once_flag g_init_flag;
 
 /* Build-time tier — what the compiler emitted for this TU and (because the
@@ -41,16 +43,56 @@ static constexpr int g_build_tier = BWAMEM3_TIER_SSE41;
 static constexpr int g_build_tier = BWAMEM3_TIER_NONE;
 #endif
 
+/* Pure helpers: rank a set of x86 CPU features (each 0 or 1) as a tier. They are
+ * defined on every architecture so the unit tests can drive them anywhere.
+ *
+ * The floor tier is what the non-kernel translation units need. An
+ * arch=avx512bw build compiles them with AVX-512 F and BW only (Makefile
+ * ARCH_FLAGS), so VL and DQ do not count toward it.
+ *
+ * The kernel tier is the highest tier whose kernel objects the host can run.
+ * The avx512bw kernels are also built with VL and DQ (Makefile
+ * KERNEL_FLAGS_avx512bw), so that tier needs all three; a host without them
+ * runs the avx2 kernels, which every build carries. */
+static int x86_tier_ladder(int avx512bw, int avx2, int avx, int sse42, int sse41)
+{
+    if (avx512bw) return BWAMEM3_TIER_AVX512BW;
+    if (avx2)     return BWAMEM3_TIER_AVX2;
+    if (avx)      return BWAMEM3_TIER_AVX;
+    if (sse42)    return BWAMEM3_TIER_SSE42;
+    if (sse41)    return BWAMEM3_TIER_SSE41;
+    return BWAMEM3_TIER_NONE;
+}
+
+extern "C" int bwamem3_x86_floor_tier(int avx512bw, int avx512vl, int avx512dq,
+                                      int avx2, int avx, int sse42, int sse41)
+{
+    (void)avx512vl;
+    (void)avx512dq;
+    return x86_tier_ladder(avx512bw, avx2, avx, sse42, sse41);
+}
+
+extern "C" int bwamem3_x86_kernel_tier(int avx512bw, int avx512vl, int avx512dq,
+                                       int avx2, int avx, int sse42, int sse41)
+{
+    return x86_tier_ladder(avx512bw && avx512vl && avx512dq, avx2, avx, sse42, sse41);
+}
+
 #if defined(__x86_64__) || defined(__i386__)
-static int detect_x86_tier(void)
+/* Reads CPUID once and ranks it twice: *floor_tier for the host-floor
+ * precheck, *kernel_tier for kernel dispatch. */
+static void detect_x86_tiers(int *floor_tier, int *kernel_tier)
 {
     __builtin_cpu_init();
-    if (__builtin_cpu_supports("avx512bw")) return BWAMEM3_TIER_AVX512BW;
-    if (__builtin_cpu_supports("avx2"))     return BWAMEM3_TIER_AVX2;
-    if (__builtin_cpu_supports("avx"))      return BWAMEM3_TIER_AVX;
-    if (__builtin_cpu_supports("sse4.2"))   return BWAMEM3_TIER_SSE42;
-    if (__builtin_cpu_supports("sse4.1"))   return BWAMEM3_TIER_SSE41;
-    return BWAMEM3_TIER_NONE;
+    const int bw    = __builtin_cpu_supports("avx512bw") != 0;
+    const int vl    = __builtin_cpu_supports("avx512vl") != 0;
+    const int dq    = __builtin_cpu_supports("avx512dq") != 0;
+    const int avx2  = __builtin_cpu_supports("avx2") != 0;
+    const int avx   = __builtin_cpu_supports("avx") != 0;
+    const int sse42 = __builtin_cpu_supports("sse4.2") != 0;
+    const int sse41 = __builtin_cpu_supports("sse4.1") != 0;
+    *floor_tier  = bwamem3_x86_floor_tier(bw, vl, dq, avx2, avx, sse42, sse41);
+    *kernel_tier = bwamem3_x86_kernel_tier(bw, vl, dq, avx2, avx, sse42, sse41);
 }
 #endif
 
@@ -168,8 +210,10 @@ extern "C" void bwamem3_enforce_host_floor(void)
      * implementation -- getScores8()/getScores16() on the sse41/sse42/avx
      * tiers are exit() stubs -- so a paired-end run that reached mate rescue
      * would abort mid-run. Refuse up front with the same clean exit(2). Since
-     * g_tier defaults to the host tier (>= avx2 here, or this precheck would
-     * already have exited), g_tier < avx2 can only be a forced downgrade.
+     * g_tier defaults to the host's kernel tier, which is at least avx2 on a
+     * host that passed the precheck above (the floor is avx2 or higher, and a
+     * host missing only AVX-512VL or DQ still runs the avx2 kernels), g_tier <
+     * avx2 can only be a forced downgrade.
      * `version`/help never call this, so forcing a sub-AVX2 tier stays
      * available there for introspection. */
 #if defined(__x86_64__) || defined(__i386__)
@@ -244,25 +288,29 @@ extern "C" void bwamem3_print_version_simd(FILE *f)
 /* The body of bwamem3_simd_init. Called at most once via std::call_once. */
 static void bwamem3_simd_init_body(void)
 {
+    int kernel_capability;
 #if defined(__x86_64__) || defined(__i386__)
-    g_host_capability = detect_x86_tier();
+    detect_x86_tiers(&g_host_capability, &kernel_capability);
 #elif defined(__aarch64__) || defined(__ARM_NEON)
     g_host_capability = BWAMEM3_TIER_NEON;
+    kernel_capability = BWAMEM3_TIER_NEON;
 #else
     g_host_capability = BWAMEM3_TIER_NONE;
+    kernel_capability = BWAMEM3_TIER_NONE;
 #endif
 
 #ifdef BWAMEM3_TESTING
     /* Test-only: BWAMEM3_TESTING_HOST_TIER overrides the detected host
-     * capability, so regression tests can simulate too-old hosts without
-     * actually being on one. Production builds (without -DBWAMEM3_TESTING)
-     * never compile this path. */
+     * capability (floor and kernel tier alike), so regression tests can
+     * simulate too-old hosts without actually being on one. Production builds
+     * (without -DBWAMEM3_TESTING) never compile this path. */
     {
         const char *injected = getenv("BWAMEM3_TESTING_HOST_TIER");
         if (injected != NULL && injected[0] != '\0') {
             int tier = parse_tier_name(injected);
             if (tier >= 0) {
                 g_host_capability = tier;
+                kernel_capability = tier;
             } else {
                 fprintf(stderr, "[W::%s] ignoring BWAMEM3_TESTING_HOST_TIER=%s "
                                 "(unknown tier)\n", __func__, injected);
@@ -271,7 +319,7 @@ static void bwamem3_simd_init_body(void)
     }
 #endif
 
-    g_tier = g_host_capability;
+    g_tier = kernel_capability;
 
     /* Build-vs-host gap (debug-only).
      *

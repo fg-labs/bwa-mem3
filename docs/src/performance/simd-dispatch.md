@@ -14,7 +14,7 @@ flowchart TD
     A[bwa-mem3 mem starts] --> B{Platform?}
     B -- ARM / aarch64 --> C[NEON kernel TU, no dispatch]
     B -- x86 --> D[bwamem3_simd_init in src/simd_dispatch.cpp]
-    D --> E["host capability = __builtin_cpu_supports;<br/>effective g_tier = host, then downgraded<br/>by BWAMEM3_FORCE_TIER if set"]
+    D --> E["host capability = __builtin_cpu_supports;<br/>effective g_tier = host's kernel tier (avx512bw<br/>needs BW, VL and DQ), then downgraded<br/>by BWAMEM3_FORCE_TIER if set"]
     E --> F{"Host capability >=<br/>build floor (g_build_tier,<br/>default avx2)?"}
     F -- no --> H1["exit(2): host below the build's SIMD floor"]
     F -- yes --> G{"Effective g_tier >= avx2?"}
@@ -27,7 +27,7 @@ checks: first the host capability against the compile-time build floor
 (`g_build_tier`, default `avx2`; `BASELINE_ARCH=avx512bw` raises it),
 then the effective tier against the absolute `avx2` runtime floor —
 which only a `BWAMEM3_FORCE_TIER` downgrade can trip, since `g_tier`
-otherwise defaults to the host tier.
+otherwise defaults to the host's kernel tier.
 
 The default (`BASELINE_ARCH=avx2`) build's floor is AVX2, so on that
 build an unforced host below AVX2 (AVX, SSE4.2, SSE4.1) is rejected by
@@ -65,8 +65,8 @@ matters for dispatch is `BASELINE_ARCH`:
 units compile. The hand-tuned kernel TUs in `KERNEL_SRCS`
 (`bandedSWA`, `kswv`, `ksw`, `sam_encode`) are always compiled at
 every supported tier and dispatched at runtime, so a build at
-`BASELINE_ARCH=avx2` still uses the AVX-512BW kernels on AVX-512BW
-hosts. The non-kernel TUs are not auto-vectorized above
+`BASELINE_ARCH=avx2` still uses the AVX-512BW kernels on hosts with
+AVX-512BW, VL and DQ. The non-kernel TUs are not auto-vectorized above
 `BASELINE_ARCH`, which is the trade-off — see
 [`BASELINE_ARCH=avx512bw` build flag](../whats-different/avx512-baseline.md)
 for the empirical perf characterization.
@@ -80,6 +80,17 @@ Supported x86 tiers (minimum CPU for each tier's kernel path):
 | `avx` | `-mavx` | Sandy Bridge (2011) / Bulldozer (2011) |
 | `avx2` | `-mavx2` | Haswell (2013) / Excavator (2015) |
 | `avx512bw` | `-mavx512f -mavx512bw -mprefer-vector-width=256` | Skylake-X (2017) / Zen 4 (2022) |
+
+The arch flags are the ones an `arch=<tier>` build compiles its non-kernel code with. The named
+x86 build tiers are `arch=avx2` and `arch=avx512bw`; `sse41`, `sse42` and `avx` exist only as
+kernel tiers. `arch=native` and a raw `arch=<flags>` value also build, but must enable AVX2.
+The kernel objects get their own `KERNEL_FLAGS_<tier>`, and the `avx512bw` ones
+add AVX-512VL and DQ: `-march=x86-64 -mavx -mavx2 -mavx512f -mavx512bw -mavx512vl -mavx512dq
+-mpopcnt`, with no vector-width cap. So the dispatcher runs the `avx512bw` kernels only on a
+CPU that reports AVX-512BW, VL and DQ, and the `avx2` kernels on any other AVX2 host. The
+floor of an `arch=avx512bw` build needs only AVX-512BW, because its non-kernel code uses F and
+BW alone: on a CPU that reports BW without VL or DQ (only seen under a hypervisor that masks
+them) that build still runs, with the `avx2` kernels.
 
 > **AVX2 is the runtime floor.** The `sse41` / `sse42` / `avx` kernel objects are still compiled so the dispatch vtable links on every tier, but a shipping build's non-kernel TUs require AVX2 (the host-floor precheck refuses to start below it) and the batched `kswv` mate-rescue kernel has no sub-AVX2 implementation. Automatic alignment dispatch therefore never selects those three tiers. Diagnostic commands and alignment commands differ in how they treat a forced sub-AVX2 tier: `version` / help bypass `bwamem3_enforce_host_floor()`, so an explicit `BWAMEM3_FORCE_TIER=sse41|sse42|avx` can still surface a sub-AVX2 tier name for introspection. An alignment run (`mem`) cannot: `bwamem3_enforce_host_floor()` refuses any effective tier below AVX2 up front with `exit(2)` — before any kernel dispatch — so a paired-end `mem` run never reaches the sub-AVX2 `kswv` `getScores8`/`getScores16` stubs. `avx2` and `avx512bw` are the reachable x86 alignment tiers.
 

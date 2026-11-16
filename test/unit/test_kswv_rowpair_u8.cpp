@@ -6,8 +6,7 @@
 //
 // The kernel is reached through make_kswv (bwa_tests::run_kswv_batch_runtime),
 // which dispatches on the RUNTIME tier and honors BWAMEM3_FORCE_TIER, so this
-// reaches the AVX-512BW kernel on a capable host (run_kswv_batch binds the tier this translation unit is compiled
-// for, AVX2 on x86, and would not). On AVX2 both arms run the same one-row
+// reaches the AVX-512BW kernel on a capable host. On AVX2 both arms run the same one-row
 // kernel, so the case would pass without exercising the pair: it is registered
 // as skipped there (and on the SSE tiers, which have no batched kswv kernel).
 //

@@ -129,7 +129,7 @@ flowchart TD
     B -- x86 --> D[bwa-mem3 main, calls bwamem3_simd_init in src/simd_dispatch.cpp]
 
     D --> E{__builtin_cpu_supports + BWAMEM3_FORCE_TIER}
-    E -- AVX-512BW --> F1[g_tier = avx512bw]
+    E -- AVX-512BW+VL+DQ --> F1[g_tier = avx512bw]
     E -- AVX2 --> F2[g_tier = avx2]
     E -- AVX --> F3[g_tier = avx]
     E -- SSE4.2 --> F4[g_tier = sse42]
