@@ -8,6 +8,39 @@ small samples back-to-back against the same reference — such as clinical
 panels or amplicon sequencing — this removes the dominant I/O bottleneck.
 `shm` also lists and destroys staged segments.
 
+> **Important — on Linux, mount `/dev/shm` with `huge=advise` before staging**
+>
+> On a stock `/dev/shm` mount (`huge=never`) a staged index sits on 4 KB pages, and
+> alignment against it uses more CPU than an index loaded from disk, by a quarter to a
+> third on a human genome
+> ([measurements below](#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size)).
+> When that happens, `shm` (after staging) and `mem` (when it attaches) print a one-line
+> `[W::bwa_shm_stage]` or `[W::bwa_shm_attach]` warning; exit status and output do not
+> change. The warning is skipped where the segment cannot be on huge pages: a segment smaller than one
+> huge page (2 MB; 512 MB on an arm64 kernel with 64 KB pages), a kernel whose
+> `/sys/kernel/mm/transparent_hugepage/shmem_enabled` is `[deny]`, which keeps every tmpfs
+> mount on 4 KB pages, and an index staged with `--huge-pages`; and it is not printed
+> with `-v 1` or lower, or when `/proc/self/smaps` cannot be read. To fix it, remount
+> and restage (but see `[force]` below). The page size is fixed when the segment is written, so an index staged
+> before the remount stays on 4 KB pages until restaged:
+>
+> ```bash
+> sudo mount -o remount,huge=advise /dev/shm
+> bwa-mem3 shm -d
+> bwa-mem3 shm ref.fa
+> ```
+>
+> To keep it across reboots, add `huge=advise` to the `/dev/shm` options in
+> `/etc/fstab`, e.g. `tmpfs /dev/shm tmpfs defaults,huge=advise 0 0`.
+>
+> Where `shmem_enabled` is `[force]`, every tmpfs mount already gets huge pages whatever
+> its `huge=` option, so a segment left on 4 KB pages means the kernel found no free huge
+> page when it was written (memory too low or too fragmented). The warning then says so
+> and advises freeing memory or compacting it
+> (`echo 1 | sudo tee /proc/sys/vm/compact_memory`, with
+> `/sys/kernel/mm/transparent_hugepage/defrag` not `[never]`) before restaging, not a
+> remount.
+
 ## Synopsis
 
 ```text
@@ -441,7 +474,8 @@ because of another tmpfs. To check this index's segment, look at its entry in
 `/proc/<pid>/smaps` of a running `mem`: `ShmemPmdMapped` is non-zero when the
 segment is mapped on 2 MB pages.
 
-On a `huge=never` mount the request is ignored. Staging still saves the index
+On a `huge=never` mount the request is ignored, and `shm` and `mem` say so
+with a `[W::]` line on stderr. Staging still saves the index
 load, but each run then pays the CPU cost above, which on a large sample can
 exceed the load time saved.
 

@@ -227,6 +227,31 @@ extern "C" {
 	 * (header cp_layout BWA_SHM_CP_LAYOUT_COMPACT), 0 if the default one. */
 	int       bwa_shm_segment_compact(const uint8_t *base);
 
+	/* The huge-page warning that `shm` (after the pack) and bwa_shm_attach (for a
+	 * segment it returns) print, at most once per process, when the segment is not
+	 * on huge pages. Exposed for its unit tests (test/unit/test_shm_hugepage_warn.cpp);
+	 * nothing else calls them.
+	 * bwa_shm_hugepage_warn_wanted: whether to warn for a segment of seg_len bytes.
+	 * on_huge is bwa_smaps_vma_finish's verdict for its mapping (bwa_thp.h);
+	 * pmd_bytes the PMD (transparent huge page) size; shmem_enabled the text of
+	 * /sys/kernel/mm/transparent_hugepage/shmem_enabled, or NULL when it cannot be
+	 * read. 1 only when the segment could be on huge pages and is not: the
+	 * mapping is resident and none of it is huge (on_huge == 0), the segment
+	 * holds at least one PMD page (a smaller one is never PMD-mapped, whatever
+	 * the mount), and the kernel has shmem THP not set to [deny] (which turns it
+	 * off for every tmpfs mount, whatever the mount option).
+	 * bwa_shm_format_hugepage_warning: the one-line "[W::<func>]" message for a
+	 * segment on page_bytes pages, newline-terminated, into buf (n bytes; NULL
+	 * and 0 to size it). forced: shmem_enabled is [force], which gives every
+	 * tmpfs mount huge pages whatever its huge= option, so the message advises
+	 * freeing or compacting memory instead of a remount. Returns the snprintf
+	 * length. */
+	int       bwa_shm_hugepage_warn_wanted(int on_huge, uint64_t seg_len, uint64_t pmd_bytes,
+	                                       const char *shmem_enabled);
+	int       bwa_shm_format_hugepage_warning(char *buf, size_t n, const char *func,
+	                                          const char *name, uint64_t page_bytes,
+	                                          uint64_t pmd_bytes, int forced);
+
 	/* Layout of a packed bwa-mem3 index segment. Computed by bwa_shm_compute
 	 * from a prefix on disk; consumed by bwa_shm_pack_into and bwa_shm_stage.
 	 * Owns a heap-loaded bntseq_t held across compute->pack_into so we don't

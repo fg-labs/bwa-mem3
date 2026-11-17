@@ -94,7 +94,8 @@ typedef struct {
 /* Streaming /proc/self/smaps parser: smaps is one record per VMA and can be
  * megabytes, so it is fed in chunks of any size (lines may span chunks). Only
  * a line's first BWA_THP_LINE_MAX-1 bytes are kept, which holds every field
- * the parser reads; a VMA header line is recognised by its leading hex digit. */
+ * the parser reads; a VMA header line is "<hex start>-<hex end> ..." (no field
+ * key is a hex number followed by '-'). */
 #define BWA_THP_LINE_MAX 64
 typedef struct {
     bwa_thp_usage_t u;
@@ -108,6 +109,39 @@ void bwa_thp_smaps_init(bwa_thp_smaps_parser_t *p);
 void bwa_thp_smaps_feed(bwa_thp_smaps_parser_t *p, const char *data, size_t n);
 /* Flush the last line and VMA; copy the totals to *out. */
 void bwa_thp_smaps_finish(bwa_thp_smaps_parser_t *p, bwa_thp_usage_t *out);
+
+/* The same streaming parser for one VMA, the one holding `addr` (the shm huge-page check,
+ * bwa_shm.cpp): its Rss and whether it is on huge pages. Shares the THP parser's line handling
+ * and VMA-header rule ("<hex start>-<hex end> ..."). */
+typedef struct {
+    unsigned long long addr;
+    int found, in_vma, have_pmd, hugetlb, done;
+    long long rss, pmd;
+    size_t len;
+    char line[BWA_THP_LINE_MAX];
+} bwa_smaps_vma_parser_t;
+
+void bwa_smaps_vma_init(bwa_smaps_vma_parser_t *p, unsigned long long addr);
+void bwa_smaps_vma_feed(bwa_smaps_vma_parser_t *p, const char *data, size_t n);
+/* Nonzero once the VMA holding addr has been read whole (the next VMA has begun): the rest of
+ * smaps can be skipped. */
+static inline int bwa_smaps_vma_done(const bwa_smaps_vma_parser_t *p) { return p->done; }
+/* 1 if the VMA holding addr is on huge pages: PMD-mapped (ShmemPmdMapped or FilePmdMapped
+ * above 0), or a hugetlb mapping (KernelPageSize of 2 MB or more, or Shared_Hugetlb /
+ * Private_Hugetlb above 0, as a System V SHM_HUGETLB segment shows). 0 if it has resident pages
+ * and none of them is huge. -1 if it cannot tell (no VMA holds addr, no resident pages, or
+ * neither PMD field is present). */
+int bwa_smaps_vma_finish(bwa_smaps_vma_parser_t *p);
+
+/* Read the file at `path` (procfs or sysfs) in 64 KB chunks, passing each to feed(ctx, data, n),
+ * retrying EINTR, until the end or until feed returns nonzero. 0 on success, -1 if it cannot be
+ * opened or read. Linux only; -1 elsewhere. */
+int bwa_proc_read_stream(const char *path, int (*feed)(void *ctx, const char *data, size_t n),
+                         void *ctx);
+/* The whole file at `path` (procfs or sysfs) in *buf, NUL-terminated: *buf is realloc'd as
+ * needed (*cap its size; start both at NULL / 0, free(*buf) when done), to at most max_bytes.
+ * Returns the length, or -1 if it cannot be read or does not fit. Linux only; -1 elsewhere. */
+long bwa_proc_read_text(const char *path, char **buf, size_t *cap, size_t max_bytes);
 
 /* The two /proc/self/status fields the check uses; -1 when absent. */
 typedef struct {

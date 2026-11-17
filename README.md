@@ -133,6 +133,7 @@ See the [installation guide](https://bwa-mem3.readthedocs.io/en/latest/getting-s
 ## Quick links
 
 - [Benchmarks](https://bwa-mem3.readthedocs.io/en/latest/performance/benchmarks.html) — published results for every release, and how they are measured
+- [Shared-memory index](https://bwa-mem3.readthedocs.io/en/latest/cli/shm.html) — `bwa-mem3 shm`; on Linux, mount `/dev/shm` with `huge=advise` before staging, or alignment uses more CPU than a disk load (hg38, 5M read pairs, `-t 16`: +33 % on Zen 4 x86-64 AVX-512BW, +26 % on Graviton4 arm64 NEON; [measurements](https://bwa-mem3.readthedocs.io/en/latest/cli/shm.html#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size))
 - [bwa-mem3-rs](https://github.com/fg-labs/bwa-mem3-rs) — Rust bindings for bwa-mem3
 - [bioconda recipe](https://github.com/bioconda/bioconda-recipes/tree/master/recipes/bwa-mem3) — conda package on bioconda
 - [fgumi](https://github.com/fulcrumgenomics/fgumi) — UMI-aware consensus and deduplication
