@@ -26,7 +26,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+/* Case 23s replays the scalar rounds with forwardExt / backwardExt. */
+#define private public
 #include "FMI_search.h"
+#undef private
 #include "seed_jump_test_util.h"
 #include "lockstep_parity_test_util.h"
 #include "smem_parked.h"
@@ -888,6 +891,73 @@ static bool check_s1_tag_contained_rules()
     fprintf(stderr, "[PASS] %s  (%lld SMEMs)\n", name, (long long)n);
     passed_cases++;
     return true;
+}
+
+/* Case 23s: replay getSMEMsOnePosOneThread's rounds for one read and pivot (the
+ * scalar oracle's own steps, through forwardExt / backwardExt) and count the
+ * backward-round shapes the lockstep loops special-case once a round keeps its
+ * first survivor (numCurr == 1): `inplace`, rounds whose survivor is prev[0] and
+ * whose next candidate is kept in its own slot (the in-place loop stores at
+ * least once); `dup`, rounds in that path that drop a candidate repeating the
+ * last kept s; `later`, rounds whose first survivor is not prev[0] (straight to
+ * the compaction loop). Test-side only: no production hook. */
+struct BwdShapes { int64_t inplace = 0, dup = 0, later = 0; };
+static void count_bwd_shapes(const FMI_search *fmi, const uint8_t *enc, int32_t len, int32_t x,
+                             int32_t min_intv, int32_t minSeedLen, BwdShapes *out)
+{
+    uint8_t a = enc[x];
+    if (a > 3) return;
+    std::vector<SMEM> prev;
+    SMEM smem{};
+    smem.m = smem.n = (uint32_t)x;
+    smem.k = fmi->count[a];
+    smem.l = fmi->count[3 - a];
+    smem.s = fmi->count[a + 1] - fmi->count[a];
+    for (int32_t j = x + 1; j < len; j++) {
+        a = enc[j];
+        if (a > 3) break;
+        SMEM ns = fmi->forwardExt(smem, a);
+        ns.n = (uint32_t)j;
+        if (ns.s != smem.s) prev.push_back(smem);
+        if (ns.s < min_intv) break;
+        smem = ns;
+    }
+    if (smem.s >= min_intv) prev.push_back(smem);
+    std::reverse(prev.begin(), prev.end());
+    for (int32_t j = x - 1; j >= 0 && !prev.empty(); j--) {
+        a = enc[j];
+        if (a > 3) break;
+        std::vector<SMEM> curr;
+        int64_t curr_s = -1;
+        size_t p = 0;
+        for (; p < prev.size(); p++) {
+            SMEM ns = fmi->backwardExt(prev[p], a);
+            ns.m = (uint32_t)j;
+            if (ns.s < min_intv && (int32_t)(prev[p].n - prev[p].m + 1) >= minSeedLen) break;
+            if (ns.s >= min_intv && ns.s != curr_s) { curr_s = ns.s; curr.push_back(ns); break; }
+        }
+        const bool kept_first = curr.size() == 1;
+        const size_t first = p;
+        p++;
+        bool stored_in_place = false, dropped = false;
+        for (size_t q = p; q < prev.size(); q++) {
+            SMEM ns = fmi->backwardExt(prev[q], a);
+            ns.m = (uint32_t)j;
+            if (ns.s >= min_intv && ns.s != curr_s) {
+                if (kept_first && first == 0 && q == 1) stored_in_place = true;
+                curr_s = ns.s;
+                curr.push_back(ns);
+            } else if (kept_first && ns.s == curr_s) {
+                dropped = true;
+            }
+        }
+        if (kept_first && p < prev.size()) {
+            if (first == 0) out->inplace += stored_in_place;
+            else out->later++;
+            out->dup += dropped;
+        }
+        prev.swap(curr);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -1961,6 +2031,96 @@ int main(int argc, char *argv[]) {
                 }
             }
             g_smem_lockstep_n = saved_n;
+            free(enc_qdb); free(seq_); free(cum_len);
+            free(ref);
+        }
+    }
+
+    /* Case 23: backward rounds with many candidates. A reference substring
+     * with a substituted base every `gap` bases, walked from its last base or
+     * from mid-read, gives a forward phase that keeps a candidate per
+     * occurrence-count drop; the backward rounds then keep the first survivor
+     * in place, drop candidates whose extension repeats the last kept s, and
+     * compact the rest. At minSeedLen 1 (every dying candidate is emitted) and
+     * 19, widths 1, 3 and the default; at minSeedLen 1 also at min_intv 2, 5
+     * and 30 (a survivor's later candidates skip the min_intv test, so a
+     * min_intv above 1 must not change which of them are kept; at minSeedLen 19
+     * no phiX match that long occurs twice, so nothing would be emitted). */
+    {
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        if (!ref) {
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 23: could not read reference FASTA '%s'\n", argv[1]);
+        } else {
+            const int32_t rl = 90;
+            const char sub[4] = {'C', 'G', 'T', 'A'};
+            std::vector<std::string> bufs;
+            std::vector<int32_t> qpa;
+            for (int32_t o = 11; o + rl <= ref_len && bufs.size() < 240; o += 173) {
+                for (const int32_t gap : {5, 9, 13, 31}) {
+                    std::string r(ref + o, (size_t)rl);
+                    for (int32_t i = gap; i < rl; i += gap) {
+                        const char c = r[(size_t)i];
+                        r[(size_t)i] = sub[c == 'A' ? 0 : c == 'C' ? 1 : c == 'G' ? 2 : 3];
+                    }
+                    bufs.push_back(r);
+                    qpa.push_back(rl - 1);
+                    bufs.push_back(r);
+                    qpa.push_back(rl / 2);
+                }
+            }
+            const int32_t n = (int32_t)bufs.size();
+            std::vector<const char *> reads;
+            std::vector<int32_t> mia, rid;
+            for (int32_t i = 0; i < n; i++) {
+                reads.push_back(bufs[(size_t)i].c_str());
+                mia.push_back(1);
+                rid.push_back(i);
+            }
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads.data(), n, &enc_qdb, &seq_, &cum_len);
+            const int32_t saved_n = g_smem_lockstep_n;
+            const int32_t widths[] = {1, clamp_width(3), SMEM_LOCKSTEP_N};
+            const int32_t msls[] = {1, 19};
+            const int32_t min_intvs[] = {1, 2, 5, 30};
+            for (const int32_t w : widths) {
+                for (const int32_t msl : msls) {
+                    for (const int32_t mi : min_intvs) {
+                        if (mi > 1 && msl != 1) continue;
+                        std::vector<int32_t> q = qpa, m(mia.size(), mi), r = rid;
+                        char name[160];
+                        snprintf(name, sizeof name, "Case 23: many-candidate backward rounds "
+                                 "(%d reads), N = %d, minSeedLen %d, min_intv %d", (int)n, (int)w,
+                                 (int)msl, (int)mi);
+                        g_smem_lockstep_n = w;
+                        run_case(fmi, name, n, rl, msl, enc_qdb, q.data(), m.data(), r.data(), seq_,
+                                 cum_len, /*expect_min_smem=*/msl == 1 ? n : n / 8);
+                    }
+                }
+            }
+            g_smem_lockstep_n = saved_n;
+            /* Case 23s: the inputs above must reach the shapes the numCurr == 1
+             * loops special-case, or Case 23 could pass without running them. At
+             * minSeedLen 1 a dying candidate is always emitted and ends the first
+             * loop, so the first survivor is prev[0] there; minSeedLen 19 must also
+             * reach a later first survivor. */
+            for (const int32_t msl : msls) {
+                BwdShapes sh;
+                for (int32_t i = 0; i < n; i++)
+                    count_bwd_shapes(fmi, enc_qdb + cum_len[i], rl, qpa[(size_t)i], 1, msl, &sh);
+                total_cases++;
+                if (sh.inplace > 0 && sh.dup > 0 && (msl == 1 || sh.later > 0)) {
+                    passed_cases++;
+                    fprintf(stderr, "[PASS] Case 23s: minSeedLen %d rounds reach the in-place store "
+                            "(%lld), the duplicate drop (%lld) and a later first survivor (%lld)\n",
+                            (int)msl, (long long)sh.inplace, (long long)sh.dup, (long long)sh.later);
+                } else {
+                    fprintf(stderr, "[FAIL] Case 23s: minSeedLen %d inputs do not reach every numCurr == 1 "
+                            "shape: in-place %lld, duplicate drop %lld, later first survivor %lld\n",
+                            (int)msl, (long long)sh.inplace, (long long)sh.dup, (long long)sh.later);
+                }
+            }
             free(enc_qdb); free(seq_); free(cum_len);
             free(ref);
         }

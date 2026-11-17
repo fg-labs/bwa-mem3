@@ -2776,6 +2776,43 @@ int32_t FMI_search::ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPre
         }
     }
     p++;
+    if (numCurr == 1) {
+        /* As in ls_advance_backward_step's default-layout loops: from the first
+         * survivor on every candidate survives, and until the first duplicate
+         * a kept candidate is updated in its own slot. */
+        SMEM *r = prev + p;
+        SMEM *const end = prev + numPrev;
+        SMEM *w = prev + 1;
+        if (w == r) {
+            for (; r < end; r++) {
+                const SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, *r);
+                if (newSmem.s == curr_s) break;
+                curr_s = newSmem.s;
+                r->k = newSmem.k;
+                r->s = newSmem.s;
+                r->m = j;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+            }
+            w = r;
+            r += (r < end);
+        }
+        for (; r < end; r++) {
+            SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, *r);
+            if (newSmem.s != curr_s) {
+                curr_s = newSmem.s;
+                newSmem.m = j;
+                *w++ = newSmem;
+#ifdef ENABLE_PREFETCH
+                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+            }
+        }
+        return (int32_t)(w - prev);
+    }
     for (; p < numPrev; p++) {
         SMEM smem = prev[p];
         SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, smem);
@@ -2902,17 +2939,60 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
             }
         }
         p++;
-        for (; p < numPrev; p++) {
-            SMEM smem = prev[p];
-            SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
-            newSmem.m = j;
-            if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
-                curr_s = newSmem.s;
-                prev[numCurr++] = newSmem;
+        if (numCurr == 1) {
+            /* The candidates are one start position extended to shorter and
+             * shorter right ends, so each one's interval holds the one before
+             * it, and so do their extensions by the same base: s never falls
+             * along prev, and from the first survivor on every candidate
+             * survives (s >= min_intv needs no test). A survivor is kept only
+             * with a new s. Until the first duplicate a kept candidate is its
+             * own slot (the write head is the read cursor), so only k, s and
+             * m are stored, not the whole SMEM. */
+            SMEM *r = prev + p;
+            SMEM *const end = prev + numPrev;
+            SMEM *w = prev + 1;
+            if (w == r) {
+                for (; r < end; r++) {
+                    const SMEM newSmem = backwardExt_konly_cp(cpo, count_a, *r, a);
+                    if (newSmem.s == curr_s) break;
+                    curr_s = newSmem.s;
+                    r->k = newSmem.k;
+                    r->s = newSmem.s;
+                    r->m = j;
 #ifdef ENABLE_PREFETCH
-                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
 #endif
+                }
+                w = r;               // the duplicate (dropped) or the end
+                r += (r < end);
+            }
+            for (; r < end; r++) {
+                SMEM newSmem = backwardExt_konly_cp(cpo, count_a, *r, a);
+                if (newSmem.s != curr_s) {
+                    curr_s = newSmem.s;
+                    newSmem.m = j;
+                    *w++ = newSmem;
+#ifdef ENABLE_PREFETCH
+                    _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                }
+            }
+            numCurr = (int32_t)(w - prev);
+        } else {
+            for (; p < numPrev; p++) {
+                SMEM smem = prev[p];
+                SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
+                newSmem.m = j;
+                if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
+                    curr_s = newSmem.s;
+                    prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+                    _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+                }
             }
         }
         s->numPrev = numCurr;
