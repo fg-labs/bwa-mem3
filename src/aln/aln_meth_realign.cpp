@@ -19,7 +19,30 @@ aln_meth_eval_status error(aln_meth_eval_status status, const char *message)
     return status;
 }
 
+struct ambiguity_window_t { uint8_t *bases; int64_t rb; };
+
+int mask_ambiguity(int64_t begin, int64_t end, void *context)
+{
+    const auto *window = static_cast<ambiguity_window_t *>(context);
+    std::fill(window->bases + begin - window->rb, window->bases + end - window->rb, 4);
+    return 0;
+}
+
 } // namespace
+
+void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
+    int64_t rb, int len, int rid, std::vector<uint8_t> &target)
+{
+    target.resize(len);
+    for (int i = 0; i < len; ++i) {
+        const int64_t p = rb + i;
+        target[i] = ref.pac[p >> 2] >> ((~p & 3) << 1) & 3;
+    }
+    ambiguity_window_t window{target.data(), rb};
+    bns_iter_ambi(ref.bns, rb, len, mask_ambiguity, &window);
+    if (mo.m.meth_context == METH_CTX_CPG && len)
+        meth_label_cpg(target.data(), len, rb, rid, ref.bns, ref.pac);
+}
 
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &c, const ubyte_t *query, int len, int n_ins, int n_del,
@@ -45,12 +68,8 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
         if (mat[i] < -3 || mat[i] > 1)
             return error(aln_meth_eval_status::invalid_input, "matrix is not the initialized match-1/mismatch-3 model");
     try {
-        std::vector<uint8_t> target(span);
-        for (int i = 0; i < span; ++i) {
-            const int64_t p = c.rb + i;
-            target[i] = ref.pac[p >> 2] >> ((~p & 3) << 1) & 3;
-        }
-        if (m == METH_M) meth_label_cpg(target.data(), span, c.rb, c.rid, ref.bns, ref.pac);
+        std::vector<uint8_t> target;
+        aln_meth_fetch_window(ref, mo, c.rb, span, c.rid, target);
         const int full = std::max(len, span), delta = std::abs(len - span);
         int band = std::min<int64_t>(full, std::max<int64_t>((int64_t)delta + 3, std::max(n_ins, n_del)));
         const int certificate = m == 5 ? bwa_global_cert_band(mat, 5, 1, 5, 1, len, query, span, target.data()) : -1;

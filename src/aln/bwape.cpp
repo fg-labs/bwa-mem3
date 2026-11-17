@@ -156,7 +156,13 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 		{ \
 			uint64_t s = d->aln[(v).y&1][(v).y>>2].score + d->aln[(u).y&1][(u).y>>2].score; \
 			s *= 10; \
-			if (ii->high) s += (int)(-4.343 * log(.5 * erfc(M_SQRT1_2 * fabs(l - ii->avg) / ii->std)) + .499); \
+			if (ii->high) { \
+				const double penalty = -4.343 * log(.5 * erfc(M_SQRT1_2 * fabs(l - ii->avg) / ii->std)) + .499; \
+				/* --meth pairing (the only SameContig caller): a narrow estimate can underflow the tail; \
+				 * do not score an unrepresentable candidate. Stock pairing is left as upstream's. */ \
+				if (SameContig && (!isfinite(penalty) || penalty > INT_MAX)) break; \
+				s += (int)penalty; \
+			} \
 			s = s<<32 | (uint32_t)hash_64((u).x<<32 | (v).x); \
 			if (s>>32 == o_score>>32) ++o_n; \
 			else if (s>>32 < o_score>>32) { subo_n += o_n; o_n = 1; } \

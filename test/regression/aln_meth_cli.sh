@@ -4,8 +4,9 @@
 # `bwa-mem3 aln --meth` from the command line, on a synthetic reference: option and index errors
 # (each refused before any output), prefix resolution, output aliasing of index files and header
 # sidecars, single-end records for each chemistry and --set-as-failed, -v, paired-end records and
-# their name and FASTQ errors, --meth-context cpg and its option checks, and, on Linux with nothing
-# else staged, a converted index attached from shared memory with its disk files gone.
+# their name and FASTQ errors, a cap-bound read 1 rescued at its mate's loci (on a generated
+# reference with 4801 copies of it), --meth-context cpg and its option checks, and, on Linux with
+# nothing else staged, a converted index attached from shared memory with its disk files gone.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -193,6 +194,57 @@ grep -F 'malformed' "$tmp/malformed.err" > /dev/null || {
     exit 1
 }
 echo 'PASS: paired-malformed'
+# A cap-bound read 1 rescued at its mate's loci. Read 1 is a 36-mer with 4801 equally good loci
+# (4800 copies in `rep` and one in `pair`), beyond the per-read lookup budget, so its search stops:
+# a repeat with no X0 and nothing to anchor ordinary rescue. Read 2 has two loci (`pair` and
+# `other`), so its MAPQ is 0. Only `pair` holds both, at the insert size the 40 ordinary pairs
+# before it establish (196-256 bp fragments of `frag`), so the pair is placed there by rescue:
+# read 1 XT:A:M. Neither end is proper or confident (MAPQ 0): the omitted competitors remain.
+mkdir "$tmp/cap"
+cat > "$tmp/cap/gen.awk" << 'EOF'
+    function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+    function conv(s, from, to) { gsub(from, to, s); return s }
+    function fq(f, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > f }
+    BEGIN {
+        seed_rng(20261115)
+        frag = dna(3000); seg_q = dna(36); frag_r = dna(36)
+        pair = dna(2000); q_pos = length(pair) + 1; pair = pair seg_q dna(150)
+        r_pos = length(pair) + 1; pair = pair frag_r dna(100)
+        second = dna(2000) frag_r dna(100)
+        rep = dna(50); for (k = 0; k < 4800; k++) rep = rep seg_q dna(30)
+        printf ">frag\n%s\n>pair\n%s\n>other\n%s\n>rep\n%s\n", frag, pair, second, rep > (dir "/ref.fa")
+        for (k = 0; k < 40; k++) {
+            f = substr(frag, 101 + 50 * k, 196 + (k * 7) % 61)
+            fq(dir "/r1.fq", "p" k, conv(substr(f, 1, 36), "C", "T"))
+            fq(dir "/r2.fq", "p" k, conv(substr(rc(f), 1, 36), "G", "A"))
+        }
+        fq(dir "/r1.fq", "cap", conv(seg_q, "C", "T"))
+        fq(dir "/r2.fq", "cap", conv(rc(frag_r), "G", "A"))
+        printf "%d %d\n", q_pos, r_pos > (dir "/pos")
+    }
+EOF
+awk -f "$(dirname "$0")/aln_rng.awk" -f "$tmp/cap/gen.awk" -v dir="$tmp/cap" < /dev/null
+read -r q_pos r_pos < "$tmp/cap/pos"
+"$bin" index --meth "$tmp/cap/ref.fa" > "$tmp/cap/index.out" 2> "$tmp/cap/index.err"
+"$bin" aln --meth "$tmp/cap/ref.fa" "$tmp/cap/r1.fq" "$tmp/cap/r2.fq" > "$tmp/cap/out.sam" 2> "$tmp/cap/aln.err"
+# The cap pair's two records: read 1 at pair:q_pos rescued (XT:A:M, no X0, XG:Z:CT), read 2 at
+# pair:r_pos, both 36M, neither proper (0x2) nor confident (MAPQ 0), after the 80 ordinary records.
+# The FLAGs are compared whole (97: paired, mate reverse, read 1; 145: paired, reverse, read 2), so
+# an unmapped (0x4) or otherwise mis-flagged record cannot pass.
+awk -v q="$q_pos" -v r="$r_pos" '!/^@/ { n++
+        if ($1 != "cap") next
+        c++
+        if ($2 == 97) {
+            if ($3 == "pair" && $4 == q && $6 == "36M" && $5 == 0 && $0 ~ /\tXT:A:M(\t|$)/ && $0 !~ /\tX0:i:/ && $0 ~ /\tXG:Z:CT(\t|$)/) r1 = 1
+        } else if ($2 == 145) {
+            if ($3 == "pair" && $4 == r && $6 == "36M" && $5 == 0) r2 = 1
+        } }
+    END { exit !(n == 82 && c == 2 && r1 && r2) }' "$tmp/cap/out.sam" || {
+    echo "FAIL: cap-rescue: expected read 1 (FLAG 97) rescued at pair:$q_pos (36M, XT:A:M, no X0, XG:Z:CT) and read 2 (FLAG 145) at pair:$r_pos (36M), both MAPQ 0, among 82 records" >&2
+    grep '^cap' "$tmp/cap/out.sam" >&2 || true
+    exit 1
+}
+echo 'PASS: cap-rescue'
 "$bin" aln --meth=taps --meth-context cpg "$tmp/ref.fa" "$tmp/r.fq" > "$tmp/cpg.sam" 2> "$tmp/cpg.err"
 grep -F 'XG:Z:' "$tmp/cpg.sam" > /dev/null || {
     echo "FAIL: cpg-success: missing XG tag" >&2
