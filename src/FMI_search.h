@@ -1461,6 +1461,8 @@ private:
     template <bool PL> void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
     void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
                        const SeedJumpEntry *jlev, int32_t jd);
+    template <bool PL> bool bsd_start_walk(BwtSeedSlot *s, const uint8_t *enc_qdb,
+                                           const SeedJumpEntry *jlev, int32_t jd);
     template <bool PL> void bsd_advance_step(BwtSeedSlot *s,
                           const uint8_t *enc_qdb,
                           int32_t minSeedLen,

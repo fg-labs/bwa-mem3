@@ -3031,8 +3031,8 @@ DONE:
 // match_buf[] is a per-slot accumulator flushed in input order; sized
 // by the driver from the batch's max_readlength.
 enum BwtSeedPhase : uint8_t {
-    BSD_FWD  = 0,  // in active inner-j extension (s->j is next j to step;
-                   // when s->j < 0 the next step does outer seek first)
+    BSD_FWD  = 0,  // in active inner-j extension (s->j is next j to step; a walk
+                   // that ends starts the next one on the same visit, bsd_start_walk)
     BSD_DONE = 1,  // slot retired; match_buf ready for in-order flush
 };
 
@@ -3058,7 +3058,7 @@ struct FMI_search::BwtSeedSlot {
 
     SMEM    smem;          // current SA interval; rid/m fixed at outer-x init
     int32_t x;             // outer cursor: position of current smem's seed base
-    int32_t j;             // inner cursor: next j to step; j < 0 = need outer seek
+    int32_t j;             // inner cursor: next j to step; j < 0 = retired, or between walks (bsd_start_walk)
     int32_t x_end;         // first x from which no walk can emit (bsd_init_slot)
 
     BwtSeedPhase phase;
@@ -3190,6 +3190,43 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
     if (jd > 0) bsd_plan_jump(s, enc_qdb, jlev, jd);
 }
 
+// Start a slot's next walk, from the first ACGT base at or after s->x (N runs
+// are skipped inline, as the scalar does; they are rare in Illumina data).
+// From x_end on no walk can emit (bsd_init_slot), so the slot retires there.
+// Otherwise smem becomes that base's interval and the walk's jump is planned
+// (bsd_plan_jump). Called on the visit that ends the previous walk, so that
+// visit also issues the next walk's jump-table prefetch instead of leaving
+// both to a visit of their own. Returns true when the visit has nothing left
+// to do (retired, or a jump planned for the next visit) and false when the
+// walk's first inner-j step may run; its blocks are hinted then, as
+// bsd_init_slot's caller does.
+template <bool PL>
+bool FMI_search::bsd_start_walk(BwtSeedSlot *s, const uint8_t *enc_qdb,
+                                const SeedJumpEntry *jlev, int32_t jd)
+{
+    while (s->x < s->x_end && enc_qdb[s->offset + s->x] >= 4) s->x++;
+    if (s->x >= s->x_end) {
+        s->j     = -1;
+        s->phase = BSD_DONE;
+        s->ready = true;
+        return true;
+    }
+    uint8_t a = enc_qdb[s->offset + s->x];
+    s->smem.rid = (uint32_t)s->input_idx;
+    s->smem.m   = s->x;
+    s->smem.n   = s->x;
+    s->smem.k   = count[a];
+    s->smem.l   = count[3 - a];
+    s->smem.s   = count[a + 1] - count[a];
+    s->j        = s->x + 1;
+    if (jd > 0) {
+        bsd_plan_jump(s, enc_qdb, jlev, jd);
+        if (s->jump != nullptr) return true;   // jump on the next visit
+    }
+    bsd_prefetch_cp_occ<PL>(s);
+    return false;
+}
+
 // Advance one slot by one unit of work. Does one cp_occ access per call when
 // the slot is active, so the lockstep pipeline keeps uniform per-pass memory
 // parallelism (Heng action 2a — collapse outer transition into the step
@@ -3234,32 +3271,11 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         return;
     }
 
-    // Outer seek: if j < 0 the slot just broke out of an inner-j extension
-    // and needs to (re-)init smem at the next ACGT x. Spin through non-ACGT
-    // bases inline (scalar does the same — at most O(N_run) here, and N runs
-    // are rare in Illumina data). Falls through to one inner-j step. From
-    // x_end on no walk can emit (bsd_init_slot), so the slot retires there.
-    if (s->j < 0) {
-        while (s->x < s->x_end && enc_qdb[s->offset + s->x] >= 4) s->x++;
-        if (s->x >= s->x_end) {
-            s->phase = BSD_DONE;
-            s->ready = true;
-            return;
-        }
-        uint8_t a = enc_qdb[s->offset + s->x];
-        s->smem.rid = (uint32_t)s->input_idx;
-        s->smem.m   = s->x;
-        s->smem.n   = s->x;
-        s->smem.k   = count[a];
-        s->smem.l   = count[3 - a];
-        s->smem.s   = count[a + 1] - count[a];
-        s->j        = s->x + 1;
-        if (jd > 0) {
-            bsd_plan_jump(s, enc_qdb, jlev, jd);
-            if (s->jump != nullptr) return;   // jump on the next visit
-        }
-        // Fall through to inner-j step.
-    }
+    // Outer seek: a walk that ended starts the next one at once
+    // (bsd_start_walk), so j < 0 is not seen here today; kept so a slot left
+    // between walks still starts its next one. Falls through to one inner-j
+    // step when no jump is planned.
+    if (s->j < 0 && bsd_start_walk<PL>(s, enc_qdb, jlev, jd)) return;
 
     // An empty interval stays empty: every later forward step gives s == 0, which is below
     // max_intv and never emitted, so the walk's end depends only on the read. Find it by
@@ -3275,11 +3291,7 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         } else {
             s->x = j + 1;   // an N at j, or the walk reached minSeedLen at j without a match
         }
-        s->j = -1;
-        if (s->x >= s->x_end) {
-            s->phase = BSD_DONE;
-            s->ready = true;
-        }
+        bsd_start_walk<PL>(s, enc_qdb, jlev, jd);
         return;
     }
 
@@ -3299,11 +3311,7 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         // Scalar: non-ACGT in inner-j sets next_x = j+1 and breaks. A walk
         // ending at x_end or past it is the read's last (bsd_init_slot).
         s->x = s->j + 1;
-        s->j = -1;
-        if (s->x >= s->x_end) {
-            s->phase = BSD_DONE;
-            s->ready = true;
-        }
+        bsd_start_walk<PL>(s, enc_qdb, jlev, jd);
         return;
     }
 
@@ -3317,11 +3325,7 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
             s->match_buf[s->match_count++] = newSmem;
         }
         s->x = s->j + 1;
-        s->j = -1;
-        if (s->x >= s->x_end) {
-            s->phase = BSD_DONE;
-            s->ready = true;
-        }
+        bsd_start_walk<PL>(s, enc_qdb, jlev, jd);
         return;
     }
 
@@ -3799,9 +3803,9 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep_t(uint8_t *enc_qdb,
             // steps next already hinted its two cp_occ lines (smem.l and
             // smem.l + smem.s) at the end of its last step (bsd_advance_step) or
             // at init; a slot with a planned jump next reads only its jump-table
-            // entry, which bsd_plan_jump prefetched; and a fresh seed (j < 0)
-            // reads lines that are not known until its next start x is found.
-            // A second hint would only repeat the first or miss.
+            // entry, which bsd_plan_jump prefetched; and a walk started without
+            // a jump hinted its first step's lines (bsd_start_walk). A second
+            // hint would only repeat the first or miss.
         }
 
         // Flush pass: emit retired slots in input order; recycle into the
