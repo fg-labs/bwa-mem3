@@ -2081,39 +2081,53 @@ static void usage(const mem_opt_t *opt)
 /* D3 (--meth) only: load the ORIGINAL reference's bns + pac (un-converted, real
  * chrom names) from `prefix` as resident handles for the future extension/scoring
  * phase, distinct from the seed FM-index. Mirrors indexEle::bwa_idx_load_ele's
- * disk path (bns_restore then slurp the full .pac into memory and close fp_pac).
- * On a bns_restore or pac-allocation failure, frees any partial allocation,
- * leaves the out-params NULL, and returns -1. (An I/O error or short read during
- * the .pac slurp itself is fatal — pac_slurp_and_close aborts the process,
- * matching the seed-index loader.)
+ * disk path (restore metadata, validate, then slurp .pac and build the lookup).
+ * On a bns_restore or pac-allocation failure, or a .pac whose size does not
+ * match the .ann (bns_pac_fp_size_ok: inconsistent packed-reference length),
+ * frees any partial allocation, leaves the out-params NULL, and returns -1.
+ * An I/O error or short read during the .pac slurp itself is fatal —
+ * pac_slurp_and_close aborts the process, matching the seed-index loader.
  * `pread_workers` is the already-resolved worker count for the parallel .pac
  * slurp (as from index_load_threads); 1 reads serially. */
-static int meth_orig_ref_load_handles(const char *prefix,
+static int meth_orig_ref_load_handles(const char *prefix, const char *seed_prefix,
+                                      const bntseq_t *seed_bns, bool staged,
                                       bntseq_t **bns_out, uint8_t **pac_out,
                                       int pread_workers)
 {
     *bns_out = NULL;
     *pac_out = NULL;
-    bntseq_t *bns = bns_restore(prefix);
+    bntseq_t *bns = bns_restore_metadata(prefix);
     if (bns == NULL) {
         fprintf(stderr,
                 "ERROR: --meth could not load the original reference bns from "
                 "'%s.{amb,ann,pac}'\n", prefix);
         return -1;
     }
-    int64_t pac_bytes = bns->l_pac / 4 + 1;
-    uint8_t *pac = (uint8_t*) calloc(pac_bytes, 1);
-    if (pac == NULL) {
-        fprintf(stderr, "ERROR: --meth failed to allocate %lld bytes for the "
-                "original reference pac\n", (long long)pac_bytes);
+    const char *why = bns_meth_seed_mismatch(seed_bns, bns);
+    if (why != NULL) {
+        fprintf(stderr, "[E::load_index] the --meth seed index %s.* and original reference %s.* "
+                "have inconsistent %s. Rebuild both from the original FASTA with "
+                "`bwa-mem3 index --meth --force`. %s\n", seed_prefix, prefix, why,
+                staged ? "The seed is staged: first run `bwa-mem3 shm -d`, then rebuild and stage again." : "");
         bns_destroy(bns);
         return -1;
     }
-    /* bns_restore left .pac open in bns->fp_pac; slurp it whole (in parallel,
-     * same as the seed index) and close it. Shared with bwa_idx_load_ele. */
     char pac_path[PATH_MAX];
     bns_pac_path(pac_path, sizeof(pac_path), prefix);
+    if (!bns_pac_fp_size_ok("load_index", pac_path, bns->fp_pac, bns->l_pac)) {
+        bns_destroy(bns);
+        return -1;
+    }
+    const int64_t pac_bytes = bns->l_pac / 4 + 1;
+    uint8_t *pac = (uint8_t*)calloc(pac_bytes, 1);
+    if (pac == NULL) {
+        fprintf(stderr, "ERROR: --meth failed to allocate %lld bytes for the original reference pac\n",
+                (long long)pac_bytes);
+        bns_destroy(bns);
+        return -1;
+    }
     pac_slurp_and_close(&bns->fp_pac, pac_path, pac, pac_bytes, pread_workers);
+    bns_build_pos2rid(bns);
 
     *bns_out = bns;
     *pac_out = pac;
@@ -4090,7 +4104,8 @@ int main_mem(int argc, char *argv[])
      * consumer yet (extension is behind the meth-mode checkpoint below); this is
      * a load-only building block. Freed on every exit path the seed index is. */
     if (opt->meth_mode && meth_orig_ref_prefix != NULL) {
-        if (meth_orig_ref_load_handles(meth_orig_ref_prefix,
+        if (meth_orig_ref_load_handles(meth_orig_ref_prefix, ref_prefix,
+                                       aux.fmi->idx->bns, aux.shm_base != NULL,
                                        &aux.meth_orig_bns, &aux.meth_orig_pac,
                                        index_load_threads(opt->n_threads)) != 0) {
             delete aux.fmi;

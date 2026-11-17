@@ -16,8 +16,14 @@ read on demand via *pac-fetch*).
   leaves your FASTA untouched:
 
   ```bash
-  bwa-mem3 index ref.fa
+  bwa-mem3 index --force ref.fa
   ```
+
+  The `bwa` index's `.amb`, `.ann` and `.pac` share names with bwa-mem3's, so
+  `index` stops with `output exists` unless `--force` lets it replace them
+  (`.bwt` and `.sa` are left alone). If you still need the `bwa` index, build
+  at a new prefix instead (`bwa-mem3 index -p ref-mem3 ref.fa`) and align
+  against that prefix.
 
 - **Coming from `bwa-mem2`:** your existing index works **as-is, no rebuild**,
   for ordinary alignment. This is a supported compatibility guarantee: bwa-mem3
@@ -57,6 +63,12 @@ read on demand via *pac-fetch*).
     `.0123`; use a new prefix if you need either.
 
 See [Indexing the reference](../user-guide/indexing.md) for details.
+
+Ordinary `index` refuses an existing output artifact unless `--force` is supplied,
+unlike upstream `bwa index`. With `--force`, replacement is not atomic; do not
+rebuild a prefix while another process loads it, and drop staged copies first
+with `shm -d`. This overwrite guard does not change the disk format or prevent
+loading an existing bwa-mem2 index. See the [force policy](../cli/index-cmd.md#--force--replace-existing-index-artifacts).
 
 ## 2. The command line is the same
 

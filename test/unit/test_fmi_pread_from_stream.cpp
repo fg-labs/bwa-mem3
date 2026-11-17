@@ -22,6 +22,7 @@
 #include "doctest/doctest.h"
 #include "../../src/FMI_search.h"
 #include "temp_dir.h"
+#include "run_in_child.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -198,4 +199,21 @@ TEST_CASE("fmi_pread_from_stream: reads the open file after its path is replaced
     CHECK(first_pattern_mismatch(dst.data(), nbytes, 0) == nbytes);
 
     REQUIRE(fclose(fp) == 0);
+}
+
+TEST_CASE("parallel index read refuses EOF independently of index size validation"
+          * doctest::test_suite("unit/fmi_pread_from_stream")) {
+    bwa_tests::TempDir dir("index_eof");
+    dir.write("short", "short data");
+    const std::string path = dir.file("short"), err = dir.file("err");
+    const int status = bwa_tests::run_in_child([&] {
+        FILE *fp = fopen(path.c_str(), "rb");
+        if (!fp) _exit(2);
+        char dst[64];
+        fmi_pread_from_stream(fp, path.c_str(), dst, sizeof dst, 1);
+        fclose(fp);
+    }, err.c_str());
+    REQUIRE(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == EXIT_FAILURE);
+    CHECK(dir.read("err").find("unexpected EOF during index load") != std::string::npos);
 }

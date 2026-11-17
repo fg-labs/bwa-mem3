@@ -48,8 +48,9 @@ expect roughly 11 GB total across all four files.
 >   at the same one. See the migration guide for what `--force` removes and
 >   why a new prefix is the safer choice.
 > - **From `bwa` (v1):** a `bwa index` uses a different FM-index format
->   (`.bwt` / `.sa`) and **cannot** be reused — run `bwa-mem3 index ref.fa` to
->   rebuild (the FASTA is unchanged).
+>   (`.bwt` / `.sa`) and **cannot** be reused — run `bwa-mem3 index --force ref.fa`
+>   to rebuild (the FASTA is unchanged; `--force` replaces the `bwa` `.amb`,
+>   `.ann` and `.pac`), or build at a new prefix with `-p`.
 >
 > See [Coming from bwa or bwa-mem2](../getting-started/migrating.md).
 
@@ -138,7 +139,7 @@ bwa-mem3 mem --meth /idx/hg38 R1.fq.gz R2.fq.gz
 
 `--meth-only` packs the original `.amb/.ann/.pac` without constructing its FM-index, leaving seven index files plus optional metadata. Ordinary alignment cannot use this minimal layout. The doubled seed build still sets the memory requirement. `--meth-only --emit-unpacked-ref` is rejected.
 
-`-p` works with `--meth` and preserves source ALT and header/dictionary metadata at the output prefix, not on converted seed contigs. Existing index outputs require `--force` before replacement. Force only replaces known artifacts, rejects unsafe aliases/symlinks/directories, and removes stale files when switching layouts. It does not provide transactional rollback after a writer failure. Ordinary indexing is unchanged.
+`-p` works with `--meth` and preserves source ALT and header/dictionary metadata at the output prefix, not on converted seed contigs. Existing index outputs require `--force` before replacement. Force only replaces known artifacts, rejects unsafe aliases/symlinks/directories, and removes stale files when switching layouts. It does not provide transactional rollback after a writer failure. Ordinary indexing also requires `--force` when any known output artifact exists. It leaves sidecars and `.meth.*` files untouched; an existing `.0123` is rewritten only with `--emit-unpacked-ref`. Unlike upstream `bwa index`, neither mode overwrites by default. Forced replacement is not atomic: a failure may leave partial or mixed files, and same-length mixtures are not all detectable. Do not rebuild a prefix while readers use it; drop any staged copy with `shm -d` first. The on-disk index format is unchanged.
 
 Conversion is always fresh in unique scratch selected by `--tmp-dir`, `BWA_INDEX_TMPDIR`, `TMPDIR`, then `/tmp`. Use `--keep-meth-fasta` to retain `<prefix>.meth.fa`. Scratch cleanup covers success and handled failures, including `exit()`; SIGKILL and machine failure can leave temporary directories behind. See the [index CLI](../cli/index-cmd.md) for the full lifecycle and collision policy.
 
@@ -214,7 +215,7 @@ numbers.
 > drop the segment first before re-indexing:
 >
 > ```bash
-> bwa-mem3 shm -d && bwa-mem3 index ref.fa
+> bwa-mem3 shm -d && bwa-mem3 index --force ref.fa
 > ```
 >
 > Rebuild only if `shm -d` succeeds: when it cannot remove a staged index it exits non-zero and
@@ -254,3 +255,9 @@ same on-disk layout.
 [Performance improvements](../whats-different/performance.md) ·
 [CLI Reference: index](../cli/index-cmd.md) ·
 [CLI Reference: re-sa](../cli/re-sa.md)
+
+## Structural consistency checks
+
+`mem`, `shm` staging and `re-sa` reject malformed FM-index sizes or sample-rate tags and reference-length disagreements between the FM-index and `.ann`. When a packed reference is used, its size and trailing length remainder must agree with `.ann`. `mem --meth` and `shm --meth` also compare the original and seed contig metadata. These are cheap structural sanity checks, not content fingerprints: different sequences with the same lengths and compatible names can pass. No on-disk format change or new manifest is required, and legacy untagged bwa-mem2 indexes remain supported.
+
+For a refused set, copy the complete index again or rebuild from the original FASTA with `index --force` (`index --meth --force` for methylation). Drop a staged copy with `shm -d` before rebuilding and staging again.

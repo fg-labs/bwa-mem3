@@ -163,6 +163,39 @@ static bool meth_same_file(const std::string& a, const std::string& b)
            meth_absolute_path(a) == meth_absolute_path(b);
 }
 
+/* Ordinary indexing writes only these artifacts, not .alt/.hdr or .meth.*.
+ * Inspect every destination before the build can replace any of them. --force
+ * authorizes replacement, never following an output symlink or clobbering an
+ * input alias. This is a preflight, not a lock against concurrent writers. */
+static bool plain_index_outputs_ok(const char *fa, const char *prefix, bool force)
+{
+    const char *suffixes[] = {".pac", ".ann", ".amb", CP_FILENAME_SUFFIX, ".0123"};
+    const std::vector<std::string> inputs = {fa, std::string(fa) + ".alt",
+        std::string(fa) + ".hdr", meth_dict_path(fa)};
+    for (const char *suffix : suffixes) {
+        const std::string path = std::string(prefix) + suffix;
+        struct stat st;
+        if (lstat(path.c_str(), &st) != 0) {
+            if (errno == ENOENT) continue;
+            fprintf(stderr, "ERROR: cannot inspect output %s: %s\n", path.c_str(), strerror(errno));
+            return false;
+        }
+        bool aliases_input = false;
+        for (const auto &input : inputs)
+            if (meth_same_file(path, input)) aliases_input = true;
+        if (!S_ISREG(st.st_mode) || st.st_nlink != 1 || aliases_input) {
+            fprintf(stderr, "ERROR: unsafe output collision: %s (source, alias, symlink or non-regular file)\n",
+                    path.c_str());
+            return false;
+        }
+        if (!force) {
+            fprintf(stderr, "ERROR: output exists: %s; use --force to replace known index artifacts\n", path.c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Convert into private scratch, checking parser, gzip, write and close errors. */
 static bool meth_write_seed_fasta(const char *fa, const std::string& conv)
 {
@@ -398,8 +431,9 @@ static void index_usage(void)
 	        "                     seven index files, for methylation alignment only\n"
 	        "  --keep-meth-fasta  with --meth, retain fresh conversion as <prefix>.meth.fa\n"
 	        "                     (otherwise removed from unique scratch on exit)\n"
-	        "  --force            with --meth, replace existing known index artifacts;\n"
-	        "                     rejects source aliases, symlinks and directories\n"
+	        "  --force            allow replacement of existing known index artifacts;\n"
+	        "                     required if an output exists; rejects source aliases,\n"
+	        "                     hard links, symlinks and directories\n"
 	        "  --emit-unpacked-ref also write the unpacked `<prefix>.0123` reference. Off by\n"
 	        "                     default: `mem` pac-fetches bases from `.pac`, so `.0123`\n"
 	        "                     is never read. Enable only for an external consumer that\n"
@@ -517,8 +551,8 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		return 1;
 	}
 
-	if (!meth && (meth_only || keep_meth_fasta || force)) {
-		fprintf(stderr, "ERROR: --meth-only, --keep-meth-fasta and --force require --meth\n");
+	if (!meth && (meth_only || keep_meth_fasta)) {
+		fprintf(stderr, "ERROR: --meth-only and --keep-meth-fasta require --meth\n");
 		return 1;
 	}
 	if (meth_only && emit_unpacked_ref) {
@@ -591,6 +625,7 @@ int bwa_index(int argc, char *argv[]) // the "index" command
 		return rc;
 	}
 	if (prefix == 0) prefix = argv[optind];
+	if (!plain_index_outputs_ok(argv[optind], prefix, force)) return 1;
 	int rc = bwa_idx_build(argv[optind], prefix, emit_unpacked_ref, user_sa_compx);
 	if (rc == 0) warn_if_sidecar_hides_alt(prefix);
 	return rc;
@@ -760,6 +795,16 @@ int main_resa(int argc, char *argv[]) // the "re-sa" command
 	// Disk SA rate: the trailing tag if present, else the legacy default.
 	const int64_t disk_sa_compx =
 		detect_sa_compx(fd, file_size, ref_seq_len, SA_COMPX);
+	const std::string ann_path = std::string(prefix) + ".ann";
+	int64_t l_pac;
+	int32_t n_seqs;
+	uint32_t seed;
+	if (!fmi_bwt_size_ok("re-sa", cp_path, file_size, ref_seq_len, disk_sa_compx, fd) ||
+	    !bns_read_ann_header(ann_path.c_str(), &l_pac, &n_seqs, &seed) ||
+	    !fmi_bwt_matches_ann("re-sa", prefix, ref_seq_len, l_pac)) {
+		close(fd);
+		return 1;
+	}
 
 	// -t only affects densification (a target below the current rate). Warn if it
 	// was set but no densify will happen (inspection, no-op, or coarsen), mirroring

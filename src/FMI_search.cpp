@@ -283,6 +283,51 @@ void fmi_pread_from_stream(FILE *fp, const char *path, void *dst, size_t nbytes,
     }
 }
 
+/* These are structural sanity checks, not a proof that files share provenance.
+ * Equal-length sequence substitutions are deliberately outside their scope. */
+bool fmi_bwt_size_ok(const char *func, const char *cp_path, int64_t file_size, int64_t ref_seq_len,
+                     int64_t sa_compx, int fd)
+{
+    if (ref_seq_len > 0 && ref_seq_len <= 0x7fffffffffLL && sa_compx >= 0 && sa_compx <= CP_SHIFT) {
+        const Bwt2bitLayout layout = fmi_bwt2bit_layout(ref_seq_len, (int)sa_compx);
+        if (sa_compx == SA_COMPX && file_size == layout.off_sa_compx_tag) return true;
+        if (file_size == layout.total_bytes) {
+            int64_t tag = -1;
+            ssize_t n;
+            do { n = pread(fd, &tag, sizeof tag, (off_t)layout.off_sa_compx_tag); }
+            while (n < 0 && errno == EINTR);
+            if (n == (ssize_t)sizeof tag && tag == sa_compx) return true;
+        }
+    }
+    fprintf(stderr, "[E::%s] %s has an invalid size, header or SA-rate tag (%lld bytes): "
+            "it may be incomplete, malformed or inconsistent with its metadata. Copy the complete "
+            "index again or rebuild from the original FASTA with `bwa-mem3 index --force` "
+            "(add --meth for a methylation index).\n", func, cp_path, (long long)file_size);
+    return false;
+}
+
+bool fmi_bwt_matches_ann(const char *func, const char *prefix, int64_t ref_seq_len, int64_t l_pac,
+                         bool from_shm)
+{
+    if (l_pac > 0 && l_pac <= (0x7fffffffffLL - 1) / 2 &&
+        ref_seq_len == 2 * l_pac + 1) return true;
+    if (from_shm) {
+        /* Defense against a corrupted segment or one staged by an earlier build
+         * with this same segment version; no staleness check against disk. */
+        fprintf(stderr, "[E::%s] the index staged in shared memory for %s is inconsistent: "
+                "FM-index rows %lld, .ann reference bases %lld. Drop it with `bwa-mem3 shm -d`, "
+                "check the index files, and stage it again.\n", func, prefix,
+                (long long)ref_seq_len, (long long)l_pac);
+        return false;
+    }
+    fprintf(stderr, "[E::%s] the index files at %s do not belong together: %s%s has %lld rows "
+            "but %s.ann describes %lld reference bases. Rebuild the index from the original "
+            "FASTA with `bwa-mem3 index --force` (add --meth for a methylation index), or "
+            "copy the complete index again.\n", func, prefix, prefix, CP_FILENAME_SUFFIX,
+            (long long)ref_seq_len, prefix, (long long)l_pac);
+    return false;
+}
+
 /* Declared in FMI_search.h; see there for the contract.
  *
  * The on-disk layout is: header(48B: reference_seq_len + count[5], i.e.
@@ -348,14 +393,7 @@ int64_t detect_sa_compx(int fd, int64_t file_size, int64_t ref_seq_len, int64_t 
     }
 
     auto off_sent_for = [ref_seq_len](int64_t compx) -> int64_t {
-        // Mirrors HDR_BYTES in fm_index_writer.cpp / BWA_BWT_2BIT_HEADER_BYTES
-        // in bwa_shm.cpp: ref_seq_len + count[5].
-        const int64_t hdr_bytes      = 6 * (int64_t)sizeof(int64_t);
-        const int64_t cp_occ_cnt     = (ref_seq_len >> CP_SHIFT) + 1;
-        const int64_t sa_sample_cnt  = (ref_seq_len >> compx) + 1;
-        return hdr_bytes + cp_occ_cnt * (int64_t)sizeof(CP_OCC)
-                         + sa_sample_cnt * (int64_t)sizeof(int8_t)
-                         + sa_sample_cnt * (int64_t)sizeof(uint32_t);
+        return fmi_bwt2bit_layout(ref_seq_len, (int)compx).off_sentinel;
     };
 
     if (candidate >= 0 && candidate <= CP_SHIFT &&
@@ -1247,28 +1285,15 @@ int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
 
     char *prefix = file_name;
 
-    // Read single-strand length from .ann to compute doubled pac_len.
+    // Read only the small header, before building the doubled reference.
     char ann_path[PATH_MAX];
     fmi_build_path(ann_path, sizeof(ann_path), prefix, ".ann");
-    FILE* fann = fopen(ann_path, "r");
-    if (fann == NULL) {
-        fprintf(stderr, "ERROR: cannot open '%s'\n", ann_path);
-        return 1;
-    }
     int64_t l_pac = 0;
-    int n_seqs = 0, seed = 0;
-    if (fscanf(fann, "%" SCNd64 " %d %d", &l_pac, &n_seqs, &seed) != 3) {
-        fprintf(stderr, "ERROR: malformed '%s'\n", ann_path);
-        fclose(fann);
-        return 1;
-    }
-    fclose(fann);
-    // Defensive: a non-positive l_pac (corrupt or zero-length .ann) would
-    // pass a bad pac_len into libsais and only fail much later. Catch it
-    // up front with an actionable message, mirroring bntseq_restore_core.
-    if (l_pac <= 0 || n_seqs < 0) {
-        fprintf(stderr, "ERROR: malformed '%s' (l_pac=%" PRId64 ", n_seqs=%d)\n",
-                ann_path, l_pac, n_seqs);
+    int32_t n_seqs = 0;
+    uint32_t seed = 0;
+    if (!bns_read_ann_header(ann_path, &l_pac, &n_seqs, &seed)) return 1;
+    if (l_pac <= 0 || l_pac > (0x7fffffffffLL - 1) / 2) {
+        fprintf(stderr, "ERROR: reference length in %s is out of bounds\n", ann_path);
         return 1;
     }
     int64_t pac_len = 2 * l_pac;
@@ -1333,6 +1358,10 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
+            if (!fmi_bwt_matches_ann("load_index", file_name, reference_seq_len, idx->bns->l_pac,
+                                     /*from_shm=*/true))
+                exit(EXIT_FAILURE);
+            bns_build_pos2rid(idx->bns);
             /* The seed jump table is process-private (not part of the staged
              * segment), so an attached index builds its own. */
             if (build_seed_jump) build_seed_jump_table(index_load_threads(n_threads));
@@ -1372,6 +1401,10 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
             fprintf(stderr, "This may be a --meth-only index: use mem --meth for methylation "
                             "alignment, or rebuild with index --meth --force (without "
                             "--meth-only) for ordinary alignment.\n");
+        else
+            fprintf(stderr, "The index may be incomplete. Copy the complete index again or rebuild "
+                            "from the original FASTA with `bwa-mem3 index --force` "
+                            "(add --meth for a methylation index).\n");
         exit(EXIT_FAILURE);
     }
     else
@@ -1415,6 +1448,32 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         }
         sa_compx = detect_sa_compx(fileno(cpstream), (int64_t)st.st_size, reference_seq_len, SA_COMPX);
         sa_compx_mask = (1LL << sa_compx) - 1;
+        if (!fmi_bwt_size_ok("load_index", cp_file_name, (int64_t)st.st_size, reference_seq_len, sa_compx, fileno(cpstream)))
+            exit(EXIT_FAILURE);
+    }
+    /* Refuse inconsistent lengths before allocating or reading the large arrays.
+     * The header peek is shared with the builder; the full BNS parse stays later. */
+    {
+        char ann_path[PATH_MAX];
+        fmi_build_path(ann_path, sizeof(ann_path), ref_file_name, ".ann");
+        int64_t l_pac;
+        int32_t n_seqs;
+        uint32_t seed;
+        if (!bns_read_ann_header(ann_path, &l_pac, &n_seqs, &seed) ||
+            !fmi_bwt_matches_ann("load_index", ref_file_name, reference_seq_len, l_pac))
+            exit(EXIT_FAILURE);
+        if (load_pac) {
+            char pac_path[PATH_MAX];
+            bns_pac_path(pac_path, sizeof pac_path, ref_file_name);
+            FILE *pac = fopen(pac_path, "rb");
+            if (!pac) {
+                fprintf(stderr, "ERROR: cannot open %s: %s\n", pac_path, strerror(errno));
+                exit(EXIT_FAILURE);
+            }
+            const bool ok = bns_pac_fp_size_ok("load_index", pac_path, pac, l_pac);
+            fclose(pac);
+            if (!ok) exit(EXIT_FAILURE);
+        }
     }
 
     // create checkpointed occ
@@ -1599,8 +1658,11 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * seed bns drives the seed->original remap; extension uses meth_orig_pac. */
     /* Pass the worker count already resolved for this load (line above), so the
      * .pac slurp reuses it rather than re-parsing BWA3_LOAD_THREADS a second
-     * time within the same load. */
-    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS, load_nt);
+     * time within the same load. Passing the FM rows already loaded re-checks
+     * the BNS restored here: the header check above read .ann separately,
+     * before the FM arrays. */
+    bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS, load_nt,
+                     reference_seq_len);
 
     fprintf(stderr, "* Done reading Index!!\n");
 }

@@ -31,6 +31,7 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 
 #include "bwa_madvise.h"
 #include "bwa_shm.h"
+#include "FMI_search.h" /* fmi_bwt_matches_ann */
 #include "io_utils.h"   /* fmi_pread_from_stream */
 
 #include <climits>     /* PATH_MAX */
@@ -72,7 +73,8 @@ indexEle::~indexEle()
     free(idx);
 }
 
-void indexEle::bwa_idx_load_ele(const char *hint, int which, int pread_workers)
+void indexEle::bwa_idx_load_ele(const char *hint, int which, int pread_workers,
+                                int64_t fm_reference_seq_len)
 {
     char *prefix;
     int l_hint = strlen(hint);
@@ -85,7 +87,7 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which, int pread_workers)
     // idx = (bwaidx_fm_t*) calloc(1, sizeof(bwaidx_fm_t));
     if (which & BWA_IDX_BNS) {
         int i, c;
-        idx->bns = bns_restore(prefix);
+        idx->bns = bns_restore_metadata(prefix);
         if (idx->bns == 0) {
             printf("Error!! : [%s] bns is NULL!!\n", __func__);
             exit(EXIT_FAILURE);
@@ -94,16 +96,26 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which, int pread_workers)
             if (idx->bns->anns[i].is_alt) ++c;
         
         fprintf(stderr, "* Read %d ALT contigs\n", c);
-        
+
+        /* The FM index was checked against an earlier read of .ann; check the
+         * metadata actually restored here too, before the PAC read and the
+         * reference-sized pos2rid build depend on it. */
+        if (fm_reference_seq_len >= 0 &&
+            !fmi_bwt_matches_ann("load_index", prefix, fm_reference_seq_len, idx->bns->l_pac))
+            exit(EXIT_FAILURE);
+
         if (which & BWA_IDX_PAC)
         {
+            char pac_path[PATH_MAX];
+            bns_pac_path(pac_path, sizeof(pac_path), prefix);
+            if (!bns_pac_fp_size_ok("load_index", pac_path, idx->bns->fp_pac, idx->bns->l_pac))
+                exit(EXIT_FAILURE);
             int64_t pac_bytes = idx->bns->l_pac/4+1;
             idx->pac = (uint8_t*) calloc(pac_bytes, 1); // concatenated 2-bit encoded sequence
             xassert(idx->pac != NULL, "out of memory: idx->pac");
-            char pac_path[PATH_MAX];
-            bns_pac_path(pac_path, sizeof(pac_path), prefix);
             pac_slurp_and_close(&idx->bns->fp_pac, pac_path, idx->pac, pac_bytes, pread_workers);
         }
+        bns_build_pos2rid(idx->bns);
     }
     free(prefix);
 }
@@ -293,9 +305,8 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pa
      * must NOT be freed individually. Likewise the patched anns[i].name /
      * anns[i].anno pointers. The destructor only frees idx->bns and
      * idx->bns->anns (both heap-copies above), gated by is_shm correctly. */
-    /* SAM-A3: anns[] (with offsets) are now populated in this process's heap,
-     * so build the position->rid acceleration table against them. */
-    bns_build_pos2rid(idx->bns);
+    /* The FMI caller validates FM/BNS lengths before building the private
+     * position lookup, including on seed-only attachments without a PAC. */
 
     idx->is_shm = 1;
     idx->mem    = base;

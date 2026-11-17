@@ -13,8 +13,9 @@ Usage: bwa-mem3 index [-p prefix] [-t N] [--max-memory SIZE] [--tmp-dir PATH] [-
                      seven index files, for methylation alignment only
   --keep-meth-fasta  with --meth, retain fresh conversion as <prefix>.meth.fa
                      (otherwise removed from unique scratch on exit)
-  --force            with --meth, replace existing known index artifacts;
-                     rejects source aliases, symlinks and directories
+  --force            allow replacement of existing known index artifacts;
+                     required if an output exists; rejects source aliases,
+                     hard links, symlinks and directories
   --emit-unpacked-ref also write the unpacked `<prefix>.0123` reference. Off by
                      default: `mem` pac-fetches bases from `.pac`, so `.0123`
                      is never read. Enable only for an external consumer that

@@ -3,6 +3,7 @@
 `bwa-mem3 index` builds the FM-index (BWT + suffix array) that `bwa-mem3 mem`
 requires for alignment. Run it once per reference; the resulting files sit
 alongside the input FASTA and are reused for all subsequent alignment jobs.
+Existing index artifacts require `--force` before replacement (see the flag reference).
 Pass `--meth` to build a dual index — the normal index plus a converted `.meth`
 seed index — for bisulfite-seq alignment.
 
@@ -168,11 +169,15 @@ bwa-mem3 mem --meth /idx/hg38 R1.fq.gz R2.fq.gz
 
 Requires `--meth`. Conversion is always regenerated in a unique scratch directory, never reused by timestamp. With this option it is also copied to `<prefix>.meth.fa` after successful indexing. Scratch selection is `--tmp-dir`, then `BWA_INDEX_TMPDIR`, then `TMPDIR`, then `/tmp`. Allow room for the doubled converted FASTA as well as the index builder's scratch. Conversion scratch is removed on success and handled failures, including lower-level `exit()` calls. SIGKILL, abrupt signals, or machine failure can leave scratch behind; remove abandoned `bwa-meth-*` directories manually.
 
-### `--force` — replace known methylation index artifacts
+### `--force` — replace existing index artifacts
 
-Requires `--meth`. Without it, an existing output artifact causes refusal before modification. With it, only known index artifacts and relocated `.alt`/`.hdr` outputs may be replaced; source aliases, hard links, symlinks, directories, and conflicting unrelated metadata are rejected. An `.alt` or `.hdr` already at a relocated prefix is deleted and not replaced when the source FASTA has no matching file, which changes ALT-contig handling or the SAM header; move or remove such files before building. Other files are untouched. Switching between full and minimal output removes stale `.bwt.2bit.64`, `.0123`, and retained `.meth.fa` artifacts as appropriate.
+Without `--force`, ordinary indexing and `--meth` refuse an existing output artifact before modifying it. This differs from upstream `bwa index`, which overwrites without an overwrite flag. Ordinary indexing checks `<prefix>.{pac,ann,amb,bwt.2bit.64,0123}`, including partial indexes. Even with `--force`, source aliases, hard links, symlinks and directories are refused.
 
-The seed memory budget and conversion are checked before replacement begins. Replacement is **not transactional**: a subsequent index-writing failure may leave a partial index; rerun with `--force` after fixing the cause. Do not rebuild a prefix while another process is reading or modifying it. Ordinary `index` behavior without `--meth` is unchanged.
+Ordinary indexing replaces only the files it writes. It leaves `.alt`, `.hdr`, dictionaries and `.meth.*` files alone. An existing `.0123` is rewritten only with `--emit-unpacked-ref`; use a new prefix, or pass that flag when rebuilding for a consumer that reads `.0123`.
+
+With `--meth`, known index artifacts and relocated `.alt`/`.hdr` outputs may be replaced; conflicting unrelated metadata is rejected. An `.alt` or `.hdr` already at a relocated prefix is deleted and not replaced when the source FASTA has no matching file, which changes ALT-contig handling or the SAM header; move or remove such files before building. Switching between full and minimal output removes stale `.bwt.2bit.64`, `.0123`, and retained `.meth.fa` artifacts as appropriate.
+
+The memory budget (and, for `--meth`, conversion) is checked before replacement begins. Replacement is **not transactional**: a subsequent index-writing failure may leave a partial or mixed index, including same-length mixtures the load-time checks cannot detect. Rerun with `--force` after fixing the cause. Do not rebuild a prefix while another process is reading or modifying it, and drop any staged copy with `shm -d` before rebuilding. The on-disk format is unchanged; existing bwa-mem2 indexes still load as-is.
 
 ## Notes / Gotchas
 

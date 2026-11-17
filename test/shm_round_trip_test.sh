@@ -37,7 +37,9 @@ for ext in .amb .ann .bwt.2bit.64 .pac; do
 done
 if [[ "$need_index" -eq 1 ]]; then
     echo "[setup] Building phix index..."
-    "$BIN" index "$PREFIX" > /dev/null 2>&1
+    # --force: a partial fixture index (some files missing) is rebuilt in full;
+    # without it `index` refuses to replace the files that remain.
+    "$BIN" index --force "$PREFIX" > /dev/null 2>&1
 fi
 
 if [[ ! -f "$READS" ]]; then

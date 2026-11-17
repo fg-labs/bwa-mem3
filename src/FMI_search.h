@@ -184,6 +184,16 @@ typedef struct bsd_first_walk_hint
  * stock indexes for no benefit. */
 int64_t detect_sa_compx(int fd, int64_t file_size, int64_t ref_seq_len, int64_t default_compx);
 
+/* Structural index checks shared by disk load, staging and re-sa. They compare
+ * header lengths and file sizes, not sequence content or provenance: same-length
+ * mixes can pass. A tagged file must also carry its actual SA-rate shift.
+ * `fd` names the already-open .bwt.2bit.64. False reports a diagnostic.
+ * from_shm validates only segment-internal lengths, not freshness against disk. */
+bool fmi_bwt_size_ok(const char *func, const char *cp_path, int64_t file_size, int64_t ref_seq_len,
+                     int64_t sa_compx, int fd);
+bool fmi_bwt_matches_ann(const char *func, const char *prefix, int64_t ref_seq_len, int64_t l_pac,
+                         bool from_shm = false);
+
 /* Configure the cross-read SMEM-interval (k,s) SA-dedup: --ks-dedup CLI value
  * (off|on|auto) > env BWA3_KS_DEDUP > default 'auto'; fatal on a bad value.
  * Mirrors mem_dedup_configure. Call once from fastmap.cpp after getopt (before

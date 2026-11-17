@@ -140,6 +140,29 @@ TEST_CASE("bns_restore_core truncates a longer .ann comment and warns") {
                                  "characters and was truncated") != std::string::npos);
 }
 
+TEST_CASE("metadata-only restore preserves ALT metadata and defers the position lookup") {
+    IndexFixture fx("10 1 11\n0 chr1 (null)\n0 10 0\n", "10 1 0\n");
+    fx.dir.write("ref.alt", "chr1\n");
+    bntseq_t *metadata = bns_restore_metadata(fx.dir.file("ref").c_str());
+    REQUIRE(metadata != nullptr);
+    CHECK(metadata->l_pac == 10);
+    CHECK(metadata->n_seqs == 1);
+    CHECK(metadata->seed == 11);
+    CHECK(metadata->anns[0].is_alt == 1);
+    CHECK(std::string(metadata->anns[0].name) == "chr1");
+    CHECK(metadata->fp_pac != nullptr);
+    CHECK(metadata->pos2rid_bucket == nullptr);
+    bns_build_pos2rid(metadata);
+    CHECK(metadata->pos2rid_bucket != nullptr);
+    CHECK(bns_pos2rid(metadata, 9) == 0);
+    bns_destroy(metadata);
+    bntseq_t *ordinary = bns_restore(fx.dir.file("ref").c_str());
+    REQUIRE(ordinary != nullptr);
+    CHECK(ordinary->pos2rid_bucket != nullptr);
+    CHECK(ordinary->anns[0].is_alt == 1);
+    bns_destroy(ordinary);
+}
+
 TEST_CASE("bns_alt_path: the .alt path bns_restore and --alt-project both read") {
     // bns_restore reads the ALT names from this path and main_mem loads the lift
     // table from it, so the two cannot name different files.

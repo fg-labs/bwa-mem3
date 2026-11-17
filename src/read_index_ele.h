@@ -62,8 +62,12 @@ public:
 	/* Load BNS (and, when `which` includes BWA_IDX_PAC, the 2-bit packed
 	 * reference) from disk. `pread_workers` is the already-resolved worker count
 	 * for the parallel .pac slurp (as returned by index_load_threads); 1 reads
-	 * serially. The loaded bytes are identical regardless of worker count. */
-	void bwa_idx_load_ele(const char *hint, int which, int pread_workers = 1);
+	 * serially. The loaded bytes are identical regardless of worker count.
+	 * `fm_reference_seq_len` (when >= 0) is the loaded FM index's row count:
+	 * the restored BNS must match it (fmi_bwt_matches_ann) before the PAC is
+	 * read or pos2rid is built, else the load is fatal. */
+	void bwa_idx_load_ele(const char *hint, int which, int pread_workers = 1,
+	                      int64_t fm_reference_seq_len = -1);
 	char *bwa_idx_infer_prefix(const char *hint);
 
 	/* Attach BNS + PAC from a packed bwa-mem3 index segment produced by
@@ -78,6 +82,8 @@ public:
 	 * load_pac=false skips the PAC section entirely (idx->pac=NULL): the D3
 	 * --meth seed segment is staged bns_only (no PAC section), and `mem --meth`
 	 * extends against the ORIGINAL pac, so the seed pac is never needed.
+         * The FMI caller checks FM/BNS lengths before building pos2rid;
+         * until then bns_pos2rid uses its binary-search fallback.
 	 */
 	void bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pac = true);
 

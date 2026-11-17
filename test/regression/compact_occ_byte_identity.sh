@@ -30,7 +30,10 @@
 #   BWA_MEM3                 — path to the bwa-mem3 binary under test
 #   COMPACT_OCC_SYN_FA       — the 1 Mb synthetic reference (test/fixtures/synthetic_1mb.fa)
 #   COMPACT_OCC_PHIX_FA      — phix reference FASTA (test/fixtures/phix.fa)
-#   COMPACT_OCC_WORK_DIR     — private scratch directory for this script
+#   COMPACT_OCC_WORK_DIR     — scratch directory; each run builds its fixtures in a
+#                              fresh subdirectory of it (removed on exit), so a rerun
+#                              never meets the index files of an earlier run, which
+#                              `index` refuses to replace without --force
 
 set -euo pipefail
 for v in BWA_MEM3 COMPACT_OCC_SYN_FA COMPACT_OCC_PHIX_FA COMPACT_OCC_WORK_DIR; do
@@ -49,8 +52,9 @@ fail() {
 }
 ok() { echo "PASS: $*"; }
 
-W="$COMPACT_OCC_WORK_DIR"
-mkdir -p "$W" || fail "create work directory"
+mkdir -p "$COMPACT_OCC_WORK_DIR" || fail "create work directory"
+W=$(mktemp -d "$COMPACT_OCC_WORK_DIR/run.XXXXXX") || fail "create run directory"
+trap 'rm -rf "$W"' EXIT
 
 # Reference: the synthetic sequence cut into five 200 kb contigs, phiX, and a
 # contig of one 3 kb segment repeated three times.

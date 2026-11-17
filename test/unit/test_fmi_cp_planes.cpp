@@ -402,7 +402,7 @@ TEST_CASE("CP_OCC_PLANES: the compact load refuses corrupt checkpoint records"
         CHECK(WTERMSIG(status) == SIGABRT);
         CHECK(dir.read("err").find(k.msg) != std::string::npos);
     }
-    // a record area cut short: the compact reader stops at the file's end
+    // a record area cut short: the file-size check refuses it before the read
     {
         const std::string cut = dir.file("cut");
         bwa_tests::TempIndex t({{"x3", bwa_tests::random_acgt(rng, 1301)}});
@@ -418,7 +418,7 @@ TEST_CASE("CP_OCC_PLANES: the compact load refuses corrupt checkpoint records"
             cut.c_str());
         REQUIRE(WIFEXITED(status));
         CHECK(WEXITSTATUS(status) == EXIT_FAILURE);
-        CHECK(dir.read("cut").find("unexpected EOF during index load") != std::string::npos);
+        CHECK(dir.read("cut").find("has an invalid size, header or SA-rate tag") != std::string::npos);
     }
 }
 

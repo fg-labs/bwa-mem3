@@ -35,6 +35,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <limits.h>
+#include <sys/stat.h>
 /* SIMD 2-bit->byte unpack fast path in bns_get_seq_into. Written once in SSE2/SSSE3;
  * on ARM it runs via sse2neon (as the rest of the aligner's SSE does), natively on x86.
  * Requires SSSE3 (pshufb) for the reverse strand; the x86 baseline is -mssse3, and
@@ -129,7 +130,8 @@ void bns_dump(const bntseq_t *bns, const char *prefix)
 	}
 }
 
-bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, const char* pac_filename)
+static bntseq_t *bns_restore_core_impl(const char *ann_filename, const char* amb_filename,
+                                      const char* pac_filename, bool build_pos2rid)
 {
 	char str[8193];
 	FILE *fp;
@@ -146,8 +148,8 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		// narrowing: %d into an int would wrap an oversized count to a small one.
 		scanres = fscanf(fp, "%lld%lld%u", &xx, &cnt, &bns->seed);
 		if (scanres != 3) goto badread;
-		if (xx < 0) err_fatal(__func__, "corrupt index %s: reference length %lld is negative", fname, xx);
-		if (cnt < 0 || cnt > INT_MAX) err_fatal(__func__, "corrupt index %s: sequence count %lld is out of range", fname, cnt);
+		if (xx < 0) err_fatal("bns_restore_core", "corrupt index %s: reference length %lld is negative", fname, xx);
+		if (cnt < 0 || cnt > INT_MAX) err_fatal("bns_restore_core", "corrupt index %s: sequence count %lld is out of range", fname, cnt);
 		bns->n_seqs = (int32_t)cnt;
 		bns->l_pac = xx;
 		bns->anns = (bntann1_t*)calloc(bns->n_seqs, sizeof(bntann1_t));
@@ -178,7 +180,7 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 			*q = 0;
 			if (truncated)
 				fprintf(stderr, "[W::%s] %s: the comment of '%s' is longer than %d characters and was truncated\n",
-						__func__, fname, p->name, (int)sizeof(str) - 2);
+						"bns_restore_core", fname, p->name, (int)sizeof(str) - 2);
 			if (q - str > 1 && strcmp(str, " (null)") != 0) p->anno = strdup(str + 1); // skip leading space
 			else p->anno = strdup("");
 			// read the rest
@@ -193,10 +195,10 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 		fp = xopen(fname = amb_filename, "r");
 		scanres = fscanf(fp, "%lld%lld%lld", &xx, &n_seqs, &cnt);
 		if (scanres != 3) goto badread;
-		if (cnt < 0 || cnt > INT_MAX) err_fatal(__func__, "corrupt index %s: hole count %lld is out of range", fname, cnt);
+		if (cnt < 0 || cnt > INT_MAX) err_fatal("bns_restore_core", "corrupt index %s: hole count %lld is out of range", fname, cnt);
 		bns->n_holes = (int32_t)cnt;
 		if (xx != bns->l_pac || n_seqs != bns->n_seqs)
-			err_fatal(__func__, "corrupt index %s: header (%lld %lld) does not match the .ann header (%lld %d)",
+			err_fatal("bns_restore_core", "corrupt index %s: header (%lld %lld) does not match the .ann header (%lld %d)",
 					  fname, xx, n_seqs, (long long)bns->l_pac, bns->n_seqs);
         if(bns->n_holes){
             bns->ambs = (bntamb1_t*)calloc(bns->n_holes, sizeof(bntamb1_t));
@@ -217,14 +219,91 @@ bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, c
 	{ // open .pac
 		bns->fp_pac = xopen(pac_filename, "rb");
 	}
-	bns_build_pos2rid(bns); // SAM-A3: build the position->rid acceleration table once
+	if (build_pos2rid) bns_build_pos2rid(bns);
 	return bns;
 
  badread:
 	if (EOF == scanres) {
-		err_fatal(__func__, "Error reading %s : %s\n", fname, ferror(fp) ? strerror(errno) : "Unexpected end of file");
+		err_fatal("bns_restore_core", "Error reading %s : %s\n", fname, ferror(fp) ? strerror(errno) : "Unexpected end of file");
 	}
-	err_fatal(__func__, "Parse error reading %s\n", fname);
+	err_fatal("bns_restore_core", "Parse error reading %s\n", fname);
+}
+
+bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, const char* pac_filename)
+{
+    return bns_restore_core_impl(ann_filename, amb_filename, pac_filename, true);
+}
+
+int bns_read_ann_header(const char *path, int64_t *l_pac, int32_t *n_seqs, uint32_t *seed)
+{
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "ERROR: cannot open %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+    long long len = -1, count = -1;
+    unsigned int raw_seed = 0;
+    const int scanned = fscanf(fp, "%lld%lld%u", &len, &count, &raw_seed);
+    const int closed = fclose(fp);
+    if (scanned != 3 || closed != 0 || len < 0 || count < 0 || count > INT_MAX) {
+        fprintf(stderr, "ERROR: malformed .ann header in %s\n", path);
+        return 0;
+    }
+    *l_pac = (int64_t)len;
+    *n_seqs = (int32_t)count;
+    *seed = raw_seed;
+    return 1;
+}
+
+int bns_pac_fp_size_ok(const char *func, const char *pac_path, FILE *fp_pac, int64_t l_pac)
+{
+    struct stat st;
+    if (fstat(fileno(fp_pac), &st) != 0) {
+        fprintf(stderr, "[E::%s] fstat(%s) failed: %s\n", func, pac_path, strerror(errno));
+        return 0;
+    }
+    const int64_t want = l_pac / 4 + 2;
+    if (l_pac <= 0 || (int64_t)st.st_size != want) {
+        fprintf(stderr, "[E::%s] %s is %lld bytes, but the .ann describes %lld reference bases "
+                "(%lld .pac bytes required). Copy the complete index again or rebuild from "
+                "the original FASTA with `bwa-mem3 index --force` (add --meth for a methylation index).\n",
+                func, pac_path, (long long)st.st_size, (long long)l_pac, (long long)want);
+        return 0;
+    }
+    unsigned char remainder = 0xff;
+    ssize_t n;
+    do { n = pread(fileno(fp_pac), &remainder, 1, (off_t)(st.st_size - 1)); }
+    while (n < 0 && errno == EINTR);
+    if (n == 1 && remainder == (l_pac & 3)) return 1;
+    fprintf(stderr, "[E::%s] %s has an invalid length remainder byte for %lld reference bases. "
+            "Copy the complete index again or rebuild from the original FASTA with "
+            "`bwa-mem3 index --force` (add --meth for a methylation index).\n",
+            func, pac_path, (long long)l_pac);
+    return 0;
+}
+
+const char *bns_meth_seed_mismatch(const bntseq_t *seed, const bntseq_t *orig)
+{
+	if ((int64_t)seed->n_seqs != 2 * (int64_t)orig->n_seqs) return "contig count";
+	if (orig->l_pac <= 0 || orig->l_pac > INT64_MAX / 2 || seed->l_pac != 2 * orig->l_pac) return "reference length";
+	for (int32_t i = 0; i < orig->n_seqs; ++i) {
+		const bntann1_t *o = &orig->anns[i];
+		for (int k = 0; k < 2; ++k) {
+			const bntann1_t *c = &seed->anns[2 * i + k];
+			if (c->len != o->len) return "contig length";
+			if (c->name[0] != "rf"[k]) return "contig name";
+			/* .ann keeps at most 8192 name bytes. Empty original names
+			 * round-trip as "(null)", while their seed names are just r/f;
+			 * a prefixed long name loses one extra byte. Preserve these
+			 * existing writer/reader forms rather than rejecting valid sets. */
+			const char *name = c->name + 1;
+			const bool empty = strcmp(o->name, "(null)") == 0 && *name == '\0';
+			const bool truncated = strlen(c->name) == 8192 && strlen(o->name) >= 8191 &&
+			                       strncmp(name, o->name, 8191) == 0;
+			if (!empty && !truncated && strcmp(name, o->name) != 0) return "contig name";
+		}
+	}
+	return NULL;
 }
 
 void bns_pac_path(char *out, size_t outsz, const char *prefix)
@@ -237,15 +316,15 @@ void bns_alt_path(char *out, size_t outsz, const char *prefix)
 	bns_build_path(out, outsz, prefix, ".alt");
 }
 
-bntseq_t *bns_restore(const char *prefix)
-{  
+static bntseq_t *bns_restore_impl(const char *prefix, bool build_pos2rid)
+{
 	char ann_filename[PATH_MAX], amb_filename[PATH_MAX], pac_filename[PATH_MAX], alt_filename[PATH_MAX];
 	FILE *fp;
 	bntseq_t *bns;
 	bns_build_path(ann_filename, sizeof(ann_filename), prefix, ".ann");
 	bns_build_path(amb_filename, sizeof(amb_filename), prefix, ".amb");
 	bns_pac_path(pac_filename, sizeof(pac_filename), prefix);
-	bns = bns_restore_core(ann_filename, amb_filename, pac_filename);
+	bns = bns_restore_core_impl(ann_filename, amb_filename, pac_filename, build_pos2rid);
 	if (bns == 0) return 0;
 	bns_alt_path(alt_filename, sizeof(alt_filename), prefix);
 	if ((fp = fopen(alt_filename, "r")) != 0) { // read .alt file if present
@@ -286,6 +365,16 @@ bntseq_t *bns_restore(const char *prefix)
 		fclose(fp);
 	}
 	return bns;
+}
+
+bntseq_t *bns_restore(const char *prefix)
+{
+    return bns_restore_impl(prefix, true);
+}
+
+bntseq_t *bns_restore_metadata(const char *prefix)
+{
+    return bns_restore_impl(prefix, false);
 }
 
 void bns_destroy(bntseq_t *bns)
