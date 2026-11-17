@@ -1,12 +1,19 @@
 
-Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [--huge-pages] [-u INT] [-t INT] [idxbase]
+Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [--compact-occ] [--huge-pages] [-u INT] [-t INT] [idxbase]
 
 Options:
   -d        destroy all indices in shared memory (matches bwa v1 behavior)
   -l        list indices in shared memory; a third column flags
-            incomplete, missing or unusable entries
+            incomplete, missing or unusable entries, and `compact` marks
+            one staged with --compact-occ
   --meth    stage a `bwa-mem3 index --meth` index — auto-appends
             `.meth` to <idxbase>, mirroring `mem --meth`
+  --compact-occ
+            stage the FM-index occurrence checkpoints in the 32-byte
+            compact layout (about 3 GB less shared memory on hg38); `mem`
+            attaches it with or without --compact-occ. One layout per
+            index: run `shm -d` to restage in the other. BWA3_COMPACT_OCC
+            does not apply to `shm`. Not with -u
   -u INT    densify the staged SA sample table to sample-rate shift INT
             (in [0,6]) when it is denser than the on-disk rate. Trades a
             one-time staging cost + extra shared memory for faster SA
@@ -15,10 +22,11 @@ Options:
             stride-8 (default) index. A value >= the disk rate is a
             no-op (warns). Output is byte-identical either way.
   -t, --threads INT
-            worker threads for the -u densify pass (default 1). The
-            per-sample walks are independent, so this scales near-
-            linearly; has no effect unless -u actually densifies (a
-            target denser than the on-disk rate).
+            worker threads for the -u densify pass and the --compact-occ
+            conversion (default 1). The per-sample walks are independent,
+            so this scales near-linearly; has no effect without -u
+            actually densifying (a target denser than the on-disk rate)
+            or --compact-occ.
   --huge-pages
             stage the index on 1 GB huge pages: a System V shared memory
             segment from the host's reserved 1 GB pool (10 pages for a

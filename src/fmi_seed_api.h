@@ -127,7 +127,12 @@ extern "C" {
  * NULL on a handle from this call. */
 FmiSeed       *fmi_seed_open(const char *prefix);
 /* fmi_seed_open in the layout the caller names (FMI_SEED_LAYOUT_*); NULL for
- * any other value. The environment is ignored here too. */
+ * any other value. The environment is ignored here too.
+ * Both open calls attach an index staged in shared memory (`bwa-mem3 shm`) only
+ * when it holds the layout the call names; a stage of the other layout (`shm
+ * --compact-occ`, or a default stage under FMI_SEED_LAYOUT_COMPACT) is not
+ * attached, and the index loads from disk, next to the stage, with a
+ * [W::bwa_shm_attach] line on stderr. */
 FmiSeed       *fmi_seed_open_layout(const char *prefix, int layout);
 void           fmi_seed_close(FmiSeed *h);                   /* delete */
 /* The checkpoints, one record per 64 rows ((ref_seq_len >> 6) + 1 of them), in

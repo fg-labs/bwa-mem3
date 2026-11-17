@@ -689,5 +689,7 @@ run_or_skip shm_thp_advise_test thp_advise
 run_or_skip shm_round_trip_test "$HERE/shm_round_trip_test.sh"
 # shm --meth flag (parity with mem --meth's c2t-suffix resolution).
 run_or_skip shm_meth_test "$HERE/shm_meth_test.sh"
+# shm --compact-occ (stage, attach, layout mismatches) against the disk path.
+run_or_skip shm_compact_occ_test "$HERE/shm_compact_occ_test.sh"
 
 echo "ALL UNIT TESTS PASSED"
