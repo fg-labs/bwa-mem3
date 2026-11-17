@@ -154,7 +154,7 @@ Expected output (with mimalloc):
 ```text
 v0.2.0-12-gabcdef1
 Compiler: clang X.Y.Z
-SIMD floor: avx2 (x86-64-v3, Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
+SIMD floor: avx2 (Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
 SIMD runtime: avx2 (BWAMEM3_FORCE_TIER unset)
 mimalloc 3.x.x (active)
 ```

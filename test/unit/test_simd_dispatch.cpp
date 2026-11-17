@@ -170,3 +170,28 @@ TEST_CASE("x86 tiers: below avx512bw the floor and kernel tiers agree" * doctest
     CHECK(bwamem3_x86_floor_tier(0, 0, 0, 0, 0, 0, 0)  == BWAMEM3_TIER_NONE);
     CHECK(bwamem3_x86_kernel_tier(0, 0, 0, 0, 0, 0, 0) == BWAMEM3_TIER_NONE);
 }
+
+/* The `SIMD floor:` parenthetical names the oldest CPU each floor runs on. It is not a
+ * psABI level: the floor check verifies only the tier's own subsets (an avx512bw build's
+ * non-kernel code needs AVX-512 F and BW), not a full x86-64-v2 / -v3 / -v4 set. */
+TEST_CASE("simd_floor_label: names a CPU family per x86 floor, not a psABI level" * doctest::test_suite("unit/simd_dispatch")) {
+    CHECK(strcmp(bwamem3_simd_floor_label(BWAMEM3_TIER_AVX512BW), "Skylake-X 2017+")    == 0);
+    CHECK(strcmp(bwamem3_simd_floor_label(BWAMEM3_TIER_AVX2),     "Haswell 2013+")      == 0);
+    CHECK(strcmp(bwamem3_simd_floor_label(BWAMEM3_TIER_AVX),      "Sandy Bridge 2011+") == 0);
+    CHECK(strcmp(bwamem3_simd_floor_label(BWAMEM3_TIER_SSE42),    "Nehalem 2008+")      == 0);
+    CHECK(strcmp(bwamem3_simd_floor_label(BWAMEM3_TIER_SSE41),    "Penryn 2007+")       == 0);
+    CHECK(strcmp(bwamem3_simd_floor_label(BWAMEM3_TIER_NONE),     "scalar")             == 0);
+}
+
+TEST_CASE("print_version_simd: the floor line never names a psABI level" * doctest::test_suite("unit/simd_dispatch")) {
+    FILE *f = tmpfile();
+    REQUIRE(f != NULL);
+    bwamem3_print_version_simd(f);
+    rewind(f);
+    char buf[512];
+    const size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = '\0';
+    CHECK(strstr(buf, "SIMD floor: ") != NULL);
+    CHECK(strstr(buf, "x86-64-v") == NULL);
+}

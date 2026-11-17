@@ -232,22 +232,29 @@ extern "C" void bwamem3_enforce_host_floor(void)
 #endif
 }
 
+/* Pure helper: the oldest CPU family each x86 build floor runs on, for the
+ * `SIMD floor:` line. It names what the non-kernel code needs (avx512bw: AVX-512
+ * F and BW, first in Skylake-X), not a psABI level: the floor check verifies
+ * only the tier's own subsets, not the rest of an x86-64-v3 / -v4 set. */
+extern "C" const char *bwamem3_simd_floor_label(int build_tier)
+{
+    switch (build_tier) {
+      case BWAMEM3_TIER_AVX512BW: return "Skylake-X 2017+";
+      case BWAMEM3_TIER_AVX2:     return "Haswell 2013+";
+      case BWAMEM3_TIER_AVX:      return "Sandy Bridge 2011+";
+      case BWAMEM3_TIER_SSE42:    return "Nehalem 2008+";
+      case BWAMEM3_TIER_SSE41:    return "Penryn 2007+";
+      default:                    return "scalar";
+    }
+}
+
 extern "C" void bwamem3_print_version_simd(FILE *f)
 {
     bwamem3_simd_init();
 
 #if defined(__x86_64__) || defined(__i386__)
-    const char *floor_paren = "x86 floor";
-    switch (g_build_tier) {
-      case BWAMEM3_TIER_AVX512BW: floor_paren = "x86-64-v4, Skylake-X 2017+"; break;
-      case BWAMEM3_TIER_AVX2:     floor_paren = "x86-64-v3, Haswell 2013+";   break;
-      case BWAMEM3_TIER_AVX:      floor_paren = "Sandy Bridge 2011+";          break;
-      case BWAMEM3_TIER_SSE42:    floor_paren = "x86-64-v2, Nehalem 2008+";    break;
-      case BWAMEM3_TIER_SSE41:    floor_paren = "Penryn 2007+";                break;
-      default:                    floor_paren = "scalar";                       break;
-    }
     fprintf(f, "SIMD floor: %s (%s); kernels: sse41 sse42 avx avx2 avx512bw\n",
-            bwamem3_simd_tier_name(g_build_tier), floor_paren);
+            bwamem3_simd_tier_name(g_build_tier), bwamem3_simd_floor_label(g_build_tier));
 #elif defined(__aarch64__) || defined(__ARM_NEON)
     fprintf(f, "SIMD floor: neon (aarch64 baseline); kernels: neon\n");
 #else

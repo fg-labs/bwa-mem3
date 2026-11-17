@@ -86,6 +86,11 @@ int bwamem3_host_meets_floor(void);
  * on too-old hosts. */
 void bwamem3_enforce_host_floor(void);
 
+/* Pure helper: the parenthetical of the x86 `SIMD floor:` line for a build tier,
+ * the oldest CPU family that floor runs on ("Haswell 2013+" for avx2,
+ * "Skylake-X 2017+" for avx512bw, ...); "scalar" for any other value. */
+const char *bwamem3_simd_floor_label(int build_tier);
+
 /* Prints the SIMD floor / runtime / optional warning banner to the given
  * stream. Calls bwamem3_simd_init() to ensure tiers are populated. Two
  * lines unconditionally (floor + runtime); a third warning line iff
