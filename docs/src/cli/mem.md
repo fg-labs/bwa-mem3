@@ -1576,25 +1576,36 @@ not exhaustive validation of the contract across inputs, hosts or SIMD tiers.
 The historical performance comparisons linked in PR #830 did not stamp their
 runtime SIMD tiers; they do not establish an all-host/all-tier no-harm result.
 
-The index files are unchanged. When `--compact-occ` is absent,
-`BWA3_COMPACT_OCC=1` selects the same layout with no change to `@PG`. Only the
-first character is parsed: a value starting with `1` enables it; unset, empty,
-or a value starting with `0` leaves it off (`1x` enables it and `0x` leaves it
-off). Any other first character (`yes`, `false`) is reported once per process
-with `[W::compact_occ_env] ignoring BWA3_COMPACT_OCC="…" (not 0 or 1)` and leaves
-it off. The explicit `--compact-occ` flag enables it without reading or
-validating `BWA3_COMPACT_OCC`, so even a malformed value produces no warning.
-Only `mem` reads the variable: `index`, `shm` and the
-`fmi_seed_api.h` facade always use the layout they are given. When the layout is on,
-`mem` says so on stderr: `[M::main_mem] occurrence checkpoints: compact layout (--compact-occ)`,
-or `(BWA3_COMPACT_OCC)` when the variable turned it on.
+The index files are unchanged. `BWA3_COMPACT_OCC=1` selects the same layout
+with no change to `@PG`. Only the first character is parsed: a value starting
+with `1` enables it; unset, empty, or a value starting with `0` leaves it off
+(`1x` enables it and `0x` leaves it off). Any other first character (`yes`,
+`false`) is reported once per process with `[W::compact_occ_env]` and ignored.
+`--compact-occ` enables the compact disk layout regardless of the variable.
+`mem` reads and validates the variable even when that flag is present, so a
+malformed value still produces the warning. A valid value starting with `0`
+explicitly requests the default layout; unset, empty or invalid values do not
+make an explicit layout request.
 
-An index staged in shared memory (`bwa-mem3 shm`) holds the default layout and
-is not attached under `--compact-occ`: `mem` loads a private copy from disk next to
-the staged one, so on that host the flag raises memory instead of lowering it, and
-the run pays a full index load. A `[W::load_index] compact checkpoint layout: not
-attaching the index staged in shared memory …` warning says so. `--huge-pages`
-applies to the compact table as it does to the default one.
+Only `mem` reads the variable: `index`, `shm` and the `fmi_seed_api.h` facade
+use their explicitly selected layout. When the compact layout is requested,
+`mem` says so on stderr before the index loads:
+`[M::main_mem] occurrence checkpoints: compact layout (--compact-occ)`, or
+`(BWA3_COMPACT_OCC)` when the variable requested it; a staged index can still
+override it, as below.
+
+The flag and the variable choose the layout of an index loaded from disk. An index
+staged in shared memory holds one layout (`bwa-mem3 shm --compact-occ` stages the
+compact one), and `mem` attaches it in that layout whatever was requested: the
+alignment records are the same either way, and attaching saves the load. When the
+staged layout is not the one requested, `mem` says so and how to restage:
+`[W::load_index] the compact checkpoint layout was requested (…), but the index staged
+in shared memory holds the default one, which this run uses instead …`. With no
+layout requested, attaching a compact segment prints
+`[M::load_index] the index staged in shared memory holds the compact checkpoint layout …`.
+The restage advice keeps the rest of the `shm` command (`--meth`), and `--huge-pages`
+holds the default layout only.
+`--huge-pages` applies to the compact table as it does to the default one.
 
 Under `--compat=bwa-mem2`, coordinates can depend on the suffix-array sample
 rate: an LF walk that reaches an unsampled sentinel drops its accumulated

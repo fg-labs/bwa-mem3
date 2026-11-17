@@ -649,7 +649,15 @@ void check_bad_and_undersized() {
     register_entry("short", (int64_t)declared);
     CHECK(list_output().find("short\t1048576\tunusable\n") != std::string::npos);
     CHECK(bwa_shm_attach(n.prefix("short").c_str(), NULL) == NULL);
-    CHECK(exited(wait_status(spawn_stage(n.dir.file("short"), HOOK_NONE)), 1));
+    {
+        // A truncated segment of this release's version is not "staged by a
+        // different release".
+        bwa_tests::StderrCapture cap;
+        CHECK(exited(wait_status(spawn_stage(n.dir.file("short"), HOOK_NONE)), 1));
+        const std::string text = cap.text();
+        CHECK(text.find("shorter than its header declares") != std::string::npos);
+        CHECK(text.find("different bwa-mem3 release") == std::string::npos);
+    }
     CHECK(read_header(n.segments[2]).total_size == declared);
     CHECK(entries() == std::vector<std::string>{"short"});
     make_segment(n.segments[1], 0, 0, 0, 0);
@@ -659,6 +667,130 @@ void check_bad_and_undersized() {
     check_attach_matches(prefix);
     CHECK(entries() == (std::vector<std::string>{"short", "empty"}));
     std::printf("ok 8 foreign and truncated segments refused; undersized segment reclaimed\n");
+}
+
+// 8b. A registered segment of another segment version, as an older release
+//     staged it (version 3, before the header recorded the checkpoint layout)
+//     or a newer one might, or of this version with a checkpoint layout this
+//     release does not know: attach and section lookup refuse it, a stage will
+//     not replace it, and both tell the user to run `bwa-mem3 shm -d` first.
+//     That removes it, and the stage then succeeds.
+void check_other_version() {
+    const struct { uint32_t version; uint16_t cp_layout; } cases[] = {
+        {BWA_SHM_VERSION - 1, 0}, {BWA_SHM_VERSION + 1, 0}, {BWA_SHM_VERSION, 2} };
+    for (const auto &k : cases) {
+        const uint32_t version = k.version;
+        Names n({"old"});
+        const std::string prefix = n.prefix("old");
+        make_segment(n.segment, 4096, BWA_SHM_MAGIC, 0, 0);
+        {
+            const int fd = shm_open(n.segment.c_str(), O_RDWR, 0);
+            CHECK(fd >= 0);
+            void *m = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
+            CHECK(m != MAP_FAILED);
+            // One section, found while the header is one this release reads,
+            // and not once the header is another version's or layout's.
+            bwa_shm_header_t *h = static_cast<bwa_shm_header_t *>(m);
+            bwa_shm_section_t sec;
+            memset(&sec, 0, sizeof sec);
+            sec.kind = BWA_SHM_SEC_FMI_SCALARS;
+            sec.offset = 128;
+            sec.size = 64;
+            memcpy((uint8_t *)m + sizeof(bwa_shm_header_t), &sec, sizeof sec);
+            h->n_sections = 1;
+            CHECK(bwa_shm_section_find((const uint8_t *)m, BWA_SHM_SEC_FMI_SCALARS, NULL, NULL) == 0);
+            h->version = version;
+            h->cp_layout = k.cp_layout;
+            CHECK(bwa_shm_section_find((const uint8_t *)m, BWA_SHM_SEC_FMI_SCALARS, NULL, NULL) != 0);
+            munmap(m, 4096);
+        }
+        register_entry("old", 4096);
+        {
+            bwa_tests::StderrCapture cap;
+            CHECK(bwa_shm_attach(prefix.c_str(), NULL) == NULL);
+            const std::string text = cap.text();
+            CHECK(text.find("unsupported segment version " + std::to_string(version) + " (checkpoint layout "
+                            + std::to_string(k.cp_layout) + ")") != std::string::npos);
+            CHECK(text.find("run bwa-mem3 shm -d") != std::string::npos);
+        }
+        {
+            // The forked stager writes to the same capture file.
+            bwa_tests::StderrCapture cap;
+            CHECK(exited(wait_status(spawn_stage(prefix, HOOK_NONE)), 1));
+            const std::string text = cap.text();
+            CHECK(text.find("as segment version " + std::to_string(version) + " (checkpoint layout "
+                            + std::to_string(k.cp_layout) + ")") != std::string::npos);
+            CHECK(text.find("run bwa-mem3 shm -d first") != std::string::npos);
+        }
+        const bwa_shm_header_t after = read_header(n.segment);
+        CHECK(after.version == version);
+        CHECK(after.cp_layout == k.cp_layout);   // refusal leaves both fields alone
+        CHECK(test_private_shm_destroy() == 0);
+        CHECK(!segment_exists(n.segment));
+        CHECK(exited(wait_status(spawn_stage(prefix, HOOK_NONE)), 0));
+        check_attach_matches(prefix);
+    }
+    std::printf("ok 8b a segment of another version is refused with `shm -d` advice, and -d clears it\n");
+}
+
+// A direct API request cannot combine compact checkpoints with any target SA
+// rate, even when the requested compact index is already staged.
+void check_compact_target_rejected() {
+    Names n({"compact"});
+    const std::string prefix = n.prefix("compact");
+    for (const bool staged : {false, true}) {
+        if (staged)
+            CHECK(test_private_shm_stage(prefix.c_str(), false, -1, 1, false, true) == 0);
+        const auto before = entries();
+        const bwa_shm_header_t header = staged ? read_header(n.segment) : bwa_shm_header_t{};
+        for (const int target : {0, 3, 6, 7}) {
+            bwa_tests::StderrCapture cap;
+            CHECK(test_private_shm_stage(prefix.c_str(), false, target, 1, false, true) == -1);
+            CHECK(cap.text().find("cannot be combined") != std::string::npos);
+            CHECK(entries() == before);
+            CHECK(segment_exists(n.segment) == staged);
+            if (staged) {
+                const bwa_shm_header_t after = read_header(n.segment);
+                CHECK(std::memcmp(&header, &after, sizeof header) == 0);
+            }
+        }
+        if (staged)
+            CHECK(test_private_shm_stage(prefix.c_str(), false, -1, 1, false, true) == 0);
+    }
+    CHECK(test_private_shm_destroy() == 0);
+    std::printf("ok compact plus target SA rate refused before and after staging\n");
+}
+
+// An old huge-page stub is refused without touching it or the registry, with
+// recovery instructions that make the all-indices effect of shm -d explicit.
+void check_old_stub_recovery() {
+    Names n({"oldstub"});
+    const std::string prefix = n.prefix("oldstub");
+    make_segment(n.segment, sizeof(bwa_shm_header_t), BWA_SHM_HUGE_MAGIC, 0, 1);
+    const int fd = shm_open(n.segment.c_str(), O_RDWR, 0);
+    CHECK(fd >= 0);
+    void *m = mmap(NULL, sizeof(bwa_shm_header_t), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    CHECK(m != MAP_FAILED);
+    auto *h = static_cast<bwa_shm_header_t *>(m);
+    h->version = BWA_SHM_VERSION - 1;
+    h->reserved[2] = 65536;   // a stub, but no System V allocation is needed
+    const bwa_shm_header_t before = *h;
+    munmap(m, sizeof(bwa_shm_header_t));
+    register_entry("oldstub", sizeof(bwa_shm_header_t));
+    const auto registered = entries();
+    bwa_tests::StderrCapture cap;
+    CHECK(bwa_shm_attach(prefix.c_str(), NULL) == NULL);
+    const std::string text = cap.text();
+    CHECK(text.find("unsupported 1 GB stub version " + std::to_string(before.version)) != std::string::npos);
+    CHECK(text.find("bwa-mem3 shm -d") != std::string::npos);
+    CHECK(text.find("all staged indices") != std::string::npos);
+    CHECK(text.find("stage it again") != std::string::npos);
+    const bwa_shm_header_t after = read_header(n.segment);
+    CHECK(std::memcmp(&before, &after, sizeof before) == 0);
+    CHECK(entries() == registered);
+    std::printf("ok old 1 GB stub refused with recovery advice and preserved\n");
 }
 
 // 9. Reclaiming one of two entries leaves the other intact; removing the first
@@ -984,8 +1116,9 @@ void check_attach_need_pac() {
     std::printf("ok 12 a load that reads PAC declines a stage without it\n");
 }
 
-// A compact-layout load in a child; returns its stderr. It never attaches a
-// segment, so it loads from disk and exits 0 whatever is staged.
+// A compact-layout load in a child; returns its stderr. Without
+// prefer_staged_layout it attaches only a compact segment, so with a default
+// stage (or none) it loads from disk and exits 0.
 std::string compact_load_stderr(const Names &n, const std::string &prefix) {
     const std::string log = n.dir.file("compact.log");
     fflush(NULL);
@@ -1004,23 +1137,23 @@ std::string compact_load_stderr(const Names &n, const std::string &prefix) {
     return slurp(log);
 }
 
-// 13. The compact layout's "not attaching the staged index" warning needs a
+// 13. A compact load's "not attaching" line for a staged default index needs a
 //     complete segment: a registry entry whose segment is missing or still
-//     being staged holds no index, so the load says nothing about one.
+//     being staged holds no index, so the load says nothing about one
+//     (bwa_shm_attach declines those before it compares layouts).
 void check_compact_warns_only_on_complete() {
-    const char *warning = "not attaching the index staged in shared memory";
+    const char *warning = "staged in shared memory with the default checkpoint layout and this "
+                          "load uses the compact one; not attaching it";
     Names n({"cmp"});
     const std::string prefix = n.prefix("cmp");
     register_entry("cmp", 64);   // registered, no segment
-    CHECK(bwa_shm_test(prefix.c_str()) == 1 && bwa_shm_test_complete(prefix.c_str()) == 0);
+    CHECK(bwa_shm_test(prefix.c_str()) == 1);
     CHECK(!has(compact_load_stderr(n, prefix), warning));
     make_segment(n.segment, sizeof(bwa_shm_header_t), 0, (uint64_t)getpid(), 7);   // staging
-    CHECK(bwa_shm_test_complete(prefix.c_str()) == 0);
     CHECK(!has(compact_load_stderr(n, prefix), warning));
     CHECK(shm_unlink(n.segment.c_str()) == 0);
     unregister_entry("cmp");
     CHECK(exited(wait_status(spawn_stage(prefix, HOOK_NONE)), 0));
-    CHECK(bwa_shm_test_complete(prefix.c_str()) == 1);
     CHECK(has(compact_load_stderr(n, prefix), warning));
     std::printf("ok 13 the compact load warns of a staged index only when it is complete\n");
 }
@@ -1610,21 +1743,25 @@ void check_huge_attach_validation() {
     const bool incomplete_unusable = has(list_output(), "\tunusable\n");
     h->magic = BWA_SHM_MAGIC;
     CHECK(m == NULL && incomplete_unusable);
-    // An index header of another version, or declaring more bytes than the
+    // An index header of another version or of the compact checkpoint layout
+    // (a 1 GB stage holds the default one), or declaring more bytes than the
     // segment holds, or fewer than the header itself.
-    for (const int field : {0, 1, 2}) {
+    for (const int field : {0, 1, 2, 3}) {
         const uint32_t version = h->version;
+        const uint16_t cp_layout = h->cp_layout;
         const uint64_t total = h->total_size;
         if (field == 0) h->version = BWA_SHM_VERSION + 1;
+        else if (field == 3) h->cp_layout = BWA_SHM_CP_LAYOUT_COMPACT;
         else h->total_size = field == 1 ? stub.reserved[2] + 1 : 0;
         m = bwa_shm_attach(prefix.c_str(), NULL);
         const bool unusable = has(list_output(), "\tunusable\n");
         c.fresh();
         const std::string err = stage_stderr(n, prefix, /*huge=*/true, 1);
         h->version = version;
+        h->cp_layout = cp_layout;
         h->total_size = total;
         CHECK(m == NULL && unusable);
-        CHECK(has(err, "another version, or a size past the segment or shorter than"));
+        CHECK(has(err, "another version or checkpoint layout, or a size past the segment or shorter than"));
     }
     CHECK(shmdt(h) == 0);
     CHECK(m == NULL);
@@ -2048,6 +2185,9 @@ int main(int argc, char *argv[]) {
         check_wait_deadline();
         check_not_ours();
         check_bad_and_undersized();
+        check_other_version();
+        check_compact_target_rejected();
+        check_old_stub_recovery();
         check_two_entries();
         check_capacity();
         check_capacity_allocated();
