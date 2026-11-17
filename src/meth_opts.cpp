@@ -179,10 +179,54 @@ int meth_opts_emseq_neutral(const mem_opt_t *opt)
         && opt->meth_scoring == MEM_METH_SCORING_NEUTRAL;
 }
 
+/* The scoring mode meth_opts_finalize leaves in opt->meth_scoring: TAPS (and
+ * 5base) without an explicit --meth-scoring scores NEUTRAL (see the comment in
+ * meth_opts_finalize for why); everything else keeps what it was given. The
+ * one rule both meth_opts_check and meth_opts_finalize read, so the check
+ * judges the mode finalize will actually set. Assumes --meth. */
+static int meth_opts_resolved_scoring(const mem_opt_t *opt, const meth_cli_t *cli)
+{
+    if (opt->meth_chem == METH_CHEM_TAPS && !cli->set_scoring) return MEM_METH_SCORING_NEUTRAL;
+    return opt->meth_scoring;
+}
+
+const char *meth_opts_check(const mem_opt_t *opt, const meth_cli_t *cli)
+{
+    /* Keyed on the value as well as on cli->set_context: the CLI's parser sets
+     * set_context whenever it changes meth_context (so for the CLI the value
+     * term adds nothing), but an embedder that sets opt->meth_context directly
+     * may leave set_context 0. */
+    if ((cli->set_context || opt->meth_context != METH_CTX_ALL) && !opt->meth_mode)
+        return "--meth-context requires --meth";
+    if (!opt->meth_mode) return NULL;
+    /* Values meth_opts_parse cannot produce, but an embedder writing *opt can. */
+    if (opt->meth_context != METH_CTX_ALL && opt->meth_context != METH_CTX_CPG)
+        return "--meth-context accepts 'all' (default) or 'cpg'";
+    if (opt->meth_chem != METH_CHEM_EMSEQ && opt->meth_chem != METH_CHEM_TAPS)
+        return "--meth accepts 'emseq' (default; aliases em-seq, bisulfite), 'taps', or '5base' "
+               "(alias 5-base)";
+    if (opt->meth_scoring != MEM_METH_SCORING_COLLAPSED && opt->meth_scoring != MEM_METH_SCORING_GENOMIC
+        && opt->meth_scoring != MEM_METH_SCORING_NEUTRAL)
+        return "--meth-scoring requires 'collapsed', 'genomic', or 'neutral'";
+    if (opt->meth_context == METH_CTX_CPG) {
+        if (opt->meth_chem == METH_CHEM_EMSEQ)
+            return "--meth-context cpg requires --meth=taps or --meth=5base: under "
+                   "EM-seq/bisulfite every unmethylated C converts, so conversions are not "
+                   "confined to CpG";
+        if (meth_opts_resolved_scoring(opt, cli) == MEM_METH_SCORING_COLLAPSED)
+            return "--meth-context cpg is incompatible with --meth-scoring collapsed: "
+                   "collapsed also frees reference T against read C, which has no CpG meaning";
+    }
+    return NULL;
+}
+
 void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
 {
-    if (cli->set_context && !opt->meth_mode) {
-        fprintf(stderr, "ERROR: --meth-context requires --meth\n");
+    /* Every fatal check, before any default is applied: the check judges the
+     * scoring mode the defaults below would resolve to. */
+    const char *err = meth_opts_check(opt, cli);
+    if (err != NULL) {
+        fprintf(stderr, "ERROR: %s\n", err);
         exit(1);
     }
     if (!opt->meth_mode) return;
@@ -205,8 +249,7 @@ void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
      * exactly as GENOMIC and COLLAPSED do. An explicit --meth-scoring still wins.
      * Set before mem_opt_apply_meth_defaults so its COLLAPSED -B 2 branch keys
      * off the resolved scoring mode. */
-    if (opt->meth_chem == METH_CHEM_TAPS && !cli->set_scoring)
-        opt->meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    opt->meth_scoring = meth_opts_resolved_scoring(opt, cli);
     /* --meth-seed-prune defaults to spec30 under --meth. Unlike non-meth, --meth
      * is a bwa-mem3-native feature -- bwa/bwa-mem2 never had a bisulfite mode, so
      * there is no upstream reference output to stay byte-identical to. spec30 is
@@ -217,19 +260,6 @@ void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
     if (!cli->set_seed_prune)
         opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
 
-    if (opt->meth_context == METH_CTX_CPG) {
-        if (opt->meth_chem == METH_CHEM_EMSEQ) {
-            fprintf(stderr, "ERROR: --meth-context cpg requires --meth=taps or --meth=5base: under "
-                            "EM-seq/bisulfite every unmethylated C converts, so conversions are not "
-                            "confined to CpG\n");
-            exit(1);
-        }
-        if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED) {
-            fprintf(stderr, "ERROR: --meth-context cpg is incompatible with --meth-scoring collapsed: "
-                            "collapsed also frees reference T against read C, which has no CpG meaning\n");
-            exit(1);
-        }
-    }
     /* NEUTRAL suits sparse conversions only. em-seq converts most cytosines, so
      * scoring each conversion 0 instead of +A takes several points off a short
      * read at its true locus: it falls below -T, or loses to a locus that matches
