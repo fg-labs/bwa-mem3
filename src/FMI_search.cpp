@@ -2661,10 +2661,12 @@ void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
 
 // Between-phases housekeeping: point prev at the forward phase's entries and
 // set up backward-phase cursors. The slot leaves as PH_BWD (ready for
-// ls_advance_backward_step) or PH_DONE (the backward outer loop would end on
-// its first step, so go straight to the final prev[0] emit).
+// ls_advance_backward_step) or PH_DONE: with no forward entries, or with the
+// start position at read base 0, where the backward outer loop cannot run, so
+// the final prev[0] emit runs here. An N just left of the start position also
+// ends the walk on its first backward visit; that visit runs the emit.
 template <bool PL>
-void FMI_search::ls_prepare_backward(BatchSlot *s)
+void FMI_search::ls_prepare_backward(BatchSlot *s, int32_t minSeedLen)
 {
     static_assert(sizeof(void *) != 8 || sizeof(BatchSlot) == 168,
                   "BatchSlot size changed: update the slot-size comments");
@@ -2683,10 +2685,16 @@ void FMI_search::ls_prepare_backward(BatchSlot *s)
         return;
     }
     if (s->j < 0) {
-        // Backward outer loop cannot execute (start_pos == 0). Transition to
-        // PH_BWD so the first ls_advance_backward_step call sees j < 0, jumps
-        // to DONE, and runs the final prev[0] emit with the correct minSeedLen.
-        s->phase = PH_BWD;
+        // The backward outer loop cannot execute (start_pos == 0): run its
+        // final prev[0] emit now, as ls_advance_backward_step's DONE would on
+        // the slot's next visit, so the slot is refilled in this one.
+        SMEM smem = s->prev[0];
+        if ((smem.n - smem.m + 1) >= minSeedLen) {
+            s->match_buf[s->match_count++] = smem;
+        }
+        s->numPrev = 0;
+        s->phase = PH_DONE;
+        s->ready = true;
         return;
     }
 #ifdef ENABLE_PREFETCH
@@ -2806,7 +2814,7 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
                 numCurr = ls_backward_one(s, a, minSeedLen);
                 s->numPrev = numCurr;
                 s->j--;
-                if (numCurr == 0) goto DONE;
+                if (numCurr == 0 || s->j < 0 || enc_qdb[s->offset + s->j] > 3) goto DONE;
                 return;
             }
             SMEM *const prev = s->prev;
@@ -2819,7 +2827,7 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
                                                                   count_a});
             s->numPrev = numCurr;
             s->j = j - 1;
-            if (numCurr == 0) goto DONE;
+            if (numCurr == 0 || j == 0 || enc_qdb[s->offset + j - 1] > 3) goto DONE;
             return;
         }
 
@@ -2833,7 +2841,9 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
          * general loops' hoisted locals to save. The compact layout runs two
          * more hand-kept copies of the same logic, ls_backward_one (this path)
          * and ls_backward_general (the loops below), kept separate so each
-         * layout's step inlines into its own loop: mirror an edit in all four. */
+         * layout's step inlines into its own loop: mirror an edit in all four.
+         * The final prev[0] emit (DONE below) has one more copy, in
+         * ls_prepare_backward's start_pos == 0 exit. */
         if (s->numPrev == 1) {
             SMEM smem = s->prev[0];
             SMEM newSmem = backwardExt_konly_file(smem, a);
@@ -2854,7 +2864,7 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
             }
             s->numPrev = numCurr;
             s->j--;
-            if (numCurr == 0) goto DONE;
+            if (numCurr == 0 || s->j < 0 || enc_qdb[s->offset + s->j] > 3) goto DONE;
             return;
         }
 
@@ -2907,7 +2917,10 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         }
         s->numPrev = numCurr;
         s->j = j - 1;          // advance for the next outer step
-        if (numCurr == 0) goto DONE;
+        /* End now when the next step would end without extending: no
+         * candidate left, the read's start, or an N. That step's checks run
+         * here and the slot is refilled in this visit instead of the next. */
+        if (numCurr == 0 || j == 0 || enc_qdb[s->offset + j - 1] > 3) goto DONE;
         return;                // stay in PH_BWD; next call continues
     }
 
@@ -3440,7 +3453,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep_t(uint8_t *enc_qdb,
                     // between-phases housekeeping immediately. prepare_backward
                     // may transition straight to PH_DONE (e.g. empty prev[]).
                     if (sl->phase == PH_BWD_INIT) {
-                        ls_prepare_backward<PL>(sl);
+                        ls_prepare_backward<PL>(sl, minSeedLen);
                     }
                     break;
                 case PH_S1_LF:
@@ -3448,16 +3461,16 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep_t(uint8_t *enc_qdb,
                     break;
                 case PH_S1_CMP:
                     ls_s1_compare(sl, enc_qdb, s1_pac, s1_l_pac);
-                    ls_prepare_backward<PL>(sl);
+                    ls_prepare_backward<PL>(sl, minSeedLen);
                     break;
                 case PH_FWD_TABLE:
                     ls_advance_forward_table<PL>(sl, enc_qdb, s1_text);
                     if (sl->phase == PH_BWD_INIT) {
-                        ls_prepare_backward<PL>(sl);
+                        ls_prepare_backward<PL>(sl, minSeedLen);
                     }
                     break;
                 case PH_BWD_INIT:
-                    ls_prepare_backward<PL>(sl);
+                    ls_prepare_backward<PL>(sl, minSeedLen);
                     break;
                 case PH_BWD:
                     ls_advance_backward_step<PL>(sl, enc_qdb, minSeedLen);

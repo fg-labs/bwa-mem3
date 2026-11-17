@@ -1400,7 +1400,7 @@ private:
                        const uint8_t *pac, int64_t l_pac);
     template <bool PL> void ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
                                   bool s1_text);
-    template <bool PL> void ls_prepare_backward(BatchSlot *s);
+    template <bool PL> void ls_prepare_backward(BatchSlot *s, int32_t minSeedLen);
     template <int A, bool WIDE>
     int32_t ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPrev, int32_t min_intv,
                                 int32_t j, int32_t minSeedLen, int64_t count_a);

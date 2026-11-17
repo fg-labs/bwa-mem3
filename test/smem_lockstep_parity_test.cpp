@@ -1903,6 +1903,69 @@ int main(int argc, char *argv[]) {
         free(ref);
     }
 
+    /* Case 22: backward walks whose last kept step ends them. A backward step
+     * that keeps candidates ends the walk at once when the read's start or an N
+     * comes next, and a walk from read base 0 ends without a backward step; the
+     * lockstep driver emits prev[0] on that same visit. Reference substrings,
+     * so the candidates are real and survive to the end: an N placed just before
+     * the start position (pivot) and at several distances from it, the pivot at
+     * the read's last base, mid-read and at 0, and minSeedLen above and below
+     * the surviving match length. At widths 1, 3 and the default. */
+    {
+        int32_t ref_len = 0;
+        char *ref = read_fasta_seq(argv[1], &ref_len);
+        if (!ref) {
+            total_cases++;
+            fprintf(stderr, "[FAIL] Case 22: could not read reference FASTA '%s'\n", argv[1]);
+        } else {
+            const int32_t rl = 64;
+            std::vector<std::string> bufs;
+            std::vector<int32_t> qpa;
+            const int32_t offs[] = {7, 333, 1201, 2777, 4444};
+            const int32_t npos[] = {-1, 0, 5, 20, 30, 31};   /* N at this read base; -1: none */
+            const int32_t pivots[] = {0, 31, 32, 40, rl - 1};
+            for (const int32_t o : offs) {
+                if (o + rl > ref_len) continue;
+                for (const int32_t np : npos) {
+                    for (const int32_t pv : pivots) {
+                        if (np >= 0 && pv <= np) continue;   /* the walk starts on the N's right */
+                        std::string r(ref + o, (size_t)rl);
+                        if (np >= 0) r[(size_t)np] = 'N';
+                        bufs.push_back(r);
+                        qpa.push_back(pv);
+                    }
+                }
+            }
+            const int32_t n = (int32_t)bufs.size();
+            std::vector<const char *> reads;
+            std::vector<int32_t> mia, rid;
+            for (int32_t i = 0; i < n; i++) {
+                reads.push_back(bufs[(size_t)i].c_str());
+                mia.push_back(1);
+                rid.push_back(i);
+            }
+            uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
+            encode_reads(reads.data(), n, &enc_qdb, &seq_, &cum_len);
+            const int32_t saved_n = g_smem_lockstep_n;
+            const int32_t widths[] = {1, clamp_width(3), SMEM_LOCKSTEP_N};
+            const int32_t msls[] = {19, 33};
+            for (const int32_t w : widths) {
+                for (const int32_t msl : msls) {
+                    std::vector<int32_t> q = qpa, m = mia, r = rid;
+                    char name[128];
+                    snprintf(name, sizeof name, "Case 22: backward walks ended by the read start "
+                             "or an N (%d reads), N = %d, minSeedLen %d", (int)n, (int)w, (int)msl);
+                    g_smem_lockstep_n = w;
+                    run_case(fmi, name, n, rl, msl, enc_qdb, q.data(), m.data(), r.data(), seq_,
+                             cum_len, /*expect_min_smem=*/n / 4);
+                }
+            }
+            g_smem_lockstep_n = saved_n;
+            free(enc_qdb); free(seq_); free(cum_len);
+            free(ref);
+        }
+    }
+
     /* Case 19: s1_tag_contained's rules (no index needed). */
     check_s1_tag_contained_rules();
 
