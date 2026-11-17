@@ -691,5 +691,7 @@ run_or_skip shm_round_trip_test "$HERE/shm_round_trip_test.sh"
 run_or_skip shm_meth_test "$HERE/shm_meth_test.sh"
 # shm --compact-occ (stage, attach, layout mismatches) against the disk path.
 run_or_skip shm_compact_occ_test "$HERE/shm_compact_occ_test.sh"
+# The shm small-pages warning (Linux; SKIP elsewhere) against the host's mount.
+run_or_skip shm_hugepage_warn_test "$HERE/shm_hugepage_warn_test.sh"
 
 echo "ALL UNIT TESTS PASSED"

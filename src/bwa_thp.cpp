@@ -106,13 +106,49 @@ static void thp_smaps_commit(bwa_thp_smaps_parser_t *p)
     p->cur_elig = -1;
 }
 
+/* A VMA header, "<hex start>-<hex end> perms ...": 1 with its range, else 0. Field keys start
+ * with an upper-case letter, and none is a hex number followed by '-'. */
+static int smaps_hex(char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); }
+
+static int smaps_vma_header(const char *s, unsigned long long *lo, unsigned long long *hi)
+{
+    const char *p = s;
+    while (smaps_hex(*p)) ++p;
+    if (p == s || *p != '-') return 0;
+    const char *h = ++p;
+    while (smaps_hex(*p)) ++p;
+    if (p == h || (*p != ' ' && *p != '\0')) return 0;
+    *lo = strtoull(s, NULL, 16);
+    *hi = strtoull(h, NULL, 16);
+    return 1;
+}
+
+/* Append data[0, n) to the line buffer `line` (cap bytes, *len used), calling on_line(ctx) on
+ * each complete line, NUL-terminated in `line`. Only a line's first cap - 1 bytes are kept. */
+static void smaps_lines_feed(char *line, size_t cap, size_t *len, const char *data, size_t n,
+                             void (*on_line)(void *), void *ctx)
+{
+    while (n > 0) {
+        const char *nl = (const char *)memchr(data, '\n', n);
+        const size_t take = nl != NULL ? (size_t)(nl - data) : n;
+        const size_t room = cap - 1 - *len;
+        const size_t keep = take < room ? take : room;
+        memcpy(line + *len, data, keep);
+        *len += keep;
+        if (nl == NULL) return;
+        line[*len] = '\0';
+        on_line(ctx);
+        *len = 0;
+        data = nl + 1;
+        n -= take + 1;
+    }
+}
+
 static void thp_smaps_line(bwa_thp_smaps_parser_t *p)
 {
     const char *s = p->line;
-    const char c = s[0];
-    /* VMA header: "<start>-<end> perms ..." in lowercase hex; field names
-     * start with an upper-case letter. */
-    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+    unsigned long long lo, hi;
+    if (smaps_vma_header(s, &lo, &hi)) {
         thp_smaps_commit(p);
         p->in_vma = 1;
         return;
@@ -126,22 +162,11 @@ static void thp_smaps_line(bwa_thp_smaps_parser_t *p)
     }
 }
 
+static void thp_smaps_on_line(void *p) { thp_smaps_line((bwa_thp_smaps_parser_t *)p); }
+
 void bwa_thp_smaps_feed(bwa_thp_smaps_parser_t *p, const char *data, size_t n)
 {
-    while (n > 0) {
-        const char *nl = (const char *)memchr(data, '\n', n);
-        const size_t take = nl != NULL ? (size_t)(nl - data) : n;
-        const size_t room = BWA_THP_LINE_MAX - 1 - p->len;
-        const size_t keep = take < room ? take : room;
-        memcpy(p->line + p->len, data, keep);
-        p->len += keep;
-        if (nl == NULL) return;
-        p->line[p->len] = '\0';
-        thp_smaps_line(p);
-        p->len = 0;
-        data = nl + 1;
-        n -= take + 1;
-    }
+    smaps_lines_feed(p->line, BWA_THP_LINE_MAX, &p->len, data, n, thp_smaps_on_line, p);
 }
 
 void bwa_thp_smaps_finish(bwa_thp_smaps_parser_t *p, bwa_thp_usage_t *out)
@@ -153,6 +178,119 @@ void bwa_thp_smaps_finish(bwa_thp_smaps_parser_t *p, bwa_thp_usage_t *out)
     }
     thp_smaps_commit(p);
     if (out != NULL) *out = p->u;
+}
+
+void bwa_smaps_vma_init(bwa_smaps_vma_parser_t *p, unsigned long long addr)
+{
+    memset(p, 0, sizeof *p);
+    p->addr = addr;
+    p->rss = -1;
+}
+
+static void smaps_vma_on_line(void *vp)
+{
+    bwa_smaps_vma_parser_t *p = (bwa_smaps_vma_parser_t *)vp;
+    const char *s = p->line;
+    unsigned long long lo, hi;
+    if (smaps_vma_header(s, &lo, &hi)) {
+        if (p->found) { p->in_vma = 0; p->done = 1; return; }   /* past the VMA we wanted */
+        p->in_vma = p->found = lo <= p->addr && p->addr < hi;
+        return;
+    }
+    if (!p->in_vma) return;
+    long long v;
+    if ((v = thp_field(s, "Rss:")) >= 0) p->rss = v;
+    else if ((v = thp_field(s, "ShmemPmdMapped:")) >= 0 || (v = thp_field(s, "FilePmdMapped:")) >= 0) {
+        p->have_pmd = 1;
+        p->pmd += v;
+    }
+    /* A hugetlb mapping (a System V SHM_HUGETLB segment): its pages are huge
+     * pages whatever the PMD fields say, and are counted in *_Hugetlb, not Rss. */
+    else if ((v = thp_field(s, "KernelPageSize:")) >= 0) { if (v >= 2048) p->hugetlb = 1; }
+    else if ((v = thp_field(s, "Shared_Hugetlb:")) > 0 || (v = thp_field(s, "Private_Hugetlb:")) > 0)
+        p->hugetlb = 1;
+}
+
+void bwa_smaps_vma_feed(bwa_smaps_vma_parser_t *p, const char *data, size_t n)
+{
+    smaps_lines_feed(p->line, BWA_THP_LINE_MAX, &p->len, data, n, smaps_vma_on_line, p);
+}
+
+int bwa_smaps_vma_finish(bwa_smaps_vma_parser_t *p)
+{
+    if (p->len > 0) {
+        p->line[p->len] = '\0';
+        smaps_vma_on_line(p);
+        p->len = 0;
+    }
+    if (p->found && p->hugetlb) return 1;
+    if (!p->found || p->rss <= 0 || !p->have_pmd) return -1;
+    return p->pmd > 0 ? 1 : 0;
+}
+
+int bwa_proc_read_stream(const char *path, int (*feed)(void *ctx, const char *data, size_t n),
+                         void *ctx)
+{
+#if defined(__linux__)
+    enum { CHUNK = 64 * 1024 };
+    char *chunk = (char *)malloc(CHUNK);
+    if (chunk == NULL) return -1;
+    const int saved_errno = errno;
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { free(chunk); errno = saved_errno; return -1; }
+    int rc = 0;
+    for (;;) {
+        const ssize_t r = read(fd, chunk, CHUNK);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            rc = -1;
+            break;
+        }
+        if (r == 0 || feed(ctx, chunk, (size_t)r) != 0) break;
+    }
+    close(fd);
+    free(chunk);
+    errno = saved_errno;
+    return rc;
+#else
+    (void)path; (void)feed; (void)ctx;
+    return -1;
+#endif
+}
+
+namespace {
+/* bwa_proc_read_text's sink: appends to a growing buffer, keeping room for the NUL. */
+struct TextSink { char **buf; size_t *cap; size_t len, max; int over; };
+bool text_sink_reserve(TextSink *t, size_t need)
+{
+    if (need > t->max) return false;
+    if (need <= *t->cap) return true;
+    size_t ncap = *t->cap ? *t->cap : 4096;
+    while (ncap < need) ncap *= 2;
+    if (ncap > t->max) ncap = t->max;
+    char *nb = (char *)realloc(*t->buf, ncap);
+    if (nb == NULL) return false;
+    *t->buf = nb;
+    *t->cap = ncap;
+    return true;
+}
+int text_sink_feed(void *vctx, const char *data, size_t n)
+{
+    TextSink *t = (TextSink *)vctx;
+    if (!text_sink_reserve(t, t->len + n + 1)) { t->over = 1; return 1; }
+    memcpy(*t->buf + t->len, data, n);
+    t->len += n;
+    return 0;
+}
+}  // namespace
+
+long bwa_proc_read_text(const char *path, char **buf, size_t *cap, size_t max_bytes)
+{
+    TextSink t = { buf, cap, 0, max_bytes, 0 };
+    if (bwa_proc_read_stream(path, text_sink_feed, &t) != 0 || t.over || !text_sink_reserve(&t, 1))
+        return -1;
+    (*buf)[t.len] = '\0';
+    return (long)t.len;
 }
 
 bwa_thp_status_t bwa_thp_parse_status(const char *text)
@@ -345,7 +483,8 @@ out:
  * anonymous-namespace C++ helper returning std::string and refuses files over
  * 4 KiB, while /proc/self/status can exceed that (a long Groups: line) and
  * smaps is megabytes, so this module reads to EOF with a growing buffer
- * (status, sysfs) or streams in chunks (smaps). */
+ * (status, sysfs: bwa_proc_read_text) or streams in chunks (smaps:
+ * bwa_proc_read_stream). */
 typedef struct {
     char  *buf;
     size_t cap;
@@ -362,54 +501,21 @@ static long thp_real_page_size(void *ctx)
 static const char *thp_real_read_text(void *vctx, const char *path)
 {
     thp_real_ctx_t *c = (thp_real_ctx_t *)vctx;
-    const int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) return NULL;
-    size_t len = 0;
-    for (;;) {
-        if (len + 1 >= c->cap) {
-            const size_t ncap = c->cap ? c->cap * 2 : 4096;
-            char *nb = ncap <= THP_READ_CAP ? (char *)realloc(c->buf, ncap) : NULL;
-            if (nb == NULL) { close(fd); return NULL; }
-            c->buf = nb;
-            c->cap = ncap;
-        }
-        const ssize_t r = read(fd, c->buf + len, c->cap - 1 - len);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            close(fd);
-            return NULL;
-        }
-        if (r == 0) break;
-        len += (size_t)r;
-    }
-    close(fd);
-    c->buf[len] = '\0';
-    return c->buf;
+    return bwa_proc_read_text(path, &c->buf, &c->cap, THP_READ_CAP) >= 0 ? c->buf : NULL;
+}
+
+static int thp_real_smaps_feed(void *p, const char *data, size_t n)
+{
+    bwa_thp_smaps_feed((bwa_thp_smaps_parser_t *)p, data, n);
+    return 0;   /* every VMA counts: read to the end */
 }
 
 static int thp_real_walk_smaps(void *vctx, bwa_thp_usage_t *out)
 {
     (void)vctx;
-    enum { CHUNK = 64 * 1024 };
-    char *chunk = (char *)malloc(CHUNK);
-    if (chunk == NULL) return -1;
-    const int fd = open("/proc/self/smaps", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) { free(chunk); return -1; }
     bwa_thp_smaps_parser_t p;
     bwa_thp_smaps_init(&p);
-    int rc = 0;
-    for (;;) {
-        const ssize_t r = read(fd, chunk, CHUNK);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            rc = -1;
-            break;
-        }
-        if (r == 0) break;
-        bwa_thp_smaps_feed(&p, chunk, (size_t)r);
-    }
-    close(fd);
-    free(chunk);
+    const int rc = bwa_proc_read_stream("/proc/self/smaps", thp_real_smaps_feed, &p);
     if (rc == 0) bwa_thp_smaps_finish(&p, out);
     return rc;
 }

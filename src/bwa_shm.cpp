@@ -32,6 +32,7 @@
 #include "utils.h"         /* err_fread_noeof, err_fclose, xopen */
 #include "bwa_madvise.h"   /* bwamem_madv_hugepage */
 #include "simd_dispatch.h" /* bwa3_host_cpu_identity */
+#include "bwa_thp.h"       /* bwa_smaps_vma_*, bwa_proc_read_stream: the shared smaps reader */
 
 #include <stdio.h>
 #include <cstdlib>
@@ -49,6 +50,7 @@
 #include <limits.h>        /* PATH_MAX */
 #include <signal.h>        /* kill(pid, 0) liveness probe */
 #include <time.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -299,6 +301,100 @@ static void *idx_segment_map(int fd, size_t len, int prot)
     void *m = mmap(NULL, len, prot, MAP_SHARED, fd, 0);
     if (m != MAP_FAILED) bwamem_madv_hugepage(m, len);
     return m;
+}
+
+int bwa_shm_hugepage_warn_wanted(int on_huge, uint64_t seg_len, uint64_t pmd_bytes,
+                                 const char *shmem_enabled)
+{
+    if (on_huge != 0) return 0;                 /* on huge pages, or cannot tell */
+    if (seg_len < pmd_bytes) return 0;          /* never PMD-mapped: no huge page fits */
+    if (shmem_enabled == NULL) return 0;        /* no shmem THP in the kernel */
+    if (std::strstr(shmem_enabled, "[deny]") != NULL) return 0;   /* off for every mount */
+    return 1;
+}
+
+/* "4 KB", "64 KB", "2 MB", "512 MB", "1 GB": a page size in the message. */
+static std::string shm_page_size_text(uint64_t bytes)
+{
+    static const char *const unit[] = { "B", "KB", "MB", "GB" };
+    int u = 0;
+    while (u < 3 && bytes >= 1024 && bytes % 1024 == 0) { bytes /= 1024; ++u; }
+    return std::to_string((unsigned long long)bytes) + " " + unit[u];
+}
+
+int bwa_shm_format_hugepage_warning(char *buf, size_t n, const char *func, const char *name,
+                                    uint64_t page_bytes, uint64_t pmd_bytes)
+{
+    return std::snprintf(buf, n,
+        "[W::%s] the shm segment for '%s' is on %s pages, not %s huge pages. "
+        "Fix: `sudo mount -o remount,huge=advise /dev/shm` (add huge=advise "
+        "to the /dev/shm options in /etc/fstab to keep it across reboots), then restage, since "
+        "page size is fixed at staging: `bwa-mem3 shm -d`, then your `bwa-mem3 shm` command "
+        "again.\n",
+        func, name, shm_page_size_text(page_bytes).c_str(), shm_page_size_text(pmd_bytes).c_str());
+}
+
+/* Warn, once per process, when the segment mapped at `base` is not on huge
+ * pages. It checks what the kernel did, not the mount options: the smaps entry
+ * for the mapping, whose pages the caller has touched (the stager's pack, the
+ * attach's magic load). smaps is streamed (bwa_proc_read_stream) and the read
+ * stops after that one VMA. Silent at -v < 2, when it cannot tell (smaps
+ * unreadable), and when the remount it advises cannot help
+ * (bwa_shm_hugepage_warn_wanted: a segment smaller than one PMD page, no shmem
+ * THP in the kernel, or shmem_enabled set to deny). The caller never passes a
+ * 1 GB (hugetlb) segment, which smaps would report as huge anyway. Linux only;
+ * a no-op elsewhere. Never changes the exit status or output. Called with no
+ * stager lock held: it reads procfs and sysfs and writes stderr. */
+#if defined(__linux__)
+static int shm_smaps_vma_feed(void *p, const char *data, size_t n)
+{
+    bwa_smaps_vma_feed((bwa_smaps_vma_parser_t *)p, data, n);
+    return bwa_smaps_vma_done((const bwa_smaps_vma_parser_t *)p);
+}
+
+/* The PMD (transparent huge page) size: 2 MB on x86-64 and on arm64 with 4 KB
+ * base pages, 512 MB on arm64 with 64 KB ones. */
+static uint64_t shm_pmd_bytes(void)
+{
+    char *text = NULL;
+    size_t cap = 0;
+    unsigned long long v = 0;
+    if (bwa_proc_read_text("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", &text, &cap, 64) > 0)
+        v = std::strtoull(text, NULL, 10);
+    std::free(text);
+    return v > 0 ? (uint64_t)v : 2ULL << 20;
+}
+#endif
+
+static std::atomic<bool> g_small_pages_warned{false};
+
+static void shm_warn_if_small_pages(const char *func, const void *base, uint64_t seg_len,
+                                    const char *name)
+{
+#if defined(__linux__)
+    if (bwa_verbose < 2 || g_small_pages_warned.load(std::memory_order_relaxed)) return;
+    const uint64_t pmd = shm_pmd_bytes();
+    if (seg_len < pmd) return;   /* no huge page fits: skip the smaps walk */
+    char *thp = NULL;
+    size_t cap = 0;
+    const bool have_thp =
+        bwa_proc_read_text("/sys/kernel/mm/transparent_hugepage/shmem_enabled", &thp, &cap, 4096) >= 0;
+    bwa_smaps_vma_parser_t vma;
+    bwa_smaps_vma_init(&vma, (unsigned long long)(uintptr_t)base);
+    const bool want = bwa_proc_read_stream("/proc/self/smaps", shm_smaps_vma_feed, &vma) == 0 &&
+                      bwa_shm_hugepage_warn_wanted(bwa_smaps_vma_finish(&vma), seg_len, pmd,
+                                                   have_thp ? thp : NULL);
+    std::free(thp);
+    if (!want || g_small_pages_warned.exchange(true)) return;
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const int n = bwa_shm_format_hugepage_warning(NULL, 0, func, name, page, pmd);
+    if (n <= 0) return;
+    std::string msg((size_t)n + 1, '\0');
+    bwa_shm_format_hugepage_warning(&msg[0], msg.size(), func, name, page, pmd);
+    std::fputs(msg.c_str(), stderr);
+#else
+    (void)func; (void)base; (void)seg_len; (void)name;
+#endif
 }
 
 /* Test-only hook, called after the lock is released and before the pack
@@ -2174,6 +2270,10 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
                      (unsigned)huge_key(layout.stage_token));
         return 0;
     }
+    /* The stage is complete. Warn with no lock held (the pack has written every
+     * page); a 1 GB stage is on huge pages by construction and returned above. */
+    g.unlock();
+    shm_warn_if_small_pages(__func__, g.idx, layout.total_size, name);
     std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) as %s\n",
                  __func__, name, (unsigned long long)layout.total_size, idx_path);
     return 0;
@@ -2234,7 +2334,8 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out
      * created, attached by huge_attach after the checks that segment_state
      * makes too (the size the stub records, the length mapped here, and a
      * complete header that carries the stub's token). */
-    if (magic == BWA_SHM_HUGE_MAGIC && is_huge_stub(&hdr)) {
+    const bool from_huge = magic == BWA_SHM_HUGE_MAGIC && is_huge_stub(&hdr);
+    if (from_huge) {
         munmap(m, len);
         if (hdr.version != BWA_SHM_VERSION) {
             std::fprintf(stderr, "[E::%s] unsupported 1 GB stub version %u in %s (expected "
@@ -2307,6 +2408,10 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out
         bwa_shm_detach((uint8_t *)m, len);
         return NULL;
     }
+
+    /* The magic load above touched the first page. A 1 GB segment is on huge
+     * pages by construction. */
+    if (!from_huge) shm_warn_if_small_pages(__func__, m, hdr.total_size, name);
 
     if (len_out != NULL) *len_out = (size_t)hdr.total_size;
     if (map_len_out != NULL) *map_len_out = len;
