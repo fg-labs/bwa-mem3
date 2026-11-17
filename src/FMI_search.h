@@ -917,6 +917,14 @@ private:
             return (int)(((b.hi >> y) & 1) << 1 | ((b.lo >> y) & 1));
         }
 
+        /* cp_occ_t / backwardExt_konly_ab's A for a base C, G or T (1..3) given at run
+         * time in `a`. Never base A (0): this form skips the sentinel-row correction
+         * that only A counts need, so an A count through it would be off by one past
+         * the sentinel. cp_step_dispatch is its only user and sends a == 0 to the
+         * A = 0 copy. Build with -DBWA_MEM3_DEBUG_CP_CGT_RUNTIME to check a at run
+         * time (off by default; release code is unchanged). */
+        static constexpr int CP_CGT_RUNTIME = -1;
+
         /* Everything an occurrence count reads besides the block, copied into
          * locals by the hot loops (cp_view()): read through `this`, clang reloads
          * each field after every store the loop makes, since it cannot tell the
@@ -1015,62 +1023,84 @@ private:
          * phase): A's rows are two and/bic ops on the planes with no plane
          * masks to apply, there is no wide test, and only an A count tests the
          * sentinel range (the sentinel reads as A, so no other base's count
-         * sees it). */
+         * sees it). A = CP_CGT_RUNTIME takes base C, G or T from `a` at run time
+         * (never A: see CP_CGT_RUNTIME), so it skips the sentinel test too. */
         template <int A, bool WIDE>
-        static inline int64_t cp_occ_t(const CpView &v, const CP_OCC_PLANES &b, int64_t pp)
+        static inline int64_t cp_occ_t(const CpView &v, const CP_OCC_PLANES &b, int64_t pp, int a)
         {
+            if (A == CP_CGT_RUNTIME) {
+#ifdef BWA_MEM3_DEBUG_CP_CGT_RUNTIME
+                xassert(a >= 1 && a <= 3, "cp_occ_t<CP_CGT_RUNTIME> takes base C, G or T only");
+#endif
+                int64_t occ = (int64_t)b.cp_count[a] + cp_rows(b, pp, cp_hx(a), cp_lx(a));
+                if (WIDE) occ += v.base[pp >> v.span_shift][a];
+                return occ;
+            }
+            constexpr int C = A < 0 ? 0 : A;
 #if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
             const uint64x1_t h = vld1_u64(&b.hi), l = vld1_u64(&b.lo);
             const uint64x1_t m = vld1_u64(&one_hot_mask_array[pp & CP_MASK]);
-            const uint64x1_t mh = (A >> 1) ? vand_u64(m, h) : vbic_u64(m, h);
-            const uint64x1_t x  = (A & 1) ? vand_u64(mh, l) : vbic_u64(mh, l);
-            int64_t occ = (int64_t)b.cp_count[A] + (int64_t)vaddv_u8(vcnt_u8(vreinterpret_u8_u64(x)));
+            const uint64x1_t mh = (C >> 1) ? vand_u64(m, h) : vbic_u64(m, h);
+            const uint64x1_t x  = (C & 1) ? vand_u64(mh, l) : vbic_u64(mh, l);
+            int64_t occ = (int64_t)b.cp_count[C] + (int64_t)vaddv_u8(vcnt_u8(vreinterpret_u8_u64(x)));
 #else
             const uint64_t m = one_hot_mask_array[pp & CP_MASK];
-            const uint64_t mh = (A >> 1) ? (m & b.hi) : (m & ~b.hi);
-            const uint64_t x  = (A & 1) ? (mh & b.lo) : (mh & ~b.lo);
-            int64_t occ = (int64_t)b.cp_count[A] + (int64_t)__builtin_popcountll(x);
+            const uint64_t mh = (C >> 1) ? (m & b.hi) : (m & ~b.hi);
+            const uint64_t x  = (C & 1) ? (mh & b.lo) : (mh & ~b.lo);
+            int64_t occ = (int64_t)b.cp_count[C] + (int64_t)__builtin_popcountll(x);
 #endif
-            if (WIDE) occ += v.base[pp >> v.span_shift][A];
+            if (WIDE) occ += v.base[pp >> v.span_shift][C];
             if (A == 0 && __builtin_expect((uint64_t)(pp - v.sent_after) < v.sent_len, 0)) occ -= 1;
             return occ;
         }
 
-        /* Return f.run<A, WIDE>() for base a (0..3) and count layout wide: the one
+        /* Return f.run<A, WIDE>(a) for base a (0..3) and count layout wide: the one
          * (wide, a) -> <A, WIDE> table the compact layout's per-base steps are picked
          * through (backwardExt_konly_planes, ls_advance_backward_step). F is a functor with
-         * a member template `template <int A, bool WIDE> R run()`. */
+         * a member template `template <int A, bool WIDE> R run(int a)`. x86 takes a copy
+         * per base, where each one's plane masks, count and checkpoint column are
+         * constants. arm64 takes two, for A (the only base that tests the sentinel) and
+         * for the other three (A = CP_CGT_RUNTIME, the base `a` at run time): the base is
+         * the read's, so a four-way pick mispredicts on most rounds, and arm64 keeps the
+         * run-time base's values in registers. */
         template <class R, class F>
         __attribute__((always_inline)) static inline R cp_step_dispatch(bool wide, int a, const F &f)
         {
+#if defined(__aarch64__)
+            /* a == 0 must take the A copy: CP_CGT_RUNTIME skips A's sentinel correction. */
+            if (wide) return a == 0 ? f.template run<0, true>(0) : f.template run<CP_CGT_RUNTIME, true>(a);
+            return a == 0 ? f.template run<0, false>(0) : f.template run<CP_CGT_RUNTIME, false>(a);
+#else
             switch ((wide ? 4 : 0) | a) {
-            case 0: return f.template run<0, false>();
-            case 1: return f.template run<1, false>();
-            case 2: return f.template run<2, false>();
-            case 3: return f.template run<3, false>();
-            case 4: return f.template run<0, true>();
-            case 5: return f.template run<1, true>();
-            case 6: return f.template run<2, true>();
-            default: return f.template run<3, true>();
+            case 0: return f.template run<0, false>(0);
+            case 1: return f.template run<1, false>(1);
+            case 2: return f.template run<2, false>(2);
+            case 3: return f.template run<3, false>(3);
+            case 4: return f.template run<0, true>(0);
+            case 5: return f.template run<1, true>(1);
+            case 6: return f.template run<2, true>(2);
+            default: return f.template run<3, true>(3);
             }
+#endif
         }
 
         /* backwardExt_konly on the compact layout for a base and count layout fixed at
-         * compile time: the step the seeding drivers run (ls_backward_one,
-         * ls_backward_general) and backwardExt_konly_planes. k is left stale on the s'->0
-         * exit, so the caller must discard any s' < min_intv. The one-row case tests the
-         * row's base on its planes; the sentinel row reads as A there but has no base, so
-         * it extends nothing. */
+         * compile time (or base C, G or T in `a` when A is CP_CGT_RUNTIME): the step the
+         * seeding drivers run (ls_backward_one, ls_backward_general) and
+         * backwardExt_konly_planes. k is left stale on the s'->0 exit, so the caller must
+         * discard any s' < min_intv. The one-row case tests the row's base on its planes;
+         * the sentinel row reads as A there but has no base, so it extends nothing. */
         template <int A, bool WIDE>
         __attribute__((always_inline)) static inline
-        SMEM backwardExt_konly_ab(const CpView &v, int64_t count_a, SMEM smem)
+        SMEM backwardExt_konly_ab(const CpView &v, int64_t count_a, SMEM smem, int a)
         {
             const int64_t sp = (int64_t)smem.k;
             if (smem.s == 1) {
                 const CP_OCC_PLANES &blk = v.cp[sp >> CP_SHIFT];
                 /* the sentinel row reads as A: only an A extension tests it */
-                if (cp_base_at(blk, sp) == A && (A != 0 || sp != v.sent_after - 1)) {
-                    smem.k = count_a + cp_occ_t<A, WIDE>(v, blk, sp);
+                if (cp_base_at(blk, sp) == (A == CP_CGT_RUNTIME ? a : A) &&
+                    (A != 0 || sp != v.sent_after - 1)) {
+                    smem.k = count_a + cp_occ_t<A, WIDE>(v, blk, sp, a);
                     smem.s = 1;
                 } else {
                     smem.s = 0;
@@ -1078,8 +1108,8 @@ private:
                 return smem;
             }
             const int64_t ep = sp + (int64_t)smem.s;
-            const int64_t occ_s = cp_occ_t<A, WIDE>(v, v.cp[sp >> CP_SHIFT], sp);
-            const int64_t occ_e = cp_occ_t<A, WIDE>(v, v.cp[ep >> CP_SHIFT], ep);
+            const int64_t occ_s = cp_occ_t<A, WIDE>(v, v.cp[sp >> CP_SHIFT], sp, a);
+            const int64_t occ_e = cp_occ_t<A, WIDE>(v, v.cp[ep >> CP_SHIFT], ep, a);
             smem.k = count_a + occ_s;
             smem.s = occ_e - occ_s;
             return smem;
@@ -1293,7 +1323,7 @@ private:
             const CpView &v;
             int64_t count_a;
             SMEM smem;
-            template <int A, bool WIDE> SMEM run() const { return backwardExt_konly_ab<A, WIDE>(v, count_a, smem); }
+            template <int A, bool WIDE> SMEM run(int a) const { return backwardExt_konly_ab<A, WIDE>(v, count_a, smem, a); }
         };
         SMEM backwardExt_konly_planes(SMEM smem, uint8_t a) const
         {
@@ -1403,14 +1433,14 @@ private:
     template <bool PL> void ls_prepare_backward(BatchSlot *s, int32_t minSeedLen);
     template <int A, bool WIDE>
     int32_t ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPrev, int32_t min_intv,
-                                int32_t j, int32_t minSeedLen, int64_t count_a);
+                                int32_t j, int32_t minSeedLen, int64_t count_a, int a);
     inline int32_t ls_backward_one(BatchSlot *s, int a, int32_t minSeedLen);
     /* ls_backward_general as a cp_step_dispatch functor. */
     struct LsBackwardGeneral {
         FMI_search *f; BatchSlot *s; SMEM *prev; int32_t numPrev, min_intv, j, minSeedLen; int64_t count_a;
-        template <int A, bool WIDE> int32_t run() const
+        template <int A, bool WIDE> int32_t run(int a) const
         {
-            return f->ls_backward_general<A, WIDE>(s, prev, numPrev, min_intv, j, minSeedLen, count_a);
+            return f->ls_backward_general<A, WIDE>(s, prev, numPrev, min_intv, j, minSeedLen, count_a, a);
         }
     };
     template <bool PL> void ls_advance_backward_step(BatchSlot *s,

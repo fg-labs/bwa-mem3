@@ -2742,14 +2742,15 @@ int32_t FMI_search::ls_backward_one(BatchSlot *s, int a, int32_t minSeedLen)
 }
 
 /* ls_advance_backward_step's two general loops (numPrev > 1) on the compact
- * layout, for base A and count layout WIDE. The slot's fields, the checkpoint state and count[A] are
+ * layout, for base A and count layout WIDE (or the base `a` at run time when A is
+ * CP_CGT_RUNTIME; cp_step_dispatch). The slot's fields, the checkpoint state and count[a] are
  * held in locals: read through s and this, clang reloads them after every
  * prev[] store (the SMEM stores may alias them as far as it can tell). prev[]
  * and match_buf[] are driver-owned buffers that overlap neither the slot nor
  * the index, so this is byte-identical. Returns numCurr. */
 template <int A, bool WIDE>
 int32_t FMI_search::ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPrev, int32_t min_intv,
-                                        int32_t j, int32_t minSeedLen, int64_t count_a)
+                                        int32_t j, int32_t minSeedLen, int64_t count_a, int a)
 {
     const CpView cpv = cp_view();
     const CP_OCC_PLANES *const cpo = cpv.cp;
@@ -2758,7 +2759,7 @@ int32_t FMI_search::ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPre
     int p;
     for (p = 0; p < numPrev; p++) {
         SMEM smem = prev[p];
-        SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, smem);
+        SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, smem, a);
         newSmem.m = j;
         if ((newSmem.s < min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
             s->cur_j = j;
@@ -2785,7 +2786,7 @@ int32_t FMI_search::ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPre
         SMEM *w = prev + 1;
         if (w == r) {
             for (; r < end; r++) {
-                const SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, *r);
+                const SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, *r, a);
                 if (newSmem.s == curr_s) break;
                 curr_s = newSmem.s;
                 r->k = newSmem.k;
@@ -2800,7 +2801,7 @@ int32_t FMI_search::ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPre
             r += (r < end);
         }
         for (; r < end; r++) {
-            SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, *r);
+            SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, *r, a);
             if (newSmem.s != curr_s) {
                 curr_s = newSmem.s;
                 newSmem.m = j;
@@ -2815,7 +2816,7 @@ int32_t FMI_search::ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPre
     }
     for (; p < numPrev; p++) {
         SMEM smem = prev[p];
-        SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, smem);
+        SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, smem, a);
         newSmem.m = j;
         if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
             curr_s = newSmem.s;
@@ -2843,10 +2844,11 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         if (a > 3) goto DONE;
 
         if (PL) {
-            /* The compact layout: the base and the count layout pick a step
-             * specialised for both (cp_occ_t), for the numPrev == 1 path and
-             * the general loops alike, with the same bookkeeping as the
-             * default layout's code below. */
+            /* The compact layout, with the same bookkeeping as the default
+             * layout's code below. The numPrev == 1 path takes the base at run
+             * time (ls_backward_one); for the general loops cp_step_dispatch
+             * picks a step for the count layout and the base (on arm64, one
+             * for A and one for any other base). */
             if (s->numPrev == 1) {
                 numCurr = ls_backward_one(s, a, minSeedLen);
                 s->numPrev = numCurr;
