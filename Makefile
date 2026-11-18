@@ -543,6 +543,7 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
                    shm_stage_test shm_thp_advise_test \
                    kt_for_pool_test bns_zero_calloc_test meth_restore_order_test \
+                   index_load_timing_test \
                    err_fgets_eof_test \
                    kernel_padded_lane_uninit_test bam_rec_scratch_test \
                    detect_sa_compx_test nst_nt4_decode_test \
@@ -1221,6 +1222,9 @@ shm_stage_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_stage_test.o
 shm_thp_advise_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/shm_thp_advise_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/shm_thp_advise_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+index_load_timing_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/index_load_timing_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/index_load_timing_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
 kt_for_pool_test: $(BWA_LIB) $(HTS_LIB) test/kt_for_pool_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/kt_for_pool_test.o $(BWA_LIB) $(LIBS) -o $@
 
@@ -1600,6 +1604,9 @@ test/shm_stage_test.o: test/shm_stage_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/shm_thp_advise_test.o: test/shm_thp_advise_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
+test/index_load_timing_test.o: test/index_load_timing_test.cpp
 	$(CXX) -c $(CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
 
 test/kt_for_pool_test.o: test/kt_for_pool_test.cpp

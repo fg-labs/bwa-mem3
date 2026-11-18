@@ -124,6 +124,11 @@ uint32_t bwa3_x86_cpu_model(uint32_t leaf1_eax);
  * reports 0 / 0 / 0. */
 void bwa3_host_cpu_identity(int *is_amd, uint32_t *family, uint32_t *model);
 
+/* Nonzero for known AMD Zen 3 identities: family 0x19, models 0x00-0x0F or
+ * 0x20-0x5F. Other models, including unrecognized ones, return zero. Zen 3 and
+ * Zen 4 share the family, so the model tells them apart. Pure for unit tests. */
+int bwa3_cpu_is_zen3(int is_amd, uint32_t family, uint32_t model);
+
 #ifdef __cplusplus
 }
 #endif

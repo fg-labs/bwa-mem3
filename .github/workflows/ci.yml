@@ -1006,6 +1006,24 @@ jobs:
           fi
           ./bns_zero_calloc_test
 
+      - name: Index-load timing and worker-limit regressions
+        # Generated small index and private shared-memory registry; no host
+        # stage is read or removed. Linux also covers a successful plain test
+        # mapping, so the huge-page worker branch needs no reserved pool.
+        env:
+          MATRIX_ARCH_FLAG: ${{ matrix.arch_flag }}
+          MATRIX_BASELINE_ARCH: ${{ matrix.baseline_arch || 'avx2' }}
+          MATRIX_USE_MIMALLOC: ${{ matrix.use_mimalloc }}
+        run: |
+          if [ "$MATRIX_ARCH_FLAG" = "" ]; then
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" index_load_timing_test \
+              arch="$MATRIX_BASELINE_ARCH" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          else
+            make -j"$(nproc 2>/dev/null || sysctl -n hw.ncpu)" index_load_timing_test \
+              arch="$MATRIX_ARCH_FLAG" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
+          fi
+          ./index_load_timing_test
+
       - name: Alloc-guard regression tests (overflow / negative-size / OOM)
         # Standalone binaries pinning the allocation and size-arithmetic guard
         # paths, which no workflow ran until now (they were reachable only
@@ -3096,7 +3114,7 @@ jobs:
             packed_text_overflow_nbases_test mem_gen_alt_zero_calloc_test err_fgets_eof_test \
             fast_reader_selftest bseq_read_pe_oob_test bseq_read_comment_copy_test \
             bseq_read_truncated_gzip_test fr_fastq_diff_test x86_soa_pack_test \
-            kopen_pipe_status_test cli_arg_safety_test pwrite_all_status_test \
+            kopen_pipe_status_test cli_arg_safety_test pwrite_all_status_test index_load_timing_test \
             rescue-prune-eq rescue-band-harness rescue-band-kernel-eq \
             arch="$row_arch" CXX="$CXX" USE_MIMALLOC="$MATRIX_USE_MIMALLOC"
           make -C test header_insert_test CXX="$CXX"

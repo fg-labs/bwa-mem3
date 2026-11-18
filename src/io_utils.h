@@ -131,13 +131,26 @@ size_t fmi_pread_request_size(size_t remaining);
  * short file. */
 void fmi_pread_from_stream(FILE *fp, const char *path, void *dst, size_t nbytes, int nthreads);
 
-/* Worker count for the index load: the caller's request clamped to [1, 8]
- * (bandwidth-bound past ~8), overridable via BWA3_LOAD_THREADS (clamped to 64).
- * A malformed override is warned about once and ignored. Always returns >= 1.
+/* Default cap on the index-load workers for a CPU identity (as from
+ * bwa3_host_cpu_identity): 4 on AMD Zen 3 (bwa3_cpu_is_zen3), 8 on every other
+ * host. Pure, so it is unit-testable. */
+int index_load_threads_default_cap(int is_amd, uint32_t family, uint32_t model);
+
+/* index_load_threads_default_cap for this host, resolved once. */
+int index_load_threads_host_cap(void);
+
+/* Worker count for the index load: the caller's request clamped to [1, cap]
+ * (a cap below 1 counts as 1), overridable via BWA3_LOAD_THREADS (clamped to
+ * 64). A malformed override is warned about and ignored. Always returns >= 1.
  * When `override_applied` is non-NULL it is set to whether a valid
  * BWA3_LOAD_THREADS value set the result (false for an unset, empty or
  * malformed one), so a caller can tell an explicit cap from the default.
  * Exposed so the fail-closed env-parse is unit-testable without an index. */
+int index_load_threads_capped(int n_threads, int cap, bool *override_applied = nullptr);
+
+/* index_load_threads_capped with this host's cap (index_load_threads_host_cap):
+ * the caller's request clamped to [1, 8], or [1, 4] on AMD Zen 3 (the load is
+ * bandwidth-bound past ~8), overridable via BWA3_LOAD_THREADS. */
 int index_load_threads(int n_threads, bool *override_applied = nullptr);
 
 #endif
