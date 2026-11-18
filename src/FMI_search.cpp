@@ -2172,10 +2172,21 @@ template <bool PL>
 void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
 {
 #ifdef ENABLE_PREFETCH
+#if defined(__APPLE__) && defined(__aarch64__)
+    /* Apple silicon: only the two lines the next step reads. Every caller passes a fresh
+     * PH_FWD slot, whose next forward step (forwardExt_t) swaps k and l before backwardExt,
+     * so it reads the lines of sp = smem.l and ep = smem.l + smem.s, never the smem.k ones
+     * (the same targets as the end of ls_advance_forward_step). Dropping the two dead hints
+     * measured faster on Apple and slower on Zen 3, so other hosts keep all four.
+     * __APPLE__ alone would also take Intel macOS. */
+    _mm_prefetch(cp_line<PL>(s->smem.l), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.l + s->smem.s), _MM_HINT_T0);
+#else
     _mm_prefetch(cp_line<PL>(s->smem.k), _MM_HINT_T0);
     _mm_prefetch(cp_line<PL>(s->smem.l), _MM_HINT_T0);
     _mm_prefetch(cp_line<PL>(s->smem.k + s->smem.s), _MM_HINT_T0);
     _mm_prefetch(cp_line<PL>(s->smem.l + s->smem.s), _MM_HINT_T0);
+#endif
 #else
     (void)s;
 #endif
