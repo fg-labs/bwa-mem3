@@ -270,6 +270,11 @@ int aln_meth_gap_arena(aln_meth_slot_t *, const gap_entry_t &p, bool ext, uint32
 // has_copy: the read has duplicate copies that will redraw over its loci.
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
+/* A search path's gap differences inside the seed (above seed_off), counted from its gap events
+ * (ALN_METH_GAP), and the same count from the path as a layout (meth_layout), as an ALT-window
+ * candidate's CIGAR gives it. The two must agree: -k treats both kinds of row alike. */
+int aln_meth_seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool gape);
+int aln_meth_layout_seed_diffs(const uint32_t *gap, int n_gapo, int len, int strand, int seed_off, bool gape);
 /* --known-snvs: scores the read's ALT-window candidates (x->extra) as rows of the main search. The
  * driver calls it once the job is started (its seed is then known) and before the search's first
  * step, so the read's best and its cuts start from them; aln_meth_slot_finish calls it for a slot

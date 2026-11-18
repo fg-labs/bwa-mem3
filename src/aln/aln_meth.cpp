@@ -617,6 +617,32 @@ static int seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool ga
     }
     return d;
 }
+// seed_gap_diffs for a path given as a layout (meth_layout's inverse for each gap): an ALT-window
+// candidate's path, which comes as a CIGAR.
+static int layout_seed_diffs(const aln_meth_layout_t &L, int strand, int len, int seed_off, bool gape)
+{
+    int d = 0;
+    for (int g = 0; g < L.n; ++g) {
+        const int gl = L.len[g], del = L.del[g];
+        const int s0 = strand ? L.qpos[g] : del ? len - L.qpos[g] : len - L.qpos[g] - gl;
+        const int i = del ? s0 - 1 : s0 + gl - 1; // the S index of the gap's first step
+        if (i > seed_off) ++d; // the open
+        if (!gape) continue;
+        if (del) d += i > seed_off ? gl - 1 : 0;
+        else for (int s = i - 1; s > i - gl; --s) d += s > seed_off;
+    }
+    return d;
+}
+int aln_meth_seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool gape)
+{
+    return seed_gap_diffs(gap, n_gapo, seed_off, gape);
+}
+int aln_meth_layout_seed_diffs(const uint32_t *gap, int n_gapo, int len, int strand, int seed_off, bool gape)
+{
+    aln_meth_layout_t L;
+    meth_layout(gap, n_gapo, len, strand, &L);
+    return layout_seed_diffs(L, strand, len, seed_off, gape);
+}
 // Whether query position q (orientation ori: 0 rd_fwd, 1 rd_rev) is inside the seed's constrained
 // part (S index above seed_off).
 static inline bool seed_pos(int q, int ori, int len, int seed_off) { return ori ? q > seed_off : q < len - 1 - seed_off; }
@@ -1355,7 +1381,13 @@ __attribute__((noinline)) void aln_meth_score_extras(aln_meth_slot_t *x)
             x->unrep_cost = 0;
             continue;
         }
-        if (path) { score_row_sites(x, key.lay, c.rid, c.hyp, c.strand, c.rb, (int)span, 0, true); continue; }
+        if (path) {
+            // The path's gap differences in the seed count toward -k, as a search row's do.
+            const int seed_gaps = x->job && x->job->seed_width
+                ? layout_seed_diffs(key.lay, c.strand, x->len, x->job->c.seed_off, x->grp->opt->mode & BWA_MODE_GAPE) : 0;
+            score_row_sites(x, key.lay, c.rid, c.hyp, c.strand, c.rb, (int)span, seed_gaps, true);
+            continue;
+        }
         const ubyte_t *query = c.strand ? x->rd_rev.data() : x->rd_fwd.data();
         resolve_with_sites(x, c, query, std::max(0, x->len - (int)span), std::max(0, (int)span - x->len), true);
     }
