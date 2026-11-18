@@ -2120,6 +2120,60 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::bwa_free_read_seq(n,reads);CHECK(ba::bwa_seq_close(input)==0);
 }
 
+TEST_CASE("aln_meth: an ALT-window candidate's path counts its seed gaps toward -k")
+{
+    // A 51-base read: c1[500, 550) with one extra base inserted near one end or the other. The
+    // candidate gives that insertion as its path. Under -k 0 a seeded read drops the row whose
+    // insertion is in the seed and keeps the other; an unseeded read keeps both.
+    namespace ba = bwa_aln;
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    opt->max_seed_diff = 0;
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::gap_slot_core_t core = {};
+    ba::bwt_width_t seed_width = {};
+    const int64_t rb = mr.bns->anns[0].offset + 500;
+    const std::string window = ref().c1.substr(500, 50);
+    for (bool seeded : {false, true}) {
+        long dropped = 0;
+        for (int at : {3, 47}) {
+            CAPTURE(seeded); CAPTURE(at);
+            std::string read = window.substr(0, at) + "A" + window.substr(at);
+            const std::string fq = write_fq("seed-gap.fq", {conv(read, 'C', 'T')});
+            ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+            int n = 0;
+            ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+            REQUIRE(n == 1);
+            ba::aln_meth_slot_t slot;
+            slot.grp = &group;
+            ba::aln_meth_read_t result;
+            ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 0);
+            slot.job = &core.job;
+            core.job.seed_width = seeded ? &seed_width : nullptr;
+            core.job.c.seed_off = (int)reads->len - 32;
+            ba::aln_meth_extra_t extra;
+            extra.rows = {{0, 0, 1, rb, rb + 50, {(uint32_t)at << 4, 1u << 4 | 1, (uint32_t)(50 - at) << 4}}};
+            slot.extra = &extra;
+            ba::aln_meth_score_extras(&slot);
+            CHECK(result.n_over_seed + (long)result.occ.size() == 1);
+            dropped += result.n_over_seed;
+            slot.extra = nullptr;
+            slot.job = nullptr;
+            ba::bwa_free_read_seq(n, reads);
+            CHECK(ba::bwa_seq_close(input) == 0);
+        }
+        CHECK(dropped == (seeded ? 1 : 0));
+    }
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+}
+
 TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless CIGAR-capped")
 {
     namespace ba = bwa_aln;
@@ -5442,6 +5496,33 @@ TEST_CASE("aln_meth: exact-rescue-window rescues a mate at the stated window's e
         CHECK(off.first[i].cigar == on.first[i].cigar); CHECK(off.first[i].pos == on.first[i].pos);
         CHECK(off.first[i].flag == on.first[i].flag); CHECK(off.first[i].mapq == on.first[i].mapq);
     }
+}
+
+TEST_CASE("aln_meth: a path's seed gap differences are the same from its gap events and from its layout")
+{
+    namespace ba = bwa_aln;
+    uint32_t st = 4242;
+    auto next = [&](int n) { st = st * 1103515245u + 12345u; return (int)((st >> 8) % (uint32_t)n); };
+    int checked = 0;
+    for (int trial = 0; trial < 2000; ++trial) {
+        const int len = 20 + next(140), n_gapo = 1 + next(ba::ALN_METH_MAX_GAPS);
+        uint32_t gap[ba::ALN_METH_MAX_GAPS];
+        for (int g = 0; g < n_gapo; ++g) {
+            const int del = next(2), gl = 1 + next(4);
+            // an insertion's S index i covers S bases [i - gl + 1, i]; a deletion follows S base i
+            const int i = del ? next(len - 1) : gl - 1 + next(len - gl + 1);
+            gap[g] = ALN_METH_GAP(i, gl, del);
+        }
+        const int seed_off = next(len);
+        for (int strand = 0; strand < 2; ++strand)
+            for (int gape = 0; gape < 2; ++gape) {
+                CAPTURE(trial); CAPTURE(strand); CAPTURE(gape);
+                CHECK(ba::aln_meth_layout_seed_diffs(gap, n_gapo, len, strand, seed_off, gape) ==
+                      ba::aln_meth_seed_gap_diffs(gap, n_gapo, seed_off, gape));
+                ++checked;
+            }
+    }
+    CHECK(checked == 8000);
 }
 
 TEST_SUITE_END;

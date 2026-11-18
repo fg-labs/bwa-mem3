@@ -309,4 +309,71 @@ TEST_CASE("aln_ks_cuts: --meth: -R counts the final best, not the main search's 
     repro_case(31, true);
 }
 
+TEST_CASE("aln_ks_cuts: a CpG allele preserves an eligible seed at equal whole-read cost")
+{
+    uint32_t st = 20261114;
+    std::string read = no_c(st, 100); read[30] = 'T'; read[31] = 'A';
+    std::string c1 = aln_test::lcg_dna(st, 5000);
+    const int a = 2000;
+    c1.replace(a, read.size(), read); c1[a + 30] = 'C';
+    const KsCase k(c1, {{a + 31, 'A', "G", 'G'}}, {read});
+    std::vector<std::string> opts = {"--meth=taps", "--meth-context", "cpg", "--meth-scoring", "genomic", "-n", "3", "-l", "32", "-k", "0"};
+    auto ksopts = opts; ksopts.insert(ksopts.end(), {"--known-snvs", k.vcf});
+    const auto got = k.run(ksopts, k.ref, "cpg.seed.ks");
+    const auto oracle = k.run(opts, k.oracle, "cpg.seed.oracle");
+    REQUIRE(got.size() == 1); REQUIRE(oracle.size() == 1);
+    CAPTURE(summary(got[0])); CAPTURE(summary(oracle[0]));
+    CHECK((std::stoi(oracle[0][1]) & 4) == 0);
+    CHECK(summary(got[0]) == summary(oracle[0]));
+}
+
+TEST_CASE("aln_ks_cuts: --meth credits an ALT at one site and the reference at another")
+{
+    // M: R with four mismatches and two sites: at s1 the reference differs from R and the ALT is
+    // R's base; at s2 the reference is R's base (the ALT is not). Crediting s1's ALT and keeping
+    // s2's reference leaves four mismatches (cost 12, MAPQ 37 under -n 5); neither the reference
+    // nor every ALT in place does (five mismatches, MAPQ 25).
+    uint32_t st = 31337;
+    const std::string read = no_c(st, 100);
+    std::string c1 = aln_test::lcg_dna(st, 4000);
+    const int m = 1500;
+    const std::string seg = with_mm(read, {40, 50, 70, 80, 60});
+    c1.replace(m, 100, seg);
+    const int s1 = m + 60, s2 = m + 65;
+    const KsCase k(c1, {{s1, seg[60], std::string(1, read[60]), read[60]},
+                        {s2, seg[65], std::string(1, mm_base(seg[65])), seg[65]}}, {read});
+    const std::string want = "0 c1:" + pos1(m) + " 100M MAPQ 37 X0 1 X1 0 XA";
+    check_against_oracle(k, true, {"-n", "5"}, {want});
+    // XV: neither site counts against the placement (each column matches one of its alleles)
+    const auto got = k.run({"--meth", "-n", "5", "--known-snvs", k.vcf}, k.ref, "xv");
+    REQUIRE(got.size() == 1);
+    const std::string xv = tag(got[0], "XV:Z");
+    CAPTURE(xv);
+    CHECK(xv.find("c1:" + pos1(s1) + ":" + seg[60] + ">" + read[60] + ",A,4,") != std::string::npos);
+    CHECK(xv.find("c1:" + pos1(s2) + ":" + seg[65] + ">" + mm_base(seg[65]) + ",R,4,") != std::string::npos);
+}
+
+TEST_CASE("aln_ks_cuts: --meth credits the second ALT of a multi-allelic site")
+{
+    // R carries the second ALT (in VCF order and in code order) of a two-ALT site, plus four
+    // mismatches: five differences against the reference and against the first ALT, four with
+    // the second ALT, which -n 4 allows (MAPQ 25: all of -n used).
+    uint32_t st = 99;
+    std::string read;
+    int at = -1;
+    while (at < 0) {
+        read = no_c(st, 100);
+        for (int q = 55; q < 66 && at < 0; ++q)
+            if (read[q] == 'T') at = q;
+    }
+    std::string c1 = aln_test::lcg_dna(st, 4000);
+    const int m = 1200;
+    std::string seg = with_mm(read, {40, 48, 72, 80});
+    seg[at] = 'A'; // the reference: A; the ALTs G and T (R's base)
+    c1.replace(m, 100, seg);
+    const KsCase k(c1, {{m + at, 'A', "G,T", 'T'}}, {read});
+    const std::string want = "0 c1:" + pos1(m) + " 100M MAPQ 25 X0 1 X1 0 XA";
+    check_against_oracle(k, true, {"-n", "4"}, {want});
+}
+
 TEST_SUITE_END();
