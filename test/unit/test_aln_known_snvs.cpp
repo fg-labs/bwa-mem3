@@ -1873,7 +1873,10 @@ TEST_CASE("aln_known_snvs: --meth mate rescue lists only its anchor contig's sit
     // A window from c1's tail into c2's head (a reverse anchor near c2's start): c1's sites would
     // fill the cap and c2's site, the only one rescue can use, would never be tried.
     std::vector<int64_t> keys;
-    bwa_aln::aln_meth_window_sites(ref, 550, (int)(c2 + 50 - 550), &keys);
+    {
+        bwa_tests::StderrCapture capture; // over the cap: the once-per-run warning
+        bwa_aln::aln_meth_window_sites(ref, 550, (int)(c2 + 50 - 550), &keys);
+    }
     CHECK(keys.size() == (size_t)KS_RESCUE_MAX_SITES);
     CHECK(std::find(keys.begin(), keys.end(), bwa_aln::aln_site_key(c2 + 10, 2)) == keys.end());
     bwa_aln::aln_meth_window_sites(ref, 550, (int)(c2 + 50 - 550), &keys, /*rid=*/1);
@@ -1884,6 +1887,39 @@ TEST_CASE("aln_known_snvs: --meth mate rescue lists only its anchor contig's sit
                                        bwa_aln::aln_site_key(598, 1), bwa_aln::aln_site_key(599, 1)});
     bwa_aln::aln_meth_window_sites(ref, c2 + 20, 30, &keys, /*rid=*/0); // wholly outside the contig
     CHECK(keys.empty());
+    bns_destroy(bns);
+}
+
+TEST_CASE("aln_known_snvs: a range over more site alleles than the cap lists the first ones and warns once"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    KsIndex &x = fixture();
+    bntseq_t *bns = bns_restore(x.prefix.c_str());
+    REQUIRE(bns != nullptr);
+    bwa_aln::ks_sites_t sites;
+    sites.by_contig.assign((size_t)bns->n_seqs, {});
+    for (int k = 0; k <= KS_RESCUE_MAX_SITES; ++k) sites.by_contig[0].push_back({100 + k, 0, 1});
+    sites.n_sites = KS_RESCUE_MAX_SITES + 1;
+    const bwa_aln::ks_rescue_ctx_t ctx = {&sites, bns};
+    bwa_aln::ks_site_cap_warned() = false;
+    const std::string warning = "more than " + std::to_string(KS_RESCUE_MAX_SITES) + " site alleles";
+    std::string err;
+    {
+        bwa_tests::StderrCapture capture;
+        std::vector<std::pair<int64_t, uint8_t>> got;
+        bwa_aln::ks_rescue_sites(&ctx, 100, 100 + KS_RESCUE_MAX_SITES, &got); // exactly the cap: no warning
+        CHECK(got.size() == (size_t)KS_RESCUE_MAX_SITES);
+        for (int pass = 0; pass < 2; ++pass) {
+            got.clear();
+            bwa_aln::ks_rescue_sites(&ctx, 100, 200, &got);
+            REQUIRE(got.size() == (size_t)KS_RESCUE_MAX_SITES);
+            CHECK(got.front().first == 100); CHECK(got.back().first == 100 + KS_RESCUE_MAX_SITES - 1);
+        }
+        err = capture.text();
+    }
+    CAPTURE(err);
+    const size_t at = err.find(warning);
+    CHECK(at != std::string::npos);
+    CHECK(err.find(warning, at + 1) == std::string::npos); // once
     bns_destroy(bns);
 }
 

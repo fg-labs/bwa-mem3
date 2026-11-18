@@ -277,7 +277,8 @@ How it works:
   below the merged best is searched again with no score cut, up to the read's `-n`.
 - Paired end: the insert size is estimated from stock placements first. Mate rescue also aligns
   the mate against its window with each site allele substituted alone, every other site at REF,
-  for at most the window's first 32 site alleles in position order (later ones stay at REF), so at
+  for at most the window's first 32 site alleles in position order (later ones stay at REF; the
+  first window holding more prints a warning, once per run), so at
   most 33 alignments per window. It keeps the best score. An alignment that `--short-insert` rules
   out of the fragment never replaces another, and equal best scores at loci that do not overlap
   leave the mate unrescued, whether they come from two alignments or from one window whose best is
