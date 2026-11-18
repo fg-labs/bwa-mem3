@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.19.0](https://github.com/fg-labs/bwa-mem3/compare/v0.18.0...v0.19.0) (2026-11-18)
+
+
+### Features
+
+* **meth:** add meth_opts_check, the --meth cross-option checks without exit ([#806](https://github.com/fg-labs/bwa-mem3/issues/806)) ([39d1c28](https://github.com/fg-labs/bwa-mem3/commit/39d1c28de37b8e96e0f7baa7e1756db4bbbc1a09)), closes [#805](https://github.com/fg-labs/bwa-mem3/issues/805)
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.18.0 ([#804](https://github.com/fg-labs/bwa-mem3/issues/804)) ([6a68ee1](https://github.com/fg-labs/bwa-mem3/commit/6a68ee16da2b26be6ab3b7ce8d507baa62784e68))
+
 ## [0.18.0](https://github.com/fg-labs/bwa-mem3/compare/v0.17.0...v0.18.0) (2026-11-16)
 
 
