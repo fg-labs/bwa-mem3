@@ -56,11 +56,32 @@
  * (~-0.8%), and Apple M3 Ultra (~-2.2%, still improving) and M2 Max (flat, no
  * regression). So 24 is a win or neutral everywhere and the portable default;
  * the prior compile-time 8 was under-tuned on every architecture. Hosts that
- * want more (SPR, M3 Ultra) are served by BWA3_BWTSEED_LOCKSTEP_N or a host-tuned
- * default (AMD Zen 5 gets 32; see "Host-tuned default widths" below). Byte-identical across widths (batching only; the bwtseed lockstep
- * parity harness pins the emission order). */
+ * want more (SPR) are served by BWA3_BWTSEED_LOCKSTEP_N or a host-tuned default
+ * (AMD Zen 5 gets 32 at run time; see "Host-tuned default widths" below), and
+ * Apple silicon builds (Arm macOS) default to 48 at compile time. Byte-identical
+ * across widths (batching only; the bwtseed lockstep parity harness pins the
+ * emission order).
+ *
+ * Apple silicon's 48 (NEON; hg38, 5M-read WGS slice of 150 bp reads, interleaved
+ * reps, user+sys vs 24, alignment records identical): M5 Ultra -t 16, 6 reps:
+ * single-end -0.29% (4/6 reps faster), paired-end -0.13% (5/6), wall -0.18% /
+ * -0.17%; M3 Ultra -t 14: single-end -0.21% (8/8), paired-end -0.29% (2/2); M2
+ * Max -t 6 (a busy laptop): single-end -0.63% (7/8), paired-end -0.05%, within
+ * its noise. An earlier, more contended M3 Ultra run had read paired-end +0.9%,
+ * which did not reproduce. Peak RSS was unchanged on these short-read workloads.
+ * The bwtSeed match buffer a worker keeps grows with width x the batch's longest
+ * read, so on long reads (tens of kb and up) 48 holds about twice the scratch of
+ * 24: pin BWA3_BWTSEED_LOCKSTEP_N lower there if memory is tight. Every other
+ * build keeps 24, and its preprocessed source is unchanged. */
 #ifndef BWTSEED_LOCKSTEP_N
+/* Set only when the build takes this default (no -DBWTSEED_LOCKSTEP_N), so a
+ * test can pin the shipped value without failing a valid -D override. */
+#define BWTSEED_LOCKSTEP_N_IS_BUILD_DEFAULT 1
+#if defined(__APPLE__) && defined(__aarch64__)
+#define BWTSEED_LOCKSTEP_N 48
+#else
 #define BWTSEED_LOCKSTEP_N 24
+#endif
 #endif
 /* Upper bound on the runtime width; sizes the driver's on-stack
  * BwtSeedSlot slots[BWTSEED_LOCKSTEP_N_MAX] array and caps any pin/calibration. */
@@ -134,7 +155,8 @@ int32_t bwa3_measure_mlp(const void *base, int64_t n_blocks,
  *
  * With no env pin and no opt-in probe, both lockstep widths fall back to a
  * per-host default. Every host gets the compile-time SMEM_LOCKSTEP_N /
- * BWTSEED_LOCKSTEP_N except AMD Zen 5, which gets 32 / 32. Zen 5 is matched by
+ * BWTSEED_LOCKSTEP_N (the latter is 48 on Apple silicon builds, 24 elsewhere)
+ * except AMD Zen 5, which gets 32 / 32. Zen 5 is matched by
  * vendor, family AND model: AMD family 1Ah also holds Zen 6, so the family alone
  * is not enough. The model ranges follow the Linux kernel's Zen generation table
  * (bsp_init_amd, arch/x86/kernel/cpu/amd.c): family 1Ah models 00h-2Fh, 40h-4Fh,
@@ -278,9 +300,9 @@ int32_t bwa3_bwtseed_width_parse_env(const char *env);
 
 /* Resolve and install g_bwtseed_lockstep_n once (idempotent). Resolution order:
  * BWA3_BWTSEED_LOCKSTEP_N pin -> host default (bwa3_bwtseed_host_default_width:
- * 32 on AMD Zen 5, else the compile-time BWTSEED_LOCKSTEP_N, 24). Call
- * before the seeding workers spawn; an invalid env value is reported to stderr and
- * resolved as if unset. */
+ * 32 on AMD Zen 5, else the compile-time BWTSEED_LOCKSTEP_N: 48 on Apple silicon,
+ * 24 elsewhere). Call before the seeding workers spawn; an invalid env value is
+ * reported to stderr and resolved as if unset. */
 void bwa3_init_bwtseed_lockstep_width(void);
 
 /* Classify a BWA3_BWTSEED_LOCKSTEP override (env may be NULL/empty) without

@@ -3740,11 +3740,11 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep_t(uint8_t *enc_qdb,
     if (numReads <= 0) return 0;
     if (bsd_hint != nullptr && bsd_hint->min_len != minSeedLen) bsd_hint = nullptr;
 
-    // Runtime lockstep width (g_bwtseed_lockstep_n, resolved once at startup from
-    // a BWA3_BWTSEED_LOCKSTEP_N pin, else the host default: 32 on AMD Zen 5
-    // (bwa3_bwtseed_host_default_width), the compile-time default elsewhere). Byte-identical
-    // across widths -- batching only. The on-stack slot array is sized to the
-    // compile-time BWTSEED_LOCKSTEP_N_MAX so the runtime width can exceed the default.
+    // Runtime lockstep width (g_bwtseed_lockstep_n, resolved once at startup from a
+    // BWA3_BWTSEED_LOCKSTEP_N pin, else the host default: 32 on AMD Zen 5
+    // (bwa3_bwtseed_host_default_width), else the compile-time BWTSEED_LOCKSTEP_N (48 on
+    // Apple silicon, 24 elsewhere). Byte-identical across widths -- batching only. The on-stack
+    // slot array is sized to BWTSEED_LOCKSTEP_N_MAX so the runtime width can exceed the default.
     const int32_t N = g_bwtseed_lockstep_n;
     // slots[] is a fixed BWTSEED_LOCKSTEP_N_MAX stack array indexed in [0, N);
     // the env parser and the host default clamp to that range, but a direct
