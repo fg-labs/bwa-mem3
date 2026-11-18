@@ -18,6 +18,7 @@
 #include "../libsais_build.h"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cstdlib>
 #include <cerrno>
@@ -1181,6 +1182,12 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 	}
 }
 
+std::atomic<bool> &ks_site_cap_warned()
+{
+	static std::atomic<bool> warned{false};
+	return warned;
+}
+
 void ks_rescue_sites(const void *ctx, int64_t beg, int64_t end, std::vector<std::pair<int64_t, uint8_t>> *out)
 {
 	const ks_rescue_ctx_t *c = (const ks_rescue_ctx_t*)ctx;
@@ -1194,7 +1201,13 @@ void ks_rescue_sites(const void *ctx, int64_t beg, int64_t end, std::vector<std:
 		const std::vector<ks_site_t> &lst = c->sites->by_contig[rid];
 		auto it = std::lower_bound(lst.begin(), lst.end(), beg - off, [](const ks_site_t &x, int64_t p) { return x.pos < p; });
 		for (; it != lst.end() && off + it->pos < end; ++it) {
-			if ((int)out->size() == KS_RESCUE_MAX_SITES) return;
+			if ((int)out->size() == KS_RESCUE_MAX_SITES) {
+				// The later sites stay at REF in this window: say so once per run.
+				if (!ks_site_cap_warned().exchange(true))
+					fprintf(stderr, "[W::aln] --known-snvs: a window holds more than %d site alleles; the later "
+							"ones are scored as the reference there (warned once)\n", KS_RESCUE_MAX_SITES);
+				return;
+			}
 			out->push_back({off + it->pos, it->alt});
 		}
 	}

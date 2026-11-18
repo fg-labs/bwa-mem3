@@ -3,6 +3,7 @@
 #ifndef BWA_MEM3_ALN_KNOWN_SNVS_H
 #define BWA_MEM3_ALN_KNOWN_SNVS_H
 
+#include <atomic>
 #include "../bntseq.h"
 #include "bwtaln.h"
 #include "bwape.h"
@@ -162,8 +163,10 @@ ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t
 						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site,
 						 std::vector<pe_hit_t> *hits = nullptr, bool stopped = false);
 /* Mate rescue's site lister (pe_alt_sites_t::list) over a ks_rescue_ctx_t: the site alleles in the
- * packed range [beg, end), on every contig it reaches, at most KS_RESCUE_MAX_SITES. */
+ * packed range [beg, end), on every contig it reaches, at most KS_RESCUE_MAX_SITES. The first range
+ * holding more prints a warning (once per run; ks_site_cap_warned, which tests reset). */
 #define KS_RESCUE_MAX_SITES 32
+std::atomic<bool> &ks_site_cap_warned();
 struct ks_rescue_ctx_t {
 	const ks_sites_t *sites;
 	const bntseq_t *bns;
