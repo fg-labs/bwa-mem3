@@ -40,10 +40,33 @@ struct meth_cli_t {
  * return 1; return 0 if it does not. A bad value prints its error and exits 1. */
 int meth_opts_parse(int opt_id, const char *optarg, mem_opt_t *opt, meth_cli_t *cli);
 
-/* Cross-option checks (exit 1 with the error on a bad combination) and the
- * chemistry defaults (TAPS scores NEUTRAL, --meth-seed-prune defaults to
- * spec30). Call once, after every option is parsed and before
- * mem_opt_apply_meth_defaults. */
+/* The family's cross-option checks, judged as meth_opts_finalize judges them:
+ * the first error's message, without an "ERROR: " prefix, or NULL when the
+ * options are consistent. It does not print, exit or change *opt, so a program
+ * embedding bwa-mem3 can report the error itself and call meth_opts_finalize
+ * only on NULL. The returned string is static.
+ *
+ * Call it BEFORE meth_opts_finalize: it judges the scoring mode finalize would
+ * resolve (TAPS without cli->set_scoring counts as NEUTRAL, whatever
+ * opt->meth_scoring holds), so after finalize it is accurate only if cli still
+ * records every scoring change made since. With meth_mode set, it also rejects
+ * a meth_context, meth_chem or meth_scoring value outside its enum (the parser
+ * never produces one). That range check reads the stored values, before the
+ * scoring is resolved, so an out-of-range meth_scoring is rejected even under
+ * TAPS without cli->set_scoring, whose resolved scoring would be NEUTRAL. With
+ * meth_mode unset, it checks only "--meth-context requires --meth" (a
+ * meth_context other than METH_CTX_ALL, or cli->set_context) and does not judge
+ * the stored meth_chem or meth_scoring. The other family fields (seed prune,
+ * tags, --set-as-failed) are validated only by meth_opts_parse. Not an error,
+ * so not reported here: the em-seq + neutral scoring warning finalize prints
+ * (meth_opts_emseq_neutral tests for it). */
+const char *meth_opts_check(const mem_opt_t *opt, const meth_cli_t *cli);
+
+/* Cross-option checks (meth_opts_check; exit 1 with its error on a bad
+ * combination) and the chemistry defaults (TAPS scores NEUTRAL,
+ * --meth-seed-prune defaults to spec30). Prints a warning to stderr, and
+ * continues, when meth_opts_emseq_neutral holds. Call once, after every option
+ * is parsed and before mem_opt_apply_meth_defaults. */
 void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli);
 
 /* 1 when the options score em-seq's dense conversions as 0 (--meth=emseq with
