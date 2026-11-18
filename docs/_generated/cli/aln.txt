@@ -4,7 +4,8 @@ Usage:   bwa-mem3 aln [options] <prefix> <in.fq> [<in2.fq>]
 Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one
 step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe
 (two files), with no .sai files. On the tested inputs its records match bwa 0.7.19's
-(@PG differs), except that `-n 1e-2` is a probability here and the integer 1 in stock.
+(@PG differs) unless --meth or --short-insert is given; `-n 1e-2` is a probability
+here and the integer 1 in stock.
 <prefix> is an index made by `bwa-mem3 index` (also one made with --meth, or one staged
 by `bwa-mem3 shm`).
 Each option shows its default and the stock command it comes from.
@@ -42,6 +43,9 @@ Paired-end options (two input files; from bwa sampe):
   -c FLOAT  prior of chimeric rate (lower bound) [1.0e-05]
   -s        disable Smith-Waterman for the unmapped mate
   -A        disable insert size estimate (force -s)
+  --short-insert   estimate short inserts without a batch-wide read-length floor, pair mates
+                   that start at the same base, and let mate rescue overlap the anchor [off]
+                   paired only, including --meth; -A overrides
   -P        accepted and ignored (sampe -P loads the index into memory; always so here)
 
 Methylation (shared with bwa-mem3 mem):

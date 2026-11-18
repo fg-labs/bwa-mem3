@@ -11,6 +11,7 @@
 #include "scoped_env.h"
 #include "stderr_capture.h"
 #include "../../src/FMI_search.h"
+#include "../framework/stderr_capture.h"
 #include "../../src/aln/aln_main.h"
 #include "../../src/aln/aln_meth.h"
 #include "../../src/compat_target.h"
@@ -99,6 +100,62 @@ TEST_CASE("aln_cli: synthetic index basename is unique to its temporary director
     CliIndex x;
     const std::string leaf = x.dir.substr(x.dir.rfind('/') + 1);
     CHECK(x.prefix == x.dir + "/" + leaf + ".fa");
+}
+
+TEST_CASE("aln_cli: repeated parsing resets state when option storage is reused"
+          * doctest::test_suite("unit/aln_cli")) {
+    char name[] = "aln", prefix[] = "unused-prefix", option[16] = "-s";
+    char *first[] = {name, prefix, option, nullptr};
+    {
+        bwa_tests::StderrCapture capture;
+        CHECK(main_aln(3, first) == 1);
+        CHECK(capture.text().find("Usage:   bwa-mem3 aln") != std::string::npos);
+    }
+
+    // glibc permutes the positional argument past -s and retains a pointer at option + 2.
+    // Reuse that storage so an incomplete reset would parse --meth as the short option -m eth.
+    std::strcpy(option, "--meth");
+    char *second[] = {name, option, nullptr};
+    bwa_tests::StderrCapture capture;
+    CHECK(main_aln(2, second) == 1);
+    const std::string error = capture.text();
+    CHECK(error.find("Usage:   bwa-mem3 aln") != std::string::npos);
+    CHECK(error.find("-m wants") == std::string::npos);
+}
+
+TEST_CASE("aln_cli: short-insert is documented and refused before single-end I/O"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    for (bool meth : {false, true}) {
+        bwa_tests::StderrCapture capture;
+        const std::string out = x.dir + "/short-single.sam";
+        const int status = meth
+            ? run({"--meth", "--short-insert", "-f", out, "/missing-index", "/missing-reads"})
+            : run({"--short-insert", "-f", out, "/missing-index", "/missing-reads"});
+        const std::string error = capture.text();
+        CHECK(status == 1);
+        CHECK(error.find("--short-insert requires paired-end input") != std::string::npos);
+        CHECK(error.find("index") == std::string::npos);
+        CHECK(access(out.c_str(), F_OK) != 0);
+    }
+    FILE *capture = tmpfile();
+    REQUIRE(capture != nullptr);
+    fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    REQUIRE(saved >= 0);
+    REQUIRE(dup2(fileno(capture), fileno(stdout)) >= 0);
+    const int status = run({"--help"});
+    fflush(stdout);
+    REQUIRE(dup2(saved, fileno(stdout)) >= 0);
+    close(saved);
+    rewind(capture);
+    std::string help;
+    char buf[1024];
+    while (fgets(buf, sizeof buf, capture)) help += buf;
+    fclose(capture);
+    CHECK(status == 0);
+    CHECK(help.find("--short-insert") != std::string::npos);
+    CHECK(help.find("unless --meth or --short-insert is given") != std::string::npos);
 }
 
 TEST_CASE("aln_cli: meaningless negative values and malformed numbers are refused"
