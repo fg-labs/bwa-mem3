@@ -1352,3 +1352,278 @@ TEST_CASE("aln_pe: short-insert rescue windows may cover the anchor and keep the
     CHECK_FALSE(ba::aln_rescue_within_fragment(&anchor, 995, m40.data(), (int)m40.size()));  // ends after
     free(pe);
 }
+
+TEST_CASE("aln_pe: ref-span-insert is an appended option that defaults off"
+          * doctest::test_suite("unit/aln_pe")) {
+    CHECK(offsetof(ba::pe_opt_t, ref_span_insert) >= offsetof(ba::pe_opt_t, short_insert) + sizeof(int));
+    auto *opt = ba::bwa_init_pe_opt();
+    REQUIRE(opt != nullptr);
+    CHECK(opt->ref_span_insert == 0);
+    free(opt);
+}
+
+TEST_CASE("aln_pe: ref-span-insert measures each insert-size observation from the alignments' reference spans"
+          * doctest::test_suite("unit/aln_pe")) {
+    // 30 planted pairs: read 1 forward, 50 bp, ungapped; read 2 reverse, 50 bp, with a 4-base
+    // deletion (spans 54 reference bases) or, every third pair, a 3-base insertion (spans 47).
+    // The fragment, from read 1's start to read 2's reference end, is frag_i bases. Read-length
+    // measurement sees frag_i - ref_shift_i instead.
+    ba::bwa_seq_t ends[2][30] = {};
+    double sum_span = 0, sum_len = 0;
+    for (int i = 0; i < 30; ++i) {
+        const int frag = 180 + i % 21, shift = i % 3 == 0 ? -3 : 4;
+        auto &a = ends[0][i], &b = ends[1][i];
+        a.mapQ = b.mapQ = 37;
+        a.len = a.full_len = b.len = b.full_len = 50;
+        a.pos = 100 + 300 * i;
+        b.ref_shift = shift; b.strand = 1;
+        b.pos = a.pos + frag - (50 + shift);
+        sum_span += frag; sum_len += frag - shift;
+    }
+    ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+    ba::isize_info_t stock = {}, span = {};
+    REQUIRE(ba::infer_isize(30, seqs, &stock, 1e-5, 100000) == 0);
+    REQUIRE(ba::infer_isize(30, seqs, &span, 1e-5, 100000, nullptr, 0, false, true) == 0);
+    CHECK(stock.avg == doctest::Approx(sum_len / 30));
+    CHECK(span.avg == doctest::Approx(sum_span / 30));
+    // The option flag on pe_opt_t reaches infer_isize through the shared driver.
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::isize_info_t none = {}, ii = {};
+    none.avg = -1;
+    ba::bwa_pe_isize_ref(100000, 30, seqs, &ii, pe, &none, nullptr, 0);
+    check_same_ii(ii, stock);
+    pe->ref_span_insert = 1;
+    ba::bwa_pe_isize_ref(100000, 30, seqs, &ii, pe, &none, nullptr, 0);
+    check_same_ii(ii, span);
+    free(pe);
+}
+
+TEST_CASE("aln_pe: ref-span-insert pairs on the reverse hit's reference span against -a"
+          * doctest::test_suite("unit/aln_pe")) {
+    // No estimate (as with -A): a pair is proper when its insert is at most -a 200. Read 1 is
+    // forward at 1000, 50 bp. Read 2 is reverse, 50 bp, and its hit has a 20-base deletion (70
+    // reference bases) or a 20-base insertion (30 reference bases).
+    auto *pe = ba::bwa_init_pe_opt();
+    pe->max_isize = 200;
+    ba::bwase_initialize();
+    struct Planted { int n_del, n_ins, pos; bool stock_proper, span_proper; };
+    const Planted cases[] = {
+        {20, 0, 1150, true, false}, // read length: 1150 + 50 - 1000 = 200; span: 220
+        {0, 20, 1165, false, true}, // read length: 215; span: 1165 + 30 - 1000 = 195
+        {0, 0, 1150, true, true},   // ungapped: both 200
+        {0, 0, 1151, false, false}, // ungapped: both 201
+    };
+    for (int option : {0, 1}) for (const auto &c : cases) {
+        CAPTURE(option); CAPTURE(c.n_del); CAPTURE(c.n_ins); CAPTURE(c.pos);
+        pe->ref_span_insert = option;
+        ba::isize_info_t ii = {}; ii.avg = ii.std = -1;
+        ba::bwa_seq_t ends[2] = {};
+        ba::bwt_aln1_t hits[2] = {};
+        hits[1].n_del = c.n_del; hits[1].n_ins = c.n_ins; hits[1].n_gapo = c.n_del || c.n_ins;
+        for (int j = 0; j < 2; ++j) {
+            ends[j].aln = hits + j; ends[j].type = BWA_TYPE_UNIQUE; ends[j].strand = j;
+            ends[j].len = ends[j].full_len = 50; ends[j].mapQ = ends[j].seQ = 25;
+        }
+        ends[0].pos = 1000; ends[1].pos = c.pos; ends[1].ref_shift = c.n_del - c.n_ins;
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[2] = {{1000, 0}, {(uint64_t)c.pos, 3}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 2;
+        ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        const bool want = option ? c.span_proper : c.stock_proper;
+        for (const auto &p : ends) CHECK(((p.extra_flag & SAM_FPP) != 0) == want);
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: ref-span-insert gives a read that pairing moves its new hit's reference span"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Read 2's best hit is ungapped and far away; its other hit (index 1) has a 4-base deletion
+    // and pairs with read 1. Stock moves the read but keeps the first hit's ref_shift (0); with
+    // the option the moved read takes its new hit's span, which refinement and output then use.
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwase_initialize();
+    for (int option : {0, 1}) {
+        CAPTURE(option);
+        pe->ref_span_insert = option;
+        ba::isize_info_t ii = {}; ii.avg = ii.std = -1;
+        ba::bwa_seq_t ends[2] = {};
+        ba::bwt_aln1_t hits0[1] = {}, hits1[2] = {};
+        hits1[1].n_del = 4; hits1[1].n_gapo = 1; hits1[1].n_gape = 3;
+        ends[0].aln = hits0; ends[1].aln = hits1;
+        for (int j = 0; j < 2; ++j) {
+            ends[j].type = BWA_TYPE_REPEAT; ends[j].strand = j;
+            ends[j].len = ends[j].full_len = 50; ends[j].mapQ = ends[j].seQ = 25;
+        }
+        ends[0].pos = 1000; ends[1].pos = 5000;
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[3] = {{1000, 0u << 2 | 0 << 1 | 0}, {5000, 0u << 2 | 1 << 1 | 1}, {1150, 1u << 2 | 1 << 1 | 1}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 3;
+        ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        CHECK(ends[1].pos == 1150);
+        CHECK((ends[1].extra_flag & SAM_FPP) != 0);
+        CHECK((int)ends[1].n_gapo == 1);
+        CHECK(ends[1].ref_shift == (option ? 4 : 0));
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: ref-span-insert installs the paired hit's span when the read keeps its start and strand"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Read 2's own hit (index 0) at 1150, reverse, has a 4-base deletion (54 reference bases);
+    // its other hit (index 1) at the same start and strand has a 4-base insertion (46) and the
+    // better score, so pairing selects it. Stock keeps the read's own hit; the option installs
+    // the selected one, so refinement uses the 46-base span the pair was measured with.
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwase_initialize();
+    for (int option : {0, 1}) {
+        CAPTURE(option);
+        pe->ref_span_insert = option;
+        ba::isize_info_t ii = {}; ii.avg = ii.std = -1;
+        ba::bwa_seq_t ends[2] = {};
+        ba::bwt_aln1_t hits0[1] = {}, hits1[2] = {};
+        hits1[0].n_del = 4; hits1[0].n_gapo = 1; hits1[0].n_gape = 3; hits1[0].n_mm = 0; hits1[0].score = 20;
+        hits1[1].n_ins = 4; hits1[1].n_gapo = 1; hits1[1].n_gape = 3; hits1[1].n_mm = 2; hits1[1].score = 10;
+        ends[0].aln = hits0; ends[1].aln = hits1;
+        for (int j = 0; j < 2; ++j) {
+            ends[j].type = BWA_TYPE_REPEAT; ends[j].strand = j;
+            ends[j].len = ends[j].full_len = 50; ends[j].mapQ = ends[j].seQ = 25;
+        }
+        ends[0].pos = 1000; ends[1].pos = 1150;
+        ends[1].n_gapo = 1; ends[1].n_gape = 3; ends[1].score = 20; ends[1].ref_shift = 4; // its own hit
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[3] = {{1000, 0u << 2 | 0 << 1 | 0}, {1150, 0u << 2 | 1 << 1 | 1}, {1150, 1u << 2 | 1 << 1 | 1}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 3;
+        const int changed = ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        CHECK(changed == 0); // the read did not move
+        CHECK(ends[1].pos == 1150); CHECK((int)ends[1].strand == 1);
+        CHECK((ends[1].extra_flag & SAM_FPP) != 0);
+        CHECK(ends[1].ref_shift == (option ? -4 : 4));
+        CHECK((int)ends[1].n_mm == (option ? 2 : 0));
+        CHECK(ends[1].score == (option ? 10 : 20));
+        CHECK((int)ends[1].n_gapo == 1); CHECK((int)ends[1].n_gape == 3);
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: ref-span-insert ends a coincident-start observation at the reverse read's span"
+          * doctest::test_suite("unit/aln_pe")) {
+    // 30 pairs whose reads start at the same base: read 1 forward with a 4-base deletion (54
+    // reference bases), read 2 reverse with a 3- or 4-base insertion (47 or 46). Pairing measures
+    // such a pair from the reverse read's end; so does estimation, whichever read is read 1.
+    for (bool swap : {false, true}) {
+        CAPTURE(swap);
+        ba::bwa_seq_t ends[2][30] = {};
+        for (int i = 0; i < 30; ++i) {
+            auto &fwd = ends[swap ? 1 : 0][i], &rev = ends[swap ? 0 : 1][i];
+            fwd.mapQ = rev.mapQ = 37;
+            fwd.len = fwd.full_len = rev.len = rev.full_len = 50;
+            fwd.pos = rev.pos = 100 + 300 * i;
+            fwd.ref_shift = 4; rev.strand = 1;
+        }
+        // The reverse read's indel varies (46 or 47 reference bases) so the estimate is defined.
+        for (int i = 0; i < 30; ++i) ends[swap ? 0 : 1][i].ref_shift = i % 2 ? -3 : -4;
+        ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+        ba::isize_info_t ii = {};
+        REQUIRE(ba::infer_isize(30, seqs, &ii, 1e-5, 100000, nullptr, 0, true, true) == 0);
+        CHECK(ii.avg == doctest::Approx(46.5));
+        // Pairing on that estimate: a coincident-start pair whose forward hit spans 46 bases is
+        // proper (its outer span, the reverse read's 46, covers both hits); one whose forward hit
+        // spans 54 bases is not, as no 46- or 47-base insert covers it.
+        auto *pe = ba::bwa_init_pe_opt();
+        pe->short_insert = 1; pe->ref_span_insert = 1;
+        ba::bwase_initialize();
+        for (int fwd_span : {46, 54}) {
+            CAPTURE(fwd_span);
+            ba::bwa_seq_t pend[2] = {};
+            ba::bwt_aln1_t hits[2][1] = {};
+            const int f = swap ? 1 : 0, r = 1 - f;
+            if (fwd_span < 50) hits[f][0].n_ins = 50 - fwd_span; else hits[f][0].n_del = fwd_span - 50;
+            hits[f][0].n_gapo = 1; hits[f][0].n_gape = 3;
+            hits[r][0].n_ins = 4; hits[r][0].n_gapo = 1; hits[r][0].n_gape = 3;
+            for (int j = 0; j < 2; ++j) {
+                pend[j].aln = hits[j]; pend[j].type = BWA_TYPE_REPEAT;
+                pend[j].len = pend[j].full_len = 50; pend[j].mapQ = pend[j].seQ = 25; pend[j].pos = 1000;
+            }
+            pend[f].strand = 0; pend[r].strand = 1;
+            ba::bwa_seq_t *pair[2] = {pend, pend + 1};
+            pair64_t rows[2] = {{1000, 0u << 2 | 0 << 1 | (uint64_t)f}, {1000, 0u << 2 | 1 << 1 | (uint64_t)r}};
+            pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 2;
+            ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+            const bool proper = (pend[0].extra_flag & SAM_FPP) && (pend[1].extra_flag & SAM_FPP);
+            CHECK(proper == (fwd_span == 46));
+            CHECK(pend[f].pos == 1000); CHECK((int)pend[f].strand == 0);
+            CHECK(pend[r].pos == 1000); CHECK((int)pend[r].strand == 1);
+        }
+        free(pe);
+    }
+}
+
+TEST_CASE("aln_pe: ref-span-insert under --short-insert floors a pair's outer span at its hits' spans"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Two 50-base reads trimmed to 40 (-q), each aligned ungapped over 40 bases: read 1 forward at
+    // 1000, read 2 reverse at 1001, an outer span of 41. Under --short-insert the fragment may be
+    // shorter than the reads, so the pair is proper; without it, or with -A (which overrides it),
+    // the minimum is stock's, the whole read (its trimmed bases included, 50), and the pair is not.
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwase_initialize();
+    for (int short_insert : {0, 1}) for (int force_isize : {0, 1}) {
+        CAPTURE(short_insert); CAPTURE(force_isize);
+        pe->short_insert = short_insert; pe->force_isize = force_isize; pe->ref_span_insert = 1;
+        ba::isize_info_t ii = {}; ii.avg = ii.std = -1;
+        ba::bwa_seq_t ends[2] = {};
+        ba::bwt_aln1_t hits[2][1] = {};
+        for (int j = 0; j < 2; ++j) {
+            ends[j].aln = hits[j]; ends[j].type = BWA_TYPE_REPEAT; ends[j].strand = j;
+            ends[j].len = 40; ends[j].full_len = 50; ends[j].mapQ = ends[j].seQ = 25;
+        }
+        ends[0].pos = 1000; ends[1].pos = 1001;
+        ba::bwa_seq_t *pair[2] = {ends, ends + 1};
+        pair64_t rows[2] = {{1000, 0u << 2 | 0 << 1 | 0}, {1001, 0u << 2 | 1 << 1 | 1}};
+        pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 2;
+        ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
+        const bool want = short_insert && !force_isize;
+        CHECK(((ends[0].extra_flag & SAM_FPP) != 0) == want);
+        CHECK(((ends[1].extra_flag & SAM_FPP) != 0) == want);
+        CHECK(ends[0].pos == 1000); CHECK((int)ends[0].strand == 0);
+        CHECK(ends[1].pos == 1001); CHECK((int)ends[1].strand == 1);
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: ref-span-insert floors the estimate's lower fence at the longest reference span"
+          * doctest::test_suite("unit/aln_pe")) {
+    // 30 pairs of 50-base reads whose alignments each carry a 4-base insertion (46 reference
+    // bases), with reference inserts of 48 or 49. Read-length units floor the fence at 50 and
+    // exclude every observation; reference units floor it at 46 and estimate 48.5.
+    ba::bwa_seq_t ends[2][30] = {};
+    for (int i = 0; i < 30; ++i) {
+        auto &a = ends[0][i], &b = ends[1][i];
+        a.mapQ = b.mapQ = 37;
+        a.len = a.full_len = b.len = b.full_len = 50;
+        a.ref_shift = b.ref_shift = -4; b.strand = 1;
+        a.pos = 100 + 300 * i;
+        b.pos = a.pos + (i % 2 ? 49 : 48) - 46;
+    }
+    ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+    ba::isize_info_t ii = {};
+    REQUIRE(ba::infer_isize(30, seqs, &ii, 1e-5, 100000, nullptr, 0, false, true) == 0);
+    CHECK(ii.low == 46);
+    CHECK(ii.avg == doctest::Approx(48.5));
+}
+
+TEST_CASE("aln_pe: ref-span-insert places the rescue window from the anchor's reference end"
+          * doctest::test_suite("unit/aln_pe")) {
+    auto *pe = ba::bwa_init_pe_opt();
+    ba::bwa_seq_t anchor = {};
+    anchor.pos = 1000; anchor.len = 30; anchor.ref_shift = 2; // 32 reference bases (a deletion)
+    for (int short_insert : {0, 1}) for (int option : {0, 1}) {
+        CAPTURE(short_insert); CAPTURE(option);
+        pe->short_insert = short_insert; pe->ref_span_insert = option;
+        CHECK(ba::aln_rescue_anchor_end(&anchor, pe) == (option ? 1032 : 1030));
+        // A forward anchor's mate starts after its end (stock) or at its start (--short-insert).
+        CHECK(ba::aln_rescue_window_floor(&anchor, pe) == (short_insert ? 1000 : option ? 1032 : 1030));
+        // --short-insert already ends a reverse anchor's window at its reference end.
+        CHECK(ba::aln_rescue_window_ceiling(&anchor, pe) == (short_insert ? 1032 : 1000));
+    }
+    free(pe);
+}

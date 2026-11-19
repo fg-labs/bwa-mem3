@@ -31,7 +31,7 @@ bwa-mem3 aln ref.fa r.fq > out.sam            # bwa aln + samse
 bwa-mem3 aln ref.fa r1.fq r2.fq > out.sam     # bwa aln (twice) + sampe
 ```
 
-**Byte-identity without `--meth` or `--short-insert`.** The tested SAM records and headers matched the output of stock
+**Byte-identity without `--meth`, `--short-insert` or `--ref-span-insert`.** The tested SAM records and headers matched the output of stock
 bwa 0.7.19 `aln` + `samse`/`sampe`, except for the `@PG` line, which names the
 program that ran, and an `-r` text that carries an `@HD` line (see **Header without `--meth`**
 under [Notes](#notes)). The comparison uses generated single-end and paired-end reads
@@ -101,6 +101,7 @@ and the name it has there when it differs.
 | `-c FLOAT` | sampe | 1e-5 | Prior of the chimeric rate (lower bound) |
 | `-s`, `-A` | sampe | off | Skip Smith-Waterman for an unmapped mate; skip the insert size estimate (which also skips that Smith-Waterman, as in stock) |
 | `--short-insert` | new | off | Estimate short inserts without a batch-wide minimum set by the longest read; paired input required |
+| `--ref-span-insert` | new | off | Measure inserts from the alignments' reference spans, not read lengths, so indels count; paired input required |
 | `-P` | sampe | off | Accepted and ignored: the index is always in memory |
 | `-v INT` | new | 3 | 0-2 suppress progress, 3 reports progress, 4 adds lookup/window/incomplete diagnostics; some errors and warnings still print at 0 |
 | `--bam` | new | off | Write BAM instead of SAM |
@@ -112,8 +113,8 @@ limits must be below 2,147,483,647 (`INT_MAX`) to leave room for the extra candi
 used internally.
 
 The stock paired-end options are ignored, with a warning, when only one input file is
-given. `--short-insert` instead requires two input files and rejects single-end use before
-loading the index or creating output.
+given. `--short-insert` and `--ref-span-insert` instead require two input files and reject
+single-end use before loading the index or creating output.
 
 ### Short, overlapping fragments
 
@@ -154,6 +155,47 @@ starts and the wider rescue windows can change pair selection, proper-pair flags
 mates and their CIGARs. This option does not make every short pair proper. Under this option, pairing and methylation cap rescue
 reject candidates when the insert-likelihood calculation underflows or its penalty
 cannot be represented as an integer. Existing defaults are unchanged.
+
+### Inserts measured from reference spans
+
+Stock `sampe` measures a pair's insert from the reverse read's start plus its *read length*,
+because it pairs reads before their gapped alignments are refined. Where that read's
+alignment has indels, the insert is off by their net length: with `-A -a 200`, a 50-base
+reverse read whose alignment spans 70 reference bases (a 20-base deletion) is marked proper
+at a true insert of 220, while one with a 20-base insertion is refused below 200. `--meth`
+pairing follows the same rule. `--ref-span-insert` measures every insert from the
+alignments' reference spans (read length plus deletions minus insertions) instead
+([#765](https://github.com/fg-labs/bwa-mem3/pull/765)):
+
+```bash
+bwa-mem3 aln --ref-span-insert ref.fa r1.fq r2.fq > out.sam
+```
+
+With the option:
+
+- insert-size estimation takes each observation to the later read's reference end (for mates
+  that start at the same base, the reverse read's, as pairing measures it) and floors its lower
+  fence at the longest reference span in the batch rather than the longest read;
+- pairing compares the insert to the estimate (or to `-a`) and scores it from the reverse
+  hit's reference end, requires the outer span to cover both hits' reference spans (without
+  `--short-insert`, or with `-A`, each also extended by its `-q`-trimmed bases, as stock counts
+  the whole read), places a
+  reverse hit from its own span rather than the read's best hit's, and gives a read the hit
+  pairing selects, with that hit's span, even when it starts at the same base on the same
+  strand (stock keeps the read's first hit, whose span the gapped refinement then uses);
+- mate rescue places its window from the anchor's reference end.
+
+The TLEN calculation is unchanged: TLEN is taken from each record's CIGAR with or without the
+option. Its value can still change, because pairing can select a different hit, with a
+different span, for a read. `--meth` cap rescue already measures inserts from spans;
+the option only makes its minimum outer span the two alignments' spans, as in pairing. With
+`--short-insert`, a coincident-start pair must cover both hits' spans, and rescue's ceiling for
+a reverse anchor is its reference end either way. `-A` does not turn the option off: pairing
+still measures the insert it compares to `-a` from the spans.
+
+This is an opt-in departure from stock output: it can change the inferred distribution, pair
+selection, proper-pair flags, MAPQ, rescue windows and, for reads pairing moves to a gapped
+hit, their position and CIGAR. Without the option the output is unchanged.
 
 **Option values.** Numbers must be well formed: where stock's `atoi` reads `abc` as 0 and
 `20x` as 20, `aln` stops with an error naming the option. Values that stock accepts but
