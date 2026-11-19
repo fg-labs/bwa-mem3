@@ -874,10 +874,10 @@ private:
             return backwardExt_konly_cp(cp_occ, count[a], smem, a);
         }
 
-        /* backwardExt_konly on a caller-held cp_occ pointer and count[a], so the
-         * general loops of ls_advance_backward_step keep both in registers across
-         * their prev[] stores. Same arithmetic and same contract: k is left stale
-         * on the s'->0 exit, so the caller must discard any s' < min_intv. */
+        /* backwardExt_konly on a caller-held cp_occ pointer and count[a]: the default
+         * layout's numPrev == 1 step (backwardExt_konly_file) and the parity tests;
+         * the general loops use the column form (backwardExt_konly_col). Same
+         * contract: k is left stale on s'->0, so callers discard any s' < min_intv. */
         __attribute__((always_inline)) static inline
         SMEM backwardExt_konly_cp(const CP_OCC *cpo, int64_t count_a, SMEM smem, uint8_t a)
         {
@@ -902,6 +902,60 @@ private:
                 occ_popcount64(&blk_sp.one_hot_bwt_str[a], &one_hot_mask_array[(sp & CP_MASK)]);
             const int64_t occ_e = blk_ep.cp_count[a] +
                 occ_popcount64(&blk_ep.one_hot_bwt_str[a], &one_hot_mask_array[(ep & CP_MASK)]);
+            smem.k = count_a + occ_s;
+            smem.s = occ_e - occ_s;
+            return smem;
+        }
+
+        /* Base a's column of the default layout: pa = (const char *)cpo + 8 * a,
+         * so a row's block has a's count at pa + blk and a's BWT word at
+         * pa + blk + 32, where blk = (row >> CP_SHIFT) * sizeof(CP_OCC). The
+         * general loops of ls_advance_backward_step hold this one pointer in
+         * place of cp_occ and a: on x86 clang ran out of registers in those
+         * loops and kept a and count[a] on the stack, reloading them for every
+         * candidate. */
+        static inline const char *cp_col(const CP_OCC *cpo, uint8_t a)
+        {
+            return (const char *)cpo + 8 * (size_t)a;
+        }
+        static inline const char *cp_col_blk(const char *pa, int64_t row)
+        {
+            return pa + (row >> CP_SHIFT) * (int64_t)sizeof(CP_OCC);
+        }
+
+        /* backwardExt_konly_cp on base a's column pointer pa (cp_col): the same
+         * two words of the same blocks are read and the arithmetic is the same,
+         * so the result is too. Same contract: k is left stale on the s'->0
+         * exit, so the caller must discard any s' < min_intv. */
+        __attribute__((always_inline)) static inline
+        SMEM backwardExt_konly_col(const char *pa, int64_t count_a, SMEM smem)
+        {
+            static_assert(sizeof(CP_OCC) == 64 && offsetof(CP_OCC, cp_count) == 0 &&
+                          offsetof(CP_OCC, one_hot_bwt_str) == 32 &&
+                          sizeof(((CP_OCC *)0)->cp_count[0]) == 8 &&
+                          sizeof(((CP_OCC *)0)->one_hot_bwt_str[0]) == 8,
+                          "backwardExt_konly_col assumes CP_OCC's 64-byte layout");
+            const int64_t sp = (int64_t)smem.k;
+            if (smem.s == 1) {
+                const char *blk = cp_col_blk(pa, sp);
+                const int pos = (int)(sp & CP_MASK);
+                const uint64_t *ohp = (const uint64_t *)(blk + 32);
+                if ((*ohp >> (CP_MASK - pos)) & 1ULL) {  /* BWT[sp] == a  => s' = 1 */
+                    smem.k = count_a + *(const int64_t *)blk +
+                             occ_popcount64(ohp, &one_hot_mask_array[pos]);
+                    smem.s = 1;
+                } else {                                 /* s' = 0; new k is dead */
+                    smem.s = 0;
+                }
+                return smem;
+            }
+            const int64_t ep = sp + (int64_t)smem.s;
+            const char *blk_sp = cp_col_blk(pa, sp);
+            const char *blk_ep = cp_col_blk(pa, ep);
+            const int64_t occ_s = *(const int64_t *)blk_sp +
+                occ_popcount64((const uint64_t *)(blk_sp + 32), &one_hot_mask_array[(sp & CP_MASK)]);
+            const int64_t occ_e = *(const int64_t *)blk_ep +
+                occ_popcount64((const uint64_t *)(blk_ep + 32), &one_hot_mask_array[(ep & CP_MASK)]);
             smem.k = count_a + occ_s;
             smem.s = occ_e - occ_s;
             return smem;

@@ -65,6 +65,11 @@ int main(int argc, char *argv[]) {
 
     int64_t checked = 0, s_mismatch = 0, k_mismatch = 0;
     int64_t s1_checked = 0;
+    /* The default layout's column form (backwardExt_konly_col, the SMEM backward
+     * step's general loops) must equal backwardExt_konly_cp field for field,
+     * the stale k of an s'->0 exit included: same words, same arithmetic. */
+    const bool col_on = !fmi->compact_occ();
+    int64_t col_checked = 0, col_mismatch = 0;
 
     for (size_t bi = 0; bi < sizeof(bases) / sizeof(bases[0]); bi++) {
         for (int32_t off = 0; off <= (int32_t)CP_MASK; off++) {
@@ -88,6 +93,22 @@ int main(int argc, char *argv[]) {
 
                     checked++;
                     if (s == 1) s1_checked++;
+
+                    if (col_on) {
+                        const SMEM ref = FMI_search::backwardExt_konly_cp(fmi->cp_occ, fmi->count[a], smem, a);
+                        const SMEM col = FMI_search::backwardExt_konly_col(FMI_search::cp_col(fmi->cp_occ, a),
+                                                                           fmi->count[a], smem);
+                        col_checked++;
+                        if (col.k != ref.k || col.s != ref.s || col.l != ref.l || col.m != ref.m ||
+                            col.n != ref.n || col.rid != ref.rid) {
+                            if (col_mismatch < 10)
+                                fprintf(stderr, "[FAIL] column form mismatch: sp=%lld s=%d a=%d "
+                                        "cp k=%lld s=%lld col k=%lld s=%lld\n",
+                                        (long long)sp, s, a, (long long)ref.k, (long long)ref.s,
+                                        (long long)col.k, (long long)col.s);
+                            col_mismatch++;
+                        }
+                    }
 
                     if (konly.s != full.s) {
                         if (s_mismatch < 10)
@@ -115,6 +136,8 @@ int main(int argc, char *argv[]) {
     fprintf(stderr, "checked=%lld (s==1 fast-path checks=%lld)  s_mismatch=%lld  k_mismatch=%lld\n",
             (long long)checked, (long long)s1_checked,
             (long long)s_mismatch, (long long)k_mismatch);
+    fprintf(stderr, "column form: checked=%lld mismatch=%lld%s\n", (long long)col_checked,
+            (long long)col_mismatch, col_on ? "" : " (compact layout: not run)");
 
     delete fmi;
 
@@ -122,7 +145,11 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "[FAIL] no comparisons ran (reference too small?)\n");
         return 1;
     }
-    if (s_mismatch != 0 || k_mismatch != 0) {
+    if (col_on && col_checked == 0) {
+        fprintf(stderr, "[FAIL] no column-form comparisons ran\n");
+        return 1;
+    }
+    if (s_mismatch != 0 || k_mismatch != 0 || col_mismatch != 0) {
         fprintf(stderr, "backwardExt_konly PARITY FAILED\n");
         return 1;
     }

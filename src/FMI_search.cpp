@@ -2924,17 +2924,21 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
          * (the SMEM stores may alias them as far as it can tell), an extra L1
          * load ahead of each prev[p] load, compare and prefetch. prev[] and
          * match_buf[] are driver-owned buffers that overlap neither the slot nor
-         * the index, so this is byte-identical. */
+         * the index, so this is byte-identical. The index is held as base a's
+         * column (cp_col), one register for cp_occ and a: with both, x86 kept
+         * a and count[a] on the stack and reloaded them for every candidate.
+         * Each prefetch names a's count in the block, on the line the block
+         * starts (blocks are line-sized and line-aligned). */
         SMEM *const prev = s->prev;
         const int32_t numPrev = s->numPrev;
         const int32_t min_intv = s->min_intv;
         const int32_t j = s->j;
-        const CP_OCC *const cpo = cp_occ;
+        const char *const pa = cp_col(cp_occ, a);
         const int64_t count_a = count[a];
         int p;
         for (p = 0; p < numPrev; p++) {
             SMEM smem = prev[p];
-            SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
+            SMEM newSmem = backwardExt_konly_col(pa, count_a, smem);
             newSmem.m = j;
             if ((newSmem.s < min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
                 s->cur_j = j;
@@ -2945,8 +2949,8 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
                 curr_s = newSmem.s;
                 prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch(cp_col_blk(pa, newSmem.k), _MM_HINT_T0);
+                _mm_prefetch(cp_col_blk(pa, newSmem.k + newSmem.s), _MM_HINT_T0);
 #endif
                 break;
             }
@@ -2966,29 +2970,29 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
             SMEM *w = prev + 1;
             if (w == r) {
                 for (; r < end; r++) {
-                    const SMEM newSmem = backwardExt_konly_cp(cpo, count_a, *r, a);
+                    const SMEM newSmem = backwardExt_konly_col(pa, count_a, *r);
                     if (newSmem.s == curr_s) break;
                     curr_s = newSmem.s;
                     r->k = newSmem.k;
                     r->s = newSmem.s;
                     r->m = j;
 #ifdef ENABLE_PREFETCH
-                    _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch(cp_col_blk(pa, newSmem.k), _MM_HINT_T0);
+                    _mm_prefetch(cp_col_blk(pa, newSmem.k + newSmem.s), _MM_HINT_T0);
 #endif
                 }
                 w = r;               // the duplicate (dropped) or the end
                 r += (r < end);
             }
             for (; r < end; r++) {
-                SMEM newSmem = backwardExt_konly_cp(cpo, count_a, *r, a);
+                SMEM newSmem = backwardExt_konly_col(pa, count_a, *r);
                 if (newSmem.s != curr_s) {
                     curr_s = newSmem.s;
                     newSmem.m = j;
                     *w++ = newSmem;
 #ifdef ENABLE_PREFETCH
-                    _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch(cp_col_blk(pa, newSmem.k), _MM_HINT_T0);
+                    _mm_prefetch(cp_col_blk(pa, newSmem.k + newSmem.s), _MM_HINT_T0);
 #endif
                 }
             }
@@ -2996,14 +3000,14 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         } else {
             for (; p < numPrev; p++) {
                 SMEM smem = prev[p];
-                SMEM newSmem = backwardExt_konly_cp(cpo, count_a, smem, a);
+                SMEM newSmem = backwardExt_konly_col(pa, count_a, smem);
                 newSmem.m = j;
                 if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
                     curr_s = newSmem.s;
                     prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                    _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch(cp_col_blk(pa, newSmem.k), _MM_HINT_T0);
+                    _mm_prefetch(cp_col_blk(pa, newSmem.k + newSmem.s), _MM_HINT_T0);
 #endif
                 }
             }
