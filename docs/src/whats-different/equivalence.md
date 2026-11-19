@@ -4,8 +4,8 @@ This page's bwa-mem2 comparisons concern `mem`, not the short-read `aln` command
 Without `--meth`, `--short-insert` or `--ref-span-insert`, [`aln`](../cli/aln.md) targets stock bwa 0.7.19
 `aln` + `samse`/`sampe` record identity, excluding program-header naming and the
 strict input/error handling documented there. Opt-in `aln --short-insert` changes
-paired insert-size calibration, pairs mates with coincident starts and widens mate rescue
-to overlap the anchor, and can change pair selection, proper-pair flags, MAPQ and rescued
+paired insert-size calibration, pairs mates with coincident starts, measures the shortest
+allowed outer span from `-q`-trimmed reads ([#811](https://github.com/fg-labs/bwa-mem3/pull/811)) and widens mate rescue to overlap the anchor, and can change pair selection, proper-pair flags, MAPQ and rescued
 mates, with or without `--meth` ([#752](https://github.com/fg-labs/bwa-mem3/pull/752)). Opt-in `aln --ref-span-insert` ([#765](https://github.com/fg-labs/bwa-mem3/pull/765)) measures paired inserts from
 alignment reference spans instead of read lengths and can change the same outputs; it is covered by unit tests (including end-to-end CLI runs), and no concordance measurement exists for it. Opt-in `aln --meth` ([#749](https://github.com/fg-labs/bwa-mem3/pull/749), [#750](https://github.com/fg-labs/bwa-mem3/pull/750)) changes search,
 refinement, accounting and tags and is not stock or MEM-equivalent. The MEM

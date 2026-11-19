@@ -166,7 +166,8 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
                    const isize_info_t *ii, const bntseq_t *bns = nullptr)
 {
 	int i, j, o_n, subo_n, cnt_chg = 0, low_bound = ii->low, max_len;
-	// --short-insert also pairs mates that start at the same base; -A overrides the option.
+	// --short-insert in effect (-A overrides it): pairing also accepts mates that start at the same
+	// base, and floors the outer span at the reads' trimmed lengths (min_outer below).
 	const bool coincident = opt->short_insert && !opt->force_isize;
 	// --ref-span-insert: the reverse read's end, and the minimum outer span, come from the hits'
 	// reference spans (read length plus deletions minus insertions) rather than read lengths.
@@ -189,11 +190,15 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	max_len = p[0]->full_len;
 	if (max_len < p[1]->full_len) max_len = p[1]->full_len;
 	if (low_bound < max_len) low_bound = max_len;
+	// The least outer span a pair may have: stock's longer whole read. Under --short-insert (not -A)
+	// a fragment can be shorter than the reads, so -q-trimmed bases need not lie inside it: the outer
+	// span need only cover the longer trimmed read, as --meth cap rescue already requires.
+	const int min_outer = coincident ? std::max(p[0]->len, p[1]->len) : max_len;
 
 	// here v>=u. When ii is set, we check insert size with ii; otherwise with opt->max_isize
 #define __pairing_aux(u,v) do { \
 		bwtint_t l = (v).x + p[(v).y&1]->len - ((u).x); \
-		bwtint_t min_l = max_len; \
+		bwtint_t min_l = (bwtint_t)min_outer; \
 		if (ref_span && (u).x != (uint64_t)-1) { \
 			l = (v).x + (bwtint_t)hit_span(v) - (u).x; \
 			min_l = (bwtint_t)(coincident ? std::max<int64_t>(hit_span(u), hit_span(v)) \

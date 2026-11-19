@@ -23,7 +23,8 @@ and a lookup-capped end can be rescued near its mate for placement only (MAPQ 0)
 For paired ordinary or methylation-aware alignment, `--short-insert` lets the insert
 estimator include short, overlapping fragments without the longest read in a batch
 setting its minimum, pairs mates that start at the same base (both reads covering a
-fragment shorter than the reads), and lets mate rescue search the anchor's own span, so a
+fragment shorter than the reads), measures the shortest allowed outer span from the reads'
+`-q`-trimmed lengths ([#811](https://github.com/fg-labs/bwa-mem3/pull/811)), and lets mate rescue search the anchor's own span, so a
 mate that runs past its anchor is rescued with the overhang soft-clipped. The flag defaults
 off and is rejected with single-end input; `-A` overrides it. Enabling it can change pair
 selection, proper-pair flags, MAPQ, rescued mates and their CIGARs.

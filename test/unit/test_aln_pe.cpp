@@ -27,6 +27,7 @@
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -344,14 +345,16 @@ TEST_CASE("aln_pe: short-insert pairs a coincident start whatever the two hits' 
     free(pe);
 }
 
-TEST_CASE("aln_pe: short-insert pairs coincident starts but keeps the other geometry and same-contig requirements"
+TEST_CASE("aln_pe: short-insert pairs coincident starts, floors the outer span at the trimmed reads, and keeps the other geometry and same-contig requirements"
           * doctest::test_suite("unit/aln_pe")) {
     auto *pe = ba::bwa_init_pe_opt();
     ba::bwase_initialize();
     ba::isize_info_t ii = {}; ii.avg = ii.std = -1;
     bntann1_t ann[2] = {}; ann[0].len = ann[1].len = 200; ann[1].offset = 200;
     bntseq_t bns = {}; bns.n_seqs = 2; bns.l_pac = 400; bns.anns = ann;
-    // stock_proper: without the option. proper: with it, which only adds coincident starts.
+    // stock_proper: without the option, or with -A (which overrides it). proper: with it, which adds
+    // coincident starts and measures the minimum outer span from the reads' trimmed lengths rather
+    // than their full lengths.
     struct Geometry {int start, end, len0, len1, full0, full1; bool proper, stock_proper;};
     const Geometry cases[] = {
         {100, 100, 20, 20, 20, 20, true, false}, // coincident starts: both reads cover the fragment
@@ -360,14 +363,15 @@ TEST_CASE("aln_pe: short-insert pairs coincident starts but keeps the other geom
         {100, 99, 20, 20, 20, 20, false, false}, // the reverse read starts first
         {100, 101, 20, 20, 20, 20, true, true},
         {100, 101, 10, 19, 20, 20, true, true}, // outer span == max full_len
-        {100, 101, 10, 18, 20, 20, false, false},
+        {100, 101, 10, 18, 20, 20, true, false}, // trimmed: 19 covers the longer trimmed read; stock needs 20
+        {100, 101, 19, 10, 20, 20, false, false}, // the longer trimmed read (19) runs past the outer span (11)
         {100, 110, 30, 20, 30, 20, true, true}, // asymmetric full lengths
         {100, 109, 30, 20, 30, 20, false, false},
         {190, 205, 20, 20, 20, 20, true, true} // only ordinary path may pair across contigs
     };
-    for (int option : {0, 1}) for (bool active : {false, true}) for (bool same_contig : {false, true})
-    for (const auto &c : cases) {
-        pe->short_insert = option;
+    for (int option : {0, 1, 2}) for (bool active : {false, true}) for (bool same_contig : {false, true})
+    for (const auto &c : cases) { // option 2: --short-insert with -A
+        pe->short_insert = option != 0; pe->force_isize = option == 2;
         CAPTURE(option);
         ii = {}; ii.avg = ii.std = -1;
         if (active) { ii.low = 1; ii.high = ii.high_bayesian = 69; ii.avg = 32; ii.std = 7; }
@@ -385,9 +389,12 @@ TEST_CASE("aln_pe: short-insert pairs coincident starts but keeps the other geom
         pair64_v arr = {}; arr.a = rows; arr.n = arr.m = 2;
         if (same_contig) ba::bwa_pe_pairing_same_contig(&bns, pair, &arr, pe, 3, &ii);
         else ba::bwa_pe_pairing(pair, &arr, pe, 3, &ii);
-        const bool want = option ? c.proper : c.stock_proper;
+        const bool want = option == 1 ? c.proper : c.stock_proper;
         const bool proper = want && !(same_contig && c.start < 200 && c.end >= 200);
-        for (const auto &p : ends) CHECK(((p.extra_flag & SAM_FPP) != 0) == proper);
+        for (const auto &p : ends) {
+            CHECK(((p.extra_flag & SAM_FPP) != 0) == proper);
+            CHECK(p.mapQ == (proper ? 50 : 25)); // a proper pair whose ends stay put sums their MAPQs
+        }
     }
     free(pe);
 }
@@ -962,13 +969,15 @@ namespace {
 // Runs aln_run_pe (the shipped driver) with batches of batch_size pairs. Returns its exit code and
 // the SAM record lines (no header) in output order; *err (if given) gets what it printed on stderr.
 int run_pe_lines(int batch_size, const std::string &f1, const std::string &f2, const std::string &out_path,
-                 std::vector<std::string> *lines, std::string *err = nullptr, int share_dup_search = 1)
+                 std::vector<std::string> *lines, std::string *err = nullptr, int share_dup_search = 1,
+                 const std::function<void(ba::aln_opt_t *)> &tweak = nullptr)
 {
     PeIndex &ix = index_fixture();
     ba::aln_opt_t o;
     ba::aln_opt_init(&o);
     o.batch_size = batch_size;
     o.share_dup_search = share_dup_search;
+    if (tweak) tweak(&o);
     ba::aln_out_t *out = ba::aln_out_open(out_path.c_str(), 0, 0, "");
     REQUIRE(out != nullptr);
     const std::string err_path = out_path + ".err";
@@ -1626,4 +1635,52 @@ TEST_CASE("aln_pe: ref-span-insert places the rescue window from the anchor's re
         CHECK(ba::aln_rescue_window_ceiling(&anchor, pe) == (short_insert ? 1032 : 1000));
     }
     free(pe);
+}
+
+TEST_CASE("aln_pe: short-insert pairs -q-trimmed reads that cover a fragment shorter than the reads"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Three pairs of 50-base reads whose last 10 bases are low quality, through the shipped driver
+    // with -q 20: each trims to its 40-base prefix, read 1 forward at s and read 2 reverse at s + 1,
+    // an outer span of 41. Under --short-insert the pairs are proper (the span covers the longer
+    // trimmed read); without it, or with -A, the minimum is the whole 50-base read and they are not.
+    PeIndex &ix = index_fixture();
+    bwa_tests::TempDir scratch{"aln_pe_trim"};
+    uint32_t st = 4242;
+    const std::string tail = aln_test::lcg_dna(st, 10);
+    auto write_trimmable = [&](const std::string &path, const std::vector<std::string> &reads) {
+        FILE *fp = fopen(path.c_str(), "w");
+        REQUIRE(fp != nullptr);
+        bool ok = true;
+        for (size_t i = 0; i < reads.size(); ++i)
+            ok = ok && fprintf(fp, "@p%zu\n%s%s\n+\n%s%s\n", i, reads[i].c_str(), tail.c_str(),
+                               std::string(reads[i].size(), 'I').c_str(), std::string(tail.size(), '#').c_str()) >= 0;
+        REQUIRE((fclose(fp) == 0 && ok));
+        return path;
+    };
+    std::vector<std::string> r1, r2;
+    for (int i = 0; i < 3; ++i) {
+        const int s = 1000 + 300 * i;
+        r1.push_back(ix.contig.substr(s, 40));
+        r2.push_back(aln_test::revcomp(ix.contig.substr(s + 1, 40)));
+    }
+    const std::string f1 = write_trimmable(scratch.path() + "/t1.fq", r1), f2 = write_trimmable(scratch.path() + "/t2.fq", r2);
+    for (int option : {0, 1, 2}) { // 2: --short-insert with -A
+        CAPTURE(option);
+        std::vector<std::string> lines;
+        REQUIRE(run_pe_lines(100, f1, f2, scratch.path() + "/t" + std::to_string(option) + ".sam", &lines, nullptr, 1,
+                             [&](ba::aln_opt_t *o) {
+                                 o->gap.trim_qual = 20;
+                                 o->pe.short_insert = option != 0;
+                                 o->pe.force_isize = option == 2;
+                             }) == 0);
+        REQUIRE(lines.size() == 6);
+        const auto flags = sam_column(lines, 1), pos = sam_column(lines, 3), cigar = sam_column(lines, 5);
+        for (size_t k = 0; k < lines.size(); ++k) {
+            CAPTURE(k);
+            const int i = (int)k / 2, s = 1000 + 300 * i;
+            CHECK(pos[k] == std::to_string(k % 2 ? s + 2 : s + 1)); // 1-based
+            CHECK(cigar[k] == (k % 2 ? "10S40M" : "40M10S")); // the trimmed 3' tail, soft-clipped
+            CHECK(((std::atoi(flags[k].c_str()) & 0x2) != 0) == (option == 1));
+        }
+    }
 }

@@ -137,9 +137,11 @@ estimation and mate rescue.
 The option also accepts a pair whose reverse read starts at the same base as its forward
 read. Stock pairing requires the reverse read to start strictly after the forward one, so
 when trimmed reads each cover a whole fragment shorter than the read length, almost no pair
-is proper and neither mate's MAPQ benefits from the other. Every other geometry requirement
-is kept: the reverse read may not start before the forward read, the outer span must be at
-least the longer read, and the insert must fit the estimate (or `-a` without one).
+is proper and neither mate's MAPQ benefits from the other. The outer span must still be at
+least the longer read, but that read is measured after `-q` trimming: trimmed bases need not
+lie inside a fragment shorter than the reads (stock, and `-A`, count the whole read). The
+other geometry requirements are kept: the reverse read may not start before the forward read,
+and the insert must fit the estimate (or `-a` without one).
 
 Mate rescue (and, with `--meth`, cap rescue) may also search the anchor's own span. Stock
 rescue looks for the mate only beyond the anchor, so it can never place a mate that covers the
@@ -151,7 +153,7 @@ reference: the window needs room only for the aligned part of the mate (at least
 where stock rescue needs room for the whole read.
 
 This is an opt-in departure from stock output. The inferred distribution, the coincident
-starts and the wider rescue windows can change pair selection, proper-pair flags, MAPQ, rescued
+starts, the trimmed-length outer span and the wider rescue windows can change pair selection, proper-pair flags, MAPQ, rescued
 mates and their CIGARs. This option does not make every short pair proper. Under this option, pairing and methylation cap rescue
 reject candidates when the insert-likelihood calculation underflows or its penalty
 cannot be represented as an integer. Existing defaults are unchanged.

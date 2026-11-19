@@ -151,7 +151,7 @@ Each change to upstream-derived code adds a line here.
   Previous-valid-estimate fallback is unchanged and `-A` still overrides estimation.
   Pairing and methylation cap rescue reject insert-likelihood calculations that underflow
   or produce unrepresentable integer penalties under this option. These opt-in changes can alter pair selection, proper-pair flags,
-  MAPQ and rescue windows. Pairing also accepts a reverse read that starts at the same base as its forward read; every other geometry requirement is unchanged (the reverse read may not start before the forward read, the outer span must be at least the longer read, and the insert must fit the estimate). Mate rescue (and `--meth` cap rescue) may also search the anchor's own span, keeping a rescued mate inside the fragment the anchor implies and soft-clipping an overhang.
+  MAPQ and rescue windows. Pairing also accepts a reverse read that starts at the same base as its forward read; the outer span must still be at least the longer read, but measured after `-q` trimming where stock counts the whole read ([#811](https://github.com/fg-labs/bwa-mem3/pull/811)); the other geometry requirements are kept (the reverse read may not start before the forward read, and the insert must fit the estimate). Mate rescue (and `--meth` cap rescue) may also search the anchor's own span, keeping a rescued mate inside the fragment the anchor implies and soft-clipping an overhang.
   Without the option, the stock inference and scoring behavior is preserved.
 - `bwtaln.h`, `bwape.cpp`/`bwape.h`, `aln_meth.cpp`: the default-zero `pe_opt_t::ref_span_insert`
   enables `--ref-span-insert`, which measures inserts from alignment reference spans (len + n_del -
