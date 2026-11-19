@@ -720,12 +720,13 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 		[&](int i, int first) {
 			bwa_seq_t *d = seqs + i;
 			d->sa = 0; d->type = BWA_TYPE_NO_MATCH; d->c1 = d->c2 = 0; d->n_aln = 0; d->aln = nullptr;
-			// res[first] is untrimmed here (has_copy kept it whole); it is trimmed after this loop.
+			// res[first] is not trimmed yet (has_copy kept its loci for these draws); it is trimmed
+			// after this loop. Pairing never reads an incomplete read past its main hit.
 			aln_meth_copy_dup(&res[i], &res[first], aln_meth_draw_seed(ref, read_no, ord0 + i),
-							  keep_strata, max_xa_hits);
+							  keep_strata && !res[first].flags, max_xa_hits);
 		});
-	if (!keep_strata)
-		for (int i = 0; i < n_seqs; ++i) if (has_copy[i]) aln_meth_trim(&res[i], max_xa_hits);
+	for (int i = 0; i < n_seqs; ++i)
+		if (has_copy[i] && (!keep_strata || res[i].flags)) aln_meth_trim(&res[i], max_xa_hits);
 	aln_meth_report(read_no, n_seqs, res);
 	return n_dups;
 }
