@@ -2172,6 +2172,7 @@ static void mem_close_input_readers(ktp_aux_t &aux, gzFile fp, gzFile fp2,
 
 int main_mem(int argc, char *argv[])
 {
+    const double wall_main0 = realtime();   /* for the -v 4 wall line at the end */
     int          i, c, ignore_alt = 0, no_mt_io = 0, alt_project = 0;
     bool         alt_project_gap_set = false;
     const char  *alt_project_exclude_bed = NULL;
@@ -4008,6 +4009,7 @@ int main_mem(int argc, char *argv[])
 
     /* Load bwt2/FMI index */
     uint64_t tim = __rdtsc();
+    const double wall_index0 = realtime();
 
     fprintf(stderr, "* Ref file: %s\n", ref_prefix);
     aux.fmi = new FMI_search(ref_prefix);
@@ -4052,6 +4054,7 @@ int main_mem(int argc, char *argv[])
     fprintf(stderr, "* SA compression enabled with xfactor: %d\n", 1 << (int)aux.fmi->sa_compx);
     #endif
     tprof[FMI][0] += __rdtsc() - tim;
+    const double wall_index1 = realtime();
 
 #if SMEM_LOCKSTEP_N > 1
     /* Resolve the phase-2 SMEM lockstep width once, before the seeding workers
@@ -4709,11 +4712,13 @@ int main_mem(int argc, char *argv[])
 #endif
 
     tim = __rdtsc();
+    const double wall_process0 = realtime();
 
     /* Relay process function */
     process(&aux, fp, fp2, pipe_workers);
 
     tprof[PROCESS][0] += __rdtsc() - tim;
+    const double wall_process1 = realtime();
 
     if (sp_enabled()) {
         struct rusage ru; getrusage(RUSAGE_SELF, &ru);
@@ -4840,6 +4845,15 @@ int main_mem(int argc, char *argv[])
                 sc ? 100.0 * (double)sk / (double)sc : 0.0);
     }
 #endif
+
+    /* -v 4 only: where the wall time of the run went outside the alignment
+     * itself, next to load_index's own phase line. `teardown` ends here, so it
+     * leaves out what the process still does after main_mem returns. */
+    if (bwa_verbose >= 4)
+        fprintf(stderr, "[M::%s] wall (s): setup=%.3f index=%.3f pre_pipeline=%.3f pipeline=%.3f "
+                "teardown=%.3f\n", __func__, wall_index0 - wall_main0, wall_index1 - wall_index0,
+                wall_process0 - wall_index1, wall_process1 - wall_process0,
+                realtime() - wall_process1);
 
     return exit_code;
 }

@@ -234,6 +234,36 @@ void parallel_pread(int shared_fd, const char *path, void *dst, size_t nbytes,
 
 }  // namespace
 
+/* Wall time of each phase of the index load, printed once at -v 4 as
+ * `[M::load_index] phases (s): name=seconds ...`. mark() charges the time since
+ * the previous mark to `name`; at the default verbosity it does nothing. The
+ * names are string literals. */
+namespace {
+struct LoadPhases {
+    enum { MAX = 12 };
+    const char *name[MAX];
+    double      dur[MAX];
+    int         n;
+    double      t0, last;
+    bool        on;
+    LoadPhases() : n(0), t0(0), last(0), on(bwa_verbose >= 4) { if (on) t0 = last = realtime(); }
+    void mark(const char *what)
+    {
+        if (!on || n == MAX) return;
+        const double t = realtime();
+        name[n] = what; dur[n] = t - last; n++;
+        last = t;
+    }
+    void report(const char *source, int nthreads) const
+    {
+        if (!on) return;
+        fprintf(stderr, "[M::load_index] phases (s):");
+        for (int i = 0; i < n; i++) fprintf(stderr, " %s=%.3f", name[i], dur[i]);
+        fprintf(stderr, " total=%.3f source=%s load_threads=%d\n", last - t0, source, nthreads);
+    }
+};
+}  // namespace
+
 // Worker count for the index load: the caller's -t, capped (bandwidth bound
 // past ~8), with an explicit BWA3_LOAD_THREADS override for tuning.
 // Exposed (declared in FMI_search.h) so the env-parse validation is
@@ -1322,6 +1352,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * attaches either and takes its layout, through set_compact_occ; any other
      * attaches only its own layout (bwa_shm_attach declines the other, and
      * this loads from disk). */
+    LoadPhases phases;
     {
         size_t   shm_attach_len = 0, shm_map_len = 0;
         uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len, &shm_map_len,
@@ -1329,6 +1360,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                                                  cp_prefer_staged ? -1
                                                  : cp_compact ? (int)BWA_SHM_CP_LAYOUT_COMPACT
                                                               : (int)BWA_SHM_CP_LAYOUT_DEFAULT);
+        phases.mark("shm_attach");
         if (shm_base_local != NULL) {
             const bool seg_compact = bwa_shm_segment_compact(shm_base_local) != 0;
             if (seg_compact != cp_compact) {
@@ -1355,6 +1387,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
             /* shm_map_len: the whole mapping, which can be longer than the
              * packed index it holds, is what the destructor unmaps. */
             load_index_from_shm(shm_base_local, shm_attach_len, shm_map_len);
+            phases.mark("shm_fmi");
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
@@ -1362,9 +1395,13 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                                      /*from_shm=*/true))
                 exit(EXIT_FAILURE);
             bns_build_pos2rid(idx->bns);
+            phases.mark("shm_bns_pac");
             /* The seed jump table is process-private (not part of the staged
              * segment), so an attached index builds its own. */
-            if (build_seed_jump) build_seed_jump_table(index_load_threads(n_threads));
+            const int jump_nt = index_load_threads(n_threads);
+            if (build_seed_jump) build_seed_jump_table(jump_nt);
+            phases.mark("jump_table");
+            phases.report("shm", jump_nt);
             fprintf(stderr, "* FMI+BNS%s attached from shm; "
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             if (huge_pages != BWAMEM_HUGETLB_OFF)
@@ -1476,6 +1513,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         }
     }
 
+    phases.mark("open_header");
     // create checkpointed occ
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;
     cp_occ = NULL;
@@ -1566,6 +1604,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes,
                           cp_occ_huge.base != NULL ? huge_load_nt : load_nt);
     }
+    phases.mark("cp_occ");
     int64_t ii = 0;
     for(ii = 0; ii < 5; ii++)// update read count structure
     {
@@ -1604,7 +1643,9 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         xassert(rc != SA_HI_READ_RANGE,
                 "FMI index: SA sample high part out of range (corrupt .bwt.2bit.64?)");
     }
+    phases.mark("sa_hi_read_pack");
     fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
+    phases.mark("sa_ls");
 
     sentinel_index = -1;
     #if SA_COMPRESSION
@@ -1644,6 +1685,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
 
     // cp_occ, count[] and sentinel_index are in: build the seed jump table.
     if (build_seed_jump) build_seed_jump_table(load_nt);
+    phases.mark("jump_table");
 
     fprintf(stderr, "* Count:\n");
     for(x = 0; x < 5; x++)
@@ -1663,6 +1705,8 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * before the FM arrays. */
     bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS, load_nt,
                      reference_seq_len);
+    phases.mark("bns_pac");
+    phases.report("disk", load_nt);
 
     fprintf(stderr, "* Done reading Index!!\n");
 }
