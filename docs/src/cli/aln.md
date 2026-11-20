@@ -275,15 +275,21 @@ How it works:
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual
   cuts. The stock primary is kept while it is still among the best.
-- The window search takes no cuts. The main search takes stock's cuts from its own first hit.
-  When the merged best is lower than its own (a window hit with the ALT credited), or its
-  difference ceiling looser, those cuts can have left out hits the merged set keeps; the read is
-  then searched again on the reference with the merged set's cuts fixed from the start, and those
-  hits are merged instead. A second search that reaches the `-m` bound leaves the read as when it
+- Both searches take stock's cuts from their own first hit. When the merged best is lower than a
+  search's own (for the main search, a window hit with the ALT credited; for the window search, a
+  main hit outside its windows), or its difference ceiling looser, those cuts can have left out
+  hits the merged set keeps. A window search's own best can also lie below the merged best, when
+  it is a row running from one window into the next, which the merge drops; and its `-R` counts a
+  locus once per window holding it, so any window search that stopped on `-R` (below the merged
+  best plus one mismatch) counts too. The read is then searched
+  again on that index with the merged set's cuts fixed from the start (score cut and difference
+  ceiling, no `-R` stop), and those hits are merged instead; `-R` is then applied to the merged
+  loci, each counted once. A second search that reaches the `-m` bound leaves the read as when it
   has too many loci (below).
 - Under `-N` the merge keeps every hit within `-n`: it does not trim the merged hits to `-R`, so
-  `--known-snvs -N` reports every hit within `-n`. A main search that stopped on `-R` (`-N -R k`)
-  below the merged best is searched again with no score cut, up to the read's `-n`.
+  `--known-snvs -N` reports every hit within `-n`. The window search then takes no `-R` stop
+  either, and runs to `-n`. A main search that stopped on `-R` (`-N -R k`) below the merged best is
+  searched again with no score cut, up to the read's `-n`.
 - Paired end: the insert size is estimated from stock placements first. Mate rescue also aligns
   the mate against its window with each site allele substituted alone, every other site at REF,
   for at most the window's first 32 site alleles in position order (later ones stay at REF; the

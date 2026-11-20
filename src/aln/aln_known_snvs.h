@@ -146,10 +146,11 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const struct
 						struct aln_meth_extra_t *out);
 void ks_windows_free(ks_windows_t *w);
 
-/* The options a read's plain (not --meth) ALT-window search runs with: NONSTOP and no -R cut, so synthetic copies
- * and cross-window hits cannot tighten the genomic discovery bound. The main search and the
- * genomic merge still apply the user's retention policy. */
-gap_opt_t ks_discovery_opt(const gap_opt_t &opt);
+/* The options a read's plain (not --meth) ALT-window search runs with: the user's, so it takes
+ * stock's cuts (score cut, top-2 ceiling and -R stop) from its own first hit, and ks_merge runs it
+ * again when those cuts may have left out hits the merged set keeps (ks_cuts_too_tight). Under -N,
+ * which takes no ceiling or score cut, it also takes no -R stop and runs to -n. */
+gap_opt_t ks_window_opt(const gap_opt_t &opt);
 
 struct aln_opt_t;
 struct aln_dup_state_t;
@@ -164,14 +165,19 @@ struct aln_meth_read_t;
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res);
 
-/* Without --meth: whether a read's main search (hits a/n, top2b: it ended on its -R stop) took
- * cuts from its own first hit (the top-2 ceiling; the -R stop on its best stratum) that may have
- * left out hits the merged set keeps, whose best is best and whose cap on differences is cap. Its
- * score cut (its best + M) never does: no merged best is above a search's own. Under -N there is
- * no ceiling or score cut and the merge keeps every hit within -n, so only an -R stop below the
- * merged best counts. ks_merge then runs the search again (the ALT-window search takes no cuts:
- * ks_discovery_opt). */
-bool ks_cuts_too_tight(const gap_opt_t *opt, int max_diff, const bwt_aln1_t *a, int n, bool top2b, int best, int cap);
+/* Without --meth: whether a read's main search (window false) or ALT-window search (window true),
+ * with hits a/n and top2b (it ended on its -R stop), took cuts from its own first hit (the top-2
+ * ceiling; the -R stop on its best stratum) that may have left out hits the merged set keeps, whose
+ * best is best and whose cap on differences is cap. The main search's score cut (its best + M)
+ * never does: no merged best is above its own. A window search's own best can be, when it is a
+ * row running from one window into the next (the window index holds them back to back), which the
+ * merge drops; that always counts. An -R stop counts when the merged best + M is above the
+ * search's own best and, for the main search, the merged best is below it; for a window search it
+ * counts also at its own best, since its -R counts one locus once per window holding it. Under -N
+ * there is no ceiling or score cut and the merge keeps every hit within -n, so only an -R stop
+ * counts (below the merged best, for the main search). ks_merge then runs that search again. */
+bool ks_cuts_too_tight(const gap_opt_t *opt, int max_diff, const bwt_aln1_t *a, int n, bool top2b, int best, int cap,
+					   bool window);
 
 /* What ks_override did to a read. */
 enum ks_outcome_t {
@@ -179,25 +185,26 @@ enum ks_outcome_t {
 	KS_SAME,            // window hits cover a site but change no hit's cost: stock result
 	KS_CREDITED,        // placement, counts and MAPQ recomputed with the ALT credited
 	KS_INCOMPLETE,      // too many hits to expand, a read too long for its window, or a genomic or
-	                    // window search stopped at -m: stock result
+	                    // window search (or one run again) stopped at -m: stock result
 	KS_N_OUTCOMES
 };
 
 /* Crediting for one single-end read after bwa_cal_pac_pos (stock position and MAPQ set) and
  * before bwa_refine_gapped. `s->aln` holds the main search's hits; win_aln/win_n the same read's
- * hits on the window index. Window hits that cover their window's site join the main hits; per
- * locus the lower search score wins; then c1/c2, the primary (the stock one when still among the
- * best, else a per-read draw, never drand48), MAPQ (bwa_approx_mapQ) and the alternative hits are
- * recomputed with aln's cuts (score <= best + mismatch penalty, differences <= min(max_diff, best's
- * + 1)), applied before the main intervals are expanded. *alt_site is the site allele
- * (aln_site_key) whose ALT the new primary's cost assumes, or -1. */
+ * hits on the window index (win_top2b: that search ended on its -R stop). Window hits that cover
+ * their window's site join the main hits; per locus the lower search score wins; then c1/c2, the
+ * primary (the stock one when still among the best, else a per-read draw, never drand48), MAPQ
+ * (bwa_approx_mapQ) and the alternative hits are recomputed with aln's cuts (score <= best +
+ * mismatch penalty, differences <= min(max_diff, best's + 1)), applied before the main intervals
+ * are expanded. *alt_site is the site allele (aln_site_key) whose ALT the new primary's cost
+ * assumes, or -1. */
 /* Paired end: `hits` gets the kept hits, best first, with each selected allele in
  * pe_hit_t::alt_site_plus1; it is cleared unless the read is credited. `stopped`: the read's
  * genomic or window search stopped at -m, so either may lack same-score competitors; a read that
  * would be credited then keeps its stock result (KS_INCOMPLETE). */
 ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
-						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site,
-						 std::vector<pe_hit_t> *hits = nullptr, bool stopped = false);
+						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, bool win_top2b,
+						 int64_t *alt_site, std::vector<pe_hit_t> *hits = nullptr, bool stopped = false);
 /* Mate rescue's site lister (pe_alt_sites_t::list) over a ks_rescue_ctx_t: the site alleles in the
  * packed range [beg, end), on every contig it reaches, at most KS_RESCUE_MAX_SITES. The first range
  * holding more prints a warning (once per run; ks_site_cap_warned, which tests reset). */
@@ -234,11 +241,13 @@ bool ks_twin_pair_same_contig(const bntseq_t *bns, const bwa_seq_t *twin, const 
 							  int64_t original_pos, int64_t twin_span = -1, int64_t mate_span = -1);
 
 /* Where a twin read lands, without a draw: its main hits (t->aln) and window hits merged as for
- * ks_override. Returns 1 when it has one best hit at (pos, strand) within KS_TWIN_SLOP whose whole
- * reference span lies in the contig holding pos (ks_twin_same_contig), 0 when not (no hit, a tie,
- * elsewhere, or a span off that contig), -1 when incomplete; *mapq is its MAPQ. */
+ * ks_override (win_top2b as there). Returns 1 when it has one best hit at (pos, strand) within
+ * KS_TWIN_SLOP whose whole reference span lies in the contig holding pos (ks_twin_same_contig), 0
+ * when not (no hit, a tie, elsewhere, or a span off that contig), -1 when incomplete; *mapq is its
+ * MAPQ. */
 int ks_twin_place(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
-				  const bwa_seq_t *t, const bwt_aln1_t *win_aln, int win_n, int64_t pos, int strand, int *mapq);
+				  const bwa_seq_t *t, const bwt_aln1_t *win_aln, int win_n, bool win_top2b, int64_t pos, int strand,
+				  int *mapq);
 
 /* One site under a read's final placement. */
 struct ks_vote_t {
