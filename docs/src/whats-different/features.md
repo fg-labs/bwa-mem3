@@ -267,6 +267,10 @@ stride-8 index and is the recommended speed-per-GB operating point; `-u 1`
 [CLI Reference → re-sa](../cli/re-sa.md) and
 [shm → `-u`](../cli/shm.md#-u-int--densify-the-staged-sa-sample-table).
 
+## 1 GB pages for the staged index: `shm --huge-pages`
+
+`/dev/shm` backs a staged index with 2 MB pages at best. `bwa-mem3 shm --huge-pages <idxbase>` stages it on 1 GB pages instead: the index goes into a System V shared memory segment from the host's reserved 1 GB pool, and `mem`, `shm -l` and `shm -d` are used as for any staged index. It is Linux-only and opt-in. The stage fails, staging nothing, when the pages cannot be had (there is no fallback to `/dev/shm`), and it is refused on AMD x86 hosts, where it measured no gain. Alignment records are byte-identical to every other way of loading the index, by construction (the segment holds the same packed bytes). On hg38 with 5M read pairs of WGS at `-t 16` (clang 19, five interleaved runs per arm) against the same index in `/dev/shm` on 2 MB pages, wall time fell 1.7 % on Intel Sapphire Rapids (AVX-512BW) and 0.7 % on Graviton4 (NEON), and did not fall on AMD Zen 4 (AVX-512BW; +0.4 to +0.6 %). See [CLI → shm `--huge-pages`](../cli/shm.md#--huge-pages--stage-the-index-on-1-gb-huge-pages-linux-opt-in).
+
 ## `HN:i` hit count tag (PR #42)
 
 Every primary and supplementary SAM/BAM record now carries an `HN:i:<n>` tag
@@ -734,6 +738,7 @@ Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#re
 | `--hic` Hi-C preset | [#372](https://github.com/fg-labs/bwa-mem3/pull/372) | — | fork-only spelling (opt-in, off by default; sets the same flag bits as `-5SP`, which both upstreams also accept, so identical by construction — the regression confirms byte-identity on phix-derived PE reads with `@PG` excluded, not a cross-host/cross-tier claim) |
 | `bwa-mem3 shm` shared-memory index | [#65](https://github.com/fg-labs/bwa-mem3/pull/65) | — | fork-only |
 | `shm --meth` symmetry | [#67](https://github.com/fg-labs/bwa-mem3/pull/67) | — | fork-only |
+| `shm --huge-pages` staged index on 1 GB pages | [#814](https://github.com/fg-labs/bwa-mem3/pull/814) | — | fork-only (Linux, opt-in; refused on AMD x86; alignment records byte-identical by construction; hg38 WGS (5M pairs), `-t 16`, clang 19, against shm on 2 MB pages: −1.7 % wall on Sapphire Rapids (AVX-512BW), −0.7 % on Graviton4 (NEON), no gain on Zen 4 (AVX-512BW)) |
 | `HN:i` hit count tag | [#42](https://github.com/fg-labs/bwa-mem3/pull/42) | [lh3/bwa#438](https://github.com/lh3/bwa/pull/438) | fork-only (analogous to bwa aln) |
 | `--bam=LEVEL` direct BAM output | [#12](https://github.com/fg-labs/bwa-mem3/pull/12) | — | fork-only |
 | `--smem-dedup` SMEM deduplication | [#187](https://github.com/fg-labs/bwa-mem3/pull/187) | — | fork-only (opt-in, not byte-identical) |

@@ -89,6 +89,9 @@ It provides little benefit when:
   pairs, `mem -t 16`, clang 19: +33 % on AMD Zen 4 (m7a.4xlarge) with AVX-512BW, +26 % on
   Graviton4 (m8g.4xlarge) with NEON). Mount it `huge=advise` or `huge=within_size` and re-stage; see
   [`shm` → Huge pages](../cli/shm.md#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size).
+  On Intel x86 and arm64 Linux hosts with a reserved 1 GB page pool, `shm --huge-pages` stages the
+  index on 1 GB pages instead; see
+  [`shm` → `--huge-pages`](../cli/shm.md#--huge-pages--stage-the-index-on-1-gb-huge-pages-linux-opt-in).
 
 > **Warning — No staleness check — always drop before re-indexing**
 >
@@ -100,10 +103,14 @@ It provides little benefit when:
 > Always drop the segment before re-indexing:
 >
 > ```bash
-> bwa-mem3 shm -d
-> bwa-mem3 index ref.fa
-> bwa-mem3 shm ref.fa
+> bwa-mem3 shm -d &&
+>   bwa-mem3 index ref.fa &&
+>   bwa-mem3 shm ref.fa
 > ```
+>
+> `shm -d` exits non-zero when it cannot remove a staged index (for example one staged with
+> `--huge-pages` in another IPC namespace), and that index stays staged; the `&&` keeps the rebuild
+> from running behind it.
 
 ---
 

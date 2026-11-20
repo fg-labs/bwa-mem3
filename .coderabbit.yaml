@@ -300,7 +300,16 @@ reviews:
         lookup that trusts an offset or size from the segment without validating
         it against the mapping bounds; and a missing `shm_unlink`/cleanup on
         partial failure. Round-trip must hold (shm_round_trip and
-        shm_pack_round_trip tests).
+        shm_pack_round_trip tests). `shm --huge-pages` stages the index in a
+        System V SHM_HUGETLB segment named by a stub in the POSIX segment; its
+        pages are pinned until removed, so also flag: a path that removes or
+        reclaims a stub without first removing the segment its stage created
+        (pages left pinned with nothing naming them); removal of a System V
+        segment that the stub's own stage did not create (the ownership rule
+        is `huge_segment`); a stub treated as dead when its segment is merely
+        not visible (another IPC namespace); and an attach that maps a length
+        it has not checked against the segment's real size. shm_stage_test's
+        `h` cases cover these.
     - path: "src/{fast_reader,fast_reader_bseq,fr_fastq}.{c,h}"
       instructions: >-
         This is the hand-rolled FASTQ reader — plain C, parsing untrusted input,
