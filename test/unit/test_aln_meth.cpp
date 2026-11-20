@@ -1627,6 +1627,7 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
     auto *opt=ba::gap_init_opt(); opt->fnr=-1; opt->max_diff=3;
+    opt->max_top2=1000; // so that stock's -R stop (more than 30 best loci) does not end it first
     // read_r has 31 equally good converted loci plus worse ones; a small lookup budget caps it.
     const int n=64;
     const auto fq=write_fq("capped-dups.fq",std::vector<std::string>(n,ref().read_r));
@@ -1761,6 +1762,39 @@ TEST_CASE("aln_meth: identical reads with different --known-snvs candidates do n
     }
     ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
+TEST_CASE("aln_meth: the -R stop counts only best loci within the final difference ceiling")
+{
+    // M=1, O=3, E=1: 31 best loci (cost 3) with three strict mismatches each, and one with a single
+    // gap open (cost 3, one difference). The best row's differences set the ceiling to 2, which drops
+    // the 31 at the finish, so they must not count toward -R: one best locus is not a repeat.
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    opt->s_mm = 1; opt->s_gapo = 3; opt->s_gape = 1; opt->max_diff = 3; opt->max_top2 = 30;
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_ref_t mr;
+    ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::aln_meth_slot_t slot; slot.grp = &group;
+    ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 3; job.score_cut = INT_MAX;
+    slot.job = &job;
+    ba::aln_meth_read_t result; slot.res = &result;
+    for (int i = 0; i < 31; ++i) {
+        ba::aln_meth_occ_t o; o.cost = 3; o.n_mm = 3; o.pos = 1000 * (i + 1);
+        result.occ.push_back(o);
+    }
+    ba::aln_meth_occ_t gapped; gapped.cost = 3; gapped.n_gapo = 1; gapped.pos = 50000;
+    result.occ.push_back(gapped);
+    slot.best = 3; slot.best_d = 1;
+    CHECK(ba::aln_meth_boundary(&slot, 4) == 0);
+    CHECK(job.max_diff == 2);
+    // 31 best loci within the ceiling are a repeat
+    for (int i = 0; i < 30; ++i) {
+        ba::aln_meth_occ_t o; o.cost = 3; o.n_mm = 1; o.n_gapo = 0; o.pos = 100000 + 1000 * i;
+        result.occ.push_back(o);
+    }
+    CHECK(ba::aln_meth_boundary(&slot, 4) == 1);
+    free(opt);
 }
 
 TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few more rows")
