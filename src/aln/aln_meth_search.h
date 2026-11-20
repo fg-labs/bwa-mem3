@@ -123,8 +123,9 @@ struct aln_meth_locus_key_t {
 };
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
-// aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not)
-enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2 };
+// aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not); TOP2 is
+// stock's -R stop under the cut (aln_meth_boundary)
+enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2, ALN_METH_STOP_TOP2 = 3 };
 struct aln_meth_slot_t {
     aln_meth_group_t *grp = nullptr;
     gap_job_t *job = nullptr;
@@ -135,6 +136,11 @@ struct aln_meth_slot_t {
     // max_diff: the read's -n limit (bwa_cal_maxdiff on its length for a fractional -n), set by
     // aln_meth_slot_start; a refined window with more differences is dropped (resolve_one).
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
+    // cut: the search takes stock aln's cuts from the verified best (aln_meth_boundary): set unless
+    // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row; best_d: the
+    // fewest differences of a row at that cost. flushed: a flush has run.
+    int cut = 0, best_d = INT_MAX, flushed = 0;
+    int64_t best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     // Gap lists of the search's paths with more than one gap, ALN_METH_MAX_GAPS words each (see
@@ -187,9 +193,19 @@ static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
          (x->alt_bound.valid && x->len > 0 && x->len <= KS_WINDOW_HALF));
 }
 bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
-// Keep batches bounded, but only refine score boundaries when stopping is possible.
+// Applies stock aln's cuts at a score boundary, for a search whose next entry has score next:
+// see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop).
+int aln_meth_boundary(aln_meth_slot_t *, int next);
+// Keep batches bounded. Under the cut, flush at the first hit and at every boundary; otherwise
+// refine score boundaries only when stopping is possible.
 static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
     if (x->pend.size() >= 32) return 1;
+    if (x->cut) { // flush at the first hit and at every score boundary; cut at boundaries
+        if (!x->pend.empty()) return !x->flushed || score > x->flushed_score;
+        if (score <= x->flushed_score) return 0;
+        x->flushed_score = score;
+        return x->best != INT64_MAX && aln_meth_boundary(x, score) && (x->stop = ALN_METH_STOP_TOP2);
+    }
     if (score <= x->flushed_score) return 0;
     if (aln_meth_stop_eligible(x)) return 1;
     // A skipped boundary replaces a flush/resume: do not re-examine this stratum.
@@ -218,6 +234,7 @@ static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t 
     *e = j->e;
     const int score=(int)(e->info>>21);
     x->flushed_score=score;
+    if (x->cut) return x->best != INT64_MAX && aln_meth_boundary(x, score);
     if (aln_meth_can_stop(x,score)) return 1;
     return 0;
 }

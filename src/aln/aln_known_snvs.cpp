@@ -266,6 +266,7 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 			ks_windows_free(out);
 			return -1;
 		}
+		out->mref->no_cut = 1;
 		out->bns = out->mref->bns;
 		// One site offset per window contig: resolve_window indexes it by the original contig rid (crid >> 1).
 		if (out->bns->n_seqs == (int)out->win.size())
