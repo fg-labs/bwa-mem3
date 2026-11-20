@@ -188,10 +188,27 @@ struct aln_meth_group_t;
  * --known-snvs ALT-window search, or null): per read, an upper bound on that read's final best
  * (INT64_MAX: none), the seed its generator search starts from (aln_meth_slot_t::cap_best). */
 struct aln_meth_extra_t;
+/* Whether a --meth search takes stock's cuts (score cut, ceiling, -R): not under -N or with a
+ * negative penalty. The --known-snvs probe runs only when they apply. */
+static inline bool aln_meth_takes_cuts(const gap_opt_t *o)
+{
+    return !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0;
+}
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, struct aln_dup_state_t *dup, aln_meth_read_t *res,
 						  const aln_meth_extra_t *extra = nullptr, const int64_t *caps = nullptr);
+
+/* --known-snvs: the probe of the main search for reads [0, n) of seqs (read_no as for that search,
+ * ordinals ord0 + i). Each read's search runs over its exact stratum only (paths of converted score 0)
+ * and verifies at most ALN_METH_PROBE_ROWS rows on the original reference, scored and filtered as
+ * the main search scores and filters them. upper[i] gets the lowest cost of a row verified for read
+ * i, or INT64_MAX when none was. Each such row is a row of the read's main search, so its cost is an
+ * upper bound on the read's final best whenever that search completes: the seed for its ALT-window
+ * search (aln_meth_search_batch's caps). */
+void aln_meth_probe_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
+						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
+						  int64_t *upper);
 
 /* samse under --meth for reads [0, n). Caller must run bwase_initialize once
  * before dispatching any finish workers (as aln_run_se_meth does). */
