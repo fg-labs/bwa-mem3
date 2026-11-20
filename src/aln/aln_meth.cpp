@@ -171,13 +171,39 @@ bool aln_meth_can_stop(const aln_meth_slot_t *x, int next_score)
     return opt.max_diff>=differences && (int64_t)next_score>differences*opt.s_mm;
 }
 
+// e's gaps (see ALN_METH_GAP) into gap[0, e.n_gapo)
+static void entry_gaps(const aln_meth_slot_t *x, const gap_entry_t &e, uint32_t *gap)
+{
+    if (e.n_gapo == 1) gap[0] = (uint32_t)e.last_diff_pos;
+    else if (e.n_gapo > 1)
+        for (int g = 0; g < (int)e.n_gapo; ++g) gap[g] = x->garena[(size_t)e.last_diff_pos * ALN_METH_MAX_GAPS + g];
+}
+__attribute__((noinline, cold)) int aln_meth_gap_arena(aln_meth_slot_t *x, const gap_entry_t &p, bool ext, uint32_t w)
+{
+    uint32_t gap[ALN_METH_MAX_GAPS] = {0, 0, 0, 0};
+    entry_gaps(x, p, gap);
+    int n = p.n_gapo;
+    if (ext) gap[n - 1] += 1u << 16;
+    else if (n < ALN_METH_MAX_GAPS) gap[n++] = w;
+    else n = ALN_METH_MAX_GAPS + 1;
+    if (n > ALN_METH_MAX_GAPS || x->garena.size() / ALN_METH_MAX_GAPS >= (size_t)INT_MAX) {
+        fprintf(stderr, "ERROR: --meth search path has more gaps than it can record\n"); exit(1);
+    }
+    const int idx = (int)(x->garena.size() / ALN_METH_MAX_GAPS);
+    x->garena.insert(x->garena.end(), gap, gap + ALN_METH_MAX_GAPS);
+    return idx;
+}
 void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
-    // Reaching the same interval with the same span adds no new candidate window.
-    // Other spans must still be evaluated, even if their normalized starts later coincide.
-    const int span = x->len + (int)e->n_del - (int)e->n_ins;
-    if (!x->intervals.insert(aln_meth_iv_key_t{k, l, span}, 0).second) return;
-    x->pend.push_back({k, l, *e});
+    // Reaching the same interval along a path with the same gaps adds no new candidate rows; a path
+    // with other gaps (another placement in a tandem repeat, say) can cost differently.
+    aln_meth_pend_t h;
+    h.k = k; h.l = l; h.e = *e;
+    for (int g = 0; g < ALN_METH_MAX_GAPS; ++g) h.gap[g] = 0;
+    entry_gaps(x, *e, h.gap);
+    aln_meth_iv_key_t key{k, l, (uint32_t)e->n_gapo, {h.gap[0], h.gap[1], h.gap[2], h.gap[3]}};
+    if (!x->intervals.insert(key, 0).second) return;
+    x->pend.push_back(h);
 }
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy)
 {
@@ -194,7 +220,8 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
         x->rd_fwd[k] = std::min<ubyte_t>(p->seq[p->len - 1 - k], 4);
         x->rd_rev[k] = std::min<ubyte_t>(p->rseq[k], 4);
     }
-    x->pend.clear(); x->windows.clear(); x->intervals.clear(); x->loci.clear();
+    x->pend.clear(); x->windows.clear(); x->intervals.clear(); x->loci.clear(); x->garena.clear();
+    x->sa_ix.clear(); x->sa_rows.clear();
     x->bits_ready = 0;
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
@@ -272,6 +299,252 @@ static bool account_alignment(const aln_meth_ref_t *ref, const aln_meth_opt_t *m
 }
 static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
                         int64_t site, int n_ins, int n_del, bool bounded = false);
+
+/* ---------------------------------------------------------------------------------------------
+ * Path cost: a hit's rows are scored on the original reference along the search path that found
+ * them, as stock aln scores a hit by its path (no window DP in the search). The converted search
+ * sees a converted mismatch wherever the original reference has one, and the gap terms are the
+ * same, so a row's strict cost is never below its path's converted score.
+ * ------------------------------------------------------------------------------------------- */
+
+// The path's gaps in query orientation (aln_meth_layout_t) from its gap events (ALN_METH_GAP),
+// whose indexes are into the complemented read the job steps over, S. S is the query of strand 1
+// (rd_rev, from p->rseq) base for base; strand 0's query (rd_fwd) is S reversed.
+static void meth_layout(const uint32_t *gap, int n_gapo, int len, int strand, aln_meth_layout_t *L)
+{
+    L->n = n_gapo;
+    for (int g = 0; g < n_gapo; ++g) {
+        const int i = (int)(gap[g] & 0xffff), gl = (int)(gap[g] >> 16 & 0x7fff), del = (int)(gap[g] >> 31);
+        // S index: an insertion's first base in S order; for a deletion, the S bases before it
+        const int s0 = del ? i + 1 : i - gl + 1;
+        L->qpos[g] = strand ? s0 : del ? len - s0 : len - s0 - gl;
+        L->len[g] = gl; L->del[g] = del;
+    }
+    for (int a = 1; a < L->n; ++a) // ascending qpos (at most ALN_METH_MAX_GAPS)
+        for (int b = a; b > 0 && L->qpos[b - 1] > L->qpos[b]; --b) {
+            std::swap(L->qpos[b - 1], L->qpos[b]); std::swap(L->len[b - 1], L->len[b]); std::swap(L->del[b - 1], L->del[b]);
+        }
+}
+static int layout_span(const aln_meth_layout_t &L, int len)
+{
+    int span = len;
+    for (int g = 0; g < L.n; ++g) span += L.del[g] ? L.len[g] : -L.len[g];
+    return span;
+}
+// The layout as a raw CIGAR (BAM op codes); false when it is not a valid alignment of len bases.
+static bool layout_cigar(const aln_meth_layout_t &L, int len, std::vector<uint32_t> *c)
+{
+    c->clear();
+    int q = 0;
+    for (int g = 0; g < L.n; ++g) {
+        if (L.qpos[g] < q || L.len[g] <= 0) return false;
+        if (L.qpos[g] > q) c->push_back((uint32_t)(L.qpos[g] - q) << 4);
+        c->push_back((uint32_t)L.len[g] << 4 | (L.del[g] ? 2u : 1u));
+        q = L.qpos[g] + (L.del[g] ? 0 : L.len[g]);
+    }
+    if (q > len) return false;
+    if (q < len) c->push_back((uint32_t)(len - q) << 4);
+    return true;
+}
+// The layout of a raw CIGAR of M/I/D operations (false: another operation, or too many gaps).
+static bool cigar_layout(const uint32_t *c, size_t n, aln_meth_layout_t *L)
+{
+    L->n = 0;
+    int q = 0;
+    for (size_t k = 0; k < n; ++k) {
+        const int op = c[k] & 15, l = (int)(c[k] >> 4);
+        if (op == 0) { q += l; continue; }
+        if ((op != 1 && op != 2) || L->n == ALN_METH_MAX_GAPS) return false;
+        L->qpos[L->n] = q; L->len[L->n] = l; L->del[L->n] = op == 2; ++L->n;
+        if (op == 1) q += l;
+    }
+    return true;
+}
+// Display normalization of a raw global CIGAR, as aln_meth_realign_window does it: a terminal
+// insertion is soft-clipped, a terminal deletion is dropped from the reference span.
+static void normalize_display(aln_meth_alignment_t *a)
+{
+    a->cigar = a->raw_cigar;
+    if ((a->cigar.back() & 15) == 1) a->cigar.back() = (a->cigar.back() & ~15u) | 4;
+    if ((a->cigar.front() & 15) == 1) a->cigar.front() = (a->cigar.front() & ~15u) | 4;
+    if ((a->cigar.back() & 15) == 2) { a->re -= a->cigar.back() >> 4; a->cigar.pop_back(); }
+    if (!a->cigar.empty() && (a->cigar.front() & 15) == 2) { a->rb += a->cigar.front() >> 4; a->cigar.erase(a->cigar.begin()); }
+}
+// The difference counts of the path's gap events made inside the seed, as the search counts them
+// against -k: a difference is constrained when the step that makes it is at an index above the
+// seed's offset (bwt_match_gap's seed test runs for ii = i - seed_off > 0).
+static int seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool gape)
+{
+    int d = 0;
+    for (int g = 0; g < n_gapo; ++g) {
+        const int i = (int)(gap[g] & 0xffff), gl = (int)(gap[g] >> 16 & 0x7fff), del = (int)(gap[g] >> 31);
+        if (i > seed_off) ++d; // the open
+        if (!gape) continue;
+        if (del) d += i > seed_off ? gl - 1 : 0; // a deletion's extensions step at the same index
+        else for (int s = i - 1; s > i - gl; --s) d += s > seed_off; // an insertion's at i-1, i-2, ...
+    }
+    return d;
+}
+// Whether query position q (orientation ori: 0 rd_fwd, 1 rd_rev) is inside the seed's constrained
+// part (S index above seed_off).
+static inline bool seed_pos(int q, int ori, int len, int seed_off) { return ori ? q > seed_off : q < len - 1 - seed_off; }
+// The read's bit planes for orientation ori, with the seed mask when the read is seeded.
+static const aln_meth_read_bits_t &slot_bits(aln_meth_slot_t *x, int ori)
+{
+    if (!(x->bits_ready >> ori & 1)) {
+        const ubyte_t *query = ori ? x->rd_rev.data() : x->rd_fwd.data();
+        aln_meth_read_bits_t &b = x->bits[ori];
+        aln_meth_read_bits(query, x->len, &b);
+        b.seed.clear();
+        if (x->job && x->job->seed_width) {
+            b.seed.assign(b.code.size(), 0);
+            for (int q = 0; q < x->len; ++q)
+                if (seed_pos(q, ori, x->len, x->job->c.seed_off)) b.seed[q >> 5] |= 1ULL << (62 - 2 * (q & 31));
+        }
+        x->bits_ready |= 1 << ori;
+    }
+    return x->bits[ori];
+}
+/* Scores path L of the read at window [rb, rb + span) of contig rid under hypothesis hyp, strand
+ * strand, with site allele site alone in place (--known-snvs; -1: the reference), into o (counts,
+ * cost, CIGARs, start); *seed_mm gets its strict mismatches in the seed's constrained part (0 for an
+ * unseeded read). The bit-parallel blocks serve the 5-letter model on the reference; otherwise the
+ * window is fetched (with that site's ALT, CpG labels) and counted base by base as
+ * account_alignment counts. */
+static bool score_path(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, int hyp, int strand, int64_t rb,
+                       int span, int64_t site, aln_meth_occ_t *o, int *seed_mm)
+{
+    aln_meth_group_t *g = x->grp;
+    const int len = x->len, ori = strand ? 1 : 0;
+    o->rid = rid; o->hyp = hyp; o->strand = strand; o->ks_site = site;
+    o->alignment.rb = rb; o->alignment.re = rb + span;
+    if (!layout_cigar(L, len, &o->alignment.raw_cigar)) return false;
+    *seed_mm = 0;
+    const bool seeded = x->job && x->job->seed_width;
+    if (site < 0 && g->mo->fast.ok) {
+        const aln_meth_read_bits_t &rd = slot_bits(x, ori);
+        aln_meth_amb_bits(*g->ref, rb, span, &x->amb);
+        aln_meth_block_counts_t c;
+        int q = 0, w = 0;
+        for (int k = 0; k <= L.n; ++k) {
+            const int end = k < L.n ? L.qpos[k] : len;
+            if (end > q) aln_meth_score_block(*g->ref, g->mo->fast, hyp, rb + w, q, end - q, rd, x->amb.data(), w, &c);
+            w += end - q; q = end;
+            if (k == L.n) break;
+            ++o->n_gapo; o->n_gape += L.len[k] - 1;
+            if (L.del[k]) { o->n_del += L.len[k]; w += L.len[k]; }
+            else { o->n_ins += L.len[k]; q += L.len[k]; }
+        }
+        o->n_mm = c.n_mm; o->n_conv = c.n_conv; *seed_mm = c.n_seed_mm;
+    } else {
+        std::vector<uint8_t> &win = x->win;
+        fetch_window(g->ref, g->mo, rb, span, rid, win, site);
+        const ubyte_t *query = ori ? x->rd_rev.data() : x->rd_fwd.data();
+        int m;
+        const int8_t *mat = meth_mat(g->mo, hyp, &m);
+        int q = 0, t = 0;
+        for (uint32_t item : o->alignment.raw_cigar) {
+            const int op = item & 15, n = (int)(item >> 4);
+            if (op == 0) {
+                for (int k = 0; k < n; ++k, ++q, ++t) {
+                    const int read = query[q], base = win[t];
+                    if (read > 3 || mat[base * m + read] < 0) {
+                        ++o->n_mm;
+                        if (seeded && seed_pos(q, ori, len, x->job->c.seed_off)) ++*seed_mm;
+                    } else if (read != meth_code_base(base)) ++o->n_conv;
+                }
+            } else {
+                ++o->n_gapo; o->n_gape += n - 1;
+                if (op == 1) { o->n_ins += n; q += n; } else { o->n_del += n; t += n; }
+            }
+        }
+    }
+    o->cost = (int64_t)g->opt->s_mm * o->n_mm + (int64_t)g->opt->s_gapo * o->n_gapo + (int64_t)g->opt->s_gape * o->n_gape;
+    normalize_display(&o->alignment);
+    o->pos = o->alignment.rb;
+    return true;
+}
+// bounded (--known-snvs, a window the ALT-window search proposed): the read's own search never
+// proposes an alignment over its difference limit, so neither may this path. The bound is the
+// gap search's: n_mm + n_gapo (+ n_gape under the default gap-extension mode) <= the read's
+// max_diff, at most max_gapo gap opens and max_gape gap extensions.
+static bool within_read_limits(const aln_meth_slot_t *x, const aln_meth_occ_t &o)
+{
+    const gap_opt_t *op = x->grp->opt;
+    const int max_diff = op->fnr > 0.0 ? bwa_cal_maxdiff(x->len, BWA_AVG_ERR, op->fnr) : op->max_diff;
+    const int diffs = o.n_mm + o.n_gapo + ((op->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
+    return diffs <= max_diff && o.n_gapo <= std::max(0, op->max_gapo) && o.n_gape <= std::max(0, op->max_gape);
+}
+// Applies the strict -n/-k filters and stores o as its locus's candidate (the cheaper wins).
+static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, bool bounded = false)
+{
+    aln_meth_group_t *g = x->grp;
+    // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
+    // seed than -k allows. The converted search cannot see a read C over a reference T, so it can
+    // reach a row within -n (-k) converted differences whose original-reference path has more; drop
+    // it before it is a locus (no X0/X1, MAPQ or pairing). Differences are counted as stock aln
+    // counts them: mismatches plus gap opens, plus gap extensions unless -e was given.
+    const bool gape = g->opt->mode & BWA_MODE_GAPE;
+    const int64_t differences = (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0);
+    if (differences > x->max_diff) { ++x->res->n_over_diff; return; }
+    if (seed_diffs > g->opt->max_seed_diff && x->job && x->job->seed_width) { ++x->res->n_over_seed; return; }
+    if (!(o.cost <= INT_MAX && o.n_mm <= 255 && o.n_gapo <= 255 && o.n_gape <= 255)) {
+        ++x->res->n_unrepresentable;
+        x->unrep_cost = std::min(x->unrep_cost, o.cost);
+        return;
+    }
+    if (bounded && !within_read_limits(x, o)) return;
+    ++x->res->n_rescored;
+    const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
+    // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
+    if (bytes > (64ULL << 20) - x->alignment_bytes) {
+        x->res->flags |= ALN_METH_BIND_CIGAR;
+        x->stop = 1;
+        return;
+    }
+    x->alignment_bytes += bytes;
+    const auto ins = x->loci.insert(aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb}, x->res->occ.size());
+    if (ins.second) x->res->occ.push_back(std::move(o));
+    else {
+        const size_t at = x->loci.val[ins.first];
+        const aln_meth_occ_t &cur = x->res->occ[at];
+        // --known-snvs: the cheaper wins; on equal cost the reference, then the lower
+        // (position, ALT) site allele (aln_site_key order, -1 first). Two rows of the same allele
+        // (the reference, or one site allele) compare as reference rows do.
+        const bool better = o.ks_site == cur.ks_site ? alignment_better(o, cur, conv_tiebreak(g->mo))
+                          : o.cost != cur.cost ? o.cost < cur.cost
+                          : (uint64_t)(o.ks_site + 1) < (uint64_t)(cur.ks_site + 1);
+        if (better) x->res->occ[at] = std::move(o);
+    }
+}
+// Scores a row along path L as the reference and, under --known-snvs, once per site allele in its
+// window with that ALT alone in place (as resolve_with_sites does for a refined window); a site the
+// row does not cover leaves it as the reference's. false: L is not an alignment of the read.
+static bool score_row_sites(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, int hyp, int strand,
+                            int64_t rb, int span, int seed_gaps, bool bounded)
+{
+    aln_meth_group_t *g = x->grp;
+    auto one = [&](int64_t site) {
+        aln_meth_occ_t o;
+        int seed_mm = 0;
+        if (!score_path(x, L, rid, hyp, strand, rb, span, site, &o, &seed_mm)) return false;
+        if (site >= 0) {
+            o.alt = ks_site_rel(g->ref->known_snvs, g->ref->bns, rid, o.alignment.rb, site);
+            if (aln_site_key_pos(site) < o.alignment.rb || aln_site_key_pos(site) >= o.alignment.re || !o.alt) return true;
+        }
+        store_row(x, o, seed_mm + seed_gaps, bounded);
+        return true;
+    };
+    if (!one(-1)) return false;
+    if ((x->res->flags & ALN_METH_BIND_CIGAR) || !g->ref->known_snvs) return true;
+    std::vector<int64_t> keys;
+    aln_meth_window_sites(*g->ref, rb, span, &keys);
+    for (const int64_t key : keys) {
+        if (x->res->flags & ALN_METH_BIND_CIGAR) break; // the read's CIGAR storage is full
+        one(key);
+    }
+    return true;
+}
 /* --known-snvs: resolves a candidate window against the reference, then once per site allele in it
  * (aln_meth_window_sites) with that ALT alone in place; its locus keeps the cheapest (see
  * resolve_one). */
@@ -279,14 +552,15 @@ static void resolve_with_sites(aln_meth_slot_t *x, const aln_meth_candidate_t &c
                                int n_ins, int n_del, bool bounded = false)
 {
     resolve_one(x, candidate, query, -1, n_ins, n_del, bounded);
-    if (x->stop || !x->grp->ref->known_snvs) return;
+    if ((x->res->flags & ALN_METH_BIND_CIGAR) || !x->grp->ref->known_snvs) return;
     std::vector<int64_t> keys;
     aln_meth_window_sites(*x->grp->ref, candidate.rb, (int)(candidate.re - candidate.rb), &keys);
     for (const int64_t key : keys) {
-        if (x->stop) return;
+        if (x->res->flags & ALN_METH_BIND_CIGAR) return; // the read's CIGAR storage is full
         resolve_one(x, candidate, query, key, n_ins, n_del, bounded);
     }
 }
+// Scores one row of hit h (SA value sa) along h's path, as the reference and each site allele.
 static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_t sa)
 {
     aln_meth_group_t *g = x->grp;
@@ -313,125 +587,72 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
             x->res->site_bound.value = std::min(x->res->site_bound.value, h.e.n_gapo ? 0 : (int)h.e.n_mm);
     }
     const int64_t rb = g->ref->bns->anns[rid].offset + (pos - ca.offset);
-    if (!x->windows.insert(aln_meth_win_key_t{rid, hyp, strand, rb, rb + span}, 0).second) return;
-    // A 65535-base read with a deletion spans more than the realigner evaluates. Drop the window
-    // as unrepresentable, with cost 0 as its bound: any retained placement is then incomplete.
+    aln_meth_win_key_t key{rid, hyp, strand, rb, rb + span, aln_meth_layout_t()};
+    meth_layout(h.gap, h.e.n_gapo, x->len, strand, &key.lay);
+    if (layout_span(key.lay, x->len) != span) {
+        fprintf(stderr, "ERROR: --meth search path's gaps (%d) do not give its reference span\n", (int)h.e.n_gapo); exit(1);
+    }
+    if (!x->windows.insert(key, 0).second) return;
+    // A 65535-base read with a deletion spans more than a window holds. Drop the window as
+    // unrepresentable, with cost 0 as its bound: any retained placement is then incomplete.
     if (span > ALN_MAX_READ_LEN) {
         ++x->res->n_unrepresentable;
         x->unrep_cost = 0;
         return;
     }
-    const aln_meth_candidate_t candidate{rid, strand, hyp, rb, rb + span};
-    const ubyte_t *query = strand ? x->rd_rev.data() : x->rd_fwd.data();
-    resolve_with_sites(x, candidate, query, h.e.n_ins, h.e.n_del);
+    const int seed_gaps = x->job && x->job->seed_width
+        ? seed_gap_diffs(h.gap, h.e.n_gapo, x->job->c.seed_off, g->opt->mode & BWA_MODE_GAPE) : 0;
+    if (!score_row_sites(x, key.lay, rid, hyp, strand, rb, span, seed_gaps, false)) {
+        fprintf(stderr, "ERROR: --meth search path (%d gaps: %#x %#x %#x %#x) is not an alignment of the %d-base read\n",
+                (int)h.e.n_gapo, h.gap[0], h.gap[1], h.gap[2], h.gap[3], x->len);
+        exit(1);
+    }
 }
+// A --known-snvs candidate window without a path (its CIGAR is not one): refined by the window DP,
+// as before path costs, and filtered by store_row without -k (it has no seed).
 static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
                         int64_t site, int n_ins, int n_del, bool bounded)
 {
     aln_meth_group_t *g = x->grp;
-    const int rid = candidate.rid, hyp = candidate.hyp, strand = candidate.strand;
-    // bounded (--known-snvs, a window the ALT-window search proposed): the read's own search never
-    // proposes an alignment over its difference limit, so neither may this path. The bound is the
-    // gap search's: n_mm + n_gapo (+ n_gape under the default gap-extension mode) <= the read's
-    // max_diff, at most max_gapo gap opens and max_gape gap extensions.
-    const gap_opt_t *op = g->opt;
-    auto within_limits = [&](const aln_meth_occ_t &c) {
-        const int max_diff = op->fnr > 0.0 ? bwa_cal_maxdiff(x->len, BWA_AVG_ERR, op->fnr) : op->max_diff;
-        const int diffs = c.n_mm + c.n_gapo + ((op->mode & BWA_MODE_GAPE) ? c.n_gape : 0);
-        return diffs <= max_diff && c.n_gapo <= std::max(0, op->max_gapo) && c.n_gape <= std::max(0, op->max_gape);
-    };
     // Realigns the window (band_limit as aln_meth_realign_window takes it) into a fresh o, with
     // fits whether its counts fit a record; false when the result misses its site.
     aln_meth_occ_t o;
     bool fits = false;
-    // The equal-span scorer: when the ungapped alignment provably beats every gapped one (the
-    // bound aln_meth_realign_window applies), the window's alignment is [len M], and its reward
-    // and counts come from 64-bit words instead of a fetched window. Same fields as the DP path,
-    // except the band, which stays 0: the alignment is already ungapped, so no band_limit changes it.
-    const aln_meth_fast_t &fast = g->mo->fast;
-    const int len = x->len;
     // The accounting reads the same window the refinement fetched (same window, contig and site).
     std::vector<uint8_t> &win = x->win;
     auto evaluate = [&](int band_limit) {
         o = aln_meth_occ_t();
-        o.rid = rid; o.hyp = hyp; o.strand = strand; o.ks_site = site;
-        bool scored = false;
-        if (site < 0 && fast.ok && candidate.re - candidate.rb == len && len <= 65535 && g->opt->s_mm >= 0 &&
-            g->opt->s_gapo >= 0 && g->opt->s_gape >= 0) {
-            const int ori = query == x->rd_fwd.data() ? 0 : 1;
-            if (!(x->bits_ready >> ori & 1)) { aln_meth_read_bits(query, len, &x->bits[ori]); x->bits_ready |= 1 << ori; }
-            aln_meth_ungapped_t u;
-            aln_meth_score_ungapped(*g->ref, fast, hyp, candidate.rb, x->bits[ori], &u);
-            if (u.reward > fast.best_cell * (len - 1) - 2 * (5 + 1)) { // ungapped_is_optimal
-                o.alignment.reward = u.reward;
-                o.alignment.rb = candidate.rb; o.alignment.re = candidate.re;
-                o.alignment.raw_cigar.assign(1, (uint32_t)len << 4);
-                o.alignment.cigar = o.alignment.raw_cigar;
-                o.n_mm = u.n_mm; o.n_conv = u.n_conv;
-                o.cost = (int64_t)g->opt->s_mm * o.n_mm;
-                scored = true;
-            }
-        }
-        if (!scored) {
-            const auto status = aln_meth_realign_window(*g->ref, *g->mo, candidate, query, x->len,
-                                                       n_ins, n_del, &o.alignment, site, &win, band_limit);
-            // Invalid/resource/empty normalized alignments must never be silently omitted competitors.
-            if (status != aln_meth_eval_status::ok) {
-                fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
-                exit(1);
-            }
+        o.rid = candidate.rid; o.hyp = candidate.hyp; o.strand = candidate.strand; o.ks_site = site;
+        const auto status = aln_meth_realign_window(*g->ref, *g->mo, candidate, query, x->len,
+                                                   n_ins, n_del, &o.alignment, site, &win, band_limit);
+        // Invalid/resource/empty normalized alignments must never be silently omitted competitors.
+        if (status != aln_meth_eval_status::ok) {
+            fprintf(stderr, "ERROR: --meth cannot evaluate a generated candidate window; stopping\n");
+            exit(1);
         }
         if (site >= 0) { // --known-snvs: a site the alignment does not cover leaves it as the reference's
-            o.alt = ks_site_rel(g->ref->known_snvs, g->ref->bns, rid, o.alignment.rb, site);
+            o.alt = ks_site_rel(g->ref->known_snvs, g->ref->bns, candidate.rid, o.alignment.rb, site);
             if (aln_site_key_pos(site) < o.alignment.rb || aln_site_key_pos(site) >= o.alignment.re || !o.alt) return false;
         }
-        fits = scored ? o.cost <= INT_MAX && o.n_mm <= 255 : account_alignment(g->mo, g->opt, win, query, x->len, &o);
+        fits = account_alignment(g->mo, g->opt, win, query, x->len, &o);
         return true;
     };
     if (!evaluate(-1)) return;
-    // A bounded window whose best-scoring alignment breaks those limits is realigned once more
-    // with its indels held to the window's own extent (n_ins, n_del: ungapped for a window of the
-    // read's length), and kept only if that alignment is within the limits.
-    if (bounded && fits && !within_limits(o)) {
+    // A bounded window whose best-scoring alignment breaks the read's limits (within_read_limits)
+    // is realigned once more with its indels held to the window's own extent (n_ins, n_del:
+    // ungapped for a window of the read's length); store_row keeps it only if that alignment is
+    // within the limits.
+    if (bounded && fits && !within_read_limits(x, o)) {
         const int narrow = std::max(n_ins, n_del);
         if (o.alignment.band > narrow && !evaluate(narrow)) return;
     }
-    // Stock aln never reports a hit with more differences than the read's -n allows. The converted
-    // search cannot see a read C over a reference T, so it can propose a window within -n converted
-    // differences whose original-reference alignment has more; drop it before it is a locus (no
-    // X0/X1, MAPQ or pairing). Differences are counted as stock aln counts them: mismatches plus
-    // gap opens, plus gap extensions unless -e was given; conversions are free.
-    const int64_t differences = (int64_t)o.n_mm + o.n_gapo + ((g->opt->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
-    if (differences > x->max_diff) { ++x->res->n_over_diff; return; }
-    if (!fits) {
+    if (!fits) { // counts past a record's fields
         ++x->res->n_unrepresentable;
         x->unrep_cost = std::min(x->unrep_cost, o.cost);
         return;
     }
-    if (bounded && !within_limits(o)) return;
-    ++x->res->n_rescored;
-    const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
-    // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
-    // This is separate from the wrapper's active-DP budget.
-    if (bytes > (64ULL << 20) - x->alignment_bytes) {
-        x->res->flags |= ALN_METH_BIND_CIGAR;
-        x->stop = 1;
-        return;
-    }
-    x->alignment_bytes += bytes;
     o.pos = o.alignment.rb;
-    const auto ins = x->loci.insert(aln_meth_locus_key_t{rid, hyp, strand, o.alignment.rb}, x->res->occ.size());
-    if (ins.second) x->res->occ.push_back(std::move(o));
-    else {
-        const size_t at = x->loci.val[ins.first];
-        const aln_meth_occ_t &cur = x->res->occ[at];
-        // --known-snvs: the cheaper wins; on equal cost the reference, then the lower
-        // (position, ALT) site allele (aln_site_key order, -1 first)
-        const bool better = o.ks_site < 0 && cur.ks_site < 0 ? alignment_better(o, cur, conv_tiebreak(g->mo))
-                          : o.cost != cur.cost ? o.cost < cur.cost
-                          : (uint64_t)(o.ks_site + 1) < (uint64_t)(cur.ks_site + 1);
-        if (better) x->res->occ[at] = std::move(o);
-    }
+    store_row(x, o, 0, bounded);
 }
 void aln_meth_flush_parked(aln_meth_group_t *g)
 {
@@ -446,23 +667,40 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
         // best-known placement. Resolve just ALN_METH_BIND_ROWS more rows for that placement
         // rather than the rest of the budget. Earlier flushes are unchanged, so the same reads
         // end incomplete.
+        // An interval already resolved (reached again along a path with other gaps) reuses its SA
+        // rows: it costs no lookups, so it does not count toward the budget.
+        auto cached = [&](const aln_meth_pend_t &h) {
+            size_t pos;
+            return x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos);
+        };
+        // Two paths can reach one uncached interval in the same flush: its rows are looked up once.
+        static thread_local std::vector<std::pair<bwtint_t, bwtint_t>> fresh;
+        fresh.clear();
+        for (const auto &h : x.pend) if (cached(h) < 0) fresh.emplace_back(h.k, h.l);
+        std::sort(fresh.begin(), fresh.end());
+        fresh.erase(std::unique(fresh.begin(), fresh.end()), fresh.end());
         int64_t limit = budget, pending = 0;
-        for (const auto &h : x.pend) pending += (int64_t)(h.l - h.k + 1);
+        for (const auto &kl : fresh) pending += (int64_t)(kl.second - kl.first + 1);
         if (pending > budget - x.res->n_lookups)
             limit = std::min<int64_t>(budget, x.res->n_lookups + ALN_METH_BIND_ROWS);
         for (const auto &h : x.pend) {
             if (x.stop) break;
             const bwtint_t width = h.l - h.k + 1;
+            const int32_t c = cached(h);
+            if (c >= 0) {
+                const size_t off = x.sa_ix.val[c];
+                for (bwtint_t r = 0; r < width && !x.stop; ++r) resolve_window(&x, h, x.sa_rows[off + r]);
+                continue;
+            }
             const int64_t remaining = limit - x.res->n_lookups;
             const int n = (int)std::min<uint64_t>(width, (uint64_t)std::max<int64_t>(0, remaining));
-            std::vector<bwtint_t> rows(n);
+            const size_t off = x.sa_rows.size();
+            x.sa_rows.resize(off + n);
+            bwtint_t *rows = x.sa_rows.data() + off;
             for (int k = 0; k < n; ++k) rows[k] = h.k + k;
-            bwt_sa_batch(g->bwt, rows.data(), n, rows.data());
-            for (bwtint_t sa : rows) {
-                if (x.stop) break;
-                ++x.res->n_lookups;
-                resolve_window(&x, h, sa);
-            }
+            bwt_sa_batch(g->bwt, rows, n, rows);
+            if ((bwtint_t)n == width) x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
+            for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
             if ((bwtint_t)n < width) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = 1; }
         }
         x.pend.clear();
@@ -601,7 +839,7 @@ void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng,
     src->hits.swap(hits); src->cig.swap(cig);
     // a copy ran no search: the work counters (aln_meth_report) stay with its first copy
     dst->n_lookups = dst->n_wrong_copy = dst->n_rescored = dst->n_flushes = dst->n_unrepresentable = 0;
-    dst->n_over_diff = 0;
+    dst->n_over_diff = dst->n_over_seed = 0;
     if (src->main >= 0) dst->main = draw_main(src->hits, src->n_conv_moved, rng);
     if (src->main >= 0 && !keep_all && trims(src, src->hits.size(), max_xa_hits)) {
         // Copy only the drawn primary, not the representative's whole locus list.
@@ -633,16 +871,23 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
     aln_meth_read_t *r = x->res;
     if (x->extra) { // --known-snvs: windows the ALT-window search found, resolved as any other
         for (const aln_meth_candidate_t &c : *x->extra) {
-            if (x->stop) break;
+            // a lookup-budget, certificate or search-cut stop still scores them; a CIGAR cap does not
+            if (x->res->flags & ALN_METH_BIND_CIGAR) break;
             if ((c.hyp ^ c.strand) != x->grp->read_no) continue;
-            if (!x->windows.insert(aln_meth_win_key_t{c.rid, c.hyp, c.strand, c.rb, c.re}, 0).second) continue;
             const int64_t span = c.re - c.rb;
-            // As in resolve_window: a span past the realigner's limit is dropped as unrepresentable.
+            // The window search's path (its hit's CIGAR) when it is one: scored as a search row.
+            aln_meth_win_key_t key{c.rid, c.hyp, c.strand, c.rb, c.re, aln_meth_layout_t()};
+            const bool path = !c.cig.empty() && cigar_layout(c.cig.data(), c.cig.size(), &key.lay) &&
+                layout_span(key.lay, x->len) == span;
+            if (!path) key.lay.n = -1;
+            if (!x->windows.insert(key, 0).second) continue;
+            // As in resolve_window: a span past a window's limit is dropped as unrepresentable.
             if (span > ALN_MAX_READ_LEN) {
                 ++r->n_unrepresentable;
                 x->unrep_cost = 0;
                 continue;
             }
+            if (path) { score_row_sites(x, key.lay, c.rid, c.hyp, c.strand, c.rb, (int)span, 0, true); continue; }
             const ubyte_t *query = c.strand ? x->rd_rev.data() : x->rd_fwd.data();
             resolve_with_sites(x, c, query, std::max(0, x->len - (int)span), std::max(0, (int)span - x->len), true);
         }
@@ -691,10 +936,10 @@ void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
     long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0, over = 0;
     for (int i = 0; i < n; ++i) {
         lookups += res[i].n_lookups; wrong += res[i].n_wrong_copy; scored += res[i].n_rescored;
-        dropped += res[i].n_unrepresentable; over += res[i].n_over_diff;
+        dropped += res[i].n_unrepresentable; over += res[i].n_over_diff + res[i].n_over_seed;
         flushes += res[i].n_flushes; incomplete += res[i].flags != 0;
     }
-    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld windows over -n dropped; stock cost/count MAPQ\n",
+    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld rows over -n/-k dropped; stock cost/count MAPQ\n",
             read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over);
 }
 
