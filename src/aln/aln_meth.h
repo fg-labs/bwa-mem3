@@ -143,7 +143,8 @@ struct aln_meth_read_t {
     // the mismatches up to which an unbound search proposes every such window (its difference
     // limit, and the seed's when seeded). Read it through aln_meth_alt_certificate.
     aln_meth_alt_bound_t site_bound;
-    long n_over_diff = 0; // refined windows dropped for more differences than the read's -n allows
+    long n_over_diff = 0; // rows dropped for more strict differences than the read's -n allows
+    long n_over_seed = 0; // rows dropped for more strict differences in the seed than -k allows
 };
 /* The stop certificate a read's ALT-window search gives its genomic search: a lower bound on the
  * mismatches of every ungapped placement that covers a site with that site's ALT in place. A

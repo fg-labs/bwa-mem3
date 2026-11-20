@@ -12,6 +12,7 @@
 #include "../../src/aln/aln_meth.h"
 #include "../../src/aln/aln_meth_search.h"
 #include "../../src/aln/aln_known_snvs.h"
+#include "../../src/aln/aln_meth_realign.h"
 #include "../../src/aln/bwaseqio.h"
 #include "../../src/aln/bwase.h"
 #include "../../src/aln/aln_out.h"
@@ -892,10 +893,10 @@ TEST_CASE("aln_meth: stock cost selects a lower reward refined CIGAR")
         CHECK(tag_value(hits[0], "NM:i") == "5");
         CHECK(tag_value(hits[0], "MD:Z") == "55");
         CHECK(tag_value(hits[0], "X0:i") == "1");
-        // Ordinary cost window ends at 11; -N also retains four worse-cost loci,
-        // including the cost-12 mismatch placement and shifted gapped placements.
-        CHECK(tag_value(hits[0], "X1:i") == (nonstop ? "4" : "0"));
-        CHECK(hits[0].mapq == (nonstop ? 17 : 37));
+        // Ordinary cost window ends at 11; -N also retains two worse-cost loci, the cost-12
+        // mismatch placement and a shifted gapped placement, each scored along its search path.
+        CHECK(tag_value(hits[0], "X1:i") == (nonstop ? "2" : "0"));
+        CHECK(hits[0].mapq == (nonstop ? 20 : 37));
     }
     for (const auto &penalties : {std::vector<std::string>{"0","1","1"},
                                    std::vector<std::string>{"6","0","0"}}) {
@@ -1040,6 +1041,63 @@ TEST_CASE("aln_meth: a refined window over the read's -n limit is not a locus")
     REQUIRE(u3.size() == 1);
     CHECK(u3[0].rname == "u_near");
     CHECK(tag_value(u3[0], "X1:i") == "1");
+}
+
+TEST_CASE("aln_meth: rows are scored along their search path, and -k limits the seed's strict differences")
+{
+    // w (40 bp, seeded under -l 20) has two loci. At k_over its reference holds a T under two read
+    // Cs inside the seed: invisible to the converted search, two strict seed differences. At k_ok
+    // it has three genuine mismatches past the seed. -k applies to strict differences, as -n does,
+    // so under -k 1 only k_ok maps the read; under -k 2, or unseeded, k_over (cost 6) beats k_ok
+    // (cost 9), which is then a retained competitor.
+    uint32_t st = 4242;
+    auto flank = [&]() { return aln_test::lcg_dna(st, 100); };
+    std::string w = aln_test::lcg_dna(st, 40);
+    for (int i : {3, 8}) w[i] = 'C';
+    for (int i : {28, 32, 36}) w[i] = 'A';
+    std::string k_over = w, k_ok = w;
+    for (int i : {3, 8}) k_over[i] = 'T';
+    for (int i : {28, 32, 36}) k_ok[i] = 'G';
+    // g (40 bp): a one-base deletion at a locus otherwise exact; the row's alignment is the path's.
+    std::string g = aln_test::lcg_dna(st, 40);
+    g[19] = 'A'; g[20] = 'G'; g[21] = 'T';
+    const std::string g_ref = g.substr(0, 20) + "C" + g.substr(20);
+    bwa_tests::TempDir tmp{"aln_meth_strict_k"}; // this case's index, reads and output
+    const std::string dir = tmp.path(), fa = dir + "/strict-k.fa";
+    REQUIRE(aln_test::write_test_fasta(fa, {{"k_over", flank() + k_over + flank()},
+                                            {"k_ok", flank() + k_ok + flank()},
+                                            {"g_ref", flank() + g_ref + flank()}}));
+    std::vector<std::string> index_args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &arg : index_args) argv.push_back(&arg[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
+    const std::string fq = write_fq_in(dir, "strict-k.fq", {w});
+    const auto k1 = run_aln({"--meth", "-n", "3", "-l", "20", "-k", "1"}, {fq}, fa, dir);
+    REQUIRE(k1.size() == 1);
+    CHECK(k1[0].rname == "k_ok");
+    CHECK(tag_value(k1[0], "NM:i") == "3");
+    CHECK(tag_value(k1[0], "X0:i") == "1");
+    CHECK(tag_value(k1[0], "X1:i") == "0");
+    for (const auto &options : {std::vector<std::string>{"--meth", "-n", "3", "-l", "20", "-k", "2"},
+                                std::vector<std::string>{"--meth", "-n", "3", "-l", "1024"}}) {
+        const auto v = run_aln(options, {fq}, fa, dir);
+        REQUIRE(v.size() == 1);
+        CHECK(v[0].rname == "k_over");
+        CHECK(tag_value(v[0], "NM:i") == "2");
+        CHECK(tag_value(v[0], "X0:i") == "1");
+        CHECK(tag_value(v[0], "X1:i") == "1");
+    }
+    const auto gv = run_aln({"--meth", "-n", "2", "-l", "1024"}, {write_fq_in(dir, "strict-k-g.fq", {g})}, fa, dir);
+    REQUIRE(gv.size() == 1);
+    CHECK(gv[0].rname == "g_ref");
+    CHECK(gv[0].pos == 101);
+    CHECK(gv[0].cigar == "20M1D20M"); // the deleted C sits between an A and a G: one placement
+    CHECK(tag_value(gv[0], "NM:i") == "1");
 }
 
 TEST_CASE("aln_meth: parallel finish preserves nonzero second-stratum MAPQ")
@@ -1776,6 +1834,20 @@ TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few 
         CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
         CHECK(same(seen_t{slot.windows.key,result.n_wrong_copy},in_order));
     }
+    SUBCASE("an interval two paths reach counts once toward the budget") {
+        // A one-base insertion's path (gap word: S index 25, length 1) to the same interval as the
+        // exact one: its rows reuse the first path's SA rows, so 100 new rows fit the 150 left.
+        mo.p_best=1000;mo.p_second=0;ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_slot_start(&slot,reads,&result,0,3,0);
+        ba::aln_meth_hit(&slot,&exact,0,849);
+        core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
+        REQUIRE(result.n_lookups==850);
+        ba::gap_entry_t ins={};ins.n_gapo=1;ins.n_ins=1;ins.last_diff_pos=25|(1u<<16);
+        ba::aln_meth_hit(&slot,&exact,850,949);ba::aln_meth_hit(&slot,&ins,850,949);
+        core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
+        CHECK(result.n_lookups==950);
+        CHECK(result.flags==0);
+    }
     SUBCASE("the binding flush never resolves past the budget") {
         CHECK(run(1000,{{980},{30}})==std::vector<long>{980,1000});
         CHECK((result.flags&ba::ALN_METH_BIND_BEST)!=0);
@@ -1818,7 +1890,9 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
            pos==(bwtint_t)(mr.conv_bns->anns[1].offset+500)){row=k;break;}
     }
     REQUIRE(row!=(bwtint_t)-1);
-    ba::gap_entry_t exact={},longer={};longer.n_del=1;
+    // A path with a deletion before the read's first base (strand 0: the window's first base), as
+    // its gap event records it (ALN_METH_GAP: the complemented read's last index, 49).
+    ba::gap_entry_t exact={},longer={};longer.n_del=1;longer.n_gapo=1;longer.last_diff_pos=(int)ALN_METH_GAP(49,1,1);
     for(int duplicate=0;duplicate<601;++duplicate) ba::aln_meth_hit(&slot,&exact,row,row);
     ba::aln_meth_hit(&slot,&longer,row,row);
     REQUIRE(slot.pend.size()==2);
@@ -1883,12 +1957,22 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::aln_meth_flush_parked(&group);ba::aln_meth_slot_finish(&slot);
     CHECK(result.flags!=0);CHECK(result.main==-1);CHECK(result.c1==0);
     mo.p_best=1;mo.p_second=0;
+    // An interval reached again along a path with other gaps reuses its SA rows: no lookup, so it
+    // cannot bind the budget.
     ba::aln_meth_slot_start(&slot,reads,&result,2,3,1);
-    ba::aln_meth_hit(&slot,&longer,row,row); // lower reward evaluated first
-    ba::aln_meth_hit(&slot,&exact,row,row); // better window hidden behind the cap
+    ba::aln_meth_hit(&slot,&longer,row,row);
+    ba::aln_meth_hit(&slot,&exact,row,row);
     core.state=ba::GAP_SLOT_PARKED;
     ba::aln_meth_flush_parked(&group);
-    REQUIRE(result.occ.size()==1);CHECK(result.occ[0].alignment.reward < 50);
+    CHECK(result.n_lookups==1);CHECK(result.flags==0);
+    REQUIRE(result.occ.size()==1);CHECK(result.occ[0].cost==0);
+    ba::aln_meth_slot_finish(&slot);
+    ba::aln_meth_slot_start(&slot,reads,&result,2,3,1);
+    ba::aln_meth_hit(&slot,&longer,row,row); // the costlier path evaluated first
+    ba::aln_meth_hit(&slot,&exact,row+1,row+1); // another interval hidden behind the cap
+    core.state=ba::GAP_SLOT_PARKED;
+    ba::aln_meth_flush_parked(&group);
+    REQUIRE(result.occ.size()==1);CHECK(result.occ[0].cost==opt->s_gapo); // the gapped path's row
     ba::aln_meth_slot_finish(&slot);
     REQUIRE(result.main>=0);CHECK(result.flags!=0);CHECK(result.n_rescored==1);
     ba::bwase_initialize(); // standalone caller, before any finish workers
@@ -1907,6 +1991,99 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     mr.bns->n_holes=old_holes; mr.bns->ambs=old_ambs;
     ba::aln_meth_ref_free(&mr);ba::bwt_destroy(bwt);free(opt);
     ba::bwa_free_read_seq(n,reads);CHECK(ba::bwa_seq_close(input)==0);
+}
+
+TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless CIGAR-capped")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("stopped-extra.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1);
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group;
+    const int64_t rb = mr.bns->anns[0].offset + 500;
+    // One known SNV inside the window, so it is scored as the reference and as that site's ALT.
+    const int ref_code = (int)std::string("ACGT").find(ref().c1[520]);
+    REQUIRE(ref_code >= 0);
+    ba::ks_sites_t sites;
+    sites.by_contig.assign(mr.bns->n_seqs, {});
+    sites.by_contig[0] = {{520, (uint8_t)ref_code, (uint8_t)((ref_code + 1) & 3)}};
+    sites.n_sites = 1;
+    mr.known_snvs = &sites;
+    for (bool path : {false, true}) for (int flags : std::vector<int>{0, ba::ALN_METH_BIND_BEST,
+        ba::ALN_METH_BIND_CIGAR, ba::ALN_METH_BIND_CIGAR | ba::ALN_METH_BIND_BEST}) {
+        CAPTURE(path); CAPTURE(flags);
+        ba::aln_meth_read_t result;
+        ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+        std::vector<ba::aln_meth_candidate_t> extra{{0, 0, 1, rb, rb + 50, {}}};
+        if (path) extra[0].cig = {50u << 4};
+        slot.extra = &extra;
+        slot.stop = 1; // lookup budget, certificate or search-cut stop is not a CIGAR cap
+        result.flags = flags;
+        ba::aln_meth_slot_finish(&slot);
+        const bool capped = flags & ba::ALN_METH_BIND_CIGAR;
+        CHECK(result.flags == flags);
+        CHECK(result.n_rescored == (capped ? 0 : 2)); // the reference and the site allele must still be considered
+        if (capped) {
+            CHECK(result.main == -1);
+            CHECK(result.hits.empty());
+        } else {
+            REQUIRE(result.main >= 0);
+            CHECK(result.hits[result.main].pos == (bwtint_t)rb);
+            CHECK(result.hits[result.main].cost == 0);
+        }
+        slot.extra = nullptr;
+    }
+    { // A read carrying the site's ALT: the site allele's row is cheaper than the reference's (one
+      // mismatch there), so the hit credits it, which only scoring that allele can do.
+        std::string alt_read = ref().c1.substr(500, 50);
+        alt_read[20] = "ACGT"[(ref_code + 1) & 3];
+        const std::string alt_fq = write_fq("stopped-extra-alt.fq", {conv(alt_read, 'C', 'T')});
+        ba::bwa_seqio_t *alt_input = ba::bwa_seq_open(alt_fq.c_str());
+        REQUIRE(alt_input != nullptr);
+        int n_alt = 0;
+        ba::bwa_seq_t *alt_reads = ba::bwa_read_seq(alt_input, 1, &n_alt, BWA_MODE_COMPREAD, 0);
+        REQUIRE(n_alt == 1);
+        for (bool path : {false, true}) {
+            CAPTURE(path);
+            ba::aln_meth_read_t result;
+            ba::aln_meth_slot_start(&slot, alt_reads, &result, 0, 3, 1);
+            std::vector<ba::aln_meth_candidate_t> extra{{0, 0, 1, rb, rb + 50, {}}};
+            if (path) extra[0].cig = {50u << 4};
+            slot.extra = &extra;
+            slot.stop = 1;
+            ba::aln_meth_slot_finish(&slot);
+            CHECK(result.n_rescored == 2);
+            REQUIRE(result.main >= 0);
+            const auto &h = result.hits[result.main];
+            CHECK(h.pos == (bwtint_t)rb);
+            CHECK(h.alt == 1); // the window's first (only) site allele
+            CHECK(h.cost == 0);
+            CHECK(h.n_mm == 0);
+            REQUIRE(h.n_cig == 1);
+            CHECK(ba::aln_meth_hit_cigar(result, h)[0] == (50u << 4));
+            slot.extra = nullptr;
+        }
+        ba::bwa_free_read_seq(n_alt, alt_reads);
+        CHECK(ba::bwa_seq_close(alt_input) == 0);
+    }
+    free(opt);
+    mr.known_snvs = nullptr;
+    ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
 }
 
 TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the next read still maps")
@@ -1928,6 +2105,7 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     ba::aln_meth_opt_t mo;
     ba::aln_meth_opt_finish(&mo);
     ba::gap_opt_t *opt = ba::gap_init_opt();
+    opt->mode |= BWA_MODE_NONSTOP; // keep the gapped competitor eligible past best + M
     ba::aln_meth_group_t group;
     group.bwt = bwt; group.ref = &mr; group.mo = &mo; group.opt = opt;
     group.n_slots = 1; group.slot.resize(1);
@@ -1954,7 +2132,8 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     const uint64_t cap = 64ULL << 20;
     slot.alignment_bytes = cap - remaining;
     ba::gap_entry_t exact = {}, longer = {};
-    longer.n_del = 1;
+    longer.n_del = longer.n_gapo = 1;
+    longer.last_diff_pos = (int)ALN_METH_GAP(49, 1, 1); // leading reference deletion
     ba::aln_meth_hit(&slot, &exact, row, row);
     core.state = ba::GAP_SLOT_PARKED;
     ba::aln_meth_flush_parked(&group);
@@ -4245,7 +4424,10 @@ TEST_CASE("aln_meth: equal-cost same-locus windows retain the fewest-conversion 
                 if(pos==(bwtint_t)mr.conv_bns->anns[2*rid+1].offset && strand==0) {row=k;break;}
             }
             REQUIRE(row!=(bwtint_t)-1);
+            // The span-41 path: a deletion after query base 20 (strand 0: the complemented read's
+            // index 19 is the base the deletion follows).
             ba::gap_entry_t entry={};entry.n_del=delta;
+            if(delta) {entry.n_gapo=1;entry.last_diff_pos=(int)ALN_METH_GAP(19,1,1);}
             ba::aln_meth_hit(&slot,&entry,row,row);core.state=ba::GAP_SLOT_PARKED;
             ba::aln_meth_flush_parked(&group);
         }
