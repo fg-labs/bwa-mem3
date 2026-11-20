@@ -266,6 +266,15 @@ How it works:
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual
   cuts. The stock primary is kept while it is still among the best.
+- The window search takes no cuts. The main search takes stock's cuts from its own first hit.
+  When the merged best is lower than its own (a window hit with the ALT credited), or its
+  difference ceiling looser, those cuts can have left out hits the merged set keeps; the read is
+  then searched again on the reference with the merged set's cuts fixed from the start, and those
+  hits are merged instead. A second search that reaches the `-m` bound leaves the read as when it
+  has too many loci (below).
+- Under `-N` the merge keeps every hit within `-n`: it does not trim the merged hits to `-R`, so
+  `--known-snvs -N` reports every hit within `-n`. A main search that stopped on `-R` (`-N -R k`)
+  below the merged best is searched again with no score cut, up to the read's `-n`.
 - Paired end: the insert size is estimated from stock placements first. Mate rescue also aligns
   the mate against its window with each site allele substituted alone, every other site at REF,
   for at most the window's first 32 site alleles in position order (later ones stay at REF), so at
@@ -273,23 +282,27 @@ How it works:
   out of the fragment never replaces another, and equal best scores at loci that do not overlap
   leave the mate unrescued, whether they come from two alignments or from one window whose best is
   tied: a pick survives only if it scores above every such tie.
-- `--meth`: the converted search also resolves the windows that the ALT-window search finds. Each
-  candidate window holding a site, and each mate-rescue window holding one, is realigned against
-  the reference and then once per site allele (each ALT of a multi-allelic site separately) with
-  only that ALT in place, under the same 32-allele cap (a mate-rescue window counts only the sites
-  on its anchor's contig, since rescue never aligns past that contig). The locus keeps the cheapest alignment;
-  on a tie the reference wins, then the lower (position, ALT). An alignment in a window that only
+- `--meth`: the ALT-window search runs first, and the converted search starts from the windows
+  it finds (see [Discovery, refinement and accounting](#discovery-refinement-and-accounting)).
+  Every row over a site, whether the search or the ALT-window search found it, and each
+  mate-rescue window holding one, is scored against the reference and then once per site allele
+  (each ALT of a multi-allelic site separately) with only that ALT in place, under the same
+  32-allele cap (a mate-rescue window counts only the sites on its anchor's contig, since rescue
+  never aligns past that contig). The locus keeps its best row: the lowest cost, then the fewest
+  differences, then (under the neutral TAPS/5base tie-break) the fewest conversions, then the
+  reference, then the lower (position, ALT). An alignment in a window that only
   the ALT-window search proposed is kept only within the read's difference limit, as the read's
   own search would be. When its best-scoring alignment breaks the read's `-n`, `-o` or `-e`
   limits, the window is realigned once more with its indels held to the window's own extent
   (ungapped when the window is the read's length), and that alignment is kept if it is within
   the limits. A pair whose placement assumes an ALT is left out of the insert-size
   estimate.
-- Without `--meth`, reads longer than about 160 bases, reads with more than 256 candidate
-  loci, and reads whose genomic or ALT-window search stopped at the `-m` limit (it may have
-  missed equal-best loci) keep their stock search result. For paired input that end still goes
-  through pairing and ALT-aware mate rescue with its mate, so its final record can still differ
-  from stock's, for example when its mate is credited. Under `--meth` those override limits do not apply to genomic
+- Without `--meth`, reads that do not fit an ALT window (length plus `-e` plus `-o` minus one over
+  160: longer than 154 bases at the defaults), reads with more than 256 candidate loci, and reads
+  whose genomic or ALT-window search stopped at the `-m` limit (it may have missed equal-best
+  loci) keep their stock search result. For paired input that end still goes through pairing and
+  ALT-aware mate rescue with its mate, so its final record can still differ from stock's, for
+  example when its mate is credited. Under `--meth` those override limits do not apply to genomic
   refinement: discovered loci can receive ALT credit under the converted search's own limits
   (its SA lookup budget and `-m`). Full-read ALT-window discovery still requires the read to fit
   inside a fixed window of at most 321 bases; it cannot independently discover an over-budget
@@ -303,9 +316,10 @@ under `--meth`). Without `--meth`, `XM:i` is the mismatch count with the ALT cre
 methylation call string as usual, and no record carries an ALT-credited mismatch count (`XV:Z`'s
 `away` field gives the differences outside each site). A read is unchanged when none of its
 candidate placements covers a site, with three exceptions under `--meth`: batch-wide
-insert-size effects for paired input; a read whose ALT-window search hit a work limit is reported
-as incomplete (MAPQ 0, and for pairs neither end can be promoted by pairing or rescue); and an
-unseeded read over 160 bases cannot stop early (see
+insert-size effects for paired input; a read whose ALT-window search hit a work limit below the
+costs the read retains is reported as incomplete (MAPQ 0, and for pairs neither end can be
+promoted by pairing or rescue); and a read that does not fit an ALT window (length plus `-e` plus
+`-o` minus one over 160) takes no cuts in its main search (see
 [what it does not handle](../user-guide/known-snvs.md#what-it-does-not-handle)). For paired input
 that must hold for both mates: when one mate is placed, moved or rescued
 at a site, its mate's flags, mate fields and MAPQ change with it. Under paired `--meth`, excluding
@@ -598,14 +612,40 @@ at every converted-score boundary. The search stops past `B + M` (stock's score 
 ceiling drops to the best row's differences plus one (stock's top-2 rule, at most `-n`); the
 retained loci obey the same ceiling. Once the best stratum is complete, more than `-R` best
 loci within that ceiling end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
-not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). These cuts apply unless `-N` is given or a penalty is negative. Under
-`--known-snvs` they apply to the main search and to the ALT-window search alike, each from its
-own `B` (the main search scores a window with a site as both haplotypes), for a read that fits an
-ALT window (its longest placement, its length plus `-o` plus `-e`, at most 161 bases); a longer read takes no cuts. A row scored with ALT bases in place can cost less than its
-converted path, so a window whose converted path lies past `B + M` is not resolved even if its
-ALT haplotype would cost less; the ALT-window search, whose index has each site's ALT in place,
-finds such windows for a read over one site. A read over two or more sites that needs more than
-one ALT to fit within `B + M` can be missed.
+not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). These cuts apply unless `-N` is given or a penalty is negative. At equal cost a
+locus keeps its row with the fewest differences, so the retained loci obey the ceiling the
+search applied.
+
+Under `--known-snvs` the read's rows come from two searches, and the cuts that depend on the
+final best (the ceiling and `-R`) are taken only once both have delivered their rows:
+
+- The ALT-window search runs first, as a candidate generator. It takes only the cuts that stay
+  valid for any lower final best: the score cut, the ceiling that cut implies (`(B + M)` divided
+  by the least a difference can cost), and `-R` once every window row cheaper than `B + M` is
+  found, counting each genomic locus once however many overlapping windows hold it (under the
+  TAPS/5base tie-break, only loci with no conversions). It keeps all
+  its rows within `B + M`, also when it stops early, and states how far they are complete.
+- The main search scores those rows before its first step, so its cuts start from them.
+- At its finish each read is audited: the window search was complete below the costs the read
+  retains (`B + M`, or `B` past `-R`), no ceiling applied was tighter than the final one, and an
+  `-R` stop left more than `-R` best loci. A read that fails is reported incomplete, with the
+  window search's limit (and so no TAPS/5base conversion tie-break). A window search that stopped
+  early above those costs leaves the read complete. Without `--known-snvs` the audit only counts
+  (shown with `-v 4`).
+- The main search takes the cuts only for a read that fits an ALT window: its longest placement
+  (its length plus a deleted base per gap open and extension `-o` and `-e` allow) at most 161
+  bases, which is its length plus `-e` plus `-o` minus one at most 160 (154 bases at the
+  defaults), so that every placement of it over a site lies inside that site's window. A longer read's main search runs to its `-n`; the
+  ALT-window search still takes its cuts.
+
+For a read that fits an ALT window, the result equals `--meth` without `--known-snvs` on the
+reference plus one ALT window per site allele. Every row over a site is scored on the reference
+and once per site allele with only that ALT in place, the haplotypes the two indexes hold, so
+the search's converted path score stays a lower bound on each row's cost and the cuts and the
+audit cover every row the output can hold. A read is credited at most one ALT: a second ALT on
+the same read counts as a difference, as it would against that one-ALT window. Stock's deletion
+rule (`-d`) and its bounds can differ between the reference, the windows and one combined index.
+Mate rescue scores each site allele alone in the same way.
 
 **Saturation certificates (single-end).** Under the stock cuts, a single-end read's rows are
 verified stratum by stratum in converted score, narrow hits first and wide ones (more than 256
@@ -625,6 +665,8 @@ cannot change the stock output ([#786](https://github.com/fg-labs/bwa-mem3/pull/
   with the fewest conversions; not using all of `-n`, where stock MAPQ is 25) and at least 255
   retained worse loci: MAPQ 0, `X0` 1 and `X1` the verified count, a lower bound.
 
+The certificates are off under `--known-snvs`, in both searches: a certificate rests on a best
+that later rows cannot lower, which the main search has only once the ALT-window rows are in.
 Other reads verify every row up to a row budget of 16,384 (4,596 without the certificates: with
 `-N`, a negative penalty, `--known-snvs` or before pairing is decided for paired-end input). A
 tie-break repeat that neither certificate closes ends incomplete past 4,596 rows, as before. A

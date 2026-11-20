@@ -23,9 +23,10 @@ Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,
 without exceeding the budget, to choose its best-known placement. Such incomplete reads have
 MAPQ 0 and omit `X0`/`X1`/`XA`; their `POS` and `CIGAR` can differ from the previous
-implementation. Incomplete ALT-window discovery under `--known-snvs` also marks the genomic result
-incomplete before confidence calculation and pairing, including the twin searches. A retained
-placement from truncated discovery therefore cannot certify a unique high-MAPQ hit.
+implementation. Under `--known-snvs`, ALT-window discovery that stopped below the costs a read
+retains also marks the genomic result incomplete before confidence calculation and pairing,
+including the twin searches. A retained placement from truncated discovery therefore cannot
+certify a unique high-MAPQ hit.
 
 Historical comparisons on ultrashort 5-base and EM-seq slices, each containing 1 million read
 pairs, found changed MAPQ-0 placements and some ends that lost their MAPQ-0 placement and became

@@ -41,9 +41,10 @@ struct ks_sites_t {
  * ambiguous N run), is an error naming it. Returns 0, or -1 with an error on stderr. */
 int ks_load(const char *path, const bntseq_t *bns, const uint8_t *pac, ks_sites_t *out);
 
-/* Half-width of an ALT window: a read up to KS_WINDOW_HALF - (max gap extensions) bases long that
- * covers a site lies inside its window. Longer reads are searched too, but ordinary placement
- * override falls back to stock; methylation genomic refinement and paired rescue have separate bounds. */
+/* Half-width of an ALT window: a read that fits one (ks_fits_window) and covers a site lies inside
+ * its window. Longer reads are searched too, but ordinary placement override falls back to stock
+ * and the --meth main search takes no cuts; methylation genomic refinement and paired rescue have
+ * separate bounds. */
 #define KS_WINDOW_HALF 160
 
 /* Whether a read of len bases fits an ALT window under the search options opt. A window is the
