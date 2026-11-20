@@ -144,6 +144,12 @@ Each change to upstream-derived code adds a line here.
   mate alignment in `bwa_sw_core` calls bwa-mem3's `ksw_align` and `ksw_global`, which match stock's up to cosmetics;
   `aln_parity.sh` is the check. `infer_isize`'s `erfc`/`sqrt` loop, the pairing score's `log`/`erfc` and the
   `int += double` arithmetic in `bwa_paired_sw_core` are kept verbatim on the default path; the objects are built with `-ffp-contract=off`.
+  On the default path, the one change in `pairing` is the conversion of that score's insert-size penalty to `int`: a non-finite penalty
+  (an underflowed tail, or 0/0) is undefined to convert, and `pair_insert_penalty` defines it as `INT_MIN`, the value
+  x86-64 builds of stock produce, so the ranking is stock x86-64's on every target. On aarch64,
+  the changed runner-up cost can change MAPQ at extreme mismatch penalties even when the selected positions agree
+  ([#803](https://github.com/fg-labs/bwa-mem3/pull/803)); `--meth` and `--short-insert` pairing skip such a candidate instead
+  ([#751](https://github.com/fg-labs/bwa-mem3/pull/751)).
 - `bwtaln.h`, `bwape.cpp`/`bwape.h`: the default-zero `pe_opt_t::short_insert` enables
   `--short-insert` for ordinary and methylation-aware paired alignment. `infer_isize`
   then floors the lower interquartile fence at one base instead of the batch's longest

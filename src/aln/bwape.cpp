@@ -10,6 +10,9 @@
  * (the two stderr lines), so the driver can run them in parallel; each holds upstream's loop body,
  * except that bwa_pe_se_pos and bwa_pe_pair make their SA lookups in batches (bwt_sa_batch) ahead
  * of the code that uses them, and bwa_pe_pair is restructured into per-group phases for that.
+ * pairing's insert-size penalty goes through pair_insert_penalty, which defines the conversion
+ * of a non-finite penalty as INT_MIN (the value x86-64 builds of upstream produce); --meth
+ * and --short-insert pairing skip such a candidate instead.
  * The bwa_paired_sw wrapper itself is not kept (nothing calls it). bwa_pe_pairing and
  * bwa_pe_pair_grouped expose pairing and the grouping to the unit tests. Pairing sorts its rows
  * with pdqsort_128 in place of ks_introsort_128; the sorted array is the same. See README.md. */
@@ -17,6 +20,7 @@
 #include "aln_alloc.h"
 
 #include <algorithm>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -161,6 +165,22 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 	return 0;
 }
 
+/* The insert-size penalty upstream adds to a pair's cost as
+ * (int)(-4.343 * log(.5 * erfc(M_SQRT1_2 * fabs(l - avg) / std)) + .499). The value is not
+ * always finite: an insert far into the tail of a narrow estimate underflows erfc to 0 (+inf),
+ * and a standard deviation of exactly 0 makes an insert at an integer mean 0/0 (NaN).
+ * infer_isize can yield zero SD after filtering, but only with a nonintegral mean, so an
+ * integer insert still produces +inf rather than NaN. Converting either is undefined: x86-64 builds produce
+ * INT_MIN and aarch64 builds INT_MAX for +inf (a constant offset that ranks candidates the
+ * same) and 0 for NaN. The changed cost magnitude can alter MAPQ at extreme mismatch penalties
+ * even when the winning positions agree. Stock pairing now uses x86-64's INT_MIN on every target; a finite
+ * penalty (at least .499 and far below INT_MAX) is converted as before. --meth and --short-insert
+ * pairing skip a non-finite candidate before this conversion, so they reach here only with a finite one. */
+static inline int pair_insert_penalty(double p)
+{
+	return isfinite(p) ? (int)p : INT_MIN;
+}
+
 template <bool SameContig = false>
 static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
                    const isize_info_t *ii, const bntseq_t *bns = nullptr)
@@ -213,10 +233,10 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 			if (ii->high) { \
 				const double penalty = -4.343 * log(.5 * erfc(M_SQRT1_2 * fabs(l - ii->avg) / ii->std)) + .499; \
 				/* --meth pairing (the only SameContig caller) and --short-insert: a narrow estimate can \
-				 * underflow the tail; do not score an unrepresentable candidate. Without either option \
-				 * pairing is upstream's. */ \
+				 * underflow the tail; do not score an unrepresentable candidate. Stock pairing converts \
+				 * it as x86-64 does. */ \
 				if ((SameContig || opt->short_insert) && (!isfinite(penalty) || penalty > INT_MAX)) break; \
-				s += (int)penalty; \
+				s += pair_insert_penalty(penalty); \
 			} \
 			s = s<<32 | (uint32_t)hash_64((u).x<<32 | (v).x); \
 			if (s>>32 == o_score>>32) ++o_n; \

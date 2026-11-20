@@ -1684,3 +1684,130 @@ TEST_CASE("aln_pe: short-insert pairs -q-trimmed reads that cover a fragment sho
         }
     }
 }
+
+TEST_CASE("aln_pe: a pair whose insert penalty is not finite scores as on x86-64"
+          * doctest::test_suite("unit/aln_pe")) {
+    // Upstream adds (int)(-4.343 * log(.5 * erfc(...)) + .499) to the pair cost; converting a
+    // non-finite value is undefined. x86-64 builds produce INT_MIN, which every target now uses.
+    // Pair A sits at the insert-size mean and pair B away from it; y = hit << 2 | strand << 1 | read
+    // and insert = mate position + 50 - first position (A 250 + 50 - 100 = 200, B 1080 + 50 - 1000
+    // = 130).
+    ba::bwase_initialize();
+    ba::pe_opt_t *pe = ba::bwa_init_pe_opt();
+    REQUIRE(pe != nullptr);
+    struct Case { const char *name; double std; int a_score, b_score; bool b_wins; int mapq; unsigned b_pos; };
+    const Case cases[] = {
+        // std 0 with an integer mean (constructed, not inferred). A's penalty is 0/0 = NaN, B's +inf;
+        // both score INT_MIN, so the cheaper B wins, as on x86-64. aarch64 converted the NaN to 0
+        // and picked the costlier A without the change. B is chosen with o_n 1 and A more than
+        // s_mm * 10 behind (mapQ_p 23); both ends move, so MAPQ is 23 - 20.
+        {"std 0: NaN and +inf", 0.0, 3, 0, true, 3, 1000},
+        // Equal alignment costs distinguish INT_MIN for NaN from INT_MAX: the penalties tie,
+        // so the coordinate hash selects B; moving both ends with a tied competitor yields MAPQ 0.
+        {"std 0: equal-cost NaN and +inf", 0.0, 0, 0, true, 0, 1003},
+        // std 0.1 (reachable): A's penalty is finite, B's +inf (700 standard deviations). The
+        // finite-penalty pair ranks ahead although it costs more; neither end moves, so the
+        // pair's MAPQ is the sum of the two, capped at 60.
+        {"std 0.1: finite and +inf", 0.1, 3, 0, false, 60, 1000},
+    };
+    for (const auto &c : cases) {
+        const std::string name = c.name;
+        CAPTURE(name);
+        ba::bwa_seq_t reads[2] = {};
+        ba::bwa_seq_t *p[2] = {reads, reads + 1};
+        ba::bwt_aln1_t hits[2][2] = {};
+        for (int j = 0; j < 2; ++j) {
+            p[j]->len = p[j]->full_len = 50;
+            p[j]->type = BWA_TYPE_UNIQUE;
+            p[j]->mapQ = p[j]->seQ = 37;
+            p[j]->aln = hits[j];
+            hits[j][0].score = c.a_score;
+            hits[j][1].score = c.b_score;
+        }
+        p[0]->pos = 100; p[0]->strand = 0; p[0]->score = c.a_score;
+        p[1]->pos = 250; p[1]->strand = 1; p[1]->score = c.a_score;
+        std::vector<pair64_t> rows = {{100, 0}, {250, 3}, {c.b_pos, 4}, {c.b_pos + 80, 7}};
+        pair64_v v;
+        v.a = rows.data(); v.n = v.m = rows.size();
+        ba::isize_info_t ii = {};
+        ii.avg = 200.0; ii.std = c.std; ii.low = 50; ii.high = 300; ii.high_bayesian = 300;
+        const int changed = ba::bwa_pe_pairing(p, &v, pe, 3, &ii);
+        CHECK(p[0]->pos == (c.b_wins ? c.b_pos : 100u));
+        CHECK(p[1]->pos == (c.b_wins ? c.b_pos + 80 : 250u));
+        CHECK((int)p[0]->strand == 0); CHECK((int)p[1]->strand == 1);
+        CHECK(p[0]->score == (c.b_wins ? c.b_score : c.a_score));
+        CHECK(p[1]->score == (c.b_wins ? c.b_score : c.a_score));
+        CHECK((p[0]->extra_flag & SAM_FPP) != 0); CHECK((p[1]->extra_flag & SAM_FPP) != 0);
+        CHECK((int)p[0]->mapQ == c.mapq); CHECK((int)p[1]->mapQ == c.mapq);
+        CHECK((int)p[0]->seQ == (c.b_wins ? 0 : 37)); CHECK((int)p[1]->seQ == (c.b_wins ? 0 : 37));
+        CHECK(changed == (c.b_wins && c.mapq > 0 ? 2 : 0));
+    }
+    free(pe);
+}
+
+TEST_CASE("aln_pe: filtered insert observations can infer zero SD with a fractional mean"
+          * doctest::test_suite("unit/aln_pe")) {
+    // The initial population has 20 observations, but the longest-read floor retains only
+    // [200, 200, 201, 201]. Their squared deviations sum to 1, canceling stock's -1 seed.
+    ba::bwa_seq_t reads[2][21] = {};
+    const int inserts[] = {100,100,100,100,100,100,100,100,100,100,
+                           150,150,150,150,150,150,200,200,201,201};
+    for (int i = 0; i < 20; ++i) for (int j = 0; j < 2; ++j) {
+        auto &read = reads[j][i];
+        read.mapQ = 37; read.len = read.full_len = 50;
+        read.pos = 100 + 500 * i + j * (inserts[i] - 50); read.strand = j;
+    }
+    for (int j = 0; j < 2; ++j) reads[j][20].len = reads[j][20].full_len = 200;
+    ba::bwa_seq_t *ends[] = {reads[0], reads[1]};
+    ba::isize_info_t inferred = {};
+    REQUIRE(ba::infer_isize(21, ends, &inferred, 1e-5, 100000, nullptr, 0) == 0);
+    CHECK(inferred.low == 200); CHECK(inferred.high == 250);
+    CHECK(inferred.avg == 200.5); CHECK(inferred.std == 0);
+    auto penalty = [](int insert, double mean, double sd) {
+        return -4.343 * std::log(.5 * std::erfc(M_SQRT1_2 * std::fabs(insert - mean) / sd)) + .499;
+    };
+    CHECK(std::isinf(penalty(200, inferred.avg, inferred.std)));
+    CHECK(std::isinf(penalty(201, inferred.avg, inferred.std)));
+    CHECK(std::isnan(penalty(200, 200.0, 0.0)));
+}
+
+TEST_CASE("aln_pe: non-finite runner-up cost uses x86 MAPQ at the largest safe mismatch penalty"
+          * doctest::test_suite("unit/aln_pe")) {
+    // A real inferred positive SD gives the selected insert a penalty of 7 and the runner-up
+    // +inf. X86's packed INT_MIN cost makes their gap exceed 10 * -M by one; ARM's former
+    // INT_MAX conversion made it equal. Keep the normalized branch, not the inherited wrap.
+    ba::bwa_seq_t calibration[2][20] = {};
+    for (int i = 0; i < 20; ++i) for (int j = 0; j < 2; ++j) {
+        const int insert = i < 6 ? 199 : i < 8 ? 200 : 201;
+        auto &read = calibration[j][i];
+        read.mapQ = 37; read.len = read.full_len = 50;
+        read.pos = 1000 + 500 * i + j * (insert - 50); read.strand = j;
+    }
+    ba::bwa_seq_t *ends[] = {calibration[0], calibration[1]};
+    ba::isize_info_t inferred = {};
+    REQUIRE(ba::infer_isize(20, ends, &inferred, 1e-5, 100000, nullptr, 0) == 0);
+    CHECK(inferred.avg == doctest::Approx(200.3));
+    CHECK(inferred.std == doctest::Approx(std::sqrt(.76)));
+    const double finite = -4.343 * std::log(.5 * std::erfc(M_SQRT1_2 * std::fabs(201 - inferred.avg) / inferred.std)) + .499;
+    REQUIRE((int)finite == 7);
+    REQUIRE(std::isinf(-4.343 * std::log(.5 * std::erfc(M_SQRT1_2 * std::fabs(130 - inferred.avg) / inferred.std)) + .499));
+    ba::bwase_initialize();
+    auto *pe = ba::bwa_init_pe_opt(); REQUIRE(pe != nullptr);
+    ba::bwa_seq_t reads[2] = {}; ba::bwa_seq_t *pair[] = {reads, reads + 1};
+    ba::bwt_aln1_t hits[2][2] = {};
+    for (int j = 0; j < 2; ++j) {
+        reads[j].len = reads[j].full_len = 50; reads[j].type = BWA_TYPE_UNIQUE;
+        reads[j].mapQ = reads[j].seQ = 37; reads[j].aln = hits[j];
+        reads[j].pos = 2000 + 100 * j;
+    }
+    pair64_t rows[] = {{100, 0}, {251, 3}, {1000, 4}, {1080, 7}};
+    pair64_v v = {}; v.a = rows; v.n = v.m = 4;
+    CHECK(ba::bwa_pe_pairing(pair, &v, pe, 214748364, &inferred) == 2);
+    CHECK(reads[0].pos == 100); CHECK(reads[1].pos == 251);
+    CHECK((int)reads[0].strand == 0); CHECK((int)reads[1].strand == 1);
+    CHECK(reads[0].score == 0); CHECK(reads[1].score == 0);
+    CHECK((int)reads[0].mapQ == 3); CHECK((int)reads[1].mapQ == 3);
+    CHECK((int)reads[0].seQ == 0); CHECK((int)reads[1].seQ == 0);
+    CHECK((reads[0].extra_flag & SAM_FPP) != 0); CHECK((reads[1].extra_flag & SAM_FPP) != 0);
+    free(pe);
+}

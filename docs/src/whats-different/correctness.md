@@ -858,6 +858,54 @@ parity regression's reference (phiX plus synthetic contigs; single- and paired-e
 `test/regression/aln_parity.sh` (stock's single- and paired-end output with its `@HD` moved to the
 top, and its warning).
 
+## `aln`: a non-finite insert-size penalty in paired-end pairing (PR #803)
+
+bwa 0.7.19's `sampe` pairing (`pairing` in `bwape.c`) adds an insert-size penalty to each
+candidate pair's cost, `(int)(-4.343 * log(.5 * erfc(M_SQRT1_2 * fabs(l - avg) / std)) + .499)`.
+The value inside the cast is not always finite. An insert far enough into the tail of a narrow
+estimate underflows `erfc` to 0, so the penalty is `+inf`; with a standard deviation of exactly 0,
+an insert at the mean is 0/0, so it is `NaN`. Converting either to `int` is undefined. x86-64
+builds produce `INT_MIN` for both, which keeps such candidates in cost order among themselves and
+behind every candidate with a finite penalty. aarch64 builds saturate `+inf` to `INT_MAX`, which
+offsets every such candidate's cost by the same constant from x86-64's and so ranks candidates the
+same, but convert `NaN` to 0, which would rank a candidate at the mean ahead of a cheaper one.
+
+On the default path, `bwa-mem3 aln` computes the penalty as a `double` and uses `INT_MIN` whenever
+it is not finite, on every target; a finite penalty (at least .499, and far below `INT_MAX`) is
+converted as before.
+This defines the conversion as the value x86-64 builds already produced, the policy `mem`'s pair
+score follows ([PR #659](#--meth-pair-with-a-negative-score-end-on-aarch64-pr-659)).
+
+`infer_isize` can produce a standard deviation of exactly 0 after filtering: its minimum of 20
+observations is checked before the longest-read floor removes observations. For example, an
+initial population of ten inserts of 100, six of 150, two of 200 and two of 201, plus an unmapped
+200-base read, retains only `[200,200,201,201]`. Their squared deviations sum to 1, cancelling the
+variance accumulator's initial -1, and yield mean 200.5 and SD 0. This does not produce a `NaN`
+penalty: an integer insert cannot equal that mean. More generally, at an integer mean a zero sum
+of squared deviations gives negative variance, while any nonzero integer deviations sum to at
+least 2 because the deviations sum to zero. Thus an inferred zero-SD estimate has a nonintegral
+mean; `0/0` requires a constructed integer-mean, zero-SD estimate.
+
+Matching candidate order does not guarantee matching MAPQ, which also uses the difference
+between the best and runner-up costs. On aarch64, replacing `INT_MAX` with the x86-64 policy can
+change that difference at a supported extreme mismatch penalty. Synthetic pairs with inferred
+mean 200.3 and SD approximately 0.87178 give a winning insert of 201 a penalty of 7, and a
+runner-up insert of 130 a non-finite penalty. With `-M 214748364`, the normalized cost difference
+is one above `10 * -M` rather than equal to it: both selected positions stay the same, but MAPQ
+changes from 232 to 3. The inherited large-penalty MAPQ arithmetic is otherwise unchanged.
+
+Scope: **paired-end `aln` without `--meth` or `--short-insert`, only for a candidate whose
+insert-size penalty is not finite.** `--meth` and `--short-insert` pairing share this code but skip
+such a candidate before the conversion
+([#751](https://github.com/fg-labs/bwa-mem3/pull/751), [#752](https://github.com/fg-labs/bwa-mem3/pull/752)). The conversion policy also applies with
+`--ref-span-insert`, but that option changes insert measurement and is outside the stock-bwa
+byte-identity scope. Without `--meth`, `--short-insert`, or `--ref-span-insert`, x86-64 output is
+byte-identical to bwa 0.7.19 by construction (this is the value its x86-64 builds produce). Aarch64 candidate
+ranking agrees for inferred estimates, but MAPQ can differ at extreme mismatch penalties as
+shown above. Pinned by `test/unit/test_aln_pe.cpp`: finite versus non-finite candidate ordering,
+a constructed integer-mean zero-SD estimate, the filtered four-observation estimate, and selected
+positions plus MAPQ at the large-penalty boundary.
+
 ## Upstream port divergences: all chains dropped by the weight filter (PR #489) and the SA sentinel offset (PR #469)
 
 bwa-mem2 advertises output identical to bwa. Two records are known where its port is not
@@ -915,6 +963,7 @@ shipped, because parity with that release is its contract (see
 | A read base `-` is scored as `N` | [#639](https://github.com/fg-labs/bwa-mem3/pull/639) | — | fork-only, also under `--compat` (reads containing `-` only; upstream scores it by an out-of-row matrix read and prints a NUL in SEQ; input with no `-` byte-identical by construction; other pairs in a batch with `-` reads can change only through the insert-size estimate) |
 | `--meth` pair with a negative-score end on aarch64 | [#659](https://github.com/fg-labs/bwa-mem3/pull/659) | — | fork-only (`--meth` paired-end on aarch64 only, where a read with a negative-score end paired at `MAPQ` 191/209 with no `AS`; it now scores as x86 builds did; x86 and non-`--meth` output byte-identical by construction — see the correctness note above) |
 | `aln`: a user `@HD` in `-r` is written first | [#797](https://github.com/fg-labs/bwa-mem3/pull/797) | [lh3/bwa#442](https://github.com/lh3/bwa/issues/442) | fork-only (`aln` with an `@HD` line in `-r`: it replaces the default and moves to the first line, and bwa's warning is kept; records and every other header line but `@PG` byte-identical to bwa 0.7.19 on the parity regression (phiX plus synthetic contigs; x86-64 AVX2, arm64 NEON). `mem --meth`: several `-H` `@HD` lines keep only the first, and an empty `-H` line is dropped instead of failing the run, as in plain `mem`) |
+| `aln`: a non-finite insert-size penalty in pairing | [#803](https://github.com/fg-labs/bwa-mem3/pull/803) | — | fork-only (paired-end `aln` without `--meth` or `--short-insert`, which skip such a candidate: a non-finite penalty scores as `INT_MIN`, the value x86-64 builds produced; removes undefined behavior; x86-64 output without `--ref-span-insert` byte-identical to bwa 0.7.19 by construction (`--ref-span-insert` uses the same conversion but changes insert measurement), while aarch64 MAPQ can change at extreme mismatch penalties even with inferred estimates and unchanged winning positions) |
 
 ---
 

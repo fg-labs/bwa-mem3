@@ -528,7 +528,8 @@ penalties, and equal choices use deterministic original-contig/coordinate orderi
 ([#751](https://github.com/fg-labs/bwa-mem3/pull/751)). A candidate pair whose
 insert-size penalty is not finite (an insert so far into the tail of a narrow estimate
 that the Gaussian tail underflows to 0) is skipped, as cap rescue already skips one;
-stock `aln` pairing is unchanged.
+stock `aln` pairing without `--short-insert` instead scores it as `INT_MIN`, the value stock's x86-64 builds produce
+(see **Insert-size penalty in pairing** under [Notes](#notes)).
 
 This is placement recovery, not confidence recovery. The rescued end remains
 incomplete at MAPQ 0 with `XT:A:M`, no exact `X0`/`X1`/`XA`, and no proper-pair flag
@@ -573,6 +574,15 @@ lookup, window, dropped and incomplete counts.
   trim) ends the run after that pair is written, with an error and exit 1, as
   `bwa sampe` stops.
 - **No `.sai` files.** Nothing is written between the search and the SAM stage.
+- **Insert-size penalty in pairing.** Paired-end pairing converts stock's insert-size
+  penalty to an integer; when it is not finite, which stock leaves undefined, every build
+  uses `INT_MIN`, the value stock's x86-64 builds produce (`--meth` and `--short-insert`
+  pairing skip such a candidate instead; see **Pairing and limits**). This preserves x86-64 behavior.
+  On aarch64, the changed runner-up cost can change MAPQ at extreme mismatch penalties, even
+  with an inferred insert-size estimate and unchanged winning positions (for example,
+  `-M 214748364` can change MAPQ from 232 to 3)
+  ([correctness note](../whats-different/correctness.md#aln-a-non-finite-insert-size-penalty-in-paired-end-pairing-pr-803);
+  [#803](https://github.com/fg-labs/bwa-mem3/pull/803)).
 - **Header without `--meth`.** `@HD`, `@SQ` (unless the `-r` text has an `@SQ` line), the `-r`
   line, then `@PG`. The `@HD` is the default `@HD VN:1.5 SO:unsorted GO:query`
   unless the `-r` text has a line that starts `@HD<tab>`: then that line, the
