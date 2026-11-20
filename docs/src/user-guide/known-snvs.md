@@ -58,10 +58,10 @@ The twin fields are `NA,NA` for:
 
 Without `--meth`, a read with more than 256 candidate loci, too long for an ALT window (its
 length plus `-e` plus `-o` minus one over 160: longer than 154 bases at the defaults), or whose
-genomic or ALT-window search stopped at the `-m` limit keeps its stock search result, but its
-first `R` or `A` site still gets a twin. For paired input, pairing and ALT-aware mate rescue still
-use that end with its mate, so its final record can still differ from stock's, for example when
-its mate is credited. The twin fields are numeric
+genomic or ALT-window search (or a second search with the merged cuts) stopped at the `-m` limit
+keeps its stock search result, but its first `R` or `A` site still gets a twin. For paired input,
+pairing and ALT-aware mate rescue still use that end with its mate, so its final record can still
+differ from stock's, for example when its mate is credited. The twin fields are numeric
 when that search completes. Twins use the original quality-trimmed bases, including the mate's
 trimmed bases for paired input.
 
