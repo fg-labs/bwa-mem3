@@ -741,7 +741,8 @@ int main_resa(int argc, char *argv[]) // the "re-sa" command
 		return 1;
 	}
 	for (int i = 0; i < 5; ++i) {
-		if (count_raw[i] < 0 || count_raw[i] > ref_seq_len ||
+		/* Raw counts leave out the one sentinel: at most ref_seq_len - 1. */
+		if (count_raw[i] < 0 || count_raw[i] > ref_seq_len - 1 ||
 		    (i > 0 && count_raw[i] < count_raw[i - 1])) {
 			fprintf(stderr, "[re-sa] %s: count[] corrupt (bad/non-monotonic)\n", cp_path);
 			close(fd);

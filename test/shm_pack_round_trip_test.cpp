@@ -288,11 +288,19 @@ int main(int argc, char *argv[]) {
     CHECK_EQ(bwa_shm_stage(prefix), 0);
     CHECK_EQ(bwa_shm_test(prefix), 1);
     CHECK_EQ(bwa_shm_stage(prefix), 0);
-    size_t attached_len = 0;
-    uint8_t *attached = bwa_shm_attach(prefix, &attached_len);
+    size_t attached_len = 0, map_len = 0;
+    uint8_t *attached = bwa_shm_attach(prefix, &attached_len, &map_len);
     CHECK(attached != NULL);
     CHECK(attached_len > sizeof(bwa_shm_header_t));
-    CHECK_EQ(munmap(attached, attached_len), 0);
+    /* The mapping is the whole POSIX object, whatever size the platform gave it. */
+    const int staged_fd = shm_open(segment, O_RDONLY, 0);
+    CHECK(staged_fd >= 0);
+    struct stat staged_st;
+    CHECK_EQ(fstat(staged_fd, &staged_st), 0);
+    CHECK_EQ(close(staged_fd), 0);
+    CHECK_EQ(map_len, (size_t)staged_st.st_size);
+    CHECK(map_len >= attached_len);
+    bwa_shm_detach(attached, map_len);
     CHECK_EQ(bwa_shm_destroy(), 0);
     errno = 0;
     const int leftover_fd = shm_open(segment, O_RDONLY, 0);

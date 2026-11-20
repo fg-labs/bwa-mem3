@@ -108,6 +108,68 @@ void indexEle::bwa_idx_load_ele(const char *hint, int which, int pread_workers)
     free(prefix);
 }
 
+bool indexEle::shm_bns_ok(const bntseq_t *bns, uint64_t sz_ambs, uint64_t sz_anns,
+                          char *why, size_t why_len)
+{
+    char scratch[160];
+    if (why == NULL) { why = scratch; why_len = sizeof(scratch); }
+    /* A corrupt or maliciously crafted segment could otherwise drive
+     * negative/overflowing size computations. Bounds match the writer-side
+     * checks in bwa_shm_compute. */
+    if (bns->n_seqs < 0 || bns->n_holes < 0 || bns->l_pac <= 0) {
+        snprintf(why, why_len, "shm BNS_STRUCT scalars out of bounds "
+                 "(n_seqs=%d n_holes=%d l_pac=%lld)",
+                 bns->n_seqs, bns->n_holes, (long long)bns->l_pac);
+        return false;
+    }
+    if ((int64_t)sz_ambs != (int64_t)bns->n_holes * (int64_t)sizeof(bntamb1_t)) {
+        snprintf(why, why_len, "BNS_AMBS size %llu != n_holes %d * sizeof(bntamb1_t) %llu",
+                 (unsigned long long)sz_ambs, bns->n_holes,
+                 (unsigned long long)sizeof(bntamb1_t));
+        return false;
+    }
+    if ((int64_t)sz_anns != (int64_t)bns->n_seqs * (int64_t)sizeof(bntann1_t)) {
+        snprintf(why, why_len, "BNS_ANNS size %llu != n_seqs %d * sizeof(bntann1_t) %llu",
+                 (unsigned long long)sz_anns, bns->n_seqs,
+                 (unsigned long long)sizeof(bntann1_t));
+        return false;
+    }
+    return true;
+}
+
+bool indexEle::shm_names_walk(const char *names, uint64_t sz, int n_seqs, bntann1_t *anns,
+                              char *why, size_t why_len)
+{
+    char scratch[160];
+    if (why == NULL) { why = scratch; why_len = sizeof(scratch); }
+    /* memchr bounds each strlen so a malformed/truncated segment can't read
+     * past the section. */
+    const char *cursor = names;
+    const char *end    = names + sz;
+    for (int i = 0; i < n_seqs; ++i) {
+        const char *name_end = (const char *)memchr(cursor, '\0', (size_t)(end - cursor));
+        if (name_end == NULL) {
+            snprintf(why, why_len, "shm segment BNS_NAMES: unterminated name for seq %d", i);
+            return false;
+        }
+        if (anns != NULL) anns[i].name = (char *)cursor;
+        cursor = name_end + 1;
+        const char *anno_end = (const char *)memchr(cursor, '\0', (size_t)(end - cursor));
+        if (anno_end == NULL) {
+            snprintf(why, why_len, "shm segment BNS_NAMES: unterminated anno for seq %d", i);
+            return false;
+        }
+        if (anns != NULL) anns[i].anno = (char *)cursor;
+        cursor = anno_end + 1;
+    }
+    if (cursor != end) {
+        snprintf(why, why_len, "shm segment BNS_NAMES walk consumed %lld of %llu bytes",
+                 (long long)(cursor - names), (unsigned long long)sz);
+        return false;
+    }
+    return true;
+}
+
 void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pac)
 {
     if (base == NULL) {
@@ -139,6 +201,14 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pa
         exit(EXIT_FAILURE);
     }
 
+    /* ambs is aliased in place as bntamb1_t[], so it must be aligned for it
+     * (the packer's 64-byte layout always is). */
+    if (off_ambs % alignof(bntamb1_t) != 0) {
+        fprintf(stderr, "ERROR! BNS_AMBS offset %llu is not aligned for bntamb1_t\n",
+                (unsigned long long)off_ambs);
+        exit(EXIT_FAILURE);
+    }
+
     if (sz_bns != sizeof(bntseq_t)) {
         fprintf(stderr, "ERROR! BNS_STRUCT size %llu != sizeof(bntseq_t) %llu\n",
                 (unsigned long long)sz_bns, (unsigned long long)sizeof(bntseq_t));
@@ -165,28 +235,13 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pa
     idx->bns->pos2rid_bucket = NULL;
 
     /* Validate the trusted-by-default scalar fields immediately after the
-     * memcpy from the segment. A corrupt or maliciously crafted segment
-     * could otherwise drive negative/overflowing size computations below.
-     * Bounds match the writer-side checks in bwa_shm_compute. */
-    if (idx->bns->n_seqs < 0 || idx->bns->n_holes < 0 || idx->bns->l_pac <= 0) {
-        fprintf(stderr,
-            "ERROR! shm BNS_STRUCT scalars out of bounds "
-            "(n_seqs=%d n_holes=%d l_pac=%lld)\n",
-            idx->bns->n_seqs, idx->bns->n_holes, (long long)idx->bns->l_pac);
-        exit(EXIT_FAILURE);
-    }
-
-    if ((int64_t)sz_ambs != (int64_t)idx->bns->n_holes * (int64_t)sizeof(bntamb1_t)) {
-        fprintf(stderr, "ERROR! BNS_AMBS size %llu != n_holes %d * sizeof(bntamb1_t) %llu\n",
-                (unsigned long long)sz_ambs, idx->bns->n_holes,
-                (unsigned long long)sizeof(bntamb1_t));
-        exit(EXIT_FAILURE);
-    }
-    if ((int64_t)sz_anns != (int64_t)idx->bns->n_seqs * (int64_t)sizeof(bntann1_t)) {
-        fprintf(stderr, "ERROR! BNS_ANNS size %llu != n_seqs %d * sizeof(bntann1_t) %llu\n",
-                (unsigned long long)sz_anns, idx->bns->n_seqs,
-                (unsigned long long)sizeof(bntann1_t));
-        exit(EXIT_FAILURE);
+     * memcpy from the segment, and the section sizes they imply. */
+    {
+        char why[160];
+        if (!shm_bns_ok(idx->bns, sz_ambs, sz_anns, why, sizeof(why))) {
+            fprintf(stderr, "ERROR! %s\n", why);
+            exit(EXIT_FAILURE);
+        }
     }
 
     /* ambs is aliased into shm — read-only is fine. */
@@ -204,38 +259,13 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pa
     }
     memcpy(idx->bns->anns, base + off_anns, (size_t)sz_anns);
 
-    /* Walk BNS_NAMES once, patching anns[i].name/anno pointers. memchr
-     * bounds each strlen so a malformed/truncated segment can't read past
-     * the section. Walk must consume the section exactly. */
+    /* Walk BNS_NAMES once, patching anns[i].name/anno pointers; the walk
+     * must consume the section exactly. */
     {
-        const char *cursor = (const char *)(base + off_names);
-        const char *end    = cursor + sz_names;
-        for (int i = 0; i < idx->bns->n_seqs; ++i) {
-            const char *name_end =
-                (const char *)memchr(cursor, '\0', (size_t)(end - cursor));
-            if (name_end == NULL) {
-                fprintf(stderr,
-                    "ERROR! shm segment BNS_NAMES: unterminated name for seq %d\n", i);
-                exit(EXIT_FAILURE);
-            }
-            idx->bns->anns[i].name = (char *)cursor;
-            cursor = name_end + 1;
-
-            const char *anno_end =
-                (const char *)memchr(cursor, '\0', (size_t)(end - cursor));
-            if (anno_end == NULL) {
-                fprintf(stderr,
-                    "ERROR! shm segment BNS_NAMES: unterminated anno for seq %d\n", i);
-                exit(EXIT_FAILURE);
-            }
-            idx->bns->anns[i].anno = (char *)cursor;
-            cursor = anno_end + 1;
-        }
-        if (cursor != end) {
-            fprintf(stderr,
-                "ERROR! shm segment BNS_NAMES walk consumed %lld of %llu bytes\n",
-                (long long)(cursor - (const char *)(base + off_names)),
-                (unsigned long long)sz_names);
+        char why[160];
+        if (!shm_names_walk((const char *)(base + off_names), sz_names, idx->bns->n_seqs,
+                            idx->bns->anns, why, sizeof(why))) {
+            fprintf(stderr, "ERROR! %s\n", why);
             exit(EXIT_FAILURE);
         }
     }
@@ -246,7 +276,7 @@ void indexEle::bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pa
      * --meth seed segment): idx->pac stays NULL so any consumer that bypasses
      * the mem_aln_pac() helper crashes rather than reading seed bases. */
     if (load_pac) {
-        int64_t expected_pac = idx->bns->l_pac / 4 + 1;
+        int64_t expected_pac = shm_pac_bytes_for(idx->bns->l_pac);
         if ((int64_t)sz_pac != expected_pac) {
             fprintf(stderr, "ERROR! BNS_PAC size %llu != l_pac/4+1 %lld\n",
                     (unsigned long long)sz_pac, (long long)expected_pac);

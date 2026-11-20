@@ -76,7 +76,33 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_SHM_SEC_PAC          9u
 #define BWA_SHM_SEC_REF_STRING   10u
 
-/* A segment is complete once `magic` is BWA_SHM_MAGIC. The stager writes the
+/* 1 GB staging (`bwa-mem3 shm --huge-pages`). /dev/shm backs a segment with
+ * 2 MB pages at most, so the index goes into a System V segment created with
+ * SHM_HUGETLB | SHM_HUGE_1GB, and the POSIX segment `/bwaidx-<name>` holds only
+ * a stub: one bwa_shm_header_t whose reserved[2] is the System V segment's
+ * size in bytes (non-zero marks a stub) and whose `magic`, published last, is
+ * BWA_SHM_HUGE_MAGIC ("BWAHUGE\0", little-endian). The registry entry, the
+ * staging PID and token, and so the waiting, reclaim and ownership rules, are
+ * those of any other stage. The System V key is derived from the token.
+ *
+ * The stub is registered before the System V segment is created and removed
+ * after it, so every segment a stage creates is named by a registered stub,
+ * even when the stage is killed, and `shm -d` or a restage frees its pages.
+ * Only the segment that the stub's own stager created is ever removed: the
+ * one whose id the stub records or, for a stager killed before it recorded the
+ * id, the one whose kernel-recorded creator is the stub's PID and whose size
+ * is the stub's. System V keys
+ * are per IPC namespace, so the stub also records the stager's: seen from
+ * another namespace (a container that shares /dev/shm but not IPC) the stub is
+ * unusable and is left alone, never taken for one whose segment is gone. The
+ * kernel reports a creator PID as seen from the asking process's PID
+ * namespace, so the stub records the stager's PID namespace too, and the
+ * creator of an unrecorded segment is compared only from that namespace. A
+ * stub's total_size is that of the index in its segment (informational). */
+#define BWA_SHM_HUGE_MAGIC     0x0045475548415742ull
+
+/* A segment is complete once `magic` is BWA_SHM_MAGIC (a 1 GB stub: once it is
+ * BWA_SHM_HUGE_MAGIC, published after its segment's). The stager writes the
  * header last and publishes `magic` with a release store, so a reader that
  * loads it with acquire ordering and sees BWA_SHM_MAGIC sees the whole index.
  * While staging, `magic` is 0, reserved[0] holds the stager's PID and
@@ -84,11 +110,17 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * header. A segment with magic 0 whose stager is no longer alive was left by
  * an interrupted stage. */
 typedef struct {
-	uint64_t magic;          /* BWA_SHM_MAGIC, or 0 while staging */
+	uint64_t magic;          /* BWA_SHM_MAGIC (a 1 GB stub: BWA_SHM_HUGE_MAGIC),
+	                          * or 0 while staging */
 	uint32_t version;        /* BWA_SHM_VERSION */
 	uint32_t n_sections;
 	uint64_t total_size;     /* bytes including this header */
-	uint64_t reserved[5];    /* [0] stager PID, [1] stage token; rest zero */
+	uint64_t reserved[5];    /* [0] stager PID, [1] stage token; 1 GB stub only:
+	                          * [2] System V segment bytes, [3] its id + 1,
+	                          * [4] the stager's IPC namespace in the low
+	                          *     32 bits, its PID namespace in the high
+	                          *     32 (0: unknown);
+	                          * rest zero */
 } bwa_shm_header_t;           /* 64 bytes; first object in every segment */
 
 typedef struct {
@@ -117,25 +149,44 @@ extern "C" {
 	 * rebuilding the on-disk index.
 	 * n_threads: worker count for the densify pass (the per-sample LF-walks are
 	 * independent); <=0 or 1 runs it serially. Ignored when not densifying. */
+	/* huge: stage on 1 GB huge pages (`shm --huge-pages`, Linux only; see
+	 * BWA_SHM_HUGE_MAGIC). Fails, staging nothing, when they cannot be had; on
+	 * an AMD x86 host, where 1 GB staging measured no gain (unless
+	 * BWAMEM3_SHM_HUGE_PAGES_AMD=1 is set); where kernel.shm_rmid_forced
+	 * would remove the segment when the stager exits, or cannot be read; and
+	 * when the index is
+	 * already staged on other pages (it is left as it is). */
 	int       bwa_shm_stage(const char *prefix, bool bns_only = false,
 	                        int target_sa_compx = -1,
-	                        int n_threads = 1); /* loads from disk, packs, stages */
+	                        int n_threads = 1,
+	                        bool huge = false); /* loads from disk, packs, stages */
 	/* Test-only hook (see bwa_shm.cpp): bwa_shm_stage calls it with its
 	 * writable index mapping after it has registered the segment and released
 	 * the stager lock, before the pack fills it, so a unit test can inspect
 	 * that mapping or act while the stage is in progress. NULL on every
 	 * production path. */
 	extern void (*bwa_shm_stage_map_hook)(const void *base, size_t len);
-	int       bwa_shm_destroy(void);                                 /* drops all (matches v1 -d) */
+	/* Drops all (matches v1 -d). -1 if a segment could not be removed (a 1 GB
+	 * segment, a header that could not be read, or, when the stager lock could
+	 * not be taken, a 1 GB stage in progress); that index's segment, its entry
+	 * and the registry are then kept. */
+	int       bwa_shm_destroy(void);
 	int       bwa_shm_list(void);                                    /* prints staged indices to stdout */
 	int       main_shm(int argc, char *argv[]);                      /* CLI entry — see src/main.cpp dispatch */
 
 	/* Attach helpers used by FMI_search / indexEle / fastmap.
 	 * *len_out is the packed index size (the header's total_size), the bound
 	 * for every section lookup. *map_len_out (optional) is the length of the
-	 * mapping, which is what the caller passes to munmap. */
+	 * mapping, which can be longer and is what bwa_shm_detach takes. An
+	 * attached index is released with bwa_shm_detach, never with a bare
+	 * munmap: a 1 GB index is a System V attachment. */
+	/* need_pac: the caller loads the packed reference (PAC), so a stage
+	 * without a usable one (a seed-only `shm --meth` stage) is declined (NULL)
+	 * rather than attached for a load that would exit on it. */
 	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out,
-	                         size_t *map_len_out = NULL);            /* NULL if not staged */
+	                         size_t *map_len_out = NULL,
+	                         bool need_pac = false);                 /* NULL if not staged */
+	void      bwa_shm_detach(uint8_t *base, size_t map_len);
 	int       bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 	                               uint64_t *offset_out, uint64_t *size_out);
 
@@ -179,9 +230,10 @@ extern "C" {
 	void bwa_shm_layout_free(bwa_shm_layout_t *layout);
 
 	/* Internal: load index components from disk and pack them into a single
-	 * self-describing buffer. Used by bwa_shm_stage (Phase 2) and exercised
-	 * by tests. On success, *buf_out is malloc'd and *len_out is its size;
-	 * caller frees with free(). Returns 0 on success, -1 on error. */
+	 * self-describing buffer, as bwa_shm_stage packs a segment. Used by
+	 * tests. On success, *buf_out is heap-allocated, with the padding
+	 * between sections zero as in a staged segment, and *len_out is its
+	 * size; caller frees with free(). Returns 0 on success, -1 on error. */
 	int bwa_shm_pack_from_disk(const char *prefix, uint8_t **buf_out, uint64_t *len_out);
 
 #ifdef __cplusplus

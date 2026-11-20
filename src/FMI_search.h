@@ -218,6 +218,19 @@ class FMI_search: public indexEle
     int64_t sa_ms_byte_size_bytes()  const { return sa_sample_count() * (int64_t)sizeof(int8_t); }
     int64_t sa_ls_word_size_bytes() const { return sa_sample_count() * (int64_t)sizeof(uint32_t); }
 
+    /* The same sizes from the scalars alone, for a check made before any
+     * FMI_search exists (bwa_shm's probe of a 1 GB stage). */
+    static int64_t cp_occ_bytes_for(int64_t ref_seq_len);
+    static int64_t sa_count_for(int64_t ref_seq_len, int64_t sa_compx);
+
+    /* Checks the packed FMI_SCALARS at `scalars` (BWA_SHM_FMI_SCALARS_BYTES
+     * bytes) the way load_index_from_shm does. Returns true when they pass,
+     * with sizes[0..2] set to the FMI_CP_OCC, FMI_SA_MS and FMI_SA_LS section
+     * sizes the load then requires; otherwise false, with what is wrong
+     * written to `why` (if not NULL). */
+    static bool shm_scalars_ok(const uint8_t *scalars, int64_t sizes[3],
+                               char *why, size_t why_len);
+
     /* Read-only data accessors. Used by the round-trip test to byte-compare
      * the packed segment payload against the in-memory loader's buffers. */
     const void     *cp_occ_data()     const { return cp_occ; }
@@ -254,11 +267,13 @@ class FMI_search: public indexEle
     void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true,
                     bwamem_hugetlb_mode_t huge_pages = BWAMEM_HUGETLB_OFF);
 
-    /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
+    /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach: `len` is
+     * the packed index size and `map_len` the length of the mapping. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
-     * destructor munmaps `base` and leaves the aliased buffers untouched.
-     * Builds no seed jump table: load_index builds it after the attach. */
-    void load_index_from_shm(uint8_t *base, size_t len);
+     * destructor unmaps `map_len` bytes at `base` and leaves the aliased
+     * buffers untouched. Builds no seed jump table: load_index builds it
+     * after the attach. */
+    void load_index_from_shm(uint8_t *base, size_t len, size_t map_len);
 
     /* Densify the SA sample table on the fly: given an existing FM-index's
      * checkpoint-occ block, C[] array, and SA samples taken at stride

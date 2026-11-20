@@ -1,5 +1,5 @@
 
-Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]
+Usage: bwa-mem3 shm [-d|-l|--help] [--meth] [--huge-pages] [-u INT] [-t INT] [idxbase]
 
 Options:
   -d        destroy all indices in shared memory (matches bwa v1 behavior)
@@ -19,6 +19,16 @@ Options:
             per-sample walks are independent, so this scales near-
             linearly; has no effect unless -u actually densifies (a
             target denser than the on-disk rate).
+  --huge-pages
+            stage the index on 1 GB huge pages: a System V shared memory
+            segment from the host's reserved 1 GB pool (11 pages for a
+            default hg38 stage), which `mem` attaches as usual. Cuts dTLB
+            page walks on Intel x86 and Graviton4 (arm64). Refused on AMD
+            x86, where it measured no gain. Linux only; needs CAP_IPC_LOCK
+            or membership of the vm.hugetlb_shm_group group, and one IPC
+            namespace for the stage, `mem` and `shm -d`. Fails, staging
+            nothing, when the pages cannot be had or the index is already
+            staged on other pages.
   -h --help print this help and exit
 
 Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into
