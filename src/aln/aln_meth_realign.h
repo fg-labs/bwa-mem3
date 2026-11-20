@@ -7,6 +7,15 @@ namespace bwa_aln {
 /* cig, when set: the raw CIGAR of a search path to the window (a --known-snvs window hit's), which
  * the main search scores as one of its own paths. */
 struct aln_meth_candidate_t { int rid, strand, hyp; int64_t rb, re; std::vector<uint32_t> cig; };
+/* --known-snvs: one read's candidates from the ALT-window search (ks_meth_candidates), the rows of
+ * its windows that cover their site, and how far that search is complete: every window row that
+ * costs less than horizon is among them (INT64_MAX: every row within the read's -n). flags: the
+ * window search's ALN_METH_BIND_* (0 when it ran to its end). */
+struct aln_meth_extra_t {
+    std::vector<aln_meth_candidate_t> rows;
+    int64_t horizon = INT64_MAX;
+    int flags = 0;
+};
 enum class aln_meth_eval_status { ok, invalid_input, resource_error, no_alignment };
 /* Fetch a validated forward-reference window (length <=65535), masking .amb runs to code N
  * before CpG labelling. Used only by aln's methylation refinement, accounting and emission. */

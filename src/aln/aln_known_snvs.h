@@ -46,6 +46,18 @@ int ks_load(const char *path, const bntseq_t *bns, const uint8_t *pac, ks_sites_
  * override falls back to stock; methylation genomic refinement and paired rescue have separate bounds. */
 #define KS_WINDOW_HALF 160
 
+/* Whether a read of len bases fits an ALT window under the search options opt. A window is the
+ * 2 * KS_WINDOW_HALF + 1 bases around its site, so it holds every placement over the site that
+ * spans at most KS_WINDOW_HALF + 1 bases. A placement spans len plus its deleted bases, at most one
+ * per gap open and gap extension opt allows, so a read fits when len + max(0, -o - 1) + max(0, -e)
+ * <= KS_WINDOW_HALF (exact for -o >= 1; under -o 0, which allows no gap, a base short). Then each
+ * placement of the read that covers a site lies inside that site's window and the window index
+ * holds it. */
+static inline bool ks_fits_window(int64_t len, const gap_opt_t *opt)
+{
+	return len + (opt->max_gapo > 1 ? opt->max_gapo - 1 : 0) + (opt->max_gape > 0 ? opt->max_gape : 0) <= KS_WINDOW_HALF;
+}
+
 /* One ALT window: the reference [beg, beg + len) of contig rid with the ALT of one site in place. */
 struct ks_window_t {
 	int rid;
@@ -89,12 +101,13 @@ void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, 
 							 uint8_t **conv_pac);
 
 /* --meth: the candidate windows (original reference, rid = contig) of the hits a read's search on
- * the converted window index found that cover their window's site. */
+ * the converted window index found that cover their window's site, with that search's horizon and
+ * flags (aln_meth_extra_t). */
 void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const struct aln_meth_read_t &wres,
-						std::vector<struct aln_meth_candidate_t> *out);
+						struct aln_meth_extra_t *out);
 void ks_windows_free(ks_windows_t *w);
 
-/* The options a read's ALT-window search runs with: NONSTOP and no -R cut, so synthetic copies
+/* The options a read's plain (not --meth) ALT-window search runs with: NONSTOP and no -R cut, so synthetic copies
  * and cross-window hits cannot tighten the genomic discovery bound. The main search and the
  * genomic merge still apply the user's retention policy. */
 gap_opt_t ks_discovery_opt(const gap_opt_t &opt);
@@ -103,12 +116,11 @@ struct aln_opt_t;
 struct aln_dup_state_t;
 struct aln_meth_read_t;
 /* --meth with --known-snvs (o->ks_windows set; without it, the genomic search alone): reads
- * [0, n) searched on the ALT-window index, then on the converted index `bwt` with the windows'
- * candidates, each read's stop certificate (aln_meth_alt_certificate) and its window-search
- * flags as incoming_flags. Incomplete window discovery taints the genomic result: retained
- * windows may place a read, but cannot certify uniqueness or support pair promotion. Arguments
- * and the return value are aln_meth_search_batch's; window_dup is the window search's
- * duplicate state. */
+ * [0, n) searched on the ALT-window index, a candidate generator, then on the converted index
+ * `bwt` with each read's window candidates (aln_meth_extra_t: rows, horizon and flags), scored
+ * before its first step. A read whose window search stopped below the costs it retains is
+ * reported incomplete with the window search's flags (the finish-time audit). Arguments and the
+ * return value are aln_meth_search_batch's; window_dup is the window search's duplicate state. */
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res);
 

@@ -135,13 +135,20 @@ struct aln_meth_slot_t {
     // aln_meth_slot_start; a refined window with more differences is dropped (resolve_one).
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
     // cut: the search takes stock aln's cuts from the verified best (aln_meth_boundary): set unless
-    // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row; best_d: the
-    // fewest differences of a row at that cost. flushed: a flush has run.
-    int cut = 0, best_d = INT_MAX, flushed = 0;
+    // -N or a negative penalty; under --known-snvs set in the ALT-window search, and in the main
+    // search only for a read that fits an ALT window (ks_fits_window). best: the lowest cost of a
+    // stored row; best_d: the fewest differences of a row at that cost. flushed: a flush has run. gen: the --known-snvs
+    // ALT-window search, a candidate generator: it takes only the cuts that later rows of the main
+    // search cannot invalidate (aln_meth_boundary_gen) and keeps every row it found.
+    int cut = 0, best_d = INT_MAX, flushed = 0, gen = 0;
     // cert: rows are verified stratum by stratum and certificates end the read (single-end, under
-    // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
+    // cut, not under --known-snvs). collect: a repeat certificate fired inside the best stratum, which the search finishes
     // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
     int cert = 0, collect = 0;
+    // extras_done: --known-snvs, the ALT-window candidates (extra) are scored (aln_meth_score_extras).
+    // ceil_applied: the tightest top-2 difference ceiling aln_meth_boundary applied (INT_MAX: none);
+    // r_stop: it ended the search on -R. Both for the finish-time audit.
+    int extras_done = 0, ceil_applied = INT_MAX, r_stop = 0;
     // prove: the search tries the pigeonhole proof once, at its first entry past the exact stratum
     // (aln_meth_prove_nohit): set under BWA_MODE_GAPE outside the --known-snvs ALT-window search, for
     // reads allowed at least ALN_METH_PH_MIN_DIFF differences.
@@ -173,8 +180,8 @@ struct aln_meth_slot_t {
     aln_meth_read_bits_t bits[2];
     int bits_ready = 0;
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
-    const std::vector<aln_meth_candidate_t> *extra = nullptr;
-    aln_meth_alt_bound_t alt_bound; // ALT-index lower bound (aln_meth_alt_certificate), not the genomic width
+    const aln_meth_extra_t *extra = nullptr;
+    aln_meth_alt_bound_t alt_bound; // ALT-index lower bound, not the genomic width
     // the ordinals of the read's duplicate copies (their draws are made here, aln_meth_slot_finish)
     const std::vector<int64_t> *copy_ords = nullptr;
     // Scratch: the reference window of the candidate being resolved (refined, then accounted), and
@@ -257,6 +264,11 @@ int aln_meth_gap_arena(aln_meth_slot_t *, const gap_entry_t &p, bool ext, uint32
 // has_copy: the read has duplicate copies that will redraw over its loci.
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
+/* --known-snvs: scores the read's ALT-window candidates (x->extra) as rows of the main search. The
+ * driver calls it once the job is started (its seed is then known) and before the search's first
+ * step, so the read's best and its cuts start from them; aln_meth_slot_finish calls it for a slot
+ * that has not (no-op once done). */
+void aln_meth_score_extras(aln_meth_slot_t *);
 /* The pigeonhole proof for the read of slot x, whose search j has found no hit in its exact stratum
  * (no interval yet): returns 1 when no search path within the read's -n differences reaches a hit
  * (aln_meth_pigeonhole), so ending the search there leaves every result as the full search would

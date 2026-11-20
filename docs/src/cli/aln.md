@@ -598,13 +598,14 @@ at every converted-score boundary. The search stops past `B + M` (stock's score 
 ceiling drops to the best row's differences plus one (stock's top-2 rule, at most `-n`); the
 retained loci obey the same ceiling. Once the best stratum is complete, more than `-R` best
 loci within that ceiling end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
-not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
-set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
-search instead stops early only on the earlier certified bound: for current best cost `B`,
-let `T = B + M` and `k = floor(T / M)`. When `M > 0`, `T < O`, `E >= 0`, the configured
-difference ceiling admits `k` differences, `-N` is off and discovery has not hit a cap, the search can stop
-after fully evaluating converted scores through `M*k`; a seeded read only when `k` is also at
-most `-k` ([#778](https://github.com/fg-labs/bwa-mem3/pull/778)). This does not make discovery exhaustive or guarantee a globally optimal alignment.
+not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). These cuts apply unless `-N` is given or a penalty is negative. Under
+`--known-snvs` they apply to the main search and to the ALT-window search alike, each from its
+own `B` (the main search scores a window with a site as both haplotypes), for a read that fits an
+ALT window (its longest placement, its length plus `-o` plus `-e`, at most 161 bases); a longer read takes no cuts. A row scored with ALT bases in place can cost less than its
+converted path, so a window whose converted path lies past `B + M` is not resolved even if its
+ALT haplotype would cost less; the ALT-window search, whose index has each site's ALT in place,
+finds such windows for a read over one site. A read over two or more sites that needs more than
+one ALT to fit within `B + M` can be missed.
 
 **Saturation certificates (single-end).** Under the stock cuts, a single-end read's rows are
 verified stratum by stratum in converted score, narrow hits first and wide ones (more than 256

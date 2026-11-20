@@ -8,10 +8,10 @@
 #include "../framework/stderr_capture.h"
 #include "../framework/run_in_child.h"
 #include "../framework/temp_dir.h"
+#include "../../src/aln/aln_known_snvs.h"
 #include "../../src/aln/aln_main.h"
 #include "../../src/aln/aln_meth.h"
 #include "../../src/aln/aln_meth_search.h"
-#include "../../src/aln/aln_known_snvs.h"
 #include "../../src/aln/aln_meth_realign.h"
 #include "../../src/aln/bwaseqio.h"
 #include "../../src/aln/bwase.h"
@@ -50,6 +50,15 @@ std::vector<uint32_t> cigar_of(const bwa_aln::aln_meth_read_t &r, const bwa_aln:
 void store_pair(bwa_aln::aln_meth_read_t *r[2])
 {
     bwa_aln::aln_meth_store_loci(r[0]); bwa_aln::aln_meth_store_loci(r[1]);
+}
+
+// Turns off what slot_start set from the run's options: the stock cuts, and with them the
+// certificates and the no-hit proof. For a test that drives a slot's flushes by hand (its slot has
+// no job options), as the search without the cuts makes them.
+void no_cuts(bwa_aln::aln_meth_slot_t &slot)
+{
+    slot.cut = slot.cert = slot.prove = 0;
+    slot.prove2_at = INT64_MAX;
 }
 
 std::string conv(std::string s, char from, char to)
@@ -1809,8 +1818,8 @@ TEST_CASE("aln_meth: identical reads with different --known-snvs candidates do n
     const auto fq=write_fq("ks-dups.fq",std::vector<std::string>(n,read));
     // Only the odd copies have the window (as an incomplete window search gives one copy and not another).
     const int64_t rb=mr.bns->anns[0].offset+q-10;
-    std::vector<std::vector<ba::aln_meth_candidate_t>> extra(n);
-    for (int i=1;i<n;i+=2) extra[i]={{0,0,1,rb,rb+25}};
+    std::vector<ba::aln_meth_extra_t> extra(n);
+    for (int i=1;i<n;i+=2) extra[i].rows={{0,0,1,rb,rb+25,{}}};
     ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
     auto *input=ba::bwa_seq_open(fq.c_str()); int got=0;
     auto *reads=ba::bwa_read_seq(input,n,&got,BWA_MODE_COMPREAD,0);
@@ -1889,8 +1898,8 @@ TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few 
     ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
-    // The budget's binding flush is the search's without stock cuts (its slot has no job options).
-    mr.no_cut=1;
+    // The budget's binding flush is the search's without stock cuts (its slot has no job options),
+    // so each slot_start below turns the stock cuts off.
     ba::gap_opt_t *opt=ba::gap_init_opt();
     ba::aln_meth_opt_t mo;
     ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;
@@ -1904,7 +1913,7 @@ TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few 
     REQUIRE(bwt->seq_len>4000);
     auto run=[&](int budget,const std::vector<std::vector<int>> &flushes) {
         mo.p_best=budget;mo.p_second=0;ba::aln_meth_opt_finish(&mo);
-        ba::aln_meth_slot_start(&slot,reads,&result,0,3,0);
+        ba::aln_meth_slot_start(&slot,reads,&result,0,3,0);no_cuts(slot);
         std::vector<long> lookups;bwtint_t k=0;
         for (const auto &widths : flushes) {
             for (int w : widths) { ba::aln_meth_hit(&slot,&exact,k,k+w-1); k+=w; }
@@ -1990,7 +1999,8 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::bwt_t *bwt=ba::bwt_from_fmi(&fmi);
     ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
-    mr.no_cut=1; // the flushes here are the search's without stock cuts (the slot has no job options)
+    // The flushes here are the search's without stock cuts (the slot has no job options), so each
+    // slot_start below turns the stock cuts off.
     ba::aln_meth_opt_t mo;ba::aln_meth_opt_finish(&mo);
     ba::gap_opt_t *opt=ba::gap_init_opt();
     ba::aln_meth_group_t group;group.bwt=bwt;group.ref=&mr;group.mo=&mo;group.opt=opt;
@@ -1998,7 +2008,7 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::gap_slot_core_t core={};group.cores=&core;
     auto &slot=group.slot[0];slot.grp=&group;slot.job=&core.job;
     ba::aln_meth_read_t result;
-    ba::aln_meth_slot_start(&slot,reads,&result,0,3,1);
+    ba::aln_meth_slot_start(&slot,reads,&result,0,3,1);no_cuts(slot);
     int strand=0; bwtint_t row=(bwtint_t)-1;
     // Find a row for the forward C->T copy at c1 offset 500; independent of search hit order.
     for(bwtint_t k=0;k<=bwt->seq_len;++k) {
@@ -2030,7 +2040,7 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     // A terminal deletion is charged on the raw CIGAR even though display removes it.
     for (int penalty : {0, 11, INT_MAX}) {
         opt->s_gapo=penalty;
-        ba::aln_meth_slot_start(&slot,reads,&result,3,3,1);
+        ba::aln_meth_slot_start(&slot,reads,&result,3,3,1);no_cuts(slot);
         ba::aln_meth_hit(&slot,&longer,row,row);
         core.state=ba::GAP_SLOT_PARKED;ba::aln_meth_flush_parked(&group);
         REQUIRE(result.occ.size()==1);
@@ -2054,7 +2064,7 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
         mo.m.meth_context=context; ba::aln_meth_opt_finish(&mo);
         // The read is converted at every C, so under cpg its non-CpG conversions are strict
         // mismatches, more than -n 3 allows: a limit of its length keeps the window to inspect.
-        ba::aln_meth_slot_start(&slot,reads,&result,0,50,1);
+        ba::aln_meth_slot_start(&slot,reads,&result,0,50,1);no_cuts(slot);
         ba::aln_meth_hit(&slot,&exact,row,row); core.state=ba::GAP_SLOT_PARKED;
         ba::aln_meth_flush_parked(&group);
         REQUIRE(result.occ.size()==1);
@@ -2069,14 +2079,14 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     mo.m.meth_context=METH_CTX_ALL; ba::aln_meth_opt_finish(&mo);
     mr.bns->n_holes=old_holes; mr.bns->ambs=old_ambs;
     mo.p_best=0;mo.p_second=0;
-    ba::aln_meth_slot_start(&slot,reads,&result,1,3,1);
+    ba::aln_meth_slot_start(&slot,reads,&result,1,3,1);no_cuts(slot);
     ba::aln_meth_hit(&slot,&exact,row,row);core.state=ba::GAP_SLOT_PARKED;
     ba::aln_meth_flush_parked(&group);ba::aln_meth_slot_finish(&slot);
     CHECK(result.flags!=0);CHECK(result.main==-1);CHECK(result.c1==0);
     mo.p_best=1;mo.p_second=0;
     // An interval reached again along a path with other gaps reuses its SA rows: no lookup, so it
     // cannot bind the budget.
-    ba::aln_meth_slot_start(&slot,reads,&result,2,3,1);
+    ba::aln_meth_slot_start(&slot,reads,&result,2,3,1);no_cuts(slot);
     ba::aln_meth_hit(&slot,&longer,row,row);
     ba::aln_meth_hit(&slot,&exact,row,row);
     core.state=ba::GAP_SLOT_PARKED;
@@ -2084,7 +2094,7 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     CHECK(result.n_lookups==1);CHECK(result.flags==0);
     REQUIRE(result.occ.size()==1);CHECK(result.occ[0].cost==0);
     ba::aln_meth_slot_finish(&slot);
-    ba::aln_meth_slot_start(&slot,reads,&result,2,3,1);
+    ba::aln_meth_slot_start(&slot,reads,&result,2,3,1);no_cuts(slot);
     ba::aln_meth_hit(&slot,&longer,row,row); // the costlier path evaluated first
     ba::aln_meth_hit(&slot,&exact,row+1,row+1); // another interval hidden behind the cap
     core.state=ba::GAP_SLOT_PARKED;
@@ -2144,8 +2154,9 @@ TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless
         CAPTURE(path); CAPTURE(flags);
         ba::aln_meth_read_t result;
         ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
-        std::vector<ba::aln_meth_candidate_t> extra{{0, 0, 1, rb, rb + 50, {}}};
-        if (path) extra[0].cig = {50u << 4};
+        ba::aln_meth_extra_t extra;
+        extra.rows = {{0, 0, 1, rb, rb + 50, {}}};
+        if (path) extra.rows[0].cig = {50u << 4};
         slot.extra = &extra;
         slot.stop = 1; // lookup budget, certificate or search-cut stop is not a CIGAR cap
         result.flags = flags;
@@ -2177,8 +2188,9 @@ TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless
             CAPTURE(path);
             ba::aln_meth_read_t result;
             ba::aln_meth_slot_start(&slot, alt_reads, &result, 0, 3, 1);
-            std::vector<ba::aln_meth_candidate_t> extra{{0, 0, 1, rb, rb + 50, {}}};
-            if (path) extra[0].cig = {50u << 4};
+            ba::aln_meth_extra_t extra;
+            extra.rows = {{0, 0, 1, rb, rb + 50, {}}};
+            if (path) extra.rows[0].cig = {50u << 4};
             slot.extra = &extra;
             slot.stop = 1;
             ba::aln_meth_slot_finish(&slot);
@@ -2201,6 +2213,276 @@ TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless
     ba::aln_meth_ref_free(&mr);
     ba::bwa_free_read_seq(n, reads);
     CHECK(ba::bwa_seq_close(input) == 0);
+}
+
+TEST_CASE("aln_meth: the finish audits the cuts a search took on a best that was not final")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("audit.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1);
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::ks_sites_t no_sites; // a --known-snvs run whose sites are elsewhere
+    no_sites.by_contig.assign(mr.bns->n_seqs, {});
+    auto *opt = ba::gap_init_opt();
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group;
+    const int64_t rb = mr.bns->anns[0].offset + 500;
+    // The read's one row (cost 0, no differences) comes from the ALT-window search, which stopped
+    // with every window row below `horizon` found; the read retains rows up to 0 + M = 3.
+    struct case_t { int64_t horizon; int ceil_applied, r_stop, want; };
+    for (const case_t &c : {case_t{INT64_MAX, INT_MAX, 0, 0}, case_t{4, INT_MAX, 0, 0},
+                            case_t{3, INT_MAX, 0, ba::ALN_METH_AUDIT_HORIZON},
+                            case_t{4, 0, 0, ba::ALN_METH_AUDIT_CEILING}, // tighter than the final 0 + 1
+                            case_t{4, 1, 0, 0},
+                            case_t{4, INT_MAX, 1, ba::ALN_METH_AUDIT_REPEAT}}) // -R, yet one best locus
+        for (const ba::ks_sites_t *sites : {(const ba::ks_sites_t *)nullptr, (const ba::ks_sites_t *)&no_sites}) {
+            CAPTURE(c.horizon); CAPTURE(c.ceil_applied); CAPTURE(c.r_stop); CAPTURE(sites != nullptr);
+            mr.known_snvs = sites;
+            ba::aln_meth_read_t result;
+            ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+            ba::aln_meth_extra_t extra;
+            extra.rows = {{0, 0, 1, rb, rb + 50, {50u << 4}}};
+            extra.horizon = c.horizon;
+            extra.flags = c.horizon == INT64_MAX ? 0 : ba::ALN_METH_BIND_BEST;
+            slot.extra = &extra;
+            slot.ceil_applied = c.ceil_applied; slot.r_stop = c.r_stop;
+            ba::aln_meth_slot_finish(&slot);
+            CHECK(result.audit == c.want);
+            // under --known-snvs a failed audit makes the read incomplete; otherwise it is counted
+            CHECK(result.flags == (c.want && sites ? ba::ALN_METH_BIND_BEST : 0));
+            REQUIRE(result.main >= 0);
+            CHECK(result.hits[result.main].pos == (bwtint_t)rb);
+            slot.extra = nullptr;
+        }
+    mr.known_snvs = nullptr;
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
+TEST_CASE("aln_meth: --known-snvs takes the stock cuts in both searches but no certificates")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("ks-cuts.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1);
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group;
+    // Only whether the run has sites matters to the slot's search settings.
+    ba::ks_sites_t site_set;
+    site_set.by_contig.assign(mr.bns->n_seqs, {});
+    site_set.by_contig[0].push_back({510, 0, 1});
+    site_set.n_sites = 1;
+    const ba::ks_sites_t *sites = &site_set;
+    struct expect_t { int cut, cert, prove; };
+    auto start = [&](const std::string &search, const ba::ks_sites_t *known, int window, int keep_strata, expect_t want) {
+        CAPTURE(search); CAPTURE(keep_strata);
+        mr.known_snvs = known; mr.ks_window = window;
+        group.keep_strata = keep_strata;
+        ba::aln_meth_read_t result;
+        ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 0);
+        CHECK(slot.cut == want.cut);
+        CHECK(slot.cert == want.cert);
+        CHECK(slot.prove == want.prove);
+        CHECK(slot.gen == window); // the ALT-window search is a candidate generator
+    };
+    for (int keep_strata : {0, 1}) {
+        // Without --known-snvs: cuts, single-end certificates and the no-hit proof.
+        start("plain", nullptr, 0, keep_strata, {1, !keep_strata, 1});
+        // --known-snvs main search: the cuts and the no-hit proof, no certificates (its best is
+        // final only through the ALT-window search's horizon, which the finish audits).
+        start("known-snvs main", sites, 0, keep_strata, {1, 0, 1});
+        // --known-snvs ALT-window search: the cuts, but no certificates and no no-hit proof.
+        start("known-snvs window", nullptr, 1, keep_strata, {1, 0, 0});
+    }
+    // -N and a negative penalty still turn the cuts (and so the certificates) off.
+    opt->mode |= BWA_MODE_NONSTOP;
+    start("-N plain", nullptr, 0, 0, {0, 0, 1});
+    start("-N known-snvs main", sites, 0, 0, {0, 0, 1});
+    start("-N known-snvs window", nullptr, 1, 0, {0, 0, 0});
+    opt->mode &= ~BWA_MODE_NONSTOP;
+    opt->s_mm = -1;
+    start("negative penalty known-snvs main", sites, 0, 0, {0, 0, 1});
+    opt->s_mm = 3;
+    // A --known-snvs read takes the cuts only when it fits an ALT window: its longest placement
+    // (its length plus a deleted base per gap open and extension allowed) at most KS_WINDOW_HALF + 1
+    // (161) bases. At -o 1 -e 6 (the defaults) that is 154 bases; at -o 2 -e 6, 153; at -o 0 -e 0,
+    // 160. The ALT-window search keeps its cuts at any length.
+    {
+        const std::vector<int> lens{153, 154, 155, 160, 161};
+        std::vector<std::string> seqs;
+        for (int len : lens) seqs.push_back(conv(ref().c1.substr(500, len), 'C', 'T'));
+        const std::string long_fq = write_fq("ks-cuts-long.fq", seqs);
+        ba::bwa_seqio_t *long_input = ba::bwa_seq_open(long_fq.c_str());
+        int n_long = 0;
+        ba::bwa_seq_t *long_reads = ba::bwa_read_seq(long_input, (int)lens.size(), &n_long, BWA_MODE_COMPREAD, 0);
+        REQUIRE(n_long == (int)lens.size());
+        group.keep_strata = 0;
+        struct gaps_t { int o, e, longest; };
+        for (const gaps_t g : {gaps_t{1, 6, 154}, gaps_t{2, 6, 153}, gaps_t{0, 0, 160}}) {
+            opt->max_gapo = g.o; opt->max_gape = g.e;
+            for (int i = 0; i < n_long; ++i) {
+                CAPTURE(g.o); CAPTURE(g.e); CAPTURE(lens[i]);
+                const bool fits = lens[i] <= g.longest;
+                CHECK(ba::ks_fits_window(lens[i], opt) == fits);
+                ba::aln_meth_read_t result;
+                mr.known_snvs = sites; mr.ks_window = 0;
+                ba::aln_meth_slot_start(&slot, long_reads + i, &result, 0, 3, 0);
+                CHECK(slot.cut == (int)fits);
+                mr.known_snvs = nullptr; mr.ks_window = 1;
+                ba::aln_meth_slot_start(&slot, long_reads + i, &result, 0, 3, 0);
+                CHECK(slot.cut == 1);
+                mr.ks_window = 0;
+                ba::aln_meth_slot_start(&slot, long_reads + i, &result, 0, 3, 0);
+                CHECK(slot.cut == 1); // without --known-snvs: stock's cuts at any length
+            }
+        }
+        opt->max_gapo = 1; opt->max_gape = 6;
+        ba::bwa_free_read_seq(n_long, long_reads);
+        CHECK(ba::bwa_seq_close(long_input) == 0);
+    }
+    mr.known_snvs = nullptr; mr.ks_window = 0;
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
+TEST_CASE("aln_meth: the ALT-window generator takes only the cuts a lower final best keeps valid")
+{
+    namespace ba = bwa_aln;
+    auto *opt = ba::gap_init_opt(); // M 3, O 11, E 4, -R 30, gap extensions count as differences
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    // 31 windows of nearby sites, each holding genomic position 5000 of contig 0 at its offset 100
+    std::vector<ba::ks_window_t> win;
+    std::vector<bntann1_t> anns(31);
+    for (int k = 0; k < 31; ++k) {
+        win.push_back({0, 4900, 321, 4950 - k, 0});
+        anns[k] = bntann1_t();
+        anns[k].offset = 321 * k; anns[k].len = 321;
+    }
+    bntseq_t wbns = bntseq_t();
+    wbns.n_seqs = 31; wbns.anns = anns.data(); wbns.l_pac = 321 * 31;
+    ba::aln_meth_ref_t mr;
+    mr.bns = &wbns; mr.ks_window = 1; mr.ks_win = win.data();
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::gap_job_t job = ba::gap_job_t();
+    job.opt = *opt;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group; slot.job = &job;
+    ba::aln_meth_read_t result;
+    slot.res = &result;
+    auto reset = [&](int64_t best, int best_d) {
+        result = ba::aln_meth_read_t();
+        job.max_diff = 5; job.score_cut = ba::GAP_SCORE_LIMIT - 1;
+        slot.gen = 1; slot.cut = 1; slot.best = best; slot.best_d = best_d;
+    };
+    auto row = [&](int window, int64_t cost) {
+        ba::aln_meth_occ_t o;
+        o.rid = window; o.hyp = 1; o.strand = 0; o.cost = cost;
+        o.alignment.rb = anns[window].offset + 100;
+        result.occ.push_back(o);
+    };
+    // A gapped best (cost 11, one difference): the score cut 14 and the ceiling it implies,
+    // (11 + 3) / 3 = 4, not stock's 2, which a lower final best with more differences loosens.
+    reset(11, 1);
+    row(0, 11);
+    CHECK(ba::aln_meth_boundary(&slot, 12) == 0);
+    CHECK(job.score_cut == 14);
+    CHECK(job.max_diff == 4);
+    // 31 rows at the best, all at one genomic locus: one locus for -R, so no stop.
+    reset(0, 0);
+    for (int k = 0; k < 31; ++k) row(k, 0);
+    CHECK(ba::aln_meth_boundary(&slot, 3) == 0);
+    CHECK(job.max_diff == 1);
+    CHECK(result.horizon == INT64_MAX);
+    // 31 distinct loci: -R stops, but only once every row below B + M is resolved, and it records
+    // where the window search stopped.
+    reset(0, 0);
+    for (int k = 0; k < 31; ++k) { row(k, 0); result.occ.back().alignment.rb += k; }
+    CHECK(ba::aln_meth_boundary(&slot, 2) == 0);
+    CHECK(ba::aln_meth_boundary(&slot, 3) == 1);
+    CHECK(result.horizon == 3);
+    // Without each window's place on the genome, each window's row is a locus of its own.
+    mr.ks_win = nullptr;
+    reset(0, 0);
+    for (int k = 0; k < 31; ++k) row(k, 0);
+    CHECK(ba::aln_meth_boundary(&slot, 3) == 1);
+    mr.ks_win = win.data();
+    // Its finish keeps every row within B + M (no top-2 ceiling, no trim, even when it is
+    // incomplete) and states how far they are complete.
+    for (int bound : {0, 1}) {
+        CAPTURE(bound);
+        reset(11, 1);
+        row(0, 11); row(1, 14); row(2, 15);
+        result.occ[1].alignment.rb += 7; result.occ[1].n_mm = 4; // four differences, over stock's 2
+        if (bound) { result.flags = ba::ALN_METH_BIND_BEST; result.horizon = 13; }
+        for (auto &o : result.occ) o.pos = o.alignment.rb;
+        ba::aln_meth_slot_finish(&slot);
+        REQUIRE(result.hits.size() == 2);
+        CHECK(result.hits[0].cost == 11);
+        CHECK(result.hits[1].cost == 14);
+        CHECK(result.horizon == (bound ? 13 : 15));
+        CHECK(result.flags == (bound ? ba::ALN_METH_BIND_BEST : 0));
+    }
+    // The -m work bound ends the search between two flushes: complete only below the last
+    // boundary it flushed, whatever its score cut.
+    reset(11, 1);
+    row(0, 11);
+    result.flags = ba::ALN_METH_BIND_M;
+    slot.flushed_score = 12;
+    for (auto &o : result.occ) o.pos = o.alignment.rb;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.horizon == 12);
+    CHECK(result.flags == ba::ALN_METH_BIND_M);
+    slot.flushed_score = -1;
+    // A window row dropped as unrepresentable within the score cut: complete only below its cost,
+    // and the generator is incomplete (its flags reach the main search's audit).
+    reset(11, 1);
+    row(0, 11);
+    result.n_unrepresentable = 1;
+    slot.unrep_cost = 13;
+    for (auto &o : result.occ) o.pos = o.alignment.rb;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.horizon == 13);
+    CHECK(result.flags == ba::ALN_METH_BIND_UNREP);
+    // Past the score cut (14) it leaves the horizon at the cut.
+    reset(11, 1);
+    row(0, 11);
+    result.n_unrepresentable = 1;
+    slot.unrep_cost = 20;
+    for (auto &o : result.occ) o.pos = o.alignment.rb;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.horizon == 15);
+    CHECK(result.flags == 0);
+    slot.unrep_cost = INT64_MAX;
+    free(opt);
 }
 
 TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the next read still maps")
@@ -2272,7 +2554,8 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     CHECK(results[0].n_lookups == (retained ? 2 : 1));
     CHECK(slot.pend.empty());
     // A stopped read must not even visit later ALT-window candidates.
-    std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, 600, 600 + ALN_MAX_READ_LEN + 1}};
+    ba::aln_meth_extra_t extra;
+    extra.rows = {{0, 0, 1, 600, 600 + ALN_MAX_READ_LEN + 1}};
     slot.extra = &extra;
     ba::aln_meth_slot_finish(&slot);
     CHECK(results[0].n_unrepresentable == 0);
@@ -2513,7 +2796,7 @@ TEST_CASE("aln_meth: retained-cost stop waits for complete strata and handles de
     free(opt);
 }
 
-TEST_CASE("aln_meth: ALT width capture survives slot reuse reset and duplicate compaction")
+TEST_CASE("aln_meth: per-read ALT-window candidates survive duplicate compaction")
 {
     namespace ba = bwa_aln;
     FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1);
@@ -2524,72 +2807,59 @@ TEST_CASE("aln_meth: ALT width capture survives slot reuse reset and duplicate c
     std::vector<std::string> queries;
     for (int i = 0; i < 36; ++i) queries.push_back(ref().c1.substr(400 + (i % 19) * 3, i % 2 ? 35 : 17));
     queries.push_back(queries[0]); queries.push_back(queries[4]);
-    const auto fq = write_fq("width-capture.fq", queries);
+    const auto fq = write_fq("extra-compaction.fq", queries);
     for (int read_no : {0, 1}) {
         opt->seed_len = 18; // seeded; the round's unseeded compaction check below sets 1024
         auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
         auto *reads = ba::bwa_read_seq(input, 100, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == (int)queries.size());
-        std::vector<int> expected(n);
-        for (int i = 0; i < n; ++i) {
-            std::vector<uint8_t> converted(reads[i].len); std::vector<ba::bwt_width_t> width(reads[i].len + 1);
-            ba::aln_meth_convert(read_no, reads[i].seq, reads[i].len, converted.data());
-            ba::bwt_cal_width(bwt, reads[i].len, converted.data(), width.data());
-            expected[i] = width[reads[i].len - 1].bid;
-            CHECK((int)width[reads[i].len].bid == expected[i] + 1); // sentinel is NOT the certificate
-        }
         std::vector<ba::aln_meth_read_t> batch(n); ba::aln_dup_state_t dup;
-        CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 2, read_no, 0, 1, 1000,
-                                      &dup, batch.data(), nullptr, nullptr, true) >= 2);
-        for (int i = 0; i < n; ++i) {
-            CHECK(batch[i].full_width_bound.valid); CHECK(batch[i].full_width_bound.value == expected[i]);
-        }
-        // Reusing the result with capture disabled must clear old validity even on duplicate copies.
-        dup = ba::aln_dup_state_t();
-        ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, read_no, 0, 1, 1000, &dup, batch.data());
-        for (const auto &r : batch) CHECK_FALSE(r.full_width_bound.valid);
-        // Differing opt-in metadata prevents inappropriate sharing, and compaction uses uniq[k].
+        // Differing candidates (here, their horizons) prevent sharing. A horizon of 0 fails the
+        // finish-time audit under --known-snvs, so each read's own extra decides its flags.
         ba::ks_sites_t no_sites; no_sites.by_contig.resize(mr.bns->n_seqs); mr.known_snvs = &no_sites;
-        std::vector<ba::aln_meth_alt_bound_t> bounds(n);
-        for (int i = 0; i < n; ++i) { bounds[i].valid = true; bounds[i].value = i; }
-        dup = ba::aln_dup_state_t();
+        std::vector<ba::aln_meth_extra_t> extra(n);
+        for (int i = 0; i < n; ++i) extra[i].horizon = i;
         CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, read_no, 0, 1, 1000,
-                                      &dup, batch.data(), nullptr, bounds.data()) == 0);
+                                      &dup, batch.data(), extra.data()) == 0);
         for (int i = 0; i < n; ++i) {
             ba::aln_meth_read_t single;
             ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads + i, opt, 1, read_no, i, 1, 1000,
-                                      nullptr, &single, nullptr, &bounds[i]);
+                                      nullptr, &single, &extra[i]);
             CHECK(batch[i].flags == single.flags); CHECK(batch[i].c1 == single.c1); CHECK(batch[i].c2 == single.c2);
             CHECK(batch[i].n_lookups == single.n_lookups);
         }
-        // A duplicate before later distinct reads makes uniq[k] nonidentity; mixed bounds must
-        // retain each later read's own stopping policy rather than the compacted position's.
+        // A duplicate before later distinct reads makes uniq[k] nonidentity; mixed extras must
+        // reach each later read as its own rather than the compacted position's.
         opt->seed_len = 1024;
         const auto swap_read = reads[1]; reads[1] = reads[n - 2]; reads[n - 2] = swap_read;
         std::vector<std::string> bases = queries; std::swap(bases[1], bases[n - 2]);
-        for (int i = 0; i < n; ++i) { bounds[i].valid = true; bounds[i].value = reads[i].len == 17 ? 0 : 100; }
-        // A copy repeats an earlier read's bases and bound; every other read is a representative.
+        for (int i = 0; i < n; ++i) extra[i].horizon = reads[i].len == 17 ? 0 : INT64_MAX;
+        // A copy repeats an earlier read's bases and extra; every other read is a representative.
         std::vector<bool> is_copy(n, false); int n_copies = 0;
         for (int i = 0; i < n; ++i) {
             for (int j = 0; j < i && !is_copy[i]; ++j)
-                is_copy[i] = bases[j] == bases[i] && bounds[j].value == bounds[i].value;
+                is_copy[i] = bases[j] == bases[i] && extra[j].horizon == extra[i].horizon;
             n_copies += is_copy[i];
         }
         REQUIRE(n_copies == 2); // the two repeated queries, one now before later distinct reads
         CHECK(is_copy[1]);
         dup = ba::aln_dup_state_t();
         CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, read_no, 0, 1, 1000,
-                                      &dup, batch.data(), nullptr, bounds.data()) == n_copies);
+                                      &dup, batch.data(), extra.data()) == n_copies);
+        int flagged = 0;
         for (int i = 0; i < n; ++i) {
             CAPTURE(i);
             ba::aln_meth_read_t single;
             ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads + i, opt, 1, read_no, i, 1, 1000,
-                                      nullptr, &single, nullptr, &bounds[i]);
+                                      nullptr, &single, &extra[i]);
             CHECK(batch[i].flags == single.flags); CHECK(batch[i].c1 == single.c1); CHECK(batch[i].c2 == single.c2);
+            flagged += batch[i].flags != 0;
             // Duplicate copies intentionally have zero work counters; a representative's are its own.
             CHECK(batch[i].n_lookups == (is_copy[i] ? 0 : single.n_lookups));
         }
+        CHECK(flagged > 0); CHECK(flagged < n); // the premise: the extras make a difference
         mr.known_snvs = nullptr;
         ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+        opt->seed_len = 18;
     }
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
@@ -2610,7 +2880,7 @@ TEST_CASE("aln_meth: known-site stop requires a strict valid same-read ALT certi
     CHECK_FALSE(ba::aln_meth_can_stop(&slot, 3)); // next == M*d cannot certify
     CHECK(ba::aln_meth_can_stop(&slot, 4));
     // No extras list is consulted: a competitive ALT can lie beyond the reference horizon.
-    std::vector<ba::aln_meth_candidate_t> empty; slot.extra = &empty;
+    ba::aln_meth_extra_t empty; slot.extra = &empty;
     slot.alt_bound.value = 0; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
     slot.alt_bound.value = 2;
     for (int len : {0, 160, 161, 350}) {
@@ -2645,7 +2915,7 @@ TEST_CASE("aln_meth: known-site stop requires a strict valid same-read ALT certi
     free(opt);
 }
 
-TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT window strata")
+TEST_CASE("aln_meth: the known-site search preserves independent REF plus ALT window strata")
 {
     namespace ba = bwa_aln;
     bwa_tests::TempDir tmp{"aln_meth_alt_stop"}; const std::string fa = tmp.path() + "/ref.fa";
@@ -2656,7 +2926,7 @@ TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT w
         contigs.push_back({"v" + std::to_string(contigs.size()), target});
     }
     // REF cost 2*M exceeds T=M; the single ALT at base zero restores cost M.
-    // This competitor must survive even though genomic safe stopping alone could omit it.
+    // This competitor must survive even though the genomic search's cuts alone could omit it.
     std::string improved = query; improved.front() = 'C'; improved.back() = 'C';
     contigs.push_back({"alt_beyond_ref_horizon", improved});
     REQUIRE(aln_test::write_test_fasta(fa, contigs));
@@ -2693,19 +2963,11 @@ TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT w
         const auto fq = write_fq_in(tmp.path(), "r.fq", {strand ? aln_test::revcomp(query) : query});
         auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
         auto *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == 1);
-        ba::gap_opt_t discovery = *opt; discovery.mode |= BWA_MODE_NONSTOP; discovery.max_top2 = INT_MAX;
-        ba::aln_meth_read_t wr;
-        ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &discovery, 1,
-                                  read_no, 0, 1, 1000, nullptr, &wr, nullptr, nullptr, true);
-        std::vector<ba::aln_meth_candidate_t> extra; ba::ks_meth_candidates(&windows, mr.bns, wr, &extra);
+        ba::aln_opt_t o; ba::aln_opt_init(&o); o.gap = *opt; o.gap.n_threads = 1; o.max_xa_hits = 1000;
+        o.meth = &mo; o.meth_ref = &mr; o.known_snvs = &sites; o.ks_windows = &windows;
         ba::aln_meth_read_t result;
-        // As ks_meth_search composes them: the production certificate and the window flags.
-        const ba::aln_meth_alt_bound_t certificate = ba::aln_meth_alt_certificate(wr);
-        const int wflags = wr.flags;
-        ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, opt, 1, read_no, 0, 1, 1000,
-                                  nullptr, &result, &extra, &certificate, false, &wflags);
-        CHECK(result.flags == 0); CHECK(wr.flags == 0);
-        REQUIRE(wr.full_width_bound.valid);CHECK(wr.full_width_bound.value<=1);
+        ba::ks_meth_search(&o, bwt, 1, reads, read_no, 0, 1, nullptr, nullptr, &result);
+        CHECK(result.flags == 0);
         std::set<Key> expected, actual;
         for (int rid = 0; rid < (int)contigs.size(); ++rid) {
             int best = INT_MAX;
@@ -2748,7 +3010,7 @@ TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT w
     free(opt); ba::ks_windows_free(&windows); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
-TEST_CASE("aln_meth: seeded known-site searches use an actual ALT bound without losing retained loci")
+TEST_CASE("aln_meth: seeded known-site searches keep their retained loci")
 {
     namespace ba = bwa_aln;
     bwa_tests::TempDir tmp{"aln_meth_seed_alt"};
@@ -2782,16 +3044,15 @@ TEST_CASE("aln_meth: seeded known-site searches use an actual ALT bound without 
         const auto fq=write_fq_in(tmp.path(),"r.fq",{strand?aln_test::revcomp(query):query});
         auto *input=ba::bwa_seq_open(fq.c_str());int n=0;
         auto *reads=ba::bwa_read_seq(input,1,&n,BWA_MODE_COMPREAD,0);REQUIRE(n==1);
-        ba::gap_opt_t discovery=*opt;discovery.mode|=BWA_MODE_NONSTOP;discovery.max_top2=INT_MAX;
-        ba::aln_meth_read_t wr;
-        ba::aln_meth_search_batch(windows.bwt,windows.mref,&mo,1,reads,&discovery,1,read_no,0,1,1000,nullptr,&wr,nullptr,nullptr,true);
-        REQUIRE(wr.flags==0);REQUIRE(wr.full_width_bound.valid);REQUIRE(wr.full_width_bound.value>1);
-        std::vector<ba::aln_meth_candidate_t> extra;ba::ks_meth_candidates(&windows,ref.bns,wr,&extra);
-        ba::aln_meth_read_t certified,uncertified;ba::aln_meth_alt_bound_t unavailable;
-        ba::aln_meth_search_batch(bwt,&ref,&mo,1,reads,opt,1,read_no,0,1,1000,nullptr,&certified,&extra,&wr.full_width_bound);
-        ba::aln_meth_search_batch(bwt,&ref,&mo,1,reads,opt,1,read_no,0,1,1000,nullptr,&uncertified,&extra,&unavailable);
+        // The --known-snvs search, and as its control the search without the sites.
+        ba::aln_opt_t o;ba::aln_opt_init(&o);o.gap=*opt;o.gap.n_threads=1;o.max_xa_hits=1000;
+        o.meth=&mo;o.meth_ref=&ref;o.known_snvs=&sites;o.ks_windows=&windows;
+        ba::aln_meth_read_t certified,uncertified;
+        ba::ks_meth_search(&o,bwt,1,reads,read_no,0,1,nullptr,nullptr,&certified);
+        ref.known_snvs=nullptr;
+        ba::aln_meth_search_batch(bwt,&ref,&mo,1,reads,opt,1,read_no,0,1,1000,nullptr,&uncertified);
+        ref.known_snvs=&sites;
         CHECK(certified.flags==0);CHECK(uncertified.flags==0);
-        CHECK(certified.n_lookups<uncertified.n_lookups);
         std::set<Key> expected{{0,hyp,strand,0,0}},actual,control;
         for(const auto &hit:certified.hits) actual.emplace(hit.rid,hit.hyp,hit.strand,hit.pos,hit.cost);
         for(const auto &hit:uncertified.hits) control.emplace(hit.rid,hit.hyp,hit.strand,hit.pos,hit.cost);
@@ -4145,7 +4406,7 @@ TEST_CASE("aln_meth: TAPS neutral's tiebreak in pairs: the end's main hit and MA
 }
 
 
-TEST_CASE("aln_meth: incoming window flags precede neutral selection and duplicate sharing")
+TEST_CASE("aln_meth: audit-flagged window searches undo neutral selection and split duplicate sharing")
 {
     namespace ba = bwa_aln;
     FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
@@ -4157,29 +4418,39 @@ TEST_CASE("aln_meth: incoming window flags precede neutral selection and duplica
     const auto fq = write_fq("incoming-flags.fq", std::vector<std::string>(8, ref().read_u));
     auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
     auto *reads = ba::bwa_read_seq(input, 20, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == 8);
+    // Each read's ALT-window search: complete, or stopped with these flags below every cost (a
+    // horizon of 0), which the finish-time audit hands on to the read under --known-snvs.
     std::vector<int> flags{0, ba::ALN_METH_BIND_M, 0, ba::ALN_METH_BIND_BEST,
         ba::ALN_METH_BIND_M, ba::ALN_METH_BIND_CIGAR, ba::ALN_METH_BIND_UNREP, 0};
+    std::vector<ba::aln_meth_extra_t> extra(n);
+    for (int i = 0; i < n; ++i) if (flags[i]) { extra[i].flags = flags[i]; extra[i].horizon = 0; }
+    ba::ks_sites_t no_sites; no_sites.by_contig.resize(mr.bns->n_seqs); mr.known_snvs = &no_sites;
     std::vector<ba::aln_meth_read_t> results(n); ba::aln_dup_state_t dup;
     CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, 1, 1000,
-          &dup, results.data(), nullptr, nullptr, false, flags.data()) == 3);
+          &dup, results.data(), extra.data()) == 3);
     for (int i = 0; i < n; ++i) {
+        CAPTURE(i);
         CHECK(results[i].flags == flags[i]);
+        // (a duplicate copy ran no search: its audit, like its work counters, stays with its first copy)
+        if (results[i].n_lookups) CHECK(results[i].audit == (flags[i] ? ba::ALN_METH_AUDIT_HORIZON : 0));
         if (flags[i]) { CHECK(results[i].n_conv_moved == 0); CHECK(results[i].conv_gap == 0); }
         else CHECK(results[i].n_conv_moved == 3);
         ba::aln_meth_read_t single;
         ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads + i, opt, 1, 1, i, 1, 1000,
-            nullptr, &single, nullptr, nullptr, false, &flags[i]);
+            nullptr, &single, &extra[i]);
         CHECK(results[i].main == single.main); CHECK(results[i].c1 == single.c1); CHECK(results[i].c2 == single.c2);
+        CHECK(results[i].n_conv_moved == single.n_conv_moved);
     }
-    // Reset with no incoming flags restores complete-state tie-breaking for every reused result.
+    // Reset with no window candidates restores complete-state tie-breaking for every reused result.
     dup = ba::aln_dup_state_t();
     ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, 1, 1000, &dup, results.data());
     for (const auto &r : results) { CHECK(r.flags == 0); CHECK(r.n_conv_moved == 3); }
+    mr.known_snvs = nullptr;
     ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
-TEST_CASE("aln_meth: ks_meth_search applies incomplete window flags before the genomic search")
+TEST_CASE("aln_meth: ks_meth_search undoes the neutral tie-break of a read its audit flags")
 {
     namespace ba = bwa_aln;
     FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
@@ -4214,42 +4485,41 @@ TEST_CASE("aln_meth: ks_meth_search applies incomplete window flags before the g
     const auto fq = write_fq("ks-incoming-flags.fq", {ref().read_u});
     auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
     auto *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == 1);
-    const ba::gap_opt_t discovery = ba::ks_discovery_opt(o.gap);
     auto window_search = [&]() {
         ba::aln_meth_read_t w;
-        ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &discovery, 1, 1, 0, 1, o.max_xa_hits,
-                                  nullptr, &w, nullptr, nullptr, true);
+        ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &o.gap, 1, 1, 0, 1, o.max_xa_hits,
+                                  nullptr, &w);
         return w;
     };
-    // The genomic search given the window search's candidates and certificate but not its flags:
-    // what the read would get if the flags were only OR-ed into the result afterwards.
+    // The genomic search given the window search's candidates as complete (no flags, no horizon):
+    // what the read would get if the window flags were only OR-ed into the result afterwards.
     auto genomic_without_flags = [&](const ba::aln_meth_read_t &w) {
-        std::vector<ba::aln_meth_candidate_t> extra; ba::ks_meth_candidates(&windows, mr.bns, w, &extra);
-        const ba::aln_meth_alt_bound_t certificate = ba::aln_meth_alt_certificate(w);
+        ba::aln_meth_extra_t extra; ba::ks_meth_candidates(&windows, mr.bns, w, &extra);
+        extra.flags = 0; extra.horizon = INT64_MAX;
         ba::aln_meth_read_t r;
-        ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, &o.gap, 1, 1, 0, 0, o.max_xa_hits, nullptr, &r, &extra,
-                                  &certificate);
+        ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, &o.gap, 1, 1, 0, 0, o.max_xa_hits, nullptr, &r, &extra);
         return r;
     };
-    // Calibrate: with the budget set to the rows the genomic search needs without stopping, the
-    // window search (more rows) is bound while the genomic search alone completes.
+    // Calibrate: with the budget set to the rows the genomic search needs, the window search (more
+    // rows) is bound while the genomic search alone completes.
     const auto full_window = window_search();
     REQUIRE(full_window.flags == 0);
-    ba::aln_meth_read_t unstopped = full_window; unstopped.site_bound.valid = false; unstopped.full_width_bound.value = 0;
-    const auto full_genomic = genomic_without_flags(unstopped);
+    const auto full_genomic = genomic_without_flags(full_window);
     REQUIRE(full_genomic.flags == 0);
     REQUIRE(full_window.n_lookups > full_genomic.n_lookups);
     mo.p_best = (int)full_genomic.n_lookups; mo.p_second = 0;
     const auto bound_window = window_search();
     REQUIRE(bound_window.flags == ba::ALN_METH_BIND_BEST);
+    REQUIRE(bound_window.horizon == 0); // bound in the read's best stratum
     // Flags OR-ed in after the search would leave neutral scoring's conversion tie-break in place.
     const auto or_after = genomic_without_flags(bound_window);
     REQUIRE(or_after.flags == 0); REQUIRE(or_after.n_conv_moved == 3);
-    // ks_meth_search hands them to the genomic slot first: the read is incomplete from the start,
-    // so the tie-break (which assumes every equal-cost locus was seen) is skipped.
+    // ks_meth_search's audit finds the window search stopped below the read's costs: the read is
+    // incomplete, so the tie-break (which assumes every equal-cost locus was seen) is undone.
     ba::aln_meth_read_t res;
     ba::ks_meth_search(&o, bwt, 1, reads, 1, 0, 0, nullptr, nullptr, &res);
     CHECK(res.flags == ba::ALN_METH_BIND_BEST);
+    CHECK(res.audit == ba::ALN_METH_AUDIT_HORIZON);
     CHECK(res.n_conv_moved == 0); CHECK(res.conv_gap == 0);
     ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
     mr.known_snvs = nullptr; ba::ks_windows_free(&windows); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
