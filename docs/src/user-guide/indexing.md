@@ -25,8 +25,25 @@ expect roughly 11 GB total across all four files.
 > **Note — reusing an existing index**
 >
 > - **From `bwa-mem2`:** an index built by `bwa-mem2 index` works as-is — no
->   rebuild. bwa-mem3 reads its `.bwt.2bit.64` and `.pac` and ignores the
->   `.0123`.
+>   rebuild, for ordinary (non-`--meth`) alignment. This is a supported
+>   compatibility guarantee, not an accident of the format. `mem` reads the
+>   bwa-mem2 `.amb`, `.ann`, `.pac` and `.bwt.2bit.64`, and does not need
+>   `.0123` (it is never opened; pac-fetch,
+>   [#177](https://github.com/fg-labs/bwa-mem3/pull/177)). A bwa-mem2
+>   `.bwt.2bit.64` uses the legacy layout (header, occurrence table,
+>   suffix-array samples, sentinel). Every file bwa-mem3 writes, at any sample
+>   rate including the default, adds a trailing 8-byte sample-rate tag
+>   (introduced with `index -u`,
+>   [#445](https://github.com/fg-labs/bwa-mem3/pull/445)). `mem` detects the
+>   untagged legacy layout from the file size and reads it at the default rate
+>   (`-u 3`).
+> - **The reverse is not guaranteed:** bwa-mem2 requires `.0123`, which
+>   bwa-mem3 does not write unless you pass `--emit-unpacked-ref`. A `--meth`
+>   index cannot come from bwa-mem2: bwa-mem3 adds the converted `.meth.*` seed
+>   index ([#174](https://github.com/fg-labs/bwa-mem3/pull/174)); build it with
+>   `bwa-mem3 index --meth`, either at a new prefix (`-p`) or with `--force`
+>   at the same one. See the migration guide for what `--force` removes and
+>   why a new prefix is the safer choice.
 > - **From `bwa` (v1):** a `bwa index` uses a different FM-index format
 >   (`.bwt` / `.sa`) and **cannot** be reused — run `bwa-mem3 index ref.fa` to
 >   rebuild (a few minutes; the FASTA is unchanged).
@@ -137,25 +154,44 @@ bwa-mem3 index /data/indexes/hg38/hg38.fa
 
 Index construction is **multi-threaded**. `index -t` defaults to the detected
 core count (cgroup-aware), and `--max-memory` defaults to the memory available
-to the process less a reserve of `min(max(2 GB, 5%), 50%)` — a batch build is
+to the process less a reserve of `min(max(2 GiB, 5%), 50%)` — a batch build is
 allowed to use the host it was given. The reserve never exceeds half of total, so
-a host below 4 GB still gets a usable budget (a 1 GB host budgets 512 MB). On a
-typical multi-core host, indexing hg38 takes a few minutes (longer if pinned to a
-single core).
+a host below 4 GiB still gets a usable budget (a 1 GiB host budgets 512 MiB).
+On a typical multi-core host, indexing hg38 takes a few minutes (longer if
+pinned to a single core).
 
-Peak memory is roughly **12 bytes per base of doubled text**, i.e. ~72 GB for
+Peak memory is roughly **12 bytes per base of doubled text**, i.e. ~72 GiB for
 hg38. Below ~1.07 Gbp the suffix array still fits 32-bit entries and the cost
-drops to ~8 bytes per base. `--max-memory` is a precondition checked before the
-build starts, not a spill target: a reference that does not fit the budget is
-rejected up front (exit code 3) rather than built more slowly. Budget hg38 on a
-host with ~76 GB of RAM or more; the rejection message names both the
-`--max-memory` override and the host size that would work without one.
+drops to ~8 bytes per base. `--max-memory` is a precondition checked before
+suffix-array construction starts, not a spill target: a reference that does not
+fit the budget is rejected (exit code 3) rather than built more slowly. Budget
+hg38 on a host with ~76 GiB of RAM or more. The rejection message names the
+`--max-memory` value that would clear the estimate and, when the budget was
+automatic, the host size that would work without an override.
 
 `--meth` needs about **twice** that, because it builds a second index over a
-per-strand-converted reference whose text is twice as long: ~144 GB estimated for
-hg38, so budget a host with ~152 GB of RAM or more. Both builds run in one
-process and the first does not fully release its memory before the second starts,
-so the per-base figures above already account for that overlap.
+per-strand-converted reference whose text is twice as long: ~144 GiB estimated
+for hg38, so budget a host with ~152 GiB of RAM or more. Both builds run in one
+process and the first does not fully release its memory before the second
+starts, so the per-base figures above already account for that overlap.
+
+> **Warning — `--max-memory` is a preflight check, not a spill target**
+>
+> `index` estimates its peak memory and exits with code 3 if the estimate
+> exceeds `--max-memory`; it never spills to disk to fit a smaller budget. For
+> `--meth` the check runs before anything is written. A plain build packs the
+> reference into `.pac` first, so a rejected plain build leaves that file behind.
+> For `--meth` on hg38 the estimate is ~144 GiB; `--meth-only` does not lower
+> it, because the check runs before that option changes what is built. The
+> measured peak can be well below the estimate, but the estimate decides.
+>
+> The default budget is physical RAM, capped by a cgroup limit when one
+> applies, less the reserve described above. A workflow manager's task request
+> is honored only when it sets such a limit, for example in a container. In
+> Nextflow or Snakemake, either pass `--max-memory` equal to the task memory
+> and request at least the estimate, or request the estimate plus the reserve
+> (~152 GiB for a `--meth` hg38 build), or build the index once on a large host
+> and stage it as an input.
 
 bwa-mem3 builds the suffix array with
 [libsais](https://github.com/IlyaGrebnov/libsais), whose OpenMP-parallel

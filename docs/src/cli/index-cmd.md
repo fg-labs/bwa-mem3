@@ -26,7 +26,7 @@ Build a methylation-aware index (required before `bwa-mem3 mem --meth`):
 bwa-mem3 index --meth ref.fa
 ```
 
-Limit peak RAM to 16 GB and write scratch data to `/scratch`:
+Set a 16 GiB preflight memory budget and write scratch data to `/scratch`:
 
 ```bash
 bwa-mem3 index --max-memory 16G --tmp-dir /scratch ref.fa
@@ -55,22 +55,37 @@ cap CPU usage.
 
 ### `--max-memory SIZE` — peak memory budget
 
-Limits how much RAM the indexer may use at once. `SIZE` accepts a `G`, `M`, or
-`K` suffix (case-insensitive) or a bare byte count. The default is the memory
-available to the process less a reserve of `min(max(2 GB, 5%), 50%)`, computed in
-a cgroup-aware manner — index construction is a one-shot batch job, so the
-default lets it use the host it was given. The reserve is the larger of 2 GB and
-5% of total, except that it never exceeds half of total, so a host below 4 GB
-still resolves to a usable budget (a 1 GB host budgets 512 MB) instead of zero.
+Sets the memory budget that `index` checks its estimated peak against before
+suffix-array construction; it does not cap the RAM the build uses. `SIZE`
+accepts a `G`, `M`, or `K` suffix (case-insensitive) or a bare byte count. The
+default is the memory available to the process less a reserve of
+`min(max(2 GiB, 5%), 50%)`, computed in a cgroup-aware manner — index
+construction is a one-shot batch job, so the default lets it use the host it
+was given. The reserve is the larger of 2 GiB and 5% of total, except that it
+never exceeds half of total, so a host below 4 GiB still resolves to a usable
+budget (a 1 GiB host budgets 512 MiB) instead of zero.
+
+> **Warning — a preflight check, not a spill target.** If the estimate exceeds
+> the budget, `index` exits with code 3 instead of building in less memory. For
+> `--meth` on hg38 the estimate is ~144 GiB, and `--meth-only` does not lower it.
+> The measured peak can be well below the estimate, but the estimate decides.
+> The default budget is physical RAM, capped by a cgroup limit when one
+> applies, less the reserve above, so a workflow manager's task request counts
+> only when it is enforced as a cgroup limit (for example in a container). In
+> Nextflow or Snakemake, either pass `--max-memory` equal to the task memory and
+> request at least the estimate, or request the estimate plus the reserve
+> (~152 GiB for a `--meth` hg38 build), or build the index once on a large host
+> and stage it as an input.
 
 Suffix-array construction is **not** currently bounded-memory: the budget is a
-precondition that is checked before the build starts, not a target the builder
-spills to meet. A reference whose estimated requirement exceeds the budget is
-rejected with exit code 3 and a message naming both the `--max-memory` value
-that would clear it and the host RAM that would clear it automatically. Human
-genomes need roughly 12 bytes per base of doubled text (8 below ~1.07 Gbp, where
-the suffix array still fits 32-bit entries) — about 72 GB for hg38 —
-so plan on a host with ~76 GB of RAM or more.
+precondition that is checked before suffix-array construction starts, not a
+target the builder spills to meet. A reference whose estimated requirement
+exceeds the budget is rejected with exit code 3 and a message naming the
+`--max-memory` value that would clear it. When the budget was automatic rather
+than set with `--max-memory`, the message also names the host RAM that would
+clear it. Human genomes need roughly 12 bytes per base of doubled text (8
+below ~1.07 Gbp, where the suffix array still fits 32-bit entries) — about
+72 GiB for hg38 — so plan on a host with ~76 GiB of RAM or more.
 
 ### `--tmp-dir PATH` — scratch directory
 
@@ -145,7 +160,7 @@ Requires `--meth`. Conversion is always regenerated in a unique scratch director
 
 ### `--force` — replace known methylation index artifacts
 
-Requires `--meth`. Without it, an existing output artifact causes refusal before modification. With it, only known index artifacts and relocated `.alt`/`.hdr` outputs may be replaced; source aliases, hard links, symlinks, directories, and conflicting unrelated metadata are rejected. Other files are untouched. Switching between full and minimal output removes stale `.bwt.2bit.64`, `.0123`, and retained `.meth.fa` artifacts as appropriate.
+Requires `--meth`. Without it, an existing output artifact causes refusal before modification. With it, only known index artifacts and relocated `.alt`/`.hdr` outputs may be replaced; source aliases, hard links, symlinks, directories, and conflicting unrelated metadata are rejected. An `.alt` or `.hdr` already at a relocated prefix is deleted and not replaced when the source FASTA has no matching file, which changes ALT-contig handling or the SAM header; move or remove such files before building. Other files are untouched. Switching between full and minimal output removes stale `.bwt.2bit.64`, `.0123`, and retained `.meth.fa` artifacts as appropriate.
 
 The seed memory budget and conversion are checked before replacement begins. Replacement is **not transactional**: a subsequent index-writing failure may leave a partial index; rerun with `--force` after fixing the cause. Do not rebuild a prefix while another process is reading or modifying it. Ordinary `index` behavior without `--meth` is unchanged.
 

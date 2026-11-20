@@ -19,10 +19,38 @@ read on demand via *pac-fetch*).
   bwa-mem3 index ref.fa
   ```
 
-- **Coming from `bwa-mem2`:** your existing index works **as-is, no rebuild**.
-  bwa-mem3 reads the `.bwt.2bit.64` and `.pac` your `bwa-mem2 index` already
-  produced; it ignores the `.0123` file (and no longer builds one — pass
-  `index --emit-unpacked-ref` only if some other tool still needs it).
+- **Coming from `bwa-mem2`:** your existing index works **as-is, no rebuild**,
+  for ordinary alignment. This is a supported compatibility guarantee: bwa-mem3
+  reads the `.bwt.2bit.64` and `.pac` your `bwa-mem2 index` already produced.
+  A bwa-mem2 `.bwt.2bit.64` uses the legacy layout, without the trailing
+  sample-rate tag that bwa-mem3 writes, and bwa-mem3 reads it at the default
+  sample rate. bwa-mem3 ignores the `.0123` file and no longer builds one
+  ([#177](https://github.com/fg-labs/bwa-mem3/pull/177)); pass
+  `index --emit-unpacked-ref` only if some other tool still needs it. The
+  reverse does not hold: bwa-mem2 needs `.0123`, which bwa-mem3 does not write
+  by default.
+
+  Methylation alignment (`mem --meth`) needs the converted seed index
+  ([#174](https://github.com/fg-labs/bwa-mem3/pull/174)), which bwa-mem2 does
+  not build; build it with `bwa-mem3 index --meth`. That also rebuilds the
+  ordinary index files, so if a bwa-mem2 index is already at the prefix it stops
+  with `output exists`. Choose one:
+
+  - **A new prefix (`-p`)** keeps the bwa-mem2 index in place and is the safer
+    choice. If the new prefix already holds an `.alt` or `.hdr` file,
+    `index --meth` stops there too, and with `--force` it deletes any such file
+    the source FASTA does not provide without replacing it. A leftover `.alt`
+    changes ALT-contig handling and a `.hdr` changes the SAM header, so move or
+    remove those files yourself before building rather than relying on
+    `--force`.
+  - **`--force` at the same prefix** deletes the bwa-mem2 `.amb`, `.ann`,
+    `.pac`, `.bwt.2bit.64` and `.0123` before it builds their replacements, so
+    a failed build can leave the prefix with no usable index. Back up the
+    bwa-mem2 index first. A new `.0123` is written only if you add
+    `--emit-unpacked-ref` to an ordinary `--meth` build. `--meth-only` rejects
+    `--emit-unpacked-ref` and does not rebuild `.bwt.2bit.64` either, so after
+    it that prefix supports neither ordinary alignment nor a tool that needs
+    `.0123`; use a new prefix if you need either.
 
 See [Indexing the reference](../user-guide/indexing.md) for details.
 
