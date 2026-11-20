@@ -622,8 +622,9 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		if (o->ks_windows) {
 			ks_aln.resize(n_seqs);
 			ks_n.resize(n_seqs);
+			std::vector<uint8_t> main_top2b(n_seqs); // the main search's -R stop (ks_merge reads it)
 			for (int i = 0; i < n_seqs; ++i) {
-				ks_aln[i] = seqs[i].aln; ks_n[i] = seqs[i].n_aln;
+				ks_aln[i] = seqs[i].aln; ks_n[i] = seqs[i].n_aln; main_top2b[i] = seqs[i].top2b;
 				seqs[i].aln = 0; seqs[i].n_aln = 0;
 			}
 			ks_save_stopped(n_seqs, seqs, &ks_stopped);
@@ -634,6 +635,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			for (int i = 0; i < n_seqs; ++i) {
 				std::swap(ks_aln[i], seqs[i].aln);
 				std::swap(ks_n[i], seqs[i].n_aln);
+				seqs[i].top2b = main_top2b[i];
 			}
 		}
 		// serial and in read order: bwa_aln2seq_core draws from drand48
@@ -820,8 +822,9 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			// --known-snvs: the same search on the ALT windows, kept beside the main search's hits
 			ks_aln[m].resize(n_in[m]);
 			ks_n[m].resize(n_in[m]);
+			std::vector<uint8_t> main_top2b(n_in[m]); // the main search's -R stop (ks_merge reads it)
 			for (int i = 0; i < n_in[m]; ++i) {
-				ks_aln[m][i] = seqs[m][i].aln; ks_n[m][i] = seqs[m][i].n_aln;
+				ks_aln[m][i] = seqs[m][i].aln; ks_n[m][i] = seqs[m][i].n_aln; main_top2b[i] = seqs[m][i].top2b;
 				seqs[m][i].aln = 0; seqs[m][i].n_aln = 0;
 			}
 			ks_save_stopped(n_in[m], seqs[m], &ks_stopped[m]);
@@ -832,6 +835,7 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			for (int i = 0; i < n_in[m]; ++i) {
 				std::swap(ks_aln[m][i], seqs[m][i].aln);
 				std::swap(ks_n[m][i], seqs[m][i].n_aln);
+				seqs[m][i].top2b = main_top2b[i];
 			}
 		}
 		// bwa_cal_pac_pos_pe, stage by stage: the drand48 pass serially in stock order, then

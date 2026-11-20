@@ -514,4 +514,54 @@ TEST_CASE("aln_ks_cuts: --meth credits the second ALT of a multi-allelic site")
     check_against_oracle(k, true, {"-n", "4"}, {want});
 }
 
+TEST_CASE("aln_ks_cuts: plain aln: a cheaper ALT-window hit loosens the ceiling the main search took from its own best")
+{
+    repro_case(1, false);
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: -R counts the final best, not the main search's own best stratum")
+{
+    repro_case(31, false);
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: the ALT-window search does not take a ceiling from its own gapped best")
+{
+    window_ceiling_case(false);
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: with -e, gap extensions are not differences in the merged cuts")
+{
+    // -e 2 turns gap extensions out of the difference count (stock's ceiling counts n_mm + n_gapo).
+    // W: R with a 2-base deletion and, at a site, a mismatch whose ALT is R's base: 15 with the ALT
+    //    (one difference: the gap open), the read's best, so stock's ceiling is 2.
+    // H: R with a 1-base deletion and two mismatches: 17, three differences: within B + M but over
+    //    the ceiling, so the oracle does not retain it. Counting W's extension as a difference
+    //    would raise the ceiling to 3 and keep H.
+    uint32_t st = 31415;
+    const std::string read = no_c(st, 100);
+    std::string c1 = aln_test::lcg_dna(st, 9000);
+    auto other = [&](std::initializer_list<char> no) {
+        for (char b : {'A', 'G', 'T', 'C'})
+            if (std::find(no.begin(), no.end(), b) == no.end()) return b;
+        return 'A';
+    };
+    const char x = other({read[49], read[50]}), y = other({read[49], read[50], x});
+    const int w = 2000, h = 6000;
+    std::string seg_w = with_mm(read, {70});
+    seg_w = seg_w.substr(0, 50) + x + y + seg_w.substr(50);
+    c1.replace(w, seg_w.size(), seg_w);
+    std::string seg_h = with_mm(read, {60, 80});
+    seg_h = seg_h.substr(0, 50) + x + seg_h.substr(50);
+    c1.replace(h, seg_h.size(), seg_h);
+    const int w_site = w + 72; // seg_w's base 72 is read base 70
+    const KsCase k(c1, {{w_site, seg_w[72], std::string(1, read[70]), read[70]}}, {read});
+    const std::string want = "0 c1:" + pos1(w) + " 50M2D50M MAPQ 37 X0 1 X1 0 XA";
+    check_against_oracle(k, false, {"-n", "5", "-e", "2"}, {want});
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: overlapping ALT windows count one locus once toward -R")
+{
+    window_overlap_case(false);
+}
+
 TEST_SUITE_END();

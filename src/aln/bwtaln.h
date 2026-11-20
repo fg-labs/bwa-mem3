@@ -90,7 +90,8 @@ typedef struct {
 typedef struct {
 	char *name;
 	ubyte_t *seq, *rseq, *qual;
-	uint32_t len:20, strand:1, type:2, dummy:1, extra_flag:8;
+	// top2b: its search ended on the -R (top2b) stop (--known-snvs re-searches such a read)
+	uint32_t len:20, strand:1, type:2, top2b:1, extra_flag:8;
 	uint32_t n_mm:8, n_gapo:8, n_gape:8, mapQ:8;
 	int score;
 	int clip_len;

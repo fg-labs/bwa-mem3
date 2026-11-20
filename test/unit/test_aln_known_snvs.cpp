@@ -388,6 +388,69 @@ TEST_CASE("aln_known_snvs: contig-crossing refined alignments have no votes"
     free(opt);
 }
 
+TEST_CASE("aln_known_snvs: under -N only an -R stop below the merged best runs the main search again"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    opt->mode |= BWA_MODE_NONSTOP; opt->max_top2 = 0x7fffffff; opt->max_diff = 3;
+    const int M = opt->s_mm;
+    // The main search's own best: one mismatch, and a worse hit with three.
+    std::vector<ba::bwt_aln1_t> a(2);
+    a[0].score = M; a[0].n_mm = 1; a[1].score = 3 * M; a[1].n_mm = 3;
+    // Plain -N never stops on -R: whatever the merged best and cap, no second search.
+    for (int best : {0, M, 2 * M}) for (int cap : {0, 1, 3})
+        CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, false, best, cap));
+    // -N -R k: an -R stop matters exactly when the merged best is below the search's own (here an
+    // ALT hit one mismatch better: without a score cut, best + M > own is not required).
+    CHECK(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, 0, 1));
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, M, 1));
+    // Without -N the ceiling and the score cut apply.
+    opt->mode &= ~BWA_MODE_NONSTOP;
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, M, 2)); // its own best and ceiling
+    CHECK(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, false, M, 3));      // the merged ceiling is looser
+    free(opt);
+}
+
+TEST_CASE("aln_known_snvs: with -N -R 1 a read credited one mismatch better keeps every hit within -n"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    bwa_tests::TempDir tmp{"ks_nonstop_r"}; const std::string dir = tmp.path();
+    // The read, 40 bases. Locus A (c1) holds it with the REF base at a site whose ALT is the read's
+    // base: one mismatch on the reference, none with the ALT. Two more copies have one (other)
+    // mismatch each, and one copy has two. Under -N -R 1 the main search sees three loci at one
+    // mismatch and stops on -R before the two-mismatch copy; the merged best (the ALT, no
+    // mismatch) is below its own, so the main search runs again and, as the merge keeps every hit
+    // within -n under -N, the two-mismatch copy is kept.
+    uint32_t st = 2718;
+    const std::string read = aln_test::lcg_dna(st, 40);
+    auto with = [&](std::initializer_list<int> at) {
+        std::string c = read;
+        for (int p : at) c[p] = std::string("CATG")[std::string("ACGT").find(c[p])];
+        return c;
+    };
+    std::string genome = aln_test::lcg_dna(st, 200);
+    const int locus_a = (int)genome.size(); genome += with({20}) + aln_test::lcg_dna(st, 200);
+    const int copy1 = (int)genome.size(); genome += with({5}) + aln_test::lcg_dna(st, 200);
+    const int copy2 = (int)genome.size(); genome += with({33}) + aln_test::lcg_dna(st, 200);
+    const int copy3 = (int)genome.size(); genome += with({8, 30}) + aln_test::lcg_dna(st, 200);
+    const std::string prefix = tmp.unique_file();
+    REQUIRE(aln_test::write_test_fasta(prefix, {{"c1", genome}}));
+    REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
+    const std::string vcf = write_vcf(dir + "/s.vcf",
+        {row("c1", locus_a + 21, genome[locus_a + 20], std::string(1, read[20]))});
+    const std::string fq = write_fq(dir + "/r.fq", {{"r", read}});
+    const std::string sam = dir + "/out.sam";
+    bwa_tests::StderrCapture quiet;
+    REQUIRE(run({"--known-snvs", vcf, "-N", "-R", "1", "-n", "3", "-l", "1024", "-f", sam, prefix, fq}) == 0);
+    const auto rec = records(slurp(sam)); REQUIRE(rec.size() == 1);
+    CAPTURE(slurp(sam));
+    CHECK(rec[0][3] == std::to_string(locus_a + 1));
+    CHECK(tag(rec[0], "XM:i:") == "XM:i:0");  // credited with the ALT
+    CHECK(tag(rec[0], "X0:i:") == "X0:i:1");
+    CHECK(tag(rec[0], "X1:i:") == "X1:i:3");  // the two one-mismatch copies and the two-mismatch one
+    const std::string xa = tag(rec[0], "XA:Z:");
+    for (int p : {copy1, copy2, copy3}) CHECK(xa.find("c1,+" + std::to_string(p + 1) + ",") != std::string::npos);
+}
+
 TEST_CASE("aln_known_snvs: XA uses selected-allele CIGAR and reference edit distance"
           * doctest::test_suite("unit/aln_known_snvs")) {
     bwa_tests::TempDir tmp{"ks_xa"}; const std::string dir = tmp.path();
