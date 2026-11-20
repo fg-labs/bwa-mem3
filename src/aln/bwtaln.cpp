@@ -293,7 +293,7 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 			return 0;
 		}
 		bwa_seq_t *p = seqs + r;
-		p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0;
+		p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0; p->top2b = 0;
 		H::slot_start(s.c, p, r);
 		if ((int)s.w.size() < p->len + 1) s.w.resize(p->len + 1);
 		width_walk_init(&s.c->ww, bwt, p->len, H::seq(s.c, p), s.w.data());
@@ -334,7 +334,7 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 	while (n_active) {
 		gap_slot_t &s = slots[H::run(cores.data(), G, &pos, bwt)];
 		if (s.c->state == GAP_SLOT_WIDTHS && !start(s)) continue; // its search runs in the next turns
-		s.p->aln = s.c->job.aln; s.p->n_aln = s.c->job.n_aln; // the read is done
+		s.p->aln = s.c->job.aln; s.p->n_aln = s.c->job.n_aln; s.p->top2b = s.c->job.top2b; // the read is done
 		H::finish(s.c, s.p);
 		if (!fill(s)) --n_active;
 	}
@@ -729,7 +729,7 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 			const size_t n = q->n_aln > 0? q->n_aln : 1;
 			d->aln = (bwt_aln1_t*)aln_malloc(n * sizeof(bwt_aln1_t));
 			if (q->n_aln > 0) memcpy(d->aln, q->aln, q->n_aln * sizeof(bwt_aln1_t));
-			d->n_aln = q->n_aln;
+			d->n_aln = q->n_aln; d->top2b = q->top2b;
 			d->search_incomplete = q->search_incomplete;
 		});
 }

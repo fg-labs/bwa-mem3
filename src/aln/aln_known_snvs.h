@@ -126,6 +126,15 @@ struct aln_meth_read_t;
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res);
 
+/* Without --meth: whether a read's main search (hits a/n, top2b: it ended on its -R stop) took
+ * cuts from its own first hit (the top-2 ceiling; the -R stop on its best stratum) that may have
+ * left out hits the merged set keeps, whose best is best and whose cap on differences is cap. Its
+ * score cut (its best + M) never does: no merged best is above a search's own. Under -N there is
+ * no ceiling or score cut and the merge keeps every hit within -n, so only an -R stop below the
+ * merged best counts. ks_merge then runs the search again (the ALT-window search takes no cuts:
+ * ks_discovery_opt). */
+bool ks_cuts_too_tight(const gap_opt_t *opt, int max_diff, const bwt_aln1_t *a, int n, bool top2b, int best, int cap);
+
 /* What ks_override did to a read. */
 enum ks_outcome_t {
 	KS_UNTOUCHED = 0,   // no window hit covers its site: the stock result stands
