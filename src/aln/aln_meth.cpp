@@ -177,7 +177,10 @@ __attribute__((noinline, cold)) int aln_meth_gap_arena(aln_meth_slot_t *x, const
  *   never cuts a path to a retained row.
  * - -R: with the best stratum complete, more than -R loci at B within the ceiling (under the
  *   TAPS/5base tie-break, the fewest-conversion ones of them) end the search, as stock's top2b
- *   stop does. */
+ *   stop does.
+ * "Final" holds only if every row from outside this search's own paths is in before its first
+ * step: under --known-snvs, the ALT-window candidates (aln_meth_score_extras, whose search is a
+ * generator with cuts of its own, aln_meth_boundary_gen). The finish audits it (meth_audit). */
 static bool conv_tiebreak(const aln_meth_opt_t *mo);
 /* Stock's top-2 ceiling from the stored rows: the fewest differences of a verified row at the best
  * cost B, plus one (INT_MAX with none, or with one at INT_MAX - 1 or more). Final once the best
@@ -414,8 +417,9 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
         (!x->grp->ref->known_snvs || x->gen || ks_fits_window(x->len, o));
     x->best = INT64_MAX; x->flushed = 0;
     x->extras_done = 0; x->ceil_applied = INT_MAX; x->r_stop = 0;
-    // Certificates stay off under --known-snvs (main and ALT-window search): a read's ALT
-    // candidates are resolved after its search, so a certificate could close it on rows that miss them.
+    // Certificates stay off under --known-snvs (main and ALT-window search): the window search is a
+    // generator whose best is not the read's, and the main search's rows below its best are final
+    // only through the window search's horizon, which the finish audits, not a certificate.
     x->cert = x->cut && !x->grp->keep_strata && !x->grp->ref->known_snvs && !x->grp->ref->ks_window;
     x->ivs.clear();
     x->perm_rng = x->rng ^ 0x6a09e667f3bcc909ULL;
