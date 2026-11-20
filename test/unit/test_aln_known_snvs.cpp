@@ -846,7 +846,7 @@ struct OffsiteSearch {
     };
     struct outcome_t {
         bwa_aln::aln_meth_read_t window, genomic;
-        bwa_aln::aln_meth_alt_bound_t certificate;
+        bwa_aln::aln_meth_extra_t extra; // the window search's candidates, horizon and flags
     };
     bwa_tests::TempDir tmp{"ks_stop_search"};
     FMI_search fmi{(offsite().prefix + ".meth").c_str()};
@@ -898,8 +898,8 @@ struct OffsiteSearch {
         REQUIRE(n == 1);
         return reads;
     }
-    // The window search, then (with `genomic`) the genomic search with its candidates, certificate
-    // and flags, as ks_meth_search composes them.
+    // The window search (a candidate generator, with the read's options), then (with `genomic`)
+    // the genomic search with its candidates, horizon and flags, as ks_meth_search composes them.
     outcome_t search(const std::vector<int> &site_pos, int read_no, const std::string &bases, int budget,
                      const bwa_aln::gap_opt_t &gap, bool genomic = true)
     {
@@ -907,18 +907,13 @@ struct OffsiteSearch {
         mr.known_snvs = &s.sites;
         bwa_aln::aln_meth_opt_t mo; mo.p_best = budget; mo.p_second = 0; bwa_aln::aln_meth_opt_finish(&mo);
         bwa_aln::bwa_seq_t *reads = read(bases, read_no);
-        const bwa_aln::gap_opt_t discovery = bwa_aln::ks_discovery_opt(gap);
         outcome_t out;
-        bwa_aln::aln_meth_search_batch(s.windows.bwt, s.windows.mref, &mo, 1, reads, &discovery, 1, read_no, 0, 1,
-                                       1000, nullptr, &out.window, nullptr, nullptr, true);
-        out.certificate = bwa_aln::aln_meth_alt_certificate(out.window);
-        if (genomic) {
-            std::vector<bwa_aln::aln_meth_candidate_t> extra;
-            bwa_aln::ks_meth_candidates(&s.windows, mr.bns, out.window, &extra);
-            const int flags = out.window.flags;
+        bwa_aln::aln_meth_search_batch(s.windows.bwt, s.windows.mref, &mo, 1, reads, &gap, 1, read_no, 0, 1,
+                                       1000, nullptr, &out.window);
+        bwa_aln::ks_meth_candidates(&s.windows, mr.bns, out.window, &out.extra);
+        if (genomic)
             bwa_aln::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, &gap, 1, read_no, 0, 1, 1000, nullptr,
-                                           &out.genomic, &extra, &out.certificate, false, &flags);
-        }
+                                           &out.genomic, &out.extra);
         bwa_aln::bwa_free_read_seq(1, reads);
         mr.known_snvs = nullptr;
         return out;
@@ -955,128 +950,140 @@ TEST_CASE("aln_known_snvs: a site its ALT window holds beside the read keeps met
     }
 }
 
-TEST_CASE("aln_known_snvs: an ALT placement covering its site within the retained differences still blocks stopping"
+TEST_CASE("aln_known_snvs: an ALT placement at the read's own locus does not cost it its confidence"
           * doctest::test_suite("unit/aln_known_snvs")) {
     const OffsiteStop &x = offsite();
     bwa_tests::TempDir tmp{"ks_stop_under"}; const std::string dir = tmp.path();
     // The read covers the site with the reference base, so the site's ALT window places it with one
-    // difference: inside the retained window (best cost plus one mismatch). The stop stays refused,
-    // the copies exhaust the lookup budget and the placement is reported without confidence. (The
-    // run without --known-snvs, MAPQ 37 and X0 1, is the previous case's.)
+    // difference, at the read's own locus: that placement collapses into the best locus and is no
+    // competitor, and the copies lie past the best cost plus one mismatch. The window search is
+    // complete there, so the record is the stock one plus XV.
     const int site = OffsiteStop::locus + 10;
     const std::string fq = write_fq(dir + "/r.fq", {{"fwd", x.fragment(false)}, {"rev", x.fragment(true)}});
     const std::string vcf = write_vcf(dir + "/s.vcf", {row("c1", site + 1, x.c1[site], std::string(1, other(x.c1[site])))});
     bwa_tests::StderrCapture quiet;
-    const std::string sam = dir + "/out.sam";
-    REQUIRE(run({"--meth", "-n", "2", "-o", "0", "-l", "1024", "-f", sam, "--known-snvs", vcf, x.prefix, fq}) == 0);
-    require_records(slurp(sam), {"fwd", "rev"}, false);
-    for (const auto &r : records(slurp(sam))) {
-        CAPTURE(r[0]);
-        CHECK(r[2] == "c1"); CHECK(r[3] == std::to_string(OffsiteStop::locus + 1)); CHECK(r[5] == "30M");
-        CHECK(r[4] == "0"); CHECK(tag(r, "X0:i:").empty()); CHECK(tag(r, "X1:i:").empty());
-        CHECK(tag(r, "XV:Z:").find("c1:" + std::to_string(site + 1) + ":") != std::string::npos);
+    std::vector<std::vector<std::string>> stock;
+    for (bool known : {false, true}) {
+        const std::string sam = dir + "/out.sam";
+        std::vector<std::string> args{"--meth", "-n", "2", "-o", "0", "-l", "1024", "-f", sam};
+        if (known) args.insert(args.end(), {"--known-snvs", vcf});
+        args.insert(args.end(), {x.prefix, fq}); REQUIRE(run(args) == 0);
+        require_records(slurp(sam), {"fwd", "rev"}, false); const auto rec = records(slurp(sam));
+        if (!known) { stock = rec; continue; }
+        for (size_t i = 0; i < rec.size(); ++i) {
+            const auto &r = rec[i];
+            CAPTURE(r[0]);
+            CHECK(r[2] == "c1"); CHECK(r[3] == std::to_string(OffsiteStop::locus + 1)); CHECK(r[5] == "30M");
+            CHECK(r[4] == "37"); CHECK(tag(r, "X0:i:") == "X0:i:1"); CHECK(tag(r, "X1:i:") == "X1:i:0");
+            CHECK(tag(r, "XV:Z:").find("c1:" + std::to_string(site + 1) + ":") != std::string::npos);
+            // every field but XV is the run's without --known-snvs
+            std::vector<std::string> without_xv;
+            for (const auto &f : r) if (f.compare(0, 5, "XV:Z:") != 0) without_xv.push_back(f);
+            CHECK(without_xv == stock[i]);
+        }
     }
 }
 
-TEST_CASE("aln_known_snvs: the ALT-window stop certificate bounds complete site-covering placements only"
+TEST_CASE("aln_known_snvs: the ALT-window generator hands on its site-covering rows, horizon and flags"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
     const OffsiteStop &x = offsite();
     OffsiteSearch s;
     const int full_budget = full_lookup_budget(), locus = OffsiteStop::locus;
+    const int64_t M = s.opt.s_mm;
     for (int read_no : {0, 1}) for (bool reverse : {false, true}) {
         CAPTURE(read_no); CAPTURE(reverse);
         // Beside the read: the window index holds the read exactly, but no placement covers the
-        // site. The width bound is 0; the site bound is one past the difference limit.
+        // site, so there are no candidates. The window search stops at its score cut (B + M, with
+        // B = 0): every row below it was found.
         auto beside = s.search({locus + 79}, read_no, x.oriented(reverse), full_budget, s.opt);
         CHECK(beside.window.flags == 0);
-        CHECK(beside.window.full_width_bound.valid); CHECK(beside.window.full_width_bound.value == 0);
-        CHECK(beside.window.site_bound.valid); CHECK(beside.window.site_bound.value == 3);
-        CHECK(beside.certificate.valid); CHECK(beside.certificate.value == 3);
-        CHECK(beside.genomic.flags == 0); CHECK(beside.genomic.n_lookups == 1);
+        CHECK(beside.extra.rows.empty()); CHECK(beside.extra.flags == 0); CHECK(beside.extra.horizon == M + 1);
+        CHECK(beside.genomic.flags == 0); CHECK(beside.genomic.audit == 0);
         CHECK(beside.genomic.c1 == 1); CHECK(beside.genomic.c2 == 0);
-        // Under the read, which carries the ALT: the ALT placement is exact. (The window search
-        // alone: this site's REF read is the case after the loop.)
+        // Under the read, which carries the ALT: the ALT placement is exact, and the one candidate.
         auto under_alt = s.search({locus + 10}, read_no, x.oriented(reverse, locus + 10, transversion(x.c1[locus + 10])),
                                   full_budget, s.opt, false);
-        CHECK(under_alt.window.flags == 0); CHECK(under_alt.window.site_bound.value == 0);
-        CHECK(under_alt.certificate.value == 0);
+        CHECK(under_alt.window.flags == 0);
+        REQUIRE(under_alt.extra.rows.size() == 1); CHECK(under_alt.extra.horizon == M + 1);
+        CHECK(under_alt.extra.rows[0].rb == s.mr.bns->anns[0].offset + locus);
         // Under the read at either end: the placement still covers its site. One base outside
         // either end: no placement of the read covers the site.
-        for (int edge : {locus, locus + 29}) CHECK(s.search({edge}, read_no, x.oriented(reverse), full_budget, s.opt, false).certificate.value == 1);
-        for (int edge : {locus - 1, locus + 30}) CHECK(s.search({edge}, read_no, x.oriented(reverse), full_budget, s.opt, false).certificate.value == 3);
+        for (int edge : {locus, locus + 29})
+            CHECK(s.search({edge}, read_no, x.oriented(reverse), full_budget, s.opt, false).extra.rows.size() == 1);
+        for (int edge : {locus - 1, locus + 30})
+            CHECK(s.search({edge}, read_no, x.oriented(reverse), full_budget, s.opt, false).extra.rows.empty());
     }
-    // Under the read, which carries the reference base: the ALT placement has one mismatch. It could
-    // be retained (best cost plus one mismatch), so the certificate refuses the stop and the copies
-    // bind the genomic search's lookup budget: past its first row, the binding flush resolves only
-    // ALN_METH_BIND_ROWS more.
+    // Under the read, which carries the reference base: the window index holds only the ALT
+    // placement, at one mismatch (B = M), so the window search is complete below 2M + 1. The
+    // genomic search's best is the exact locus (0), which needs rows below M only: it completes,
+    // and the candidate (the same locus) costs it no confidence.
     auto under_ref = s.search({locus + 10}, 1, x.oriented(false), full_budget, s.opt);
-    CHECK(under_ref.window.flags == 0); CHECK(under_ref.window.site_bound.value == 1);
-    CHECK(under_ref.certificate.value == 1);
-    CHECK(under_ref.genomic.flags == ba::ALN_METH_BIND_BEST);
-    CHECK(under_ref.genomic.n_lookups == 1 + ba::ALN_METH_BIND_ROWS);
+    CHECK(under_ref.window.flags == 0);
+    REQUIRE(under_ref.extra.rows.size() == 1); CHECK(under_ref.extra.horizon == 2 * M + 1);
+    CHECK(under_ref.genomic.flags == 0); CHECK(under_ref.genomic.audit == 0);
+    CHECK(under_ref.genomic.c1 == 1); CHECK(under_ref.genomic.c2 == 0);
     // Two windows hold the read beside their sites. A lookup budget of one row binds the window
-    // search before it has seen both: it proved nothing about site-covering placements, so the
-    // certificate falls back to the width bound and the genomic result stays incomplete.
+    // search in the read's best stratum: its horizon is 0, below every cost the read retains, so
+    // the audit reports the genomic result incomplete with the window search's flags.
     auto bound = s.search({locus + 79, locus + 85}, 1, x.oriented(false), 1, s.opt);
     CHECK(bound.window.flags == ba::ALN_METH_BIND_BEST);
-    CHECK(bound.window.site_bound.valid); CHECK(bound.window.site_bound.value == 3);
-    CHECK(bound.certificate.valid); CHECK(bound.certificate.value == bound.window.full_width_bound.value);
-    CHECK(bound.certificate.value == 0);
-    CHECK((bound.genomic.flags & ba::ALN_METH_BIND_BEST) != 0);
-    // The same windows searched to completion certify the stop.
+    CHECK(bound.extra.flags == ba::ALN_METH_BIND_BEST); CHECK(bound.extra.horizon == 0);
+    CHECK(bound.genomic.flags == ba::ALN_METH_BIND_BEST);
+    CHECK(bound.genomic.audit == ba::ALN_METH_AUDIT_HORIZON);
+    // The same windows searched to completion leave the genomic result complete.
     auto unbound = s.search({locus + 79, locus + 85}, 1, x.oriented(false), full_budget, s.opt);
-    CHECK(unbound.window.flags == 0); CHECK(unbound.certificate.value == 3);
-    CHECK(unbound.genomic.flags == 0); CHECK(unbound.genomic.n_lookups == 1);
-    // A seeded search proposes every ungapped window only up to the seed's difference limit.
-    for (int seed_diff : {0, 1, 2, 5}) {
-        ba::gap_opt_t seeded = s.opt; seeded.seed_len = 20; seeded.max_seed_diff = seed_diff;
-        CAPTURE(seed_diff);
-        CHECK(s.search({locus + 79}, 1, x.oriented(false), full_budget, seeded, false).window.site_bound.value
-              == std::min(seed_diff, 2) + 1);
-    }
-    // -n and -k accept INT_MAX: the horizon saturates rather than overflowing. (Window search only,
-    // under a one-row budget: the bound is set before the search runs.)
-    ba::gap_opt_t unlimited = s.opt; unlimited.max_diff = INT_MAX; unlimited.max_entries = 1000;
-    for (bool seeded : {false, true}) {
-        CAPTURE(seeded);
-        ba::gap_opt_t g = unlimited;
-        if (seeded) { g.seed_len = 20; g.max_seed_diff = INT_MAX; }
-        const auto o = s.search({locus + 79}, 1, x.oriented(false), 1, g, false);
-        CHECK(o.window.site_bound.valid); CHECK(o.window.site_bound.value == INT_MAX);
-    }
+    CHECK(unbound.window.flags == 0); CHECK(unbound.extra.horizon == M + 1);
+    CHECK(unbound.genomic.flags == 0); CHECK(unbound.genomic.audit == 0);
+    CHECK(unbound.genomic.c1 == 1); CHECK(unbound.genomic.c2 == 0);
 }
 
-TEST_CASE("aln_known_snvs: the stop certificate counts only equal-span gapped window histories, at zero"
+TEST_CASE("aln_known_snvs: duplicate copies of a flagged ALT-window search keep every row"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
     const OffsiteStop &x = offsite();
     OffsiteSearch s;
-    // A 30-base read from the unique part of c1, past the read the other cases use.
-    const int beg = 400, site = beg + 3;
-    const std::string ref = x.c1.substr(beg, 31);
-    ba::gap_opt_t gapped = s.opt; gapped.max_diff = 3; gapped.max_gapo = 2;
-    // Equal span: one base deleted after read base 8 and one inserted after read base 23, and the
-    // reference base at the site (one mismatch against its ALT window). Ungapped, the 15 shifted
-    // bases between the gaps mismatch: the only histories within -n 3 covering the site are this
-    // one (two gap opens, one mismatch) and its equivalent gap placements, so the bound is 0.
-    const std::string equal = ref.substr(0, 8) + ref.substr(9, 15) + "A" + ref.substr(24, 6);
-    REQUIRE(equal.size() == 30);
-    auto e = s.search({site}, 1, equal, full_lookup_budget(), gapped, false);
-    CHECK(e.window.flags == 0); CHECK(e.window.site_bound.valid); CHECK(e.window.site_bound.value == 0);
-    // Unequal span: one base deleted, and the read carries the ALT. That history covers the site
-    // with no mismatch, but its window is a base longer than the read: the bound ignores it. (One
-    // gap open at most, so no second gap can restore the read's length.)
-    std::string alt = x.c1.substr(beg, 31); alt[site - beg] = transversion(alt[site - beg]);
-    const std::string longer = alt.substr(0, 15) + alt.substr(16, 15);
-    REQUIRE(longer.size() == 30);
-    ba::gap_opt_t one_gap = gapped; one_gap.max_gapo = 1;
-    auto l = s.search({site}, 1, longer, full_lookup_budget(), one_gap, false);
-    CHECK(l.window.flags == 0); CHECK(l.window.site_bound.valid); CHECK(l.window.site_bound.value == 4);
-    CHECK(l.window.n_rescored > 0);
+    const int locus = OffsiteStop::locus;
+    // Four windows hold the read beside their sites, and a two-row lookup budget binds the window
+    // search: it is incomplete but keeps every row it found, which a copy must not trim to its main
+    // hit (max_xa_hits 0 trims any trimmed result to it).
+    OffsiteSearch::site_set_t &w = s.site_set({locus + 79, locus + 85, locus + 91, locus + 97});
+    s.mr.known_snvs = &w.sites;
+    ba::aln_meth_opt_t mo; mo.p_best = 2; mo.p_second = 0; ba::aln_meth_opt_finish(&mo);
+    std::string converted = x.oriented(false);
+    for (char &b : converted) if (b == 'C') b = 'T';
+    const int n = 8;
+    std::vector<std::pair<std::string, std::string>> fq_reads;
+    for (int i = 0; i < n; ++i) fq_reads.push_back({"r" + std::to_string(i), converted});
+    const std::string fq = write_fq(s.tmp.file("dups.fq"), fq_reads);
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    int got = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, n, &got, BWA_MODE_COMPREAD, 0);
+    ba::bwa_seq_close(input);
+    REQUIRE(got == n);
+    ba::aln_meth_read_t single;
+    ba::aln_meth_search_batch(w.windows.bwt, w.windows.mref, &mo, 1, reads, &s.opt, 1, 1, 0, 1, 0, nullptr, &single);
+    REQUIRE(single.flags != 0); REQUIRE(single.hits.size() > 1); // the premise
+    std::vector<ba::aln_meth_read_t> batch(n);
+    ba::aln_dup_state_t dup;
+    CHECK(ba::aln_meth_search_batch(w.windows.bwt, w.windows.mref, &mo, n, reads, &s.opt, 1, 1, 0, 1, 0, &dup,
+                                    batch.data()) == n - 1);
+    ba::aln_meth_extra_t want;
+    ba::ks_meth_candidates(&w.windows, s.mr.bns, single, &want);
+    for (int i = 0; i < n; ++i) {
+        CAPTURE(i);
+        CHECK(batch[i].flags == single.flags); CHECK(batch[i].horizon == single.horizon);
+        CHECK(batch[i].hits.size() == single.hits.size());
+        ba::aln_meth_extra_t got_extra;
+        ba::ks_meth_candidates(&w.windows, s.mr.bns, batch[i], &got_extra);
+        CHECK(got_extra.rows.size() == want.rows.size());
+        CHECK(got_extra.horizon == want.horizon); CHECK(got_extra.flags == want.flags);
+    }
+    ba::bwa_free_read_seq(n, reads);
+    s.mr.known_snvs = nullptr;
 }
 
-TEST_CASE("aln_known_snvs: ks_meth_search passes the site certificate and the window flags to the genomic search"
+TEST_CASE("aln_known_snvs: ks_meth_search passes the window rows, horizon and flags to the genomic search"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
     const OffsiteStop &x = offsite();
@@ -1095,11 +1102,17 @@ TEST_CASE("aln_known_snvs: ks_meth_search passes the site certificate and the wi
         s.mr.known_snvs = nullptr;
         return res;
     };
-    // The site beside the read: the site bound (3), not the width bound (0), lets the read stop at
-    // its exact locus after one lookup instead of spending the budget on the copies.
-    const auto beside = run_search({locus + 79}, x.oriented(false));
-    CHECK(beside.flags == 0); CHECK(beside.n_lookups == 1); CHECK(beside.c1 == 1); CHECK(beside.c2 == 0);
-    // (That the window flags reach the genomic slot before it searches is pinned in test_aln_meth.cpp,
+    // The site beside the read, and the site under it: the read stops at its exact locus on its
+    // own cuts instead of spending the lookup budget on the copies, as the direct searches do.
+    for (int site : {locus + 79, locus + 10}) {
+        CAPTURE(site);
+        const auto direct = s.search({site}, 1, x.oriented(false), full_lookup_budget(), s.opt);
+        const auto res = run_search({site}, x.oriented(false));
+        CHECK(res.flags == 0); CHECK(res.audit == 0); CHECK(res.c1 == 1); CHECK(res.c2 == 0);
+        CHECK(res.n_lookups == direct.genomic.n_lookups);
+        CHECK(res.n_lookups < full_lookup_budget());
+    }
+    // (That a flagged window search's read loses the neutral tie-break is pinned in test_aln_meth.cpp,
     // where TAPS neutral scoring makes the difference visible.)
 }
 
@@ -1929,6 +1942,38 @@ TEST_CASE("aln_known_snvs: at a multi-allelic site, the other ALT's vote counts 
         std::string(32, 'I'), "XT:A:U", e.f[11], "X0:i:1", "X1:i:0", "XM:i:0", "XO:i:0", "XG:i:0", e.f[12],
         std::string("XV:Z:c1:500:") + ref + ">" + a1 + ",O,0,2,NA,NA;c1:500:" + ref + ">" + a2 + ",A,0,2,1,37"};
     CHECK(k[0] == want);
+}
+
+TEST_CASE("aln_known_snvs: a plain read is credited exactly when its longest placement fits the ALT window"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    KsIndex x;
+    bwa_tests::TempDir scratch{"ks_case"};
+    const std::string dir = scratch.path();
+    // A read from c1[420, ...) carrying a transversion ALT at c1:500. A window (321 bases) holds a
+    // placement over its site of at most 161 bases; the read's longest placement is its length plus
+    // a base per gap open and extension allowed. At -o 1 -e 6 (the defaults) a 154-base read fits
+    // (154 + 1 + 6 = 161) and is credited (XM 0 with the ALT); at -o 2 -e 6 only 153 bases fit, and
+    // a 154-base read, whose two-gap placements could overhang the window, keeps its stock record
+    // (XM 1).
+    const char ref = x.c1[499];
+    const char alt = std::string("CATG")[std::string("ACGT").find(ref)];
+    const std::string vcf = write_vcf(dir + "/s.vcf", {row("c1", 500, ref, std::string(1, alt))});
+    struct case_t { int len; const char *o; bool credited; };
+    for (const case_t c : {case_t{154, "1", true}, case_t{155, "1", false}, case_t{153, "2", true},
+                           case_t{154, "2", false}}) {
+        CAPTURE(c.len); CAPTURE(c.o);
+        std::string read = x.c1.substr(420, c.len);
+        read[79] = alt;
+        const std::string fq = write_fq(dir + "/r.fq", {{"r", read}});
+        const std::string out = dir + "/out.sam";
+        bwa_tests::StderrCapture quiet;
+        REQUIRE(run({"--known-snvs", vcf, "-o", c.o, "-f", out, x.prefix, fq}) == 0);
+        const auto k = records(slurp(out));
+        REQUIRE(k.size() == 1);
+        CHECK(k[0][2] == "c1"); CHECK(k[0][3] == "421");
+        CHECK(tag(k[0], "XM:i:") == (c.credited ? "XM:i:0" : "XM:i:1"));
+        CHECK(tag(k[0], "XV:Z:").find(std::string(",A,0,")) != std::string::npos);
+    }
 }
 
 TEST_CASE("aln_known_snvs: --meth evaluates every ALT of a multi-allelic site"
@@ -3464,10 +3509,10 @@ TEST_CASE("aln_known_snvs: an ALT-window candidate carries its hit's search path
         if (display.size() == 1) h.cig = display[0];
         else { h.cig = 0; r.cig = display; }
         r.hits.push_back(h);
-        std::vector<ba::aln_meth_candidate_t> out;
+        ba::aln_meth_extra_t out;
         ba::ks_meth_candidates(&w, &bns, r, &out);
-        REQUIRE(out.size() == 1);
-        return out[0];
+        REQUIRE(out.rows.size() == 1);
+        return out.rows[0];
     };
     SUBCASE("a soft-clipped terminal insertion is the path's insertion") {
         const auto c = one({M(39), S(1)}, 20, 39, 1, 0);

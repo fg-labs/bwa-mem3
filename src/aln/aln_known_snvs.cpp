@@ -484,11 +484,9 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 			ks_windows_free(out);
 			return -1;
 		}
-		out->mref->no_cut = 1;
+		out->mref->ks_window = 1;
+		out->mref->ks_win = out->win.data();
 		out->bns = out->mref->bns;
-		// One site offset per window contig: resolve_window indexes it by the original contig rid (crid >> 1).
-		if (out->bns->n_seqs == (int)out->win.size())
-			for (const ks_window_t &w : out->win) out->mref->window_site.push_back((int32_t)(w.site_pos - w.beg));
 	} else {
 		bool loaded = false;
 		const int rc = ks_index_text(wpac, wbns->l_pac, bo, 0, cache_path, &arrays, &loaded);
@@ -505,8 +503,7 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 		out->bns = out->fmi->idx->bns;
 		out->bwt = bwt_from_fmi(out->fmi);
 	}
-	if (out->bns->n_seqs != (int)out->win.size() ||
-		(out->mref && out->mref->window_site.size() != (size_t)out->bns->n_seqs)) {
+	if (out->bns->n_seqs != (int)out->win.size()) {
 		fprintf(stderr, "[E::aln] --known-snvs: the window index has %d contigs for %zu windows\n",
 				out->bns->n_seqs, out->win.size());
 		ks_windows_free(out);
@@ -611,7 +608,7 @@ ks_outcome_t ks_merge(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *b
 		}
 	}
 	if (win_hits.empty()) return KS_UNTOUCHED;
-	if ((int64_t)len + opt->max_gape > KS_WINDOW_HALF) return KS_INCOMPLETE;
+	if (!ks_fits_window(len, opt)) return KS_INCOMPLETE;
 
 	// The cuts (aln's: score <= best + mismatch penalty, differences <= min(max_diff, best's + 1))
 	// come from the scores alone, so only the main search's intervals that pass them are expanded:
@@ -1027,9 +1024,11 @@ static std::vector<uint32_t> ks_hit_path(const uint32_t *c, uint32_t n, const al
 }
 
 void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_meth_read_t &wres,
-						std::vector<aln_meth_candidate_t> *out)
+						aln_meth_extra_t *out)
 {
-	out->clear();
+	out->rows.clear();
+	out->horizon = wres.horizon;
+	out->flags = wres.flags;
 	for (const aln_meth_hit_t &h : wres.hits) {
 		if (h.rid < 0 || h.rid >= (int)w->win.size()) continue;
 		const ks_window_t &win = w->win[h.rid];
@@ -1042,7 +1041,7 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 		// genomic search scores it as it scores its own rows, terminal gaps included.
 		int lead, trail;
 		std::vector<uint32_t> path = ks_hit_path(aln_meth_hit_cigar(wres, h), h.n_cig, h, off, win.len, &lead, &trail);
-		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb - lead, rb + h.span + trail, std::move(path)});
+		out->rows.push_back({win.rid, (int)h.strand, (int)h.hyp, rb - lead, rb + h.span + trail, std::move(path)});
 	}
 }
 
@@ -1107,27 +1106,18 @@ gap_opt_t ks_discovery_opt(const gap_opt_t &opt)
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res)
 {
-	std::vector<std::vector<aln_meth_candidate_t>> extra;
-	std::vector<int> flags;
-	std::vector<aln_meth_alt_bound_t> alt_bounds;
+	std::vector<aln_meth_extra_t> extra;
 	if (o->ks_windows) {
+		// The ALT-window search runs with the read's own options: as a candidate generator
+		// (aln_meth_boundary_gen) it takes only the cuts that hold for any final best.
 		std::vector<aln_meth_read_t> windows(n);
-		const gap_opt_t discovery = ks_discovery_opt(o->gap);
-		aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n, seqs, &discovery,
-							  o->gap.n_threads, read_no, ord, 1, o->max_xa_hits, window_dup, windows.data(), nullptr,
-							  nullptr, true);
-		extra.resize(n); flags.resize(n); alt_bounds.resize(n);
-		for (int i = 0; i < n; ++i) {
-			ks_meth_candidates(o->ks_windows, o->meth_ref->bns, windows[i], &extra[i]);
-			// Incoming flags both split duplicate groups and disable stopping in the genomic search.
-			flags[i] = windows[i].flags;
-			alt_bounds[i] = aln_meth_alt_certificate(windows[i]);
-		}
+		aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n, seqs, &o->gap,
+							  o->gap.n_threads, read_no, ord, 1, o->max_xa_hits, window_dup, windows.data());
+		extra.resize(n);
+		for (int i = 0; i < n; ++i) ks_meth_candidates(o->ks_windows, o->meth_ref->bns, windows[i], &extra[i]);
 	}
 	return aln_meth_search_batch(bwt, o->meth_ref, o->meth, n, seqs, &o->gap, o->gap.n_threads, read_no, ord, keep,
-								 o->max_xa_hits, dup, res, extra.empty() ? nullptr : extra.data(),
-								 alt_bounds.empty() ? nullptr : alt_bounds.data(), false,
-								 flags.empty() ? nullptr : flags.data());
+								 o->max_xa_hits, dup, res, extra.empty() ? nullptr : extra.data());
 }
 
 } // namespace bwa_aln

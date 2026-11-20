@@ -52,11 +52,13 @@ struct aln_meth_ref_t {
 	bntseq_t *bns = nullptr;
 	uint8_t *pac = nullptr;
 	const struct ks_sites_t *known_snvs = nullptr; // --known-snvs sites (null without); not owned
-	// --known-snvs ALT windows as a reference: contig i's site, as an offset in it (else empty)
-	std::vector<int32_t> window_site;
-	// --known-snvs ALT-window search: its windows are candidates for the main search, which takes no
-	// stock cuts under --known-snvs, so neither does this one
-	int no_cut = 0;
+	// set for the --known-snvs ALT-window search, whose windows are candidates for the main search:
+	// it runs as a candidate generator (aln_meth_boundary_gen), with no certificates and no no-hit
+	// proof
+	int ks_window = 0;
+	// the ALT-window search: window i's place on the original reference (ks_windows_t::win), so a
+	// window row's genomic locus is known; null elsewhere
+	const struct ks_window_t *ks_win = nullptr;
 };
 int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads);
 /* Takes ownership of an in-memory original reference (bns, pac) and checks it pairs with
@@ -128,6 +130,12 @@ struct aln_meth_alt_bound_t {
  * count, MAPQ 0); CROWDED, a unique best and at least ALN_METH_CROWDED retained worse loci (X1 is
  * a lower bound, MAPQ 0). */
 enum { ALN_METH_CERT_REPEAT = 1, ALN_METH_CERT_CROWDED = 2 };
+/* The finish-time audit of a complete read's cuts (aln_meth_slot_finish): HORIZON, the ALT-window
+ * search stopped below the costs the read retains (B + M, or B when more than -R loci tie at B);
+ * CEILING, the search applied a top-2 difference ceiling tighter than the final best's; REPEAT, the
+ * search stopped on -R but the final best has at most -R loci. Under --known-snvs a read that fails
+ * is incomplete; otherwise it is only counted (aln_meth_report). */
+enum { ALN_METH_AUDIT_HORIZON = 1, ALN_METH_AUDIT_CEILING = 2, ALN_METH_AUDIT_REPEAT = 4 };
 enum { ALN_METH_CROWDED = 255 };
 // Best loci that give MAPQ 0 under the TAPS/5base tie-break whichever has the fewest conversions:
 // stock MAPQ is 0 from 178 worse loci (bwa_approx_mapQ), and all but one are displaced to X1.
@@ -151,12 +159,6 @@ struct aln_meth_read_t {
     std::vector<aln_meth_hit_t> hits;
     std::vector<uint32_t> cig;
     int64_t ks_site = -1; // --known-snvs: the site allele mate rescue credited (aln_site_key), or -1
-    aln_meth_alt_bound_t full_width_bound; // captured before search shadowing, only when requested
-    // With full_width_bound, on a reference with window_site: the fewest search mismatches of a
-    // proposed read-length window that covers its own window's site, and at most one more than
-    // the mismatches up to which an unbound search proposes every such window (its difference
-    // limit, and the seed's when seeded). Read it through aln_meth_alt_certificate.
-    aln_meth_alt_bound_t site_bound;
     long n_over_diff = 0; // rows dropped for more strict differences than the read's -n allows
     long n_over_seed = 0; // rows dropped for more strict differences in the seed than -k allows
     int cert = 0; // ALN_METH_CERT_*: the certificate that ended a complete read's row work, or 0
@@ -164,21 +166,11 @@ struct aln_meth_read_t {
     // the copy's ordinal and its main locus, which is among hits; in ascending ordinal.
     struct copy_draw_t { int64_t ord; int rid, hyp, strand; bwtint_t pos; };
     std::vector<copy_draw_t> copy_draw;
+    // The --known-snvs ALT-window search (a candidate generator): every window row that costs less
+    // than this was found (INT64_MAX: every row within the read's -n).
+    int64_t horizon = INT64_MAX;
+    int audit = 0; // ALN_METH_AUDIT_*: the cuts the finished search finds it took on a best that was not final
 };
-/* The stop certificate a read's ALT-window search gives its genomic search: a lower bound on the
- * mismatches of every ungapped placement that covers a site with that site's ALT in place. A
- * search that ran to completion (no flags) proposed every such window within its limits, so its
- * site_bound holds; a bound search may have missed one, and only the index-wide width bound
- * (which also counts copies beside the site) is left.
- * The fallback is defensive. When the window search has flags, ks_meth_search passes the same
- * flags to the genomic search as incoming_flags, and a slot with flags is never stop-eligible
- * (aln_meth_stop_eligible), so the bound returned here is not used for stopping. It then only
- * keys duplicate sharing (copies share a search only with equal bounds), and it is the whole
- * certificate for a window reference without window_site. */
-static inline aln_meth_alt_bound_t aln_meth_alt_certificate(const aln_meth_read_t &window)
-{
-    return !window.flags && window.site_bound.valid ? window.site_bound : window.full_width_bound;
-}
 // The pointer is into h itself (one operation) or into r.cig, so it is valid while both are.
 static inline const uint32_t *aln_meth_hit_cigar(const aln_meth_read_t &r, const aln_meth_hit_t &h)
 {
@@ -194,21 +186,15 @@ struct aln_meth_group_t;
  * draw is seeded from it). res[i] gets read i's result. keep_strata: keep every locus of both
  * strata (paired-end pairs on them; an incomplete read, which never pairs, keeps only its main
  * hit); otherwise a read keeps its main hit, and the other loci only when they will be printed as
- * XA (at most max_xa_hits + 1 occurrences). extra (--known-snvs, or null): per read, candidate
- * windows the search did not have to propose, resolved (as the reference and with each site
- * allele in place) before the read finishes; identical reads share a search only with equal extras. */
-struct aln_meth_candidate_t;
-/* Optional alt_bounds are same-read ALT-index certificates, never genomic widths.
- * capture_full_width records width[len-1] before search mutation (and site_bound, on a reference
- * with window_site); both defaults are off.
- * incoming_flags are per-read window-search flags, applied after reset and before searching or
- * finalizing; duplicate sharing requires equal flags. Null means no incoming flags. */
+ * XA (at most max_xa_hits + 1 occurrences). extra (--known-snvs, or null): per read, the ALT-window
+ * search's candidates (aln_meth_extra_t), windows the search did not have to propose, resolved (as
+ * the reference and with each site allele in place) before the read finishes; identical reads share
+ * a search only with equal extras. */
+struct aln_meth_extra_t;
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, struct aln_dup_state_t *dup, aln_meth_read_t *res,
-						  const std::vector<aln_meth_candidate_t> *extra = nullptr,
-						  const aln_meth_alt_bound_t *alt_bounds = nullptr, bool capture_full_width = false,
-                          const int *incoming_flags = nullptr);
+						  const aln_meth_extra_t *extra = nullptr);
 
 /* samse under --meth for reads [0, n). Caller must run bwase_initialize once
  * before dispatching any finish workers (as aln_run_se_meth does). */
