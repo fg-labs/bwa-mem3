@@ -292,8 +292,9 @@ How it works:
   out of the fragment never replaces another, and equal best scores at loci that do not overlap
   leave the mate unrescued, whether they come from two alignments or from one window whose best is
   tied: a pick survives only if it scores above every such tie.
-- `--meth`: the ALT-window search runs first, and the converted search starts from the windows
-  it finds (see [Discovery, refinement and accounting](#discovery-refinement-and-accounting)).
+- `--meth`: the ALT-window search runs first, capped by a quick probe of the converted search,
+  and the converted search starts from the windows it finds (see
+  [Discovery, refinement and accounting](#discovery-refinement-and-accounting)).
   Each candidate window holding a site is scored along the ALT-window search's path to it (its
   gaps, including a gap at either end of the read, as the converted search scores its own rows).
   Every row over a site, whether the search or the ALT-window search found it, is scored against
@@ -639,10 +640,21 @@ final best (the ceiling and `-R`) are taken only once both have delivered their 
 
 - The ALT-window search runs first, as a candidate generator. It takes only the cuts that stay
   valid for any lower final best: the score cut, the ceiling that cut implies (`(B + M)` divided
-  by the least a difference can cost), and `-R` once every window row cheaper than `B + M` is
+  by the least a difference can cost; not taken with `-e`, where gap extensions are not
+  differences), and `-R` once every window row cheaper than `B + M` is
   found, counting each genomic locus once however many overlapping windows hold it (under the
   TAPS/5base tie-break, only loci with no conversions). It keeps all
   its rows within `B + M`, also when it stops early, and states how far they are complete.
+- Before it, a probe of the main search runs the read's exact stratum (converted score 0) and
+  verifies at most 32 rows. A verified row is one the main search keeps or beats, so its cost `U`
+  bounds the final best from above, and the window search stops at `U + M` for single-end reads
+  and `U + 2M` for paired-end reads. A window differs from the reference at one base, so a row
+  costs at most `M` more there than in the read, and a row credited that ALT costs the same. A
+  read's own search finds its reference rows unless it stops at `-R`; paired-end pairing then
+  uses every row within `B + M` it has, which a window can hold at up to `U + 2M`, while
+  single-end output keeps only the read's main hit. A read with no probe row, a read that does not
+  fit an ALT window, and every read under `--meth-context cpg` (where an ALT can change the CpG
+  context of its neighbour) run the window search uncapped.
 - The main search scores those rows before its first step, so its cuts start from them.
 - At its finish each read is audited: the window search was complete below the costs the read
   retains (`B + M`, or `B` past `-R`; any cost under `-N` or for a read with no row), no ceiling

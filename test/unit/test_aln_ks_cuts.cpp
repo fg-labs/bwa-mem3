@@ -10,11 +10,15 @@
 #include "../framework/stderr_capture.h"
 #include "../framework/temp_dir.h"
 #include "../../src/aln/aln_main.h"
+#include "../../src/aln/aln_known_snvs.h"
+#include "../../src/aln/bwtgap.h"
 #include "../../src/bwa.h"
 
 #include <getopt.h>
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -55,7 +59,7 @@ struct site_t {
  * reference (c1 with each site's `oracle` base in place), each with a plain and a --meth index. */
 struct KsCase {
     bwa_tests::TempDir tmp{"aln_ks_cuts_unit"};
-    std::string dir = tmp.path(), ref, oracle, vcf, fq;
+    std::string dir = tmp.path(), ref, oracle, vcf, fq, fq2; // fq2: read 2, for a paired case
     size_t n_reads = 0; // reads r0, r1, ... in order
 
     KsCase(const std::string &c1, const std::vector<site_t> &sites, const std::vector<std::string> &reads)
@@ -81,6 +85,17 @@ struct KsCase {
         REQUIRE(fp != nullptr);
         for (size_t i = 0; i < reads.size(); ++i)
             fprintf(fp, "@r%zu\n%s\n+\n%s\n", i, reads[i].c_str(), std::string(reads[i].size(), 'I').c_str());
+        REQUIRE(fclose(fp) == 0);
+    }
+
+    // Makes the case paired: mates[i] is read 2 of reads[i].
+    void pair_with(const std::vector<std::string> &mates)
+    {
+        fq2 = dir + "/r2.fq";
+        FILE *fp = fopen(fq2.c_str(), "w");
+        REQUIRE(fp != nullptr);
+        for (size_t i = 0; i < mates.size(); ++i)
+            fprintf(fp, "@r%zu\n%s\n+\n%s\n", i, mates[i].c_str(), std::string(mates[i].size(), 'I').c_str());
         REQUIRE(fclose(fp) == 0);
     }
 
@@ -114,6 +129,7 @@ struct KsCase {
         a.insert(a.end(), args.begin(), args.end());
         a.push_back(reference);
         a.push_back(fq);
+        if (!fq2.empty()) a.push_back(fq2);
         std::vector<char *> argv;
         for (std::string &s : a) argv.push_back(&s[0]);
         argv.push_back(nullptr);
@@ -283,6 +299,76 @@ void window_overlap_case(bool meth)
     const KsCase k(c1, sites, {read});
     const std::string want = "0 c1:" + pos1(p) + " 100M MAPQ 23 X0 1 X1 1 XA c1,+" + pos1(q) + ",100M";
     check_against_oracle(k, meth, {"-n", "5"}, {want});
+}
+
+/* The ALT-window search is capped at U + M, where U is the cost of a row the main search's probe
+ * (its exact stratum) verified. U is that row's cost on the original reference, not its converted
+ * score:
+ * P: R over a reference T where R has its one C: an exact match in converted space, but a
+ *    mismatch on the original reference (cost 3). It is the read's best.
+ * Q: R with three mismatches, one at a site whose ALT is R's base: 6 with the ALT (two
+ *    differences), in its ALT window too. It is retained (6 = 3 + M, ceiling 2), and only the
+ *    ALT-window search proposes it, which must reach cost 6 = U + M. */
+void cap_at_verified_cost_case()
+{
+    uint32_t st = 5150;
+    std::string read = no_c(st, 100);
+    read[30] = 'C';
+    std::string c1 = aln_test::lcg_dna(st, 9000);
+    const int p = 2000, q = 6000;
+    std::string seg_p = read;
+    seg_p[30] = 'T';
+    c1.replace(p, 100, seg_p);
+    const std::string seg_q = with_mm(read, {50, 60, 70});
+    c1.replace(q, 100, seg_q);
+    const KsCase k(c1, {{q + 60, seg_q[60], std::string(1, read[60]), read[60]}}, {read});
+    const std::string want = "0 c1:" + pos1(p) + " 100M MAPQ 23 X0 1 X1 1 XA c1,+" + pos1(q) + ",100M";
+    check_against_oracle(k, true, {"-n", "5"}, {want});
+}
+
+/* A read with no exact-stratum row (no probe row) runs its ALT-window search uncapped:
+ * P: R with two mismatches, no site: 6, the read's best.
+ * Q: R with four mismatches, one at a site whose ALT is R's base: 9 with the ALT (three
+ *    differences), retained (9 = 6 + M, ceiling 3), and proposed only by the ALT-window search. */
+void no_probe_row_case()
+{
+    uint32_t st = 1618;
+    const std::string read = no_c(st, 100);
+    std::string c1 = aln_test::lcg_dna(st, 9000);
+    const int p = 2000, q = 6000;
+    c1.replace(p, 100, with_mm(read, {45, 75}));
+    const std::string seg_q = with_mm(read, {40, 50, 60, 80});
+    c1.replace(q, 100, seg_q);
+    const KsCase k(c1, {{q + 60, seg_q[60], std::string(1, read[60]), read[60]}}, {read});
+    const std::string want = "0 c1:" + pos1(p) + " 100M MAPQ 23 X0 1 X1 1 XA c1,+" + pos1(q) + ",100M";
+    check_against_oracle(k, true, {"-n", "5"}, {want});
+}
+
+/* A paired read whose own search stops on -R pairs on the rows it found and the ALT-window search's
+ * candidates, so the window search must reach every row within B + M that a window holds:
+ * A1, A2: R exact, two best loci (more than -R 1). The probe verifies one: U = 0.
+ * C: R with one mismatch (3 = B + M), with R's mate 300 bases downstream. R carries the REF of a
+ *    site under C, so C costs 6 = U + 2M in that site's ALT window.
+ * R's search stops on -R at its best stratum, before C; only the window search proposes C, which it
+ * delivers only when it reaches U + 2M. Pairing then places R at C, a proper pair with its mate. */
+void rstop_pair_case()
+{
+    uint32_t st = 2718;
+    const std::string read = no_c(st, 100);
+    std::string c1 = aln_test::lcg_dna(st, 12000);
+    const int a1 = 1000, a2 = 4000, c = 8000, site = c + 60;
+    c1.replace(a1, 100, read);
+    c1.replace(a2, 100, read);
+    c1.replace(c, 100, with_mm(read, {30}));
+    const std::string mate = aln_test::revcomp(c1.substr(c + 300, 100));
+    KsCase k(c1, {{site, c1[site], std::string(1, mm_base(read[60])), c1[site]}}, {read});
+    k.pair_with({mate});
+    const auto got = k.run({"--meth", "-n", "5", "-R", "1", "--known-snvs", k.vcf}, k.ref, "pe");
+    REQUIRE(got.size() == 2);
+    const auto &r1 = (std::stoi(got[0][1]) & 0x40) ? got[0] : got[1];
+    CAPTURE(summary(r1));
+    CHECK(r1[3] == pos1(c));
+    CHECK((std::stoi(r1[1]) & 0x2) != 0);
 }
 
 } // namespace
@@ -607,6 +693,34 @@ TEST_CASE("aln_ks_cuts: neutral conversion ties retain the better one-ALT haplot
         CHECK(loci(oracle[0]) == both);
         CHECK(loci(got[0]) == both);
     }
+}
+
+TEST_CASE("aln_ks_cuts: --meth: the ALT-window cap is the probe row's verified cost plus M")
+{
+    cap_at_verified_cost_case();
+}
+
+TEST_CASE("aln_ks_cuts: --meth: a read with no probe row runs its ALT-window search uncapped")
+{
+    no_probe_row_case();
+}
+
+TEST_CASE("aln_ks_cuts: --meth: the ALT-window seed is U for single-end reads and U + M for paired reads")
+{
+    bwa_aln::gap_opt_t *o = bwa_aln::gap_init_opt();
+    const int fits = KS_WINDOW_HALF - (o->max_gapo - 1) - o->max_gape; // the longest read that fits a window (154)
+    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, 0, false) == 4);
+    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, 1, false) == 4 + o->s_mm);
+    CHECK(bwa_aln::ks_meth_window_seed(INT64_MAX, 100, o, 1, false) == INT64_MAX); // no probe row
+    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, 0, true) == INT64_MAX);          // --meth-context cpg
+    CHECK(bwa_aln::ks_meth_window_seed(4, fits, o, 1, false) == 4 + o->s_mm);
+    CHECK(bwa_aln::ks_meth_window_seed(4, fits + 1, o, 0, false) == INT64_MAX);    // past its window
+    free(o);
+}
+
+TEST_CASE("aln_ks_cuts: --meth: a paired read stopped on -R pairs on a window row at U + 2M")
+{
+    rstop_pair_case();
 }
 
 TEST_SUITE_END();

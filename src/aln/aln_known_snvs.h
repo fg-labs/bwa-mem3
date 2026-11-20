@@ -60,6 +60,27 @@ static inline bool ks_fits_window(int64_t len, const gap_opt_t *opt)
 	return len + (opt->max_gapo > 1 ? opt->max_gapo - 1 : 0) + (opt->max_gape > 0 ? opt->max_gape : 0) <= KS_WINDOW_HALF;
 }
 
+/* --known-snvs under --meth: the seed (starting best) of a read's ALT-window search, from upper, an
+ * upper bound U on the read's final best B_f (its probe's cheapest verified row, INT64_MAX: none).
+ * The window search stops at the seed + M, so it must deliver every window row the read can retain:
+ * - A window is the reference with one site's ALT in place, so a row costs at most M more in a window
+ *   than when the read's search scores it (with that ALT credited, or on the reference): one column
+ *   differs. A row credited that ALT costs the same in both.
+ * - A complete main search proposes every reference row within B_f + M itself; only rows credited an
+ *   ALT need the windows, and they cost at most B_f + M <= U + M there. A main search that stops on -R
+ *   has only the rows it found and the window search's: single-end output keeps just such a read's
+ *   main hit, but paired-end pairing uses all its rows within B_f + M, which a window holds at up to
+ *   U + 2M. So paired reads (and their twins) take U + M as the seed, single-end reads U.
+ * - A read that does not fit an ALT window (ks_fits_window) can cover a site outside that site's
+ *   window, so it can need a row that only another site's window holds, at up to 2M more; under
+ *   --meth-context cpg an ALT can relabel its neighbour's CpG, changing two columns. Both run
+ *   uncapped (INT64_MAX), as does a read with no bound. */
+static inline int64_t ks_meth_window_seed(int64_t upper, int len, const gap_opt_t *opt, int paired, bool cpg)
+{
+	if (upper == INT64_MAX || cpg || !ks_fits_window(len, opt)) return INT64_MAX;
+	return paired ? upper + opt->s_mm : upper;
+}
+
 /* One ALT window: the reference [beg, beg + len) of contig rid with the ALT of one site in place. */
 struct ks_window_t {
 	int rid;
@@ -123,8 +144,10 @@ struct aln_meth_read_t;
  * [0, n) searched on the ALT-window index, a candidate generator, then on the converted index
  * `bwt` with each read's window candidates (aln_meth_extra_t: rows, horizon and flags), scored
  * before its first step. A read whose window search stopped below the costs it retains is
- * reported incomplete with the window search's flags (the finish-time audit). Arguments and the
- * return value are aln_meth_search_batch's; window_dup is the window search's duplicate state. */
+ * reported incomplete with the window search's flags (the finish-time audit). The window search is
+ * capped from a probe of the main search (ks_meth_window_seed; keep also marks paired-end reads,
+ * whose cap is one mismatch higher). Arguments and the return value are aln_meth_search_batch's;
+ * window_dup is the window search's duplicate state. */
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res);
 

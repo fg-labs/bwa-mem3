@@ -2952,6 +2952,48 @@ TEST_CASE("aln_meth: an ALT-window generator seeded with an upper bound takes it
     CHECK(ba::bwa_seq_close(input) == 0);
 }
 
+TEST_CASE("aln_meth: the --known-snvs probe bounds each read's best by a verified row's cost")
+{
+    // aln_meth_probe_batch searches the exact stratum (converted score 0) only and returns the cost
+    // of its cheapest verified row on the original reference: 0 for a read that matches with free
+    // conversions; M for a read C over a reference T (exact once converted, a mismatch on the
+    // original); none for a read whose every row needs a difference in converted space.
+    namespace ba = bwa_aln;
+    const std::string f = ref().c1.substr(500, 50);
+    const std::string exact = conv(f, 'C', 'T');
+    int t = -1;
+    for (int i = 5; i < 45 && t < 0; ++i) if (f[i] == 'T') t = i;
+    REQUIRE(t >= 0);
+    std::string c_over_t = exact;
+    c_over_t[t] = 'C';
+    std::string mism = exact;
+    mism[25] = mism[25] == 'A' ? 'G' : 'A';
+    const std::string fq = write_fq("probe.fq", {exact, c_over_t, mism});
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt(); // M 3
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 3, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 3);
+    std::vector<int64_t> upper(3, -1);
+    ba::aln_meth_probe_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, upper.data());
+    CHECK(upper[0] == 0);
+    CHECK(upper[1] == 3);
+    CHECK(upper[2] == INT64_MAX);
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+    ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the next read still maps")
 {
     namespace ba = bwa_aln;

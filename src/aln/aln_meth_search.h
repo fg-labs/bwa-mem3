@@ -202,6 +202,9 @@ struct aln_meth_group_t {
     const aln_meth_opt_t *mo = nullptr;
     const gap_opt_t *opt = nullptr;
     int read_no = 1, keep_strata = 0, max_xa_hits = 3;
+    // probe: the --known-snvs probe of the main search (aln_meth_probe_batch): its exact stratum only,
+    // at most ALN_METH_PROBE_ROWS rows, giving each read an upper bound on its final best.
+    int probe = 0;
     int n_slots = 0, n_active = 0, n_parked = 0, k_park = 1;
     std::vector<aln_meth_slot_t> slot;
     gap_slot_core_t *cores = nullptr;
@@ -289,6 +292,9 @@ enum { ALN_METH_PH_MIN_DIFF = 3 };
 int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j);
 int aln_meth_prove_nohit2(aln_meth_slot_t *x, const gap_job_t *j);
 void aln_meth_report(int, int, const aln_meth_read_t *);
+// The rows (SA lookups) a --known-snvs probe resolves per read (aln_meth_probe_batch): a few verified
+// rows suffice for an upper bound, and a wide interval would cost its whole width.
+enum { ALN_METH_PROBE_ROWS = 32 };
 // Finishes a read (stores its occ as hits; see aln_meth_store_loci), then trims it to its main hit
 // (an incomplete read always; a complete one when it has more than max_xa_hits + 1 loci).
 void aln_meth_trim(aln_meth_read_t *, int);
