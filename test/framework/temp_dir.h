@@ -79,6 +79,13 @@ public:
         if (path_.empty()) throw std::runtime_error("TempDir has been removed");
         return path_ + "/" + name;
     }
+    // file(<this directory's own unique leaf> + suffix). Use it for an index a test aligns
+    // against: aln and load_index attach an index staged in shared memory by basename, so a
+    // fixed name such as ref.fa could load another process's index.
+    std::string unique_file(const std::string &suffix = ".fa") const {
+        if (path_.empty()) throw std::runtime_error("TempDir has been removed");
+        return file(path_.substr(path_.rfind('/') + 1) + suffix);
+    }
 
     // Writes `text` to file(name), replacing it; throws on any short write.
     void write(const std::string &name, const std::string &text) const {

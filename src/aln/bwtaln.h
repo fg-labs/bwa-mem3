@@ -4,7 +4,8 @@
  *
  * MODIFIED from the original: the types and constants are moved into namespace bwa_aln, and
  * bwa_cigar_t is widened from 16 to 32 bits; the .sai/BAM-input declarations and the
- * extern "C" block are dropped. */
+ * extern "C" block are dropped. Known-SNV metadata extends alternative hits, and reads
+ * carry plain-search work-limit completeness. See README.md. */
 #ifndef BWA_MEM3_ALN_BWTALN_H
 #define BWA_MEM3_ALN_BWTALN_H
 
@@ -67,11 +68,23 @@ typedef uint32_t bwa_cigar_t;
 #define __cigar_len(__cigar) ((__cigar)&CIGAR_LN_MASK)
 #define __cigar_create(__op, __len) ((__op)<<CIGAR_OP_SHIFT | (__len))
 
+/* The reference bases a CIGAR spans: the sum of its M and D lengths. This layout only; mem's
+ * CIGARs (cigar_ref_len_mem) pack op and length differently. */
+static inline int64_t bwa_cigar_ref_span(const bwa_cigar_t *cigar, int n_cigar)
+{
+	int64_t span = 0;
+	for (int i = 0; i < n_cigar; ++i)
+		if (__cigar_op(cigar[i]) == FROM_M || __cigar_op(cigar[i]) == FROM_D) span += __cigar_len(cigar[i]);
+	return span;
+}
+
 typedef struct {
 	uint32_t n_cigar:15, gap:8, mm:8, strand:1;
 	int ref_shift;
 	bwtint_t pos;
 	bwa_cigar_t *cigar;
+	uint64_t alt_site_plus1; // selected packed site allele + 1; zero keeps stock XA behavior
+	int reference_nm;       // original-reference edit distance after ALT-aware refinement
 } bwt_multi1_t;
 
 typedef struct {
@@ -84,6 +97,7 @@ typedef struct {
 	// alignments in SA coordinates
 	int n_aln;
 	bwt_aln1_t *aln;
+	int search_incomplete; // plain search exceeded -m; copied with duplicate search results
 	// multiple hits
 	int n_multi;
 	bwt_multi1_t *multi;

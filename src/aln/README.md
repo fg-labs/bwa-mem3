@@ -2,7 +2,7 @@
 
 This directory holds the code behind `bwa-mem3 aln`, a fused port of bwa's
 short-read `aln` + `samse`/`sampe` pipeline whose SAM records without `--meth`,
-`--short-insert` or `--ref-span-insert` are byte-identical to
+`--short-insert`, `--ref-span-insert` or `--known-snvs` are byte-identical to
 stock bwa 0.7.19's (the header is too, except the `@PG` line, which names bwa-mem3), as
 checked on the generated reads described in `docs/src/cli/aln.md`.
 
@@ -31,12 +31,15 @@ contributors" line in the headers of the files derived from them was added here.
 | `bwape.h`, `bwape.cpp` | `bwape.c`: the pairing half of sampe (`bwa_init_pe_opt`, `infer_isize`, `pairing`, `bwa_cal_pac_pos_pe`, `bwa_sw_core`, and `bwa_paired_sw`'s body as `bwa_paired_sw_core`/`bwa_paired_sw_report`) |
 | `aln_out.h`, `aln_out.cpp`, `aln_main.h`, `aln_main.cpp` | new code (MIT, as the rest of bwa-mem3; `SPDX-License-Identifier` line): the SAM/BAM sink and the `aln` subcommand driver (`bwa_aln` and `bwa_sai2sam_se` option handling, fused) |
 | `aln_meth.h`, `aln_meth.cpp`, `aln_meth_search.h`, `aln_meth_realign.h`, `aln_meth_realign.cpp` | new code (MIT): converted candidate-window discovery, owned fixed-reward global CIGARs, stock chemistry-aware cost/count accounting, and methylation single/paired output. See the ranking and resource limits below |
+| `aln_known_snvs.h`, `aln_known_snvs.cpp` | new code (MIT): sites-only VCF/BCF loading, single-allele ALT-window discovery, per-locus hit merging, ALT-aware refinement, site votes and twin annotations |
 | `aln_alloc.h` | new code (MIT): `aln_malloc`/`aln_calloc`/`aln_realloc`/`aln_strdup`, which exit with a message on allocation failure; every allocation in the files above goes through them (upstream dereferences the result unchecked) |
 | `aln_bwt.h`, `aln_bwt.cpp` | bwa's FM-index API (`bwt_occ`, `bwt_2occ`, `bwt_2occ4`, `bwt_sa`, plus the new `bwt_sa_batch`) re-implemented over bwa-mem3's own index (`FMI_search`); `bwt_match_exact_alt` is copied from upstream `bwt.c` |
 
 ## Modifications
 
 Each change to upstream-derived code adds a line here.
+
+- `--known-snvs`: `bwtaln.h` adds selected-allele and original-reference edit-distance fields to alternative hits, and plain-search completeness to reads. `bwtaln.cpp` preserves that completeness when sharing duplicate searches and supports candidate-aware methylation discovery. Its opt-in full-read ALT-width capture precedes search shadowing; methylation stopping requires a valid same-read lower bound excluding competitive ungapped ALT placements, with all seed, length, gap and incompleteness guards retained. `bwape.cpp`/`bwape.h` add allele-bearing explicit hit lists, reference-span pairing and single-allele mate rescue. `bwase.cpp`/`bwase.h` refine primary and alternative CIGARs against the selected ALT, then compute MD/NM against the original reference (retaining methylation conversion accounting under `--meth`). `bwtgap.h` exposes the batch-search interfaces used by the extra searches. These paths are opt-in; ordinary records without the option retain the stock path.
 
 - `aln_bwt.cpp`: `bwt_match_exact_alt` is upstream's body verbatim, moved into
   `namespace bwa_aln`. The occ and SA functions are new code with bwa's

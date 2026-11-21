@@ -4,7 +4,7 @@ Usage:   bwa-mem3 aln [options] <prefix> <in.fq> [<in2.fq>]
 Aligns short reads with bwa's backtracking algorithm and writes SAM (or BAM) in one
 step: bwa aln followed by bwa samse (one FASTQ/FASTA, or '-' for stdin) or bwa sampe
 (two files), with no .sai files. On the tested inputs its records match bwa 0.7.19's
-(@PG differs) unless --meth, --short-insert or --ref-span-insert is given; `-n 1e-2` is
+(@PG differs) unless --meth, --short-insert, --ref-span-insert or --known-snvs is given; `-n 1e-2` is
 a probability here and the integer 1 in stock.
 <prefix> is an index made by `bwa-mem3 index` (also one made with --meth, or one staged
 by `bwa-mem3 shm`).
@@ -117,6 +117,12 @@ Methylation (shared with bwa-mem3 mem):
    Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.
    aln -B is barcode length, not mem's mismatch penalty. Records carry
    XR/XG/XM:Z instead of XM:i/XO:i/XG:i.
+
+Known SNVs:
+  --known-snvs FILE   VCF/BCF of SNVs (FILTER ignored): a read carrying a site's ALT is
+                   placed as on a genome with both alleles, and every read over a site
+                   gets XV:Z (allele, differences elsewhere, budget, allele-swapped twin's
+                   placement) [off]; single-end, paired-end and --meth
 
 New in bwa-mem3 aln:
   -v INT    verbosity: 0-2 no progress reports, 3 progress, 4 diagnostics [3]

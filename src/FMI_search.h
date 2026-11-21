@@ -260,9 +260,12 @@ class FMI_search: public indexEle
      * allocation when it cannot; the SA samples always use the default
      * allocation. Disk path only (an shm attach prints that it has no effect).
      * Production callers pass OFF or ON; the other values are unit-test seams.
-     * See bwa_hugepages.h. */
+     * See bwa_hugepages.h.
+     * allow_shm=false forces disk loading for private temporary indexes whose
+     * basename might collide with an unrelated staged index. */
     void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true,
-                    bwamem_hugetlb_mode_t huge_pages = BWAMEM_HUGETLB_OFF);
+                    bwamem_hugetlb_mode_t huge_pages = BWAMEM_HUGETLB_OFF,
+                    bool allow_shm = true);
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the

@@ -11,6 +11,7 @@
 #include "../../src/aln/aln_main.h"
 #include "../../src/aln/aln_meth.h"
 #include "../../src/aln/aln_meth_search.h"
+#include "../../src/aln/aln_known_snvs.h"
 #include "../../src/aln/bwaseqio.h"
 #include "../../src/aln/bwase.h"
 #include "../../src/aln/aln_out.h"
@@ -71,7 +72,7 @@ struct MethRef {
     MethRef()
     {
         dir = tmp.path();
-        fa = dir + "/ref.fa";
+        fa = tmp.unique_file();
         uint32_t st = 1234567;
         c1 = aln_test::lcg_dna(st, 3000);
         c2 = aln_test::lcg_dna(st, 2000);
@@ -1534,6 +1535,69 @@ TEST_CASE("aln_meth: capped duplicate copies draw the main hit a search of their
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
+TEST_CASE("aln_meth: identical reads with different --known-snvs candidates do not share a search")
+{
+    namespace ba=bwa_aln;
+    FMI_search fmi((ref().fa+".meth").c_str()); fmi.load_index(false,1);
+    auto *bwt=ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    auto *opt=ba::gap_init_opt(); opt->fnr=-1; opt->max_diff=2;
+    // A site at c1[q] (A or T) with ALT G. The read, read 1 unmethylated, is c1[q - 10, q + 15) with
+    // G at the site and two A<->G mismatches: three differences, over the budget of 2, so its own
+    // search finds nothing; the site's window as a candidate places it with G (two).
+    int q=1005;
+    while (ref().c1[q]!='A' && ref().c1[q]!='T') ++q;
+    std::string read=ref().c1.substr(q-10,25);
+    read[10]='G';
+    int n_mm=0;
+    for (int k : {3,17,6,20,2,22,4,18})
+        if (n_mm<2 && (read[k]=='A' || read[k]=='G')) read[k]=read[k]=='A'?'G':'A', ++n_mm;
+    REQUIRE(n_mm==2);
+    read=conv(read,'C','T');
+    ba::ks_sites_t sites;
+    sites.by_contig.assign(mr.bns->n_seqs,{});
+    sites.by_contig[0]={{q,(uint8_t)(ref().c1[q]=='A'?0:3),2}};
+    sites.n_sites=1;
+    mr.known_snvs=&sites;
+    const int n=8;
+    const auto fq=write_fq("ks-dups.fq",std::vector<std::string>(n,read));
+    // Only the odd copies have the window (as an incomplete window search gives one copy and not another).
+    const int64_t rb=mr.bns->anns[0].offset+q-10;
+    std::vector<std::vector<ba::aln_meth_candidate_t>> extra(n);
+    for (int i=1;i<n;i+=2) extra[i]={{0,0,1,rb,rb+25}};
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+    auto *input=ba::bwa_seq_open(fq.c_str()); int got=0;
+    auto *reads=ba::bwa_read_seq(input,n,&got,BWA_MODE_COMPREAD,0);
+    REQUIRE(got==n);
+    std::vector<ba::aln_meth_read_t> batch(n);
+    ba::aln_dup_state_t dup;
+    // every copy but the first of each candidate set shares its search
+    CHECK(ba::aln_meth_search_batch(bwt,&mr,&mo,n,reads,opt,1,1,0,0,3,&dup,batch.data(),extra.data())==n-2);
+    for (int i=0;i<n;++i) {
+        CAPTURE(i);
+        ba::aln_meth_read_t single; ba::aln_dup_state_t single_dup;
+        ba::aln_meth_search_batch(bwt,&mr,&mo,1,reads+i,opt,1,1,i,0,3,&single_dup,&single,&extra[i]);
+        REQUIRE((single.main>=0)==(i%2==1)); // the test's premise: only the candidate places it
+        REQUIRE(batch[i].main==single.main);
+        CHECK(batch[i].c1==single.c1); CHECK(batch[i].c2==single.c2);
+        REQUIRE(batch[i].hits.size()==single.hits.size());
+        for (size_t k=0;k<single.hits.size();++k) {
+            const auto &x=batch[i].hits[k], &y=single.hits[k];
+            CHECK(std::make_tuple(x.rid,x.hyp,x.strand,x.pos,x.cost,x.span,x.alt,
+                                  x.n_cig,x.n_conv,x.n_mm,x.n_gapo,x.n_gape)==
+                  std::make_tuple(y.rid,y.hyp,y.strand,y.pos,y.cost,y.span,y.alt,
+                                  y.n_cig,y.n_conv,y.n_mm,y.n_gapo,y.n_gape));
+            if (x.n_cig==y.n_cig) { // the operations, not the cig field (an offset into r.cig)
+                const uint32_t *cx=ba::aln_meth_hit_cigar(batch[i],x), *cy=ba::aln_meth_hit_cigar(single,y);
+                CHECK(std::vector<uint32_t>(cx,cx+x.n_cig)==std::vector<uint32_t>(cy,cy+y.n_cig));
+            }
+        }
+    }
+    ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
+    free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique strata")
 {
     namespace ba = bwa_aln;
@@ -1715,16 +1779,21 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
         ba::aln_meth_flush_parked(&group);
     }
     CHECK(results[0].flags == ba::ALN_METH_BIND_CIGAR);
-    CHECK(slot.stop == 1);
+    CHECK(slot.stop == ba::ALN_METH_STOP_CIGAR);
     CHECK(results[0].n_lookups == (retained ? 2 : 1));
     CHECK(slot.pend.empty());
+    // A read stopped by the CIGAR budget must not even visit later ALT-window candidates.
+    std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, 600, 600 + ALN_MAX_READ_LEN + 1}};
+    slot.extra = &extra;
     ba::aln_meth_slot_finish(&slot);
+    CHECK(results[0].n_unrepresentable == 0);
     CHECK((results[0].main >= 0) == retained);
     if (retained) {
         CHECK(results[0].hits[results[0].main].pos == 500);
         CHECK(results[0].hits[results[0].main].strand == 0);
     }
     // Reuse the same slot for a later read: the cap and stop state belong to one read only.
+    slot.extra = nullptr;
     ba::aln_meth_slot_start(&slot, reads + 1, results + 1, 1, 3, 1);
     CHECK(slot.stop == 0);
     CHECK(slot.alignment_bytes == 0);
@@ -1750,6 +1819,134 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     CHECK(record.find("X0:i:") == std::string::npos);
     CHECK(record.find("X1:i:") == std::string::npos);
     CHECK(record.find("XA:Z:") == std::string::npos);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
+    free(opt);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
+TEST_CASE("aln_meth: a CIGAR stop survives the lookup budget ending the same flush")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("cigar-lookup-cap.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(reads != nullptr);
+    REQUIRE(n == 1);
+    const std::string prefix = ref().fa + ".meth";
+    FMI_search fmi(prefix.c_str());
+    fmi.load_index(false, 1);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    mo.p_best = 1; mo.p_second = 0; // one genomic lookup fits the budget
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    ba::aln_meth_group_t group;
+    group.bwt = bwt; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    group.n_slots = 1; group.slot.resize(1);
+    ba::gap_slot_core_t core = {};
+    group.cores = &core;
+    auto &slot = group.slot[0];
+    slot.grp = &group; slot.job = &core.job;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+    bwtint_t row = (bwtint_t)-1;
+    for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
+        int strand = 0;
+        const auto pos = ba::bwa_pos_from_sa(mr.conv_bns, ba::bwt_sa(bwt, k), 50, &strand);
+        if (pos != (bwtint_t)-1 && strand == 0 && bns_pos2rid(mr.conv_bns, pos) == 1 &&
+            pos == (bwtint_t)(mr.conv_bns->anns[1].offset + 500)) { row = k; break; }
+    }
+    REQUIRE(row < bwt->seq_len);
+    // The one looked-up row's 8-byte alignment overflows the CIGAR budget, and the interval's
+    // second row is past the lookup budget: both budgets end this flush.
+    slot.alignment_bytes = (64ULL << 20) - 7;
+    ba::gap_entry_t exact = {};
+    ba::aln_meth_hit(&slot, &exact, row, row + 1);
+    core.state = ba::GAP_SLOT_PARKED;
+    ba::aln_meth_flush_parked(&group);
+    CHECK(result.n_lookups == 1);
+    CHECK(result.flags == (ba::ALN_METH_BIND_CIGAR | ba::ALN_METH_BIND_BEST));
+    // The CIGAR stop is final: the lookup stop must not replace it.
+    CHECK(slot.stop == ba::ALN_METH_STOP_CIGAR);
+    // So a pending ALT-window candidate is not resolved past the CIGAR budget.
+    std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, 600, 600 + ALN_MAX_READ_LEN + 1}};
+    slot.extra = &extra;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.n_unrepresentable == 0);
+    CHECK(slot.windows.size() == 1); // only the looked-up row's window
+    CHECK(result.main == -1);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
+    free(opt);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
+TEST_CASE("aln_meth: a genomic lookup-budget stop still resolves the ALT-window candidates")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("lookup-cap.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(reads != nullptr);
+    REQUIRE(n == 1);
+    const std::string prefix = ref().fa + ".meth";
+    FMI_search fmi(prefix.c_str());
+    fmi.load_index(false, 1);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    mo.p_best = 0; mo.p_second = 0; // no genomic lookup fits the budget
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    ba::aln_meth_group_t group;
+    group.bwt = bwt; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    group.n_slots = 1; group.slot.resize(1);
+    ba::gap_slot_core_t core = {};
+    group.cores = &core;
+    auto &slot = group.slot[0];
+    slot.grp = &group; slot.job = &core.job;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+    ba::gap_entry_t exact = {};
+    ba::aln_meth_hit(&slot, &exact, 0, 0);
+    core.state = ba::GAP_SLOT_PARKED;
+    ba::aln_meth_flush_parked(&group);
+    CHECK(result.flags == ba::ALN_METH_BIND_BEST);
+    CHECK(slot.stop == ba::ALN_METH_STOP_LOOKUP);
+    CHECK(result.n_lookups == 0);
+    CHECK(result.occ.empty());
+    // The ALT-window search already found the read's exact window: it is still resolved.
+    const int64_t rb = (int64_t)mr.bns->anns[0].offset + 500;
+    std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, rb, rb + 50}};
+    slot.extra = &extra;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.flags == ba::ALN_METH_BIND_BEST);
+    REQUIRE(result.main >= 0);
+    CHECK(result.hits[result.main].pos == 500);
+    CHECK(result.hits[result.main].strand == 0);
+    ba::bwase_initialize();
+    ba::aln_meth_finish_se(&mr, &mo, opt, 3, 1, reads, &result);
+    // Still incomplete: MAPQ 0, no exact X0/X1.
+    CHECK((int)reads[0].mapQ == 0);
+    CHECK((int)reads[0].c1 == 0);
+    CHECK((int)reads[0].c2 == 0);
+    kstring_t text = {0, 0, nullptr};
+    ba::aln_meth_print_sam1(&text, &mr, &mo, reads, &result, 1, nullptr, BWA_MODE_COMPREAD, 30);
+    const std::string record(text.s, text.l);
+    free(text.s);
+    CHECK(record.find("r0\t0\tc1\t501\t0\t50M\t") == 0);
+    CHECK(record.find("X0:i:") == std::string::npos);
+    CHECK(record.find("X1:i:") == std::string::npos);
     ba::aln_meth_ref_free(&mr);
     ba::bwt_destroy(bwt);
     free(opt);
@@ -1944,6 +2141,226 @@ TEST_CASE("aln_meth: retained-cost stop waits for complete strata and handles de
     free(opt);
 }
 
+TEST_CASE("aln_meth: ALT width capture survives slot reuse reset and duplicate compaction")
+{
+    namespace ba = bwa_aln;
+    FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi); ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 2;
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+    std::vector<std::string> queries;
+    for (int i = 0; i < 36; ++i) queries.push_back(ref().c1.substr(400 + (i % 19) * 3, i % 2 ? 35 : 17));
+    queries.push_back(queries[0]); queries.push_back(queries[4]);
+    const auto fq = write_fq("width-capture.fq", queries);
+    for (int read_no : {0, 1}) {
+        opt->seed_len = 18; // seeded; the round's unseeded compaction check below sets 1024
+        auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+        auto *reads = ba::bwa_read_seq(input, 100, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == (int)queries.size());
+        std::vector<int> expected(n);
+        for (int i = 0; i < n; ++i) {
+            std::vector<uint8_t> converted(reads[i].len); std::vector<ba::bwt_width_t> width(reads[i].len + 1);
+            ba::aln_meth_convert(read_no, reads[i].seq, reads[i].len, converted.data());
+            ba::bwt_cal_width(bwt, reads[i].len, converted.data(), width.data());
+            expected[i] = width[reads[i].len - 1].bid;
+            CHECK((int)width[reads[i].len].bid == expected[i] + 1); // sentinel is NOT the certificate
+        }
+        std::vector<ba::aln_meth_read_t> batch(n); ba::aln_dup_state_t dup;
+        CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 2, read_no, 0, 1, 1000,
+                                      &dup, batch.data(), nullptr, nullptr, true) >= 2);
+        for (int i = 0; i < n; ++i) {
+            CHECK(batch[i].full_width_bound.valid); CHECK(batch[i].full_width_bound.value == expected[i]);
+        }
+        // Reusing the result with capture disabled must clear old validity even on duplicate copies.
+        dup = ba::aln_dup_state_t();
+        ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, read_no, 0, 1, 1000, &dup, batch.data());
+        for (const auto &r : batch) CHECK_FALSE(r.full_width_bound.valid);
+        // Differing opt-in metadata prevents inappropriate sharing, and compaction uses uniq[k].
+        ba::ks_sites_t no_sites; no_sites.by_contig.resize(mr.bns->n_seqs); mr.known_snvs = &no_sites;
+        std::vector<ba::aln_meth_alt_bound_t> bounds(n);
+        for (int i = 0; i < n; ++i) { bounds[i].valid = true; bounds[i].value = i; }
+        dup = ba::aln_dup_state_t();
+        CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, read_no, 0, 1, 1000,
+                                      &dup, batch.data(), nullptr, bounds.data()) == 0);
+        for (int i = 0; i < n; ++i) {
+            ba::aln_meth_read_t single;
+            ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads + i, opt, 1, read_no, i, 1, 1000,
+                                      nullptr, &single, nullptr, &bounds[i]);
+            CHECK(batch[i].flags == single.flags); CHECK(batch[i].c1 == single.c1); CHECK(batch[i].c2 == single.c2);
+            CHECK(batch[i].n_lookups == single.n_lookups);
+        }
+        // A duplicate before later distinct reads makes uniq[k] nonidentity; mixed bounds must
+        // retain each later read's own stopping policy rather than the compacted position's.
+        opt->seed_len = 1024;
+        const auto swap_read = reads[1]; reads[1] = reads[n - 2]; reads[n - 2] = swap_read;
+        std::vector<std::string> bases = queries; std::swap(bases[1], bases[n - 2]);
+        for (int i = 0; i < n; ++i) { bounds[i].valid = true; bounds[i].value = reads[i].len == 17 ? 0 : 100; }
+        // A copy repeats an earlier read's bases and bound; every other read is a representative.
+        std::vector<bool> is_copy(n, false); int n_copies = 0;
+        for (int i = 0; i < n; ++i) {
+            for (int j = 0; j < i && !is_copy[i]; ++j)
+                is_copy[i] = bases[j] == bases[i] && bounds[j].value == bounds[i].value;
+            n_copies += is_copy[i];
+        }
+        REQUIRE(n_copies == 2); // the two repeated queries, one now before later distinct reads
+        CHECK(is_copy[1]);
+        dup = ba::aln_dup_state_t();
+        CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, read_no, 0, 1, 1000,
+                                      &dup, batch.data(), nullptr, bounds.data()) == n_copies);
+        for (int i = 0; i < n; ++i) {
+            CAPTURE(i);
+            ba::aln_meth_read_t single;
+            ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads + i, opt, 1, read_no, i, 1, 1000,
+                                      nullptr, &single, nullptr, &bounds[i]);
+            CHECK(batch[i].flags == single.flags); CHECK(batch[i].c1 == single.c1); CHECK(batch[i].c2 == single.c2);
+            // Duplicate copies intentionally have zero work counters; a representative's are its own.
+            CHECK(batch[i].n_lookups == (is_copy[i] ? 0 : single.n_lookups));
+        }
+        mr.known_snvs = nullptr;
+        ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+    }
+    free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
+TEST_CASE("aln_meth: known-site stop requires a strict valid same-read ALT certificate")
+{
+    namespace ba = bwa_aln;
+    auto *opt = ba::gap_init_opt();
+    ba::ks_sites_t sites; ba::aln_meth_ref_t ref; ref.known_snvs = &sites;
+    ba::aln_meth_group_t group; group.ref = &ref; group.opt = opt;
+    ba::gap_job_t job = {}; job.opt = *opt; job.opt.max_diff = 3;
+    ba::aln_meth_read_t res; ba::aln_meth_occ_t best = {}; best.cost = 0; res.occ.push_back(best);
+    ba::aln_meth_slot_t slot; slot.grp = &group; slot.job = &job; slot.res = &res; slot.len = 30;
+    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 4)); // unavailable is not zero candidates
+    slot.alt_bound.valid = true; slot.alt_bound.value = 1;
+    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 4)); // LB == d cannot certify
+    slot.alt_bound.value = 2;
+    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 3)); // next == M*d cannot certify
+    CHECK(ba::aln_meth_can_stop(&slot, 4));
+    // No extras list is consulted: a competitive ALT can lie beyond the reference horizon.
+    std::vector<ba::aln_meth_candidate_t> empty; slot.extra = &empty;
+    slot.alt_bound.value = 0; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
+    slot.alt_bound.value = 2;
+    for (int len : {0, 160, 161, 350}) {
+        slot.len = len; CHECK(ba::aln_meth_can_stop(&slot, 4) == (len == 160));
+    }
+    slot.len = 30;
+    for (int flag : {ba::ALN_METH_BIND_BEST, ba::ALN_METH_BIND_UNREP, ba::ALN_METH_BIND_CIGAR, ba::ALN_METH_BIND_M}) {
+        res.flags = flag; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100));
+    }
+    res.flags = 0;
+    ba::bwt_width_t seed = {}; job.seed_width = &seed;
+    CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.seed_width = nullptr;
+    job.opt.mode |= BWA_MODE_NONSTOP; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.mode &= ~BWA_MODE_NONSTOP;
+    job.opt.s_gapo = 3; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.s_gapo = 11;
+    for (int m : {0, -1}) { job.opt.s_mm = m; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); }
+    job.opt.s_mm = 3; job.opt.s_gape = -1; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.s_gape = 0;
+    job.opt.max_diff = 0; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 100)); job.opt.max_diff = 3;
+    job.opt.mode &= ~BWA_MODE_GAPE; CHECK(ba::aln_meth_can_stop(&slot, 4));
+    res.occ[0].cost = 3; slot.alt_bound.value = 2; CHECK_FALSE(ba::aln_meth_can_stop(&slot, 7));
+    slot.alt_bound.value = 3; CHECK(ba::aln_meth_can_stop(&slot, 7));
+    free(opt);
+}
+
+TEST_CASE("aln_meth: known-site certificate preserves independent REF plus ALT window strata")
+{
+    namespace ba = bwa_aln;
+    bwa_tests::TempDir tmp{"aln_meth_alt_stop"}; const std::string fa = tmp.path() + "/ref.fa";
+    const std::string query = "ACGTCGATCGTA";
+    std::vector<std::pair<std::string, std::string>> contigs{{"exact", query}};
+    for (int i = 0; i < (int)query.size(); ++i) for (char b : std::string("ACGTN")) {
+        std::string target = query; target[i] = b;
+        contigs.push_back({"v" + std::to_string(contigs.size()), target});
+    }
+    // REF cost 2*M exceeds T=M; the single ALT at base zero restores cost M.
+    // This competitor must survive even though genomic safe stopping alone could omit it.
+    std::string improved = query; improved.front() = 'C'; improved.back() = 'C';
+    contigs.push_back({"alt_beyond_ref_horizon", improved});
+    REQUIRE(aln_test::write_test_fasta(fa, contigs));
+    std::vector<std::string> args{"index", "--meth", fa}; std::vector<char *> argv;
+    for (auto &a : args) argv.push_back(&a[0]); argv.push_back(nullptr); optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)args.size(), argv.data()) == 0);
+    FMI_search fmi((fa + ".meth").c_str()); fmi.load_index(false, 1, true, BWAMEM_HUGETLB_OFF, false);
+    auto *bwt = ba::bwt_from_fmi(&fmi); ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::ks_sites_t sites; sites.by_contig.resize(contigs.size());
+    for (size_t i = 0; i < contigs.size(); ++i) {
+        int p = i == contigs.size() - 1 ? 0 : i % 2 ? 0 : query.size() - 1; // both edges
+        if (contigs[i].second[p] == 'N') p = p == 0 ? query.size() - 1 : 0; // sites require ACGT REF
+        const char rb = contigs[i].second[p];
+        sites.by_contig[i].push_back({p, (uint8_t)std::string("ACGT").find(rb),
+                                     (uint8_t)(i == contigs.size() - 1 ? 0 : rb == 'A' ? 2 : 0)});
+        ++sites.n_sites;
+    }
+    mr.known_snvs = &sites;
+    ba::ks_windows_t windows; REQUIRE(ba::ks_windows_build(&sites, mr.bns, mr.pac, 1, 1, &windows) == 0);
+    auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 2; opt->seed_len = 1024;
+    using Key = std::tuple<int,int,int,int64_t,int64_t>;
+    for (int scoring : {MEM_METH_SCORING_NEUTRAL, MEM_METH_SCORING_COLLAPSED})
+    for (int context : {METH_CTX_ALL, METH_CTX_CPG}) for (int read_no : {0, 1}) for (int hyp : {0, 1}) {
+        ba::aln_meth_opt_t mo; mo.m.meth_scoring = scoring; mo.m.meth_context = context;
+        mo.m.meth_chem = METH_CHEM_TAPS; ba::aln_meth_opt_finish(&mo);
+        const int strand = hyp ^ read_no;
+        const auto fq = write_fq_in(tmp.path(), "r.fq", {strand ? aln_test::revcomp(query) : query});
+        auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+        auto *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == 1);
+        ba::gap_opt_t discovery = *opt; discovery.mode |= BWA_MODE_NONSTOP; discovery.max_top2 = INT_MAX;
+        ba::aln_meth_read_t wr;
+        ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &discovery, 1,
+                                  read_no, 0, 1, 1000, nullptr, &wr, nullptr, nullptr, true);
+        std::vector<ba::aln_meth_candidate_t> extra; ba::ks_meth_candidates(&windows, mr.bns, wr, &extra);
+        ba::aln_meth_read_t result;
+        // As ks_meth_search composes them: the production certificate and the window flags.
+        const ba::aln_meth_alt_bound_t certificate = ba::aln_meth_alt_certificate(wr);
+        const int wflags = wr.flags;
+        ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, opt, 1, read_no, 0, 1, 1000,
+                                  nullptr, &result, &extra, &certificate, false, &wflags);
+        CHECK(result.flags == 0); CHECK(wr.flags == 0);
+        std::set<Key> expected, actual;
+        for (int rid = 0; rid < (int)contigs.size(); ++rid) {
+            int best = INT_MAX;
+            for (bool alt : {false, true}) {
+                std::string target = contigs[rid].second;
+                if (alt) { const auto &s = sites.by_contig[rid][0]; target[s.pos] = "ACGT"[s.alt]; }
+                int mm = 0;
+                for (int k = 0; k < (int)query.size(); ++k) {
+                    const char r = target[k], q = query[k], from = hyp ? 'C' : 'G', to = hyp ? 'T' : 'A';
+                    const bool cpg = hyp ? (r == 'C' && k + 1 < (int)target.size() && target[k + 1] == 'G')
+                                         : (r == 'G' && k > 0 && target[k - 1] == 'C');
+                    const bool cv = r == from && q == to && (context == METH_CTX_ALL || cpg);
+                    const bool mirror = context == METH_CTX_ALL && scoring == MEM_METH_SCORING_COLLAPSED && r == to && q == from;
+                    mm += r == 'N' || (r != q && !cv && !mirror);
+                }
+                best = std::min(best, mm);
+            }
+            if (best <= 1) expected.emplace(rid, hyp, strand, mr.bns->anns[rid].offset, best * opt->s_mm);
+        }
+        for (const auto &h : result.hits) {
+            INFO("duplicate " << h.rid << " hyp=" << h.hyp << " strand=" << h.strand << " pos=" << h.pos);
+            CHECK(actual.emplace(h.rid, h.hyp, h.strand, h.pos, h.cost).second);
+        }
+        CAPTURE(scoring); CAPTURE(context); CAPTURE(read_no); CAPTURE(hyp);
+        for (const auto &k : actual) if (!expected.count(k)) {
+            INFO("unexpected " << std::get<0>(k) << " hyp=" << std::get<1>(k) << " strand=" << std::get<2>(k)
+                 << " pos=" << std::get<3>(k) << " cost=" << std::get<4>(k)); CHECK(expected.count(k) == 1);
+        }
+        for (const auto &k : expected) if (!actual.count(k)) {
+            INFO("missing " << std::get<0>(k) << " hyp=" << std::get<1>(k) << " strand=" << std::get<2>(k)
+                 << " pos=" << std::get<3>(k) << " cost=" << std::get<4>(k)); CHECK(actual.count(k) == 1);
+        }
+        CHECK(actual == expected);
+        int best_count = 0, second_count = 0;
+        for (const auto &k : expected) { if (std::get<4>(k) == 0) ++best_count; else ++second_count; }
+        CHECK(result.c1 + result.n_conv_moved == best_count);
+        CHECK(result.c2 == second_count + result.n_conv_moved);
+        ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+    }
+    free(opt); ba::ks_windows_free(&windows); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: zero-cost stopping preserves an independently enumerated tiny candidate set")
 {
     namespace ba=bwa_aln;
@@ -1962,7 +2379,7 @@ TEST_CASE("aln_meth: zero-cost stopping preserves an independently enumerated ti
     optreset=1;
 #endif
     REQUIRE(bwa_index((int)args.size(),argv.data())==0);
-    FMI_search fmi((fa+".meth").c_str());fmi.load_index(false,1);
+    FMI_search fmi((fa+".meth").c_str());fmi.load_index(false,1,true,BWAMEM_HUGETLB_OFF,false);
     auto *bwt=ba::bwt_from_fmi(&fmi);ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,fa.c_str(),fmi.idx->bns,1)==0);
     auto *opt=ba::gap_init_opt();opt->fnr=-1;opt->max_diff=2;opt->seed_len=1024;
@@ -2021,7 +2438,7 @@ TEST_CASE("aln_meth: nonzero stopping preserves independent candidate strata wit
     optreset=1;
 #endif
     REQUIRE(bwa_index((int)args.size(),argv.data())==0);
-    FMI_search fmi((fa+".meth").c_str());fmi.load_index(false,1);
+    FMI_search fmi((fa+".meth").c_str());fmi.load_index(false,1,true,BWAMEM_HUGETLB_OFF,false);
     auto *bwt=ba::bwt_from_fmi(&fmi);ba::aln_meth_ref_t mr;
     REQUIRE(ba::aln_meth_ref_load(&mr,fa.c_str(),fmi.idx->bns,1)==0);
     auto *opt=ba::gap_init_opt();opt->fnr=-1;opt->max_diff=3;opt->seed_len=1024;
@@ -2505,7 +2922,7 @@ TEST_CASE("aln_meth: short-insert rescues a reverse mate whose overhang runs pas
     SUBCASE("ordinary") {}
     SUBCASE("meth") { meth = true; }
     bwa_tests::TempDir tmp{"aln_meth_ref_end"};
-    const std::string fa = tmp.path() + "/end.fa";
+    const std::string fa = tmp.unique_file();
     uint32_t seed = 752;
     const std::string contig = aln_test::lcg_dna(seed, 3000);
     REQUIRE(aln_test::write_test_fasta(fa, {{"end", contig}}));
@@ -3273,6 +3690,116 @@ TEST_CASE("aln_meth: TAPS neutral's tiebreak in pairs: the end's main hit and MA
 }
 
 
+TEST_CASE("aln_meth: incoming window flags precede neutral selection and duplicate sharing")
+{
+    namespace ba = bwa_aln;
+    FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
+    auto *bwt = ba::bwt_from_fmi(&fmi); ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 2; opt->seed_len = 1024;
+    ba::aln_meth_opt_t mo; mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    ba::aln_meth_opt_finish(&mo);
+    const auto fq = write_fq("incoming-flags.fq", std::vector<std::string>(8, ref().read_u));
+    auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+    auto *reads = ba::bwa_read_seq(input, 20, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == 8);
+    std::vector<int> flags{0, ba::ALN_METH_BIND_M, 0, ba::ALN_METH_BIND_BEST,
+        ba::ALN_METH_BIND_M, ba::ALN_METH_BIND_CIGAR, ba::ALN_METH_BIND_UNREP, 0};
+    std::vector<ba::aln_meth_read_t> results(n); ba::aln_dup_state_t dup;
+    CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, 1, 1000,
+          &dup, results.data(), nullptr, nullptr, false, flags.data()) == 3);
+    for (int i = 0; i < n; ++i) {
+        CHECK(results[i].flags == flags[i]);
+        if (flags[i]) { CHECK(results[i].n_conv_moved == 0); CHECK(results[i].conv_gap == 0); }
+        else CHECK(results[i].n_conv_moved == 3);
+        ba::aln_meth_read_t single;
+        ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads + i, opt, 1, 1, i, 1, 1000,
+            nullptr, &single, nullptr, nullptr, false, &flags[i]);
+        CHECK(results[i].main == single.main); CHECK(results[i].c1 == single.c1); CHECK(results[i].c2 == single.c2);
+    }
+    // Reset with no incoming flags restores complete-state tie-breaking for every reused result.
+    dup = ba::aln_dup_state_t();
+    ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, 1, 1000, &dup, results.data());
+    for (const auto &r : results) { CHECK(r.flags == 0); CHECK(r.n_conv_moved == 3); }
+    ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+    free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
+TEST_CASE("aln_meth: ks_meth_search applies incomplete window flags before the genomic search")
+{
+    namespace ba = bwa_aln;
+    FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
+    auto *bwt = ba::bwt_from_fmi(&fmi); ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    int c4 = -1;
+    for (int i = 0; i < mr.bns->n_seqs; ++i) if (std::strcmp(mr.bns->anns[i].name, "c4") == 0) c4 = i;
+    REQUIRE(c4 >= 0);
+    // Eight sites just past read_u's exact locus, none under the read: every site's ALT window
+    // holds the read (and its first one-conversion copy), so the window search has more rows to
+    // look up than the genomic search.
+    ba::ks_sites_t sites; sites.by_contig.resize(mr.bns->n_seqs);
+    const int read_end = ref().u_pos - 1 + (int)ref().read_u.size();
+    for (int k = 0; k < 8; ++k) {
+        const int p = read_end + 10 + 5 * k;
+        const uint8_t code = (uint8_t)std::string("ACGT").find(ref().c4[p]);
+        REQUIRE(code < 4);
+        sites.by_contig[c4].push_back({p, code, (uint8_t)(code ^ 1)}); // a transversion
+        ++sites.n_sites;
+    }
+    mr.known_snvs = &sites;
+    ba::ks_windows_t windows;
+    {
+        bwa_tests::StderrCapture quiet;
+        REQUIRE(ba::ks_windows_build(&sites, mr.bns, mr.pac, 1, 1, &windows) == 0);
+    }
+    ba::aln_opt_t o; ba::aln_opt_init(&o);
+    o.gap.fnr = -1; o.gap.max_diff = 2; o.gap.seed_len = 1024; o.gap.n_threads = 1;
+    ba::aln_meth_opt_t mo; mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    ba::aln_meth_opt_finish(&mo);
+    o.meth = &mo; o.meth_ref = &mr; o.known_snvs = &sites; o.ks_windows = &windows;
+    const auto fq = write_fq("ks-incoming-flags.fq", {ref().read_u});
+    auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+    auto *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == 1);
+    const ba::gap_opt_t discovery = ba::ks_discovery_opt(o.gap);
+    auto window_search = [&]() {
+        ba::aln_meth_read_t w;
+        ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &discovery, 1, 1, 0, 1, o.max_xa_hits,
+                                  nullptr, &w, nullptr, nullptr, true);
+        return w;
+    };
+    // The genomic search given the window search's candidates and certificate but not its flags:
+    // what the read would get if the flags were only OR-ed into the result afterwards.
+    auto genomic_without_flags = [&](const ba::aln_meth_read_t &w) {
+        std::vector<ba::aln_meth_candidate_t> extra; ba::ks_meth_candidates(&windows, mr.bns, w, &extra);
+        const ba::aln_meth_alt_bound_t certificate = ba::aln_meth_alt_certificate(w);
+        ba::aln_meth_read_t r;
+        ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, &o.gap, 1, 1, 0, 0, o.max_xa_hits, nullptr, &r, &extra,
+                                  &certificate);
+        return r;
+    };
+    // Calibrate: with the budget set to the rows the genomic search needs without stopping, the
+    // window search (more rows) is bound while the genomic search alone completes.
+    const auto full_window = window_search();
+    REQUIRE(full_window.flags == 0);
+    ba::aln_meth_read_t unstopped = full_window; unstopped.site_bound.valid = false; unstopped.full_width_bound.value = 0;
+    const auto full_genomic = genomic_without_flags(unstopped);
+    REQUIRE(full_genomic.flags == 0);
+    REQUIRE(full_window.n_lookups > full_genomic.n_lookups);
+    mo.p_best = (int)full_genomic.n_lookups; mo.p_second = 0;
+    const auto bound_window = window_search();
+    REQUIRE(bound_window.flags == ba::ALN_METH_BIND_BEST);
+    // Flags OR-ed in after the search would leave neutral scoring's conversion tie-break in place.
+    const auto or_after = genomic_without_flags(bound_window);
+    REQUIRE(or_after.flags == 0); REQUIRE(or_after.n_conv_moved == 3);
+    // ks_meth_search hands them to the genomic slot first: the read is incomplete from the start,
+    // so the tie-break (which assumes every equal-cost locus was seen) is skipped.
+    ba::aln_meth_read_t res;
+    ba::ks_meth_search(&o, bwt, 1, reads, 1, 0, 0, nullptr, nullptr, &res);
+    CHECK(res.flags == ba::ALN_METH_BIND_BEST);
+    CHECK(res.n_conv_moved == 0); CHECK(res.conv_gap == 0);
+    ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+    mr.known_snvs = nullptr; ba::ks_windows_free(&windows); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: neutral lexicographic strata honor stock cost and incomplete state")
 {
     namespace ba=bwa_aln;
@@ -3811,7 +4338,8 @@ TEST_CASE("aln_meth: a refined window whose counts overflow a record is dropped,
     // index with few differences. Refined against the original reference (where read C over
     // reference T is not free for TAPS/5-base), the best global alignment needs more than 255 gap
     // extensions: it cannot be stored in a record, so it must not compete, and must not abort.
-    const std::string fa = ref().dir + "/homopolymer.fa";
+    // Beside the shared MethRef index (ref().fa), under a name of its own.
+    const std::string fa = ref().tmp.unique_file("_homopolymer.fa");
     uint32_t st = 424242;
     const std::string left = aln_test::lcg_dna(st, 2000), right = aln_test::lcg_dna(st, 2000);
     REQUIRE(aln_test::write_test_fasta(fa, {{"poly", left + std::string(400, 'T') + right}}));
@@ -3939,7 +4467,7 @@ TEST_CASE("aln_meth: a window longer than the realigner accepts is dropped, not 
     // bases, one more than the realigner evaluates. That candidate cannot be scored: the read is
     // reported without it (unmapped here, as it is the only candidate) and the next read still maps.
     bwa_tests::TempDir tmp{"aln_meth_long"}; // this case's index and reads, removed when it ends
-    const std::string fa = tmp.path() + "/long.fa";
+    const std::string fa = tmp.unique_file();
     uint32_t st = 777;
     const std::string contig = aln_test::lcg_dna(st, 70000);
     REQUIRE(aln_test::write_test_fasta(fa, {{"long", contig}}));
