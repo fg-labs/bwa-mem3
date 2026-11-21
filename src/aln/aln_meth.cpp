@@ -141,36 +141,6 @@ uint64_t aln_meth_draw_seed(const aln_meth_ref_t *ref, int read_no, int64_t ord)
     splitmix64(&r);
     return r;
 }
-/* For current best B, retained cost T=B+M excludes gaps when T<O and E>=0.
- * Its raw CIGAR then has <=floor(T/M) strict mismatches. Every such equal-span
- * window has an ungapped converted proposal with no more mismatches: genuine
- * matches/conversions project identically and either N counts strictly regardless
- * of PAC fill. Unseeded discovery admitting that many differences proposes every
- * surviving window by score M*floor(T/M). Refine the entire stratum before stopping.
- * Seeding (reads longer than -l) admits at most -k differences in the seed, so a seeded
- * search proposes every such window only when floor(T/M) <= -k: no proposal with that
- * many mismatches in all can have more in its seed.
- * B can only decrease, so later flushes can only narrow the required stratum.
- * This bounds equivalent proposals, NOT the cost of arbitrary search histories. */
-bool aln_meth_can_stop(const aln_meth_slot_t *x, int next_score)
-{
-    const gap_job_t *job=x->job;
-    const gap_opt_t &opt=job->opt;
-    if (!aln_meth_stop_eligible(x) || x->res->occ.empty()) return false;
-    int64_t best=INT64_MAX;
-    for (const auto &o : x->res->occ) best=std::min(best,o.cost);
-    // Stored costs fit INT_MAX; widen before adding penalties or multiplying.
-    if (best<0 || best>INT_MAX) return false;
-    const int64_t retained=best+(int64_t)opt.s_mm;
-    if (retained>=opt.s_gapo) return false;
-    const int64_t differences=retained/opt.s_mm;
-    if (job->seed_width && differences>opt.max_seed_diff) return false;
-    // Every competitive raw alignment is ungapped. A same-read ALT bound (aln_meth_alt_certificate)
-    // strictly above its mismatch allowance rules out all omitted single-allele improvements.
-    if (x->grp->ref && x->grp->ref->known_snvs && x->alt_bound.value <= differences) return false;
-    return opt.max_diff>=differences && (int64_t)next_score>differences*opt.s_mm;
-}
-
 // e's gaps (see ALN_METH_GAP) into gap[0, e.n_gapo)
 static void entry_gaps(const aln_meth_slot_t *x, const gap_entry_t &e, uint32_t *gap)
 {
@@ -198,12 +168,15 @@ __attribute__((noinline, cold)) int aln_meth_gap_arena(aln_meth_slot_t *x, const
  * the search pops next: every entry below it has been expanded and every hit it made resolved.
  * - Score cut: no row of a path above B + M can be retained, and a path's rows cost at least its
  *   score, so the search stops past B + M (job->score_cut), at any time.
- * - Difference ceiling: once B <= next, no unverified row can cost less than B, so B is final and
- *   every row at B is verified: stock's top-2 ceiling (best differences + 1, at most -n) applies.
- *   A row's converted differences are at most its strict ones, so the ceiling never cuts a path
- *   to a retained row (slot_finish applies the same ceiling to the stored rows).
+ * - Difference ceiling: once B <= next, no unverified row of this search can cost less than B, so
+ *   B is final and every row at B is verified: stock's top-2 ceiling (best differences + 1, at
+ *   most -n) applies. A row's converted differences are at most its strict ones, so the ceiling
+ *   never cuts a path to a retained row (slot_finish applies the same ceiling to the stored rows).
  * - -R: once B < next the best stratum is complete; more than -R loci at B (under the TAPS/5base
- *   tie-break, at B with the fewest conversions) end the search, as stock's top2b stop does. */
+ *   tie-break, at B with the fewest conversions) end the search, as stock's top2b stop does.
+ * "Final" holds only if every row from outside this search's own paths is in before its first
+ * step: under --known-snvs, the ALT-window candidates (aln_meth_score_extras, whose search is a
+ * generator with cuts of its own, aln_meth_boundary_gen). The finish audits it (meth_audit). */
 static bool conv_tiebreak(const aln_meth_opt_t *mo);
 enum { ALN_METH_GIVE_UP = 3 }; // cert_kind: the read ends incomplete instead
 /* The saturation certificates, for a read whose rows of converted score below s are all verified
@@ -267,27 +240,88 @@ static int aln_meth_certify(aln_meth_slot_t *x, int s)
     }
     return 1;
 }
+/* aln_meth_boundary for the --known-snvs ALT-window search (x->gen), a candidate generator for the
+ * main search. Its best B is not the read's: the main search can hold a cheaper row away from any
+ * site, and the read's retained rows reach B_f + M for that lower final best B_f. So it takes only
+ * the cuts that stay valid for every final best at or below B:
+ * - the score cut B + M, as the main search does;
+ * - when gap extensions count as differences (no -e), the ceiling implied by that cut,
+ *   K(B) = (B + M) / mu, where mu = min(M, O, E) is the least a difference costs: a path with more
+ *   converted differences already costs more than B + M. It prunes nothing the score cut keeps,
+ *   unlike stock's top-2 ceiling (B's differences + 1), which a lower final best with more
+ *   differences loosens;
+ * - -R only once every row cheaper than B + M is resolved (next >= B + M), counting distinct
+ *   genomic loci (windows of nearby sites overlap, so one locus is a row in several windows), and
+ *   under the TAPS/5base tie-break only loci with no conversions. A lower final best then has every
+ *   row within its own B_f + M, and the final best B itself has more than -R loci, as stock's stop.
+ * A stop records the horizon (aln_meth_read_t::horizon) the main search checks at its finish. */
+static __attribute__((noinline)) int aln_meth_boundary_gen(aln_meth_slot_t *x, int next)
+{
+    gap_job_t *job = x->job;
+    const gap_opt_t &opt = job->opt;
+    const int64_t B = x->best, M = opt.s_mm;
+    job->score_cut = std::min(job->score_cut, gap_score_cut(B, opt.s_mm));
+    // Under -e (gap extensions are not differences) the job's max_diff also gates stock's deletion
+    // extension (-d: n_gapo + n_gape < max_diff), which K(B) does not bound, so K(B) applies only
+    // when gap extensions count as differences.
+    if (opt.mode & BWA_MODE_GAPE) {
+        const int64_t mu = std::min<int64_t>(std::min<int64_t>(opt.s_mm, opt.s_gapo), opt.s_gape);
+        if (mu > 0) {
+            const int64_t k = (B + M) / mu;
+            if (k < job->max_diff) job->max_diff = (int)k;
+        }
+    }
+    if ((int64_t)next < B + M || (int64_t)next <= B) return 0;
+    const aln_meth_ref_t *ref = x->grp->ref;
+    const bool conv = conv_tiebreak(x->grp->mo);
+    struct locus_t {
+        int64_t pos; int rid, hs;
+        bool operator<(const locus_t &o) const { return pos != o.pos ? pos < o.pos : rid != o.rid ? rid < o.rid : hs < o.hs; }
+        bool operator==(const locus_t &o) const { return pos == o.pos && rid == o.rid && hs == o.hs; }
+    };
+    std::vector<locus_t> loci;
+    for (const auto &o : x->res->occ) {
+        if (o.cost != B || (conv && o.n_conv)) continue;
+        locus_t l{o.alignment.rb, o.rid, o.hyp * 2 + o.strand};
+        if (ref->ks_win && o.rid >= 0 && o.rid < ref->bns->n_seqs) { // the window's place on the genome
+            const ks_window_t &w = ref->ks_win[o.rid];
+            l.rid = w.rid;
+            l.pos = w.beg + (o.alignment.rb - ref->bns->anns[o.rid].offset);
+        }
+        loci.push_back(l);
+    }
+    std::sort(loci.begin(), loci.end());
+    const long n = (long)(std::unique(loci.begin(), loci.end()) - loci.begin());
+    if (n <= opt.max_top2) return 0;
+    x->res->horizon = std::min<int64_t>(x->res->horizon, next);
+    return 1;
+}
 int aln_meth_boundary(aln_meth_slot_t *x, int next)
 {
+    if (x->gen) return aln_meth_boundary_gen(x, next);
     gap_job_t *job = x->job;
     const gap_opt_t &opt = job->opt;
     job->score_cut = std::min(job->score_cut, gap_score_cut(x->best, opt.s_mm));
     if (x->best > next) return 0;
     const int ceiling = x->best_d >= INT_MAX - 1 ? INT_MAX : x->best_d + 1;
     if (ceiling < job->max_diff) job->max_diff = ceiling;
+    x->ceil_applied = std::min(x->ceil_applied, ceiling);
     if (x->cert) return aln_meth_certify(x, next);
     if (x->best == next) return 0;
-    // Count the best loci the finish keeps: those within the final difference ceiling (a row with
-    // more is dropped there), and under the TAPS/5base tie-break the fewest-conversion ones of them.
-    const bool conv = conv_tiebreak(x->grp->mo), gape = opt.mode & BWA_MODE_GAPE;
-    auto kept = [&](const aln_meth_occ_t &o) {
-        return o.cost == x->best && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= (int64_t)ceiling;
+    // The best stratum's loci as the finish counts them (c1): rows at B within the ceiling just
+    // applied (an equal-cost row with more differences is not retained), not a drawn primary.
+    const bool gape = opt.mode & BWA_MODE_GAPE;
+    auto counted = [&](const aln_meth_occ_t &o) {
+        return o.cost == x->best && !o.drawn && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
     };
+    const bool conv = conv_tiebreak(x->grp->mo);
     int fewest = INT_MAX;
-    if (conv) for (const auto &o : x->res->occ) if (kept(o)) fewest = std::min(fewest, o.n_conv);
+    if (conv) for (const auto &o : x->res->occ) if (counted(o)) fewest = std::min(fewest, o.n_conv);
     long n = 0;
-    for (const auto &o : x->res->occ) n += kept(o) && (!conv || o.n_conv == fewest);
-    return n > opt.max_top2;
+    for (const auto &o : x->res->occ) n += counted(o) && (!conv || o.n_conv == fewest);
+    if (n <= opt.max_top2) return 0;
+    x->r_stop = 1;
+    return 1;
 }
 // The second proof (aln_meth_prove_nohit2): after this many Occ4 expansions with no hit, with these
 // caps (candidate rows, piece-search lookups). Measured on EM-seq pairs: 200k expansions and 16k rows.
@@ -331,7 +365,6 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->p = p; x->res = res; x->len = p->len; x->max_diff = max_diff;
     x->keep = has_copy ? ALN_METH_KEEP_COPIES : x->grp->keep_strata ? ALN_METH_KEEP_STRATA : 0;
     *res = aln_meth_read_t();
-    x->alt_bound = aln_meth_alt_bound_t();
     x->rng = aln_meth_draw_seed(x->grp->ref, x->grp->read_no, ord);
     x->vseq.resize(p->len); x->rd_fwd.resize(p->len); x->rd_rev.resize(p->len);
     aln_meth_convert(x->grp->read_no, p->seq, p->len, x->vseq.data());
@@ -346,16 +379,24 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->bits_ready = 0;
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
-    x->prove = (x->grp->opt->mode & BWA_MODE_GAPE) && !x->grp->ref->no_cut && max_diff >= ALN_METH_PH_MIN_DIFF;
+    x->prove = (x->grp->opt->mode & BWA_MODE_GAPE) && !x->grp->ref->ks_window && max_diff >= ALN_METH_PH_MIN_DIFF;
     x->n_steps = 0;
     x->ph.why = -1; // no proof tried for this read yet
     x->prove2_at = x->prove ? (int64_t)ALN_METH_P2_STEPS : INT64_MAX;
     x->flushed_score = -1;
     const gap_opt_t *o = x->grp->opt;
-    x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 && !x->grp->ref->known_snvs &&
-        !x->grp->ref->no_cut;
+    // Under --known-snvs the main search's cuts rest on the ALT-window search holding every
+    // placement that covers a site (aln_meth_boundary_gen), so a read that does not fit a window
+    // takes none. The ALT-window search itself (gen) keeps its cuts at any length.
+    x->gen = x->grp->ref->ks_window;
+    x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 &&
+        (!x->grp->ref->known_snvs || x->gen || ks_fits_window(x->len, o));
     x->best = INT64_MAX; x->best_d = INT_MAX; x->flushed = 0;
-    x->cert = x->cut && !x->grp->keep_strata; x->collect = 0;
+    x->extras_done = 0; x->ceil_applied = INT_MAX; x->r_stop = 0;
+    // Certificates stay off under --known-snvs (main and ALT-window search): the window search is a
+    // generator whose best is not the read's, and the main search's rows below its best are final
+    // only through the window search's horizon, which the finish audits, not a certificate.
+    x->cert = x->cut && !x->grp->keep_strata && !x->grp->ref->known_snvs && !x->grp->ref->ks_window; x->collect = 0;
     x->ivs.clear();
     x->perm_rng = x->rng ^ 0x6a09e667f3bcc909ULL;
     return x->vseq.data();
@@ -371,11 +412,17 @@ static int conv_mapq_cap(int gap)
     return gap < 10 ? 6 * gap : 60;
 }
 
-// Rank the fixed-refinement CIGAR by stock cost, not by its refinement reward.
-static bool alignment_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, bool conversions)
+// Rank the fixed-refinement CIGAR by stock cost, not by its refinement reward; then by stock
+// differences (see aln_meth_search.h).
+bool aln_meth_row_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, bool conversions, bool gape)
 {
     if (a.cost != b.cost) return a.cost < b.cost;
+    const int64_t da = (int64_t)a.n_mm + a.n_gapo + (gape ? a.n_gape : 0);
+    const int64_t db = (int64_t)b.n_mm + b.n_gapo + (gape ? b.n_gape : 0);
+    if (da != db) return da < db;
     if (conversions && a.n_conv != b.n_conv) return a.n_conv < b.n_conv;
+    // --known-snvs: the reference, then the lower (position, ALT) site allele (aln_site_key, -1 first)
+    if (a.ks_site != b.ks_site) return (uint64_t)(a.ks_site + 1) < (uint64_t)(b.ks_site + 1);
     if (a.alignment.cigar != b.alignment.cigar) return a.alignment.cigar < b.alignment.cigar;
     if (a.alignment.re != b.alignment.re) return a.alignment.re < b.alignment.re;
     return a.alignment.raw_cigar < b.alignment.raw_cigar;
@@ -527,6 +574,32 @@ static int seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool ga
     }
     return d;
 }
+// seed_gap_diffs for a path given as a layout (meth_layout's inverse for each gap): an ALT-window
+// candidate's path, which comes as a CIGAR.
+static int layout_seed_diffs(const aln_meth_layout_t &L, int strand, int len, int seed_off, bool gape)
+{
+    int d = 0;
+    for (int g = 0; g < L.n; ++g) {
+        const int gl = L.len[g], del = L.del[g];
+        const int s0 = strand ? L.qpos[g] : del ? len - L.qpos[g] : len - L.qpos[g] - gl;
+        const int i = del ? s0 - 1 : s0 + gl - 1; // the S index of the gap's first step
+        if (i > seed_off) ++d; // the open
+        if (!gape) continue;
+        if (del) d += i > seed_off ? gl - 1 : 0;
+        else for (int s = i - 1; s > i - gl; --s) d += s > seed_off;
+    }
+    return d;
+}
+int aln_meth_seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool gape)
+{
+    return seed_gap_diffs(gap, n_gapo, seed_off, gape);
+}
+int aln_meth_layout_seed_diffs(const uint32_t *gap, int n_gapo, int len, int strand, int seed_off, bool gape)
+{
+    aln_meth_layout_t L;
+    meth_layout(gap, n_gapo, len, strand, &L);
+    return layout_seed_diffs(L, strand, len, seed_off, gape);
+}
 // Whether query position q (orientation ori: 0 rd_fwd, 1 rd_rev) is inside the seed's constrained
 // part (S index above seed_off).
 static inline bool seed_pos(int q, int ori, int len, int seed_off) { return ori ? q > seed_off : q < len - 1 - seed_off; }
@@ -670,14 +743,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     if (ins.second) x->res->occ.push_back(std::move(o));
     else {
         const size_t at = x->loci.val[ins.first];
-        const aln_meth_occ_t &cur = x->res->occ[at];
-        // --known-snvs: the cheaper wins; on equal cost the reference, then the lower
-        // (position, ALT) site allele (aln_site_key order, -1 first). Two rows of the same allele
-        // (the reference, or one site allele) compare as reference rows do.
-        const bool better = o.ks_site == cur.ks_site ? alignment_better(o, cur, conv_tiebreak(g->mo))
-                          : o.cost != cur.cost ? o.cost < cur.cost
-                          : (uint64_t)(o.ks_site + 1) < (uint64_t)(cur.ks_site + 1);
-        if (better) x->res->occ[at] = std::move(o);
+        if (aln_meth_row_better(o, x->res->occ[at], conv_tiebreak(g->mo), gape)) x->res->occ[at] = std::move(o);
     }
 }
 // Scores a row along path L as the reference and, under --known-snvs, once per site allele in its
@@ -756,16 +822,6 @@ static void resolve_located(aln_meth_slot_t *x, const aln_meth_pend_t &h, const 
     if (L.kind == 1) { ++x->res->n_wrong_copy; return; }
     const int hyp = L.hyp, rid = L.rid, strand = L.strand;
     const int64_t rb = L.rb;
-    // --known-snvs, the ALT-window search: every distinct read-length window reaches here once or
-    // more, before exact-window dedup, refinement and locus collapse can drop or move it. One
-    // covering its own window's site is an ungapped ALT placement with the history's mismatches
-    // (a gapped history of equal span does not give the window's mismatch count: bound it by 0).
-    if (x->res->site_bound.valid && span == x->len) {
-        xassert(rid >= 0 && (size_t)rid < g->ref->window_site.size(), "--known-snvs window without a recorded site");
-        const int64_t off = rb - g->ref->bns->anns[rid].offset, site = g->ref->window_site[rid];
-        if (site >= off && site < off + span)
-            x->res->site_bound.value = std::min(x->res->site_bound.value, h.e.n_gapo ? 0 : (int)h.e.n_mm);
-    }
     aln_meth_win_key_t key{rid, hyp, strand, rb, rb + span, aln_meth_layout_t()};
     meth_layout(h.gap, h.e.n_gapo, x->len, strand, &key.lay);
     if (layout_span(key.lay, x->len) != span) {
@@ -921,6 +977,12 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
         else if (!certified) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = 1; }
     }
 }
+// The ALT-window generator's flush bound (its budget or CIGAR cap): its rows are complete only below
+// the lowest converted score of the hits that flush held.
+static __attribute__((noinline, cold)) void meth_gen_bound(aln_meth_slot_t *x)
+{
+    for (const auto &h : x->pend) x->res->horizon = std::min<int64_t>(x->res->horizon, pend_score(x, h));
+}
 void aln_meth_flush_parked(aln_meth_group_t *g)
 {
     const int64_t budget = std::max<int64_t>(0, (int64_t)g->mo->p_best + g->mo->p_second);
@@ -977,6 +1039,7 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             resolve_rows(&x, h, x.sa_rows.data() + off, n, true);
             if ((bwtint_t)n < width) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = 1; }
         }
+        if (x.gen && x.res->flags) meth_gen_bound(&x);
         x.pend.clear();
         g->cores[i].state = GAP_SLOT_SEARCH;
     }
@@ -1116,6 +1179,7 @@ void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng,
     // a copy ran no search: the work counters (aln_meth_report) stay with its first copy
     dst->n_lookups = dst->n_wrong_copy = dst->n_rescored = dst->n_flushes = dst->n_unrepresentable = 0;
     dst->n_over_diff = dst->n_over_seed = 0;
+    dst->audit = 0;
     if (src->main >= 0) {
         // A repeat certificate's copy takes the draw its first copy's search made for it.
         int placed = -1;
@@ -1231,32 +1295,108 @@ static __attribute__((noinline)) bool meth_repeat_draw(aln_meth_slot_t *x, const
     }
     return false;
 }
+/* The ALT-window search's candidates as rows of this read's main search, as the reference and with
+ * each site allele in place (see aln_meth.h). Called before the main search's first step (bwtaln.cpp's job start), so that its
+ * best, ceiling and -R start from them: then a candidate, which the main search may not propose
+ * itself, can never lower the best after a cut was taken on a higher one. */
+__attribute__((noinline)) void aln_meth_score_extras(aln_meth_slot_t *x)
+{
+    if (x->extras_done || !x->extra) return;
+    x->extras_done = 1;
+    for (const aln_meth_candidate_t &c : x->extra->rows) {
+        // a lookup-budget stop still scores them; a CIGAR cap does not
+        if (x->res->flags & ALN_METH_BIND_CIGAR) break;
+        if ((c.hyp ^ c.strand) != x->grp->read_no) continue;
+        const int64_t span = c.re - c.rb;
+        // The window search's path (its hit's CIGAR) when it is one: scored as a search row.
+        aln_meth_win_key_t key{c.rid, c.hyp, c.strand, c.rb, c.re, aln_meth_layout_t()};
+        const bool path = !c.cig.empty() && cigar_layout(c.cig.data(), c.cig.size(), &key.lay) &&
+            layout_span(key.lay, x->len) == span;
+        if (!path) key.lay.n = -1;
+        if (!x->windows.insert(key, 0).second) continue;
+        // As in resolve_located: a span past a window's limit is dropped as unrepresentable.
+        if (span > ALN_MAX_READ_LEN) {
+            ++x->res->n_unrepresentable;
+            x->unrep_cost = 0;
+            continue;
+        }
+        if (path) {
+            // The path's gap differences in the seed count toward -k, as a search row's do.
+            const int seed_gaps = x->job && x->job->seed_width
+                ? layout_seed_diffs(key.lay, c.strand, x->len, x->job->c.seed_off, x->grp->opt->mode & BWA_MODE_GAPE) : 0;
+            score_row_sites(x, key.lay, c.rid, c.hyp, c.strand, c.rb, (int)span, seed_gaps, true);
+            continue;
+        }
+        const ubyte_t *query = c.strand ? x->rd_rev.data() : x->rd_fwd.data();
+        resolve_with_sites(x, c, query, std::max(0, x->len - (int)span), std::max(0, (int)span - x->len), true);
+    }
+}
+/* The finish-time audit (ALN_METH_AUDIT_*) of a complete main-search read whose best is best and
+ * whose final top-2 ceiling is ceiling (INT64_MAX: none): the cuts the search took on a provisional
+ * best must hold for the final one. With the ALT-window candidates scored first they do, so a
+ * failure means a candidate source broke that premise; under --known-snvs the read is then
+ * reported incomplete (the window search's flags, or the lookup budget's), never silently short. */
+static __attribute__((noinline)) void meth_audit(aln_meth_slot_t *x, int64_t best, int64_t ceiling)
+{
+    aln_meth_read_t *r = x->res;
+    const gap_opt_t *opt = x->grp->opt;
+    int audit = 0, wflags = 0;
+    if (x->extra) {
+        const int64_t need = r->c1 > opt->max_top2 ? best : best + opt->s_mm;
+        if (x->extra->horizon <= need) { audit |= ALN_METH_AUDIT_HORIZON; wflags = x->extra->flags; }
+    }
+    if (ceiling != INT64_MAX && (int64_t)x->ceil_applied < std::min<int64_t>(x->max_diff, ceiling))
+        audit |= ALN_METH_AUDIT_CEILING;
+    if (x->r_stop && r->c1 <= opt->max_top2) audit |= ALN_METH_AUDIT_REPEAT;
+    r->audit = audit;
+    if (audit && x->grp->ref->known_snvs) r->flags |= wflags ? wflags : ALN_METH_BIND_BEST;
+}
+/* aln_meth_slot_finish for the --known-snvs ALT-window search (x->gen): its rows are candidates for
+ * the main search, which applies the read's cuts from the final best, so they get no top-2 ceiling
+ * and are never trimmed, only the score cut from the window search's own best (a lower final best
+ * only narrows it). The horizon (aln_meth_read_t::horizon) says how far the rows are complete: a
+ * stop at the score cut leaves out rows above B + M, a stop on -R (aln_meth_boundary_gen) or a bind
+ * leaves out rows from where it stopped. */
+static __attribute__((noinline)) void meth_gen_finish(aln_meth_slot_t *x)
+{
+    aln_meth_read_t *r = x->res;
+    const gap_opt_t *opt = x->grp->opt;
+    // the -m work bound ends the search between two flushes: every row below the last boundary
+    if (r->flags & ALN_METH_BIND_M) r->horizon = std::min<int64_t>(r->horizon, std::max(0, x->flushed_score));
+    int64_t best = INT64_MAX;
+    for (const auto &o : r->occ) best = std::min(best, o.cost);
+    const bool nonstop = !x->cut;
+    const int64_t cut = nonstop || best == INT64_MAX ? INT64_MAX : best + (int64_t)opt->s_mm;
+    if (cut != INT64_MAX) r->horizon = std::min<int64_t>(r->horizon, cut + 1);
+    if (r->n_unrepresentable && x->unrep_cost <= cut) {
+        r->flags |= ALN_METH_BIND_UNREP;
+        r->horizon = std::min<int64_t>(r->horizon, x->unrep_cost);
+    }
+    struct order_t { int rid, hyp, strand; bwtint_t pos; uint32_t i; };
+    std::vector<order_t> order;
+    order.reserve(r->occ.size());
+    for (size_t i = 0; i < r->occ.size(); ++i) {
+        const aln_meth_occ_t &o = r->occ[i];
+        if (o.cost > cut) continue;
+        if (o.cost == best) ++r->c1;
+        else ++r->c2;
+        order.push_back(order_t{o.rid, o.hyp, o.strand, o.pos, (uint32_t)i});
+    }
+    std::sort(order.begin(), order.end(), [](const order_t &a, const order_t &b) {
+        return std::make_tuple(a.rid, a.hyp, a.strand, a.pos) < std::make_tuple(b.rid, b.hyp, b.strand, b.pos);
+    });
+    std::vector<aln_meth_occ_t> keep;
+    keep.reserve(order.size());
+    for (const order_t &k : order) keep.push_back(std::move(r->occ[k.i]));
+    r->occ.swap(keep);
+    r->main = r->occ.empty() ? -1 : 0;
+    aln_meth_store_loci(r);
+}
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
     aln_meth_read_t *r = x->res;
-    if (x->extra) { // --known-snvs: windows the ALT-window search found, resolved as any other
-        for (const aln_meth_candidate_t &c : *x->extra) {
-            // a lookup-budget, certificate or search-cut stop still scores them; a CIGAR cap does not
-            if (x->res->flags & ALN_METH_BIND_CIGAR) break;
-            if ((c.hyp ^ c.strand) != x->grp->read_no) continue;
-            const int64_t span = c.re - c.rb;
-            // The window search's path (its hit's CIGAR) when it is one: scored as a search row.
-            aln_meth_win_key_t key{c.rid, c.hyp, c.strand, c.rb, c.re, aln_meth_layout_t()};
-            const bool path = !c.cig.empty() && cigar_layout(c.cig.data(), c.cig.size(), &key.lay) &&
-                layout_span(key.lay, x->len) == span;
-            if (!path) key.lay.n = -1;
-            if (!x->windows.insert(key, 0).second) continue;
-            // As in resolve_window: a span past a window's limit is dropped as unrepresentable.
-            if (span > ALN_MAX_READ_LEN) {
-                ++r->n_unrepresentable;
-                x->unrep_cost = 0;
-                continue;
-            }
-            if (path) { score_row_sites(x, key.lay, c.rid, c.hyp, c.strand, c.rb, (int)span, 0, true); continue; }
-            const ubyte_t *query = c.strand ? x->rd_rev.data() : x->rd_fwd.data();
-            resolve_with_sites(x, c, query, std::max(0, x->len - (int)span), std::max(0, (int)span - x->len), true);
-        }
-    }
+    if (x->gen) { meth_gen_finish(x); return; }
+    if (x->extra && !x->extras_done) aln_meth_score_extras(x);
     if (r->occ.empty()) {
         // Every candidate was dropped: any of them could have been the best locus.
         if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
@@ -1327,6 +1467,16 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
             r->c2 += r->n_conv_moved;
         }
     }
+    if (!r->flags) {
+        meth_audit(x, best, ceiling);
+        // An audit-flagged read is incomplete and finishes as a search-flagged one: no TAPS/5base
+        // conversion tie-break (the block above runs only on a read with no flags).
+        if (r->flags && r->n_conv_moved) {
+            r->c1 += r->n_conv_moved;
+            r->c2 -= r->n_conv_moved;
+            r->n_conv_moved = r->conv_gap = 0;
+        }
+    }
     int held = -1;
     if (repeat_draw)
         for (size_t i = 0; i < r->occ.size(); ++i) {
@@ -1341,13 +1491,15 @@ void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
 {
     if (bwa_verbose < 4) return;
     long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0, over = 0;
+    long audit[3] = {0, 0, 0};
     for (int i = 0; i < n; ++i) {
         lookups += res[i].n_lookups; wrong += res[i].n_wrong_copy; scored += res[i].n_rescored;
         dropped += res[i].n_unrepresentable; over += res[i].n_over_diff + res[i].n_over_seed;
         flushes += res[i].n_flushes; incomplete += res[i].flags != 0;
+        for (int b = 0; b < 3; ++b) audit[b] += res[i].audit >> b & 1;
     }
-    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld rows over -n/-k dropped; stock cost/count MAPQ\n",
-            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over);
+    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld rows over -n/-k dropped; stock cost/count MAPQ; audit: %ld horizon, %ld ceiling, %ld repeat\n",
+            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over, audit[0], audit[1], audit[2]);
 }
 
 /* bwa_cal_md1 with NM counting only the mismatches the mode does not free (and gap lengths); MD

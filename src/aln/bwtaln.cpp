@@ -23,9 +23,9 @@
 #include "aln_meth_search.h"
 #include "../kthread.h"
 
-#include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
@@ -160,7 +160,6 @@ template <> struct gap_group<AlnStock> {
 	static inline void slot_start(gap_slot_core_t *, bwa_seq_t *, int) {}
 	// the bases slot c's width walks and search run on, read at each use as the stock driver does
 	static inline const ubyte_t *seq(const gap_slot_core_t *, const bwa_seq_t *p) { return p->seq; }
-	static inline void widths_done(gap_slot_core_t *) {}
 	static inline int job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start(j, bwt); }
 	// steps the slots to the next one whose widths or search are done (gap_slots_run); a policy
 	// that parks slots (aln --meth) also flushes them in here, so the driver never sees a parked one
@@ -184,13 +183,10 @@ template <> struct gap_group<AlnMeth> {
 		const int64_t *ord;      // per read of the (possibly compacted) batch: its ordinal in the stream
 		const uint8_t *keep;     // per read: keep both strata (others share its search), or null
 		aln_meth_read_t *res;    // per read of the (possibly compacted) batch
-		// extra, alt_bounds and incoming_flags are per read of the caller's batch: read r of a
-		// compacted batch reads entry src[r] of each (src null: entry r).
+		// extra is per read of the caller's batch: read r of a compacted batch reads entry src[r]
+		// (src null: entry r).
 		const int *src;
-		const std::vector<aln_meth_candidate_t> *extra; // per read: --known-snvs candidates, or null
-		const aln_meth_alt_bound_t *alt_bounds;
-		bool capture_full_width;
-		const int *incoming_flags;
+		const aln_meth_extra_t *extra; // per read: --known-snvs candidates, or null
 		const std::vector<std::vector<int64_t>> *copies; // per read: its duplicate copies' ordinals, or null
 	};
 
@@ -222,29 +218,18 @@ template <> struct gap_group<AlnMeth> {
 		aln_meth_slot_start(slot(c), p, ctx->res + r, ctx->ord[r], max_diff, ctx->keep ? ctx->keep[r] : 0);
 		const int s = ctx->src ? ctx->src[r] : r;
 		slot(c)->extra = ctx->extra ? ctx->extra + s : nullptr;
-		if (ctx->incoming_flags) slot(c)->res->flags |= ctx->incoming_flags[s];
-		if (ctx->alt_bounds) slot(c)->alt_bound = ctx->alt_bounds[s];
 		slot(c)->copy_ords = ctx->copies ? &(*ctx->copies)[r] : nullptr;
 	}
 	static const ubyte_t *seq(const gap_slot_core_t *c, const bwa_seq_t *) { return slot(c)->vseq.data(); }
-	static void widths_done(gap_slot_core_t *c)
+	static int job_start(gap_job_t *j, const bwt_t *bwt)
 	{
-		aln_meth_slot_t *x = slot(c);
-		if (ctx->capture_full_width && x->len > 0) {
-			x->res->full_width_bound.value = c->job.width[x->len - 1].bid;
-			x->res->full_width_bound.valid = true;
-			if (!x->grp->ref->window_site.empty()) {
-				// An unbound search proposes every ungapped window of at most this many
-				// mismatches: its difference limit, and the seed's when the read is seeded.
-				// -n and -k accept INT_MAX: saturate there, as gap_job_start and bwt_match_gap do.
-				const gap_job_t &j = c->job;
-				const int horizon = j.seed_width ? std::min(j.opt.max_diff, j.opt.max_seed_diff) : j.opt.max_diff;
-				x->res->site_bound.value = horizon == INT_MAX ? INT_MAX : std::max(horizon, -1) + 1;
-				x->res->site_bound.valid = true;
-			}
-		}
+		const int done = gap_job_start_meth(j, bwt);
+		// --known-snvs: the read's ALT-window candidates are scored now, before its search's first
+		// step, so its cuts start from them (aln_meth_score_extras). The job is its core's first member.
+		aln_meth_slot_t *x = slot(reinterpret_cast<const gap_slot_core_t *>(reinterpret_cast<const char *>(j) - offsetof(gap_slot_core_t, job)));
+		if (x->extra) aln_meth_score_extras(x);
+		return done;
 	}
-	static int job_start(gap_job_t *j, const bwt_t *bwt) { return gap_job_start_meth(j, bwt); }
 	static int run(gap_slot_core_t *cores, int n, int *pos, const bwt_t *bwt)
 	{
 		// Count after refill so the last active slots cannot wait forever for a larger flush.
@@ -308,7 +293,7 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 			return 0;
 		}
 		bwa_seq_t *p = seqs + r;
-		p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0;
+		p->sa = 0; p->type = BWA_TYPE_NO_MATCH; p->c1 = p->c2 = 0; p->n_aln = 0; p->aln = 0; p->top2b = 0;
 		H::slot_start(s.c, p, r);
 		if ((int)s.w.size() < p->len + 1) s.w.resize(p->len + 1);
 		width_walk_init(&s.c->ww, bwt, p->len, H::seq(s.c, p), s.w.data());
@@ -341,7 +326,6 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 		j->width = s.w.data();
 		j->seed_width = p->len <= opt->seed_len? 0 : s.seed_w.data();
 		s.c->state = GAP_SLOT_SEARCH;
-		H::widths_done(s.c); // capture full width before mutable search shadowing
 		return H::job_start(j, bwt);
 	};
 	for (gap_slot_t &s : slots)
@@ -350,7 +334,7 @@ static void bwa_cal_sa_reg_gap_group(read_claim_t *claim, const bwt_t *bwt, int 
 	while (n_active) {
 		gap_slot_t &s = slots[H::run(cores.data(), G, &pos, bwt)];
 		if (s.c->state == GAP_SLOT_WIDTHS && !start(s)) continue; // its search runs in the next turns
-		s.p->aln = s.c->job.aln; s.p->n_aln = s.c->job.n_aln; // the read is done
+		s.p->aln = s.c->job.aln; s.p->n_aln = s.c->job.n_aln; s.p->top2b = s.c->job.top2b; // the read is done
 		H::finish(s.c, s.p);
 		if (!fill(s)) --n_active;
 	}
@@ -745,7 +729,7 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 			const size_t n = q->n_aln > 0? q->n_aln : 1;
 			d->aln = (bwt_aln1_t*)aln_malloc(n * sizeof(bwt_aln1_t));
 			if (q->n_aln > 0) memcpy(d->aln, q->aln, q->n_aln * sizeof(bwt_aln1_t));
-			d->n_aln = q->n_aln;
+			d->n_aln = q->n_aln; d->top2b = q->top2b;
 			d->search_incomplete = q->search_incomplete;
 		});
 }
@@ -754,15 +738,13 @@ int aln_search_batch(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs, const gap_op
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res,
-						  const std::vector<aln_meth_candidate_t> *extra,
-						  const aln_meth_alt_bound_t *alt_bounds, bool capture_full_width, const int *incoming_flags)
+						  const aln_meth_extra_t *extra)
 {
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	gap_group<AlnMeth>::ctx_t mc;
 	mc.ref = ref; mc.mo = mo; mc.read_no = read_no; mc.keep_strata = keep_strata; mc.max_xa_hits = max_xa_hits;
 	mc.keep = nullptr; mc.src = nullptr;
-	mc.extra = extra; mc.alt_bounds = alt_bounds; mc.capture_full_width = capture_full_width;
-	mc.incoming_flags = incoming_flags;
+	mc.extra = extra;
 	mc.copies = nullptr;
 	std::vector<int64_t> ord(n_seqs);
 	std::vector<uint8_t> has_copy(n_seqs, 0);
@@ -795,25 +777,25 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			d->sa = 0; d->type = BWA_TYPE_NO_MATCH; d->c1 = d->c2 = 0; d->n_aln = 0; d->aln = nullptr;
 			// res[first] is not trimmed yet (has_copy kept its loci for these draws); it is trimmed
 			// after this loop. Pairing never reads an incomplete read past its main hit.
-			// a repeat certificate's copy takes the draw its first copy's search made for it (copy_draw)
+			// a repeat certificate's copy takes the draw its first copy's search made for it (copy_draw).
+			// The ALT-window search (a candidate generator) keeps every row, also when it is incomplete,
+			// so its copies take them all (meth_gen_finish).
 			aln_meth_copy_dup(&res[i], &res[first], aln_meth_draw_seed(ref, read_no, ord[i]),
-							  keep_strata && !res[first].flags, max_xa_hits, ord[i]);
+							  ref->ks_window || (keep_strata && !res[first].flags), max_xa_hits, ord[i]);
 		},
-		// --known-snvs: a copy shares only with the same candidate windows (an incomplete window
-		// search keeps each copy's own drawn hit, so copies' candidates can differ)
+		// --known-snvs: a copy shares only with the same candidate windows, horizon and flags
 		[&](int i, int first) {
-			if (incoming_flags && incoming_flags[i] != incoming_flags[first]) return false;
-			if (alt_bounds && (alt_bounds[i].valid != alt_bounds[first].valid ||
-					(alt_bounds[i].valid && alt_bounds[i].value != alt_bounds[first].value))) return false;
 			if (!extra) return true;
-			const std::vector<aln_meth_candidate_t> &a = extra[i], &b = extra[first];
-			return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
+			const aln_meth_extra_t &a = extra[i], &b = extra[first];
+			return a.horizon == b.horizon && a.flags == b.flags && a.rows.size() == b.rows.size() &&
+				std::equal(a.rows.begin(), a.rows.end(), b.rows.begin(),
 				[](const aln_meth_candidate_t &x, const aln_meth_candidate_t &y) {
-					return x.rid == y.rid && x.strand == y.strand && x.hyp == y.hyp && x.rb == y.rb && x.re == y.re;
+					return x.rid == y.rid && x.strand == y.strand && x.hyp == y.hyp && x.rb == y.rb && x.re == y.re &&
+						x.cig == y.cig;
 				});
 		});
 	for (int i = 0; i < n_seqs; ++i)
-		if (has_copy[i] && (!keep_strata || res[i].flags)) aln_meth_trim(&res[i], max_xa_hits);
+		if (has_copy[i] && !ref->ks_window && (!keep_strata || res[i].flags)) aln_meth_trim(&res[i], max_xa_hits);
 	aln_meth_report(read_no, n_seqs, res);
 	return n_dups;
 }

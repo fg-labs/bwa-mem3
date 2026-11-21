@@ -206,6 +206,7 @@ typedef struct {
 	// results
 	bwt_aln1_t *aln;
 	int n_aln;
+	int top2b; // the -R (top2b) stop ended the search: hits past its best stratum were left out
 } gap_job_t;
 int gap_job_start(gap_job_t *j, const bwt_t *bwt);
 int gap_job_run(gap_job_t *j, const bwt_t *bwt);

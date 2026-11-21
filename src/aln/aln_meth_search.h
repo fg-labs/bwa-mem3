@@ -13,7 +13,6 @@
 #include "aln_meth_prove.h"
 #include <vector>
 #include "bwtgap.h"
-#include "aln_known_snvs.h"
 namespace bwa_aln {
 // SA rows a read resolves at the flush that binds its lookup budget (at most what is left of it),
 // to pick its best-known placement: that flush makes the read incomplete either way.
@@ -135,13 +134,20 @@ struct aln_meth_slot_t {
     // aln_meth_slot_start; a refined window with more differences is dropped (resolve_one).
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
     // cut: the search takes stock aln's cuts from the verified best (aln_meth_boundary): set unless
-    // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row; best_d: the
-    // fewest differences of a row at that cost. flushed: a flush has run.
-    int cut = 0, best_d = INT_MAX, flushed = 0;
+    // -N or a negative penalty; under --known-snvs set in the ALT-window search, and in the main
+    // search only for a read that fits an ALT window (ks_fits_window). best: the lowest cost of a
+    // stored row; best_d: the fewest differences of a row at that cost. flushed: a flush has run. gen: the --known-snvs
+    // ALT-window search, a candidate generator: it takes only the cuts that later rows of the main
+    // search cannot invalidate (aln_meth_boundary_gen) and keeps every row it found.
+    int cut = 0, best_d = INT_MAX, flushed = 0, gen = 0;
     // cert: rows are verified stratum by stratum and certificates end the read (single-end, under
-    // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
+    // cut, not under --known-snvs). collect: a repeat certificate fired inside the best stratum, which the search finishes
     // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
     int cert = 0, collect = 0;
+    // extras_done: --known-snvs, the ALT-window candidates (extra) are scored (aln_meth_score_extras).
+    // ceil_applied: the tightest top-2 difference ceiling aln_meth_boundary applied (INT_MAX: none);
+    // r_stop: it ended the search on -R. Both for the finish-time audit.
+    int extras_done = 0, ceil_applied = INT_MAX, r_stop = 0;
     // prove: the search tries the pigeonhole proof once, at its first entry past the exact stratum
     // (aln_meth_prove_nohit): set under BWA_MODE_GAPE outside the --known-snvs ALT-window search, for
     // reads allowed at least ALN_METH_PH_MIN_DIFF differences.
@@ -173,8 +179,7 @@ struct aln_meth_slot_t {
     aln_meth_read_bits_t bits[2];
     int bits_ready = 0;
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
-    const std::vector<aln_meth_candidate_t> *extra = nullptr;
-    aln_meth_alt_bound_t alt_bound; // ALT-index lower bound (aln_meth_alt_certificate), not the genomic width
+    const aln_meth_extra_t *extra = nullptr;
     // the ordinals of the read's duplicate copies (their draws are made here, aln_meth_slot_finish)
     const std::vector<int64_t> *copy_ords = nullptr;
     // Scratch: the reference window of the candidate being resolved (refined, then accounted), and
@@ -192,22 +197,12 @@ struct aln_meth_group_t {
     std::vector<aln_meth_slot_t> slot;
     gap_slot_core_t *cores = nullptr;
 };
-// These guards do not depend on candidates that the next flush might discover. A seeded read
-// (longer than -l) can stop only once its stratum fits the seed's difference limit (-k), which
-// aln_meth_can_stop checks against the best cost; -k 0 never can.
-static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
-    const gap_opt_t &opt=x->job->opt;
-    return opt.s_mm>0 && opt.s_gape>=0 && opt.s_gapo>opt.s_mm &&
-        !(opt.mode&BWA_MODE_NONSTOP) && (!x->job->seed_width || opt.max_seed_diff>0) && !x->res->flags &&
-        (!(x->grp->ref && x->grp->ref->known_snvs) ||
-         (x->alt_bound.valid && x->len > 0 && x->len <= KS_WINDOW_HALF));
-}
-bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
 // Applies stock aln's cuts at a score boundary, for a search whose next entry has score next:
 // see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop).
 int aln_meth_boundary(aln_meth_slot_t *, int next);
-// Keep batches bounded. Under the cut, flush at the first hit and at every boundary; otherwise
-// refine score boundaries only when stopping is possible.
+// Keep batches bounded. Under the cut, flush at the first hit and at every boundary; without it
+// (-N, a negative penalty, or a --known-snvs read that does not fit an ALT window: the search runs
+// to its -n) flush only for the bound and to find the lookup budget's binding flush at its stratum.
 static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
     if (x->pend.size() >= 32) return 1;
     if (x->cut) { // flush at the first hit and at every score boundary; cut at boundaries
@@ -217,7 +212,6 @@ static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
         return x->best != INT64_MAX && aln_meth_boundary(x, score) && (x->stop = 1);
     }
     if (score <= x->flushed_score) return 0;
-    if (aln_meth_stop_eligible(x)) return 1;
     // A skipped boundary replaces a flush/resume: do not re-examine this stratum.
     x->flushed_score=score;
     if (x->pend.empty()) return 0;
@@ -244,9 +238,7 @@ static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t 
     *e = j->e;
     const int score=(int)(e->info>>21);
     x->flushed_score=score;
-    if (x->cut) return x->best != INT64_MAX && aln_meth_boundary(x, score);
-    if (aln_meth_can_stop(x,score)) return 1;
-    return 0;
+    return x->cut && x->best != INT64_MAX && aln_meth_boundary(x, score);
 }
 static inline int aln_meth_resume(void *, gap_job_t *, gap_entry_t *) { return 1; }
 void aln_meth_hit(aln_meth_slot_t *, const gap_entry_t *, bwtint_t, bwtint_t);
@@ -257,6 +249,24 @@ int aln_meth_gap_arena(aln_meth_slot_t *, const gap_entry_t &p, bool ext, uint32
 // has_copy: the read has duplicate copies that will redraw over its loci.
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
 void aln_meth_slot_finish(aln_meth_slot_t *);
+/* Whether row a is a better row for its locus than b: lower stock cost; then fewer stock
+ * differences (mismatches and gap opens, and gap extensions under gape), so that the locus keeps,
+ * among its rows at the best cost, one with the differences the search's top-2 ceiling counted
+ * (store_row's best_d), and the finish's ceiling, taken from the stored rows, is the search's;
+ * then, under the TAPS/5base tie-break (conversions), fewer conversions; then (--known-snvs) the
+ * reference before a site allele, and the lower aln_site_key; then the normalized and raw CIGARs and
+ * the end, for a deterministic order. */
+bool aln_meth_row_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, bool conversions, bool gape);
+/* A search path's gap differences inside the seed (above seed_off), counted from its gap events
+ * (ALN_METH_GAP), and the same count from the path as a layout (meth_layout), as an ALT-window
+ * candidate's CIGAR gives it. The two must agree: -k treats both kinds of row alike. */
+int aln_meth_seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool gape);
+int aln_meth_layout_seed_diffs(const uint32_t *gap, int n_gapo, int len, int strand, int seed_off, bool gape);
+/* --known-snvs: scores the read's ALT-window candidates (x->extra) as rows of the main search. The
+ * driver calls it once the job is started (its seed is then known) and before the search's first
+ * step, so the read's best and its cuts start from them; aln_meth_slot_finish calls it for a slot
+ * that has not (no-op once done). */
+void aln_meth_score_extras(aln_meth_slot_t *);
 /* The pigeonhole proof for the read of slot x, whose search j has found no hit in its exact stratum
  * (no interval yet): returns 1 when no search path within the read's -n differences reaches a hit
  * (aln_meth_pigeonhole), so ending the search there leaves every result as the full search would
