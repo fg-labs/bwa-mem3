@@ -155,7 +155,62 @@ TEST_CASE("aln_cli: short-insert is documented and refused before single-end I/O
     fclose(capture);
     CHECK(status == 0);
     CHECK(help.find("--short-insert") != std::string::npos);
-    CHECK(help.find("unless --meth, --short-insert, --ref-span-insert or --known-snvs is given") != std::string::npos);
+    CHECK(help.find("unless --meth, --short-insert, --ref-span-insert, --known-snvs or") != std::string::npos);
+    CHECK(help.find("--exact-rescue-window is given;") != std::string::npos);
+}
+
+TEST_CASE("aln_cli: exact-rescue-window is paired only, its --no- form is accepted anywhere, and both are documented"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    for (bool meth : {false, true}) {
+        bwa_tests::StderrCapture capture;
+        const std::string out = x.dir + "/exact-single.sam";
+        const int status = meth
+            ? run({"--meth", "--exact-rescue-window", "-f", out, "/missing-index", "/missing-reads"})
+            : run({"--exact-rescue-window", "-f", out, "/missing-index", "/missing-reads"});
+        const std::string error = capture.text();
+        CHECK(status == 1);
+        CHECK(error.find("--exact-rescue-window requires paired-end input") != std::string::npos);
+        CHECK(error.find("index") == std::string::npos);
+        CHECK(access(out.c_str(), F_OK) != 0);
+    }
+    { // the --no- form only restores sampe's window, so one FASTQ is fine; flags take no argument
+        bwa_tests::StderrCapture capture;
+        const std::string se = x.dir + "/exact-off-se.sam", pe = x.dir + "/exact-pe.sam";
+        CHECK(run({"--no-exact-rescue-window", "-f", se, x.prefix, x.fq}) == 0);
+        CHECK(n_records(slurp(se)) == 4);
+        CHECK(run({"--exact-rescue-window", "--no-exact-rescue-window", "--exact-rescue-window", "-f", pe,
+                   x.prefix, x.fq, x.fq}) == 0);
+        CHECK(n_records(slurp(pe)) == 8);
+    }
+    { // the last of the two flags wins: single-end input is refused only when it enables the window
+        const std::string off_last = x.dir + "/exact-on-off-se.sam", on_last = x.dir + "/exact-off-on-se.sam";
+        CHECK(run({"--exact-rescue-window", "--no-exact-rescue-window", "-f", off_last, x.prefix, x.fq}) == 0);
+        CHECK(n_records(slurp(off_last)) == 4);
+        bwa_tests::StderrCapture capture;
+        CHECK(run({"--no-exact-rescue-window", "--exact-rescue-window", "-f", on_last, x.prefix, x.fq}) == 1);
+        CHECK(capture.text().find("--exact-rescue-window requires paired-end input") != std::string::npos);
+        CHECK(access(on_last.c_str(), F_OK) != 0);
+    }
+    FILE *capture = tmpfile();
+    REQUIRE(capture != nullptr);
+    fflush(stdout);
+    const int saved = dup(fileno(stdout));
+    REQUIRE(saved >= 0);
+    REQUIRE(dup2(fileno(capture), fileno(stdout)) >= 0);
+    const int status = run({"--help"});
+    fflush(stdout);
+    REQUIRE(dup2(saved, fileno(stdout)) >= 0);
+    close(saved);
+    rewind(capture);
+    std::string help;
+    char buf[1024];
+    while (fgets(buf, sizeof buf, capture)) help += buf;
+    fclose(capture);
+    CHECK(status == 0);
+    CHECK(help.find("  --exact-rescue-window") != std::string::npos);
+    CHECK(help.find("[off; on under --meth]") != std::string::npos);
+    CHECK(help.find("--no-exact-rescue-window keeps sampe's window under --meth") != std::string::npos);
 }
 
 TEST_CASE("aln_cli: ref-span-insert parses, is documented and is refused before single-end I/O"

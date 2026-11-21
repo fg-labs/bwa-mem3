@@ -4821,6 +4821,81 @@ TEST_CASE("aln_meth: ref-span-insert estimates the insert size from gapped mates
     }
 }
 
+TEST_CASE("aln_meth: exact-rescue-window rescues a mate at the stated window's end; plain aln keeps sampe's window"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // 40 calibration pairs of 30 bp reads (inserts 96-104), then a singleton whose reverse mate,
+    // which carries a transversion so -n 0 cannot place it, ends at the last base of the stated
+    // window (avg + 3 std + 15 past the anchor's start, rounded out). sampe's window ends one or
+    // two bases short, so stock rescue clips the mate there; the exact window holds all of it.
+    namespace ba = bwa_aln;
+    bool meth = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth") { meth = true; }
+    const int len = 30, n_cal = 40, anchor = 2300;
+    std::vector<std::string> reads[2];
+    ba::bwa_seq_t ends[2][n_cal] = {};
+    for (int i = 0; i < n_cal; ++i) {
+        const int start = 100 + 50 * i, insert = 100 + i % 9 - 4;
+        reads[0].push_back(ref().c1.substr(start, len));
+        reads[1].push_back(aln_test::revcomp(ref().c1.substr(start + insert - len, len)));
+        ends[0][i].pos = start; ends[1][i].pos = start + insert - len; ends[1][i].strand = 1;
+        ends[0][i].len = ends[1][i].len = len; ends[0][i].mapQ = ends[1][i].mapQ = 25;
+    }
+    ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+    ba::isize_info_t ii = {};
+    REQUIRE(ba::infer_isize(n_cal, seqs, &ii, 1e-5, 100000, nullptr, 0) == 0);
+    int64_t sb, se, eb, ee;
+    ba::aln_rescue_window(anchor, true, len, &ii, false, &sb, &se);
+    ba::aln_rescue_window(anchor, true, len, &ii, true, &eb, &ee);
+    // Independently of aln_rescue_window: the calibration inserts' mean, the stated window's end
+    // (avg + 3 std + len/2 past the anchor, rounded up) and sampe's truncated end.
+    double mean = 0;
+    for (int i = 0; i < n_cal; ++i) mean += 100 + i % 9 - 4;
+    mean /= n_cal;
+    CHECK(ii.avg == doctest::Approx(mean));
+    CHECK(ee == anchor + (int64_t)std::ceil(ii.avg + 3 * ii.std + len * 0.5));
+    CHECK(se == (int64_t)((double)(int64_t)(anchor + ii.avg - 3 * ii.std - len * 1.5) + 6 * ii.std + 2 * len));
+    const int lost = (int)(ee - se);
+    REQUIRE(lost >= 1); REQUIRE(lost <= 2); REQUIRE(sb == eb);
+    std::string mate = ref().c1.substr(ee - len, len);
+    const char tv[] = {'C', 'A', 'T', 'G'}; // A>C, C>A, G>T, T>G: never a conversion
+    mate[10] = tv[std::string("ACGT").find(mate[10])];
+    reads[0].push_back(ref().c1.substr(anchor, len));
+    reads[1].push_back(aln_test::revcomp(mate));
+    const std::vector<std::string> input = {write_fq("exact-window1.fq", reads[0]), write_fq("exact-window2.fq", reads[1])};
+    auto run = [&](std::vector<std::string> extra) {
+        std::vector<std::string> args = {"-n", "0", "-l", "1024"};
+        if (meth) args.push_back("--meth");
+        args.insert(args.end(), extra.begin(), extra.end());
+        const auto recs = run_aln(args, input);
+        REQUIRE(recs.size() == 2 * (n_cal + 1));
+        std::stringstream in(slurp_out()); // the records' text, without the header (@PG has the flags)
+        std::string body;
+        for (std::string l; std::getline(in, l);) if (l.empty() || l[0] != '@') body += l + "\n";
+        return std::make_pair(recs, body);
+    };
+    const auto by_default = run({}), off = run({"--no-exact-rescue-window"}), on = run({"--exact-rescue-window"});
+    const auto &stock = off.first[2 * n_cal + 1], &exact = on.first[2 * n_cal + 1];
+    CHECK((stock.flag & 4) == 0); CHECK((exact.flag & 4) == 0);
+    CHECK(stock.pos == ee - len + 1); CHECK(exact.pos == ee - len + 1);
+    CHECK(stock.cigar == std::to_string(len - lost) + "M" + std::to_string(lost) + "S");
+    CHECK(exact.cigar == std::to_string(len) + "M");
+    CHECK(tag_value(exact, "NM:i") == "1");
+    // Plain aln keeps sampe's window unless asked; --meth takes the exact one unless told not to.
+    CHECK(by_default.second == (meth ? on.second : off.second));
+    // The calibration pairs are proper and need no rescue: every field of their records, tags
+    // included, is the same in both modes.
+    std::stringstream off_body(off.second), on_body(on.second);
+    for (int i = 0; i < 2 * n_cal; ++i) {
+        CAPTURE(i);
+        std::string off_line, on_line;
+        REQUIRE(static_cast<bool>(std::getline(off_body, off_line)));
+        REQUIRE(static_cast<bool>(std::getline(on_body, on_line)));
+        CHECK(off_line == on_line);
+    }
+}
+
 TEST_SUITE_END;
 
 TEST_CASE("aln_meth: known alleles stop at the CIGAR cap and the next read resets"
