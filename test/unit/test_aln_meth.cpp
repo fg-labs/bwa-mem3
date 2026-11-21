@@ -4821,6 +4821,199 @@ TEST_CASE("aln_meth: ref-span-insert estimates the insert size from gapped mates
     }
 }
 
+TEST_CASE("aln_meth: exact-rescue-window rescues a mate at the stated window's end; plain aln keeps sampe's window"
+          * doctest::test_suite("unit/aln_meth"))
+{
+    // 40 calibration pairs of 30 bp reads (inserts 96-104), then a singleton whose reverse mate,
+    // which carries a transversion so -n 0 cannot place it, ends at the last base of the stated
+    // window (avg + 3 std + 15 past the anchor's start, rounded out). sampe's window ends one or
+    // two bases short, so stock rescue clips the mate there; the exact window holds all of it.
+    namespace ba = bwa_aln;
+    bool meth = false;
+    SUBCASE("ordinary") {}
+    SUBCASE("meth") { meth = true; }
+    const int len = 30, n_cal = 40, anchor = 2300;
+    std::vector<std::string> reads[2];
+    ba::bwa_seq_t ends[2][n_cal] = {};
+    for (int i = 0; i < n_cal; ++i) {
+        const int start = 100 + 50 * i, insert = 100 + i % 9 - 4;
+        reads[0].push_back(ref().c1.substr(start, len));
+        reads[1].push_back(aln_test::revcomp(ref().c1.substr(start + insert - len, len)));
+        ends[0][i].pos = start; ends[1][i].pos = start + insert - len; ends[1][i].strand = 1;
+        ends[0][i].len = ends[1][i].len = len; ends[0][i].mapQ = ends[1][i].mapQ = 25;
+    }
+    ba::bwa_seq_t *seqs[2] = {ends[0], ends[1]};
+    ba::isize_info_t ii = {};
+    REQUIRE(ba::infer_isize(n_cal, seqs, &ii, 1e-5, 100000, nullptr, 0) == 0);
+    int64_t sb, se, eb, ee;
+    ba::aln_rescue_window(anchor, true, len, &ii, false, &sb, &se);
+    ba::aln_rescue_window(anchor, true, len, &ii, true, &eb, &ee);
+    // Independently of aln_rescue_window: the calibration inserts' mean, the stated window's end
+    // (avg + 3 std + len/2 past the anchor, rounded up) and sampe's truncated end.
+    double mean = 0;
+    for (int i = 0; i < n_cal; ++i) mean += 100 + i % 9 - 4;
+    mean /= n_cal;
+    CHECK(ii.avg == doctest::Approx(mean));
+    CHECK(ee == anchor + (int64_t)std::ceil(ii.avg + 3 * ii.std + len * 0.5));
+    CHECK(se == (int64_t)((double)(int64_t)(anchor + ii.avg - 3 * ii.std - len * 1.5) + 6 * ii.std + 2 * len));
+    const int lost = (int)(ee - se);
+    REQUIRE(lost >= 1); REQUIRE(lost <= 2); REQUIRE(sb == eb);
+    std::string mate = ref().c1.substr(ee - len, len);
+    const char tv[] = {'C', 'A', 'T', 'G'}; // A>C, C>A, G>T, T>G: never a conversion
+    mate[10] = tv[std::string("ACGT").find(mate[10])];
+    reads[0].push_back(ref().c1.substr(anchor, len));
+    reads[1].push_back(aln_test::revcomp(mate));
+    const std::vector<std::string> input = {write_fq("exact-window1.fq", reads[0]), write_fq("exact-window2.fq", reads[1])};
+    auto run = [&](std::vector<std::string> extra) {
+        std::vector<std::string> args = {"-n", "0", "-l", "1024"};
+        if (meth) args.push_back("--meth");
+        args.insert(args.end(), extra.begin(), extra.end());
+        const auto recs = run_aln(args, input);
+        REQUIRE(recs.size() == 2 * (n_cal + 1));
+        std::stringstream in(slurp_out()); // the records' text, without the header (@PG has the flags)
+        std::string body;
+        for (std::string l; std::getline(in, l);) if (l.empty() || l[0] != '@') body += l + "\n";
+        return std::make_pair(recs, body);
+    };
+    const auto by_default = run({}), off = run({"--no-exact-rescue-window"}), on = run({"--exact-rescue-window"});
+    const auto &stock = off.first[2 * n_cal + 1], &exact = on.first[2 * n_cal + 1];
+    CHECK((stock.flag & 4) == 0); CHECK((exact.flag & 4) == 0);
+    CHECK(stock.pos == ee - len + 1); CHECK(exact.pos == ee - len + 1);
+    CHECK(stock.cigar == std::to_string(len - lost) + "M" + std::to_string(lost) + "S");
+    CHECK(exact.cigar == std::to_string(len) + "M");
+    CHECK(tag_value(exact, "NM:i") == "1");
+    // Plain aln keeps sampe's window unless asked; --meth takes the exact one unless told not to.
+    CHECK(by_default.second == (meth ? on.second : off.second));
+    // The calibration pairs are proper and need no rescue: every field of their records, tags
+    // included, is the same in both modes.
+    std::stringstream off_body(off.second), on_body(on.second);
+    for (int i = 0; i < 2 * n_cal; ++i) {
+        CAPTURE(i);
+        std::string off_line, on_line;
+        REQUIRE(static_cast<bool>(std::getline(off_body, off_line)));
+        REQUIRE(static_cast<bool>(std::getline(on_body, on_line)));
+        CHECK(off_line == on_line);
+    }
+}
+
+TEST_CASE("aln_meth: cap rescue takes a reverse anchor's end as mate rescue does")
+{
+    // A reverse anchor with a one-base deletion: 50 read bases over 51 reference bases. Mate rescue
+    // places a forward mate's window from the anchor's read-length end (pos + len), or its reference
+    // end under --ref-span-insert, and the cap-rescue window, exact or not, must start at the same
+    // base. The window's offset is an integer here, so both modes start it at the same base. The
+    // lookup-capped mate lies exactly at that start: from the read-length end its first base is in
+    // the window and it is placed end to end; from the reference end the window starts a base
+    // later, so the only candidate clips the first base and the mate keeps its retained locus.
+    namespace ba = bwa_aln;
+    bool ref_span = false, exact = true;
+    SUBCASE("read-length end") {}
+    SUBCASE("no-exact-rescue-window: read-length end") { exact = false; }
+    SUBCASE("ref-span-insert: reference end") { ref_span = true; }
+    FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    auto *pe = ba::bwa_init_pe_opt();
+    pe->exact_rescue_window = exact ? 1 : 0; pe->ref_span_insert = ref_span ? 1 : 0;
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo); ba::bwase_initialize();
+    const int len = 50, anchor = 1500, retained_pos = 400;
+    ba::isize_info_t ii{};
+    ii.avg = 200; ii.std = 10; ii.high = 300; ii.ap_prior = 1e-5;
+    // The window's start from the read-length end: floor(-avg - 3 std - len / 2) before it.
+    const int mate = anchor + len + (int)std::floor(-ii.avg - 3 * ii.std - len * 0.5);
+    REQUIRE(mate == anchor - 205);
+    ba::bwa_seq_t *seqs[2]; ba::bwa_seqio_t *inputs[2];
+    for (int j = 0; j < 2; ++j) {
+        const auto read = j ? aln_test::revcomp(ref().c1.substr(anchor, 25) + ref().c1.substr(anchor + 26, 25))
+                            : ref().c1.substr(mate, len);
+        inputs[j] = ba::bwa_seq_open(write_fq(j ? "gapped-anchor2.fq" : "gapped-anchor1.fq", {read}).c_str());
+        REQUIRE(inputs[j] != nullptr);
+        int n = 0; seqs[j] = ba::bwa_read_seq(inputs[j], 1, &n, BWA_MODE_COMPREAD, 0);
+        REQUIRE(n == 1);
+    }
+    ba::aln_meth_read_t result[2]; ba::aln_meth_read_t *r[2] = {result, result + 1};
+    ba::aln_meth_occ_t retained{}; retained.rid = 0; retained.hyp = 1;
+    retained.pos = retained_pos; retained.alignment.rb = retained_pos; retained.alignment.re = retained_pos + len;
+    retained.alignment.cigar = {(uint32_t)len << 4};
+    result[0].occ.push_back(retained); result[0].main = 0; result[0].flags = ba::ALN_METH_BIND_BEST;
+    ba::aln_meth_occ_t a{}; a.rid = 0; a.hyp = 1; a.strand = 1; a.pos = anchor;
+    a.alignment.rb = anchor; a.alignment.re = anchor + len + 1;
+    a.alignment.cigar = {25u << 4, 1u << 4 | 2, 25u << 4};
+    result[1].occ.push_back(a); result[1].main = 0; result[1].c1 = 1;
+    store_pair(r);
+    ba::aln_meth_pe_stage1(opt, 1, seqs, r);
+    uint64_t total[2] = {}, mapped[2] = {};
+    ba::aln_meth_pe_stage2(&mr, &mo, opt, pe, &ii, 1, seqs, r, total, mapped);
+    REQUIRE(result[0].hits.size() == 1);
+    CHECK(seqs[0]->pos == (ref_span ? retained_pos : mate));
+    CHECK(result[0].hits[0].pos == seqs[0]->pos);
+    CHECK(cigar_of(result[0], result[0].hits[0]) == std::vector<uint32_t>{(uint32_t)len << 4});
+    CHECK((int)seqs[0]->type == (ref_span ? BWA_TYPE_REPEAT : BWA_TYPE_MATESW));
+    CHECK(seqs[1]->pos == (uint64_t)anchor); // the anchor stays where it was
+    for (int j = 0; j < 2; ++j) {
+        ba::bwa_free_read_seq(1, seqs[j]); CHECK(ba::bwa_seq_close(inputs[j]) == 0);
+    }
+    free(pe); free(opt); ba::aln_meth_ref_free(&mr);
+}
+
+TEST_CASE("aln_meth: cap rescue floors a forward anchor's mate at the anchor's end as mate rescue does")
+{
+    // A forward anchor with a one-base deletion: 50 read bases over 51 reference bases. Without
+    // --short-insert, mate rescue starts a reverse mate's window no earlier than the anchor's end:
+    // its read-length end (pos + len), or its reference end under --ref-span-insert. The capped
+    // mate starts at pos + len, a base before the reference end: from the read-length floor it is
+    // placed end to end, in either window mode; from the reference-end floor its first base lies
+    // outside the window, so the only candidate clips it and the mate keeps its retained locus.
+    namespace ba = bwa_aln;
+    bool ref_span = false, exact = true;
+    SUBCASE("read-length floor") {}
+    SUBCASE("no-exact-rescue-window: read-length floor") { exact = false; }
+    SUBCASE("ref-span-insert: reference-end floor") { ref_span = true; }
+    FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    auto *pe = ba::bwa_init_pe_opt();
+    pe->exact_rescue_window = exact ? 1 : 0; pe->ref_span_insert = ref_span ? 1 : 0;
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo); ba::bwase_initialize();
+    const int len = 50, anchor = 1500, retained_pos = 2400, mate = anchor + len;
+    ba::isize_info_t ii{};
+    ii.avg = 100; ii.std = 10; ii.high = 200; ii.ap_prior = 1e-5;
+    ba::bwa_seq_t *seqs[2]; ba::bwa_seqio_t *inputs[2];
+    for (int j = 0; j < 2; ++j) {
+        const auto read = j ? aln_test::revcomp(ref().c1.substr(mate, len))
+                            : ref().c1.substr(anchor, 25) + ref().c1.substr(anchor + 26, 25);
+        inputs[j] = ba::bwa_seq_open(write_fq(j ? "floor-anchor2.fq" : "floor-anchor1.fq", {read}).c_str());
+        REQUIRE(inputs[j] != nullptr);
+        int n = 0; seqs[j] = ba::bwa_read_seq(inputs[j], 1, &n, BWA_MODE_COMPREAD, 0);
+        REQUIRE(n == 1);
+    }
+    ba::aln_meth_read_t result[2]; ba::aln_meth_read_t *r[2] = {result, result + 1};
+    ba::aln_meth_occ_t a{}; a.rid = 0; a.hyp = 1; a.pos = anchor;
+    a.alignment.rb = anchor; a.alignment.re = anchor + len + 1;
+    a.alignment.cigar = {25u << 4, 1u << 4 | 2, 25u << 4};
+    result[0].occ.push_back(a); result[0].main = 0; result[0].c1 = 1;
+    ba::aln_meth_occ_t retained{}; retained.rid = 0; retained.hyp = 1; retained.strand = 1;
+    retained.pos = retained_pos; retained.alignment.rb = retained_pos; retained.alignment.re = retained_pos + len;
+    retained.alignment.cigar = {(uint32_t)len << 4};
+    result[1].occ.push_back(retained); result[1].main = 0; result[1].flags = ba::ALN_METH_BIND_BEST;
+    store_pair(r);
+    ba::aln_meth_pe_stage1(opt, 1, seqs, r);
+    uint64_t total[2] = {}, mapped[2] = {};
+    ba::aln_meth_pe_stage2(&mr, &mo, opt, pe, &ii, 1, seqs, r, total, mapped);
+    REQUIRE(result[1].hits.size() == 1);
+    CHECK(seqs[1]->pos == (uint64_t)(ref_span ? retained_pos : mate));
+    CHECK(result[1].hits[0].pos == seqs[1]->pos);
+    CHECK(cigar_of(result[1], result[1].hits[0]) == std::vector<uint32_t>{(uint32_t)len << 4});
+    CHECK((int)seqs[1]->type == (ref_span ? BWA_TYPE_REPEAT : BWA_TYPE_MATESW));
+    CHECK(seqs[0]->pos == (uint64_t)anchor); // the anchor stays where it was
+    for (int j = 0; j < 2; ++j) {
+        ba::bwa_free_read_seq(1, seqs[j]); CHECK(ba::bwa_seq_close(inputs[j]) == 0);
+    }
+    free(pe); free(opt); ba::aln_meth_ref_free(&mr);
+}
+
 TEST_SUITE_END;
 
 TEST_CASE("aln_meth: known alleles stop at the CIGAR cap and the next read resets"
