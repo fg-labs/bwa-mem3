@@ -797,6 +797,9 @@ mem_opt_t *mem_opt_init()
     o->meth_seed_prune = 0;                        /* base default off; --meth turns it on
                                                       (SPEC30), set in fastmap.cpp */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
+    o->meth_mapq    = MEM_METH_MAPQ_SCORING;       /* the em-seq default is resolved by meth_opts_finalize */
+    o->meth_mapq_max_len = 0;                      /* --meth-mapq-max-len: every length (the uncapped
+                                                      MAPQ's bias persists at full length in repeats) */
     o->meth_context = METH_CTX_ALL;                /* --meth-context default: every C converts */
     o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */

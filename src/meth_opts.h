@@ -23,7 +23,9 @@ enum {
     OPT_METH_SEED_PRUNE,
     OPT_METH_TAGS,
     OPT_METH_SET_AS_FAILED,
-    OPT_METH_CHIMERA_QC
+    OPT_METH_CHIMERA_QC,
+    OPT_METH_MAPQ,
+    OPT_METH_MAPQ_MAX_LEN
 };
 
 /* Where a methylation conversion is free (--meth-context). Stored in
@@ -33,7 +35,10 @@ enum meth_ctx_t { METH_CTX_ALL = 0, METH_CTX_CPG = 1 };
 /* Which family options the user gave explicitly: a default must not override
  * them. Zero-initialise before parsing. */
 struct meth_cli_t {
-    int set_meth, set_scoring, set_context, set_seed_prune, set_tags;
+    int set_meth, set_scoring, set_context, set_seed_prune, set_tags, set_mapq, set_mapq_max_len;
+    // Set by a subcommand that registers METH_LONG_OPTION_MAPQ and implements the conversion-blind
+    // MAPQ (mem), before meth_opts_finalize: only there does --meth-mapq default to it.
+    int mapq_supported;
 };
 
 /* If opt_id belongs to the family, apply optarg to *opt, record it in *cli and
@@ -76,6 +81,8 @@ int meth_opts_emseq_neutral(const mem_opt_t *opt);
 
 /* Help text: the options every subcommand shares, then the ones only `mem` has. */
 void meth_opts_usage_shared(FILE *fp);
+/* --meth-mapq's help text, printed by the subcommands that register METH_LONG_OPTION_MAPQ. */
+void meth_opts_usage_mapq(FILE *fp);
 void meth_opts_usage_mem_only(FILE *fp);
 
 /* The closed-vocabulary values of the family's options, NULL-terminated. A
@@ -94,6 +101,12 @@ const char *meth_opts_stray_flag(const char *s, const char **canon);
     {"meth-context", required_argument, 0, OPT_METH_CONTEXT}, \
     {"meth-scoring", required_argument, 0, OPT_METH_SCORING}, \
     {"meth-tags",    required_argument, 0, OPT_METH_TAGS},
+
+/* --meth-mapq and --meth-mapq-max-len: parsed and resolved with the shared options, registered by
+ * each subcommand that implements the conversion-blind MAPQ (mem). */
+#define METH_LONG_OPTION_MAPQ \
+    {"meth-mapq",    required_argument, 0, OPT_METH_MAPQ}, \
+    {"meth-mapq-max-len", required_argument, 0, OPT_METH_MAPQ_MAX_LEN},
 
 #define METH_LONG_OPTIONS_MEM_ONLY \
     {"meth-seed-prune", optional_argument, 0, OPT_METH_SEED_PRUNE}, \

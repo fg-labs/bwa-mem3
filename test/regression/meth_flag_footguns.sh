@@ -85,6 +85,7 @@ expect_diagnosed() { # $1 = label, $2 = stray token, $3 = flag it belongs to, re
 expect_diagnosed "--meth-tags space-separated" XG --meth-tags mem --meth --meth-tags XR XG ref.fa r.fq
 expect_diagnosed "--meth separated argument" taps --meth mem --meth taps ref.fa r.fq
 expect_diagnosed "--meth-scoring orphan" genomic --meth-scoring mem --meth --meth-scoring collapsed genomic ref.fa r.fq
+expect_diagnosed "--meth-mapq orphan" scoring --meth-mapq mem --meth --meth-mapq conversion-blind scoring ref.fa r.fq
 # --meth-seed-prune is also OPTIONAL-argument, so `--meth-seed-prune baseline`
 # (space, no '=') silently selects spec30 and orphans `baseline` into <idxbase>.
 # Diagnose it by name rather than letting it slide into a missing-index error.

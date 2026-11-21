@@ -164,6 +164,18 @@ enum mem_tie_break_mode { MEM_TIE_BREAK_INDEX = 0, MEM_TIE_BREAK_NAME = 1 };
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
 
+/* How --meth MAPQ is computed (--meth-mapq; mem_opt_t.meth_mapq).
+ *   SCORING:          MAPQ follows the --meth-scoring model.
+ *   CONVERSION_BLIND: MAPQ is capped at what the same scoring gives with the mirror cell
+ *                     (read C x reference T on the C->T strand, read G x reference A on the G->A
+ *                     strand) freed as a conversion, at the same penalties. Under genomic scoring a
+ *                     retained (methylated) C otherwise makes a short read look unique, so a MAPQ
+ *                     filter selects methylated molecules and inflates CpG methylation. Placement,
+ *                     CIGAR and the other tags stay the scoring model's. Resolved by
+ *                     meth_opts_finalize: the em-seq default with genomic scoring, and only ever
+ *                     left set under genomic. */
+enum mem_meth_mapq { MEM_METH_MAPQ_SCORING = 0, MEM_METH_MAPQ_CONVERSION_BLIND = 1 };
+
 /* --meth-seed-prune modes (mem_opt_t.meth_seed_prune). Shared here so the CLI
  * (fastmap.cpp) and the prune (bwamem.cpp) agree on the numeric values. */
 enum mem_meth_seed_prune { MEM_METH_PRUNE_OFF = 0, MEM_METH_PRUNE_SPEC30 = 1,
@@ -272,6 +284,9 @@ typedef struct mem_opt_t {
     int    meth_mode;       // 1 = bisulfite mode (--meth)
     int    meth_scoring;    // bisulfite matrix mode (--meth-scoring):
                             // MEM_METH_SCORING_{COLLAPSED,GENOMIC,NEUTRAL}
+    int    meth_mapq;       // --meth-mapq: a mem_meth_mapq value (resolved by meth_opts_finalize)
+    int    meth_mapq_max_len; // --meth-mapq-max-len: conversion-blind caps only reads (pairs: an end)
+                              // this long or shorter; 0 = every length
     int    meth_seed_prune; // --meth-seed-prune: prune 3-letter over-seeding before
                             // SA resolution. 0 = off, 1 = spec30 (per-read two-regime),
                             // 2 = baseline (len<25 & hits>1). mem_opt_init sets 0, but
@@ -351,6 +366,20 @@ typedef struct mem_opt_t {
     const compat_target_t *compat;
 } mem_opt_t;
 
+/* Whether the conversion-blind MAPQ cap applies. meth_opts_finalize leaves CONVERSION_BLIND set
+ * only for em-seq with genomic scoring: it resolves collapsed to SCORING (collapsed already frees
+ * the mirror cell) and refuses TAPS/5-base and neutral. */
+static inline int meth_mapq_conversion_blind(const mem_opt_t *opt)
+{
+    return opt->meth_mode && opt->meth_mapq == MEM_METH_MAPQ_CONVERSION_BLIND;
+}
+
+/* Whether --meth-mapq-max-len lets the conversion-blind cap apply to a read of length l (for a
+ * pair, the shorter end's): the bias it removes is a short-read one. */
+static inline int meth_mapq_blind_len(const mem_opt_t *opt, int l)
+{
+    return opt->meth_mapq_max_len <= 0 || l <= opt->meth_mapq_max_len;
+}
 
 struct mem_alnreg_t;
 class RescueBandBatch;   // rescue_band.h

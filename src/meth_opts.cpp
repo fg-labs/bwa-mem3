@@ -26,6 +26,7 @@ static const struct { const char *name; meth_chem_t chem; } meth_chem_names[] = 
 static const struct { const char *value, *flag; } meth_stray_known[] = {
     { "collapsed", "--meth-scoring" }, { "genomic",   "--meth-scoring" },
     { "neutral",   "--meth-scoring" },
+    { "conversion-blind", "--meth-mapq" }, { "scoring", "--meth-mapq" },
     { "cpg",       "--meth-context" },
     { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
     { "XM",        "--meth-tags"    }, { "all",       "--meth-tags" },
@@ -109,6 +110,30 @@ int meth_opts_parse(int opt_id, const char *optarg, mem_opt_t *opt, meth_cli_t *
         }
         cli->set_context = 1;
         return 1;
+    case OPT_METH_MAPQ:
+        if (optarg != NULL && strcmp(optarg, "conversion-blind") == 0) {
+            opt->meth_mapq = MEM_METH_MAPQ_CONVERSION_BLIND;
+        } else if (optarg != NULL && strcmp(optarg, "scoring") == 0) {
+            opt->meth_mapq = MEM_METH_MAPQ_SCORING;
+        } else {
+            fprintf(stderr, "ERROR: --meth-mapq accepts 'conversion-blind' or 'scoring', got '%s'\n",
+                    optarg != NULL ? optarg : "");
+            exit(1);
+        }
+        cli->set_mapq = 1;
+        return 1;
+    case OPT_METH_MAPQ_MAX_LEN: {
+        char *end = NULL;
+        const long v = optarg != NULL ? strtol(optarg, &end, 10) : -1;
+        if (optarg == NULL || *optarg == '\0' || end == NULL || *end != '\0' || v < 0 || v > INT_MAX) {
+            fprintf(stderr, "ERROR: --meth-mapq-max-len accepts a read length >= 0 (0: every length), got '%s'\n",
+                    optarg != NULL ? optarg : "");
+            exit(1);
+        }
+        opt->meth_mapq_max_len = (int)v;
+        cli->set_mapq_max_len = 1;
+        return 1;
+    }
     case OPT_METH_SCORING:
         if (optarg != NULL && strcmp(optarg, "collapsed") == 0) {
             opt->meth_scoring = MEM_METH_SCORING_COLLAPSED;
@@ -198,7 +223,18 @@ const char *meth_opts_check(const mem_opt_t *opt, const meth_cli_t *cli)
      * may leave set_context 0. */
     if ((cli->set_context || opt->meth_context != METH_CTX_ALL) && !opt->meth_mode)
         return "--meth-context requires --meth";
+    if (cli->set_mapq && !opt->meth_mode) return "--meth-mapq requires --meth";
+    if (cli->set_mapq_max_len && !opt->meth_mode) return "--meth-mapq-max-len requires --meth";
     if (!opt->meth_mode) return NULL;
+    if (cli->set_mapq && opt->meth_mapq == MEM_METH_MAPQ_CONVERSION_BLIND) {
+        if (opt->meth_chem != METH_CHEM_EMSEQ)
+            return "--meth-mapq conversion-blind applies to em-seq/bisulfite (--meth, --meth=emseq), "
+                   "not --meth=taps or --meth=5base: their reads are mostly unconverted, so freeing "
+                   "the mirror cell throws away what places a short read; use --meth-mapq scoring";
+        if (meth_opts_resolved_scoring(opt, cli) == MEM_METH_SCORING_NEUTRAL)
+            return "--meth-mapq conversion-blind applies to em-seq with genomic or collapsed scoring, "
+                   "not --meth-scoring neutral; use --meth-mapq scoring";
+    }
     /* Values meth_opts_parse cannot produce, but an embedder writing *opt can. */
     if (opt->meth_context != METH_CTX_ALL && opt->meth_context != METH_CTX_CPG)
         return "--meth-context accepts 'all' (default) or 'cpg'";
@@ -259,6 +295,20 @@ void meth_opts_finalize(mem_opt_t *opt, const meth_cli_t *cli)
      * wins; no effect outside --meth (the prune is gated on the meth remap). */
     if (!cli->set_seed_prune)
         opt->meth_seed_prune = MEM_METH_PRUNE_SPEC30;
+    /* --meth-mapq defaults to conversion-blind for em-seq with genomic scoring, in a subcommand
+     * that implements it (cli->mapq_supported). Genomic scores a retained (methylated) C over a
+     * reference T as a mismatch, so a short read that kept its CpG Cs is unique where a fully
+     * converted one is not, and a MAPQ filter selects methylated molecules (measured in
+     * docs/src/methylation/flags.md, --meth-mapq). Collapsed already frees the mirror cell, so
+     * conversion-blind is accepted there and resolved to scoring. TAPS/5-base and neutral (refused
+     * by meth_opts_check): their reads are mostly unconverted, so freeing the mirror cell throws
+     * away most of what places a short read. */
+    if (!cli->set_mapq)
+        opt->meth_mapq = cli->mapq_supported && opt->meth_chem == METH_CHEM_EMSEQ
+                && opt->meth_scoring == MEM_METH_SCORING_GENOMIC
+            ? MEM_METH_MAPQ_CONVERSION_BLIND : MEM_METH_MAPQ_SCORING;
+    else if (opt->meth_scoring == MEM_METH_SCORING_COLLAPSED)
+        opt->meth_mapq = MEM_METH_MAPQ_SCORING;
 
     /* NEUTRAL suits sparse conversions only. em-seq converts most cytosines, so
      * scoring each conversion 0 instead of +A takes several points off a short
@@ -336,6 +386,27 @@ void meth_opts_usage_shared(FILE *fp)
     fprintf(fp, "                 that recompute calls from the reference and the read.\n");
     fprintf(fp, "                 Keep XM for Bismark-family tools (bismark_methylation_extractor)\n");
     fprintf(fp, "                 and other callers that read the per-base calls from XM:Z.\n");
+}
+
+void meth_opts_usage_mapq(FILE *fp)
+{
+    fprintf(fp, "   --meth-mapq conversion-blind|scoring\n");
+    fprintf(fp, "                 how MAPQ is computed. conversion-blind (default for em-seq with\n");
+    fprintf(fp, "                 genomic scoring): MAPQ is capped at what the same scoring gives\n");
+    fprintf(fp, "                 with C/T (and G/A) interchangeable, at the same penalties; the\n");
+    fprintf(fp, "                 record's placement, CIGAR and other tags are unchanged, but\n");
+    fprintf(fp, "                 for the MAPQ that MQ:i and SA:Z repeat; when the cap lowers\n");
+    fprintf(fp, "                 MAPQ the original is kept in YQ:i. Without it a\n");
+    fprintf(fp, "                 retained (methylated) C makes a short read look unique, so\n");
+    fprintf(fp, "                 filtering on MAPQ inflates CpG methylation. scoring: MAPQ\n");
+    fprintf(fp, "                 follows --meth-scoring; the default for collapsed (where the\n");
+    fprintf(fp, "                 two agree) and for taps/5base and neutral (which refuse\n");
+    fprintf(fp, "                 conversion-blind).\n");
+    fprintf(fp, "   --meth-mapq-max-len INT\n");
+    fprintf(fp, "                 conversion-blind caps only reads of at most INT bases (a pair:\n");
+    fprintf(fp, "                 both ends, when either end is); longer reads keep the scoring\n");
+    fprintf(fp, "                 MAPQ, trading a small bias in repeats for less CPU. 0: every\n");
+    fprintf(fp, "                 length [0]\n");
 }
 
 void meth_opts_usage_mem_only(FILE *fp)

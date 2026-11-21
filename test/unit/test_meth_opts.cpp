@@ -15,10 +15,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <initializer_list>
 #include <sstream>
 #include <string>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <utility>
 
 TEST_SUITE("unit/meth_opts") {
 
@@ -308,6 +310,101 @@ TEST_CASE("meth_opts: stray-value list names cpg and every chemistry") {
     }
     CHECK(cpg);
     CHECK(taps);
+}
+
+namespace {
+// The --meth-mapq the options resolve to: argv as (option id, value) pairs, parsed and finalized as
+// a subcommand that does (mem) or does not implement it; NULL when meth_opts_check rejects them.
+const char *resolved_mapq(std::initializer_list<std::pair<int, const char *>> args, bool supported, int *out) {
+    Fixture f;
+    f.cli.mapq_supported = supported;
+    for (const auto &a : args) f.parse(a.first, a.second);
+    const char *err = meth_opts_check(f.opt, &f.cli);
+    if (err != NULL) return err;
+    meth_opts_finalize(f.opt, &f.cli);
+    *out = meth_mapq_conversion_blind(f.opt) ? MEM_METH_MAPQ_CONVERSION_BLIND : f.opt->meth_mapq;
+    return NULL;
+}
+int mapq_of(std::initializer_list<std::pair<int, const char *>> args, bool supported = true) {
+    int out = -1;
+    const char *err = resolved_mapq(args, supported, &out);
+    CHECK(err == nullptr);
+    return out;
+}
+}  // namespace
+
+TEST_CASE("meth_opts: --meth-mapq resolves to conversion-blind only for em-seq genomic where implemented") {
+    const int blind = MEM_METH_MAPQ_CONVERSION_BLIND, scoring = MEM_METH_MAPQ_SCORING;
+    CHECK(mapq_of({{OPT_METH, nullptr}}) == blind);
+    CHECK(mapq_of({{OPT_METH, "emseq"}}) == blind);
+    CHECK(mapq_of({{OPT_METH, "bisulfite"}}) == blind);
+    CHECK(mapq_of({{OPT_METH, nullptr}, {OPT_METH_SCORING, "collapsed"}}) == scoring);
+    CHECK(mapq_of({{OPT_METH, nullptr}, {OPT_METH_SCORING, "neutral"}}) == scoring);
+    CHECK(mapq_of({{OPT_METH, "taps"}}) == scoring);
+    CHECK(mapq_of({{OPT_METH, "5base"}}) == scoring);
+    CHECK(mapq_of({{OPT_METH, "5base"}, {OPT_METH_SCORING, "genomic"}}) == scoring);
+    CHECK(mapq_of({{OPT_METH, nullptr}}, false) == scoring); // a subcommand that does not implement it
+    CHECK(mapq_of({{OPT_METH, nullptr}, {OPT_METH_MAPQ, "scoring"}}) == scoring);
+    CHECK(mapq_of({{OPT_METH_MAPQ, "conversion-blind"}, {OPT_METH, nullptr}}) == blind);
+    // collapsed accepts conversion-blind, in either order, as a no-op
+    CHECK(mapq_of({{OPT_METH, nullptr}, {OPT_METH_MAPQ, "conversion-blind"}, {OPT_METH_SCORING, "collapsed"}}) == scoring);
+    CHECK(mapq_of({{OPT_METH_SCORING, "collapsed"}, {OPT_METH_MAPQ, "conversion-blind"}, {OPT_METH, nullptr}}) == scoring);
+}
+
+TEST_CASE("meth_opts: check refuses --meth-mapq without --meth and conversion-blind outside em-seq genomic/collapsed") {
+    int out;
+    CHECK(std::string(resolved_mapq({{OPT_METH_MAPQ, "scoring"}}, true, &out)) == "--meth-mapq requires --meth");
+    // each argv inline: a nested std::initializer_list would leave the inner arrays dangling
+    auto refused = [](const char *err) {
+        REQUIRE(err != nullptr);
+        CHECK(std::string(err).rfind("--meth-mapq conversion-blind applies to em-seq", 0) == 0);
+    };
+    refused(resolved_mapq({{OPT_METH, "taps"}, {OPT_METH_MAPQ, "conversion-blind"}}, true, &out));
+    refused(resolved_mapq({{OPT_METH, "5base"}, {OPT_METH_MAPQ, "conversion-blind"}}, true, &out));
+    refused(resolved_mapq({{OPT_METH, nullptr}, {OPT_METH_SCORING, "neutral"}, {OPT_METH_MAPQ, "conversion-blind"}},
+                          true, &out));
+}
+
+TEST_CASE("meth_opts: the conversion-blind cap applies only under --meth") {
+    Fixture f;
+    f.opt->meth_mapq = MEM_METH_MAPQ_CONVERSION_BLIND;
+    CHECK(!meth_mapq_conversion_blind(f.opt)); // meth_mode unset
+    f.opt->meth_mode = 1;
+    CHECK(meth_mapq_conversion_blind(f.opt));
+    f.opt->meth_mapq = MEM_METH_MAPQ_SCORING;
+    CHECK(!meth_mapq_conversion_blind(f.opt));
+}
+
+TEST_CASE("meth_opts: --meth-mapq-max-len defaults to 0 (every length), parses a length, and gates by length") {
+    Fixture f;
+    CHECK(f.opt->meth_mapq_max_len == 0);
+    CHECK(meth_mapq_blind_len(f.opt, 1000000));
+    f.parse(OPT_METH, nullptr);
+    f.parse(OPT_METH_MAPQ_MAX_LEN, "100");
+    CHECK(f.cli.set_mapq_max_len == 1);
+    CHECK(meth_opts_check(f.opt, &f.cli) == nullptr);
+    meth_opts_finalize(f.opt, &f.cli);
+    CHECK(f.opt->meth_mapq_max_len == 100);
+    CHECK(meth_mapq_blind_len(f.opt, 100));
+    CHECK(!meth_mapq_blind_len(f.opt, 101));
+    f.parse(OPT_METH_MAPQ_MAX_LEN, "0"); // every length
+    CHECK(meth_mapq_blind_len(f.opt, 1000000));
+}
+
+TEST_CASE("meth_opts: check refuses --meth-mapq-max-len without --meth") {
+    Fixture f;
+    f.parse(OPT_METH_MAPQ_MAX_LEN, "50");
+    const char *err = meth_opts_check(f.opt, &f.cli);
+    REQUIRE(err != nullptr);
+    CHECK(std::string(err) == "--meth-mapq-max-len requires --meth");
+}
+
+TEST_CASE("meth_opts: the stray-value list routes the --meth-mapq values to --meth-mapq") {
+    const char *canon = nullptr;
+    CHECK(std::string(meth_opts_stray_flag("conversion-blind", &canon)) == "--meth-mapq");
+    CHECK(std::string(canon) == "conversion-blind");
+    CHECK(std::string(meth_opts_stray_flag("Scoring", &canon)) == "--meth-mapq");
+    CHECK(std::string(canon) == "scoring");
 }
 
 }  // TEST_SUITE("unit/meth_opts")
