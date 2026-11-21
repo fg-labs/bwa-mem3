@@ -317,12 +317,99 @@ TEST_CASE("aln_known_snvs: merge guards cover large options and distinct combine
     // A search that stopped at -m may lack competitors: a read that would be credited keeps its
     // stock result (and no listed hits); the other outcomes are unchanged.
     std::vector<ba::pe_hit_t> stopped_hits(1);
-    CHECK(ba::ks_override(&w, w.bns, bwt, opt, 0, &s, win.data(), win.size(), &alt, &stopped_hits, true)
+    CHECK(ba::ks_override(&w, w.bns, bwt, opt, 0, &s, win.data(), win.size(), false, &alt, &stopped_hits, true)
           == (expected == ba::KS_CREDITED ? ba::KS_INCOMPLETE : expected));
     CHECK(s.pos == 7); CHECK(alt == -1); CHECK(stopped_hits.empty());
-    CHECK(ba::ks_override(&w, w.bns, bwt, opt, 0, &s, win.data(), win.size(), &alt) == expected);
+    CHECK(ba::ks_override(&w, w.bns, bwt, opt, 0, &s, win.data(), win.size(), false, &alt) == expected);
     if (expected != ba::KS_CREDITED) { CHECK(s.pos == 7); CHECK(alt == -1); }
     ba::bwt_destroy(bwt); free(opt);
+}
+
+TEST_CASE("aln_known_snvs: an ALT-window search run again that stops at -m keeps the stock result"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    namespace ba = bwa_aln;
+    KsIndex &x = fixture();
+    FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    // As "merge guards" above: one synthetic window hit at 400, over the site at 499.
+    ba::ks_windows_t w; w.bns = fmi.idx->bns; w.bwt = bwt;
+    w.win.resize(w.bns->n_seqs);
+    w.win[0].rid = 0; w.win[0].beg = 0; w.win[0].len = x.c1.size();
+    w.win[0].site_pos = 499; w.win[0].alt = 0;
+    ba::bwt_aln1_t win = {};
+    bool found = false;
+    for (ba::bwtint_t r = 0; r <= bwt->seq_len && !found; ++r) {
+        int strand;
+        if (ba::bwa_sa2pos(w.bns, bwt, r, 120, &strand) == 400 && strand == 0) { win.k = win.l = r; found = true; }
+    }
+    REQUIRE(found);
+    ba::gap_opt_t *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 2;
+    opt->max_entries = 0; // any search run again stops at -m at once
+    uint8_t seq[120] = {};
+    auto read = [&]() { ba::bwa_seq_t s = {}; s.len = 120; s.seq = seq; s.pos = 7; return s; };
+    int64_t alt = -1;
+    std::vector<ba::pe_hit_t> hits(1);
+    // The window search ended on its -R stop: it runs again, that search stops at -m, and the read
+    // keeps its stock result; a twin is incomplete.
+    ba::bwa_seq_t s = read();
+    CHECK(ba::ks_override(&w, w.bns, bwt, opt, 0, &s, &win, 1, true, &alt, &hits) == ba::KS_INCOMPLETE);
+    CHECK(s.pos == 7); CHECK(alt == -1);
+    int mapq = -1;
+    CHECK(ba::ks_twin_place(&w, w.bns, bwt, opt, &s, &win, 1, true, 400, 0, &mapq) == -1);
+    // Without the stop nothing runs again and the window hit is credited.
+    CHECK(ba::ks_override(&w, w.bns, bwt, opt, 0, &s, &win, 1, false, &alt, &hits) == ba::KS_CREDITED);
+    CHECK(s.pos == 400);
+    free(s.multi); free(opt); ba::bwt_destroy(bwt);
+}
+
+TEST_CASE("aln_known_snvs: an ALT-window search runs again on any -R stop within the merged cut"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt = ba::gap_init_opt(); opt->max_diff = 4;
+    const int M = opt->s_mm, O = opt->s_gapo;
+    // The search's own hits: a gapped best (one difference) and two mismatches behind it.
+    std::vector<ba::bwt_aln1_t> a(2);
+    a[0].score = O; a[0].n_gapo = 1; a[1].score = O + M - 1; a[1].n_mm = 2; // its ceiling: 2
+    // Its own best is the merged best (cap 2): the main search's -R stop lost nothing the merge
+    // keeps (its best stratum counts loci), but a window search's counted a locus once per window.
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, true, O, 2, false));
+    CHECK(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, true, O, 2, true));
+    // Without the stop, its own ceiling is the merged one: no second search.
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, false, O, 2, true));
+    // A cheaper hit elsewhere with three mismatches (9, cap 4) loosens the ceiling.
+    CHECK(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, false, 3 * M, 4, true));
+    CHECK(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, false, 3 * M, 4, false));
+    // A stop at or past the merged best + M lost only hits the merged cut drops: a cheaper exact hit
+    // (0, cap 1) is M + 8 below its own.
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, true, 0, 1, true));
+    // A window search's own best below the merged one (a row across two windows, which the merge
+    // drops): its score cut may have dropped hits the merge keeps.
+    CHECK(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, false, O + M, 2, true));
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, false, O + M, 2, false));
+    // Under -N (no ceiling, no score cut) any -R stop of a window search counts. ks_window_opt turns
+    // -R off for the window search under -N, so this is defensive.
+    opt->mode |= BWA_MODE_NONSTOP;
+    CHECK(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, true, O, 2, true));
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, true, O, 2, false));
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 4, a.data(), 2, false, 3 * M, 4, true));
+    free(opt);
+}
+
+TEST_CASE("aln_known_snvs: the plain ALT-window search takes the user's cuts, and no -R under -N"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt = ba::gap_init_opt(); opt->max_top2 = 5; opt->max_diff = 3;
+    for (bool nonstop : {false, true}) {
+        CAPTURE(nonstop);
+        if (nonstop) opt->mode |= BWA_MODE_NONSTOP;
+        const ba::gap_opt_t w = ba::ks_window_opt(*opt);
+        CHECK(w.mode == opt->mode);
+        CHECK(w.max_top2 == (nonstop ? INT_MAX : 5));
+        CHECK(w.max_diff == 3); CHECK(w.s_mm == opt->s_mm);
+        CHECK(w.max_gapo == opt->max_gapo); CHECK(w.max_gape == opt->max_gape);
+        CHECK(w.max_entries == opt->max_entries);
+    }
+    free(opt);
 }
 
 TEST_CASE("aln_known_snvs: merged histories count each locus once and restore -R"
@@ -356,7 +443,7 @@ TEST_CASE("aln_known_snvs: merged histories count each locus once and restore -R
     uint8_t seq[32] = {}; s.seq = seq;
     int64_t alt;
     std::vector<ba::pe_hit_t> hits;
-    REQUIRE(ba::ks_override(&w, w.bns, bwt, opt, 10, &s, win.data(), win.size(), &alt, &hits) == ba::KS_CREDITED);
+    REQUIRE(ba::ks_override(&w, w.bns, bwt, opt, 10, &s, win.data(), win.size(), false, &alt, &hits) == ba::KS_CREDITED);
     CHECK((int)s.c1 == 1); CHECK((int)s.c2 == want_c2);
     CHECK(hits.size() == (size_t)(1 + want_c2));
     CHECK(s.n_multi == want_c2);
@@ -399,15 +486,15 @@ TEST_CASE("aln_known_snvs: under -N only an -R stop below the merged best runs t
     a[0].score = M; a[0].n_mm = 1; a[1].score = 3 * M; a[1].n_mm = 3;
     // Plain -N never stops on -R: whatever the merged best and cap, no second search.
     for (int best : {0, M, 2 * M}) for (int cap : {0, 1, 3})
-        CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, false, best, cap));
+        CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, false, best, cap, false));
     // -N -R k: an -R stop matters exactly when the merged best is below the search's own (here an
     // ALT hit one mismatch better: without a score cut, best + M > own is not required).
-    CHECK(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, 0, 1));
-    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, M, 1));
+    CHECK(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, 0, 1, false));
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, M, 1, false));
     // Without -N the ceiling and the score cut apply.
     opt->mode &= ~BWA_MODE_NONSTOP;
-    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, M, 2)); // its own best and ceiling
-    CHECK(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, false, M, 3));      // the merged ceiling is looser
+    CHECK_FALSE(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, true, M, 2, false)); // its own best and ceiling
+    CHECK(ba::ks_cuts_too_tight(opt, 3, a.data(), 2, false, M, 3, false));      // the merged ceiling is looser
     free(opt);
 }
 
@@ -1720,7 +1807,7 @@ TEST_CASE("aln_known_snvs: rejected junction rows cannot produce a credited merg
     ba::gap_opt_t *opt = ba::gap_init_opt();
     int64_t alt = -1;
     const int status = bwa_tests::run_in_child([&] {
-        const auto result = ba::ks_override(&w, fmi.idx->bns, bwt, opt, 0, &s, &win, 1, &alt);
+        const auto result = ba::ks_override(&w, fmi.idx->bns, bwt, opt, 0, &s, &win, 1, false, &alt);
         _exit(result == ba::KS_INCOMPLETE ? 0 : 2);
     });
     REQUIRE(WIFEXITED(status)); CHECK(WEXITSTATUS(status) == 0);
@@ -2745,12 +2832,12 @@ TEST_CASE("aln_known_snvs: negative plain twin placements reject moved tied and 
     REQUIRE(pos != (ba::bwtint_t)-1);
     ba::bwa_seq_t read = {}; read.len = 25; read.n_aln = 1; read.aln = &hit;
     ba::ks_windows_t windows; int mapq = -1;
-    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, pos + 6, strand, &mapq) == 0);
+    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, false, pos + 6, strand, &mapq) == 0);
     CHECK(mapq > 0);
-    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, pos + 5, strand, &mapq) == 1);
-    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, pos, 1 - strand, &mapq) == 0);
+    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, false, pos + 5, strand, &mapq) == 1);
+    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, false, pos, 1 - strand, &mapq) == 0);
     hit.l = hit.k + 1;
-    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, pos, strand, &mapq) == 0);
+    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, false, pos, strand, &mapq) == 0);
     ba::ks_site_t site = {10, 0, 1}; ba::ks_vote_t vote = {}; vote.rid = 0; vote.site = &site; vote.allele = 'A';
     std::string xv; ba::ks_format_xv(fmi.idx->bns, {vote}, 0, 0, 37, &xv);
     CHECK(xv.substr(xv.size() - 5) == ",0,37");
@@ -2776,13 +2863,13 @@ TEST_CASE("aln_known_snvs: credited twin checks the deletion-derived full span"
     ba::bwa_seq_t read = {}; read.len = 25;
     auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 1;
     int mapq = -1;
-    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, &hit, 1, 400, 0, &mapq) == 1);
+    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, &hit, 1, false, 400, 0, &mapq) == 1);
     CHECK(mapq > 0);
     // Keep the read's 25 bases inside the contig, but its one deleted base outside it.
     bntann1_t ann = fmi.idx->bns->anns[0]; ann.len = 425;
     bntseq_t shorter = *fmi.idx->bns; shorter.anns = &ann; shorter.n_seqs = 1;
     shorter.l_pac = ann.len; shorter.pos2rid_bucket = nullptr;
-    CHECK(ba::ks_twin_place(&windows, &shorter, bwt, opt, &read, &hit, 1, 400, 0, &mapq) == 0);
+    CHECK(ba::ks_twin_place(&windows, &shorter, bwt, opt, &read, &hit, 1, false, 400, 0, &mapq) == 0);
     CHECK(mapq > 0);
     free(opt); ba::bwt_destroy(bwt);
 }
@@ -2805,7 +2892,7 @@ TEST_CASE("aln_known_snvs: stock twin placement checks the deletion-derived full
     ba::ks_windows_t windows;
     auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 1;
     int mapq = -1;
-    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, 400, 0, &mapq) == 1);
+    CHECK(ba::ks_twin_place(&windows, fmi.idx->bns, bwt, opt, &read, nullptr, 0, false, 400, 0, &mapq) == 1);
     CHECK(mapq > 0);
     // c1 ends after the read's 25 bases but before its deleted base (l_pac unchanged, so the
     // hit's position is as before).
@@ -2813,7 +2900,7 @@ TEST_CASE("aln_known_snvs: stock twin placement checks the deletion-derived full
     ann[0].len = 425; ann[1].offset = 425; ann[1].len = fmi.idx->bns->l_pac - 425;
     bntseq_t split = *fmi.idx->bns; split.anns = ann; split.n_seqs = 2; split.pos2rid_bucket = nullptr;
     mapq = -1;
-    CHECK(ba::ks_twin_place(&windows, &split, bwt, opt, &read, nullptr, 0, 400, 0, &mapq) == 0);
+    CHECK(ba::ks_twin_place(&windows, &split, bwt, opt, &read, nullptr, 0, false, 400, 0, &mapq) == 0);
     CHECK(mapq > 0);
     free(opt); ba::bwt_destroy(bwt);
 }

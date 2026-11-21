@@ -642,20 +642,29 @@ void ks_final_cuts(const std::vector<ks_hit_t> &win_hits, const bwt_aln1_t *aln,
 
 } // namespace
 
-bool ks_cuts_too_tight(const gap_opt_t *opt, int max_diff, const bwt_aln1_t *a, int n, bool top2b, int best, int cap)
+bool ks_cuts_too_tight(const gap_opt_t *opt, int max_diff, const bwt_aln1_t *a, int n, bool top2b, int best, int cap,
+					   bool window)
 {
 	if (n <= 0) return false; // no hit: it ran to -n
 	int own = INT32_MAX;
 	for (int k = 0; k < n; ++k) own = std::min(own, (int)a[k].score);
+	// A window search's -R counts a locus once per window holding it, so its stop can fire on a
+	// stratum the merge counts as fewer loci than -R, and the merge then keeps the hits past it:
+	// any such stop counts, also when the merged best is its own.
+	const bool below = window || best < own;
 	// -N takes no top-2 ceiling and no score cut, and the merge keeps every hit within -n; stock's
 	// -R stop (which -R turns on under -N too) still drops every hit past the search's own best
 	// stratum, which matters once the merged best is below its own.
-	if (opt->mode & BWA_MODE_NONSTOP) return top2b && best < own;
+	if (opt->mode & BWA_MODE_NONSTOP) return top2b && below;
+	// A window search's own best can lie below the merged best: the window index holds the windows
+	// back to back, and a row that runs from one window into the next (in no window alone, so the
+	// merge drops it) can be its first hit. Its score cut then dropped hits the merge keeps.
+	if (window && own < best) return true;
 	const int first = aln_diffs(opt, a[0]);
 	const int ceiling = first + 1 > max_diff ? max_diff : first + 1;
 	if (cap > ceiling) return true;
 	// With the score cut, the merged set keeps only hits within best + M: a stop past it lost none.
-	return top2b && (int64_t)best + opt->s_mm > own && best < own;
+	return top2b && (int64_t)best + opt->s_mm > own && below;
 }
 
 namespace {
@@ -705,29 +714,47 @@ bwt_aln1_t *ks_research(const bwt_t *bwt, const gap_opt_t *opt, const ubyte_t *s
 	return j.aln;
 }
 
-/* Merges a read's main hits (aln/n_aln, its main search) with its window hits (win_aln/win_n).
- * seq: the read's bases as both searches were given them. The main search took stock's cuts from
- * its own first hit; when the merged set's best is lower (or its ceiling looser) than its own,
- * those cuts can have left out hits the merged set keeps, and the main search is run again with
- * the merged set's cuts (ks_cuts_too_tight, ks_research). Returns KS_UNTOUCHED (no window hit
- * covers its site), KS_SAME (they change no hit), KS_INCOMPLETE (too many loci or too long for the
- * window), or KS_CREDITED with `m` filled. */
+/* Merges a read's main hits (aln/n_aln, its main search; top2b: it ended on its -R stop) with its
+ * window hits (win_aln/win_n; win_top2b likewise). seq: the read's bases as both searches were
+ * given them. Each search took stock's cuts from its own first hit; when the merged set's best is
+ * lower (or its ceiling looser) than a search's own, or above a window search's own (a row across
+ * two windows, which the merge drops), or a window search stopped on -R, those cuts
+ * can have left out hits the merged set keeps, and that search is run again with the merged set's
+ * cuts (ks_cuts_too_tight, ks_research). Returns KS_UNTOUCHED (no window hit covers its site),
+ * KS_SAME (they change no hit), KS_INCOMPLETE (too many loci, too long for the window, or a search
+ * run again stopped at -m), or KS_CREDITED with `m` filled. */
 ks_outcome_t ks_merge(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
 					  int len, const ubyte_t *seq, const bwt_aln1_t *aln, int n_aln, bool top2b,
-					  const bwt_aln1_t *win_aln, int win_n, ks_merged_t *m)
+					  const bwt_aln1_t *win_aln, int win_n, bool win_top2b, ks_merged_t *m)
 {
-	if (win_n <= 0) return KS_UNTOUCHED;
+	if (win_n <= 0) return KS_UNTOUCHED; // a search with no hit took no cuts
 	std::vector<ks_hit_t> win_hits;
 	if (!ks_window_hits(w, bns, len, win_aln, win_n, &win_hits)) return KS_INCOMPLETE;
-	if (win_hits.empty()) return KS_UNTOUCHED;
-	if (!ks_fits_window(len, opt)) return KS_INCOMPLETE;
 	const int max_diff = read_max_diff(opt, len);
 	const bool nonstop = opt->mode & BWA_MODE_NONSTOP;
 	int best, cap;
 	ks_final_cuts(win_hits, aln, n_aln, max_diff, opt, &best, &cap);
-	std::unique_ptr<bwt_aln1_t, decltype(&free)> main_again(nullptr, &free);
-	if (ks_cuts_too_tight(opt, max_diff, aln, n_aln, top2b, best, cap)) {
-		// with the cuts the merge keeps below: under -N, every hit within the read's -n
+	// A read too long for a window with a covering hit keeps its stock result whatever is run again.
+	if (!win_hits.empty() && !ks_fits_window(len, opt)) return KS_INCOMPLETE;
+	// The window search first: its cuts may have left out every hit that covers a site. Its second
+	// search takes the merged cuts (under -N, every hit within the read's -n); when a dropped row put
+	// its own best below the merged one, a covering hit below the merged best may have more
+	// differences than the merged cap allows, so it takes the read's -n.
+	std::unique_ptr<bwt_aln1_t, decltype(&free)> win_again(nullptr, &free), main_again(nullptr, &free);
+	if (ks_cuts_too_tight(opt, max_diff, win_aln, win_n, win_top2b, best, cap, true)) {
+		int own = INT32_MAX;
+		for (int k = 0; k < win_n; ++k) own = std::min(own, (int)win_aln[k].score);
+		int n;
+		win_again.reset(ks_research(w->bwt, opt, seq, len, nonstop ? INT32_MAX : best,
+									nonstop || own < best ? max_diff : cap, &n));
+		if (n < 0) return KS_INCOMPLETE;
+		if (!ks_window_hits(w, bns, len, win_again.get(), n, &win_hits)) return KS_INCOMPLETE;
+		// it can find a covering hit below the merged best, which lowers the cuts
+		ks_final_cuts(win_hits, aln, n_aln, max_diff, opt, &best, &cap);
+	}
+	if (win_hits.empty()) return KS_UNTOUCHED;
+	if (!ks_fits_window(len, opt)) return KS_INCOMPLETE;
+	if (ks_cuts_too_tight(opt, max_diff, aln, n_aln, top2b, best, cap, false)) {
 		int n;
 		main_again.reset(ks_research(bwt, opt, seq, len, nonstop ? INT32_MAX : best, nonstop ? max_diff : cap, &n));
 		if (n < 0) return KS_INCOMPLETE;
@@ -807,13 +834,14 @@ int approx_mapq(int c1, int c2, int n_mm, int max_diff)
 } // namespace
 
 ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
-						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site,
-						 std::vector<pe_hit_t> *hits, bool stopped)
+						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, bool win_top2b,
+						 int64_t *alt_site, std::vector<pe_hit_t> *hits, bool stopped)
 {
 	*alt_site = -1;
 	if (hits) hits->clear();
 	ks_merged_t m;
-	const ks_outcome_t r = ks_merge(w, bns, bwt, opt, s->len, s->seq, s->aln, s->n_aln, s->top2b, win_aln, win_n, &m);
+	const ks_outcome_t r = ks_merge(w, bns, bwt, opt, s->len, s->seq, s->aln, s->n_aln, s->top2b, win_aln, win_n,
+										win_top2b, &m);
 	if (r != KS_CREDITED) return r;
 	if (stopped) return KS_INCOMPLETE; // a search that stopped at -m may lack competitors
 	std::vector<ks_hit_t> &kept = m.kept;
@@ -906,12 +934,13 @@ bool ks_twin_pair_same_contig(const bntseq_t *bns, const bwa_seq_t *twin, const 
 }
 
 int ks_twin_place(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *bwt, const gap_opt_t *opt,
-				  const bwa_seq_t *t, const bwt_aln1_t *win_aln, int win_n, int64_t pos, int strand,
-				  int *mapq)
+				  const bwa_seq_t *t, const bwt_aln1_t *win_aln, int win_n, bool win_top2b, int64_t pos,
+				  int strand, int *mapq)
 {
 	*mapq = 0;
 	ks_merged_t m;
-	const ks_outcome_t r = ks_merge(w, bns, bwt, opt, t->len, t->seq, t->aln, t->n_aln, t->top2b, win_aln, win_n, &m);
+	const ks_outcome_t r = ks_merge(w, bns, bwt, opt, t->len, t->seq, t->aln, t->n_aln, t->top2b, win_aln, win_n,
+										win_top2b, &m);
 	if (r == KS_INCOMPLETE) return -1;
 	if (r == KS_CREDITED) {
 		const ks_hit_t &b = m.kept[0];
@@ -1179,12 +1208,11 @@ void ks_aln2seq_nodraw(const bntseq_t *bns, bwa_seq_t *s)
 	s->type = s->c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
 }
 
-gap_opt_t ks_discovery_opt(const gap_opt_t &opt)
+gap_opt_t ks_window_opt(const gap_opt_t &opt)
 {
-	gap_opt_t discovery = opt;
-	discovery.mode |= BWA_MODE_NONSTOP;
-	discovery.max_top2 = INT_MAX;
-	return discovery;
+	gap_opt_t window = opt;
+	if (opt.mode & BWA_MODE_NONSTOP) window.max_top2 = INT_MAX;
+	return window;
 }
 
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
