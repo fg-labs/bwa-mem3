@@ -185,8 +185,8 @@ The twin of a paired read is a pair, so `twin_mapq` is the twin pair's paired MA
 - **Work limits under `--meth`.** If a read's ALT-window search hits a work limit (the lookup
   budget or the `-m` stack cap), the read is reported as incomplete even when none of its
   placements covers a site: it gets MAPQ 0 with no `X0`/`X1`. If its genomic search hits the
-  lookup budget instead, the ALT-window placements already found are still evaluated, and the
-  read is likewise incomplete. For paired input, neither end of that pair can then be promoted
+  lookup budget instead, the ALT-window placements already found are still evaluated (unless the
+  read has also reached its 64 MiB candidate CIGAR cap), and the read is likewise incomplete. For paired input, neither end of that pair can then be promoted
   by pairing or mate rescue, so the mate's record can change too.
 - **Long unseeded reads under `--meth`.** With known sites loaded, an unseeded read longer than
   160 bases (possible only when `-l` exceeds 160) cannot stop early, so a highly repetitive one

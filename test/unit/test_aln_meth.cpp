@@ -1826,6 +1826,68 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     CHECK(ba::bwa_seq_close(input) == 0);
 }
 
+TEST_CASE("aln_meth: a CIGAR stop survives the lookup budget ending the same flush")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("cigar-lookup-cap.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(reads != nullptr);
+    REQUIRE(n == 1);
+    const std::string prefix = ref().fa + ".meth";
+    FMI_search fmi(prefix.c_str());
+    fmi.load_index(false, 1);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    mo.p_best = 1; mo.p_second = 0; // one genomic lookup fits the budget
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    ba::aln_meth_group_t group;
+    group.bwt = bwt; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    group.n_slots = 1; group.slot.resize(1);
+    ba::gap_slot_core_t core = {};
+    group.cores = &core;
+    auto &slot = group.slot[0];
+    slot.grp = &group; slot.job = &core.job;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+    bwtint_t row = (bwtint_t)-1;
+    for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
+        int strand = 0;
+        const auto pos = ba::bwa_pos_from_sa(mr.conv_bns, ba::bwt_sa(bwt, k), 50, &strand);
+        if (pos != (bwtint_t)-1 && strand == 0 && bns_pos2rid(mr.conv_bns, pos) == 1 &&
+            pos == (bwtint_t)(mr.conv_bns->anns[1].offset + 500)) { row = k; break; }
+    }
+    REQUIRE(row < bwt->seq_len);
+    // The one looked-up row's 8-byte alignment overflows the CIGAR budget, and the interval's
+    // second row is past the lookup budget: both budgets end this flush.
+    slot.alignment_bytes = (64ULL << 20) - 7;
+    ba::gap_entry_t exact = {};
+    ba::aln_meth_hit(&slot, &exact, row, row + 1);
+    core.state = ba::GAP_SLOT_PARKED;
+    ba::aln_meth_flush_parked(&group);
+    CHECK(result.n_lookups == 1);
+    CHECK(result.flags == (ba::ALN_METH_BIND_CIGAR | ba::ALN_METH_BIND_BEST));
+    // The CIGAR stop is final: the lookup stop must not replace it.
+    CHECK(slot.stop == ba::ALN_METH_STOP_CIGAR);
+    // So a pending ALT-window candidate is not resolved past the CIGAR budget.
+    std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, 600, 600 + ALN_MAX_READ_LEN + 1}};
+    slot.extra = &extra;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.n_unrepresentable == 0);
+    CHECK(slot.windows.size() == 1); // only the looked-up row's window
+    CHECK(result.main == -1);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
+    free(opt);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
 TEST_CASE("aln_meth: a genomic lookup-budget stop still resolves the ALT-window candidates")
 {
     namespace ba = bwa_aln;

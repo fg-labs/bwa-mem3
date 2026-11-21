@@ -396,7 +396,12 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
                 ++x.res->n_lookups;
                 resolve_window(&x, h, sa);
             }
-            if ((bwtint_t)n < width) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = ALN_METH_STOP_LOOKUP; }
+            // A CIGAR stop on this interval's looked-up rows is final: keep it over the lookup
+            // stop, which aln_meth_slot_finish lifts to resolve the ALT-window candidates.
+            if ((bwtint_t)n < width) {
+                x.res->flags |= ALN_METH_BIND_BEST;
+                if (!x.stop) x.stop = ALN_METH_STOP_LOOKUP;
+            }
         }
         x.pend.clear();
         g->cores[i].state = GAP_SLOT_SEARCH;
