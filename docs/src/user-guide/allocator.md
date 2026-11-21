@@ -239,7 +239,8 @@ mapping needs Linux 5.14 or later; on an older kernel the table falls back:
 
 The flag applies to an index loaded from disk. An index attached from shared
 memory (`bwa-mem3 shm`) lives in the shared segment, so `--huge-pages` does not
-move it, and an `[M::]` note says so.
+move it, and an `[M::]` note says so. To put a staged index on 1 GB pages, stage
+it with [`bwa-mem3 shm --huge-pages`](../cli/shm.md#--huge-pages--stage-the-index-on-1-gb-huge-pages-linux-opt-in).
 
 Pages in the hugetlb pool are not counted in a process's resident set size, so
 with `--huge-pages` the peak RSS that `/usr/bin/time` reports drops by about the

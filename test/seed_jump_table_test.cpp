@@ -1193,7 +1193,7 @@ static int fixture_workload(const char *prefix, bool portable_checks)
             memcpy(map, buf, (size_t)len);
             fmi->build_seed_jump_table(1);   // the disk load's default table again
             FMI_search *at = new FMI_search(prefix);
-            at->load_index_from_shm((uint8_t *)map, (size_t)len);
+            at->load_index_from_shm((uint8_t *)map, (size_t)len, (size_t)len);
             none = at->seed_jump == NULL && at->seed_jump_depth == 0;
             at->build_seed_jump_table(3);
             const size_t bytes = (size_t)FMI_search::seed_jump_level_off(11) * sizeof(FMI_search::SeedJumpEntry);

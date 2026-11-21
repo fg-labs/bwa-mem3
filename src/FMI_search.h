@@ -254,11 +254,13 @@ class FMI_search: public indexEle
     void load_index(bool load_pac = true, int n_threads = 1, bool build_seed_jump = true,
                     bwamem_hugetlb_mode_t huge_pages = BWAMEM_HUGETLB_OFF);
 
-    /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach. Sets
+    /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach: `len` is
+     * the packed index size and `map_len` the length of the mapping. Sets
      * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
-     * destructor munmaps `base` and leaves the aliased buffers untouched.
-     * Builds no seed jump table: load_index builds it after the attach. */
-    void load_index_from_shm(uint8_t *base, size_t len);
+     * destructor unmaps `map_len` bytes at `base` and leaves the aliased
+     * buffers untouched. Builds no seed jump table: load_index builds it
+     * after the attach. */
+    void load_index_from_shm(uint8_t *base, size_t len, size_t map_len);
 
     /* Densify the SA sample table on the fly: given an existing FM-index's
      * checkpoint-occ block, C[] array, and SA samples taken at stride

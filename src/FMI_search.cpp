@@ -460,11 +460,11 @@ FMI_search::FMI_search(const char *fname)
 FMI_search::~FMI_search()
 {
     /* When attached from shm, cp_occ/sa_*_byte/sa_*_word alias mmap'd pages
-     * owned by the shm segment, so we don't _mm_free them. We do munmap the
+     * owned by the shm segment, so we don't _mm_free them. We do unmap the
      * mapping itself — leaving it would leak VA in long-lived processes that
      * construct and destroy FMI_search repeatedly. */
     if (shm_base != NULL) {
-        munmap(shm_base, shm_len);
+        bwa_shm_detach(shm_base, shm_len);
         shm_base = NULL;
         shm_len  = 0;
     } else {
@@ -626,7 +626,7 @@ void FMI_search::build_seed_jump_table(int n_threads)
         if (spawned[i]) pthread_join(tids[i], NULL);
 }
 
-void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
+void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
 {
     if (base == NULL) {
         fprintf(stderr, "ERROR! load_index_from_shm called with NULL base\n");
@@ -724,7 +724,7 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
     sa_ls_word = (uint32_t *)(base + off);
 
     shm_base = base;
-    shm_len  = len;
+    shm_len  = map_len;   /* what the destructor unmaps */
 
     fprintf(stderr, "* FMI attached from shm: ref_seq_len=%ld sentinel_index=%ld\n",
             (long)reference_seq_len, (long)sentinel_index);
@@ -888,10 +888,12 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
      * mapping; the segment lifetime belongs to the shm-loading process. */
     {
-        size_t   shm_attach_len = 0;
-        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
+        size_t   shm_attach_len = 0, shm_map_len = 0;
+        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len, &shm_map_len);
         if (shm_base_local != NULL) {
-            load_index_from_shm(shm_base_local, shm_attach_len);
+            /* shm_map_len: the whole mapping, which can be longer than the
+             * packed index it holds, is what the destructor unmaps. */
+            load_index_from_shm(shm_base_local, shm_attach_len, shm_map_len);
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
@@ -902,7 +904,9 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             if (huge_pages != BWAMEM_HUGETLB_OFF)
                 fprintf(stderr, "[M::load_index] --huge-pages: no effect on an index "
-                        "attached from shared memory; its pages are the segment's\n");
+                        "attached from shared memory; its pages are the segment's "
+                        "(an index staged with `bwa-mem3 shm --huge-pages` is on 1 GB "
+                        "pages)\n");
             return;
         }
     }
