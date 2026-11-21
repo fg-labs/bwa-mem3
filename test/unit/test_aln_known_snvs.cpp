@@ -3194,7 +3194,8 @@ TEST_CASE("aln_known_snvs: in-memory window index equals the file-built one"
             }
 }
 
-TEST_CASE("aln_known_snvs: incomplete ALT-window discovery cannot claim unique methylation hits")
+TEST_CASE("aln_known_snvs: incomplete ALT-window discovery cannot claim unique methylation hits"
+          * doctest::test_suite("unit/aln_known_snvs"))
 {
     bwa_tests::TempDir tmp("ks_meth_incomplete");
     const std::string prefix = tmp.path() + "/" + tmp.path().substr(tmp.path().rfind('/') + 1) + ".fa";

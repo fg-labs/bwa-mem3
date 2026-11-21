@@ -4728,7 +4728,8 @@ TEST_CASE("aln_meth: ref-span-insert estimates the insert size from gapped mates
 
 TEST_SUITE_END;
 
-TEST_CASE("aln_meth: known alleles stop at the CIGAR cap and the next read resets")
+TEST_CASE("aln_meth: known alleles stop at the CIGAR cap and the next read resets"
+          * doctest::test_suite("unit/aln_meth"))
 {
     namespace ba = bwa_aln;
     const std::string fq = write_fq("cigar-cap.fq", std::vector<std::string>(2, conv(ref().c1.substr(500, 50), 'C', 'T')));
