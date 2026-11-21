@@ -1010,7 +1010,8 @@ TEST_CASE("aln_meth: a refined window over the read's -n limit is not a locus")
     const auto s2 = run_aln({"--meth", "-n", "2"}, {fq_s}, fa, dir);
     REQUIRE(s2.size() == 1);
     CHECK(s2[0].rname == "s_gap");
-    CHECK(s2[0].cigar.find('D') != std::string::npos);
+    CHECK(s2[0].pos == 101); // the flank's 100 bp, then the planted G between s[14] (C) and s[15] (A)
+    CHECK(s2[0].cigar == "15M1D15M");
     CHECK(tag_value(s2[0], "X0:i") == "1");
     CHECK(tag_value(s2[0], "X1:i") == "0");
     CHECK(s2[0].mapq == 37);
