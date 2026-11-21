@@ -229,11 +229,17 @@ for e in se pe; do
         echo "FAIL: $e: over-budget ALT reads not placed with an A vote" >&2
         exit 1
     }
-    # every extra exact read carries its vote and a same-locus twin
-    check_reads "$tmp/ks.$e.sam" many '^,[RA],0,2,1,[0-9]+$' || {
-        echo "FAIL: $e: exact site reads not placed with an R or A vote and a same-locus twin" >&2
-        exit 1
-    }
+    # every extra exact read carries its own allele's vote and a same-locus twin: the generator
+    # gives letters at even k (a, c, ...) exact REF and at odd k (b, d, ...) exact ALT
+    letters=abcdefghijklmnop
+    for ((k = 0; k < 16; k++)); do
+        allele=R
+        if ((k % 2)); then allele=A; fi
+        check_reads "$tmp/ks.$e.sam" "many${letters:k:1}" "^,$allele,0,2,1,[0-9]+$" || {
+            echo "FAIL: $e: exact site reads many${letters:k:1}* not placed with an $allele vote and a same-locus twin" >&2
+            exit 1
+        }
+    done
     # REF and ALT reads both carry their vote
     for a in ref:R alt:A; do
         check_reads "$tmp/ks.$e.sam" "${a%%:*}" "^,${a##*:},1,2,1,[0-9]+$" || {
