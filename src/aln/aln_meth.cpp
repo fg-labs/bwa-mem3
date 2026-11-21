@@ -1009,7 +1009,11 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
         if(a.pos<(uint64_t)ann.offset || a_re>ann.offset+ann.len) {
             fprintf(stderr,"ERROR: --meth cap-rescue anchor leaves contig\n");exit(1);
         }
-        const double begin=a.strand ? a_re-ii->avg-3*ii->std-pm->len*.5
+        // The anchor's end as mate rescue takes it (aln_rescue_anchor_end): its read length, or
+        // its reference span under --ref-span-insert. It places a reverse anchor's window and,
+        // without --short-insert, floors a forward anchor's.
+        const int64_t a_end=ref_span?a_re:(int64_t)a.pos+pa->len;
+        const double begin=a.strand ? a_end-ii->avg-3*ii->std-pm->len*.5
                                    : a.pos+ii->avg-3*ii->std-pm->len*1.5;
         const double finish=begin+6*ii->std+2*pm->len;
         if(!isfinite(begin) || !isfinite(finish) || begin<INT64_MIN || finish>=INT64_MAX) {
@@ -1017,13 +1021,11 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
         }
         int64_t beg=(int64_t)begin,last=(int64_t)finish;
         // --exact-rescue-window: the same window as mate rescue's, rounded outward from the anchor.
-        // A reverse anchor's end is aln_rescue_anchor_end's: its read length, or its reference
-        // span under --ref-span-insert.
-        if(exact_window) aln_rescue_window(a.strand?(ref_span?a_re:(int64_t)a.pos+pa->len):(int64_t)a.pos,
-                                           !a.strand,pm->len,ii,true,&beg,&last);
-        // As in mate rescue, --short-insert lets the window cover the anchor's own span.
+        if(exact_window) aln_rescue_window(a.strand?a_end:(int64_t)a.pos,!a.strand,pm->len,ii,true,&beg,&last);
+        // As in mate rescue, --short-insert lets the window cover the anchor's own span; the
+        // reverse anchor's ceiling is then its reference end either way.
         if(a.strand) last=std::min<int64_t>(last,short_insert?a_re:(int64_t)a.pos);
-        else beg=std::max<int64_t>(beg,short_insert?(int64_t)a.pos:a_re);
+        else beg=std::max<int64_t>(beg,short_insert?(int64_t)a.pos:a_end);
         beg=std::max<int64_t>(beg,ann.offset);last=std::min<int64_t>(last,ann.offset+ann.len);
         if(last<=beg) continue;
         const auto key=std::make_tuple(a.rid,a.hyp,1-a.strand,beg,last);

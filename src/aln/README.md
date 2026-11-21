@@ -176,7 +176,9 @@ Each change to upstream-derived code adds a line here.
   then re-selects the end's hit by its start, strand, span and cost, not the first hit at that start. `bwa_pe_pair_grouped` places each reverse hit from its own span rather than the read's
   best hit's. `aln_rescue_anchor_end` gives mate rescue the anchor's reference end (both paths), and
   `--meth` cap rescue, whose inserts already come from spans, takes its minimum outer span from the
-  two spans. TLEN is unchanged: `pos_5` already uses the CIGAR. Every change branches once per pair
+  two spans. Cap rescue, which has no stock counterpart, takes the anchor's end as mate rescue does: a
+  reverse anchor's window and, without `--short-insert`, a forward anchor's floor start from its
+  read-length end, or from its reference end under the option. TLEN is unchanged: `pos_5` already uses the CIGAR. Every change branches once per pair
   or hit on the option; without it the stock arithmetic runs unchanged.
 - `bwtaln.h`, `bwape.cpp`/`bwape.h`, `aln_meth.cpp`, `aln_main.cpp`: the `pe_opt_t::exact_rescue_window`
   field (appended; zero from `bwa_init_pe_opt`) enables `--exact-rescue-window`, which `aln_main.cpp`

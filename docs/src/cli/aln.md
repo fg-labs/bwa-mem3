@@ -188,12 +188,14 @@ With the option:
   reverse hit from its own span rather than the read's best hit's, and gives a read the hit
   pairing selects, with that hit's span, even when it starts at the same base on the same
   strand (stock keeps the read's first hit, whose span the gapped refinement then uses);
-- mate rescue places its window from the anchor's reference end.
+- mate rescue, and `--meth` cap rescue, place a forward mate's window and (without
+  `--short-insert`) floor a reverse mate's at the anchor's reference end rather than its
+  read-length end.
 
 The TLEN calculation is unchanged: TLEN is taken from each record's CIGAR with or without the
 option. Its value can still change, because pairing can select a different hit, with a
 different span, for a read. `--meth` cap rescue already measures inserts from spans;
-the option only makes its minimum outer span the two alignments' spans, as in pairing. With
+the option also makes its minimum outer span the two alignments' spans, as in pairing. With
 `--short-insert`, a coincident-start pair must cover both hits' spans, and rescue's ceiling for
 a reverse anchor is its reference end either way. `-A` does not turn the option off: pairing
 still measures the insert it compares to `-a` from the spans.
