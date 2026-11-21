@@ -18,7 +18,11 @@ The command page documents discovery/resource limits and incomplete confidence.
 TAPS/5base neutral scoring ranks equal-cost loci by fewest conversions, paired
 ends pair over every retained locus up to `--max-occ` when neither end was cut off,
 and a lookup-capped end can be rescued near its mate for placement only (MAPQ 0).
-([PR #751](https://github.com/fg-labs/bwa-mem3/pull/751))
+([PR #751](https://github.com/fg-labs/bwa-mem3/pull/751)) For EM-seq with `genomic` scoring (the
+defaults), `--meth-mapq conversion-blind` (the default there) caps each record's MAPQ at the MAPQ
+it gets with the mirror cell free, so a retained methylated C does not make a short read look
+unique; a lowered record keeps its uncapped MAPQ in `YQ:i`, and `--meth-mapq scoring` gives the
+previous output. ([PR #816](https://github.com/fg-labs/bwa-mem3/pull/816))
 
 For paired ordinary or methylation-aware alignment, `--short-insert` lets the insert
 estimator include short, overlapping fragments without the longest read in a batch
@@ -318,7 +322,8 @@ on which stock crashes or drops every read (for example a negative `-l` or `-B`)
 `--meth-context cpg` in [PR #750](https://github.com/fg-labs/bwa-mem3/pull/750)) aligns single-end
 and paired-end methylation reads on an `index --meth` index, with `XR:Z`, `XG:Z` and `XM:Z` tags,
 and takes `--meth-context cpg`; stock bwa has no methylation mode, so those records have no stock
-counterpart. See [CLI Reference → aln](../cli/aln.md).
+counterpart. Its EM-seq `genomic` MAPQ is conversion-blind by default (`--meth-mapq`, with the
+uncapped MAPQ in `YQ:i` when lowered; [PR #816](https://github.com/fg-labs/bwa-mem3/pull/816)). See [CLI Reference → aln](../cli/aln.md).
 
 ```bash
 bwa-mem3 aln -l 1024 -n 0.04 -o 2 -t 8 ref.fa reads.fq.gz > out.sam

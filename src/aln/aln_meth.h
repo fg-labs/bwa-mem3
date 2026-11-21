@@ -77,6 +77,7 @@ struct aln_meth_occ_t {
     bwtint_t pos;
     int rid, strand, hyp;
     int n_mm = 0, n_gapo = 0, n_gape = 0, n_ins = 0, n_del = 0, n_conv = 0;
+    int n_mirror = 0;      // mismatches in the mirror cell (OT read C x ref T, OB read G x ref A); in n_mm
     int alt = 0;           // --known-snvs: the credited site allele as ks_site_rel gives it (0: none)
     int64_t ks_site = -1;  // --known-snvs: the credited site allele (aln_site_key), or -1
     int64_t cost = 0;
@@ -95,8 +96,16 @@ struct aln_meth_hit_t {
     uint32_t cig, n_cig;
     uint8_t strand, hyp, n_mm, n_gapo, n_gape;
     uint8_t alt; // --known-snvs: the credited site allele, ks_site_rel from pos (0: none; in the padding)
+    uint8_t n_mirror; // the locus's mirror-cell mismatches (counted in n_mm; in the padding)
 };
 static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record");
+/* --meth-mapq conversion-blind: a locus the genomic cut dropped that the mirror-free cut keeps,
+ * at its mirror-free cost and mismatches; only the paired-end shadow pairing reads it. */
+struct aln_meth_blind_row_t {
+    bwtint_t pos;
+    int32_t span, cost;
+    uint8_t strand, n_mm, n_gapo, n_gape;
+};
 // incomplete: lookup budget, an unrepresentable competitor, CIGAR storage, -m work budget
 enum { ALN_METH_BIND_BEST = 1, ALN_METH_BIND_UNREP = 2, ALN_METH_BIND_CIGAR = 4, ALN_METH_BIND_M = 8 };
 // A same-read ALT-index lower bound; an unavailable bound must never authorize stopping.
@@ -129,6 +138,17 @@ struct aln_meth_read_t {
     // the mismatches up to which an unbound search proposes every such window (its difference
     // limit, and the seed's when seeded). Read it through aln_meth_alt_certificate.
     aln_meth_alt_bound_t site_bound;
+    // --meth-mapq conversion-blind: the strata with the mirror cell freed (cost minus s_mm per
+    // mirror mismatch), counted over every candidate before the stock cut: the best mirror-free
+    // cost, the loci at it, and the loci up to s_mm above it. blind_best is INT64_MAX when unset.
+    int64_t blind_best = INT64_MAX;
+    int blind_c1 = 0, blind_c2 = 0;
+    // The mirror-free strata's loci that the genomic cut drops (a locus that costs two or more
+    // mirror mismatches more than the genomic best), for the paired-end shadow pairing.
+    std::vector<aln_meth_blind_row_t> blind_rows;
+    // The MAPQ cap the record's end carries to emission (255: none), and the MAPQ it replaced
+    // when the cap lowered it (YQ:i), else -1.
+    int blind_cap = 255, yq = -1;
 };
 /* The stop certificate a read's ALT-window search gives its genomic search: a lower bound on the
  * mismatches of every ungapped placement that covers a site with that site's ALT in place. A
