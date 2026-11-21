@@ -2165,12 +2165,13 @@ TEST_CASE("aln_known_snvs: --meth ALT-window candidates obey the read's differen
     CHECK(kd[0] == s[0]);
 }
 
-TEST_CASE("aln_known_snvs: --meth ALT-window placements over the limits are realigned within the window's extent"
+TEST_CASE("aln_known_snvs: --meth ALT-window placements are scored along their search path"
           * doctest::test_suite("unit/aln_known_snvs")) {
     bwa_tests::TempDir tmp{"ks_meth_narrow"}; const std::string dir = tmp.path();
     // The read is the window's own length, ungapped against REF GAGGTTAGGTATATAAGGGTTAGGA with
-    // the ALT (T>G at its base 21) and four mismatches (ATAT read as TATA). Its best-scoring
-    // realignment trades those four mismatches for an insertion and a deletion (9M1I4M1D11M).
+    // the ALT (T>G at its base 21) and four mismatches (ATAT read as TATA). A window DP would
+    // trade those four mismatches for an insertion and a deletion (9M1I4M1D11M); a row is scored
+    // along the path that found it instead, here the ungapped one.
     uint32_t state = 4242;
     const std::string core = "GAGGTTAGGTATATAAGGGTTAGGA", read = "GAGGTTAGGTTATAAAGGGTGAGGA";
     const std::string c1 = aln_test::lcg_dna(state, 300) + core + aln_test::lcg_dna(state, 300);
@@ -2199,18 +2200,57 @@ TEST_CASE("aln_known_snvs: --meth ALT-window placements over the limits are real
         CHECK(tag(r, "NM:i:") == "NM:i:5");
         CHECK(tag(r, "MD:Z:") == "MD:Z:10A0T0A0T6T4");
         // The REF twin has the same four mismatches and no ALT: it places as the genomic search
-        // places it, at the same start.
-        CHECK(tag(r, "XV:Z:") == "XV:Z:c1:321:T>G,A,4,4,1,37");
+        // places it, at the same start and its difference limit.
+        CHECK(tag(r, "XV:Z:") == "XV:Z:c1:321:T>G,A,4,4,1,25");
     }
-    SUBCASE("within the limits: the best-scoring realignment is unchanged") {
-        // -n 4 -o 2: the gapped realignment (two gap opens, one mismatch) fits and is kept.
+    SUBCASE("gaps allowed: the row is still its search path's") {
+        // -n 4 -o 2: the gapped alignment (two gap opens, one mismatch) would fit, but the search
+        // reaches the window by its cheaper ungapped path, which is the row.
         const auto r = one({"--meth", "--known-snvs", vcf, "-n", "4", "-o", "2"});
         INFO(slurp(sam));
-        CHECK(r[1] == "0"); CHECK(r[2] == "c1"); CHECK(r[3] == "301"); CHECK(r[5] == "9M1I4M1D11M");
-        CHECK(r[4] == "37");
-        CHECK(tag(r, "NM:i:") == "NM:i:3");
-        CHECK(tag(r, "XV:Z:") == "XV:Z:c1:321:T>G,A,2,4,1,37");
+        CHECK(r[1] == "0"); CHECK(r[2] == "c1"); CHECK(r[3] == "301"); CHECK(r[5] == "25M");
+        CHECK(r[4] == "25");
+        CHECK(tag(r, "NM:i:") == "NM:i:5");
+        CHECK(tag(r, "XV:Z:") == "XV:Z:c1:321:T>G,A,4,4,1,25");
     }
+}
+
+TEST_CASE("aln_known_snvs: --meth ALT-window candidates without a path are realigned within the window's extent"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    bwa_tests::TempDir tmp{"ks_meth_retry"}; const std::string dir = tmp.path();
+    // The read starts one base before c1, so the ALT-window search's hit soft-clips that base
+    // (1S40M): its CIGAR is not a search path, and the window DP refines it. The read carries the
+    // ALT (A>C at c1:30) and a stretch shifted one base right (TACAT read as TTACA): four
+    // mismatches. The DP's best realignment trades them for an insertion and a deletion: three gap
+    // opens with the leading insertion, over -o 1. Realigned with its indels held to the window's
+    // extent (one inserted base), it is 1S40M with the four mismatches and the ALT: within -n 5.
+    uint32_t state = 4242;
+    const std::string core = "GCTAAAGACAATTACATAACATACACGTCAGCACGAAACT";
+    const std::string read = "TGCTAAAGACAATTTACAAACATACACGTCCGCACGAAACT";
+    const std::string c1 = core + aln_test::lcg_dna(state, 300);
+    const std::string prefix = tmp.unique_file();
+    REQUIRE(aln_test::write_test_fasta(prefix, {{"c1", c1}}));
+    REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
+    build_meth_index(prefix);
+    const std::string fq = write_fq(dir + "/r.fq", {{"r", read}});
+    const std::string vcf = write_vcf(dir + "/s.vcf", {row("c1", 30, 'A', "C")});
+    const std::string sam = dir + "/out.sam";
+    bwa_tests::StderrCapture quiet;
+    auto one = [&](std::vector<std::string> args) {
+        args.insert(args.end(), {"-n", "5", "-o", "1", "-i", "0", "-l", "1024", "-f", sam, prefix, fq});
+        REQUIRE(run(args) == 0);
+        const auto rec = records(slurp(sam)); REQUIRE(rec.size() == 1);
+        return rec[0];
+    };
+    // Stock (no sites): with the REF base the read has five mismatches and a gap open, over -n 5.
+    CHECK(one({"--meth"})[1] == "4");
+    const auto r = one({"--meth", "--known-snvs", vcf});
+    INFO(slurp(sam));
+    CHECK(r[1] == "0"); CHECK(r[2] == "c1"); CHECK(r[3] == "1"); CHECK(r[5] == "1S40M");
+    CHECK(r[4] == "37");
+    CHECK(tag(r, "NM:i:") == "NM:i:5");
+    CHECK(tag(r, "MD:Z:") == "MD:Z:13A0C0A0T12A10");
+    CHECK(tag(r, "XV:Z:") == "XV:Z:c1:30:A>C,A,5,5,1,37");
 }
 
 TEST_CASE("aln_known_snvs: negative gap-open limits allow ungapped methylation ALT reads only"

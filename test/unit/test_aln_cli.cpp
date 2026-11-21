@@ -213,6 +213,28 @@ TEST_CASE("aln_cli: exact-rescue-window is paired only, its --no- form is accept
     CHECK(help.find("--no-exact-rescue-window keeps sampe's window under --meth") != std::string::npos);
 }
 
+TEST_CASE("aln_cli: --meth refuses -e above 255, which its 8-bit gap-extension count cannot hold"
+          * doctest::test_suite("unit/aln_cli")) {
+    CliIndex x;
+    { // 256 extensions would wrap the search entry's count: refused before any I/O
+        bwa_tests::StderrCapture capture;
+        const std::string out = x.dir + "/meth-e256.sam";
+        CHECK(run({"--meth", "-e", "256", "-f", out, "/missing-index", "/missing-reads"}) == 1);
+        CHECK(capture.text().find("--meth allows at most -o 4 gap opens and -e 255 gap extensions") != std::string::npos);
+        CHECK(access(out.c_str(), F_OK) != 0);
+    }
+    { // 255 passes the check (the run then stops at the missing index)
+        bwa_tests::StderrCapture capture;
+        CHECK(run({"--meth", "-e", "255", "-f", x.dir + "/meth-e255.sam", "/missing-index", "/missing-reads"}) != 0);
+        CHECK(capture.text().find("gap extensions") == std::string::npos);
+    }
+    { // plain aln keeps stock's range
+        bwa_tests::StderrCapture capture;
+        CHECK(run({"-e", "256", "-f", x.dir + "/plain-e256.sam", x.prefix, x.fq}) == 0);
+        CHECK(capture.text().find("gap extensions") == std::string::npos);
+    }
+}
+
 TEST_CASE("aln_cli: ref-span-insert parses, is documented and is refused before single-end I/O"
           * doctest::test_suite("unit/aln_cli")) {
     CliIndex x;
