@@ -55,6 +55,7 @@
  * oriented mate): int32 len1, int32 len2, len1 reference bytes, len2 query bytes (2-bit codes,
  * 4 = N). The aligner does not write them; capture new ones by instrumenting mem_matesw_batch_pre
  * where it calls rescue_prune_window. */
+#include <climits>
 #include "rescue_band.h"
 #include "bwa.h"
 #include "bwamem.h"
@@ -811,6 +812,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
         for (int t = 0; t < m; t++) {
             const Job &J = jobs[t];
             const kswr_t &a = T.aln[t];
+            int b_ub = INT_MIN;   // the pruned / banded job's score2_ub, when it ran and agrees
             n++; cls_n[J.cls]++;
             n12_band += band && rescue_prune_is_default_scoring(pp) && J.cls == 12;   // the ceiling at a = 1, b = 4
             band_hi += banded[t] && a.score >= 241;
@@ -832,6 +834,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 else {
                     ok = a.score == b.score && a.te == b.te + off[t] && a.qe == b.qe && a.score2 == b.score2
                          && a.tb == b.tb + off[t] && a.qb == b.qb;
+                    if (ok) b_ub = b.score2_ub;
                     if (ok && a.score2 >= 0 && a.te2 != b.te2 + off[t]) te2_diff++;
                 }
                 if (!ok && mism < 10) {
@@ -859,7 +862,7 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
              * 16-bit kernels keep a plain row max, so their score2 can differ from it (both widths
              * as in v0.13.0). RB_16BIT checks pruned against full-window kswv16 only. */
             if (!g_16 && scalar_stride > 0 && rescue_prune_is_default_scoring(pp) && (n % scalar_stride) == 0) {
-                int S, te, qe; std::vector<int> R;
+                int S, te, qe, om = -1; std::vector<int> R;
                 scalar_dp(J, S, te, qe, R);
                 const int s2 = S >= minsc ? scalar_score2(R, S, te, minsc) : -1;
                 bool sok = S == a.score;
@@ -868,11 +871,17 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                     int tb, qb;
                     scalar_pass1(J, S, te, qe, tb, qb);
                     sok = sok && s2 == a.score2 && tb == a.tb && qb == a.qb;
+                    /* score2_ub bounds every row max >= minsc outside the zone, unmerged: the
+                     * pruned window's rows are R's shifted by off[t], so the same rows are outside */
+                    for (int i = 0; i < (int)R.size(); i++)
+                        if ((i < te - S || i > te + S) && R[i] >= minsc) om = std::max(om, R[i]);
+                    sok = sok && a.score2_ub >= om && (b_ub == INT_MIN || b_ub >= om);
                 }
                 if (!sok) {
                     scal_mm++;
-                    if (scal_mm < 5) fprintf(stderr, "SCALAR vs kswv job=%zu cls=%d: scalar{%d %d %d %d} kswv{%d %d %d %d}\n",
-                                             base + t, J.cls, S, te, qe, s2, a.score, a.te, a.qe, a.score2);
+                    if (scal_mm < 5) fprintf(stderr, "SCALAR vs kswv job=%zu cls=%d: scalar{%d %d %d %d out-of-zone max %d} kswv{%d %d %d %d score2_ub %d} pruned score2_ub %d\n",
+                                             base + t, J.cls, S, te, qe, s2, om, a.score, a.te, a.qe, a.score2, a.score2_ub,
+                                             b_ub == INT_MIN ? -2 : b_ub);
                 }
             }
         }

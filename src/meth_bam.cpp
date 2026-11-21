@@ -501,6 +501,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
     /* Chimera QC + set-as-failed applied here so group propagation upstream
      * only scans flags. */
     uint8_t mapq = p.mapq;
+    int qc_ceiling = 0; // chimera QC capped this record's MAPQ at 1 (YQ:i takes the same ceiling)
     int mapped = !(flag16 & 0x4) && direction != 0;
     if (mapped) {
         if (opt->meth_set_as_failed != 0 && opt->meth_set_as_failed == direction) {
@@ -512,6 +513,7 @@ int meth_mem_aln_to_bam(bam1_t *b,
                 flag16 |= 0x200;
                 flag16 &= ~0x2;
                 if (mapq > 1) mapq = 1;
+                qc_ceiling = 1;
             }
         }
     }
@@ -614,6 +616,12 @@ int meth_mem_aln_to_bam(bam1_t *b,
     if (p.sub >= 0) {
         int32_t xs = (int32_t)p.sub;
         if (bam_aux_append(b, "XS", 'i', sizeof(xs), (const uint8_t *)&xs) < 0) return -1;
+    }
+    if (p.yq1) { // --meth-mapq conversion-blind (only under --meth): the MAPQ without the cap
+        // under the same chimera-QC ceiling as the emitted MAPQ; only when still above it
+        int32_t yq = (int32_t)p.yq1 - 1;
+        if (qc_ceiling && yq > 1) yq = 1;
+        if (yq > (int32_t)mapq && bam_aux_append(b, "YQ", 'i', sizeof(yq), (const uint8_t *)&yq) < 0) return -1;
     }
     if (bwa_rg_id[0]) {
         if (bam_aux_append(b, "RG", 'Z', (int)strlen(bwa_rg_id) + 1, (const uint8_t *)bwa_rg_id) < 0) return -1;

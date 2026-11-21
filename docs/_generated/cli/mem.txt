@@ -216,11 +216,12 @@ Methylation (--meth) options:
                  and other callers that read the per-base calls from XM:Z.
    --meth-mapq conversion-blind|scoring
                  how MAPQ is computed. conversion-blind (default for em-seq with
-                 genomic scoring): MAPQ is capped at what the same scoring gives
-                 with C/T (and G/A) interchangeable, at the same penalties; the
-                 record's placement, CIGAR and other tags are unchanged, but
-                 for the MAPQ that MQ:i and SA:Z repeat; when the cap lowers
-                 MAPQ the original is kept in YQ:i. Without it a
+                 genomic scoring): MAPQ is capped at an estimate of what the same
+                 scoring gives with C/T (and G/A) interchangeable, at the same
+                 penalties (the alignments found, repriced on their gap
+                 placement); the record's placement, CIGAR and other tags are
+                 unchanged, but for the MAPQ that MQ:i and SA:Z repeat; when
+                 the cap lowers MAPQ the original is kept in YQ:i. Without it a
                  retained (methylated) C makes a short read look unique, so
                  filtering on MAPQ inflates CpG methylation. scoring: MAPQ
                  follows --meth-scoring; the default for collapsed (where the

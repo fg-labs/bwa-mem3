@@ -58,9 +58,13 @@ typedef struct {
 	int te, qe; // target end and query end
 	int score2, te2; // second best score and ending position on the target
 	int tb, qb; // target start and query start
+	/* An upper bound on every column maximum >= minsc ending outside [te - Z, te + Z]
+	 * (Z = ceil(score / max)), before score2's adjacent-column merge, which can drop such a column
+	 * for a higher neighbour inside the zone; -1: none. With KSW_XSUBO, like score2. */
+	int score2_ub;
 } kswr_t;
 
-const kswr_t g_defr = { 0, -1, -1, -1, -1, -1, -1 };
+const kswr_t g_defr = { 0, -1, -1, -1, -1, -1, -1, -1 };
 
 #ifdef __cplusplus
 extern "C" {

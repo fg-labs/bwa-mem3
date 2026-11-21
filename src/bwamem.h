@@ -166,9 +166,11 @@ enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC
 
 /* How --meth MAPQ is computed (--meth-mapq; mem_opt_t.meth_mapq).
  *   SCORING:          MAPQ follows the --meth-scoring model.
- *   CONVERSION_BLIND: MAPQ is capped at what the same scoring gives with the mirror cell
- *                     (read C x reference T on the C->T strand, read G x reference A on the G->A
- *                     strand) freed as a conversion, at the same penalties. Under genomic scoring a
+ *   CONVERSION_BLIND: MAPQ is capped at an estimate of what the same scoring gives with the
+ *                     mirror cell (read C x reference T on the C->T strand, read G x reference A
+ *                     on the G->A strand) freed as a conversion, at the same penalties: the
+ *                     alignments found are repriced on their genomic gap placement (see
+ *                     mem_meth_blind_rescore). Under genomic scoring a
  *                     retained (methylated) C otherwise makes a short read look unique, so a MAPQ
  *                     filter selects methylated molecules and inflates CpG methylation. Placement,
  *                     CIGAR and the other tags stay the scoring model's. Resolved by
@@ -614,6 +616,9 @@ typedef struct { // This struct is only used for the convenience of API.
      * (meth_mem_aln_to_bam) sources the XG strand tag and the XM source
      * strand from THIS, not from the (now retired) f/r contig direction. */
     int8_t meth_hypothesis;
+    /* --meth-mapq conversion-blind: the MAPQ the cap replaced, plus one (YQ:i); 0 when the cap
+     * did not lower this record's MAPQ. In what was tail padding. */
+    uint8_t yq1;
 } mem_aln_t;
 
 // struct
@@ -881,9 +886,11 @@ int mem_chain_weight(const mem_chain_t *c);
 
 /* `oa` (--alt-project primary only, else NULL): the read's OA:Z candidate,
  * written on its record if the read ends up unmapped and oa->rid >= 0. */
+/* id >= 0: the mem_mark_primary_se id the regions were marked with, which --meth-mapq
+ * conversion-blind needs to redo their selection (mem_meth_blind_se_caps); -1: no cap. */
 void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                  bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
-                 const mem_alnreg_t *oa = NULL);
+                 const mem_alnreg_t *oa = NULL, int64_t id = -1);
 /* mem_reg2sam that reuses `anchor`, the caller's unmodified mem_reg2aln of
  * a->a[anchor_k], instead of converting that region again (anchor NULL or
  * anchor_k < 0: none). The caller keeps ownership of `anchor`, whose CIGAR
@@ -893,7 +900,40 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                           bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
                           int anchor_k, const mem_aln_t *anchor,
-                          const mem_alnreg_t *oa = NULL);
+                          const mem_alnreg_t *oa = NULL, const int *mapq_cap = NULL);
+
+/* --meth-mapq conversion-blind (mem_meth_mapq). mapq_cap above, when non-NULL, holds each
+ * region's cap (255: none): a primary or supplementary record's MAPQ above it is lowered to it,
+ * and the MAPQ it would otherwise have had kept in mem_aln_t.yq1 (YQ:i).
+ *
+ * The helpers below are internal to the aligner (bwamem.cpp and bwamem_pair.cpp):
+ * mem_meth_blind_prefix: the running counts of C (pc) and G (pg) in the original read, and the
+ * read in 2-bit codes (query; N is 4), as mem_meth_blind_rescore takes it.
+ * mem_meth_blind_bound: an upper bound on how much freeing the mirror cell can raise region ar's
+ * score (mem_meth_blind_rescore): a+b for each read base the mirror cell can take (C on the C->T
+ * strand, G on the G->A strand) in the read, plus, when one lies outside the query span, a match
+ * for each base past the span; 0 for a non-meth region.
+ * mem_meth_blind_rescore: raises ar's score and truesc by what freeing the mirror cell gains on
+ * the path its score was taken from: a+b per mirror mismatch on it (on its diagonal when it is
+ * certainly gap-free, else on its genomic CIGAR, made with emission's band), and what the path
+ * then gains by extending past where the genomic one stopped, within the read and the region's
+ * contig. When it raises the score, it also moves ar's span (qb, qe, rb, re) to the path that
+ * score is taken over, so that mem_approx_mapq_se's identity and mem_mark_primary_se's overlaps
+ * read the raised score on its own span.
+ * mem_meth_blind_tmp: mem_mark_primary_se's near-tie margin. */
+void mem_meth_blind_prefix(const char *orig, int l_query, std::vector<int> *pc, std::vector<int> *pg,
+                           std::vector<uint8_t> *query);
+int mem_meth_blind_bound(const mem_opt_t *opt, const bntseq_t *bns, const std::vector<int> &pc,
+                         const std::vector<int> &pg, const mem_alnreg_t *ar);
+void mem_meth_blind_rescore(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                            int l_query, const uint8_t *query, mem_alnreg_t *ar);
+static inline int mem_meth_blind_tmp(const mem_opt_t *opt)
+{
+    int tmp = opt->a + opt->b;
+    tmp = opt->o_del + opt->e_del > tmp ? opt->o_del + opt->e_del : tmp;
+    tmp = opt->o_ins + opt->e_ins > tmp ? opt->o_ins + opt->e_ins : tmp;
+    return tmp;
+}
 
 int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a) ;
 /* --alt-project primary: the number of read ends (an SE read, or one end of a
@@ -1244,12 +1284,27 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
  * paired alignment was preferred; on *paired_out == 0 it is partial (0x1 only)
  * and the caller owns the proper-pair 0x2 FLAG bit itself (emission-side), as
  * mem_sam_pe does. Returns the mate-rescue hit count. */
+/* --meth-mapq conversion-blind: the pairing decision a mirror-free run would make for one pair,
+ * from mem_pair_resolve_batch_post to emission (mem_meth_blind_pe_cap in bwamem_pair.cpp). A caller
+ * of mem_pair_resolve_batch_post that emits its own records must pass one under conversion-blind
+ * and cap each end itself; without it the decision is the scoring one. The regions live in
+ * thread-local storage, valid until the thread's next shadow. */
+struct mem_meth_blind_pe_t {
+    int on;           // the shadow ran (else no end is capped)
+    int paired;       // the shadow paired the ends: z[] and q[] are set
+    int n_pri[2], z[2], q[2];
+    mem_alnreg_v a[2];
+    /* each end's regions as the real decision has them, by index: a shadow region's dedup_re_rank
+     * (a scratch field) indexes it here, since a rescore can move its span */
+    const mem_alnreg_t *orig[2];
+};
 int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                 const uint8_t *pac, const mem_pestat_t pes[4],
                                 uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
                                 kswr_t **myaln, mem_cache *mmc, int32_t &gcnt, int tid,
                                 int n_pri[2], int z[2], int q_se[2],
-                                int *extra_flag_out, int *paired_out);
+                                int *extra_flag_out, int *paired_out,
+                                mem_meth_blind_pe_t *blind = NULL);
 
 /* Caller-owned state of one mate-rescue alnreg vector across
  * mem_matesw_batch_post calls: `fixpoint` = 1 when the vector, apart from

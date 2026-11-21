@@ -1,8 +1,9 @@
-# Flags: --meth chemistry, --meth-context, --meth-scoring, --meth-tags, --set-as-failed, --chimera-qc
+# Flags: --meth chemistry, --meth-context, --meth-scoring, --meth-mapq, --meth-mapq-max-len, --meth-tags, --set-as-failed, --chimera-qc
 
 `--meth` itself takes an optional chemistry argument. Alongside it,
 `--meth-context` selects where a conversion is free,
-`--meth-scoring` selects the scoring model and `--meth-tags` selects which
+`--meth-scoring` selects the scoring model, `--meth-mapq` how MAPQ is computed (and `--meth-mapq-max-len` for
+which read lengths) and `--meth-tags` selects which
 Bismark tags are emitted; `--set-as-failed` and `--chimera-qc`
 control QC behavior during BAM post-processing (both affect the chimera QC and
 strand-filtering logic inside `meth_mem_aln_to_bam`, `src/meth_bam.cpp`).
@@ -171,6 +172,109 @@ simulated 5-base reads ([measurement](5base.md#measured-on-simulated-5-base-read
 > matrices, whether it appears before or after `--meth`. The other `--meth`
 > defaults (`-L 10 -U 100 -T 40 -M -C`) are the same across modes.
 
+## `--meth-mapq {conversion-blind|scoring}`
+
+Under `genomic` scoring the mirror cell (reference `T` × read `C` on OT, reference
+`A` × read `G` on OB) is a mismatch. A short read that kept a methylated CpG `C`
+is then unique where a fully converted copy of the same molecule is not, because
+every competing locus with a `T` at that position costs a mismatch. Filtering on
+MAPQ therefore selects methylated molecules, and CpG methylation from short reads
+comes out too high.
+
+**Accepted values:**
+
+- `conversion-blind` (**default for `--meth`/`--meth=emseq` with `genomic` scoring**)
+  — cap each record's MAPQ at an estimate of the MAPQ the same run gives with the
+  mirror cell freed as a conversion, at the same penalties; a locus that wins with
+  the mirror cell free gives a cap of 0. The estimate reprices the alignments this
+  run found, keeping the gap placement of their genomic alignments: apart from the
+  mate-rescue window (below), it does not search again for alignments or gap
+  placements that only the mirror-free scoring would choose. Placement, CIGAR, `NM`,
+  `MD`, `XA`, `SA`, the Bismark tags, pairing and mate rescue are unchanged, so the
+  record is `genomic`'s in every field but MAPQ (and the MAPQ that `MQ:i` and `SA:Z`
+  repeat). A record whose MAPQ the cap lowered carries the MAPQ it would otherwise
+  have (the `scoring` one, after the supplementary rules and the `--chimera-qc`
+  ceiling of 1) in `YQ:i`, whatever `--meth-tags` selects; a record whose uncapped
+  MAPQ is no higher than its emitted one after that ceiling carries none. `AS:i` and
+  `XS:i` stay `genomic`'s, so filter on MAPQ, not on those.
+- `scoring` — MAPQ follows `--meth-scoring`, as before. The default (and the only
+  value accepted) for `--meth=taps`, `--meth=5base` and `--meth-scoring neutral`:
+  their reads are mostly unconverted, so freeing the mirror cell discards most of
+  what places a short read. Under `collapsed`, which already frees the mirror cell,
+  the two values are the same.
+
+The CPU costs in this section and the next were measured on an AWS c8g.8xlarge (Graviton4, 32
+vCPUs; Linux, arm64, NEON tier; clang 19), `-t 32`. The accuracy numbers were measured on an
+Apple M2 Max (arm64, NEON tier) and reproduced exactly on that host.
+
+**How it is computed.** After a read's alignments are selected, they are copied and
+each one is rescored with the mirror cell free: it gains `A+B` for each mirror
+mismatch on the path its score was taken from (its diagonal when it is certainly
+gap-free, else its alignment, made with the same band as the emitted CIGAR), and it may then
+extend past where the genomic extension stopped, within the read and its contig; a copy that
+gains takes the span of that path. The same primary
+selection and MAPQ then run on the copies. For a pair, the copies go through the same pairing (with the batch's
+insert-size estimate); an end that pairing places where the real one does is capped
+at the MAPQ it gives that end, any other end at 0. A single read rescores its primaries and only
+the other alignments a mirror-free gain could bring within reach of a primary; a pair rescores every alignment that can
+gain, since the pairing MAPQ counts near-ties of the second-best pair, which can lie far below
+the chosen one. A mate found by mate rescue also takes its rescue window's second-best alignment
+as a competitor (`csub`); the shadow aligns that window again with the mirror cell free, when
+that could change the mate's MAPQ, and keeps the higher second-best. With
+[`--rescue-kmer`](../cli/mem.md#--rescue-kmerk----rescue-band-int--banded-mate-rescue-opt-in-not-byte-identical),
+the genomic second-best comes from a narrowed window, so the shadow's estimate can differ from
+`collapsed -B 4`'s. A read whose MAPQ is already 0 is skipped. The cost is +3.2 % user CPU on NA12878 read 1
+cut to 20–50 bp single-end, +3.7 % and +4.2 % on pairs with read 1 at 25 bp or both ends
+at 30 bp, and +6.4 % on full-length 2×99 bp pairs (median of 5;
+[`--meth-mapq-max-len`](#--meth-mapq-max-len-int) trades it against a bias in repeats).
+
+**Measured** on public NA12878 EM-seq (SRR10532145, 2×99 bp, 2 M pairs), read 1
+cut to 20–50 bp and aligned single-end with `mem -k 14 -T 18`.
+The columns are the share of reads at MAPQ ≥ 20 and the CpG methylation of those
+reads minus the mean ENCODE GM12878 WGBS level at the same CpGs (ONT HG001 5mC
+agrees within about 0.007):
+
+| read length | `scoring` | `conversion-blind` |
+|---|---|---|
+| 20 bp | 2.6 %, +0.151 | 0.1 %, +0.002 |
+| 25 bp | 10.7 %, +0.113 | 5.3 %, +0.002 |
+| 30 bp | 51.9 %, +0.016 | 50.1 %, +0.004 |
+| 36 bp | 64.3 %, +0.007 | 63.3 %, +0.002 |
+| 50 bp | 68.5 %, +0.003 | 67.7 %, +0.001 |
+
+Why cap MAPQ rather than default to `collapsed`: `genomic`'s full-length placement
+gain over `collapsed` comes from its `-B 4`, not from the mirror cell, and the cap
+keeps it. On simulated 2×150 bp EM-seq from chr20–22 aligned to hg38 (2.16 M reads;
+every read is capped), MAPQ ≥ 20 and
+correct is 0.9217 with the cap vs 0.9234 under `genomic` (`collapsed`: 0.9097),
+misplaced at MAPQ ≥ 20 is 46 vs 55 per million, and wrong at MAPQ 60 is 8 in both
+(`collapsed`: 177).
+
+## `--meth-mapq-max-len INT`
+
+`--meth-mapq conversion-blind` caps only reads of at most `INT` bases. For a pair, both ends are
+capped when either end is that short, since the pairing MAPQ couples them. Longer reads keep the
+`scoring` MAPQ unchanged and carry no `YQ:i`. `0`, the default, caps every length.
+
+The pooled bias is a short-read one. Measured as above, with read 1 cut to 60 and 75 bp (the
+columns are as in the table above; `collapsed -B 4`, the cap's reference, in the last):
+
+| read length | `scoring` | `conversion-blind` | `collapsed -B 4` |
+|---|---|---|---|
+| 60 bp | 72.2 %, +0.002 | 71.2 %, −0.001 | 71.3 %, −0.001 |
+| 75 bp | 76.3 %, −0.000 | 75.2 %, −0.002 | 75.3 %, −0.002 |
+
+But it does not go away at full length: it moves into repeats. In a twin simulation (2×150 bp
+pairs from chr20–22 at about 10×, each fragment simulated once fully CpG-methylated and once
+unmethylated with the same sequencing errors, aligned to hg38), the uncapped
+MAPQ lets 0.16 % more methylated than unmethylated reads through MAPQ ≥ 20. Pooled that is only
++0.0006, but at CpGs in segmental duplications (GIAB v3.3) the mean bias is +0.006 and 1.9 % of
+sites with at least 10 reads are off by more than 0.1. With the cap no site is. So every length is
+capped by default. Capping long reads costs CPU (rescoring the competitors of reads in repeats, and
+a second pairing decision): +6.4 % user CPU on 2×99 bp pairs (200 k NA12878 pairs; median of 5,
+on the host above). Set `INT` (for example 60) to cap only short reads and save that
+CPU, at the cost of the bias in repeats.
+
 ## `--meth-context {all|cpg}`
 
 Where a methylation conversion is free. `all` (the default, for every chemistry)
@@ -338,10 +442,11 @@ bwameth.py's chimera logic always runs.
 
 | Condition | `0x200` set? | `0x2` cleared? | MAPQ capped? |
 |-----------|-------------|----------------|--------------|
-| Normal aligned record (default, no flags) | No | No | No |
+| Normal aligned record (no flags; `--meth-mapq scoring`, or outside em-seq `genomic`) | No | No | No |
 | `--chimera-qc` triggers (longest M/=/X < 44%) | Yes | Yes | Yes (≤1) |
 | `--set-as-failed` strand matches | Yes | No | No |
 | Both `--chimera-qc` + `--set-as-failed` active | Yes | Yes | Yes (≤1) |
+| `--meth-mapq conversion-blind` (the em-seq `genomic` default), reads of at most `--meth-mapq-max-len` bases | No | No | Yes (to the conversion-blind MAPQ; the original in `YQ:i`) |
 
 ## `-M` and split alignments
 

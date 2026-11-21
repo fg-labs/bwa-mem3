@@ -1400,6 +1400,26 @@ only at a CpG, and a C→T at any other `C` counts
 with `--meth`.
 See [Flags → --meth-scoring](../methylation/flags.md#--meth-scoring-collapsedgenomicneutral).
 
+#### `--meth-mapq {conversion-blind|scoring}` — methylation-independent MAPQ
+
+`conversion-blind` (the default for `--meth`/`--meth=emseq` with `genomic` scoring) caps each
+record's MAPQ at an estimate of the MAPQ it would get with the mirror cell (reference `T` × read
+`C`, reference `A` × read `G`) free, at the same penalties (the alignments this run found,
+repriced on their genomic gap placement), so a retained methylated `C` does not make a short read
+look unique and a MAPQ filter does not select methylated molecules. Placement and CIGAR are
+unchanged, as is every other tag except the MAPQ that `MQ:i` and `SA:Z` repeat, which follows the
+capped MAPQ; a lowered record keeps its uncapped MAPQ in `YQ:i`. `scoring` restores the
+uncapped MAPQ, and is the default (and the only value accepted) for `--meth=taps`, `--meth=5base` and
+`--meth-scoring neutral`; under `collapsed` the two are the same. Only meaningful with `--meth`.
+See [Flags → --meth-mapq](../methylation/flags.md#--meth-mapq-conversion-blindscoring).
+
+#### `--meth-mapq-max-len INT` — read length the conversion-blind MAPQ applies to
+
+`conversion-blind` caps only reads of at most `INT` bases; for a pair, both ends are capped when
+either end is that short. Longer reads keep the `scoring` MAPQ, which saves CPU but leaves a small
+bias at CpGs in repeats. `0` (the default) caps every length. Requires `--meth`.
+See [Flags → --meth-mapq-max-len](../methylation/flags.md#--meth-mapq-max-len-int).
+
 #### `--meth-context {all|cpg}` — where a conversion is free
 
 `all` (the default for every chemistry) frees the conversion at every reference

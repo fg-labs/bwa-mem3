@@ -392,11 +392,12 @@ void meth_opts_usage_mapq(FILE *fp)
 {
     fprintf(fp, "   --meth-mapq conversion-blind|scoring\n");
     fprintf(fp, "                 how MAPQ is computed. conversion-blind (default for em-seq with\n");
-    fprintf(fp, "                 genomic scoring): MAPQ is capped at what the same scoring gives\n");
-    fprintf(fp, "                 with C/T (and G/A) interchangeable, at the same penalties; the\n");
-    fprintf(fp, "                 record's placement, CIGAR and other tags are unchanged, but\n");
-    fprintf(fp, "                 for the MAPQ that MQ:i and SA:Z repeat; when the cap lowers\n");
-    fprintf(fp, "                 MAPQ the original is kept in YQ:i. Without it a\n");
+    fprintf(fp, "                 genomic scoring): MAPQ is capped at an estimate of what the same\n");
+    fprintf(fp, "                 scoring gives with C/T (and G/A) interchangeable, at the same\n");
+    fprintf(fp, "                 penalties (the alignments found, repriced on their gap\n");
+    fprintf(fp, "                 placement); the record's placement, CIGAR and other tags are\n");
+    fprintf(fp, "                 unchanged, but for the MAPQ that MQ:i and SA:Z repeat; when\n");
+    fprintf(fp, "                 the cap lowers MAPQ the original is kept in YQ:i. Without it a\n");
     fprintf(fp, "                 retained (methylated) C makes a short read look unique, so\n");
     fprintf(fp, "                 filtering on MAPQ inflates CpG methylation. scoring: MAPQ\n");
     fprintf(fp, "                 follows --meth-scoring; the default for collapsed (where the\n");

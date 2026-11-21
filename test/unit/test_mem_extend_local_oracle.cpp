@@ -425,7 +425,7 @@ TEST_CASE("local SW oracle: hand-worked ksw_align2 and kswv results on every run
             CAPTURE(dai);
             const kswr_t o = local_align(c.qry, c.ref, def, xtra16, dai);
             INFO("oracle " << show(o) << "; want " << show(c.want));
-            CHECK(memcmp(&o, &c.want, sizeof o) == 0);
+            CHECK(show(o) == show(c.want)); // the seven fields above; not score2_ub, which the oracle leaves unset
         }
         Expected want;
         want.r = c.want;

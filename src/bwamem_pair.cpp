@@ -1276,6 +1276,20 @@ int mem_pair(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, cons
 
 void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq1_t *s, int n, const mem_aln_t *list, int which, const mem_aln_t *m);
 
+/* --meth-mapq conversion-blind: where each region mate rescue added came from, for the shadow to
+ * reprice its csub (mem_meth_blind_reprice). Recorded per mate end by mem_matesw_batch_post while
+ * mem_pair_resolve_batch_post runs a pair with the shadow on, and cleared at its next pair. */
+struct blind_rescue_prov_t {
+    int64_t wrb, wre;     // the rescue window [wrb, wre), before any narrowing
+    int64_t rb, re;       // the region rescue added
+    int qb, qe, rid;
+    int is_rev, hyp;      // the mate's orientation and the matrix hypothesis it was scored with
+    int score, te, score2; // the window's best score, its end (window coordinates) and the csub
+    int score2_ub;         // kswr_t::score2_ub: bounds every column score2's merge can drop
+};
+static thread_local bool t_rescue_prov_on = false;
+static thread_local std::vector<blind_rescue_prov_t> t_rescue_prov[2];
+
 // Preserve the integer MAPQ until after the near-pair correction, but bound
 // the conversion when a saturated pair leaves a very large score margin.
 static inline int raw_mapq(int64_t diff, int a)
@@ -1754,6 +1768,326 @@ int mem_sam_pe_batch(const mem_opt_t *opt, mem_cache *mmc,
     return 1;
 }
 
+struct blind_reprice_ctx_t;
+static int mem_pair_decide(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                           const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
+                           int n_pri[2], int z[2], int q_se[2], int *extra_flag_out, int trace,
+                           const blind_reprice_ctx_t *rp = NULL);
+
+// mem_meth_blind_pe_prepare's state for mem_meth_blind_pe_run, per thread
+static thread_local std::vector<int> t_blind_bound[2];
+static thread_local std::vector<mem_alnreg_t> t_blind_regs[2], t_blind_orig[2];
+static thread_local std::vector<uint8_t> t_blind_query[2];
+static thread_local std::vector<uint8_t> t_blind_repriced[2]; // by original region index
+
+// what mem_meth_blind_reprice needs inside the shadow's pairing decision
+struct blind_reprice_ctx_t {
+    const mem_opt_t *opt;
+    const bntseq_t *bns;
+    const uint8_t *pac;
+    const bseq1_t *s;
+    const mem_meth_blind_pe_t *b;
+};
+
+/* The single-end MAPQ terms a region's csub enters: mem_approx_mapq_se and the pairing's tandem
+ * cap, raw_mapq(score - csub), each clipped to [0, 60]. Both fall as csub rises. */
+static inline void blind_csub_terms(const mem_opt_t *opt, mem_alnreg_t *x, int csub, int t[2])
+{
+    const int keep = x->csub;
+    x->csub = csub;
+    t[0] = mem_approx_mapq_se(opt, x);
+    x->csub = keep;
+    const int r = raw_mapq((int64_t)x->score - csub, opt->a);
+    t[1] = r < 0 ? 0 : r > 60 ? 60 : r;
+}
+
+/* --meth-mapq conversion-blind: reprice the csub of a shadow region x of end `end` that mate rescue
+ * added. Its csub is the rescue window's second-best score (ksw_align2's score2: the best column
+ * maximum ending outside te +- ceil(score / max) of the window's best end te), under genomic
+ * scoring; with the mirror cell free that alternative can score higher. The window is aligned
+ * again with the mirror cell free, and with Z the genomic best's zone: when the free best ends
+ * outside Z, an alternative overtook it and csub becomes its score; when the free best ends in Z
+ * and its second best outside, csub becomes that; otherwise (Z moved, an artifact of the zone)
+ * csub is kept. csub only rises, so the MAPQ only falls.
+ *
+ * Every column counted lies outside Z, where the genomic column maximum is at most
+ * max(score2_ub, minsc - 1) (not score2: its adjacent-column merge can drop a column outside Z for
+ * a higher neighbour inside it, which freeing the mirror cell can then overtake), and freeing
+ * the mirror cell raises a path by at most a+b per mirror-able base of the mate (C, or G, as the
+ * window's matrix sees it). The window is aligned only when that
+ * bound could change one of x's csub terms; the skip depends on the read's bases only through a
+ * bound that cannot change the result, so the cap stays independent of methylation. Done once per
+ * region; x->dedup_re_rank indexes it. */
+static void mem_meth_blind_reprice(const blind_reprice_ctx_t *rp, int end, mem_alnreg_t *x)
+{
+    const mem_opt_t *opt = rp->opt;
+    const int k = x->dedup_re_rank;
+    std::vector<uint8_t> &done = t_blind_repriced[end];
+    if (k < 0 || (size_t)k >= done.size() || done[k]) return;
+    done[k] = 1;
+    const mem_alnreg_t *o = &rp->b->orig[end][k];
+    const blind_rescue_prov_t *pv = NULL;
+    for (const blind_rescue_prov_t &e : t_rescue_prov[end])
+        if (e.rid == o->rid && e.rb == o->rb && e.re == o->re && e.qb == o->qb && e.qe == o->qe) { pv = &e; break; }
+    if (pv == NULL) return;
+    const bseq1_t *s = &rp->s[end];
+    const int l_ms = s->l_seq;
+    // the mirror cell's read base as the window's matrix sees the oriented mate: C (hyp 1) or G;
+    // on the forward read, its complement when the mate is reverse-complemented
+    const int mb = pv->hyp ? 1 : 2, fb = pv->is_rev ? 3 - mb : mb;
+    int n_mirror = 0;
+    for (int i = 0; i < l_ms; ++i) n_mirror += nst_nt4_decode((unsigned char)s->meth_orig_seq[i], 4) == fb;
+    if (n_mirror == 0) return;
+    const int minsc = opt->min_seed_len * opt->a;
+    const int64_t hi = (int64_t)std::max(pv->score2_ub, minsc - 1) + (int64_t)(opt->a + opt->b) * n_mirror;
+    const int cu = (int)std::min<int64_t>(hi, INT_MAX);
+    if (cu <= x->csub) return;
+    int t0[2], t1[2];
+    blind_csub_terms(opt, x, x->csub, t0);
+    blind_csub_terms(opt, x, cu, t1);
+    if (t0[0] == t1[0] && t0[1] == t1[1]) return;
+    int m = 5;
+    const int8_t *gen = meth_model_mat(opt, pv->hyp, &m);
+    if (m != 5) return; // --meth-context cpg: refused with em-seq, so never here
+    int8_t mf[25];
+    memcpy(mf, gen, sizeof mf);
+    mf[(pv->hyp ? 3 : 0) * 5 + mb] = (int8_t)opt->a; // ref T x read C, or ref A x read G
+    int amax = 0;
+    for (int i = 0; i < 25; ++i) amax = std::max(amax, (int)mf[i]);
+    if (amax <= 0) return;
+    static thread_local std::vector<uint8_t> ref, fwd, qry;
+    const int64_t wl = pv->wre - pv->wrb;
+    if (wl <= 0) return;
+    ref.resize((size_t)wl);
+    int64_t got = 0;
+    bns_get_seq_into(rp->bns->l_pac, rp->pac, pv->wrb, pv->wre, ref.data(), &got);
+    if (got != wl) return;
+    fwd.resize((size_t)l_ms);
+    qry.resize((size_t)l_ms);
+    for (int i = 0; i < l_ms; ++i) fwd[i] = nst_nt4_decode((unsigned char)s->meth_orig_seq[i], 4);
+    matesw_orient(fwd.data(), l_ms, pv->is_rev, qry.data());
+    const int u8_shift = matesw_u8_shift_for(opt, opt->mat), u8_qmax = matesw_u8_qmax_for(opt, opt->mat);
+    const int xtra = KSW_XSUBO | (matesw_use_u8(l_ms, u8_qmax, u8_shift) ? KSW_XBYTE : 0) | minsc;
+    const kswr_t r = ksw_align2(l_ms, qry.data(), (int)wl, ref.data(), 5, mf, opt->o_del, opt->e_del,
+                                opt->o_ins, opt->e_ins, xtra, 0);
+    const int zw = (pv->score + amax - 1) / amax;
+    auto outside = [&](int te) { return te < pv->te - zw || te > pv->te + zw; };
+    int csub = x->csub;
+    if (r.score > 0 && outside(r.te)) csub = std::max(csub, r.score);
+    else if (r.score2 > 0 && outside(r.te2)) csub = std::max(csub, r.score2);
+    x->csub = csub;
+}
+
+/* --meth-mapq conversion-blind's shadow, in two steps around the real decision.
+ * mem_meth_blind_pe_prepare, on the regions after mate rescue: when some region of either end can
+ * gain from a free mirror cell (mem_meth_blind_bound > 0), copies both ends' regions and returns
+ * 1; else 0 (also when both ends are longer than --meth-mapq-max-len: the whole pair is then left
+ * uncapped).
+ * mem_meth_blind_pe_run then rescores every copy that can gain (mem_meth_blind_rescore) and runs
+ * the same pairing decision on them (b->on = 1). No competitor is pruned by its score, as the
+ * single-end shadow does: the pairing MAPQ counts the pairs near the second-best pair (n_sub),
+ * which can lie any distance below the pair chosen, so a region out of range on its own can still
+ * move it. */
+static int mem_meth_blind_pe_prepare(const mem_opt_t *opt, const bntseq_t *bns, const bseq1_t s[2],
+                                     const mem_alnreg_v a[2], mem_meth_blind_pe_t *b)
+{
+    b->on = b->paired = 0;
+    if (!meth_mapq_conversion_blind(opt) || s[0].meth_orig_seq == NULL || s[1].meth_orig_seq == NULL
+        || !meth_mapq_blind_len(opt, s[0].l_seq < s[1].l_seq ? s[0].l_seq : s[1].l_seq))
+        return 0;
+    static thread_local std::vector<int> pc, pg;
+    bool any = false;
+    for (int i = 0; i < 2; ++i) {
+        const int n = (int)a[i].n;
+        std::vector<int> &bound = t_blind_bound[i];
+        bound.assign(n, 0);
+        if (n == 0) continue;
+        mem_meth_blind_prefix(s[i].meth_orig_seq, s[i].l_seq, &pc, &pg, &t_blind_query[i]);
+        for (int k = 0; k < n; ++k) {
+            bound[k] = mem_meth_blind_bound(opt, bns, pc, pg, &a[i].a[k]);
+            if (bound[k] > 0) any = true;
+        }
+    }
+    if (!any) return 0;
+    for (int i = 0; i < 2; ++i) {
+        t_blind_regs[i].assign(a[i].a, a[i].a + a[i].n);
+        t_blind_orig[i].assign(a[i].a, a[i].a + a[i].n);
+        for (size_t k = 0; k < a[i].n; ++k) {
+            t_blind_regs[i][k].sub_n = 0;               // mem_mark_primary_se counts it up from 0
+            t_blind_regs[i][k].dedup_re_rank = (int)k; // its region in b->orig[i]
+        }
+        t_blind_repriced[i].assign(a[i].n, 0);
+        b->orig[i] = t_blind_orig[i].data();
+        b->a[i].n = b->a[i].m = a[i].n;
+        b->a[i].a = t_blind_regs[i].data();
+        b->a[i].capped_w = a[i].capped_w;
+    }
+    return 1;
+}
+
+static void mem_meth_blind_pe_run(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                                  const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2],
+                                  mem_meth_blind_pe_t *b)
+{
+    for (int i = 0; i < 2; ++i) {
+        std::vector<mem_alnreg_t> &c = t_blind_regs[i];
+        const std::vector<int> &bound = t_blind_bound[i];
+        for (size_t k = 0; k < c.size() && k < bound.size(); ++k)
+            if (bound[k] > 0) mem_meth_blind_rescore(opt, bns, pac, s[i].l_seq, t_blind_query[i].data(), &c[k]);
+    }
+    const blind_reprice_ctx_t rp = { opt, bns, pac, s, b };
+    int extra_flag;
+    b->paired = mem_pair_decide(opt, bns, pac, pes, id, s, b->a, b->n_pri, b->z, b->q, &extra_flag, 0, &rp);
+    // the regions mem_meth_blind_pe_cap may take a single-end MAPQ from
+    for (int i = 0; i < 2; ++i)
+        for (size_t k = 0; k < b->a[i].n; ++k)
+            if (b->a[i].a[k].secondary < 0) mem_meth_blind_reprice(&rp, i, &b->a[i].a[k]);
+    b->on = 1;
+}
+
+/* The cap for an end emitted at region L: 255 when the shadow did not run; when it paired (and
+ * pair is set), its MAPQ for that end if it chose the same region, else 0; otherwise that region's
+ * single-end MAPQ in the shadow (0 when it is not primary there; 255 if absent). */
+static int mem_meth_blind_pe_cap(const mem_opt_t *opt, const mem_meth_blind_pe_t *b, int end,
+                                 const mem_alnreg_t *L, bool pair = true)
+{
+    if (b == NULL || !b->on) return 255;
+    auto same = [L, b, end](const mem_alnreg_t *s) {
+        const mem_alnreg_t *x = &b->orig[end][s->dedup_re_rank]; // where the real decision has it
+        return x->rid == L->rid && x->rb == L->rb && x->re == L->re && x->qb == L->qb && x->qe == L->qe;
+    };
+    if (pair && b->paired) return same(&b->a[end].a[b->z[end]]) ? b->q[end] : 0;
+    for (size_t k = 0; k < b->a[end].n; ++k) {
+        const mem_alnreg_t *x = &b->a[end].a[k];
+        if (same(x)) return x->secondary < 0 ? mem_approx_mapq_se(opt, x) : 0;
+    }
+    return 255;
+}
+
+/* The pairing decision on an end pair's regions after mate rescue: mem_mark_primary_se, PRIMARY5,
+ * mem_seed_capped_sub, mem_pair, is_multi and the q_pe/q_se recombination. Returns 1 when the
+ * ends are paired (z[] and q_se[] set, *extra_flag_out carrying 0x2 iff the paired alignment is
+ * preferred), else 0 (only n_pri[] valid, *extra_flag_out 0x1). trace: write the --alt-project
+ * trace (the real decision; --meth-mapq's shadow decision passes 0). */
+static int mem_pair_decide(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                           const mem_pestat_t pes[4], uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
+                           int n_pri[2], int z[2], int q_se[2], int *extra_flag_out, int trace,
+                           const blind_reprice_ctx_t *rp)
+{
+    extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
+    extern void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);
+    extern int mem_approx_mapq_se(const mem_opt_t *opt, const mem_alnreg_t *a);
+    int i, j, o, subo, n_sub, extra_flag = 1;
+    n_pri[0] = mem_mark_primary_se(opt, a[0].n, a[0].a, id<<1|0);
+    n_pri[1] = mem_mark_primary_se(opt, a[1].n, a[1].a, id<<1|1);
+
+    #if V17
+    if (opt->flag & MEM_F_PRIMARY5) {
+        mem_reorder_primary5(opt->T, &a[0]);
+        mem_reorder_primary5(opt->T, &a[1]);
+    }
+    #endif
+
+    /* --extend-csub: seed each end's primary competitor score from the chains the
+     * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
+    mem_seed_capped_sub(&a[0], opt->a);
+    mem_seed_capped_sub(&a[1], opt->a);
+
+    if (trace && opt->alt_lift)
+        for (int end = 0; end < 2; ++end)
+            mem_alt_trace_pair(bns, "paired_input", s[end].name, s[end].id,
+                               (int) a[end].n, a[end].a, n_pri[end], -2);
+
+    if (opt->flag & MEM_F_NOPAIRING) { *extra_flag_out = extra_flag; return 0; }
+
+    // pairing single-end hits
+    if (!(n_pri[0] && n_pri[1] &&
+          (o = mem_pair(opt, bns, pac, pes, s, a, id, &subo, &n_sub, z, n_pri)) > 0)) {
+        *extra_flag_out = extra_flag;
+        return 0;
+    }
+
+    int is_multi[2], q_pe;
+    int64_t score_un;
+    // check if an end has multiple hits even after mate-SW
+    for (i = 0; i < 2; ++i) {
+        for (j = 1; j < n_pri[i]; ++j)
+            if (a[i].a[j].secondary < 0 && a[i].a[j].score >= opt->T) break;
+        is_multi[i] = j < n_pri[i]? 1 : 0;
+    }
+    if (is_multi[0] || is_multi[1]) { *extra_flag_out = extra_flag; return 0; } // TODO: in rare cases, the true hit may be long but with low score
+
+    // compute mapQ for the best SE hit
+    // The unpaired alternative can exceed the saturated pair score. Keep it
+    // wide so that overflow cannot turn an inferior pair into a proper pair.
+    score_un = (int64_t)a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
+    int64_t subo_wide = subo > score_un? subo : score_un;
+    if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo_wide) subo_wide = fl; }
+    {
+        /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
+         * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
+         * either end deflates confidence even when one paired alignment looks
+         * clean. Meth-gated so non-meth PE MAPQ is byte-identical. */
+        int64_t qdiff = (int64_t)o - subo_wide;
+        if (opt->meth_mode) {
+            int se2_0 = (n_pri[0] > 1) ? a[0].a[1].score : 0;
+            int se2_1 = (n_pri[1] > 1) ? a[1].a[1].score : 0;
+            int64_t cap = (int64_t)o + 4LL * opt->a - ((int64_t)se2_0 + se2_1);
+            if (qdiff > cap) qdiff = cap;
+        }
+        if (qdiff < 0) qdiff = 0;
+        q_pe = raw_mapq(qdiff, opt->a);
+    }
+
+    if (n_sub > 0) q_pe -= (int)(4.343 * log((double)n_sub + 1.) + .499);
+    if (q_pe < 0) q_pe = 0;
+    if (q_pe > 60) q_pe = 60;
+
+    q_pe = (int)(q_pe * (1. - .5 * (a[0].a[0].frac_rep + a[1].a[0].frac_rep)) + .499);
+
+    // the following assumes no split hits
+    if (o > score_un) { // paired alignment is preferred
+        mem_alnreg_t *c[2];
+        c[0] = &a[0].a[z[0]]; c[1] = &a[1].a[z[1]];
+        for (i = 0; i < 2; ++i) {
+            if (c[i]->secondary >= 0)
+                c[i]->sub = a[i].a[c[i]->secondary].score, c[i]->secondary = -2;
+            if (rp) mem_meth_blind_reprice(rp, i, c[i]); // the shadow: reprice a rescued csub
+            q_se[i] = mem_approx_mapq_se(opt, c[i]);
+        }
+
+        q_se[0] = q_se[0] > q_pe? q_se[0] : q_pe < q_se[0] + 40? q_pe : q_se[0] + 40;
+        q_se[1] = q_se[1] > q_pe? q_se[1] : q_pe < q_se[1] + 40? q_pe : q_se[1] + 40;
+        extra_flag |= 2;
+
+        // cap at the tandem repeat score
+        q_se[0] = q_se[0] < raw_mapq((int64_t)c[0]->score - c[0]->csub, opt->a)? q_se[0] : raw_mapq((int64_t)c[0]->score - c[0]->csub, opt->a);
+        q_se[1] = q_se[1] < raw_mapq((int64_t)c[1]->score - c[1]->csub, opt->a)? q_se[1] : raw_mapq((int64_t)c[1]->score - c[1]->csub, opt->a);
+        q_se[0] = q_se[0] > 0? q_se[0] : 0;
+        q_se[1] = q_se[1] > 0? q_se[1] : 0;
+
+    } else { // the unpaired alignment is preferred
+        z[0] = z[1] = 0;
+        if (rp) mem_meth_blind_reprice(rp, 0, &a[0].a[0]), mem_meth_blind_reprice(rp, 1, &a[1].a[0]);
+        q_se[0] = mem_approx_mapq_se(opt, &a[0].a[0]);
+        q_se[1] = mem_approx_mapq_se(opt, &a[1].a[0]);
+
+    }
+    /* Experimental confidence-only guard: preserve every projected locus for
+     * pair selection, then subtract the requested margin from the pair's score
+     * advantage. Cap both ends so SE/PE recombination cannot undo the guard. */
+    if (opt->alt_lift && opt->alt_project_pair_gap && opt->alt_project_min_gap > 0
+        && o > score_un && (a[0].a[z[0]].alt_bw || a[1].a[z[1]].alt_bw)) {
+        const int64_t margin = (int64_t) opt->alt_project_min_gap * opt->a;
+        const int64_t advantage = std::max((int64_t) 0, (int64_t) o - subo_wide - margin);
+        const int cap = std::min(60, raw_mapq(advantage, opt->a));
+        q_se[0] = std::min(q_se[0], cap);
+        q_se[1] = std::min(q_se[1], cap);
+    }
+    *extra_flag_out = extra_flag;
+    return 1;
+}
+
 /* Resolve half of mem_sam_pe_batch_post (below): mate rescue over the batched
  * kswv results plus the full pairing decision, with SAM/BAM emission left to
  * the caller. Provided so external callers can drive the batched SIMD
@@ -1778,7 +2112,7 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                                 uint64_t id, bseq1_t s[2], mem_alnreg_v a[2],
                                 kswr_t **myaln, mem_cache *mmc, int32_t &gcnt, int tid,
                                 int n_pri[2], int z[2], int q_se[2],
-                                int *extra_flag_out, int *paired_out)
+                                int *extra_flag_out, int *paired_out, mem_meth_blind_pe_t *blind)
 {
     extern int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id);
     extern void mem_seed_capped_sub(mem_alnreg_v *a, int match_a);
@@ -1793,10 +2127,15 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
 
     int32_t *gar = (int32_t*) mmc->seqPairArrayAux[tid];
 
-    int n = 0, i, j, o, subo, n_sub, extra_flag = 1;
+    int n = 0, i, j, extra_flag = 1;
 
     *paired_out = 0;
     *extra_flag_out = extra_flag;
+
+    // --meth-mapq conversion-blind: record where rescued regions came from (mem_meth_blind_reprice)
+    t_rescue_prov[0].clear(), t_rescue_prov[1].clear();
+    t_rescue_prov_on = blind != NULL && opt->meth_mode
+                       && meth_mapq_blind_len(opt, s[0].l_seq < s[1].l_seq ? s[0].l_seq : s[1].l_seq);
 
     if (!(opt->flag & MEM_F_NO_RESCUE)) { // then perform SW for the best alignment
         mem_alnreg_v b[2];
@@ -1900,110 +2239,32 @@ int mem_pair_resolve_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         #endif
         free(b[0].a); free(b[1].a);
     }
+    t_rescue_prov_on = false; // mem_matesw_batch_post records only for this pair's rescue
 
-    n_pri[0] = mem_mark_primary_se(opt, a[0].n, a[0].a, id<<1|0);
-    n_pri[1] = mem_mark_primary_se(opt, a[1].n, a[1].a, id<<1|1);
-
-    #if V17
-    if (opt->flag & MEM_F_PRIMARY5) {
-        mem_reorder_primary5(opt->T, &a[0]);
-        mem_reorder_primary5(opt->T, &a[1]);
+    /* --meth-mapq conversion-blind: copies of the regions as the decision below receives them (it
+     * sorts them), when a region could gain from a free mirror cell, for the same decision on them
+     * rescored (mem_meth_blind_pe_run), which runs only when a record the real decision would emit
+     * has a MAPQ above 0 to cap. */
+    const int prepared = blind ? mem_meth_blind_pe_prepare(opt, bns, s, a, blind) : 0;
+    const int paired = mem_pair_decide(opt, bns, pac, pes, id, s, a, n_pri, z, q_se, &extra_flag, 1);
+    if (prepared) {
+        bool any_mapq = false;
+        for (i = 0; i < 2 && !any_mapq; ++i) {
+            if (paired) {
+                // the pair's region, and the end's ALT record (emitted at its single-end MAPQ)
+                any_mapq = q_se[i] > 0;
+                const int alt_i = mem_pe_alt_slot(opt, &a[i], n_pri[i]);
+                if (alt_i >= 0) any_mapq = any_mapq || mem_approx_mapq_se(opt, &a[i].a[alt_i]) > 0;
+            } else {
+                for (j = 0; j < (int)a[i].n && !any_mapq; ++j)
+                    any_mapq = a[i].a[j].secondary < 0 && mem_approx_mapq_se(opt, &a[i].a[j]) > 0;
+            }
+        }
+        if (any_mapq) mem_meth_blind_pe_run(opt, bns, pac, pes, id, s, blind);
     }
-    #endif
-
-    /* --extend-csub: seed each end's primary competitor score from the chains the
-     * cap/gate dropped, before pairing/MAPQ below reads csub. No-op when off. */
-    mem_seed_capped_sub(&a[0], opt->a);
-    mem_seed_capped_sub(&a[1], opt->a);
-
-    if (opt->alt_lift)
-        for (int end = 0; end < 2; ++end)
-            mem_alt_trace_pair(bns, "paired_input", s[end].name, s[end].id,
-                               (int) a[end].n, a[end].a, n_pri[end], -2);
-
-    if (opt->flag & MEM_F_NOPAIRING) { *extra_flag_out = extra_flag; return n; }
-
-    // pairing single-end hits
-    if (!(n_pri[0] && n_pri[1] &&
-          (o = mem_pair(opt, bns, pac, pes, s, a, id, &subo, &n_sub, z, n_pri)) > 0)) {
+    if (!paired) {
         *extra_flag_out = extra_flag;
         return n;
-    }
-
-    int is_multi[2], q_pe;
-    int64_t score_un;
-    // check if an end has multiple hits even after mate-SW
-    for (i = 0; i < 2; ++i) {
-        for (j = 1; j < n_pri[i]; ++j)
-            if (a[i].a[j].secondary < 0 && a[i].a[j].score >= opt->T) break;
-        is_multi[i] = j < n_pri[i]? 1 : 0;
-    }
-    if (is_multi[0] || is_multi[1]) { *extra_flag_out = extra_flag; return n; } // TODO: in rare cases, the true hit may be long but with low score
-
-    // compute mapQ for the best SE hit
-    // The unpaired alternative can exceed the saturated pair score. Keep it
-    // wide so that overflow cannot turn an inferior pair into a proper pair.
-    score_un = (int64_t)a[0].a[0].score + a[1].a[0].score - opt->pen_unpaired;
-    int64_t subo_wide = subo > score_un? subo : score_un;
-    if (opt->extend_csub) { int fl = mem_capped_pair_subo(a, z, o); if (fl > subo_wide) subo_wide = fl; }
-    {
-        /* Meth PE MAPQ hardening (dragmap-style, cf. minibwa r404): fold each
-         * end's SECOND-best single-end hit into the pair MAPQ so a repeat on
-         * either end deflates confidence even when one paired alignment looks
-         * clean. Meth-gated so non-meth PE MAPQ is byte-identical. */
-        int64_t qdiff = (int64_t)o - subo_wide;
-        if (opt->meth_mode) {
-            int se2_0 = (n_pri[0] > 1) ? a[0].a[1].score : 0;
-            int se2_1 = (n_pri[1] > 1) ? a[1].a[1].score : 0;
-            int64_t cap = (int64_t)o + 4LL * opt->a - ((int64_t)se2_0 + se2_1);
-            if (qdiff > cap) qdiff = cap;
-        }
-        if (qdiff < 0) qdiff = 0;
-        q_pe = raw_mapq(qdiff, opt->a);
-    }
-
-    if (n_sub > 0) q_pe -= (int)(4.343 * log((double)n_sub + 1.) + .499);
-    if (q_pe < 0) q_pe = 0;
-    if (q_pe > 60) q_pe = 60;
-
-    q_pe = (int)(q_pe * (1. - .5 * (a[0].a[0].frac_rep + a[1].a[0].frac_rep)) + .499);
-
-    // the following assumes no split hits
-    if (o > score_un) { // paired alignment is preferred
-        mem_alnreg_t *c[2];
-        c[0] = &a[0].a[z[0]]; c[1] = &a[1].a[z[1]];
-        for (i = 0; i < 2; ++i) {
-            if (c[i]->secondary >= 0)
-                c[i]->sub = a[i].a[c[i]->secondary].score, c[i]->secondary = -2;
-            q_se[i] = mem_approx_mapq_se(opt, c[i]);
-        }
-
-        q_se[0] = q_se[0] > q_pe? q_se[0] : q_pe < q_se[0] + 40? q_pe : q_se[0] + 40;
-        q_se[1] = q_se[1] > q_pe? q_se[1] : q_pe < q_se[1] + 40? q_pe : q_se[1] + 40;
-        extra_flag |= 2;
-
-        // cap at the tandem repeat score
-        q_se[0] = q_se[0] < raw_mapq((int64_t)c[0]->score - c[0]->csub, opt->a)? q_se[0] : raw_mapq((int64_t)c[0]->score - c[0]->csub, opt->a);
-        q_se[1] = q_se[1] < raw_mapq((int64_t)c[1]->score - c[1]->csub, opt->a)? q_se[1] : raw_mapq((int64_t)c[1]->score - c[1]->csub, opt->a);
-        q_se[0] = q_se[0] > 0? q_se[0] : 0;
-        q_se[1] = q_se[1] > 0? q_se[1] : 0;
-
-    } else { // the unpaired alignment is preferred
-        z[0] = z[1] = 0;
-        q_se[0] = mem_approx_mapq_se(opt, &a[0].a[0]);
-        q_se[1] = mem_approx_mapq_se(opt, &a[1].a[0]);
-
-    }
-    /* Experimental confidence-only guard: preserve every projected locus for
-     * pair selection, then subtract the requested margin from the pair's score
-     * advantage. Cap both ends so SE/PE recombination cannot undo the guard. */
-    if (opt->alt_lift && opt->alt_project_pair_gap && opt->alt_project_min_gap > 0
-        && o > score_un && (a[0].a[z[0]].alt_bw || a[1].a[z[1]].alt_bw)) {
-        const int64_t margin = (int64_t) opt->alt_project_min_gap * opt->a;
-        const int64_t advantage = std::max((int64_t) 0, (int64_t) o - subo_wide - margin);
-        const int cap = std::min(60, raw_mapq(advantage, opt->a));
-        q_se[0] = std::min(q_se[0], cap);
-        q_se[1] = std::min(q_se[1], cap);
     }
     for (i = 0; i < 2; ++i) {
         int k = a[i].a[z[i]].secondary_all;
@@ -2045,8 +2306,11 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
      * the mate-rescue hit count. On the paired path z[]/q_se[]/extra_flag carry
      * the pairing outputs; on the no-pairing path (paired == 0) only n_pri[] is
      * valid and this function assembles the proper-pair 0x2 FLAG bit itself. */
+    mem_meth_blind_pe_t blind_state;
+    mem_meth_blind_pe_t *blind = meth_mapq_conversion_blind(opt) ? &blind_state : NULL;
+    if (blind) blind->on = 0;
     int n = mem_pair_resolve_batch_post(opt, bns, pac, pes, id, s, a, myaln, mmc,
-                                        gcnt, tid, n_pri, z, q_se, &extra_flag, &paired);
+                                        gcnt, tid, n_pri, z, q_se, &extra_flag, &paired, blind);
 
     if (opt->alt_lift)
         for (int end = 0; end < 2; ++end)
@@ -2069,6 +2333,10 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
         for (i = 0; i < 2; ++i) {
             h[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, &a[i].a[z[i]], s[i].meth_orig_seq);
             h[i].mapq = q_se[i];
+            if (blind) { // --meth-mapq conversion-blind
+                const int cap = mem_meth_blind_pe_cap(opt, blind, i, &a[i].a[z[i]]);
+                if ((int)h[i].mapq > cap) { h[i].yq1 = (uint8_t)(h[i].mapq + 1); h[i].mapq = (uint32_t)cap; }
+            }
 
             h[i].flag |= 0x40<<i | extra_flag;
             h[i].XA = XA[i]? XA[i][z[i]] : 0;
@@ -2077,11 +2345,15 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (alt[i] >= 0) { // the read has an emitted ALT hit
                 mem_alnreg_t *p = &a[i].a[alt[i]];
                 g[i] = mem_reg2aln(opt, bns, pac, s[i].l_seq, s[i].seq, p, s[i].meth_orig_seq);
+                if (blind) { // --meth-mapq conversion-blind: the ALT hit at its shadow single-end MAPQ
+                    const int cap = mem_meth_blind_pe_cap(opt, blind, i, p, false);
+                    if ((int)g[i].mapq > cap) { g[i].yq1 = (uint8_t)(g[i].mapq + 1); g[i].mapq = (uint32_t)cap; }
+                }
                 g[i].flag |= 0x800 | 0x40<<i | extra_flag;
                 g[i].XA = XA[i]? XA[i][alt[i]] : 0;
                 g[i].HN = HN[i]? HN[i][alt[i]] : -1;
                 if (opt->supp_rep_hard_cap > 0 && p->chain_n_hits >= opt->supp_rep_hard_cap)
-                    g[i].mapq = 0; // fg-labs: force repetitive-supp MAPQ to 0
+                    g[i].mapq = 0, g[i].yq1 = 0; // fg-labs: force repetitive-supp MAPQ to 0 (with or without the cap)
                 aa[i][n_aa[i]++] = g[i];
             }
         }
@@ -2147,10 +2419,25 @@ int mem_sam_pe_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
     // reuses it rather than running mem_reg2aln (and its global alignment) on
     // that region again. When which[i] < 0, h[i] is the unmapped record and
     // nothing is reused.
-    mem_reg2sam_anchored(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &h[1], which[0], &h[0],
-                         oa ? &oa[0] : NULL);
-    mem_reg2sam_anchored(opt, bns, pac, &s[1], &a[1], 0x81|extra_flag, &h[0], which[1], &h[1],
-                         oa ? &oa[1] : NULL);
+    /* --meth-mapq conversion-blind: each primary region's cap, and the mates as each record's
+     * MQ:i sees them (h[] itself stays the unmodified anchor). */
+    static thread_local std::vector<int> pcap[2];
+    const int *caps[2] = { NULL, NULL };
+    mem_aln_t mate[2] = { h[0], h[1] };
+    if (blind && blind->on)
+        for (i = 0; i < 2; ++i) {
+            pcap[i].assign(a[i].n, 255);
+            for (j = 0; j < (int)a[i].n; ++j)
+                // an ALT record takes its single-end cap, as on the paired path
+                if (a[i].a[j].secondary < 0)
+                    pcap[i][j] = mem_meth_blind_pe_cap(opt, blind, i, &a[i].a[j], !a[i].a[j].is_alt);
+            caps[i] = pcap[i].data();
+            if (which[i] >= 0 && (int)mate[i].mapq > pcap[i][which[i]]) mate[i].mapq = (uint32_t)pcap[i][which[i]];
+        }
+    mem_reg2sam_anchored(opt, bns, pac, &s[0], &a[0], 0x41|extra_flag, &mate[1], which[0], &h[0],
+                         oa ? &oa[0] : NULL, caps[0]);
+    mem_reg2sam_anchored(opt, bns, pac, &s[1], &a[1], 0x81|extra_flag, &mate[0], which[1], &h[1],
+                         oa ? &oa[1] : NULL, caps[1]);
     if (strcmp(s[0].name, s[1].name) != 0)
         err_fatal(__func__, "paired reads have different names: \"%s\", \"%s\"\n",
                   s[0].name, s[1].name);
@@ -2922,12 +3209,13 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             /* --rescue-kmer or pruning: apply the same narrowing offset _pre stored
              * for this regid, so aln.tb/te map against the narrowed window start
              * (batched pairs only; index==-1 scalar-fallback pairs were never narrowed). */
+            const int64_t wrb = rb; // the window before narrowing (the shadow rescores all of it)
             if (narrowed && index >= 0)
                 rb += mmc->rescue_narrow_off[tid][index];
             if (index == MATESW_GAR_PROVEN_FAIL) {
                 /* Proven score < min_seed_len: the gate below fails exactly as for a real SW. */
                 memset(&aln, 0, sizeof aln);
-                aln.qb = aln.qe = aln.tb = aln.te = aln.score2 = aln.te2 = -1;
+                aln.qb = aln.qe = aln.tb = aln.te = aln.score2 = aln.te2 = aln.score2_ub = -1;
             }
             else if (index == -1) {
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
@@ -3025,6 +3313,11 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 b.score = aln.score;
                 b.csub = aln.score2;
                 b.secondary = -1;
+                if (t_rescue_prov_on && meth_won_hyp >= 0 && mate_meth_ot >= 0)
+                    t_rescue_prov[mate_meth_ot ^ 1].push_back({ wrb, re, b.rb, b.re, b.qb, b.qe, b.rid, is_rev,
+                                                                 meth_won_hyp, aln.score,
+                                                                 aln.te + (int)(rb - wrb), aln.score2,
+                                                                 aln.score2_ub });
                 b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
                 b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
