@@ -4884,10 +4884,15 @@ TEST_CASE("aln_meth: exact-rescue-window rescues a mate at the stated window's e
     CHECK(tag_value(exact, "NM:i") == "1");
     // Plain aln keeps sampe's window unless asked; --meth takes the exact one unless told not to.
     CHECK(by_default.second == (meth ? on.second : off.second));
-    for (int i = 0; i < 2 * n_cal; ++i) { // the calibration pairs are proper and need no rescue
+    // The calibration pairs are proper and need no rescue: every field of their records, tags
+    // included, is the same in both modes.
+    std::stringstream off_body(off.second), on_body(on.second);
+    for (int i = 0; i < 2 * n_cal; ++i) {
         CAPTURE(i);
-        CHECK(off.first[i].cigar == on.first[i].cigar); CHECK(off.first[i].pos == on.first[i].pos);
-        CHECK(off.first[i].flag == on.first[i].flag); CHECK(off.first[i].mapq == on.first[i].mapq);
+        std::string off_line, on_line;
+        REQUIRE(static_cast<bool>(std::getline(off_body, off_line)));
+        REQUIRE(static_cast<bool>(std::getline(on_body, on_line)));
+        CHECK(off_line == on_line);
     }
 }
 
