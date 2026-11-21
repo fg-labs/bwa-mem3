@@ -355,7 +355,7 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
     // This is separate from the wrapper's active-DP budget.
     if (bytes > (64ULL << 20) - x->alignment_bytes) {
         x->res->flags |= ALN_METH_BIND_CIGAR;
-        x->stop = 1;
+        x->stop = ALN_METH_STOP_CIGAR;
         return;
     }
     x->alignment_bytes += bytes;
@@ -396,7 +396,7 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
                 ++x.res->n_lookups;
                 resolve_window(&x, h, sa);
             }
-            if ((bwtint_t)n < width) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = 1; }
+            if ((bwtint_t)n < width) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = ALN_METH_STOP_LOOKUP; }
         }
         x.pend.clear();
         g->cores[i].state = GAP_SLOT_SEARCH;
@@ -564,6 +564,10 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
     aln_meth_read_t *r = x->res;
     if (x->extra) { // --known-snvs: windows the ALT-window search found, resolved as any other
+        // The lookup budget ends only the genomic lookups: these windows are already found, so
+        // they are still resolved, under the CIGAR budget. ALN_METH_BIND_BEST keeps the read
+        // incomplete (MAPQ 0, no pairing promotion).
+        if (x->stop == ALN_METH_STOP_LOOKUP) x->stop = 0;
         for (const aln_meth_candidate_t &c : *x->extra) {
             if (x->stop) break;
             if ((c.hyp ^ c.strand) != x->grp->read_no) continue;

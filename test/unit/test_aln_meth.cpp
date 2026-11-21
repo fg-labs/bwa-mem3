@@ -1779,10 +1779,10 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
         ba::aln_meth_flush_parked(&group);
     }
     CHECK(results[0].flags == ba::ALN_METH_BIND_CIGAR);
-    CHECK(slot.stop == 1);
+    CHECK(slot.stop == ba::ALN_METH_STOP_CIGAR);
     CHECK(results[0].n_lookups == (retained ? 2 : 1));
     CHECK(slot.pend.empty());
-    // A stopped read must not even visit later ALT-window candidates.
+    // A read stopped by the CIGAR budget must not even visit later ALT-window candidates.
     std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, 600, 600 + ALN_MAX_READ_LEN + 1}};
     slot.extra = &extra;
     ba::aln_meth_slot_finish(&slot);
@@ -1819,6 +1819,72 @@ TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the 
     CHECK(record.find("X0:i:") == std::string::npos);
     CHECK(record.find("X1:i:") == std::string::npos);
     CHECK(record.find("XA:Z:") == std::string::npos);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
+    free(opt);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
+TEST_CASE("aln_meth: a genomic lookup-budget stop still resolves the ALT-window candidates")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("lookup-cap.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(reads != nullptr);
+    REQUIRE(n == 1);
+    const std::string prefix = ref().fa + ".meth";
+    FMI_search fmi(prefix.c_str());
+    fmi.load_index(false, 1);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    mo.p_best = 0; mo.p_second = 0; // no genomic lookup fits the budget
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    ba::aln_meth_group_t group;
+    group.bwt = bwt; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    group.n_slots = 1; group.slot.resize(1);
+    ba::gap_slot_core_t core = {};
+    group.cores = &core;
+    auto &slot = group.slot[0];
+    slot.grp = &group; slot.job = &core.job;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+    ba::gap_entry_t exact = {};
+    ba::aln_meth_hit(&slot, &exact, 0, 0);
+    core.state = ba::GAP_SLOT_PARKED;
+    ba::aln_meth_flush_parked(&group);
+    CHECK(result.flags == ba::ALN_METH_BIND_BEST);
+    CHECK(slot.stop == ba::ALN_METH_STOP_LOOKUP);
+    CHECK(result.n_lookups == 0);
+    CHECK(result.occ.empty());
+    // The ALT-window search already found the read's exact window: it is still resolved.
+    const int64_t rb = (int64_t)mr.bns->anns[0].offset + 500;
+    std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, rb, rb + 50}};
+    slot.extra = &extra;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.flags == ba::ALN_METH_BIND_BEST);
+    REQUIRE(result.main >= 0);
+    CHECK(result.hits[result.main].pos == 500);
+    CHECK(result.hits[result.main].strand == 0);
+    ba::bwase_initialize();
+    ba::aln_meth_finish_se(&mr, &mo, opt, 3, 1, reads, &result);
+    // Still incomplete: MAPQ 0, no exact X0/X1.
+    CHECK((int)reads[0].mapQ == 0);
+    CHECK((int)reads[0].c1 == 0);
+    CHECK((int)reads[0].c2 == 0);
+    kstring_t text = {0, 0, nullptr};
+    ba::aln_meth_print_sam1(&text, &mr, &mo, reads, &result, 1, nullptr, BWA_MODE_COMPREAD, 30);
+    const std::string record(text.s, text.l);
+    free(text.s);
+    CHECK(record.find("r0\t0\tc1\t501\t0\t50M\t") == 0);
+    CHECK(record.find("X0:i:") == std::string::npos);
+    CHECK(record.find("X1:i:") == std::string::npos);
     ba::aln_meth_ref_free(&mr);
     ba::bwt_destroy(bwt);
     free(opt);

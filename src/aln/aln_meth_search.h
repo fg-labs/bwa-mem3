@@ -14,6 +14,8 @@ namespace bwa_aln {
 struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; };
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
+// aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not)
+enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2 };
 struct aln_meth_slot_t {
     aln_meth_group_t *grp = nullptr;
     gap_job_t *job = nullptr;
