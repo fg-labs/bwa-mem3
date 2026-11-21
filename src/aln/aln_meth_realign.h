@@ -61,9 +61,11 @@ void aln_meth_score_ungapped(const aln_meth_ref_t &ref, const aln_meth_fast_t &f
 /* The path scorer's ungapped block: query [qs, qs + n) against the original reference [rpos, rpos +
  * n), which starts at offset wo of a window whose ambiguity runs are amb (aln_meth_amb_bits; one bit
  * per base in the low bit of a 2-bit lane, as the read's planes). Adds the block's strict
- * mismatches (an N on either side included), conversions, ambiguous columns and, when rd.seed is
- * set, strict mismatches at the seed mask's positions. Requires f.ok. */
-struct aln_meth_block_counts_t { int n_mm = 0, n_conv = 0, n_amb = 0, n_seed_mm = 0; };
+ * mismatches (an N on either side included), the mirror-cell mismatches among them (OT read C over
+ * reference T, OB read G over reference A; --meth-mapq conversion-blind), conversions, ambiguous
+ * columns and, when rd.seed is set, strict and mirror-cell mismatches at the seed mask's positions.
+ * Requires f.ok. */
+struct aln_meth_block_counts_t { int n_mm = 0, n_conv = 0, n_amb = 0, n_seed_mm = 0, n_mirror = 0, n_seed_mirror = 0; };
 void aln_meth_amb_bits(const aln_meth_ref_t &ref, int64_t rb, int len, std::vector<uint64_t> *bits);
 void aln_meth_score_block(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, int hyp, int64_t rpos, int qs, int n,
                           const aln_meth_read_bits_t &rd, const uint64_t *amb, int wo, aln_meth_block_counts_t *out);

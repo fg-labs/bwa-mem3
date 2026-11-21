@@ -1322,6 +1322,9 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "   equal-cost locus, an end left there has MAPQ <= min(60,6*delta), delta the smallest\n");
 	fprintf(fp, "   conversion-count gap; an end that pairing or mate rescue moves takes the pair's MAPQ.\n");
 	fprintf(fp, "   Pair all retained loci up to --max-occ only without lookup/work cutoffs on either end.\n");
+	fprintf(fp, "   Paired, --meth-mapq conversion-blind caps an end by the same pairing on mirror-free costs\n");
+	fprintf(fp, "   (an end it places elsewhere gets 0), and a rescued mate by its anchor's cap.\n");
+	meth_opts_usage_mapq(fp);
 	fprintf(fp, "   Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.\n");
 	fprintf(fp, "   aln -B is barcode length, not mem's mismatch penalty. Records carry\n");
 	fprintf(fp, "   XR/XG/XM:Z instead of XM:i/XO:i/XG:i.\n");
@@ -1493,6 +1496,7 @@ int main_aln(int argc, char *argv[])
 	aln_meth_ref_t meth_ref;
 	meth_cli_t meth_cli;
 	memset(&meth_cli, 0, sizeof meth_cli);
+	meth_cli.mapq_supported = 1; // aln implements --meth-mapq (METH_LONG_OPTION_MAPQ below)
 	static const struct option long_opts[] = {
 		{"max-xa-hits", required_argument, 0, OPT_MAX_XA},
 		{"max-xa-hits-discordant", required_argument, 0, OPT_MAX_XA_DISC},
@@ -1506,6 +1510,7 @@ int main_aln(int argc, char *argv[])
 		{"bam-level", required_argument, 0, OPT_BAM_LEVEL},
 		{"help", no_argument, 0, OPT_HELP},
 		METH_LONG_OPTIONS_SHARED
+		METH_LONG_OPTION_MAPQ
 		{0, 0, 0, 0}
 	};
 
