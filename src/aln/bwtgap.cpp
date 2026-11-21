@@ -347,6 +347,19 @@ static GAP_HOT void gap_cpush(gap_cstack_t *stack, int i, bwtint_t k, bwtint_t l
 	gap_cstore(stack, score, &t);
 }
 
+// Prefetches the entry gap_cpop would return now (the top of the lowest non-empty bucket): after
+// an expansion whose children all score above it, that entry is the next pop, and it was usually
+// pushed long before, so it is no longer in cache. A hint only: nothing is read or changed.
+template <class E>
+static inline void gap_prefetch_top(const gap_cstack_t *stack)
+{
+	if (!stack->n_entries) return;
+	const gap_bucket_t *q = stack->stacks + stack->best;
+	const E *t = ((const gap_chunk_of<E>*)q->top)->e + (q->top_n - 1);
+	__builtin_prefetch(t);
+	__builtin_prefetch((const char*)t + sizeof(E) - 1);
+}
+
 template <class E = gap_entry_t>
 static GAP_HOT void gap_cpop(gap_cstack_t *stack, E *e)
 {
@@ -780,6 +793,10 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 						X->prove = 0;
 						if (aln_meth_prove_nohit(X, J)) break;
 					}
+					if (__builtin_expect(X->n_steps > X->prove2_at, 0)) {
+						X->prove2_at = INT64_MAX;
+						if (aln_meth_prove_nohit2(X, J)) break;
+					}
 				}
 			}
 			k = e.k; l = e.l; // SA interval
@@ -815,10 +832,12 @@ static GAP_HOT int gap_job_step(gap_job_t *J, const bwt_t *bwt, typename P::ext_
 			J->pending = JOB_OCC4;
 			J->e = e; J->i = i; J->m = m; J->m_seed = m_seed; J->k = k; J->l = l;
 			bwt_prefetch_2occ(bwt, k, l);
+			if constexpr (P::meth) gap_prefetch_top<E>(stack); // the entry the next pop may return
 			return 0;
 		}
 
 		bwt_2occ4(bwt, k - 1, l, cnt_k, cnt_l); // retrieve Occ values
+		if constexpr (P::meth) ++X->n_steps; // the second proof's trigger (aln_meth_prove_nohit2)
 		occ = l - k + 1;
 		f_score = -1; // no child held yet
 		// test whether diff is allowed
