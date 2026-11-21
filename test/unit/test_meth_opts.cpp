@@ -9,7 +9,9 @@
 #include "aln/aln_meth.h"
 
 #include <cstdlib>
+#include <initializer_list>
 #include <string>
+#include <utility>
 
 namespace {
 
@@ -128,6 +130,7 @@ TEST_CASE("meth_opts: aln and mem share named defaults and set-as-failed parsing
     CHECK(aln.m.meth_context == f.opt->meth.meth_context);
     CHECK(aln.m.meth_set_as_failed == f.opt->meth.meth_set_as_failed);
     CHECK(aln.m.meth_set_as_failed == 0);
+    CHECK(aln.m.meth_mapq == f.opt->meth.meth_mapq);
     for (const char *value : {"f", "r"}) {
         meth_cli_t cli = {};
         REQUIRE(meth_opts_parse_shared(OPT_METH, "taps", &aln.m, &cli) == 1);
@@ -142,4 +145,51 @@ TEST_CASE("meth_opts: aln and mem share named defaults and set-as-failed parsing
         CHECK(aln.m.meth_set_as_failed == f.opt->meth.meth_set_as_failed);
         CHECK(aln.m.meth_scoring == f.opt->meth.meth_scoring);
     }
+}
+
+namespace {
+// The --meth-mapq a subcommand ends up with: argv as (option id, value) pairs, parsed and finalized
+// as a subcommand that does (aln) or does not (mem) implement it.
+int resolved_mapq(std::initializer_list<std::pair<int, const char *>> args, bool supported) {
+    meth_opt_t m;
+    meth_opt_init(&m);
+    meth_cli_t cli = {};
+    cli.mapq_supported = supported;
+    for (const auto &a : args) REQUIRE(meth_opts_parse_shared(a.first, a.second, &m, &cli) == 1);
+    meth_opts_finalize_shared(&m, &cli);
+    return meth_mapq_conversion_blind(&m) ? MEM_METH_MAPQ_CONVERSION_BLIND : m.meth_mapq;
+}
+}  // namespace
+
+TEST_CASE("meth_opts: --meth-mapq resolves to conversion-blind only for em-seq genomic where implemented"
+          * doctest::test_suite("unit/meth_opts")) {
+    const int blind = MEM_METH_MAPQ_CONVERSION_BLIND, scoring = MEM_METH_MAPQ_SCORING;
+    // the default
+    CHECK(resolved_mapq({{OPT_METH, nullptr}}, true) == blind);
+    CHECK(resolved_mapq({{OPT_METH, "emseq"}}, true) == blind);
+    CHECK(resolved_mapq({{OPT_METH, "bisulfite"}}, true) == blind);
+    CHECK(resolved_mapq({{OPT_METH, nullptr}, {OPT_METH_SCORING, "genomic"}}, true) == blind);
+    CHECK(resolved_mapq({{OPT_METH, nullptr}, {OPT_METH_SCORING, "collapsed"}}, true) == scoring);
+    CHECK(resolved_mapq({{OPT_METH, nullptr}, {OPT_METH_SCORING, "neutral"}}, true) == scoring);
+    CHECK(resolved_mapq({{OPT_METH, "taps"}}, true) == scoring);
+    CHECK(resolved_mapq({{OPT_METH, "5base"}}, true) == scoring);
+    CHECK(resolved_mapq({{OPT_METH, "5base"}, {OPT_METH_SCORING, "genomic"}}, true) == scoring);
+    // a subcommand that does not implement it (mem) keeps scoring
+    CHECK(resolved_mapq({{OPT_METH, nullptr}}, false) == scoring);
+    // explicit values, in either order relative to the scoring option
+    CHECK(resolved_mapq({{OPT_METH, nullptr}, {OPT_METH_MAPQ, "scoring"}}, true) == scoring);
+    CHECK(resolved_mapq({{OPT_METH_MAPQ, "conversion-blind"}, {OPT_METH, nullptr}}, true) == blind);
+    CHECK(resolved_mapq({{OPT_METH, nullptr}, {OPT_METH_MAPQ, "conversion-blind"},
+                         {OPT_METH_SCORING, "collapsed"}}, true) == scoring); // accepted, a no-op
+    CHECK(resolved_mapq({{OPT_METH_SCORING, "collapsed"}, {OPT_METH_MAPQ, "conversion-blind"},
+                         {OPT_METH, nullptr}}, true) == scoring);
+}
+
+TEST_CASE("meth_opts: the stray-value list routes the --meth-mapq values to --meth-mapq"
+          * doctest::test_suite("unit/meth_opts")) {
+    const char *canon = nullptr;
+    CHECK(std::string(meth_opts_stray_flag("conversion-blind", &canon)) == "--meth-mapq");
+    CHECK(std::string(canon) == "conversion-blind");
+    CHECK(std::string(meth_opts_stray_flag("Scoring", &canon)) == "--meth-mapq");
+    CHECK(std::string(canon) == "scoring");
 }

@@ -302,7 +302,9 @@ int main(int argc, char* argv[])
             "--min-ext-len", "--max-extend-chains", "--dedup", "--dedup-reads",
             "--chunk-cap", "--cohort-slices", "--rescue-band",
             "--cohort-ramp-ratio", "--cohort-ramp-first", "--meth-scoring",
-            "--meth-tags", "--meth-context", "--set-as-failed", "--supp-rep-hard-cap",
+            "--meth-tags", "--meth-context",
+            "--meth-mapq", // meth_opts.h declares it; mem registers it once it implements the cap
+            "--set-as-failed", "--supp-rep-hard-cap",
             "--seed-order", "--compat", "--md", "--tie-break", "--bam-threads",
             "--ks-dedup", "--extend-tie-frac", "--extend-tie-floor",
 #ifdef STAGE_PROF

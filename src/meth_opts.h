@@ -23,13 +23,17 @@ enum {
     OPT_METH_SEED_PRUNE,
     OPT_METH_TAGS,
     OPT_METH_SET_AS_FAILED,
-    OPT_METH_CHIMERA_QC
+    OPT_METH_CHIMERA_QC,
+    OPT_METH_MAPQ
 };
 
 /* Which family options the user gave explicitly: a default must not override
  * them. Zero-initialise before parsing. */
 struct meth_cli_t {
-    int set_meth, set_scoring, set_context, set_seed_prune, set_tags, set_failed;
+    int set_meth, set_scoring, set_context, set_seed_prune, set_tags, set_failed, set_mapq;
+    // Set by a subcommand that registers METH_LONG_OPTION_MAPQ and implements the conversion-blind
+    // MAPQ (aln), before meth_opts_finalize_shared: only there does --meth-mapq default to it.
+    int mapq_supported;
 };
 
 /* If opt_id belongs to the family, apply optarg to *opt, record it in *cli and
@@ -37,8 +41,8 @@ struct meth_cli_t {
  * mem's parser: the shared options (meth_opts_parse_shared) and mem's own. */
 int meth_opts_parse(int opt_id, const char *optarg, mem_opt_t *opt, meth_cli_t *cli);
 
-/* The shared options only (--meth, --meth-context, --meth-scoring, --meth-tags,
- * --set-as-failed), into *meth: what every subcommand that takes --meth parses. */
+/* The shared options only (--meth, --meth-context, --meth-scoring, --meth-mapq,
+ * --meth-tags, --set-as-failed), into *meth: what every subcommand that takes --meth parses. */
 int meth_opts_parse_shared(int opt_id, const char *optarg, meth_opt_t *meth, meth_cli_t *cli);
 
 /* --set-as-failed's value ('f' or 'r') into *out; exits 1 on anything else. */
@@ -60,6 +64,8 @@ void meth_opts_finalize_shared(meth_opt_t *meth, const meth_cli_t *cli);
 
 /* Help text: the options every subcommand shares, then the ones only `mem` has. */
 void meth_opts_usage_shared(FILE *fp);
+/* --meth-mapq's help text, printed by the subcommands that register METH_LONG_OPTION_MAPQ. */
+void meth_opts_usage_mapq(FILE *fp);
 void meth_opts_usage_mem_only(FILE *fp);
 
 /* The closed-vocabulary values of the family's options, NULL-terminated. A
@@ -79,6 +85,11 @@ const char *meth_opts_stray_flag(const char *s, const char **canon);
     {"meth-scoring", required_argument, 0, OPT_METH_SCORING}, \
     {"meth-tags",    required_argument, 0, OPT_METH_TAGS}, \
     {"set-as-failed", required_argument, 0, OPT_METH_SET_AS_FAILED},
+
+/* --meth-mapq: parsed and resolved with the shared options, registered by each subcommand that
+ * implements the conversion-blind MAPQ (aln). */
+#define METH_LONG_OPTION_MAPQ \
+    {"meth-mapq",    required_argument, 0, OPT_METH_MAPQ},
 
 #define METH_LONG_OPTIONS_MEM_ONLY \
     {"meth-seed-prune", optional_argument, 0, OPT_METH_SEED_PRUNE}, \
