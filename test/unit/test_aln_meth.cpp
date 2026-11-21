@@ -2565,6 +2565,115 @@ TEST_CASE("aln_meth: the ALT-window generator takes only the cuts a lower final 
     free(opt);
 }
 
+TEST_CASE("aln_meth: an ALT-window generator seeded with an upper bound takes its cuts from the seed")
+{
+    // The seed is an upper bound on the read's final best known before the generator's search
+    // (aln_meth_slot_t::cap_best). The generator starts from it as from a row of its own: its score
+    // cut, K(B) and horizon use min(seed, own best), and its boundary runs before it has a row.
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("gen-seed.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1);
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt(); // M 3, O 11, E 4, gap extensions count as differences
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::gap_job_t job = ba::gap_job_t();
+    job.opt = *opt;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group; slot.job = &job;
+    ba::aln_meth_read_t result;
+    // Only a generator takes the seed; any other search starts with no best.
+    mr.ks_window = 0;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 5, 0, 6);
+    CHECK(slot.cap_best == INT64_MAX);
+    CHECK(slot.best == INT64_MAX);
+    mr.ks_window = 1;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 5, 0);
+    CHECK(slot.cap_best == INT64_MAX); // no seed: as before
+    CHECK(slot.best == INT64_MAX);
+    auto row = [&](int64_t cost, int at) {
+        ba::aln_meth_occ_t o;
+        o.rid = 0; o.hyp = 1; o.strand = 0; o.cost = cost; o.n_mm = (int)(cost / 3);
+        o.alignment.rb = o.pos = mr.bns->anns[0].offset + at;
+        result.occ.push_back(o);
+    };
+    for (int own : {0, 1}) { // a seed below the generator's own best; then an own best below the seed
+        CAPTURE(own);
+        ba::aln_meth_slot_start(&slot, reads, &result, 0, 5, 0, 6);
+        CHECK(slot.cap_best == 6);
+        CHECK(slot.best == 6);
+        job.max_diff = 5; job.score_cut = ba::GAP_SCORE_LIMIT - 1;
+        // The first entry is a boundary: the cuts apply before any row, from the seed.
+        CHECK(ba::aln_meth_needs_flush(&slot, 0) == 0);
+        CHECK(job.score_cut == 9);
+        CHECK(job.max_diff == 3); // K(6) = (6 + 3) / 3
+        if (own) { slot.best = 3; row(3, 100); } // as store_row records a row below the seed
+        row(9, 200); row(12, 300);
+        ba::aln_meth_slot_finish(&slot);
+        // Rows within min(seed, own best) + M are kept, and are complete below one past it.
+        const int64_t b = own ? 3 : 6;
+        CHECK(result.horizon == b + 3 + 1);
+        REQUIRE(result.hits.size() == 1);
+        CHECK(result.hits[0].cost == (own ? 3 : 9)); // 9 is past 3 + 3; 12 is past 6 + 3
+    }
+    mr.ks_window = 0;
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
+TEST_CASE("aln_meth: the --known-snvs probe bounds each read's best by a verified row's cost")
+{
+    // aln_meth_probe_batch searches the exact stratum (converted score 0) only and returns the cost
+    // of its cheapest verified row on the original reference: 0 for a read that matches with free
+    // conversions; M for a read C over a reference T (exact once converted, a mismatch on the
+    // original); none for a read whose every row needs a difference in converted space.
+    namespace ba = bwa_aln;
+    const std::string f = ref().c1.substr(500, 50);
+    const std::string exact = conv(f, 'C', 'T');
+    int t = -1;
+    for (int i = 5; i < 45 && t < 0; ++i) if (f[i] == 'T') t = i;
+    REQUIRE(t >= 0);
+    std::string c_over_t = exact;
+    c_over_t[t] = 'C';
+    std::string mism = exact;
+    mism[25] = mism[25] == 'A' ? 'G' : 'A';
+    const std::string fq = write_fq("probe.fq", {exact, c_over_t, mism});
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt(); // M 3
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 3, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 3);
+    std::vector<int64_t> upper(3, -1);
+    ba::aln_meth_probe_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, upper.data());
+    CHECK(upper[0] == 0);
+    CHECK(upper[1] == 3);
+    CHECK(upper[2] == INT64_MAX);
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+    ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: the CIGAR byte cap retains an incomplete placement and the next read still maps")
 {
     namespace ba = bwa_aln;

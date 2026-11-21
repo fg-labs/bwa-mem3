@@ -159,6 +159,11 @@ struct aln_meth_slot_t {
     std::vector<aln_meth_pend_t> ivs;
     uint64_t perm_rng = 0;
     int64_t best = INT64_MAX;
+    // cap_best: the --known-snvs ALT-window generator's seed, an upper bound on the read's final best
+    // known before its search (INT64_MAX: none). The generator's best starts there, so its score
+    // cut, K(B), -R and horizon (aln_meth_boundary_gen, meth_gen_finish) use min(cap_best, its own
+    // best) from the first entry, before it has a row. Unset (INT64_MAX) on any other search.
+    int64_t cap_best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     // Gap lists of the search's paths with more than one gap, ALN_METH_MAX_GAPS words each (see
@@ -193,6 +198,9 @@ struct aln_meth_group_t {
     const aln_meth_opt_t *mo = nullptr;
     const gap_opt_t *opt = nullptr;
     int read_no = 1, keep_strata = 0, max_xa_hits = 3;
+    // probe: the --known-snvs probe of the main search (aln_meth_probe_batch): its exact stratum only,
+    // at most ALN_METH_PROBE_ROWS rows, giving each read an upper bound on its final best.
+    int probe = 0;
     int n_slots = 0, n_active = 0, n_parked = 0, k_park = 1;
     std::vector<aln_meth_slot_t> slot;
     gap_slot_core_t *cores = nullptr;
@@ -247,7 +255,9 @@ static inline void aln_meth_hit(void *, const gap_entry_t *, bwtint_t, bwtint_t)
 // longer (ext), or plus the new gap w. Returns the list's index.
 int aln_meth_gap_arena(aln_meth_slot_t *, const gap_entry_t &p, bool ext, uint32_t w);
 // has_copy: the read has duplicate copies that will redraw over its loci.
-const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy);
+// cap_best: the ALT-window generator's seed (aln_meth_slot_t::cap_best); ignored by other searches.
+const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *, bwa_seq_t *, aln_meth_read_t *, int64_t, int, int has_copy,
+                                   int64_t cap_best = INT64_MAX);
 void aln_meth_slot_finish(aln_meth_slot_t *);
 /* Whether row a is a better row for its locus than b: lower stock cost; then fewer stock
  * differences (mismatches and gap opens, and gap extensions under gape), so that the locus keeps,
@@ -276,6 +286,9 @@ enum { ALN_METH_PH_MIN_DIFF = 3 };
 int aln_meth_prove_nohit(aln_meth_slot_t *x, const gap_job_t *j);
 int aln_meth_prove_nohit2(aln_meth_slot_t *x, const gap_job_t *j);
 void aln_meth_report(int, int, const aln_meth_read_t *);
+// The rows (SA lookups) a --known-snvs probe resolves per read (aln_meth_probe_batch): a few verified
+// rows suffice for an upper bound, and a wide interval would cost its whole width.
+enum { ALN_METH_PROBE_ROWS = 32 };
 // Finishes a read (stores its occ as hits; see aln_meth_store_loci), then trims it to its main hit
 // (an incomplete read always; a complete one when it has more than max_xa_hits + 1 loci).
 void aln_meth_trim(aln_meth_read_t *, int);
