@@ -1163,7 +1163,18 @@ TEST_CASE("aln_known_snvs: conservative downstream counting excludes both conver
         const std::string fq = write_fq(dir + "/r.fq", {{"ref", genome.substr(200, 35)}, {"alt", a}});
         const std::string vcf = write_vcf(dir + "/s.vcf", {row("c1", ga ? 790 : 211, ga ? 'G' : 'C', ga ? "T" : "A")});
         const std::string sam = dir + "/out.sam";
+        // The REF read's retained C (G) also matches the paralog's T (A) once converted, so the
+        // default conversion-blind MAPQ is 0 (the scoring MAPQ kept in YQ:i); the ALT read's A
+        // (T) is no conversion, so it keeps its MAPQ. The checks below read the scoring MAPQ.
         REQUIRE(run({"--meth", "--known-snvs", vcf, "-n", "2", "-o", "0", "-f", sam, prefix, fq}) == 0);
+        {
+            const auto blind = records(slurp(sam));
+            REQUIRE(blind.size() == 2);
+            CHECK(blind[0][4] == "0"); CHECK(tag(blind[0], "YQ:i:") == "YQ:i:23");
+            CHECK(blind[1][4] == "23"); CHECK(tag(blind[1], "YQ:i:").empty());
+        }
+        REQUIRE(run({"--meth", "--meth-mapq", "scoring", "--known-snvs", vcf, "-n", "2", "-o", "0", "-f", sam,
+                     prefix, fq}) == 0);
         require_records(slurp(sam), {"ref", "alt"}, false);
         const auto rec = records(slurp(sam));
         for (int i = 0; i < 2; ++i) {

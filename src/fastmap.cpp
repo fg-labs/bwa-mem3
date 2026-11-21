@@ -1774,6 +1774,11 @@ static int path_exists(const char *p)
 static const char *stray_option_value_flag(const char *s, const char **canon)
 {
     const char *flag = meth_opts_stray_flag(s, canon);
+    // mem does not take --meth-mapq yet: its values are not one of mem's options
+    if (flag != NULL && strcmp(flag, "--meth-mapq") == 0) {
+        if (canon != NULL) *canon = NULL;
+        flag = NULL;
+    }
     if (flag != NULL) return flag;
     if (s != NULL && (strcasecmp(s, "true") == 0 || strcasecmp(s, "false") == 0)) {
         if (canon != NULL) *canon = strcasecmp(s, "true") == 0 ? "true" : "false";

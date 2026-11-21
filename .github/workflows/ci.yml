@@ -1956,6 +1956,13 @@ jobs:
         # runs here (Linux) when nothing else is staged on the runner.
         run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_meth_cli.sh
 
+      - name: aln --meth-mapq checks (synthetic reference)
+        # The conversion-blind MAPQ cap: single-end reads unique only through a retained C (or G)
+        # are capped to collapsed's MAPQ with YQ:i, --meth-mapq scoring is unchanged, only MAPQ/YQ
+        # differ, paired-end caps (shadow pairing, placed elsewhere, rescued mate, mate anchors),
+        # and the option's refusals.
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/aln_meth_mapq.sh
+
       - name: aln --known-snvs checks (synthetic reference)
         # No-SNV identity, untouched reads unchanged, over-budget ALT reads placed with XV,
         # thread-count independence and VCF errors, single- and paired-end, plain and --meth.

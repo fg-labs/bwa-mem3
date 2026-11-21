@@ -26,6 +26,7 @@ static const struct { const char *name; meth_chem_t chem; } meth_chem_names[] = 
 static const struct { const char *value, *flag; } meth_stray_known[] = {
     { "collapsed", "--meth-scoring" }, { "genomic",   "--meth-scoring" },
     { "neutral",   "--meth-scoring" },
+    { "conversion-blind", "--meth-mapq" }, { "scoring", "--meth-mapq" },
     { "cpg",       "--meth-context" },
     { "XR",        "--meth-tags"    }, { "XG",        "--meth-tags" },
     { "XM",        "--meth-tags"    }, { "all",       "--meth-tags" },
@@ -123,6 +124,18 @@ int meth_opts_parse_shared(int opt_id, const char *optarg, meth_opt_t *meth, met
         }
         cli->set_scoring = 1;
         break;
+    case OPT_METH_MAPQ:
+        if (optarg != NULL && strcmp(optarg, "conversion-blind") == 0) {
+            meth->meth_mapq = MEM_METH_MAPQ_CONVERSION_BLIND;
+        } else if (optarg != NULL && strcmp(optarg, "scoring") == 0) {
+            meth->meth_mapq = MEM_METH_MAPQ_SCORING;
+        } else {
+            fprintf(stderr, "ERROR: --meth-mapq accepts 'conversion-blind' or 'scoring', got '%s'\n",
+                    optarg != NULL ? optarg : "");
+            exit(1);
+        }
+        cli->set_mapq = 1;
+        break;
     case OPT_METH_TAGS: {
         const char *tag_err = NULL;
         if (mem_opt_parse_meth_tags(optarg, &meth->meth_tags, &tag_err) != 0) {
@@ -219,6 +232,10 @@ void meth_opts_finalize_shared(meth_opt_t *meth, const meth_cli_t *cli)
         fprintf(stderr, "ERROR: --meth-context requires --meth\n");
         exit(1);
     }
+    if (cli->set_mapq && !meth->meth_mode) {
+        fprintf(stderr, "ERROR: --meth-mapq requires --meth\n");
+        exit(1);
+    }
     if (!meth->meth_mode) return;
     /* TAPS (and 5base, which is TAPS here) defaults to NEUTRAL scoring.
      * TAPS converts only the METHYLATED cytosines, so conversions are ~20-30x rarer than under em-seq (measured:
@@ -253,6 +270,27 @@ void meth_opts_finalize_shared(meth_opt_t *meth, const meth_cli_t *cli)
                             "collapsed also frees reference T against read C, which has no CpG meaning\n");
             exit(1);
         }
+    }
+    /* --meth-mapq defaults to conversion-blind for em-seq with genomic scoring, in a subcommand
+     * that implements it (cli->mapq_supported). Genomic scores a retained (methylated) C over a
+     * reference T as a mismatch, so a short read that kept its CpG Cs is unique where a fully
+     * converted one is not, and a MAPQ filter selects methylated molecules (measured in
+     * docs/src/methylation/flags.md, --meth-mapq). Collapsed already frees the mirror cell, so
+     * conversion-blind is accepted there and resolved to scoring. TAPS/5-base and neutral: their
+     * reads are mostly unconverted, so freeing the mirror cell throws away most of what places a
+     * short read; refuse it there. */
+    if (!cli->set_mapq) {
+        meth->meth_mapq = cli->mapq_supported && meth->meth_chem == METH_CHEM_EMSEQ
+                && meth->meth_scoring == MEM_METH_SCORING_GENOMIC
+            ? MEM_METH_MAPQ_CONVERSION_BLIND : MEM_METH_MAPQ_SCORING;
+    } else if (meth->meth_mapq == MEM_METH_MAPQ_CONVERSION_BLIND) {
+        if (meth->meth_chem != METH_CHEM_EMSEQ || meth->meth_scoring == MEM_METH_SCORING_NEUTRAL) {
+            fprintf(stderr, "ERROR: --meth-mapq conversion-blind applies to em-seq/bisulfite (--meth, "
+                            "--meth=emseq) with genomic or collapsed scoring; TAPS/5-base and "
+                            "--meth-scoring neutral keep --meth-mapq scoring\n");
+            exit(1);
+        }
+        if (meth->meth_scoring == MEM_METH_SCORING_COLLAPSED) meth->meth_mapq = MEM_METH_MAPQ_SCORING;
     }
     /* NEUTRAL suits sparse conversions only. em-seq converts most cytosines, so
      * scoring each conversion 0 instead of +A takes several points off a short
@@ -326,6 +364,21 @@ void meth_opts_usage_shared(FILE *fp)
     fprintf(fp, "                 and other callers that read the per-base calls from XM:Z.\n");
     fprintf(fp, "   --set-as-failed f|r\n");
     fprintf(fp, "                 flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)\n");
+}
+
+void meth_opts_usage_mapq(FILE *fp)
+{
+    fprintf(fp, "   --meth-mapq conversion-blind|scoring\n");
+    fprintf(fp, "                 how MAPQ is computed. conversion-blind (default for em-seq with\n");
+    fprintf(fp, "                 genomic scoring): MAPQ is capped at what the same scoring gives\n");
+    fprintf(fp, "                 with C/T (and G/A) interchangeable, at the same penalties; the\n");
+    fprintf(fp, "                 record's placement, CIGAR and other tags are unchanged; when\n");
+    fprintf(fp, "                 the cap lowers MAPQ the original is kept in YQ:i. Without it a\n");
+    fprintf(fp, "                 retained (methylated) C makes a short read look unique, so\n");
+    fprintf(fp, "                 filtering on MAPQ inflates CpG methylation. scoring: MAPQ\n");
+    fprintf(fp, "                 follows --meth-scoring; the default for collapsed (where the\n");
+    fprintf(fp, "                 two agree) and for taps/5base and neutral (which refuse\n");
+    fprintf(fp, "                 conversion-blind).\n");
 }
 
 void meth_opts_usage_mem_only(FILE *fp)

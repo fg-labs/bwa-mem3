@@ -536,8 +536,8 @@ share the sparser copy, coordinate with other users of shared memory, run
 
 `aln --meth[=emseq|taps|5base]` aligns converted reads with the backtracking search. It takes the
 same `--meth`, `--meth-context`, `--meth-scoring` and `--meth-tags` options as
-[`mem --meth`](mem.md), with the same values, defaults and checks, plus `--set-as-failed`, for
-single-end and paired-end input. Single-end support was added in
+[`mem --meth`](mem.md), with the same values, defaults and checks, plus `--set-as-failed` and
+`--meth-mapq` (below), for single-end and paired-end input. Single-end support was added in
 [#749](https://github.com/fg-labs/bwa-mem3/pull/749); paired-end and CpG support in
 [#750](https://github.com/fg-labs/bwa-mem3/pull/750). Every chemistry requires both the original and
 converted indices written by `bwa-mem3 index --meth`; give the reference prefix
@@ -620,6 +620,17 @@ tails are restored for primary and alternative alignments on either strand.
 can differ from the raw ranking mismatch/gap count. Records use Bismark
 `XR:Z`, `XG:Z`, `XM:Z` tags selected by `--meth-tags`, rather than stock
 `XM:i`, `XO:i`, `XG:i`. The header includes `@PG ID:bwa-mem3-meth`.
+
+**Conversion-blind MAPQ (`--meth-mapq`).** With EM-seq and `genomic` scoring (the defaults),
+each record's MAPQ is capped at the stock MAPQ its locus gets when the mirror cell (reference T x
+read C on OT, reference A x read G on OB) costs nothing: the read's loci are recounted at their
+cost minus `-M` per mirror mismatch, before the stock cut, and a locus that is then cheaper than
+the primary gives a cap of 0. Paired-end ends take the MAPQ of the same stock pairing run on those
+costs (including the loci only the mirror-free strata keep), and a rescued mate its anchor's.
+Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
+and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. A gapped locus is taken at its
+`genomic` alignment's cost, not realigned. `--meth-mapq scoring` restores the uncapped MAPQ. See
+[`--meth-mapq`](../methylation/flags.md#--meth-mapq-conversion-blindscoring).
 
 ### Pairing and limits
 

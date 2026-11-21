@@ -13,7 +13,9 @@ alternative hits at the sites, and adds `XV:Z` ([PR #770](https://github.com/fg-
 refinement, accounting and tags and is not stock or MEM-equivalent. The MEM
 methylation accuracy/performance evidence on this site does not establish those
 properties for the rewritten `aln --meth` path. Its stock-shaped MAPQ is a heuristic
-on retained loci, not a guarantee of exhaustive discovery.
+on retained loci, not a guarantee of exhaustive discovery. For EM-seq with `genomic` scoring its
+MAPQ is by default capped at a conversion-blind MAPQ, with a lowered record's uncapped MAPQ in
+`YQ:i`; `--meth-mapq scoring` turns the cap off ([PR #816](https://github.com/fg-labs/bwa-mem3/pull/816)).
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,
