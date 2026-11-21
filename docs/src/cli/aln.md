@@ -271,7 +271,9 @@ pairs in the batch, even when neither mate's candidates cover a site.
 Every record with a read base aligned to a site gets `XV:Z`, one entry per REF–ALT pair at each
 such site, separated by `;`: a multi-allelic site gives one entry for each ALT, all at the same
 contig and position. Positions are 1-based. A site the alignment covers only with a deletion has
-no read base, so it gets no entry:
+no read base, so it gets no entry. A record whose reference span crosses a contig boundary
+(which `aln` flags unmapped; under `--meth` no placement crosses one) gets no `XV:Z` at all,
+even when a read base aligns to a site:
 
 ```text
 contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq

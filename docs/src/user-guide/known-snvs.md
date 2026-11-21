@@ -27,7 +27,9 @@ that is what `XV:Z` is for.
 
 `XV:Z` has one entry for each REF–ALT pair of each site in FILE where the read's alignment has a
 read base, separated by `;`. A multi-allelic site gives one entry per ALT, all at the same contig
-and position. A site that the alignment spans with a deletion has no read base and gets no entry:
+and position. A site that the alignment spans with a deletion has no read base and gets no entry.
+A record whose reference span crosses a contig boundary (`aln` flags it unmapped) gets no `XV:Z`
+at all, even when a read base aligns to a site:
 
 ```text
 contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq
@@ -182,8 +184,10 @@ The twin of a paired read is a pair, so `twin_mapq` is the twin pair's paired MA
   rescue separately tries ALT-substituted rescue windows and is not limited by that discovery width.
 - **Work limits under `--meth`.** If a read's ALT-window search hits a work limit (the lookup
   budget or the `-m` stack cap), the read is reported as incomplete even when none of its
-  placements covers a site: it gets MAPQ 0 with no `X0`/`X1`. For paired input, neither end of
-  that pair can then be promoted by pairing or mate rescue, so the mate's record can change too.
+  placements covers a site: it gets MAPQ 0 with no `X0`/`X1`. If its genomic search hits the
+  lookup budget instead, the ALT-window placements already found are still evaluated, and the
+  read is likewise incomplete. For paired input, neither end of that pair can then be promoted
+  by pairing or mate rescue, so the mate's record can change too.
 - **Long unseeded reads under `--meth`.** With known sites loaded, an unseeded read longer than
   160 bases (possible only when `-l` exceeds 160) cannot stop early, so a highly repetitive one
   can use up the lookup budget.
