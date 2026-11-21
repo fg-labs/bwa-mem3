@@ -1648,6 +1648,50 @@ TEST_CASE("aln_known_snvs: rejected junction rows cannot produce a credited merg
     ba::ks_windows_free(&w); ba::bwt_destroy(bwt); free(opt);
 }
 
+TEST_CASE("aln_known_snvs: a main row joining two contigs neither ties nor stays the primary"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    namespace ba = bwa_aln;
+    KsIndex &x = fixture();
+    FMI_search fmi(x.prefix.c_str());
+    fmi.load_index(true, 1, false);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    const bntseq_t *bns = fmi.idx->bns;
+    ba::ks_sites_t sites; sites.by_contig.resize(bns->n_seqs);
+    sites.by_contig[0] = {{499, (uint8_t)nst_nt4_table[(int)x.c1[499]], 0}};
+    sites.n_sites = 1;
+    ba::ks_windows_t w;
+    REQUIRE(ba::ks_windows_build(&sites, bns, fmi.idx->pac, 1, 0, &w) == 0);
+    auto row_at = [](const ba::bwt_t *b, const bntseq_t *n, int64_t pos, int span) {
+        for (ba::bwtint_t r = 0; r <= b->seq_len; ++r) {
+            int strand;
+            if ((int64_t)ba::bwa_sa2pos(n, b, r, span, &strand) == pos && strand == 0) return r;
+        }
+        return (ba::bwtint_t)-1;
+    };
+    // The main search's row reads across the c1/c2 junction, at the same score as the ALT hit.
+    const int64_t join = (int64_t)bns->anns[1].offset - 10;
+    REQUIRE(!ba::ks_span_in_contig(bns, join, 20, join));
+    ba::bwt_aln1_t main = {}, win = {};
+    main.k = main.l = row_at(bwt, bns, join, 20);
+    win.k = win.l = row_at(w.bwt, w.bns, 150, 20);
+    REQUIRE(main.k != (ba::bwtint_t)-1); REQUIRE(win.k != (ba::bwtint_t)-1);
+    main.score = win.score = 3; main.n_mm = win.n_mm = 1;
+    ba::bwa_seq_t s = {}; s.len = 20; s.n_aln = 1; s.aln = &main;
+    uint8_t seq[20] = {}; s.seq = seq;
+    // The stock primary is the joining row.
+    s.type = BWA_TYPE_UNIQUE; s.pos = (ba::bwtint_t)join; s.strand = 0;
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    int64_t alt = -1;
+    REQUIRE(ba::ks_override(&w, bns, bwt, opt, 0, &s, &win, 1, &alt) == ba::KS_CREDITED);
+    CHECK((int64_t)s.pos != join);
+    CHECK(ba::ks_span_in_contig(bns, (int64_t)s.pos, 20, (int64_t)s.pos));
+    CHECK(alt >= 0);
+    CHECK((int)s.c1 == 1);
+    CHECK((int)s.c2 == 0);
+    CHECK((int)s.type == BWA_TYPE_UNIQUE);
+    ba::ks_windows_free(&w); ba::bwt_destroy(bwt); free(opt);
+}
+
 TEST_CASE("aln_known_snvs: -f naming the --known-snvs file, by path or hard link, is refused before writing"
           * doctest::test_suite("unit/aln_known_snvs")) {
     KsIndex &x = fixture();

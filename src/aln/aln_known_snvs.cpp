@@ -428,6 +428,9 @@ ks_outcome_t ks_merge(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *b
 			int strand;
 			const bwtint_t p = bwa_sa2pos(bns, bwt, r, span, &strand);
 			if (p == (bwtint_t)-1) continue;
+			// A row whose span joins two contigs is not a placement (as the twin checks reject it):
+			// it neither competes with nor ties a site-covering hit, nor stays the primary.
+			if (!ks_span_in_contig(bns, (int64_t)p, span, (int64_t)p)) continue;
 			const ks_hit_t h = hit_of(q, (int64_t)p, strand, -1);
 			auto it = std::find_if(hits.begin(), hits.end(), [&](const ks_hit_t &x) {
 				return x.strand == h.strand && x.pos == h.pos;
@@ -458,8 +461,9 @@ ks_outcome_t ks_merge(const ks_windows_t *w, const bntseq_t *bns, const bwt_t *b
 	});
 	int c1 = 0;
 	while (c1 < (int)hits.size() && hits[c1].score == best) ++c1;
-	// Main-index rows crossing the forward/reverse junction may have supplied `best` but no
-	// usable position. Keep the stock outcome rather than credit an unrepresented best stratum.
+	// Main-index rows crossing the forward/reverse junction or joining two contigs may have
+	// supplied `best` but no usable position. Keep the stock outcome rather than credit an
+	// unrepresented best stratum.
 	if (c1 == 0) return KS_INCOMPLETE;
 	if (!(opt->mode & BWA_MODE_NONSTOP) && c1 > opt->max_top2) hits.resize(c1);
 	m->kept = std::move(hits);
