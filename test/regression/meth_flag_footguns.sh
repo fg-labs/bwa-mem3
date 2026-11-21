@@ -117,6 +117,20 @@ expect_advice "--meth-seed-prune OFF (case)" "write --meth-seed-prune=off, not -
 expect_advice "--meth-scoring Neutral (case)" "--meth-scoring neutral." "" \
     mem --meth --meth-scoring collapsed Neutral ref.fa r.fq
 
+# mem does not take --meth-mapq (only aln does): a stray `conversion-blind` or `scoring` must not be
+# advised as a --meth-mapq value, and --meth-mapq itself is not one of mem's options.
+for token in conversion-blind scoring; do
+    if "$BWA_MEM3" mem --meth ref.fa r.fq "$token" > /dev/null 2> err.txt; then
+        fail "mem stray '$token': exited 0"
+    fi
+    if grep -Fq -- "--meth-mapq" err.txt; then
+        fail "mem stray '$token': advises --meth-mapq, which mem does not take"
+    fi
+done
+if "$BWA_MEM3" mem --meth --meth-mapq scoring ref.fa r.fq > /dev/null 2> err.txt; then
+    fail "mem accepted --meth-mapq, which it does not implement"
+fi
+
 # --- 2. no false positive on a real file with a vocabulary name -------------
 # A reference genuinely named `taps` must still work: the guard fires only when
 # the token names nothing on disk.
@@ -142,4 +156,4 @@ c=$(tags_of caret.bam)
 [ "$d" = "XG XR" ] || fail "--meth-tags -XM: tags '$d', want 'XG XR'"
 [ "$d" = "$c" ] || fail "-XM and ^XM disagree: '$d' vs '$c'"
 
-echo "PASS: meth_flag_footguns (orphaned --meth/--meth-tags/--meth-scoring/--meth-seed-prune values diagnosed by name; real files with vocabulary names unaffected; -XM == ^XM)"
+echo "PASS: meth_flag_footguns (orphaned --meth/--meth-tags/--meth-scoring/--meth-seed-prune values diagnosed by name; mem neither advises nor takes --meth-mapq; real files with vocabulary names unaffected; -XM == ^XM)"
