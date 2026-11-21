@@ -908,20 +908,74 @@ int main_resa(int argc, char *argv[]) // the "re-sa" command
 	return 0;
 }
 
+/* The packed reference is staged in a scratch directory beside the output and
+ * moved into place only once it is known to be buildable, so a build rejected
+ * for its memory budget (or for an empty reference) leaves an existing index at
+ * <prefix> untouched. pack_staging is that directory; the packed files are
+ * <dir>/pack plus one of kPackSuffixes. Removed on every return and exit(),
+ * including the err_fatal exits inside the packer; a signal or an abort() (an
+ * xassert failure) can leave it behind. */
+static std::string pack_staging;
+static const char *const kPackSuffixes[] = {".pac", ".ann", ".amb"};
+
+static void pack_staging_cleanup(void)
+{
+	if (pack_staging.empty()) return;
+	for (const char *suffix : kPackSuffixes) unlink((pack_staging + "/pack" + suffix).c_str());
+	rmdir(pack_staging.c_str());
+	pack_staging.clear();
+}
+
 int bwa_idx_build(const char *fa, const char *prefix, int emit_unpacked_ref, int sa_compx)
 {
-	extern void bwa_pac_rev_core(const char *fn, const char *fn_rev);
-
 	clock_t t;
 	int rc = 0;
 
 	{ // nucleotide indexing
+		// The reference length that decides the budget is known only once the
+		// FASTA has been read, so pack it into a staging directory beside the
+		// output first. Same filesystem, so the moves below are renames.
+		std::string pattern = std::string(prefix) + ".tmpXXXXXX";
+		std::vector<char> name(pattern.begin(), pattern.end());
+		name.push_back('\0');
+		if (!mkdtemp(name.data())) {
+			fprintf(stderr, "ERROR: cannot create a staging directory beside %s: %s\n",
+			        prefix, strerror(errno));
+			return 1;
+		}
+		pack_staging = name.data();
+		static bool registered = false;
+		if (!registered) { atexit(pack_staging_cleanup); registered = true; }
+		const std::string staged = pack_staging + "/pack";
+
 		gzFile fp = xzopen(fa, "r");
 		t = clock();
 		fprintf(stderr, "[bwa_index] Pack FASTA... ");
-		bns_fasta2bntseq(fp, prefix, 1);
+		int64_t l_pac = bns_fasta2bntseq(fp, staged.c_str(), 1);
 		fprintf(stderr, "%.2f sec\n", (float)(clock() - t) / CLOCKS_PER_SEC);
 		err_gzclose(fp);
+
+		// The FM-index build would reject an empty reference only after the
+		// packed files had replaced an existing index's; reject it here instead.
+		if (l_pac <= 0) {
+			fprintf(stderr, "ERROR: malformed reference '%s': no bases to index\n", fa);
+			pack_staging_cleanup();
+			return 1;
+		}
+		// The FM-index build runs this same check over the same doubled length.
+		rc = libsais_check_budget(2 * l_pac, libsais_build_opts_from_env());
+		if (rc != 0) { pack_staging_cleanup(); return rc; }
+		for (const char *suffix : kPackSuffixes) {
+			std::string from = staged + suffix, to = std::string(prefix) + suffix;
+			if (rename(from.c_str(), to.c_str()) != 0) {
+				fprintf(stderr, "ERROR: cannot move %s to %s: %s\n",
+				        from.c_str(), to.c_str(), strerror(errno));
+				pack_staging_cleanup();
+				return 1;
+			}
+		}
+		pack_staging_cleanup();
+
         FMI_search *fmi = new FMI_search(prefix);
         rc = fmi->build_index(emit_unpacked_ref, sa_compx);
         delete fmi;

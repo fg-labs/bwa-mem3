@@ -855,27 +855,7 @@ int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
     }
     int64_t pac_len = 2 * l_pac;
 
-    auto parse_ll = [](const char* s, const char* name,
-                       long long max_val = LLONG_MAX) -> long long {
-        char* end = nullptr;
-        errno = 0;
-        long long v = strtoll(s, &end, 10);
-        if (errno || end == s || *end != '\0' || v <= 0 || v > max_val) {
-            fprintf(stderr, "ERROR: invalid %s='%s' (expected positive integer)\n",
-                    name, s);
-            exit(1);
-        }
-        return v;
-    };
-    LibsaisBuildOpts opts;
-    if (const char* th = getenv("BWA_INDEX_THREADS"))
-        opts.num_threads      = (int)parse_ll(th, "BWA_INDEX_THREADS", INT_MAX);
-    if (const char* mm = getenv("BWA_INDEX_MAX_MEMORY"))
-        opts.max_memory_bytes = parse_ll(mm, "BWA_INDEX_MAX_MEMORY");
-    if (const char* td = getenv("BWA_INDEX_TMPDIR"))
-        opts.tmpdir           = td;
-    if (const char* mu = getenv("BWA_INDEX_MAX_MEMORY_USER"))
-        opts.max_memory_user_specified = (mu[0] == '1');
+    LibsaisBuildOpts opts = libsais_build_opts_from_env();
     opts.emit_unpacked_ref = emit_unpacked_ref;
     opts.sa_compx          = sa_compx;
     return libsais_build_fm_index(prefix, pac_len, opts);
