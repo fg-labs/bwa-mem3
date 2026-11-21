@@ -185,7 +185,8 @@ Each change to upstream-derived code adds a line here.
   `aln_rescue_window`, which the `--meth` mate rescue shares. Without the option it is stock's
   expression for expression (start truncated, then start + 6 std + 2 len truncated); with it each
   bound is the anchor-relative offset rounded outward (`floor` for the start, `ceil` for the end),
-  and `--meth` cap rescue takes the same window instead of truncating its own two doubles.
+  and `--meth` cap rescue takes the same window, from the same anchor end (a reverse anchor's read
+  length, or its reference span under `--ref-span-insert`), instead of truncating its own two doubles.
 - Paired-end driver (`aln_run_pe`, new code). `bwa-mem3 aln [options] <prefix> <R1.fq> <R2.fq>` is `aln` on each
   file followed by `sampe`. Per batch of 0x40000 reads from each file: R1's reads are read, then R2's (stock
   order); each file is searched as its own batch, because stock runs `aln` on each file separately and the
