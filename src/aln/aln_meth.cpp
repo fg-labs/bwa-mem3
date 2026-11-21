@@ -74,19 +74,40 @@ int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t
 {
 	r->conv_bns = conv_bns;
 	if (meth_orig_ref_load(orig_prefix, &r->bns, &r->pac, n_threads < 1 ? 1 : n_threads) != 0) return -1;
-	return meth_ref_check(r, orig_prefix, conv_bns, "; rebuild with `bwa-mem3 index --meth`");
+	if (meth_ref_check(r, orig_prefix, conv_bns, "; rebuild with `bwa-mem3 index --meth`") != 0) return -1;
+	aln_meth_ref_index_holes(r);
+	return 0;
 }
 
 int aln_meth_ref_adopt(aln_meth_ref_t *r, bntseq_t *orig_bns, uint8_t *orig_pac, const bntseq_t *conv_bns)
 {
 	r->bns = orig_bns;
 	r->pac = orig_pac;
-	return meth_ref_check(r, "(in-memory windows)", conv_bns, " (internal error: the in-memory window references are inconsistent)");
+	if (meth_ref_check(r, "(in-memory windows)", conv_bns, " (internal error: the in-memory window references are inconsistent)") != 0)
+		return -1;
+	aln_meth_ref_index_holes(r);
+	return 0;
+}
+
+void aln_meth_ref_index_holes(aln_meth_ref_t *r)
+{
+	r->hole_bins.clear();
+	if (!r->bns || r->bns->n_holes <= 0) return; // no run to find: aln_meth_amb_bits searches none
+	const uint64_t n_bins = ((uint64_t)r->bns->l_pac >> ALN_METH_HOLE_SHIFT) + 1;
+	r->hole_bins.assign((n_bins + 63) / 64, 0);
+	for (int i = 0; i < r->bns->n_holes; ++i) {
+		const bntamb1_t &a = r->bns->ambs[i];
+		if (a.len <= 0 || a.offset < 0) continue;
+		const uint64_t first = (uint64_t)a.offset >> ALN_METH_HOLE_SHIFT;
+		const uint64_t last = std::min<uint64_t>(((uint64_t)a.offset + (uint64_t)a.len - 1) >> ALN_METH_HOLE_SHIFT, n_bins - 1);
+		for (uint64_t b = first; b <= last; ++b) r->hole_bins[b >> 6] |= 1ULL << (b & 63);
+	}
 }
 
 void aln_meth_ref_free(aln_meth_ref_t *r)
 {
 	meth_orig_ref_free(&r->bns, &r->pac);
+	std::vector<uint64_t>().swap(r->hole_bins);
 }
 
 int aln_meth_header_check(const char *rg_line)
@@ -832,7 +853,13 @@ static void resolve_located(aln_meth_slot_t *x, const aln_meth_pend_t &h, const 
     if (layout_span(key.lay, x->len) != span) {
         fprintf(stderr, "ERROR: --meth search path's gaps (%d) do not give its reference span\n", (int)h.e.n_gapo); exit(1);
     }
-    if (!x->windows.insert(key, 0).second) return;
+    // An ungapped row's window cannot repeat within a read: the read's ungapped hits are distinct
+    // strings of its length (aln_meth_hit keeps one per interval), so their SA rows, and the windows
+    // those rows locate, are distinct; and a gapped key never equals an ungapped one. Under
+    // --known-snvs the read's ALT-window candidates are deduplicated against these keys, so there
+    // every row's key goes into the set.
+    const bool dedup = key.lay.n != 0 || g->ref->known_snvs || g->ref->ks_window;
+    if (dedup && !x->windows.insert(key, 0).second) return;
     // A 65535-base read with a deletion spans more than a window holds. Drop the window as
     // unrepresentable, with cost 0 as its bound: any retained placement is then incomplete.
     if (span > ALN_MAX_READ_LEN) {
@@ -988,10 +1015,69 @@ static __attribute__((noinline, cold)) void meth_gen_bound(aln_meth_slot_t *x)
 {
     for (const auto &h : x->pend) x->res->horizon = std::min<int64_t>(x->res->horizon, pend_score(x, h));
 }
+// The lookup limit of parked slot x's flush (budget: the read's lookup budget). A flush whose
+// pending rows exceed what is left of the budget binds it: the read ends incomplete
+// (ALN_METH_BIND_BEST) whatever those rows resolve to, keeping only a MAPQ-0 best-known placement.
+// Resolve just ALN_METH_BIND_ROWS more rows for that placement rather than the rest of the budget.
+// Earlier flushes are unchanged, so the same reads end incomplete. An interval already resolved
+// (reached again along a path with other gaps) reuses its SA rows: it costs no lookups, so it does
+// not count toward the budget. Two paths can reach one uncached interval in the same flush: its
+// rows are looked up once, so they count once.
+static int64_t flush_limit(const aln_meth_slot_t &x, int64_t budget)
+{
+    static thread_local std::vector<std::pair<bwtint_t, bwtint_t>> fresh;
+    fresh.clear();
+    for (const auto &h : x.pend) {
+        size_t pos;
+        if (x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos) < 0) fresh.emplace_back(h.k, h.l);
+    }
+    std::sort(fresh.begin(), fresh.end());
+    fresh.erase(std::unique(fresh.begin(), fresh.end()), fresh.end());
+    int64_t pending = 0;
+    for (const auto &kl : fresh) pending += (int64_t)(kl.second - kl.first + 1);
+    return pending > budget - x.res->n_lookups ? std::min<int64_t>(budget, x.res->n_lookups + ALN_METH_BIND_ROWS) : budget;
+}
+// The rows parked slot i's flush will look up, hit by hit, as aln_meth_flush_parked decides them
+// (a hit whose interval is resolved by then needs none), appended to g->flush_rows and g->flush_plan.
+// It assumes the slot is not stopped part way by its CIGAR bound; the flush checks each hit's plan.
+static void plan_flush(aln_meth_group_t *g, int i, int64_t budget)
+{
+    const aln_meth_slot_t &x = g->slot[i];
+    if (x.stop) return;
+    const int64_t limit = flush_limit(x, budget);
+    int64_t lookups = x.res->n_lookups;
+    const size_t first = g->flush_plan.size();
+    for (size_t j = 0; j < x.pend.size(); ++j) {
+        const aln_meth_pend_t &h = x.pend[j];
+        const bwtint_t width = h.l - h.k + 1;
+        size_t pos;
+        bool cached = x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos) >= 0;
+        for (size_t p = first; p < g->flush_plan.size() && !cached; ++p) { // resolved earlier in this flush
+            const aln_meth_pend_t &e = x.pend[g->flush_plan[p].hit];
+            cached = e.k == h.k && e.l == h.l && (bwtint_t)g->flush_plan[p].n == e.l - e.k + 1;
+        }
+        if (cached) continue;
+        const int n = (int)std::min<uint64_t>(width, (uint64_t)std::max<int64_t>(0, limit - lookups));
+        if (n > 0) {
+            g->flush_plan.push_back({i, j, g->flush_rows.size(), n});
+            for (int k = 0; k < n; ++k) g->flush_rows.push_back(h.k + k);
+        }
+        lookups += n;
+        if ((bwtint_t)n < width) break;
+    }
+}
 void aln_meth_flush_parked(aln_meth_group_t *g)
 {
     const int64_t budget = g->probe ? (int64_t)ALN_METH_PROBE_ROWS : std::max<int64_t>(0, (int64_t)g->mo->p_best + g->mo->p_second);
     if (budget > 65536) { fprintf(stderr, "ERROR: --meth lookup budget exceeds 65536 rows per read\n"); exit(1); }
+    // The SA rows of every parked slot's hits are looked up in one batch first, so that slots whose
+    // flush holds a row or two (a unique read) overlap their walks. Each SA value depends on its row
+    // alone; rows are scored, and lookups counted, slot by slot and hit by hit as before.
+    g->flush_rows.clear(); g->flush_plan.clear();
+    for (int i = 0; i < g->n_slots; ++i)
+        if (g->cores[i].state == GAP_SLOT_PARKED && !g->slot[i].cert) plan_flush(g, i, budget);
+    if (!g->flush_rows.empty()) bwt_sa_batch(g->bwt, g->flush_rows.data(), (int64_t)g->flush_rows.size(), g->flush_rows.data());
+    size_t plan = 0;
     for (int i = 0; i < g->n_slots; ++i) {
         if (g->cores[i].state != GAP_SLOT_PARKED) continue;
         aln_meth_slot_t &x = g->slot[i];
@@ -1003,28 +1089,13 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             g->cores[i].state = GAP_SLOT_SEARCH;
             continue;
         }
-        // A flush whose pending rows exceed what is left of the budget binds it: the read ends
-        // incomplete (ALN_METH_BIND_BEST) whatever those rows resolve to, keeping only a MAPQ-0
-        // best-known placement. Resolve just ALN_METH_BIND_ROWS more rows for that placement
-        // rather than the rest of the budget. Earlier flushes are unchanged, so the same reads
-        // end incomplete.
-        // An interval already resolved (reached again along a path with other gaps) reuses its SA
-        // rows: it costs no lookups, so it does not count toward the budget.
         auto cached = [&](const aln_meth_pend_t &h) {
             size_t pos;
             return x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos);
         };
-        // Two paths can reach one uncached interval in the same flush: its rows are looked up once.
-        static thread_local std::vector<std::pair<bwtint_t, bwtint_t>> fresh;
-        fresh.clear();
-        for (const auto &h : x.pend) if (cached(h) < 0) fresh.emplace_back(h.k, h.l);
-        std::sort(fresh.begin(), fresh.end());
-        fresh.erase(std::unique(fresh.begin(), fresh.end()), fresh.end());
-        int64_t limit = budget, pending = 0;
-        for (const auto &kl : fresh) pending += (int64_t)(kl.second - kl.first + 1);
-        if (pending > budget - x.res->n_lookups)
-            limit = std::min<int64_t>(budget, x.res->n_lookups + ALN_METH_BIND_ROWS);
-        for (const auto &h : x.pend) {
+        const int64_t limit = flush_limit(x, budget);
+        for (size_t j = 0; j < x.pend.size(); ++j) {
+            const aln_meth_pend_t &h = x.pend[j];
             if (x.stop) break;
             const bwtint_t width = h.l - h.k + 1;
             const int32_t c = cached(h);
@@ -1038,12 +1109,20 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             const size_t off = x.sa_rows.size();
             x.sa_rows.resize(off + n);
             bwtint_t *rows = x.sa_rows.data() + off;
-            for (int k = 0; k < n; ++k) rows[k] = h.k + k;
-            bwt_sa_batch(g->bwt, rows, n, rows);
+            while (plan < g->flush_plan.size() && g->flush_plan[plan].slot == i && g->flush_plan[plan].hit < j) ++plan;
+            if (plan < g->flush_plan.size() && g->flush_plan[plan].slot == i && g->flush_plan[plan].hit == j &&
+                g->flush_plan[plan].n == n) {
+                std::copy_n(g->flush_rows.data() + g->flush_plan[plan].off, n, rows);
+                ++plan;
+            } else { // not as planned (or no rows): look them up here
+                for (int k = 0; k < n; ++k) rows[k] = h.k + k;
+                bwt_sa_batch(g->bwt, rows, n, rows);
+            }
             if ((bwtint_t)n == width) x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
             resolve_rows(&x, h, x.sa_rows.data() + off, n, true);
             if ((bwtint_t)n < width) { x.res->flags |= ALN_METH_BIND_BEST; x.stop = 1; }
         }
+        while (plan < g->flush_plan.size() && g->flush_plan[plan].slot == i) ++plan;
         if (x.gen && x.res->flags) meth_gen_bound(&x);
         x.pend.clear();
         g->cores[i].state = GAP_SLOT_SEARCH;

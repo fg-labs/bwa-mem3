@@ -204,6 +204,11 @@ struct aln_meth_group_t {
     int n_slots = 0, n_active = 0, n_parked = 0, k_park = 1;
     std::vector<aln_meth_slot_t> slot;
     gap_slot_core_t *cores = nullptr;
+    // aln_meth_flush_parked: the SA rows the parked slots' hits look up, resolved in one batch, and
+    // for each looked-up hit (slot, hit index, rows) where its rows start in flush_rows.
+    struct flush_plan_t { int slot; size_t hit, off; int n; };
+    std::vector<bwtint_t> flush_rows;
+    std::vector<flush_plan_t> flush_plan;
 };
 // Applies stock aln's cuts at a score boundary, for a search whose next entry has score next:
 // see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop).
