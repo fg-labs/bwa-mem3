@@ -1729,7 +1729,7 @@ TEST_CASE("aln_known_snvs: --known-snvs and a read file cannot both be standard 
     }
 }
 
-TEST_CASE("aln_known_snvs: a run that ends with exit() removes its window directory"
+TEST_CASE("aln_known_snvs: a run that ends with exit() leaves nothing under TMPDIR"
           * doctest::test_suite("unit/aln_known_snvs")) {
     // Exec only this case: a plain fork inherits other tests' worker TLS and OpenMP state.
     // This deliberately non-unwinding child does not leak-check; its ASAN memory checks and
@@ -1746,9 +1746,8 @@ TEST_CASE("aln_known_snvs: a run that ends with exit() removes its window direct
         sites.n_sites = 1;
         bwa_aln::ks_windows_t w;
         if (bwa_aln::ks_windows_build(&sites, fmi.idx->bns, fmi.idx->pac, 1, 0, &w) != 0) _exit(2);
-        struct stat st;
-        if (w.dir.rfind(std::string(child_root) + "/", 0) != 0 || stat(w.dir.c_str(), &st) != 0) _exit(3);
-        // A status of its own: a failed index load also ends with exit(1), before any directory.
+        if (w.fmi == nullptr) _exit(3);
+        // A status of its own: a failed index load also ends with exit(1), before any window index.
         exit(42);
     }
     REQUIRE(child_root == nullptr);
@@ -1769,7 +1768,7 @@ TEST_CASE("aln_known_snvs: a run that ends with exit() removes its window direct
     const pid_t child = fork();
     if (child == 0) {
         const char *args[] = {executable.c_str(),
-            "--test-case=aln_known_snvs: a run that ends with exit() removes its window directory",
+            "--test-case=aln_known_snvs: a run that ends with exit() leaves nothing under TMPDIR",
             "--no-colors", nullptr};
         execvp(args[0], const_cast<char *const *>(args));
         _exit(127);
@@ -2930,4 +2929,264 @@ TEST_CASE("aln_known_snvs: artificial cross-window matches cannot hide a valid p
         CHECK(rec[0][2] == "c3"); CHECK(rec[0][3] == "201");
         if (!joined) want = body(slurp(sam)); else CHECK(body(slurp(sam)) == want);
     }
+}
+
+// ---- the window reference built in memory ----------------------------------------------------
+
+#include "../../src/aln/aln_known_snvs.h"
+#include "../../src/aln/aln_meth.h"
+#include "../../src/meth_ref.h"
+
+namespace {
+
+struct KsWinFixture {
+    bwa_tests::TempDir tmp_dir{"aln_ks_winref_unit"};
+    std::string dir = tmp_dir.path(), ref, fa;
+    bntseq_t *bns = nullptr;
+    uint8_t *pac = nullptr;
+    std::vector<bwa_aln::ks_window_t> win;
+
+    explicit KsWinFixture(const std::vector<std::vector<int64_t>> &sites = {{5, 200, 395}, {2, 450, 897}})
+    {
+        // Basenames from the TempDir's unique leaf: load_index first attaches any index staged in
+        // shared memory under the same basename, so a fixed name could load another index.
+        const std::string leaf = dir.substr(dir.rfind('/'));
+        ref = dir + leaf + ".fa";
+        uint32_t st = 7;
+        const std::string s1 = aln_test::lcg_dna(st, 400), s2 = aln_test::lcg_dna(st, 900);
+        FILE *fp = fopen(ref.c_str(), "w");
+        REQUIRE(fp != nullptr);
+        fprintf(fp, ">chrA\n%s\n>chrB\n%s\n", s1.c_str(), s2.c_str());
+        REQUIRE(fclose(fp) == 0);
+        REQUIRE(bwa_idx_build(ref.c_str(), ref.c_str(), 0, 3) == 0);
+        REQUIRE(meth_orig_ref_load(ref.c_str(), &bns, &pac, 1) == 0);
+        for (int rid = 0; rid < 2; ++rid)
+            for (int64_t p : sites[rid]) {
+                const int64_t beg = std::max<int64_t>(0, p - KS_WINDOW_HALF);
+                const int64_t end = std::min<int64_t>(bns->anns[rid].len, p + KS_WINDOW_HALF + 1);
+                const uint8_t refc = (pac[(bns->anns[rid].offset + p) >> 2] >> ((~(bns->anns[rid].offset + p) & 3) << 1)) & 3;
+                win.push_back({rid, beg, (int32_t)(end - beg), p, (uint8_t)((refc + 1) & 3)});
+            }
+        fa = dir + leaf + ".windows.fa";
+        fp = fopen(fa.c_str(), "w");
+        REQUIRE(fp != nullptr);
+        for (size_t i = 0; i < win.size(); ++i) {
+            const auto &w = win[i];
+            std::string seq((size_t)w.len, 'N');
+            for (int32_t j = 0; j < w.len; ++j) {
+                const int64_t k = bns->anns[w.rid].offset + w.beg + j;
+                seq[(size_t)j] = "ACGT"[(pac[k >> 2] >> ((~k & 3) << 1)) & 3];
+            }
+            seq[(size_t)(w.site_pos - w.beg)] = "ACGT"[w.alt];
+            fprintf(fp, ">w%zu\n%s\n", i, seq.c_str());
+        }
+        REQUIRE(fclose(fp) == 0);
+    }
+    ~KsWinFixture() { meth_orig_ref_free(&bns, &pac); }
+};
+
+void expect_bns_equal(const bntseq_t *a, const bntseq_t *b, bool check_fp_pac = true)
+{
+    REQUIRE(a->l_pac == b->l_pac);
+    REQUIRE(a->n_seqs == b->n_seqs);
+    CHECK(a->seed == b->seed);
+    CHECK(a->n_holes == b->n_holes);
+    CHECK((a->ambs == nullptr) == (b->ambs == nullptr));
+    if (check_fp_pac) CHECK(a->fp_pac == b->fp_pac); // a file-loaded seed index keeps its .pac open
+    CHECK((a->pos2rid_bucket == nullptr) == (b->pos2rid_bucket == nullptr));
+    if (a->pos2rid_bucket && b->pos2rid_bucket) {
+        const int64_t nb = (a->l_pac >> BNS_POS2RID_SHIFT) + 2;
+        for (int64_t i = 0; i < nb; ++i) CHECK(a->pos2rid_bucket[i] == b->pos2rid_bucket[i]);
+    }
+    for (int i = 0; i < a->n_seqs; ++i) {
+        CHECK(std::string(a->anns[i].name) == b->anns[i].name);
+        CHECK(std::string(a->anns[i].anno) == b->anns[i].anno);
+        CHECK(a->anns[i].offset == b->anns[i].offset);
+        CHECK(a->anns[i].len == b->anns[i].len);
+        CHECK(a->anns[i].n_ambs == b->anns[i].n_ambs);
+        CHECK(a->anns[i].gi == b->anns[i].gi);
+        CHECK(a->anns[i].is_alt == b->anns[i].is_alt);
+    }
+}
+
+} // namespace
+
+TEST_CASE("aln_known_snvs: window reference equals the indexed windows.fa"
+          * doctest::test_suite("unit/aln_known_snvs"))
+{
+    KsWinFixture f;
+    REQUIRE(bwa_idx_build(f.fa.c_str(), f.fa.c_str(), 0, 3) == 0);
+    bntseq_t *want_bns = nullptr;
+    uint8_t *want_pac = nullptr;
+    REQUIRE(meth_orig_ref_load(f.fa.c_str(), &want_bns, &want_pac, 1) == 0);
+    bntseq_t *bns = nullptr;
+    uint8_t *pac = nullptr;
+    bwa_aln::ks_windows_ref(f.win, f.bns, f.pac, &bns, &pac);
+    expect_bns_equal(want_bns, bns);
+    CHECK(bns->n_holes == 0);
+    CHECK(memcmp(want_pac, pac, (size_t)(want_bns->l_pac / 4 + 1)) == 0);
+    bns_destroy(bns);
+    free(pac);
+    meth_orig_ref_free(&want_bns, &want_pac);
+}
+
+TEST_CASE("aln_known_snvs: --meth window conversion equals index --meth"
+          * doctest::test_suite("unit/aln_known_snvs"))
+{
+    KsWinFixture f;
+    std::string a0 = "index", a1 = "--meth", a2 = f.fa;
+    char *argv[] = {&a0[0], &a1[0], &a2[0], nullptr};
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optind = 1;
+    optreset = 1;
+#else
+    optind = 0;
+#endif
+    REQUIRE(bwa_index(3, argv) == 0);
+    bntseq_t *want_bns = nullptr;
+    uint8_t *want_pac = nullptr;
+    REQUIRE(meth_orig_ref_load((f.fa + ".meth").c_str(), &want_bns, &want_pac, 1) == 0);
+    bntseq_t *wbns = nullptr, *cbns = nullptr;
+    uint8_t *wpac = nullptr, *cpac = nullptr;
+    bwa_aln::ks_windows_ref(f.win, f.bns, f.pac, &wbns, &wpac);
+    bwa_aln::ks_windows_meth_convert(wbns, wpac, &cbns, &cpac);
+    expect_bns_equal(want_bns, cbns);
+    CHECK(memcmp(want_pac, cpac, (size_t)(want_bns->l_pac / 4 + 1)) == 0);
+
+    bwa_aln::aln_meth_ref_t ok;
+    CHECK(bwa_aln::aln_meth_ref_adopt(&ok, wbns, wpac, cbns) == 0);
+    bwa_aln::aln_meth_ref_free(&ok);
+
+    bntseq_t *wbns2 = nullptr, *cbns2 = nullptr;
+    uint8_t *wpac2 = nullptr, *cpac2 = nullptr;
+    bwa_aln::ks_windows_ref(f.win, f.bns, f.pac, &wbns2, &wpac2);
+    bwa_aln::ks_windows_meth_convert(wbns2, wpac2, &cbns2, &cpac2);
+    cbns2->anns[3].name[1] = 'X';
+    bwa_tests::StderrCapture cap;
+    bwa_aln::aln_meth_ref_t bad;
+    CHECK(bwa_aln::aln_meth_ref_adopt(&bad, wbns2, wpac2, cbns2) == -1);
+    CHECK(bad.bns == nullptr);
+
+    bns_destroy(cbns); free(cpac);
+    bns_destroy(cbns2); free(cpac2);
+    meth_orig_ref_free(&want_bns, &want_pac);
+}
+
+#include "../../src/FMI_search.h"
+#include "../../src/aln/aln_bwt.h"
+
+namespace {
+
+// Today's file build path (frozen as the oracle): windows.fa -> bwa_idx_build, or `index --meth`
+// then the converted index loaded without its pac and the original windows loaded from the file.
+struct FileBuilt {
+    FMI_search *fmi = nullptr;
+    bwa_aln::aln_meth_ref_t mref;
+    ~FileBuilt()
+    {
+        if (mref.bns) bwa_aln::aln_meth_ref_free(&mref);
+        delete fmi;
+    }
+};
+
+void file_build(const KsWinFixture &f, bool meth, int n_threads, FileBuilt *out)
+{
+    if (meth) {
+        std::string a0 = "index", a1 = "--meth", a2 = f.fa;
+        char *argv[] = {&a0[0], &a1[0], &a2[0], nullptr};
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        optind = 1;
+        optreset = 1;
+#else
+        optind = 0;
+#endif
+        REQUIRE(bwa_index(3, argv) == 0);
+        out->fmi = new FMI_search((f.fa + ".meth").c_str());
+        out->fmi->load_index(false, n_threads, /*build_seed_jump=*/false);
+        REQUIRE(bwa_aln::aln_meth_ref_load(&out->mref, f.fa.c_str(), out->fmi->idx->bns, n_threads) == 0);
+    } else {
+        REQUIRE(bwa_idx_build(f.fa.c_str(), f.fa.c_str(), 0, 3) == 0);
+        out->fmi = new FMI_search(f.fa.c_str());
+        out->fmi->load_index(true, n_threads, /*build_seed_jump=*/false);
+    }
+}
+
+void expect_fmi_equal(FMI_search *a, FMI_search *b, bool pac)
+{
+    CHECK(a->reference_seq_len == b->reference_seq_len);
+    CHECK(a->sentinel_index == b->sentinel_index);
+    CHECK(a->sa_compx == b->sa_compx);
+    CHECK(a->sa_compx_mask == b->sa_compx_mask);
+    CHECK(memcmp(a->count_data(), b->count_data(), 5 * sizeof(int64_t)) == 0);
+    REQUIRE(a->cp_occ_size_bytes() == b->cp_occ_size_bytes());
+    CHECK(memcmp(a->cp_occ_data(), b->cp_occ_data(), (size_t)a->cp_occ_size_bytes()) == 0);
+    REQUIRE(a->sa_ms_byte_size_bytes() == b->sa_ms_byte_size_bytes());
+    CHECK(memcmp(a->sa_ms_byte_data(), b->sa_ms_byte_data(), (size_t)a->sa_ms_byte_size_bytes()) == 0);
+    REQUIRE(a->sa_ls_word_size_bytes() == b->sa_ls_word_size_bytes());
+    CHECK(memcmp(a->sa_ls_word_data(), b->sa_ls_word_data(), (size_t)a->sa_ls_word_size_bytes()) == 0);
+    expect_bns_equal(a->idx->bns, b->idx->bns, pac);
+    if (pac) {
+        REQUIRE(a->idx->pac != nullptr);
+        REQUIRE(b->idx->pac != nullptr);
+        CHECK(memcmp(a->idx->pac, b->idx->pac, (size_t)(a->idx->bns->l_pac / 4 + 1)) == 0);
+    } else {
+        CHECK(a->idx->pac == nullptr);
+        CHECK(b->idx->pac == nullptr);
+    }
+}
+
+} // namespace
+
+TEST_CASE("aln_known_snvs: in-memory window index equals the file-built one"
+          * doctest::test_suite("unit/aln_known_snvs"))
+{
+    struct layout_t { const char *name; std::vector<std::vector<int64_t>> site_pos; };
+    const std::vector<layout_t> cases = {{"three sites on each of two contigs", {{5, 200, 395}, {2, 450, 897}}},
+                                         {"one site on the second contig", {{}, {300}}}};
+    for (const auto &c : cases)
+        for (bool meth : {false, true})
+            for (int nt : {1, 8}) {
+                const std::string name = std::string(c.name) + (meth ? " / --meth" : " / plain") + " / " +
+                    std::to_string(nt) + (nt == 1 ? " thread" : " threads");
+                SUBCASE(name.c_str()) {
+                    KsWinFixture f(c.site_pos);
+                    bwa_aln::ks_sites_t sites;
+                    sites.by_contig.assign(f.bns->n_seqs, {});
+                    for (const auto &w : f.win) {
+                        const int64_t k = f.bns->anns[w.rid].offset + w.site_pos;
+                        const uint8_t refc = (f.pac[k >> 2] >> ((~k & 3) << 1)) & 3;
+                        sites.by_contig[w.rid].push_back({w.site_pos, refc, w.alt});
+                        ++sites.n_sites;
+                    }
+                    FileBuilt want;
+                    file_build(f, meth, nt, &want);
+
+                    bwa_aln::ks_windows_t got;
+                    REQUIRE(bwa_aln::ks_windows_build(&sites, f.bns, f.pac, nt, meth ? 1 : 0, &got) == 0);
+                    REQUIRE(got.win.size() == f.win.size());
+                    for (size_t i = 0; i < f.win.size(); ++i) {
+                        CHECK(got.win[i].rid == f.win[i].rid);
+                        CHECK(got.win[i].beg == f.win[i].beg);
+                        CHECK(got.win[i].len == f.win[i].len);
+                        CHECK(got.win[i].site_pos == f.win[i].site_pos);
+                        CHECK(got.win[i].alt == f.win[i].alt);
+                    }
+                    expect_fmi_equal(got.fmi, want.fmi, !meth);
+                    bwa_aln::bwt_t *bw = bwa_aln::bwt_from_fmi(want.fmi);
+                    CHECK(got.bwt->primary == bw->primary);
+                    CHECK(got.bwt->seq_len == bw->seq_len);
+                    bwa_aln::bwt_destroy(bw);
+                    if (meth) {
+                        REQUIRE(got.mref != nullptr);
+                        REQUIRE(got.bns == got.mref->bns);
+                        expect_bns_equal(want.mref.bns, got.mref->bns);
+                        CHECK(memcmp(want.mref.pac, got.mref->pac, (size_t)(want.mref.bns->l_pac / 4 + 1)) == 0);
+                    } else {
+                        CHECK(got.mref == nullptr);
+                        CHECK(got.bns == got.fmi->idx->bns);
+                        expect_bns_equal(want.fmi->idx->bns, got.bns);
+                    }
+                    bwa_aln::ks_windows_free(&got);
+                }
+            }
 }

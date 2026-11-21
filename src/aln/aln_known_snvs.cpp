@@ -15,20 +15,15 @@
 
 #include "../FMI_search.h"
 #include "../bwa.h"
+#include "../libsais_build.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <climits>
 #include <cstdlib>
-#include <dirent.h>
-#include <unistd.h>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <unordered_map>
-#include <getopt.h>
-
-int bwa_index(int argc, char *argv[]); // src/bwtindex.cpp, the `index` command
 
 namespace bwa_aln {
 
@@ -161,47 +156,74 @@ int ks_load(const char *path, const bntseq_t *bns, const uint8_t *pac, ks_sites_
 
 namespace {
 
-void remove_dir(const std::string &dir)
+// A restored-state bns (what bns_restore leaves after bwa_idx_load_ele closes fp_pac): seed 11,
+// gi 0, empty anno, no holes, fp_pac NULL, pos2rid built.
+bntseq_t *ks_new_bns(int n_seqs)
 {
-	DIR *d = opendir(dir.c_str());
-	if (d) {
-		struct dirent *e;
-		while ((e = readdir(d)) != nullptr) {
-			if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
-			unlink((dir + "/" + e->d_name).c_str());
-		}
-		closedir(d);
-	}
-	rmdir(dir.c_str());
+	bntseq_t *b = (bntseq_t *)aln_calloc(1, sizeof(bntseq_t));
+	b->seed = 11;
+	b->n_seqs = n_seqs;
+	b->anns = (bntann1_t *)aln_calloc((size_t)std::max(n_seqs, 1), sizeof(bntann1_t));
+	return b;
 }
 
-// Window directories not yet removed by ks_windows_free. Several error paths (--meth's among
-// them) end the run with exit(); the handler removes what is left then. Heap-held and never
-// freed, so static destruction cannot run before the handler (abort() still leaves the directory).
-std::vector<std::string> *live_dirs = nullptr;
-
-void remove_live_dirs()
+void ks_set_ann(bntann1_t *a, const std::string &name, int64_t offset, int32_t len)
 {
-	if (!live_dirs) return;
-	for (const std::string &d : *live_dirs) remove_dir(d);
-	live_dirs->clear();
-}
-
-void track_dir(const std::string &dir)
-{
-	if (!live_dirs) {
-		live_dirs = new std::vector<std::string>();
-		atexit(remove_live_dirs);
-	}
-	live_dirs->push_back(dir);
-}
-
-void untrack_dir(const std::string &dir)
-{
-	if (live_dirs) live_dirs->erase(std::remove(live_dirs->begin(), live_dirs->end(), dir), live_dirs->end());
+	a->name = aln_strdup(name.c_str());
+	a->anno = aln_strdup("");
+	a->offset = offset;
+	a->len = len;
 }
 
 } // namespace
+
+void ks_windows_ref(const std::vector<ks_window_t> &win, const bntseq_t *bns, const uint8_t *pac,
+					bntseq_t **out_bns, uint8_t **out_pac)
+{
+	bntseq_t *b = ks_new_bns((int)win.size());
+	int64_t off = 0;
+	for (size_t i = 0; i < win.size(); ++i) {
+		ks_set_ann(&b->anns[i], "w" + std::to_string(i), off, win[i].len);
+		off += win[i].len;
+	}
+	b->l_pac = off;
+	uint8_t *p = (uint8_t *)aln_calloc((size_t)(off / 4 + 1), 1);
+	int64_t o = 0;
+	for (const ks_window_t &w : win) {
+		const int64_t base = bns->anns[w.rid].offset + w.beg;
+		for (int32_t j = 0; j < w.len; ++j, ++o) {
+			const int64_t k = base + j;
+			// _set_pac ORs into zeroed bytes, so each base is set once: the ALT in place of REF
+			_set_pac(p, o, j == w.site_pos - w.beg ? w.alt : (pac[k >> 2] >> ((~k & 3) << 1)) & 3);
+		}
+	}
+	bns_build_pos2rid(b);
+	*out_bns = b;
+	*out_pac = p;
+}
+
+void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, bntseq_t **conv_bns,
+							 uint8_t **conv_pac)
+{
+	bntseq_t *b = ks_new_bns(2 * orig_bns->n_seqs);
+	b->l_pac = 2 * orig_bns->l_pac;
+	uint8_t *p = (uint8_t *)aln_calloc((size_t)(b->l_pac / 4 + 1), 1);
+	for (int i = 0; i < orig_bns->n_seqs; ++i) {
+		const bntann1_t &a = orig_bns->anns[i];
+		for (int h = 0; h < 2; ++h) { // r: G->A, then f: C->T (index --meth's order)
+			const int64_t off = 2 * a.offset + h * (int64_t)a.len;
+			ks_set_ann(&b->anns[2 * i + h], std::string(h ? "f" : "r") + a.name, off, a.len);
+			const uint8_t from = h ? 1 : 2, to = h ? 3 : 0;
+			for (int32_t j = 0; j < a.len; ++j) {
+				const uint8_t c = _get_pac(orig_pac, a.offset + j);
+				_set_pac(p, off + j, c == from ? to : c);
+			}
+		}
+	}
+	bns_build_pos2rid(b);
+	*conv_bns = b;
+	*conv_pac = p;
+}
 
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
 					 int meth, ks_windows_t *out)
@@ -215,58 +237,32 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 			out->win.push_back({rid, beg, (int32_t)(end - beg), s.pos, s.alt});
 		}
 	}
-	const char *tmp = getenv("TMPDIR");
-	std::string templ = std::string(tmp && *tmp ? tmp : "/tmp") + "/bwa-mem3-known-snvs.XXXXXX";
-	std::vector<char> buf(templ.begin(), templ.end());
-	buf.push_back('\0');
-	if (!mkdtemp(buf.data())) {
-		fprintf(stderr, "[E::aln] --known-snvs: cannot create a temporary directory from '%s': %s\n",
-				templ.c_str(), strerror(errno));
-		return -1;
-	}
-	out->dir = buf.data();
-	track_dir(out->dir);
-	const std::string fa = out->dir + "/windows.fa";
-	FILE *fp = fopen(fa.c_str(), "w");
-	bool ok = fp != nullptr;
-	std::string seq;
-	for (size_t i = 0; ok && i < out->win.size(); ++i) {
-		const ks_window_t &w = out->win[i];
-		const int64_t off = bns->anns[w.rid].offset;
-		seq.resize((size_t)w.len);
-		for (int32_t j = 0; j < w.len; ++j) {
-			const int64_t k = off + w.beg + j;
-			seq[(size_t)j] = "ACGT"[(pac[k >> 2] >> ((~k & 3) << 1)) & 3];
-		}
-		seq[(size_t)(w.site_pos - w.beg)] = "ACGT"[w.alt];
-		ok = fprintf(fp, ">w%zu\n%s\n", i, seq.c_str()) >= 0;
-	}
-	if (fp && fclose(fp) != 0) ok = false;
-	if (!ok) {
-		fprintf(stderr, "[E::aln] --known-snvs: cannot write '%s'\n", fa.c_str());
-		ks_windows_free(out);
-		return -1;
-	}
-	if (meth) { // `index --meth`: the converted index, and the original one it is checked against
-		std::string a0 = "index", a1 = "--meth", a2 = "-t", a3 = std::to_string(std::max(1, n_threads)), a4 = fa;
-		char *argv[] = {&a0[0], &a1[0], &a2[0], &a3[0], &a4[0], nullptr};
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
-		optind = 1;
-		optreset = 1;
-#else
-		optind = 0;
-#endif
-		if (bwa_index(5, argv) != 0) {
-			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows in '%s'\n", out->dir.c_str());
+	bntseq_t *wbns = nullptr;
+	uint8_t *wpac = nullptr;
+	ks_windows_ref(out->win, bns, pac, &wbns, &wpac);
+	LibsaisBuildOpts bo;
+	bo.num_threads = std::max(1, n_threads);
+	bo.sa_compx = 3; // bwa_idx_build's default, which the file-built window index used
+	FmArrays arrays;
+	if (meth) { // the converted index seeds the search; the original windows are the reference
+		bntseq_t *cbns = nullptr;
+		uint8_t *cpac = nullptr;
+		ks_windows_meth_convert(wbns, wpac, &cbns, &cpac);
+		const int rc = libsais_build_fm_memory(cpac, cbns->l_pac, bo, &arrays);
+		free(cpac);
+		if (rc != 0) {
+			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows (status %d)\n", rc);
+			bns_destroy(cbns);
+			bns_destroy(wbns);
+			free(wpac);
 			ks_windows_free(out);
 			return -1;
 		}
-		out->fmi = new FMI_search((fa + ".meth").c_str());
-		out->fmi->load_index(/*load_pac=*/false, n_threads, /*build_seed_jump=*/false,
-				BWAMEM_HUGETLB_OFF, /*allow_shm=*/false);
+		out->fmi = new FMI_search("(known-snvs windows)");
+		out->fmi->adopt_built(&arrays, cbns, nullptr, n_threads, /*build_seed_jump=*/false); // as load_index(false, ...) leaves it; aln never reads the seed jump table
 		out->bwt = bwt_from_fmi(out->fmi);
 		out->mref = new aln_meth_ref_t();
-		if (aln_meth_ref_load(out->mref, fa.c_str(), out->fmi->idx->bns, n_threads) != 0) {
+		if (aln_meth_ref_adopt(out->mref, wbns, wpac, out->fmi->idx->bns) != 0) { // frees wbns, wpac
 			ks_windows_free(out);
 			return -1;
 		}
@@ -275,14 +271,16 @@ int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t
 		if (out->bns->n_seqs == (int)out->win.size())
 			for (const ks_window_t &w : out->win) out->mref->window_site.push_back((int32_t)(w.site_pos - w.beg));
 	} else {
-		if (bwa_idx_build(fa.c_str(), fa.c_str()) != 0) {
-			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows in '%s'\n", out->dir.c_str());
+		const int rc = libsais_build_fm_memory(wpac, wbns->l_pac, bo, &arrays);
+		if (rc != 0) {
+			fprintf(stderr, "[E::aln] --known-snvs: cannot index the ALT windows (status %d)\n", rc);
+			bns_destroy(wbns);
+			free(wpac);
 			ks_windows_free(out);
 			return -1;
 		}
-		out->fmi = new FMI_search(fa.c_str());
-		out->fmi->load_index(/*load_pac=*/true, n_threads, /*build_seed_jump=*/false,
-				BWAMEM_HUGETLB_OFF, /*allow_shm=*/false);
+		out->fmi = new FMI_search("(known-snvs windows)");
+		out->fmi->adopt_built(&arrays, wbns, wpac, n_threads, /*build_seed_jump=*/false); // aln never reads it
 		out->bns = out->fmi->idx->bns;
 		out->bwt = bwt_from_fmi(out->fmi);
 	}
@@ -304,10 +302,6 @@ void ks_windows_free(ks_windows_t *w)
 	}
 	if (w->bwt) bwt_destroy(w->bwt);
 	delete w->fmi;
-	if (!w->dir.empty()) {
-		remove_dir(w->dir);
-		untrack_dir(w->dir);
-	}
 	*w = ks_windows_t();
 }
 
