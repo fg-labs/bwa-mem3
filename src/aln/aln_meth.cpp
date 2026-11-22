@@ -333,12 +333,12 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
     // bounded (--known-snvs, a window the ALT-window search proposed): the read's own search never
     // proposes an alignment over its difference limit, so neither may this path. The bound is the
     // gap search's: n_mm + n_gapo (+ n_gape under the default gap-extension mode) <= the read's
-    // max_diff, at most max_gapo gap opens and max_gape gap extensions.
+    // max_diff (x->max_diff, the limit the final filter below also applies), at most max_gapo gap
+    // opens and max_gape gap extensions.
     const gap_opt_t *op = g->opt;
     auto within_limits = [&](const aln_meth_occ_t &c) {
-        const int max_diff = op->fnr > 0.0 ? bwa_cal_maxdiff(x->len, BWA_AVG_ERR, op->fnr) : op->max_diff;
         const int diffs = c.n_mm + c.n_gapo + ((op->mode & BWA_MODE_GAPE) ? c.n_gape : 0);
-        return diffs <= max_diff && c.n_gapo <= std::max(0, op->max_gapo) && c.n_gape <= std::max(0, op->max_gape);
+        return diffs <= x->max_diff && c.n_gapo <= std::max(0, op->max_gapo) && c.n_gape <= std::max(0, op->max_gape);
     };
     // Realigns the window (band_limit as aln_meth_realign_window takes it) into a fresh o, with
     // fits whether its counts fit a record; false when the result misses its site.
