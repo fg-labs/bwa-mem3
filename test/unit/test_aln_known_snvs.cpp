@@ -30,6 +30,7 @@
 #include <string>
 #include <vector>
 #include <unistd.h>
+#include <fcntl.h>
 #include <dirent.h>
 #include <getopt.h>
 #include <map>
@@ -1730,6 +1731,43 @@ TEST_CASE("aln_known_snvs: --known-snvs and a read file cannot both be standard 
         CHECK(run(args) == 1);
         CHECK(capture.text().find("can stand for only one of --known-snvs and the read files") != std::string::npos);
     }
+}
+
+TEST_CASE("aln_known_snvs: -f naming the --known-snvs file on standard input is refused and the sites are kept"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    KsIndex x;
+    bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF and output, removed when it ends
+    const char ref = x.c1[100], alt = ref == 'A' ? 'G' : 'A'; // a valid site: c1:101 is its REF
+    const std::string vcf = write_vcf(scratch.path() + "/sites.vcf", {row("c1", 101, ref, std::string(1, alt))});
+    const std::string before = slurp(vcf), out = scratch.path() + "/out.sam";
+    // Runs aln with the VCF on standard input for --known-snvs -, writing -f `to`.
+    auto run_piped = [&](const std::string &to, std::string *err) {
+        const int saved = dup(STDIN_FILENO);
+        REQUIRE(saved >= 0);
+        const int fd = open(vcf.c_str(), O_RDONLY);
+        REQUIRE(fd >= 0);
+        REQUIRE(dup2(fd, STDIN_FILENO) == STDIN_FILENO);
+        close(fd);
+        int rc;
+        {
+            bwa_tests::StderrCapture capture;
+            rc = run({"--known-snvs", "-", "-f", to, x.prefix, x.fq});
+            *err = capture.text();
+        }
+        REQUIRE(dup2(saved, STDIN_FILENO) == STDIN_FILENO);
+        close(saved);
+        return rc;
+    };
+    // -f naming the file on standard input: opening it would truncate the sites before they are read
+    std::string err;
+    CHECK(run_piped(vcf, &err) == 1);
+    CHECK(err.find("is the --known-snvs file") != std::string::npos);
+    CHECK(slurp(vcf) == before);
+    // a piped VCF with a separate output file still runs
+    INFO(err);
+    CHECK(run_piped(out, &err) == 0);
+    CHECK(slurp(vcf) == before);
+    CHECK(!records(slurp(out)).empty());
 }
 
 TEST_CASE("aln_known_snvs: a run that ends with exit() leaves nothing under TMPDIR"

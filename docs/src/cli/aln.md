@@ -419,7 +419,8 @@ zcat reads.fq.gz | bwa-mem3 aln ref.fa - > out.sam
 - Each input file and any existing `-f` path are checked before the index is
   loaded. Absent output paths are not opened by this check: failures to create
   them are reported when the output opens, after loading the index. An `-f`
-  that names one of the input files, or a file of the index (`.pac`, `.ann`,
+  that names one of the input files (the reads or the `--known-snvs` VCF, also
+  when it is the file on standard input for `-`), or a file of the index (`.pac`, `.ann`,
   `.bwt.2bit.64` and the others, including the `.meth.*` seed index that
   `index --meth` writes), is refused (writing it would truncate the reads before
   they are read, or overwrite the index).

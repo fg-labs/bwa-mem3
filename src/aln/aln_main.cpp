@@ -1812,7 +1812,8 @@ int main_aln(int argc, char *argv[])
 		fprintf(stderr, "[E::aln] standard input ('-') can stand for only one of --known-snvs and the read files\n");
 		return 1;
 	}
-	if (ks_path && aln_same_file(out_path, ks_path)) {
+	// "-" reads the sites from standard input, which -f must not name either
+	if (ks_path && (aln_same_file(out_path, ks_path) || (strcmp(ks_path, "-") == 0 && aln_out_is_stdin(out_path)))) {
 		fprintf(stderr, "[E::aln] -f '%s' is the --known-snvs file; writing it would truncate the sites before they are read\n",
 				out_path);
 		return 1;
