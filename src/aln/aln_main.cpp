@@ -57,6 +57,8 @@ void aln_opt_init(aln_opt_t *o)
 	o->share_dup_search = 1;
 	o->meth = nullptr;
 	o->meth_ref = nullptr;
+	o->known_snvs = nullptr;
+	o->ks_windows = nullptr;
 }
 
 /* The next batch is read on a helper thread while the current one is processed (background_task_t). */

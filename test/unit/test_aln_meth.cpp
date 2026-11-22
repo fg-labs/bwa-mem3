@@ -714,17 +714,23 @@ TEST_CASE("aln_meth: identical reads share a search and still draw their own mai
     }
 }
 
-TEST_CASE("aln_meth: aln_opt_init clears the --meth pointers of a reused aln_opt_t")
+TEST_CASE("aln_meth: aln_opt_init clears the --meth and --known-snvs pointers of a reused aln_opt_t")
 {
     namespace ba = bwa_aln;
     ba::aln_opt_t o;
     ba::aln_meth_opt_t mo;
     ba::aln_meth_ref_t mr;
+    ba::ks_sites_t sites;
+    ba::ks_windows_t windows;
     o.meth = &mo;
     o.meth_ref = &mr;
+    o.known_snvs = &sites;
+    o.ks_windows = &windows;
     ba::aln_opt_init(&o);
     CHECK(o.meth == nullptr);
     CHECK(o.meth_ref == nullptr);
+    CHECK(o.known_snvs == nullptr);
+    CHECK(o.ks_windows == nullptr);
 }
 
 TEST_CASE("aln_meth: a duplicate's search work is counted once, by the read it copies")
