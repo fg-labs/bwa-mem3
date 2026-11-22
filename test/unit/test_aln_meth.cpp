@@ -975,7 +975,8 @@ TEST_CASE("aln_meth: a refined window over the read's -n limit is not a locus")
     u_over = u;
     for (int i : {3, 13, 26}) u_over[i] = 'T';
     bwa_tests::TempDir tmp{"aln_meth_strict_n"}; // this case's index, reads and output
-    const std::string dir = tmp.path(), fa = dir + "/strict-n.fa";
+    // a unique basename: shared memory is looked up by basename, which the directory does not isolate
+    const std::string dir = tmp.path(), fa = tmp.unique_file();
     REQUIRE(aln_test::write_test_fasta(fa, {{"r_over", flank() + r_over + flank()},
                                             {"s_over", flank() + s_over + flank()},
                                             {"s_gap", flank() + s_gap + flank()},
