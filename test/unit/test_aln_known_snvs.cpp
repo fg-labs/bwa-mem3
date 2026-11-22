@@ -172,7 +172,10 @@ void require_records(const std::string &sam, const std::vector<std::string> &nam
     for (const auto &r : rec) {
         REQUIRE(r.size() >= 11);
         const int flag = std::stoi(r[1]);
-        const int mate = paired ? flag & (64 | 128) : 0;
+        const int mate = flag & (64 | 128);
+        // a paired record has 0x1 and exactly one mate bit; a single-end record has none of them
+        if (paired) REQUIRE(((flag & 1) && (mate == 64 || mate == 128)));
+        else REQUIRE((flag & (1 | 64 | 128)) == 0);
         ++actual[{r[0], mate}];
     }
     CHECK(actual == expected);
@@ -638,7 +641,10 @@ TEST_CASE("aln_known_snvs: a read whose search stops at -m keeps its stock recor
         // control: the default -m completes both searches and the read is credited
         std::string err = aln({"-v", "3", "-f", ks, "--known-snvs", vcf});
         CHECK(err.find(" 1 " + what + " credited, 0 at a site with no change, 0 kept stock") != std::string::npos);
-        CHECK((std::stoi(records(slurp(ks))[0][1]) & 4) == 0);
+        const auto control = records(slurp(ks));
+        REQUIRE(control.size() == (paired ? 2u : 1u));
+        REQUIRE(control[0].size() >= 11);
+        CHECK((std::stoi(control[0][1]) & 4) == 0);
         aln({"-m", "16", "-f", stock});
         err = aln({"-m", "16", "-v", "3", "-f", ks, "--known-snvs", vcf});
         INFO(err);
@@ -1139,7 +1145,12 @@ TEST_CASE("aln_known_snvs: conservative downstream counting excludes both conver
                 CHECK(votes[0].conv == active);
                 // Placeable literal source can be informative even when its counterpart is hidden.
                 const bool old_count = old_recipe(votes[0], 37, 1, 37);
-                const bool count = !exclude && old_count;
+                // The documented rule, applied to the observed vote: drop it when the conversion
+                // applies at the site (conv) and either site allele is the conversion source.
+                REQUIRE(votes[0].site != nullptr);
+                const bool rule_excludes = votes[0].conv && (votes[0].site->ref == source || votes[0].site->alt == source);
+                CHECK(rule_excludes == exclude); // against the fixture's own expectation
+                const bool count = !rule_excludes && old_count;
                 if (exclude) CHECK_FALSE(count);
                 else CHECK(count); // unchanged inactive-context and nonsource R/A controls
                 if (active && kind == 1) {
