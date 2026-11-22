@@ -42,10 +42,11 @@ int bwa_index(int argc, char *argv[]); // src/bwtindex.cpp, the `index` command
 
 namespace {
 
-// The index the cases share. Its files stay until the process exits rather than being dropped
-// (TempIndex::drop_files) once loaded: most cases run the aln command, which loads the index from
-// disk itself. A case's own scratch files (VCF, reads, output) go in its own TempDir, and a case
-// that needs the converted index builds its own (KsMethIndex).
+// A case's index (a few kilobases, built in milliseconds), with the reads over it. Each case
+// builds its own, and its files are removed when the case ends: most cases run the aln command,
+// which loads the index from disk itself, so the files cannot be dropped once loaded
+// (TempIndex::drop_files). A case's own scratch files (VCF, reads, output) go in its own TempDir,
+// and a case that needs the converted index builds its own (KsMethIndex).
 struct KsIndex {
     bwa_tests::TempDir tmp_dir{"aln_known_snvs_unit"};
     std::string dir = tmp_dir.path(), prefix, fq;
@@ -67,12 +68,6 @@ struct KsIndex {
         REQUIRE(fclose(fp) == 0);
     }
 };
-
-KsIndex &fixture()
-{
-    static KsIndex idx;
-    return idx;
-}
 
 int run(std::vector<std::string> args)
 {
@@ -270,7 +265,7 @@ std::string tag(const std::vector<std::string> &r, const std::string &prefix)
 TEST_CASE("aln_known_snvs: merge guards cover large options and distinct combined loci"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
     // Synthetic window hits use the main index's coordinate system; merging only reads rows.
@@ -332,7 +327,7 @@ TEST_CASE("aln_known_snvs: merge guards cover large options and distinct combine
 TEST_CASE("aln_known_snvs: merged histories count each locus once and restore -R"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
     ba::ks_windows_t w; w.bns = fmi.idx->bns; w.bwt = bwt;
@@ -428,7 +423,7 @@ TEST_CASE("aln_known_snvs: XA uses selected-allele CIGAR and reference edit dist
 
 TEST_CASE("aln_known_snvs: sites load, non-SNVs and duplicates are counted, FILTER is ignored"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     const char r100 = x.c1[99], r200 = x.c1[199];
@@ -448,7 +443,7 @@ TEST_CASE("aln_known_snvs: sites load, non-SNVs and duplicates are counted, FILT
 TEST_CASE("aln_known_snvs: sampled VCF compressed VCF and BCF load identical sites and reject truncation"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir tmp{"ks_formats"}; const std::string dir = tmp.path();
     const std::string text = dir + "/s.vcf";
     FILE *fp = fopen(text.c_str(), "w"); REQUIRE(fp != nullptr);
@@ -510,7 +505,7 @@ TEST_CASE("aln_known_snvs: sampled VCF compressed VCF and BCF load identical sit
 
 TEST_CASE("aln_known_snvs: a contig, REF or position the reference does not have is an error naming the record"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     struct bad_t { std::string row, msg; };
@@ -537,7 +532,7 @@ TEST_CASE("aln_known_snvs: a contig, REF or position the reference does not have
 
 TEST_CASE("aln_known_snvs: an empty site set leaves the output unchanged"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     const std::string base = dir + "/base.sam", with = dir + "/empty.sam";
@@ -556,7 +551,7 @@ TEST_CASE("aln_known_snvs: an empty site set leaves the output unchanged"
 
 TEST_CASE("aln_known_snvs: an ALT read over the mismatch budget is placed; its REF twin's record is unchanged"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     // Site c1:500 (0-based 499), outside the part of c1 that c2 copies. A 20-base read has a
@@ -659,7 +654,7 @@ TEST_CASE("aln_known_snvs: a read whose search stops at -m keeps its stock recor
 
 TEST_CASE("aln_known_snvs: paired end, an ALT mate is placed by its own search or by mate rescue"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     // Site c1:500 (0-based 499). Pairs of 25-base reads with 55- to 65-base inserts from
@@ -1416,7 +1411,7 @@ TEST_CASE("aln_known_snvs: with -e, a gap's extensions are not differences, as i
 
 TEST_CASE("aln_known_snvs: under --meth-context cpg a converted base counts as its allele only at a CpG"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str());
     fmi.load_index(/*load_pac=*/true, 1, /*build_seed_jump=*/false);
     const bntseq_t *bns = fmi.idx->bns;
@@ -1503,7 +1498,7 @@ TEST_CASE("aln_known_snvs: trimmed votes retain the search budget and twins reta
 TEST_CASE("aln_known_snvs: listed pairing retains the selected duplicate's reference span"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str());
     fmi.load_index(/*load_pac=*/true, 1, /*build_seed_jump=*/false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
@@ -1529,7 +1524,7 @@ TEST_CASE("aln_known_snvs: listed pairing retains the selected duplicate's refer
 TEST_CASE("aln_known_snvs: listed extra hits keep the primary's start on the other strand"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str());
     fmi.load_index(/*load_pac=*/true, 1, /*build_seed_jump=*/false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
@@ -1627,7 +1622,7 @@ TEST_CASE("aln_known_snvs: XV escapes delimiters in contig names"
 TEST_CASE("aln_known_snvs: rejected junction rows cannot produce a credited merge with no best hit"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str());
     fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
@@ -1666,7 +1661,7 @@ TEST_CASE("aln_known_snvs: rejected junction rows cannot produce a credited merg
 TEST_CASE("aln_known_snvs: a main row joining two contigs neither ties nor stays the primary"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str());
     fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
@@ -1709,7 +1704,7 @@ TEST_CASE("aln_known_snvs: a main row joining two contigs neither ties nor stays
 
 TEST_CASE("aln_known_snvs: -f naming the --known-snvs file, by path or hard link, is refused before writing"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     const std::string vcf = write_vcf(dir + "/alias.vcf", {row("c1", 500, x.c1[499], std::string(1, other(x.c1[499])))});
@@ -1728,7 +1723,7 @@ TEST_CASE("aln_known_snvs: -f naming the --known-snvs file, by path or hard link
 
 TEST_CASE("aln_known_snvs: --known-snvs and a read file cannot both be standard input"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     // The sites are read to the end before the reads, which would find standard input empty.
@@ -1804,7 +1799,7 @@ TEST_CASE("aln_known_snvs: a run that ends with exit() leaves nothing under TMPD
     }
     REQUIRE(child_root == nullptr);
     REQUIRE(child_prefix == nullptr);
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir tmp{"ks_exit"};
     const std::string root = tmp.path();
     const std::string executable = doctest::getContextOptions()->binary_name.c_str();
@@ -1845,7 +1840,7 @@ TEST_CASE("aln_known_snvs: a run that ends with exit() leaves nothing under TMPD
 
 TEST_CASE("aln_known_snvs: mate rescue lists the sites of every contig its range crosses"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bntseq_t *bns = bns_restore(x.prefix.c_str());
     REQUIRE(bns != nullptr);
     REQUIRE(bns->n_seqs == 3);
@@ -1872,7 +1867,7 @@ TEST_CASE("aln_known_snvs: mate rescue lists the sites of every contig its range
 
 TEST_CASE("aln_known_snvs: --meth mate rescue lists only its anchor contig's sites"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bntseq_t *bns = bns_restore(x.prefix.c_str());
     REQUIRE(bns != nullptr);
     REQUIRE(bns->n_seqs == 3);
@@ -1906,7 +1901,7 @@ TEST_CASE("aln_known_snvs: --meth mate rescue lists only its anchor contig's sit
 
 TEST_CASE("aln_known_snvs: at a multi-allelic site, the other ALT's vote counts against the credited ALT"
           * doctest::test_suite("unit/aln_known_snvs")) {
-    KsIndex &x = fixture();
+    KsIndex x;
     bwa_tests::TempDir scratch{"ks_case"}; // this case's VCF, reads and output, removed when it ends
     const std::string dir = scratch.path();
     // Site c1:500 with both non-REF bases a1 < a2 as ALTs. The read is c1[484, 516) carrying a2 and
@@ -2589,7 +2584,7 @@ TEST_CASE("aln_known_snvs: a plain paired twin's supporting mate cannot cross a 
 TEST_CASE("aln_known_snvs: a paired twin's mate moved by pairing is checked with its new hit's span"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture();
+    KsIndex x;
     FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
     const bntseq_t *bns = fmi.idx->bns;
@@ -2643,7 +2638,7 @@ TEST_CASE("aln_known_snvs: a paired twin's mate moved by pairing is checked with
 TEST_CASE("aln_known_snvs: negative plain twin placements reject moved tied and strand-inverted hits"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture(); FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
+    KsIndex x; FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
     auto *opt = ba::gap_init_opt(); ba::bwt_aln1_t hit = {};
     int strand = 0; ba::bwtint_t pos = (ba::bwtint_t)-1;
@@ -2669,7 +2664,7 @@ TEST_CASE("aln_known_snvs: negative plain twin placements reject moved tied and 
 TEST_CASE("aln_known_snvs: credited twin checks the deletion-derived full span"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture(); FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
+    KsIndex x; FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
     ba::bwt_aln1_t hit = {}; bool found = false;
     for (ba::bwtint_t row = 0; row < bwt->seq_len; ++row) {
@@ -2699,7 +2694,7 @@ TEST_CASE("aln_known_snvs: credited twin checks the deletion-derived full span"
 TEST_CASE("aln_known_snvs: stock twin placement checks the deletion-derived full span"
           * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
-    KsIndex &x = fixture(); FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
+    KsIndex x; FMI_search fmi(x.prefix.c_str()); fmi.load_index(true, 1, false);
     ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
     ba::bwt_aln1_t hit = {}; bool found = false;
     for (ba::bwtint_t row = 0; row < bwt->seq_len; ++row) {
