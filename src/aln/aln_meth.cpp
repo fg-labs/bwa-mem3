@@ -375,7 +375,7 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
     // search cannot see a read C over a reference T, so it can propose a window within -n converted
     // differences whose original-reference alignment has more; drop it before it is a locus (no
     // X0/X1, MAPQ or pairing). Differences are counted as stock aln counts them: mismatches plus
-    // gap opens, plus gap extensions unless -e was given; conversions are free.
+    // gap opens, plus gap extensions unless -e is positive; conversions are free.
     const int64_t differences = (int64_t)o.n_mm + o.n_gapo + ((g->opt->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
     if (differences > x->max_diff) { ++x->res->n_over_diff; return; }
     if (!fits) {
