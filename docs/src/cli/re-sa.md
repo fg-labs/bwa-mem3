@@ -104,14 +104,14 @@ depends on the workload; representative figures on hg38, a 5M-read-pair WGS
 slice (Graviton4, arm64/NEON tier, 16 threads), as relative user-CPU deltas
 versus a plain stride-8 index (indicative, not absolute):
 
-| `-u` | stride | user-CPU Δ vs stride-8 | added index / resident size (hg38) |
+| `-u` | stride | user-CPU Δ vs stride-8 | added on disk / resident (hg38) |
 |---|---|---|---|
-| `2` | 4 | **≈ −2.5 %** | +4 GB |
-| `1` | 2 | **≈ −4.2 %** | +12 GB |
+| `2` | 4 | **≈ −2.5 %** | +4 GB / +3.3 GB |
+| `1` | 2 | **≈ −4.2 %** | +12 GB / +10 GB |
 
 **`-u 2` (stride-4) is the best speed-per-GB operating point and the recommended
 target.** `-u 1` (stride-2) is a real further step (another ≈ −1.7 % for +8 GB
-more) where the disk and RAM budget allows. The cost is paid on disk (a larger
+on disk, +6.7 GB resident) where the disk and RAM budget allows. The cost is paid on disk (a larger
 `.bwt.2bit.64`) and in resident memory each time `mem` loads the index; the
 speed-up scales with how resolve-heavy the workload is and how large the
 reference is. Coarsening trades in the other direction — a smaller index and

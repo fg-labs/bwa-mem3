@@ -106,6 +106,11 @@ the pages it pins are that size rounded up to whole 1 GB pages. A third column f
 
 Useful to confirm that staging succeeded before launching alignment jobs.
 
+After an upgrade that changes the staged layout, an index staged by the older
+bwa-mem3 is listed as `unusable`: `mem` loads from disk instead, and restaging
+that index fails. It stays staged, holding its memory (or its 1 GB pages), until
+`shm -d` removes it; then stage it again.
+
 ### `--meth` — stage a methylation index
 
 Stages the `.meth` seed index (`<idxbase>.meth.*`) into shared memory, mirroring
@@ -133,7 +138,7 @@ are used exactly as for any other staged index; `mem` needs no flag.
 `/dev/shm` cannot hold 1 GB pages, so the index goes into a System V shared
 memory segment created with `SHM_HUGETLB | SHM_HUGE_1GB`, and `/dev/shm` holds
 only a 64-byte stub that names it. The index is rounded up to whole pages: a
-default hg38 stage (11,261,255,872 bytes) takes 11, and `-u` adds the pages of
+default hg38 stage (10,557,461,248 bytes, 9.83 GiB) takes 10, and `-u` adds the pages of
 its denser table. An index of any size takes at least one whole page.
 
 Which hosts: it was measured on three CPUs only, on hg38 with 5M read pairs
@@ -154,7 +159,7 @@ stage is when the staging command exits, and where that setting cannot be read
 
 Requirements:
 
-- Enough free, unreserved 1 GB pages in the host's pool: 11 for a default hg38
+- Enough free, unreserved 1 GB pages in the host's pool: 10 for a default hg38
   stage. `nr_hugepages` sets the pool's total size; it does not add pages, and
   other workloads on the host may be using or have reserved some of them. So
   check what is available first, and grow the pool only by the shortfall, never
@@ -162,7 +167,7 @@ Requirements:
 
   ```bash
   pool=/sys/kernel/mm/hugepages/hugepages-1048576kB
-  need=11
+  need=10
   avail=$(( $(cat $pool/free_hugepages) - $(cat $pool/resv_hugepages) ))
   if [ "$avail" -lt "$need" ]; then
     echo $(( $(cat $pool/nr_hugepages) + need - avail )) | sudo tee $pool/nr_hugepages
@@ -321,7 +326,8 @@ tier; it is enforced by the shm densify-parity test (`test/shm_pack_round_trip_t
 which checks the staged table against an independent `index -u` build.
 `INT` must be in `[0, 6]`; a value that is not strictly denser than the on-disk
 rate is ignored with a warning (the disk rate is staged unchanged). The extra
-memory is real: on hg38, `-u 2` adds ~4 GB to the staged segment.
+memory is real: on hg38, `-u 2` adds ~3.3 GB to the staged segment (4.125 bytes
+per added sample: a 4-byte low word and a 1-bit high part).
 
 To make the denser table permanent on disk (so every `mem` and every future
 `shm` stage picks it up with no flag, at the cost of a larger index file), use
@@ -346,14 +352,14 @@ times:
 | `-u` | stride | user-CPU Δ vs stride-8 | added shared memory (hg38) |
 |---|---|---|---|
 | _(none)_ | 8 | — | — |
-| `-u 2` | 4 | **≈ −2.5 %** | +4 GB |
-| `-u 1` | 2 | **≈ −4.2 %** | +12 GB |
+| `-u 2` | 4 | **≈ −2.5 %** | +3.3 GB |
+| `-u 1` | 2 | **≈ −4.2 %** | +10 GB |
 
 **`-u 2` is the best speed-per-GB operating point and the recommended setting.**
 (Staging without `-u` does not select it — no-flag staging keeps the on-disk
 default rate, `u = 3` / stride 8; `-u 2` is an explicit opt-in.)
 The second halving (`-u 1`) is not sharply diminishing — it buys roughly another
-−1.7 % for +8 GB more — so it is worthwhile where the RAM is available (peak
+−1.7 % for +6.7 GB more — so it is worthwhile where the RAM is available (peak
 staging RSS is ~26 GB on hg38), but `-u 2` is the sweet spot. `-u 0` (stride-1)
 would need a host with well over 32 GB just to stage hg38 and is not recommended.
 The resolved coordinates are byte-identical either way — a deterministic property
@@ -483,7 +489,7 @@ above).
 > a `statvfs` failure (no `/dev/shm`, restricted sandbox, ENOSYS) is
 > non-fatal and the stage proceeds. A `--huge-pages` stage needs room in
 > `/dev/shm` for its 64-byte stub only. As a rough sizing guide, a default hg38
-> stage is ~11.3 GB and `/dev/shm` defaults to half of RAM, so a host with
+> stage is ~10.6 GB and `/dev/shm` defaults to half of RAM, so a host with
 > 16 GB of RAM (8 GB of `/dev/shm`) needs a remount (`remount,size=12g`) and one
 > with 32 GB does not.
 >

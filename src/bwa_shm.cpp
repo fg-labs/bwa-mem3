@@ -2266,7 +2266,7 @@ static void print_shm_usage(void)
         "            target denser than the on-disk rate).\n"
         "  --huge-pages\n"
         "            stage the index on 1 GB huge pages: a System V shared memory\n"
-        "            segment from the host's reserved 1 GB pool (11 pages for a\n"
+        "            segment from the host's reserved 1 GB pool (10 pages for a\n"
         "            default hg38 stage), which `mem` attaches as usual. Cuts dTLB\n"
         "            page walks on Intel x86 and Graviton4 (arm64). Refused on AMD\n"
         "            x86, where it measured no gain. Linux only; needs CAP_IPC_LOCK\n"
