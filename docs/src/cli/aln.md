@@ -668,18 +668,28 @@ can differ from the raw ranking mismatch/gap count. Records use Bismark
 
 **Conversion-blind MAPQ (`--meth-mapq`).** With EM-seq and `genomic` scoring (the defaults),
 each record's MAPQ is capped at the stock MAPQ its locus gets when the mirror cell (reference T x
-read C on OT, reference A x read G on OB) costs nothing: the read's loci are recounted at their
-cost minus `-M` per mirror mismatch, before the stock cut, together with any row the `-n` (or
-seed `-k`) limit dropped only for its mirror mismatches (with the mirror cell free it is within
-the limit, as under `collapsed`; under `--known-snvs`, also such a row of the ALT-window search),
-and a locus that is then cheaper than the primary gives a cap of 0. Paired-end ends take the MAPQ of the same stock pairing run on those
-costs (including the loci only the mirror-free strata keep), and a rescued mate its anchor's.
-An end with more than `--max-occ` such loci would not pair, so each end keeps its single-end cap,
-or gets 0 if pairing moves it.
+read C on OT, reference A x read G on OB) costs nothing: the read's loci are recounted before the
+stock cut, each at its cheapest row with the mirror cell free (cost minus `-M` per mirror
+mismatch, among the rows the search scored there; the row `collapsed` keeps among them), together with any
+row the `-n` (or seed `-k`) limit dropped only for its mirror mismatches (with the mirror cell
+free it is within the limit, as under `collapsed`; under `--known-snvs`, also such a row of the
+ALT-window search, [#820](https://github.com/fg-labs/bwa-mem3/pull/820)). A locus that is then
+cheaper than the primary gives a cap of 0. Complete mapped paired ends take the MAPQ of stock
+pairing on only those mirror-free strata (best cost plus `-M`, or no cut under `-N`), including
+loci only those strata keep. The shadow's `--max-occ` gate uses its own counts, even when genomic
+counts prevent pairing ([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). It still starts each
+end at its `genomic` single-end selection and uses the `genomic` insert-size estimate. A rescued
+mate takes its anchor's cap. If either end's mirror-free strata are unknown (its mirror table
+exceeded its budget), both ends' caps are 0. Otherwise an end with more than `--max-occ`
+mirror-free loci would not pair, so each end keeps its single-end cap, or gets 0 if genomic
+pairing moves it. When the counts fit but a row the shadow admits has a mirror-free cost too large
+for the pairing's score field (20 bits), both caps are 0.
 Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
-and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. A gapped locus is taken at its
-`genomic` alignment's cost, not realigned. `--meth-mapq scoring` restores the uncapped MAPQ
-([#816](https://github.com/fg-labs/bwa-mem3/pull/816), [#820](https://github.com/fg-labs/bwa-mem3/pull/820)). See
+and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. Under `--known-snvs`, the `XV:Z`
+twin MAPQ can also change. At an ALT window without a search path, realignment still uses
+`genomic` scoring, so a row `collapsed` would keep there can be missing.
+`--meth-mapq scoring` restores the uncapped MAPQ
+([#816](https://github.com/fg-labs/bwa-mem3/pull/816)). See
 [`--meth-mapq`](../methylation/flags.md#--meth-mapq-conversion-blindscoring).
 
 ### Pairing and limits

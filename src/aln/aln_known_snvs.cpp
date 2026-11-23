@@ -831,13 +831,12 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 												 (int64_t)h.pos - w->bns->anns[h.rid].offset, win.len, &lead, &trail);
 		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb - lead, rb + h.span + trail, std::move(path)});
 	}
-	// --meth-mapq conversion-blind: the rows the window search's -n (or -k) limit dropped only for
-	// their mirror mismatches (blind_over, display bounds and search path). The main search
-	// rescores them along their paths for its mirror-free strata alone (blind: never a locus, so
-	// placement and every field but MAPQ stay as they are), as collapsed scoring keeps such a row
-	// as a locus. Without them a placement that only an ALT window reaches is missing from those
-	// strata.
-	for (const aln_meth_occ_t &o : wres.blind_over) {
+	// --meth-mapq conversion-blind: each retained lowest mirror-free window row (among the rows
+	// that cover the window's site, the only ones the table holds), including
+	// in-limit alternatives to a genomic-selected hit and rows only mirror-free limits admit.
+	// The main search rescores their paths against the reference and each site allele for its
+	// mirror table alone: these blind-only candidates never become genomic loci.
+	for (const aln_meth_occ_t &o : wres.mirror_rows) {
 		const std::vector<uint32_t> &path = o.alignment.raw_cigar;
 		const int64_t span = o.alignment.re - o.alignment.rb;
 		const int64_t rb = path.empty() ? -1 : genomic_rb(o.rid, o.alignment.rb, span);
@@ -911,7 +910,7 @@ int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res)
 {
 	std::vector<std::vector<aln_meth_candidate_t>> extra;
-	std::vector<int> flags;
+	std::vector<int> flags, blind_partial;
 	std::vector<aln_meth_alt_bound_t> alt_bounds;
 	if (o->ks_windows) {
 		std::vector<aln_meth_read_t> windows(n);
@@ -919,18 +918,19 @@ int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs,
 		aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n, seqs, &discovery,
 							  o->gap.n_threads, read_no, ord, 1, o->max_xa_hits, window_dup, windows.data(), nullptr,
 							  nullptr, true);
-		extra.resize(n); flags.resize(n); alt_bounds.resize(n);
+		extra.resize(n); flags.resize(n); blind_partial.resize(n); alt_bounds.resize(n);
 		for (int i = 0; i < n; ++i) {
 			ks_meth_candidates(o->ks_windows, o->meth_ref->bns, windows[i], &extra[i]);
 			// Incoming flags both split duplicate groups and disable stopping in the genomic search.
 			flags[i] = windows[i].flags;
+			blind_partial[i] = windows[i].blind_partial;
 			alt_bounds[i] = aln_meth_alt_certificate(windows[i]);
 		}
 	}
 	return aln_meth_search_batch(bwt, o->meth_ref, o->meth, n, seqs, &o->gap, o->gap.n_threads, read_no, ord, keep,
 								 o->max_xa_hits, dup, res, extra.empty() ? nullptr : extra.data(),
 								 alt_bounds.empty() ? nullptr : alt_bounds.data(), false,
-								 flags.empty() ? nullptr : flags.data());
+								 flags.empty() ? nullptr : flags.data(), blind_partial.empty() ? nullptr : blind_partial.data());
 }
 
 } // namespace bwa_aln

@@ -11,6 +11,7 @@
 #define BWA_MEM3_ALN_METH_H
 
 #include <stdint.h>
+#include <algorithm>
 #include <vector>
 
 #include "../bntseq.h"
@@ -115,8 +116,8 @@ struct aln_meth_hit_t {
     uint8_t n_mirror; // the locus's mirror-cell mismatches (counted in n_mm; in the padding)
 };
 static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record");
-/* --meth-mapq conversion-blind: a locus the genomic cut dropped that the mirror-free cut keeps,
- * at its mirror-free cost and mismatches; only the paired-end shadow pairing reads it. */
+/* --meth-mapq conversion-blind: a locus at its lowest mirror-free row (the row collapsed scoring
+ * keeps there), at that row's mirror-free cost and mismatches, its gaps and its span. */
 struct aln_meth_blind_row_t {
     bwtint_t pos;
     int32_t span, cost;
@@ -161,16 +162,27 @@ struct aln_meth_read_t {
     // cost, the loci at it, and the loci up to s_mm above it. blind_best is INT64_MAX when unset.
     int64_t blind_best = INT64_MAX;
     int blind_c1 = 0, blind_c2 = 0;
-    // The mirror-free strata's loci that the genomic cut drops (a locus that costs two or more
-    // mirror mismatches more than the genomic best), for the paired-end shadow pairing.
+    // The mirror-free strata's loci that are not hits: the genomic cut drops them (a locus that
+    // costs two or more mirror mismatches more than the genomic best), or the -n (or -k) limit
+    // drops every row of theirs, but not once its mirror mismatches are free. For the paired-end
+    // shadow pairing.
     std::vector<aln_meth_blind_row_t> blind_rows;
-    // Rows the -n (or -k) limit dropped that the limit keeps once their mirror mismatches are free
-    // (a read C over a reference T is a mismatch genomically but a conversion mirror-free): the
-    // mirror-free strata count them, as collapsed scoring keeps them as loci. Their CIGARs are
-    // not kept. Consumed and cleared when the read finishes, but by an ALT-window search
-    // (--known-snvs), which keeps them with their search paths for the main search
-    // (ks_meth_candidates).
-    std::vector<aln_meth_occ_t> blind_over;
+    // The hits whose locus's lowest mirror-free row is not the hit's own row (the genomic search
+    // keeps the genomically cheapest row of a locus, and on equal cost the lower CIGAR), at that
+    // row; pos and strand name the hit, sorted by them. Read through aln_meth_blind_view.
+    std::vector<aln_meth_blind_row_t> blind_alt;
+    // The mirror table, while the read is searched: per locus, the lowest mirror-free row among
+    // its mirror-mismatch rows and blind-only ALT-window candidates within mirror-free limits,
+    // with CIGARs kept for the tie-break. A read C over a reference T is a mismatch genomically
+    // but a conversion mirror-free. It only observes the search: no search decision reads it.
+    // Consumed and cleared when the main search finishes. An ALT-window search retains it
+    // with its paths for ks_meth_candidates, including when it has no genomic hit, and holds
+    // only rows that cover their window's site, with or without mirror mismatches.
+    std::vector<aln_meth_occ_t> mirror_rows;
+    // Cumulative accepted mirror CIGARs (including replacements) outgrew the budget: the strata
+    // are not known, so each end's conversion-blind cap is 0. Propagated from the ALT-window
+    // search separately from genomic incompleteness (flags).
+    int blind_partial = 0;
     // The MAPQ cap the record's end carries to emission (255: none), and the MAPQ it replaced
     // when the cap lowered it (YQ:i), else -1.
     int blind_cap = 255, yq = -1;
@@ -188,6 +200,22 @@ struct aln_meth_read_t {
 static inline aln_meth_alt_bound_t aln_meth_alt_certificate(const aln_meth_read_t &window)
 {
     return !window.flags && window.site_bound.valid ? window.site_bound : window.full_width_bound;
+}
+// --meth-mapq conversion-blind: hit h of r at its locus's lowest mirror-free row (blind_alt), or,
+// when that is h's own row, at h with its mirror mismatches free.
+static inline aln_meth_blind_row_t aln_meth_blind_view(const aln_meth_read_t &r, const aln_meth_hit_t &h, int s_mm)
+{
+    auto before = [](const aln_meth_blind_row_t &x, const aln_meth_blind_row_t &y) {
+        return x.pos != y.pos ? x.pos < y.pos : x.strand < y.strand;
+    };
+    aln_meth_blind_row_t b;
+    b.pos = h.pos; b.strand = h.strand;
+    const auto it = std::lower_bound(r.blind_alt.begin(), r.blind_alt.end(), b, before);
+    if (it != r.blind_alt.end() && it->pos == h.pos && it->strand == h.strand) return *it;
+    b.span = h.span;
+    b.cost = (int32_t)((int64_t)h.cost - (int64_t)s_mm * h.n_mirror); // in [0, h.cost]
+    b.n_mm = (uint8_t)(h.n_mm - h.n_mirror); b.n_gapo = h.n_gapo; b.n_gape = h.n_gape;
+    return b;
 }
 // The pointer is into h itself (one operation) or into r.cig, so it is valid while both are.
 static inline const uint32_t *aln_meth_hit_cigar(const aln_meth_read_t &r, const aln_meth_hit_t &h)
@@ -212,13 +240,15 @@ struct aln_meth_candidate_t;
  * capture_full_width records width[len-1] before search mutation (and site_bound, on a reference
  * with window_site); both defaults are off.
  * incoming_flags are per-read window-search flags, applied after reset and before searching or
- * finalizing; duplicate sharing requires equal flags. Null means no incoming flags. */
+ * finalizing; duplicate sharing requires equal flags. Null means no incoming flags.
+ * incoming_blind_partial separately carries unknown ALT-window mirror strata; it only caps
+ * confidence, never genomic search/output. Duplicate sharing also requires equal partial state. */
 int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int n_seqs,
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, struct aln_dup_state_t *dup, aln_meth_read_t *res,
 						  const std::vector<aln_meth_candidate_t> *extra = nullptr,
 						  const aln_meth_alt_bound_t *alt_bounds = nullptr, bool capture_full_width = false,
-                          const int *incoming_flags = nullptr);
+                          const int *incoming_flags = nullptr, const int *incoming_blind_partial = nullptr);
 
 /* samse under --meth for reads [0, n). Caller must run bwase_initialize once
  * before dispatching any finish workers (as aln_run_se_meth does). */

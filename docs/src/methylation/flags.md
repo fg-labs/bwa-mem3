@@ -185,13 +185,19 @@ comes out too high.
 - `conversion-blind` (**default for `--meth`/`--meth=emseq` with `genomic` scoring**)
   — cap each record's MAPQ at the MAPQ the same run gives with the mirror cell
   freed as a conversion, at the same penalties; a locus that wins with the mirror
-  cell free gives a cap of 0. Each locus is taken at its `genomic` alignment's cost
-  less one mismatch penalty per mirror mismatch: exact for an ungapped locus, while a
-  gapped locus is not realigned with the mirror cell free. A row that `-n` (or the
+  cell free gives a cap of 0. Each locus is taken at its cheapest row with the mirror
+  cell free among the rows the search scored there (one per search path and site allele): the row
+  `collapsed` keeps among them, ties broken as `collapsed` breaks them. That row's cost,
+  mismatches and gaps set the cap, not those of the row `genomic` keeps, which is the
+  genomically cheapest and can cost more with the mirror cell free
+  ([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). A row that `-n` (or the
   seed's `-k`) dropped only for its mirror mismatches counts too, since with the mirror
   cell free it is within the limit, as under `collapsed`; under `--known-snvs` that
   includes such a row of the ALT-window search, which can be the only search to reach a
-  placement with a site's ALT ([#820](https://github.com/fg-labs/bwa-mem3/pull/820)). Placement, CIGAR, `NM`,
+  placement with a site's ALT ([#820](https://github.com/fg-labs/bwa-mem3/pull/820)). Accepted
+  mirror-row CIGAR bytes count cumulatively toward a 64 MiB budget, including rows later
+  replaced at the same locus. Exceeding that budget makes the strata unknown and the cap 0.
+  Placement, CIGAR, `NM`,
   `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
   is `genomic`'s in every field but MAPQ and, under `--known-snvs`, the `XV:Z`
   twin MAPQ. A record whose MAPQ the cap lowered carries the uncapped MAPQ in
@@ -205,12 +211,21 @@ comes out too high.
   what places a short read. Under `collapsed`, which already frees the mirror cell,
   the two values are the same.
 
-In `aln` paired-end output, pairing runs once more on the mirror-free costs (with
-the loci only the mirror-free strata keep), with each end at its single-end cap; an
-end placed where that pairing places it is capped at the MAPQ that pairing gives
-it, any other end at 0. A rescued mate takes its anchor's cap. That pairing uses
-the batch's `genomic` insert-size estimate. `--known-snvs` twin MAPQs (`XV:Z`) are computed the same way as
-the record's.
+In `aln` paired-end output, complete mapped ends have a shadow pairing over only the
+mirror-free strata: loci within the mirror-free best cost plus `-M`, or all retained
+loci under `-N`, including loci only those strata keep. Its `--max-occ` gate uses the
+mirror-free counts independently of the genomic pairing's counts
+([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). Each end starts at its `genomic`
+single-end selection with its MAPQ clamped to its single-end cap, and the shadow uses
+the batch's `genomic` insert-size estimate, not a separate collapsed estimate or draw.
+An end placed where the shadow places it is capped at the MAPQ the shadow gives it,
+any other end at 0. If either end's mirror-free strata are unknown (a partial mirror
+table), both caps are 0. Otherwise, if its mirror-free counts do not fit `--max-occ`, each
+end keeps its single-end cap at its original placement, or gets 0 if genomic pairing moves
+it; and if the counts fit but a row the shadow admits has a mirror-free cost too large for
+the pairing's score field (20 bits), both caps are 0.
+A rescued mate takes its anchor's cap; rescue is not replayed by the shadow.
+`--known-snvs` twin MAPQs (`XV:Z`) are computed the same way as the record's.
 
 **Measured** on public NA12878 EM-seq (SRR10532145, 2×99 bp, 2 M pairs), read 1
 cut to 20–50 bp and aligned single-end with `aln` on an Apple M2 Max (12 cores; macOS, arm64, NEON
@@ -236,10 +251,16 @@ at MAPQ 60 8, 8 and 27. With 160 k simulated SNPs and indels (6.5 M reads), wron
 MAPQ 60 is 14 with the cap and 73 under `collapsed -B 4`.
 
 For `aln` the following is by construction, not a measurement: `aln`'s `genomic` and
-`collapsed` share `-M`, so there the single-end cap estimates the `collapsed` MAPQ at
-`genomic`'s costs: exactly for ungapped loci, and 0 when a mirror-free locus beats the
-`genomic` primary, even where a `collapsed` run would place the read there with a
-positive MAPQ. A record's MAPQ is the lower of that cap and its `genomic` MAPQ: where
+`collapsed` share `-M`, so there the single-end cap is the `collapsed` MAPQ from the rows
+`genomic`'s search scored. Under `--known-snvs`, the ALT-window search forwards its
+`genomic` selections and, at each locus, its cheapest retained mirror-free row that covers
+the window's site (with or without mirror mismatches, so a cheaper `genomic` row that misses
+the site does not leave the locus without a path), including rows over `-n` or `-k` only
+through mirror mismatches, for the main search to rescore along their paths.
+A window without a search path is still realigned under `genomic` scoring rather than
+with the mirror cell free, so a row `collapsed` would keep there can be missing. The cap
+is 0 when a mirror-free locus beats the `genomic` primary, even where a `collapsed` run
+would place the read there with a positive MAPQ. A record's MAPQ is the lower of that cap and its `genomic` MAPQ: where
 the cap is higher, the record keeps its `genomic` MAPQ.
 
 ## `--meth-context {all|cpg}`
