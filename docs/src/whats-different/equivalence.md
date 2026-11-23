@@ -99,7 +99,12 @@ over `-R`, a locus the finish's ceiling drops is kept for the mirror-free pairin
 apply stock's top-2 ceiling on mirror-free differences, so they are what `collapsed` scoring
 selects. Hits only the wider ceiling or the continued search reach feed those strata alone, with a
 lookup budget of their own, so every field but `MAPQ` and `YQ:i` is the same as with
-`--meth-mapq scoring`, whose output is unchanged by this rule.
+`--meth-mapq scoring`, whose output is unchanged by this rule. The exception is the `-m` queue
+limit, which the wider search shares: with a smallest penalty below `-M` a long read can exceed it
+and end incomplete. On a chr22 EM-seq simulation (40,000 reads or pairs per run, 40 and 150 bp,
+arm64) every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring` at the default penalties
+and with `-R 1`, `-R 2`, `-n 8`, `-e 3`, `-l 32 -k 0`, `-m 300`, `-N`, `-M 0` and
+`-M 2 -O 5 -E 2`; at `-M 5 -O 3 -E 1`, 4 pairs of 40,000 at 150 bp ended with one end incomplete.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>

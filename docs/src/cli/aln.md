@@ -610,7 +610,10 @@ within their own ceiling are themselves more than `-R`. The mirror-free strata a
 top-2 ceiling on mirror-free differences. The genomic result is unchanged: a hit that only the
 wider ceiling or a search continued past stock's `-R` stop reaches feeds the mirror-free strata
 alone, and its lookups come from a budget of their own (the size of the read's); if that budget
-runs out the cap is 0. With `--meth-mapq scoring` the cuts are stock's alone.
+runs out the cap is 0. The wider search does share the `-m` queue limit: when the smallest
+penalty is below `-M` (for example `-M 5 -O 3 -E 1`) a long read's search can exceed `-m` and end
+incomplete where it would not with `--meth-mapq scoring`. With `--meth-mapq scoring` the cuts are
+stock's alone.
 These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
 set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
 search instead stops early only on the earlier certified bound: for current best cost `B`,
