@@ -77,6 +77,22 @@ budget had left incomplete (the incomplete-read rate fell from 8.52% to 4.32% an
 percentage points, and peak RSS rose by 0.7 to 1.1 GB because a repeat end keeps all its best loci
 for pairing. Output without `--meth` is byte-identical: the cuts run only in the `--meth` search.
 
+Since [#786](https://github.com/fg-labs/bwa-mem3/pull/786), a single-end `aln --meth` read that
+takes those cuts verifies its rows stratum by stratum and ends on a saturation certificate once
+more rows cannot change stock's output: a *repeat* (more than `-R` best loci) or a *crowded* read
+(a unique best with at least 255 retained worse loci). See [`aln`](../cli/aln.md) for the
+conditions. A certified read has `MAPQ` 0. A repeat reports the verified count in `X0` (a lower
+bound) with no `X1`, and its primary (`POS`, `CIGAR`, strand) is drawn uniformly over every row
+of the hits that can hold a best row, not only the verified ones. A crowded read reports the
+verified count in `X1` (a lower bound). Other reads verify up to 16,384 rows instead of 4,596,
+so fewer reads end incomplete. On ultrashort EM-seq and 5-base slices (200,000 reads each, hg19,
+an x86_64 AVX-512 host, clang 19.1.7), every read complete without a certificate both with the
+certificates and in an uncut search with a 65,536-row lookup budget was identical, and every
+certified read had the same `MAPQ` (crowded reads also the same placement). Incomplete reads fell
+from 4.32% to 0.15% (EM-seq) and from 7.49% to 1.44% (5-base); about 11% of reads changed, almost
+all of them formerly incomplete reads and repeats. Paired-end `--meth` input keeps the previous
+search and is unchanged. Output without `--meth` is byte-identical.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:
