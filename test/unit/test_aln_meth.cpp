@@ -621,6 +621,54 @@ TEST_CASE("aln_meth: a repeat certificate's drawn gapped row does not lower the 
     CHECK(gapped > 0); // the case the ceiling must survive
 }
 
+TEST_CASE("aln_meth: a certificate counts only the best rows within the top-2 ceiling")
+{
+    // Default penalties (M 3, O 11, E 4); every locus costs 18. gapA: the read lacks two bases and
+    // has a read C over a reference T, invisible in converted space, so it is verified first, in
+    // stratum 15, and sets the ceiling at four differences. Six loci with six transversions each
+    // (six differences, over the ceiling: the finish drops them) are verified next, then the two
+    // copies of gapB (two missing bases and a transversion: three differences), the widest hit. With
+    // -R 5, counting the dropped loci would fire a repeat certificate before gapB is verified: X0 1
+    // and a unique-looking MAPQ. Counting only the kept rows verifies gapB: three best loci.
+    bwa_tests::TempDir tmp{"aln_meth_cert_ceiling"};
+    const std::string dir = tmp.path(), fa = dir + "/cert-ceiling.fa";
+    uint32_t st = 3141;
+    std::string read = aln_test::lcg_dna(st, 40);
+    read[30] = 'C';
+    auto tv = [](char b) { return b == 'A' ? 'T' : b == 'T' ? 'A' : b == 'C' ? 'G' : 'C'; };
+    std::vector<std::pair<std::string, std::string>> contigs;
+    for (int i = 0; i < 6; ++i) {
+        std::string mm = read;
+        for (int at : {1, 7, 13, 19, 25, 33}) mm[at + i] = tv(mm[at + i]);
+        contigs.push_back({"mm" + std::to_string(i), aln_test::lcg_dna(st, 100) + mm + aln_test::lcg_dna(st, 100)});
+    }
+    std::string gap_a = read.substr(0, 20) + "GT" + read.substr(20);
+    gap_a[32] = 'T'; // read position 30
+    contigs.push_back({"gapA", aln_test::lcg_dna(st, 100) + gap_a + aln_test::lcg_dna(st, 100)});
+    std::string gap_b = read;
+    gap_b[5] = tv(gap_b[5]);
+    gap_b = gap_b.substr(0, 12) + "CA" + gap_b.substr(12);
+    for (int k = 0; k < 2; ++k)
+        contigs.push_back({"gapB" + std::to_string(k), aln_test::lcg_dna(st, 100) + gap_b + aln_test::lcg_dna(st, 100)});
+    REQUIRE(aln_test::write_test_fasta(fa, contigs));
+    std::vector<std::string> index_args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &arg : index_args) argv.push_back(&arg[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
+    const auto v = run_aln({"--meth", "-n", "6", "-l", "1024", "-R", "5"},
+                           {write_fq_in(dir, "cert-ceiling.fq", {read})}, fa, dir);
+    REQUIRE(v.size() == 1);
+    CHECK(v[0].rname.rfind("gap", 0) == 0);
+    CHECK(tag_value(v[0], "XT:A") == "R");
+    CHECK(tag_value(v[0], "X0:i") == "3");
+    CHECK(v[0].mapq == 0);
+}
+
 TEST_CASE("aln_meth: -N preserves best placements while retaining more worse costs")
 {
     // reads from c1/c2 with conversions, substitutions and reverse-direction cells
