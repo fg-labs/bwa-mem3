@@ -2784,6 +2784,27 @@ TEST_CASE("aln_meth: a locus the finish's ceiling drops is a conversion-blind ro
     }
 }
 
+TEST_CASE("aln_meth: under the cuts the conversion-blind strata take the mirror-free ceiling")
+{
+    // Default penalties. G: one gap open (cost 11, one difference); Y: four mismatches (12). Under
+    // the cuts stock's ceiling (2) drops Y, and so does collapsed's, which has the same rows: the
+    // mirror-free strata are stock's selection on mirror-free costs, so Y is not counted there
+    // either. Without the cuts both keep the cost window alone and count Y.
+    for (int cut = 0; cut < 2; ++cut) {
+        CAPTURE(cut);
+        BlindFinish f(cut);
+        f.add(100, 11, 0, 0, 1);
+        f.add(200, 12, 4, 0, 0);
+        bwa_aln::aln_meth_slot_finish(&f.slot);
+        CHECK(f.result.c1 == 1);
+        CHECK(f.result.c2 == (cut ? 0 : 1));
+        CHECK(f.result.blind_best == 11);
+        CHECK(f.result.blind_c1 == 1);
+        CHECK(f.result.blind_c2 == (cut ? 0 : 1));
+        CHECK(f.result.blind_rows.empty());
+    }
+}
+
 TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few more rows")
 {
     namespace ba = bwa_aln;
