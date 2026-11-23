@@ -19,6 +19,7 @@
 
 #include <pthread.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 
@@ -37,6 +38,19 @@ static inline int gap_score_cut(int64_t best_score, int s_mm)
 {
 	const int64_t cut = best_score + s_mm;
 	return cut < -1 ? -1 : cut > GAP_SCORE_LIMIT - 1 ? GAP_SCORE_LIMIT - 1 : (int)cut;
+}
+
+// Whether every score a search within opt's limits can give an entry is below n_stacks, so that
+// gap_cscore never exits on it: each of at most max_diff differences (a mismatch, a gap open or,
+// under BWA_MODE_GAPE, a gap extension) adds at most the largest such penalty, and without GAPE up
+// to max_gape extensions come on top. A negative penalty never fits. A bound, not the search's.
+static inline bool gap_scores_fit(const gap_opt_t *opt, int n_stacks)
+{
+	const bool gape = opt->mode & BWA_MODE_GAPE;
+	if (opt->s_mm < 0 || opt->s_gapo < 0 || opt->s_gape < 0 || opt->max_diff < 0) return false;
+	const int64_t per = std::max({opt->s_mm, opt->s_gapo, gape ? opt->s_gape : 0});
+	const int64_t ext = gape ? 0 : (int64_t)std::max(0, opt->max_gape) * opt->s_gape;
+	return (int64_t)opt->max_diff * per + ext < n_stacks;
 }
 
 typedef struct { // recursion stack

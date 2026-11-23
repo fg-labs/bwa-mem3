@@ -15,8 +15,9 @@
  * and --short-insert pairing skip such a candidate instead.
  * The bwa_paired_sw wrapper itself is not kept (nothing calls it). bwa_pe_pairing and
  * bwa_pe_pair_grouped expose pairing and the grouping to the unit tests. Pairing sorts its rows
- * with pdqsort_128 in place of ks_introsort_128; the sorted array is the same. Known-SNV
- * pairing consumes allele-bearing hit lists and rescue tries single-allele windows. See README.md. */
+ * with aln_pair_sort (pdqsort_128, or a radix sort for large arrays) in place of ks_introsort_128;
+ * the sorted array is the same. Known-SNV pairing consumes allele-bearing hit lists and rescue
+ * tries single-allele windows. See README.md. */
 #include "bwape.h"
 #include "aln_alloc.h"
 
@@ -207,40 +208,49 @@ void aln_pair_sort(size_t n, pair64_t *a)
 	const int bx = xr ? 64 - __builtin_clzll(xr) : 0;
 	if (bx + by > 63) { pdqsort_128(n, a); return; }
 	static_assert(sizeof(pair64_t) == 2 * sizeof(uint64_t), "pair64_t is two words");
-	uint64_t *w = reinterpret_cast<uint64_t*>(a);
+	// The array as 2n words, through its bytes (memcpy): a uint64_t pointer into a row may not step
+	// past that row's member it points at.
+	unsigned char *const w = reinterpret_cast<unsigned char*>(a);
+	auto ld = [w](size_t i) { uint64_t v; memcpy(&v, w + 8 * i, 8); return v; };
+	auto st = [w](size_t i, uint64_t v) { memcpy(w + 8 * i, &v, 8); };
 	// Key i goes to word i once row i (words 2i, 2i + 1) is read: word i <= 2i is part of a row
 	// already read. Words [n, 2n) are then free for the second buffer.
 	for (size_t i = 0; i < n; ++i) {
 		const uint64_t k = (a[i].x - x_min) << by | a[i].y;
-		w[i] = k;
+		st(i, k);
 	}
-	uint64_t *k0 = w, *k1 = w + n;
+	size_t k0 = 0, k1 = n; // the first word of the keys and of the second buffer
 	const int passes = (bx + by + 7) / 8;
 	uint32_t cnt[8][256];
 	memset(cnt, 0, sizeof(uint32_t) * 256 * (size_t)passes);
-	for (size_t i = 0; i < n; ++i)
-		for (int p = 0; p < passes; ++p) ++cnt[p][k0[i] >> (8 * p) & 0xff];
+	for (size_t i = 0; i < n; ++i) {
+		const uint64_t k = ld(i);
+		for (int p = 0; p < passes; ++p) ++cnt[p][k >> (8 * p) & 0xff];
+	}
 	for (int p = 0; p < passes; ++p) {
 		uint32_t *c = cnt[p];
-		if (c[k0[0] >> (8 * p) & 0xff] == n) continue; // every key has this digit
+		if (c[ld(k0) >> (8 * p) & 0xff] == n) continue; // every key has this digit
 		uint32_t sum = 0;
 		for (int b = 0; b < 256; ++b) { const uint32_t t = c[b]; c[b] = sum; sum += t; }
-		for (size_t i = 0; i < n; ++i) k1[c[k0[i] >> (8 * p) & 0xff]++] = k0[i];
+		for (size_t i = 0; i < n; ++i) {
+			const uint64_t k = ld(k0 + i);
+			st(k1 + c[k >> (8 * p) & 0xff]++, k);
+		}
 		std::swap(k0, k1);
 	}
 	// Back to rows: row i is words 2i, 2i + 1. Keys in [0, n) are decoded from the last (rows i' > i
 	// at words 2i and 2i + 1 are already done); keys in [n, 2n) from the first (the words written for
 	// row i hold keys i' <= i, already read).
 	const uint64_t ym = (1ULL << by) - 1;
-	if (k0 == w) {
+	if (k0 == 0) {
 		for (size_t i = n; i-- > 0;) {
-			const uint64_t k = w[i];
+			const uint64_t k = ld(i);
 			a[i].x = (k >> by) + x_min;
 			a[i].y = k & ym;
 		}
 	} else {
 		for (size_t i = 0; i < n; ++i) {
-			const uint64_t k = w[n + i];
+			const uint64_t k = ld(n + i);
 			a[i].x = (k >> by) + x_min;
 			a[i].y = k & ym;
 		}
