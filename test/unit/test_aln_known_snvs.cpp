@@ -3438,8 +3438,8 @@ TEST_CASE("aln_known_snvs: incomplete ALT-window discovery cannot claim unique m
     }
 }
 
-TEST_CASE("aln_known_snvs: an ALT-window candidate carries its hit's search path, terminal gaps included")
-{
+TEST_CASE("aln_known_snvs: an ALT-window candidate carries its hit's search path, terminal gaps included"
+          * doctest::test_suite("unit/aln_known_snvs")) {
     namespace ba = bwa_aln;
     // One 100-base window at genome position 1000 (offset 0 of contig 0), its site at 1050; the
     // window index's contig 0 is that window.

@@ -1043,7 +1043,8 @@ TEST_CASE("aln_meth: a refined window over the read's -n limit is not a locus")
     CHECK(tag_value(u3[0], "X1:i") == "1");
 }
 
-TEST_CASE("aln_meth: rows are scored along their search path, and -k limits the seed's strict differences")
+TEST_CASE("aln_meth: rows are scored along their search path, and -k limits the seed's strict differences"
+          * doctest::test_suite("unit/aln_meth"))
 {
     // w (40 bp, seeded under -l 20) has two loci. At k_over its reference holds a T under two read
     // Cs inside the seed: invisible to the converted search, two strict seed differences. At k_ok
@@ -1993,7 +1994,8 @@ TEST_CASE("aln_meth: window cache scores spans once and caps cannot claim unique
     ba::bwa_free_read_seq(n,reads);CHECK(ba::bwa_seq_close(input)==0);
 }
 
-TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless CIGAR-capped")
+TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless CIGAR-capped"
+          * doctest::test_suite("unit/aln_meth"))
 {
     namespace ba = bwa_aln;
     const std::string fq = write_fq("stopped-extra.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
@@ -4190,7 +4192,8 @@ TEST_CASE("aln_meth: incoming window flags precede neutral selection and duplica
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
-TEST_CASE("aln_meth: duplicate reads share a search only with the same candidate paths")
+TEST_CASE("aln_meth: duplicate reads share a search only with the same candidate paths"
+          * doctest::test_suite("unit/aln_meth"))
 {
     namespace ba = bwa_aln;
     FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
