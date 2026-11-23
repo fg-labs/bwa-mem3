@@ -194,10 +194,14 @@ comes out too high.
   seed's `-k`) dropped only for its mirror mismatches counts too, since with the mirror
   cell free it is within the limit, as under `collapsed`. If the rows kept for this
   outgrow 64 MiB of CIGARs, the strata are unknown and the cap is 0. So are they when `aln`'s
-stock search cuts may have pruned a row they need (the mirror-free best has more differences
-than the ceiling the search applies, or a `-R` stop comes before they are complete;
-[#785](https://github.com/fg-labs/bwa-mem3/pull/785)); in a pair, an end with unknown strata
-gives both ends a cap of 0. Placement, CIGAR, `NM`,
+  stock search cuts may leave them different from a mirror-free run's while a row that could
+  still enter them (at most the mirror-free best plus `-M`) is unresolved: the search applies a
+  difference ceiling below the strata's own top-2 ceiling (the fewest mirror-free differences at
+  the mirror-free best, plus one, at most `-n`), or a `-R` stop ends the search but not a
+  mirror-free run, or a mirror-free run's `-R` stop ends it but the search goes on and resolves
+  such a row ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). Once the next score the search would
+  expand is past the mirror-free best plus `-M`, no such row is left. In a pair, an end with
+  unknown strata gives both ends a cap of 0. Placement, CIGAR, `NM`,
   `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
   is `genomic`'s in every field but MAPQ. A record whose MAPQ the cap lowered
   carries the uncapped MAPQ in `YQ:i`, whatever `--meth-tags` selects. The other

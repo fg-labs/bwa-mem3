@@ -148,10 +148,15 @@ struct aln_meth_slot_t {
     // flush has run. blind: --meth-mapq conversion-blind, which only observes the search: the
     // search, its cuts and its limits are those of --meth-mapq scoring (aln_meth_boundary).
     // need_next: the score at which the cuts first applied (the best stratum complete), -1 before;
-    // blind_need: at that point the mirror-free strata could still miss a row the cuts prune
-    // (blind_note_need), so they are not known.
-    int cut = 0, flushed = 0, blind = 0, need_next = -1, blind_need = 0;
-    int64_t best = INT64_MAX;
+    // top2_next: the same for a mirror-free run (its best stratum complete), whose -R stop
+    // blind_note_top2 checks there; blind_need: the mirror-free strata could miss a row the cuts
+    // prune, or hold one a mirror-free run's -R stop never reaches (blind_note_need,
+    // blind_note_late), so they are not known. mf_best: the lowest mirror-free cost of a row in the
+    // mirror table (store_mirror_row); the mirror-free best so far is the lower of it and best.
+    // late_cut, late_ceiling: after a mirror-free -R stop this search goes on past, the mirror-free
+    // cost and differences within which a later row could enter the strata (-1: no such stop).
+    int cut = 0, flushed = 0, blind = 0, need_next = -1, top2_next = -1, blind_need = 0;
+    int64_t best = INT64_MAX, mf_best = INT64_MAX, late_cut = -1, late_ceiling = 0;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     // Gap lists of the search's paths with more than one gap, ALN_METH_MAX_GAPS words each (see
@@ -215,7 +220,8 @@ static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
         if (!x->pend.empty()) return !x->flushed || score > x->flushed_score;
         if (score <= x->flushed_score) return 0;
         x->flushed_score = score;
-        return x->best != INT64_MAX && aln_meth_boundary(x, score) && (x->stop = ALN_METH_STOP_TOP2);
+        return (x->best != INT64_MAX || x->mf_best != INT64_MAX) && aln_meth_boundary(x, score)
+            && (x->stop = ALN_METH_STOP_TOP2);
     }
     if (score <= x->flushed_score) return 0;
     if (aln_meth_stop_eligible(x)) return 1;
@@ -245,7 +251,7 @@ static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t 
     *e = j->e;
     const int score=(int)(e->info>>21);
     x->flushed_score=score;
-    if (x->cut) return x->best != INT64_MAX && aln_meth_boundary(x, score);
+    if (x->cut) return (x->best != INT64_MAX || x->mf_best != INT64_MAX) && aln_meth_boundary(x, score);
     if (aln_meth_can_stop(x,score)) return 1;
     return 0;
 }
