@@ -141,6 +141,24 @@ can hold a best row. A crowded read reports the verified count in `X1` (a lower 
 reads verify up to 16,384 rows instead of 4,596, so fewer reads end incomplete. Paired-end `--meth` input keeps the previous
 search and is unchanged. Output without `--meth` is byte-identical.
 
+Since [#787](https://github.com/fg-labs/bwa-mem3/pull/787), an `aln --meth` search that has found
+no hit in its exact stratum can end on a proof that the read has no alignment within its
+difference limit (see [`aln`](../cli/aln.md) for the conditions; not under a positive `-e` nor in
+the `--known-snvs` ALT-window search). Such a read ends with no hit, as the full search would, so
+a read whose search used to finish is unchanged. A no-hit read whose search used to stop at the
+`-m` work bound, incomplete, is now complete. In paired-end runs that end can then be placed by
+mate rescue, which can change the rescued end's `FLAG` (including strand, unmapped,
+mate-unmapped and proper-pair bits), `RNAME`, `POS`, `CIGAR`, `MAPQ`, `SEQ`/`QUAL` orientation,
+alignment tags (`XT`, `NM`/`CM`, `MD`, `XN`, `X0`/`X1`/`XA`) and enabled `XG`/`XM` tags. Its
+mate's `MAPQ`, both ends' `SM`/`AM`, mate fields and `FLAG` can change too. Conversion-blind
+capping can also change `YQ:i` presence or value; with `--known-snvs`, `XV:Z` votes, including
+twin MAPQ, can change even when the original read's placement does not. On ultrashort EM-seq
+and 5-base slices of 1 million and of 200,000 reads (hg19, an x86_64 AVX-512 host, clang 19.1.7),
+single-end output was byte-identical (md5 of non-`@PG` lines), including the read-length bins,
+`--known-snvs`, simulated reads and the AVX2 and AVX-512 tiers; on 1 million EM-seq pairs one
+pair changed this way. Output
+without `--meth` is byte-identical: the proof runs only in the `--meth` search.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:
