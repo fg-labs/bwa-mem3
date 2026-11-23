@@ -494,22 +494,34 @@ above).
 > The index is packed without the lock, so interrupting a stage during the
 > pack leaves the lock free. POSIX semaphores have no `SEM_UNDO` equivalent:
 > only a stager killed inside the short registry update leaves the lock held,
-> and later stages then block in `sem_wait`. Run `bwa-mem3 shm -d` to recover:
-> it takes the lock for its walk of the registry, so no stage rewrites the
-> registry under it. A lock still held after 5 s is taken to be one left by a
-> killed stager: `shm -d` warns and proceeds without it, and unlinks the
-> semaphore alongside the registry. Without the lock it does not rewrite the
-> registry, so the entries of the segments it removed stay, listed as
-> `missing`, until a stage drops them. It keeps the stub of a `--huge-pages`
-> stage that may still be creating its segment (its stager is alive, or in
-> another PID namespace), and then leaves the semaphore in place too, so that
-> no later `shm -d` can take a new one and remove that stub; run `shm -d` again
-> once that stage has finished or its stager has exited. Until then new stages
-> block on that lock. If the stager is dead but cannot be seen to be (it was in
-> another PID namespace, which is gone), remove the lock by hand
-> (`rm /dev/shm/sem.bwactl_lock` on Linux) and run `shm -d` again. Unlinking does not
-> wake a stager already blocked in `sem_wait`, so stop any such stager first,
-> then start a new stage.
+> and later stages then wait for it, retrying every 10 ms. Run
+> `bwa-mem3 shm -d` to recover: it takes the lock for its walk of the
+> registry, so no stage rewrites the registry under it. A lock still held after
+> 5 s is taken to be one left by a killed stager: `shm -d` warns and proceeds
+> without it, and unlinks the semaphore alongside the registry. Without the
+> lock it does not rewrite the registry, so the entries of the segments it
+> removed stay, listed as `missing`, until a stage drops them. It keeps the
+> stub of a `--huge-pages` stage that may still be creating its segment (its
+> stager is alive, or in another PID namespace), and then leaves the semaphore
+> in place too, so that no later `shm -d` can take a new one and remove that
+> stub; run `shm -d` again once that stage has finished or its stager has
+> exited. Until then new stages wait on that lock. If the stager is dead but
+> cannot be seen to be (it was in another PID namespace, which is gone), remove
+> the lock by hand (`rm /dev/shm/sem.bwactl_lock` on Linux) and run `shm -d`
+> again.
+>
+> A waiting stage, and a waiting `shm -d`, open the lock by name on each try,
+> so once the semaphore is unlinked they move to the new one. When `shm -d`
+> removes everything, it leaves the semaphore it unlinked taken. A stage that
+> was waiting on that semaphore therefore cannot take it while a new stage
+> holds the new one.
+>
+> Run the same release for every process that shares the registry. A stage from
+> a release without this fix waits on one semaphore: if it is already waiting
+> when `shm -d` unlinks the lock, it never wakes, so stop it and run it again.
+> A `shm -d` from such a release releases the semaphore it unlinked, so a stage
+> waiting on that semaphore and a stage that starts afterwards can both hold
+> the lock for a moment.
 >
 > Known limitation: the 5 s timeout cannot tell a killed stager from a live
 > one that is merely slow to finish its registry update. A `shm -d` that times
