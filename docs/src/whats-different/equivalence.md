@@ -97,7 +97,9 @@ mirror-free cost, the search's difference ceiling is at least `floor(B / mu) + 1
 smallest counted penalty), the `-R` stop waits until those strata are complete or are themselves
 over `-R`, a locus the finish's ceiling drops is kept for the mirror-free pairing, and the strata
 apply stock's top-2 ceiling on mirror-free differences, so they are what `collapsed` scoring
-selects. With `--meth-mapq scoring` the output is unchanged by this rule.
+selects. Hits only the wider ceiling or the continued search reach feed those strata alone, with a
+lookup budget of their own, so every field but `MAPQ` and `YQ:i` is the same as with
+`--meth-mapq scoring`, whose output is unchanged by this rule.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
