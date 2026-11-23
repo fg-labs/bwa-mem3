@@ -1977,6 +1977,13 @@ jobs:
           FIXTURES="$GITHUB_WORKSPACE/test/fixtures" \
           bash test/regression/input_fail_fast.sh
 
+      - name: A plain index rejected for its memory budget leaves the prefix intact
+        # A rebuild over an existing index that fails the --max-memory check
+        # must exit 3 and leave every index file at the prefix byte-identical
+        # (no mix of two references' files), as must an empty reference; a
+        # build within budget still replaces it.
+        run: BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" bash test/regression/index_budget_preflight.sh
+
       - name: Chunk cap stays opt-in (batching matches bwa-mem2 at every -t)
         # bwa and bwa-mem2 both use an uncapped `chunk_size * n_threads` batch.
         # A default cap re-partitions the input, which changes each batch's

@@ -66,8 +66,13 @@ still resolves to a usable budget (a 1 GB host budgets 512 MB) instead of zero.
 Suffix-array construction is **not** currently bounded-memory: the budget is a
 precondition that is checked before the build starts, not a target the builder
 spills to meet. A reference whose estimated requirement exceeds the budget is
-rejected with exit code 3 and a message naming both the `--max-memory` value
-that would clear it and the host RAM that would clear it automatically. Human
+rejected with exit code 3 and a message naming the `--max-memory` value that
+would clear it and, when the budget was auto-detected, the host RAM that would
+clear it automatically. The packed reference is staged beside the output and
+moved into place only after the check passes, so a rejected build leaves an
+index already at the prefix intact
+([#818](https://github.com/fg-labs/bwa-mem3/pull/818)); the output directory
+briefly needs room for the new `.pac` alongside the old one. Human
 genomes need roughly 12 bytes per base of doubled text (8 below ~1.07 Gbp, where
 the suffix array still fits 32-bit entries) — about 72 GB for hg38 —
 so plan on a host with ~76 GB of RAM or more.

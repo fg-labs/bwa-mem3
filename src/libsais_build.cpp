@@ -203,6 +203,41 @@ void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,
                 suggest_n, suggest_sfx);
 }
 
+LibsaisBuildOpts libsais_build_opts_from_env() {
+    auto parse_ll = [](const char* s, const char* name,
+                       long long max_val = LLONG_MAX) -> long long {
+        char* end = nullptr;
+        errno = 0;
+        long long v = strtoll(s, &end, 10);
+        if (errno || end == s || *end != '\0' || v <= 0 || v > max_val) {
+            std::fprintf(stderr, "ERROR: invalid %s='%s' (expected positive integer)\n",
+                         name, s);
+            std::exit(1);
+        }
+        return v;
+    };
+    LibsaisBuildOpts opts;
+    if (const char* th = std::getenv("BWA_INDEX_THREADS"))
+        opts.num_threads      = (int)parse_ll(th, "BWA_INDEX_THREADS", INT_MAX);
+    if (const char* mm = std::getenv("BWA_INDEX_MAX_MEMORY"))
+        opts.max_memory_bytes = parse_ll(mm, "BWA_INDEX_MAX_MEMORY");
+    if (const char* td = std::getenv("BWA_INDEX_TMPDIR"))
+        opts.tmpdir           = td;
+    if (const char* mu = std::getenv("BWA_INDEX_MAX_MEMORY_USER"))
+        opts.max_memory_user_specified = (mu[0] == '1');
+    return opts;
+}
+
+int libsais_check_budget(int64_t N, const LibsaisBuildOpts& opts) {
+    const int64_t est_bytes = libsais_estimate_peak_bytes(N);
+    if (opts.max_memory_bytes > 0 && est_bytes > opts.max_memory_bytes) {
+        libsais_report_budget_shortfall("libsais", est_bytes, opts.max_memory_bytes,
+                                        opts.max_memory_user_specified, N / 2);
+        return 3;
+    }
+    return 0;
+}
+
 int libsais_build_fm_index(const char* prefix, int64_t pac_len,
                            const LibsaisBuildOpts& opts)
 {
@@ -223,11 +258,9 @@ int libsais_build_fm_index(const char* prefix, int64_t pac_len,
 
     const bool    use_int64_sa = libsais_sa_is_64bit(N);
     const int64_t est_bytes    = libsais_estimate_peak_bytes(N);
-    if (opts.max_memory_bytes > 0 && est_bytes > opts.max_memory_bytes) {
-        libsais_report_budget_shortfall("libsais", est_bytes, opts.max_memory_bytes,
-                                        opts.max_memory_user_specified, l_pac);
-        return 3;
-    }
+    // `index` has already run this check before writing anything; repeating it
+    // keeps the contract for any other caller of this function.
+    if (int rc = libsais_check_budget(N, opts)) return rc;
     std::fprintf(stderr, "[libsais_build] estimate ~%s (budget %s)\n",
             fmt_bytes(est_bytes).c_str(),
             opts.max_memory_bytes > 0 ? fmt_bytes(opts.max_memory_bytes).c_str() : "unset");

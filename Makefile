@@ -1477,6 +1477,7 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	./klib_alloc_fail_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 	BWA_MEM3="$(CURDIR)/bwa-mem3" ./test/regression/meth_index_output.sh
+	BWA_MEM3="$(CURDIR)/bwa-mem3" ./test/regression/index_budget_preflight.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh

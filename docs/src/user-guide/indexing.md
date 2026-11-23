@@ -147,9 +147,14 @@ Peak memory is roughly **12 bytes per base of doubled text**, i.e. ~72 GB for
 hg38. Below ~1.07 Gbp the suffix array still fits 32-bit entries and the cost
 drops to ~8 bytes per base. `--max-memory` is a precondition checked before the
 build starts, not a spill target: a reference that does not fit the budget is
-rejected up front (exit code 3) rather than built more slowly. Budget hg38 on a
-host with ~76 GB of RAM or more; the rejection message names both the
-`--max-memory` override and the host size that would work without one.
+rejected up front (exit code 3) rather than built more slowly. The packed
+reference is staged beside the output and moved into place only after the check
+passes, so a rejected build leaves an index already at the prefix intact
+([#818](https://github.com/fg-labs/bwa-mem3/pull/818)). Budget hg38 on a host
+with ~76 GB of RAM or more. The rejection message names the `--max-memory` value
+that would clear the budget and, when the budget was auto-detected, the host
+size that would work without one; with an explicit `--max-memory` it suggests
+only raising that value.
 
 `--meth` needs about **twice** that, because it builds a second index over a
 per-strand-converted reference whose text is twice as long: ~144 GB estimated for

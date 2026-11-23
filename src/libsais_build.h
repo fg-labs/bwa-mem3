@@ -44,6 +44,20 @@ void libsais_report_budget_shortfall(const char* what, int64_t need_bytes,
                                      int64_t budget_bytes, bool budget_user_specified,
                                      int64_t ref_bases);
 
+// The build options `bwa-mem3 index` hands the FM-index build through the
+// environment (BWA_INDEX_THREADS, BWA_INDEX_MAX_MEMORY, BWA_INDEX_TMPDIR,
+// BWA_INDEX_MAX_MEMORY_USER). Unset variables keep the defaults above; a
+// malformed value is fatal (exit 1). emit_unpacked_ref and sa_compx are not
+// read from the environment.
+LibsaisBuildOpts libsais_build_opts_from_env();
+
+// The memory-budget check for a libsais build over a doubled text of length
+// `N`. Returns 0 when the estimate fits opts.max_memory_bytes (or no budget is
+// set); otherwise reports the shortfall on stderr and returns 3, the exit code
+// `index` uses for a rejected budget. libsais_build_fm_index runs this itself;
+// it is exposed so `index` can run the same check before it writes any output.
+int libsais_check_budget(int64_t N, const LibsaisBuildOpts& opts);
+
 // Build the bwa-mem3 FM index via libsais's generalized-suffix-array
 // construction. Precondition: `<prefix>.pac` and `<prefix>.ann` already
 // exist, with the .pac encoding the forward-only bases emitted by

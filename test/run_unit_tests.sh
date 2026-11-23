@@ -561,6 +561,14 @@ ok "libsais_hg38_slice_diff_test"
 (cd "$HERE" && ./libsais_memory_budget_test.sh) || fail "libsais_memory_budget_test"
 ok "libsais_memory_budget_test"
 
+# --- index_budget_preflight (regression script) -----------------------------
+# A plain `index` rejected for its memory budget must leave an existing index
+# at the prefix byte-identical: the budget is checked before any output file is
+# replaced, so a rejected rebuild cannot mix two references' index files. Run
+# here too so the Linux ARM64 row covers it, not only canonical-regressions.
+BWA_MEM3="$BWAMEM3" "$HERE/regression/index_budget_preflight.sh" || fail "index_budget_preflight failed"
+ok "index_budget_preflight"
+
 # --- shm_section_find_test (unit: section-find helper) -----------------------
 echo "==> shm_section_find_test"
 (cd "$ROOT" && ./shm_section_find_test)
