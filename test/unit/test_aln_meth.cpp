@@ -4213,6 +4213,22 @@ TEST_CASE("aln_meth: duplicate reads share a search only with the same candidate
     const int64_t rb = mr.bns->anns[c4].offset + ref().u_pos - 1;
     const std::vector<uint32_t> ungapped{(uint32_t)len << 4};
     const std::vector<uint32_t> gapped{10u << 4, 1u << 4 | 1, 10u << 4, 1u << 4 | 2, (uint32_t)(len - 21) << 4};
+    // Independently: every c4 window that read_u matches base for base, a read T over a reference C
+    // (a TAPS conversion) included, is a tied ungapped locus with nothing to pay. The candidate's
+    // (u_pos) is one; its gapped path costs more there and does not replace it.
+    std::vector<std::pair<int64_t, int>> expected; // (locus, conversions)
+    for (size_t p = 0; p + len <= ref().c4.size(); ++p) {
+        int n_conv = 0, k = 0;
+        for (; k < len; ++k) {
+            const char a = ref().read_u[k], b = ref().c4[p + k];
+            if (a == b) continue;
+            if (a != 'T' || b != 'C') break;
+            ++n_conv;
+        }
+        if (k == len) expected.emplace_back(mr.bns->anns[c4].offset + (int64_t)p, n_conv);
+    }
+    REQUIRE(expected.size() == 4u);
+    CHECK(expected[0] == std::make_pair(rb, 0));
     for (bool same : {true, false}) {
         CAPTURE(same);
         std::vector<std::vector<ba::aln_meth_candidate_t>> extra(2);
@@ -4221,6 +4237,39 @@ TEST_CASE("aln_meth: duplicate reads share a search only with the same candidate
         std::vector<ba::aln_meth_read_t> results(n); ba::aln_dup_state_t dup;
         CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, 1, 1000, &dup, results.data(),
                                         extra.data()) == (same ? 1 : 0));
+        for (int i = 0; i < n; ++i) {
+            CAPTURE(i);
+            // The read searched alone, with no duplicate to share: what a shared or unshared
+            // result must equal.
+            ba::aln_meth_read_t single; ba::aln_dup_state_t single_dup;
+            ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads + i, opt, 1, 1, i, 1, 1000, &single_dup, &single,
+                                      &extra[i]);
+            const ba::aln_meth_read_t &r = results[i];
+            CHECK(r.flags == single.flags);
+            CHECK(r.c1 == single.c1); CHECK(r.c2 == single.c2);
+            REQUIRE(r.main == single.main);
+            REQUIRE(r.hits.size() == single.hits.size());
+            for (size_t k = 0; k < r.hits.size(); ++k) {
+                const auto &x = r.hits[k], &y = single.hits[k];
+                CHECK(std::make_tuple(x.rid, x.hyp, x.strand, x.pos, x.cost, x.span, x.alt) ==
+                      std::make_tuple(y.rid, y.hyp, y.strand, y.pos, y.cost, y.span, y.alt));
+                CHECK(std::make_tuple(x.n_mm, x.n_gapo, x.n_gape, x.n_conv) ==
+                      std::make_tuple(y.n_mm, y.n_gapo, y.n_gape, y.n_conv));
+                CHECK(cigar_of(r, x) == cigar_of(single, y));
+            }
+            // Independently: the expected loci, each ungapped with nothing to pay.
+            CHECK(r.c1 == (int)expected.size()); CHECK(r.c2 == 0); CHECK(r.flags == 0);
+            REQUIRE(r.hits.size() == expected.size());
+            for (size_t k = 0; k < expected.size(); ++k) {
+                CAPTURE(k);
+                const auto &h = r.hits[k];
+                CHECK(h.rid == c4); CHECK(h.strand == 0); CHECK(h.span == len);
+                CHECK(h.pos == (bwtint_t)expected[k].first); CHECK(h.n_conv == expected[k].second);
+                CHECK(h.cost == 0); CHECK(h.n_mm == 0); CHECK(h.n_gapo == 0); CHECK(h.n_gape == 0);
+                CHECK(cigar_of(r, h) == ungapped);
+            }
+            CHECK((r.main >= 0 && (size_t)r.main < r.hits.size()));
+        }
     }
     ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
