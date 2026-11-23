@@ -284,10 +284,18 @@ void aln_meth_score_block(const aln_meth_ref_t &ref, const aln_meth_fast_t &f, i
         }
         const uint64_t nn = (plane_at(rd.n.data(), nq, q) | plane_at(amb, na, wo + 32LL * w)) & valid;
         const uint64_t mm = ((neq & ~conv) & valid) | nn;
+        // the mirror cell among the strict mismatches (none under collapsed, where it converts)
+        const uint64_t mirror = mm & ~nn & (hyp ? lo & hi & plane_at(rd.c.data(), nq, q)
+                                                : ~lo & ~hi & LANE_LO & plane_at(rd.g.data(), nq, q));
         out->n_amb += __builtin_popcountll(nn);
         out->n_mm += __builtin_popcountll(mm);
+        out->n_mirror += __builtin_popcountll(mirror);
         out->n_conv += __builtin_popcountll(conv & ~nn & valid);
-        if (seed) out->n_seed_mm += __builtin_popcountll(mm & plane_at(rd.seed.data(), rd.seed.size(), q));
+        if (seed) {
+            const uint64_t sm = plane_at(rd.seed.data(), rd.seed.size(), q);
+            out->n_seed_mm += __builtin_popcountll(mm & sm);
+            out->n_seed_mirror += __builtin_popcountll(mirror & sm);
+        }
     }
 }
 

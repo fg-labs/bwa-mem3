@@ -949,7 +949,8 @@ TEST_CASE("aln_meth: a refined window over the read's -n limit is not a locus")
     // The converted search frees a read C over a reference T (read 1, OT), so it proposes windows
     // within -n converted differences whose original-reference alignment has more. Stock aln never
     // reports such a hit, and neither does --meth: the window does not map the read, count toward
-    // X0/X1 or set the MAPQ.
+    // X0/X1 or set the genomic MAPQ. The conversion-blind cap still counts one that is within -n
+    // with the mirror cell free (s, below).
     uint32_t st = 8675309;
     auto flank = [&]() { return aln_test::lcg_dna(st, 100); };
     auto swap_ag = [](char c) { return c == 'A' ? 'G' : 'A'; };
@@ -1022,7 +1023,18 @@ TEST_CASE("aln_meth: a refined window over the read's -n limit is not a locus")
     CHECK(s2[0].cigar == "15M1D15M");
     CHECK(tag_value(s2[0], "X0:i") == "1");
     CHECK(tag_value(s2[0], "X1:i") == "0");
-    CHECK(s2[0].mapq == 37);
+    // the default --meth-mapq conversion-blind still counts the dropped locus: with the mirror
+    // cell free its 3 mismatches cost nothing and it is within -n, so it beats the gapped hit (as
+    // under collapsed) and the cap is 0; the genomic MAPQ is kept in YQ:i and under scoring
+    CHECK(s2[0].mapq == 0);
+    CHECK(tag_value(s2[0], "YQ:i") == "37");
+    const auto s2_scoring = run_aln({"--meth", "--meth-mapq", "scoring", "-n", "2"}, {fq_s}, fa, dir);
+    REQUIRE(s2_scoring.size() == 1);
+    CHECK(s2_scoring[0].rname == "s_gap");
+    CHECK(s2_scoring[0].mapq == 37);
+    const auto s2_collapsed = run_aln({"--meth", "--meth-scoring", "collapsed", "-n", "2"}, {fq_s}, fa, dir);
+    REQUIRE(s2_collapsed.size() == 1);
+    CHECK(s2_collapsed[0].rname == "s_over"); // the oracle: collapsed keeps that locus, and prefers it
     const auto s3 = run_aln({"--meth", "-n", "3"}, {fq_s}, fa, dir);
     REQUIRE(s3.size() == 1);
     CHECK(s3[0].rname == "s_over");

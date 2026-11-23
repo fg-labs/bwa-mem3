@@ -1,4 +1,4 @@
-# Flags: --meth chemistry, --meth-context, --meth-scoring, --meth-tags, --set-as-failed, --chimera-qc
+# Flags: --meth chemistry, --meth-context, --meth-scoring, --meth-mapq, --meth-tags, --set-as-failed, --chimera-qc
 
 `--meth` itself takes an optional chemistry argument. Alongside it,
 `--meth-context` selects where a conversion is free,
@@ -168,6 +168,76 @@ simulated 5-base reads ([measurement](5base.md#measured-on-simulated-5-base-read
 > explicit `-B` overrides the mode default and still reaches the per-strand
 > matrices, whether it appears before or after `--meth`. The other `--meth`
 > defaults (`-L 10 -U 100 -T 40 -M -C`) are the same across modes.
+
+## `--meth-mapq {conversion-blind|scoring}`
+
+`aln` only for now; `mem` keeps `scoring` MAPQ.
+
+Under `genomic` scoring the mirror cell (reference `T` × read `C` on OT, reference
+`A` × read `G` on OB) is a mismatch. A short read that kept a methylated CpG `C`
+is then unique where a fully converted copy of the same molecule is not, because
+every competing locus with a `T` at that position costs a mismatch. Filtering on
+MAPQ therefore selects methylated molecules, and CpG methylation from short reads
+comes out too high.
+
+**Accepted values:**
+
+- `conversion-blind` (**default for `--meth`/`--meth=emseq` with `genomic` scoring**)
+  — cap each record's MAPQ at the MAPQ the same run gives with the mirror cell
+  freed as a conversion, at the same penalties; a locus that wins with the mirror
+  cell free gives a cap of 0. Each locus is taken at its `genomic` alignment's cost
+  less one mismatch penalty per mirror mismatch: exact for an ungapped locus, while a
+  gapped locus is not realigned with the mirror cell free. A row that `-n` (or the
+  seed's `-k`) dropped only for its mirror mismatches counts too, since with the mirror
+  cell free it is within the limit, as under `collapsed`. Placement, CIGAR, `NM`,
+  `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
+  is `genomic`'s in every field but MAPQ. A record whose MAPQ the cap lowered
+  carries the uncapped MAPQ in `YQ:i`, whatever `--meth-tags` selects. The other
+  confidence fields stay `genomic`'s: `XT:A`, `X0:i`/`X1:i` and, for paired reads,
+  `SM:i`/`AM:i` (the single-end MAPQs), so filter on MAPQ, not on those
+  ([#816](https://github.com/fg-labs/bwa-mem3/pull/816)).
+- `scoring` — MAPQ follows `--meth-scoring`, as before. The default (and the only
+  value accepted) for `--meth=taps`, `--meth=5base` and `--meth-scoring neutral`:
+  their reads are mostly unconverted, so freeing the mirror cell discards most of
+  what places a short read. Under `collapsed`, which already frees the mirror cell,
+  the two values are the same.
+
+In `aln` paired-end output, pairing runs once more on the mirror-free costs (with
+the loci only the mirror-free strata keep), with each end at its single-end cap; an
+end placed where that pairing places it is capped at the MAPQ that pairing gives
+it, any other end at 0. A rescued mate takes its anchor's cap. That pairing uses
+the batch's `genomic` insert-size estimate. `--known-snvs` twin MAPQs (`XV:Z`) are computed the same way as
+the record's.
+
+**Measured** on public NA12878 EM-seq (SRR10532145, 2×99 bp, 2 M pairs), read 1
+cut to 20–50 bp and aligned single-end with `aln` on an Apple M2 Max (12 cores; macOS, arm64, NEON
+tier; clang 21). The columns are the share of
+reads at MAPQ ≥ 20 and the CpG methylation of those reads minus the mean ENCODE
+GM12878 WGBS level at the same CpGs (ONT HG001 5mC agrees within about 0.007):
+
+| read length | `scoring` | `conversion-blind` |
+|---|---|---|
+| 20 bp | 1.4 %, +0.141 | 0.2 %, +0.001 |
+| 25 bp | 36.8 %, +0.030 | 34.4 %, +0.003 |
+| 30 bp | 59.3 %, +0.008 | 58.5 %, +0.003 |
+| 50 bp | 72.1 %, +0.003 | 71.5 %, +0.001 |
+
+Why cap MAPQ rather than default to `collapsed`: in `mem`, `genomic`'s full-length
+placement gain over `collapsed` comes from its `-B 4`, not from the mirror cell, and
+`collapsed -B 4`, though unbiased by construction, places reads less reliably. On
+simulated 2×150 bp EM-seq from chr20–22 aligned with `mem` (2.16 M reads, error rising
+from 0.1 % to 1 % along the read; on the M2 Max above: macOS, arm64, NEON tier,
+clang 21), MAPQ ≥ 20 and correct is 0.9217 with the cap, 0.9234 under `genomic` and
+0.9218 under `collapsed -B 4`; misplaced at MAPQ ≥ 20 46, 55 and 58 per million; wrong
+at MAPQ 60 8, 8 and 27. With 160 k simulated SNPs and indels (6.5 M reads), wrong at
+MAPQ 60 is 14 with the cap and 73 under `collapsed -B 4`.
+
+For `aln` the following is by construction, not a measurement: `aln`'s `genomic` and
+`collapsed` share `-M`, so there the single-end cap estimates the `collapsed` MAPQ at
+`genomic`'s costs: exactly for ungapped loci, and 0 when a mirror-free locus beats the
+`genomic` primary, even where a `collapsed` run would place the read there with a
+positive MAPQ. A record's MAPQ is the lower of that cap and its `genomic` MAPQ: where
+the cap is higher, the record keeps its `genomic` MAPQ.
 
 ## `--meth-context {all|cpg}`
 

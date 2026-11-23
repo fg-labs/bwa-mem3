@@ -30,6 +30,20 @@
 enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC = 1,
                         MEM_METH_SCORING_NEUTRAL = 2 };
 
+/* How --meth MAPQ is computed (--meth-mapq).
+ *   SCORING:          MAPQ follows the --meth-scoring model.
+ *   CONVERSION_BLIND: MAPQ is capped at what the same scoring gives with the mirror cell
+ *                     (read C x reference T on the C->T strand, read G x reference A on the G->A
+ *                     strand) freed as a conversion, at the same penalties: each locus at its
+ *                     scoring alignment's cost less one mismatch penalty per mirror mismatch
+ *                     (exact for an ungapped locus; a gapped one is not realigned). Under genomic
+ *                     scoring a retained (methylated) C otherwise makes a short read look unique,
+ *                     so a MAPQ filter selects methylated molecules and inflates CpG methylation.
+ *                     Placement, CIGAR and the other tags stay the scoring model's. Resolved by
+ *                     meth_opts_finalize_shared: the em-seq default with genomic scoring in a
+ *                     subcommand that implements it, and only ever left set under genomic. */
+enum mem_meth_mapq { MEM_METH_MAPQ_SCORING = 0, MEM_METH_MAPQ_CONVERSION_BLIND = 1 };
+
 /* Bismark tag selection under --meth (--meth-tags). XR:Z and XG:Z are two-byte
  * strand labels; XM:Z is a read-length methylation-call string and dominates the
  * BAM's aux payload, so it is the one worth being able to turn off. */
@@ -68,6 +82,8 @@ struct meth_opt_t {
                       // METH_CTX_CPG (only at a CpG).
     char meth_set_as_failed; // --set-as-failed: 'f' (OT), 'r' (OB) or 0; records
                              // on that strand get the QC-fail flag 0x200
+    int meth_mapq;    // --meth-mapq: a mem_meth_mapq value (resolved by meth_opts_finalize_shared;
+                      // SCORING in a subcommand that does not implement --meth-mapq)
 };
 
 /* The defaults, in one place for every subcommand. */
@@ -80,6 +96,16 @@ static inline void meth_opt_init(struct meth_opt_t *m)
     m->meth_tags = MEM_METH_TAGS_ALL;             /* XR, XG and XM (the Bismark set) */
     m->meth_context = METH_CTX_ALL;               /* every C converts */
     m->meth_set_as_failed = 0;
+    m->meth_mapq = MEM_METH_MAPQ_SCORING;          /* the em-seq default is set once the
+                                                     chemistry and scoring are final */
+}
+
+/* Whether the conversion-blind MAPQ cap applies. meth_opts_finalize_shared leaves
+ * CONVERSION_BLIND set only for em-seq with genomic scoring: it resolves collapsed to SCORING
+ * (collapsed already frees the mirror cell) and refuses TAPS/5-base and neutral. */
+static inline int meth_mapq_conversion_blind(const struct meth_opt_t *m)
+{
+    return m->meth_mode && m->meth_mapq == MEM_METH_MAPQ_CONVERSION_BLIND;
 }
 
 #endif

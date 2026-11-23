@@ -42,7 +42,7 @@ contig:pos:REF>ALT,allele,away,max_diff,twin_same,twin_mapq
 | `away` | The read's differences outside this site, counted as `aln`'s gap search counts them against `-n`: mismatches, gap opens and, unless `-e` is positive, gap extensions. |
 | `max_diff` | The read's mismatch budget, set by its quality-trimmed search length and `-n`. |
 | `twin_same` | For single-end input, 1 only if the twin has one best hit on the same strand within 5 bases, with its whole reference span on the read's contig; an equal-best hit elsewhere gives 0. For paired input, 1 if the twin end is mapped on the same strand within 5 bases after pairing and rescue, with its whole span on the read's contig and, without `--meth`, either an unmapped mate or a mapped mate whose span does not cross a contig end; else 0. Under `--meth`, hits and rescue never cross contigs. |
-| `twin_mapq` | The twin's MAPQ. |
+| `twin_mapq` | The twin's MAPQ, computed as the record's is (under `--meth`, after `--meth-mapq`). |
 
 The **twin** is a copy of the read with REF and ALT swapped at the site. An ALT read's twin
 carries REF and a REF read's twin carries ALT. `aln` aligns the twin the same way as the read and
