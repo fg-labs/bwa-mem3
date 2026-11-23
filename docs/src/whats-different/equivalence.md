@@ -114,8 +114,9 @@ was above `scoring`'s. At the default penalties 77 of 40,000 reads at 40 bp sing
 40,000 pairs at 40 bp and 2 of 40,000 pairs at 150 bp had their cap set to 0 for strata the cuts may
 have left incomplete (none of the 150 bp single-end reads); at `-M 5 -O 3 -E 1`, 78, 149 and 3. Almost
 all are reads whose mirror-free best has more than `-R` loci, so a mirror-free run stops where the
-search goes on: their single-end caps were 0 already (no 40 bp single-end MAPQ changed), and in pairs
-225 of 80,000 records at 40 bp dropped to 0, mostly mates. These are observations from those runs,
+search goes on: their single-end caps were 0 already (no 40 bp single-end MAPQ changed), but in pairs
+the mirror-free pairing had given them a cap, and 225 of 80,000 records at 40 bp dropped to 0 (both
+ends of 108 pairs, one end of 9 whose other end was 0 already). These are observations from those runs,
 not a bound for all inputs.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
