@@ -121,8 +121,9 @@ Methylation (shared with bwa-mem3 mem):
    equal-cost locus, an end left there has MAPQ <= min(60,6*delta), delta the smallest
    conversion-count gap; an end that pairing or mate rescue moves takes the pair's MAPQ.
    Pair all retained loci up to --max-occ only without lookup/work cutoffs on either end.
-   Paired, --meth-mapq conversion-blind caps an end by the same pairing on mirror-free costs
-   (an end it places elsewhere gets 0), and a rescued mate by its anchor's cap.
+   Paired, --meth-mapq conversion-blind caps an end by the pairing collapsed makes (its
+   loci, main hits and insert size; an end it places elsewhere gets 0), and a rescued mate
+   by its anchor's cap.
    --meth-mapq conversion-blind|scoring
                  how MAPQ is computed. conversion-blind (default for em-seq with
                  genomic scoring): MAPQ is capped at what the same scoring gives

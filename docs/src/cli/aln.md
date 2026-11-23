@@ -673,17 +673,21 @@ stock cut, each at its cheapest row with the mirror cell free (cost minus `-M` p
 mismatch, among the rows the search scored there; the row `collapsed` keeps among them), together with any
 row the `-n` (or seed `-k`) limit dropped only for its mirror mismatches (with the mirror cell
 free it is within the limit, as under `collapsed`; under `--known-snvs`, also such a row of the
-ALT-window search, [#820](https://github.com/fg-labs/bwa-mem3/pull/820)). A locus that is then
-cheaper than the primary gives a cap of 0. Complete mapped paired ends take the MAPQ of stock
-pairing on only those mirror-free strata (best cost plus `-M`, or no cut under `-N`), including
-loci only those strata keep. The shadow's `--max-occ` gate uses its own counts, even when genomic
-counts prevent pairing ([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). It still starts each
-end at its `genomic` single-end selection and uses the `genomic` insert-size estimate. A rescued
-mate takes its anchor's cap. If either end's mirror-free strata are unknown (its mirror table
-exceeded its budget), both ends' caps are 0. Otherwise an end with more than `--max-occ`
-mirror-free loci would not pair, so each end keeps its single-end cap, or gets 0 if genomic
-pairing moves it. When the counts fit but a row the shadow admits has a mirror-free cost too large
-for the pairing's score field (20 bits), both caps are 0.
+ALT-window search, [#820](https://github.com/fg-labs/bwa-mem3/pull/820)), and a locus that is then cheaper than the
+primary gives a cap of 0. Paired-end ends take the MAPQ of the stock pairing `collapsed` makes:
+on its mirror-free strata (best cost plus `-M`, or no cut under `-N`), including loci only those
+strata keep. The shadow's `--max-occ` gate uses its own counts, independently of genomic counts
+([#821](https://github.com/fg-labs/bwa-mem3/pull/821)).
+Each end starts at the main hit `collapsed` draws, with `collapsed`'s single-end MAPQ and the
+insert size it infers from those selections ([#822](https://github.com/fg-labs/bwa-mem3/pull/822)).
+An end that pairing places elsewhere gets 0, and a rescued mate its anchor's cap
+(and at most that pairing's MAPQ there when it pairs the ends properly; `collapsed`'s own mate
+rescue is not rerun). If either end's mirror-free strata are unknown (its mirror table exceeded
+its budget), both ends' caps are 0. An
+end with more than `--max-occ` such loci is not paired, as under `collapsed`, so each end keeps
+`collapsed`'s single-end MAPQ, or gets 0 if that is at another locus. When the counts fit but a
+row the shadow admits has a mirror-free cost too large for the pairing's score field (20 bits),
+both caps are 0.
 Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
 and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. Under `--known-snvs`, the `XV:Z`
 twin MAPQ can also change. At an ALT window without a search path, realignment still uses

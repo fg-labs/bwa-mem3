@@ -30,13 +30,18 @@ including retained mirror-free rows from ALT-window searches. A separate `collap
 keep the same row: at an ALT window without a search path, `genomic` realignment can omit the row
 that run would keep. Where a locus has several rows, the cap can differ from that of
 earlier versions ([PR #821](https://github.com/fg-labs/bwa-mem3/pull/821)).
-For complete mapped pairs, the shadow also excludes genomic hits outside the mirror-free score
-cut and evaluates pairing when mirror-free counts fit `--max-occ`, even when genomic counts do
-not. Fitting `--max-occ` is not enough on its own: both ends' mirror-free strata must be known
-(no partial mirror table) and every row the shadow admits must have a cost that fits the
-pairing's score field; otherwise both caps are 0, even for a complete genomic pair. These corrections can change MAPQ, the presence of `YQ:i`, and the `XV:Z` twin MAPQ; other
-fields are unchanged. The shadow still starts from the `genomic` single-end selections, uses
-its insert-size estimate, and does not replay mate rescue, so it is not a full collapsed run.
+In paired-end runs the cap reruns the pairing `collapsed` makes, from the main hits `collapsed`
+draws for its ends, at its single-end MAPQs and with the insert size it infers, so paired-end
+MAPQs can differ from those of earlier versions. The shadow excludes genomic hits outside the
+mirror-free score cut and evaluates pairing when mirror-free counts fit `--max-occ`, even when
+genomic counts do not. Fitting `--max-occ` is not enough on its own: both ends' mirror-free
+strata must be known (no partial mirror table) and every row the shadow admits must have a cost
+that fits the pairing's score field; otherwise both caps are 0. A changed cap can add or remove
+`YQ:i`; an existing `YQ:i` still holds the uncapped MAPQ. Under `--known-snvs`, the `XV:Z` twin
+MAPQ can change too. Placement and all other fields are unchanged. Mate rescue is not replayed,
+so this is not a full collapsed run ([PR #822](https://github.com/fg-labs/bwa-mem3/pull/822)).
+At an ALT window without a search path, realignment still uses `genomic` scoring, so a row
+`collapsed` would keep there can be missing.
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,

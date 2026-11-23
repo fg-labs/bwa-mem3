@@ -1051,6 +1051,7 @@ struct pe_meth_ctx_t {
 	bwa_seq_t *seqs[2];
 	aln_meth_read_t *res[2];
 	const isize_info_t *ii;
+	const isize_info_t *blind_ii = nullptr; // --meth-mapq conversion-blind: collapsed's insert size
 	fmt_bufs_t *fb;
 	std::vector<long long> cnt_chg;
 	std::vector<uint64_t> sw_cnt;
@@ -1067,6 +1068,15 @@ int64_t ks_meth_alt(const aln_opt_t *o, const bwa_seq_t *s, const aln_meth_read_
 	return ks_site_of_rel(o->known_snvs, o->meth_ref->bns, h.rid, (int64_t)h.pos, h.alt);
 }
 
+/* --meth-mapq conversion-blind: ks_meth_alt at the end's collapsed single-end selection (its
+ * blind_main, as aln_meth_blind_isize takes it), else at its own. */
+int64_t ks_meth_blind_alt(const aln_opt_t *o, const bwa_seq_t *s, const aln_meth_read_t &r)
+{
+	if (r.blind_main < 0 || r.blind_partial || r.flags) return ks_meth_alt(o, s, r);
+	const aln_meth_blind_row_t &m = r.blind_ties[r.blind_main];
+	return ks_site_of_rel(o->known_snvs, o->meth_ref->bns, m.rid, (int64_t)m.pos, m.alt);
+}
+
 void pe_meth_post_worker(void *data, int st, int n, int tid)
 {
 	pe_meth_ctx_t *c = (pe_meth_ctx_t*)data;
@@ -1075,7 +1085,7 @@ void pe_meth_post_worker(void *data, int st, int n, int tid)
 	aln_meth_read_t *r[2] = {c->res[0] + st, c->res[1] + st};
 	if (c->ks_phase != 2) {
 		uint64_t *sw = &c->sw_cnt[4 * tid];
-		c->cnt_chg[tid] += aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2);
+		c->cnt_chg[tid] += aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2, c->blind_ii);
 		if (c->ks_rec[0])
 			for (int j = 0; j < 2; ++j)
 				for (int i = 0; i < n; ++i) {
@@ -1112,11 +1122,13 @@ void pe_meth_post_worker(void *data, int st, int n, int tid)
 }
 
 /* --known-snvs under --meth, paired end: as ks_place_twins_pe, through the --meth pipeline (window
- * search, main search with the windows it finds, stages 1 and 2 with the batch's insert size). The
- * twins' ordinals start past any read's, so no read's draw changes. */
+ * search, main search with the windows it finds, stages 1 and 2 with the batch's insert size, and
+ * under --meth-mapq conversion-blind the batch's collapsed one for the cap). The twins' ordinals
+ * start past any read's, so no read's draw changes. */
 struct ks_twin_pe_meth_ctx_t {
 	const aln_opt_t *o;
 	const isize_info_t *ii;
+	const isize_info_t *blind_ii; // as pe_meth_ctx_t
 	bwa_seq_t *tw[2];
 	aln_meth_read_t *res[2];
 };
@@ -1130,11 +1142,12 @@ void ks_twin_pe_meth_worker(void *data, int st, int n, int tid)
 	aln_meth_read_t *r[2] = {c->res[0] + st, c->res[1] + st};
 	aln_meth_pe_stage1(&o->gap, n, s, r);
 	uint64_t sw[4] = {0, 0, 0, 0};
-	aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2);
+	aln_meth_pe_stage2(o->meth_ref, o->meth, &o->gap, &o->pe, c->ii, n, s, r, sw, sw + 2, c->blind_ii);
 }
 
-void ks_place_twins_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const isize_info_t *ii, bwa_seq_t *const seqs[2],
-							aln_meth_read_t *const res[2], std::vector<ks_rec_t> rec[2], int64_t ord0)
+void ks_place_twins_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const isize_info_t *ii, const isize_info_t *blind_ii,
+							bwa_seq_t *const seqs[2], aln_meth_read_t *const res[2], std::vector<ks_rec_t> rec[2],
+							int64_t ord0)
 {
 	std::vector<std::pair<int, int>> idx; // (pair, end holding the twin)
 	for (int i = 0; i < (int)rec[0].size(); ++i)
@@ -1168,7 +1181,7 @@ void ks_place_twins_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const isize_in
                        tres[j].data());
 	}
 	ks_twin_pe_meth_ctx_t c;
-	c.o = o, c.ii = ii;
+	c.o = o, c.ii = ii, c.blind_ii = blind_ii;
 	for (int j = 0; j < 2; ++j) c.tw[j] = tw[j], c.res[j] = tres[j].data();
 	kt_for_nt(ks_twin_pe_meth_worker, &c, nt, n_threads);
 	for (int t = 0; t < nt; ++t) {
@@ -1196,6 +1209,8 @@ int aln_run_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq1, co
 	aln_dup_state_t *dup[2] = {nullptr, nullptr};
 	if (o->share_dup_search) dup[0] = &dup_state[0], dup[1] = &dup_state[1];
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
+	isize_info_t blind_last_ii; // --meth-mapq conversion-blind: collapsed's last_ii (aln_meth_blind_isize)
+	blind_last_ii.avg = -1.0;
 	return run_pe_batches(o, fn_fq1, fn_fq2, out,
 		[&](int n_seqs, const int *n_in, bwa_seq_t **seqs, fmt_bufs_t &fb,
 			isize_info_t &last_ii, int64_t tot) {
@@ -1219,8 +1234,26 @@ int aln_run_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq1, co
 		// pairing is same-contig only, so the estimate counts only same-contig pairs
 		bwa_pe_isize_ref(o->meth_ref->bns->l_pac, n_seqs, seqs, &ii, &o->pe, &last_ii, o->meth_ref->bns,
 						 bwa_verbose >= 3, ks_excluded.empty() ? nullptr : ks_excluded.data());
+		// --meth-mapq conversion-blind: the insert size a collapsed run would infer, for the pairing it
+		// would make (aln_meth_pe_stage2), with its own previous-batch fallback
+		isize_info_t blind_ii;
+		const bool blind = meth_mapq_conversion_blind(&o->meth->m);
+		if (blind) {
+			// --known-snvs: the pairs collapsed excludes, from its own selections
+			std::vector<uint8_t> blind_excluded;
+			if (o->ks_windows) {
+				blind_excluded.resize(n_seqs);
+				for (int i = 0; i < n_seqs; ++i)
+					blind_excluded[i] = ks_meth_blind_alt(o, seqs[0] + i, r[0][i]) != -1
+						|| ks_meth_blind_alt(o, seqs[1] + i, r[1][i]) != -1;
+			}
+			aln_meth_blind_isize(o->meth_ref, &o->gap, &o->pe, n_seqs, seqs, r,
+			                     blind_excluded.empty() ? nullptr : blind_excluded.data(), &blind_last_ii, &blind_ii);
+			blind_last_ii = blind_ii;
+		}
 		pe_meth_ctx_t c;
 		c.o = o, c.seqs[0] = seqs[0], c.seqs[1] = seqs[1], c.res[0] = r[0], c.res[1] = r[1], c.ii = &ii, c.fb = &fb;
+		c.blind_ii = blind ? &blind_ii : nullptr;
 		c.cnt_chg.assign(n_threads, 0);
 		c.sw_cnt.assign(4 * n_threads, 0);
 		std::vector<ks_rec_t> ks_rec[2];
@@ -1231,7 +1264,7 @@ int aln_run_pe_meth(const aln_opt_t *o, const bwt_t *bwt, const char *fn_fq1, co
 			}
 			c.ks_phase = 1;
 			kt_for_nt(pe_meth_post_worker, &c, n_seqs, n_threads);
-			ks_place_twins_pe_meth(o, bwt, &ii, seqs, r, ks_rec, tot);
+			ks_place_twins_pe_meth(o, bwt, &ii, c.blind_ii, seqs, r, ks_rec, tot);
 			c.ks_phase = 2;
 		}
 		fb.reset();
@@ -1322,8 +1355,9 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "   equal-cost locus, an end left there has MAPQ <= min(60,6*delta), delta the smallest\n");
 	fprintf(fp, "   conversion-count gap; an end that pairing or mate rescue moves takes the pair's MAPQ.\n");
 	fprintf(fp, "   Pair all retained loci up to --max-occ only without lookup/work cutoffs on either end.\n");
-	fprintf(fp, "   Paired, --meth-mapq conversion-blind caps an end by the same pairing on mirror-free costs\n");
-	fprintf(fp, "   (an end it places elsewhere gets 0), and a rescued mate by its anchor's cap.\n");
+	fprintf(fp, "   Paired, --meth-mapq conversion-blind caps an end by the pairing collapsed makes (its\n");
+	fprintf(fp, "   loci, main hits and insert size; an end it places elsewhere gets 0), and a rescued mate\n");
+	fprintf(fp, "   by its anchor's cap.\n");
 	meth_opts_usage_mapq(fp);
 	fprintf(fp, "   Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.\n");
 	fprintf(fp, "   aln -B is barcode length, not mem's mismatch penalty. Records carry\n");
