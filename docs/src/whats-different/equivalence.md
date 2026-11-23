@@ -90,23 +90,27 @@ an x86_64 Sapphire Rapids host at its default AVX-512BW dispatch tier, clang 19.
 search with a 65,536-row lookup budget were identical. Against the previous implementation, 4.3% (EM-seq) and 3.1% (5-base) of reads changed, almost all of them reads the lookup
 budget had left incomplete (the incomplete-read rate fell from 8.52% to 4.32% and from 10.48% to
 7.49%), plus about 11 EM-seq reads per million whose competitor exceeded the ceiling (MAPQ 23 to
-37). With `--short-insert` (1 million pairs), proper pairs rose by 4.1 (EM-seq) and 0.85 (5-base)
+37). With `--short-insert` (1 million pairs of the same EM-seq and 5-base samples; the host and
+SIMD tier of that run were not recorded), proper pairs rose by 4.1 (EM-seq) and 0.85 (5-base)
 percentage points, and peak RSS rose by 0.7 to 1.1 GB because a repeat end keeps all its best loci
 for pairing. Output without `--meth` is byte-identical: the cuts run only in the `--meth` search.
-Under `--meth-mapq conversion-blind` (the EM-seq `genomic` default since [#816](https://github.com/fg-labs/bwa-mem3/pull/816)) every cut is also
-valid for the mirror-free strata the MAPQ cap is computed from: a row is dropped on its
-mirror-free cost, the search's difference ceiling is at least `floor(B / mu) + 1` (`mu` the
-smallest counted penalty), the `-R` stop waits until those strata are complete or are themselves
-over `-R`, a locus the finish's ceiling drops is kept for the mirror-free pairing, and the strata
-apply stock's top-2 ceiling on mirror-free differences, so they are what `collapsed` scoring
-selects. Hits only the wider ceiling or the continued search reach feed those strata alone, with a
-lookup budget of their own, so every field but `MAPQ` and `YQ:i` is the same as with
-`--meth-mapq scoring`, whose output is unchanged by this rule. The exception is the `-m` queue
-limit, which the wider search shares: with a smallest penalty below `-M` a long read can exceed it
-and end incomplete. On a chr22 EM-seq simulation (40,000 reads or pairs per run, 40 and 150 bp,
-arm64) every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring` at the default penalties
-and with `-R 1`, `-R 2`, `-n 8`, `-e 3`, `-l 32 -k 0`, `-m 300`, `-N`, `-M 0` and
-`-M 2 -O 5 -E 2`; at `-M 5 -O 3 -E 1`, 4 pairs of 40,000 at 150 bp ended with one end incomplete.
+Under `--meth-mapq conversion-blind` (the EM-seq `genomic` default since [#816](https://github.com/fg-labs/bwa-mem3/pull/816)) the search, its
+cuts and its limits are those of `--meth-mapq scoring`; the MAPQ cap only observes it, so every
+field but `MAPQ` and `YQ:i` is the same as with `--meth-mapq scoring` by construction. The cap is
+computed from stock's selection on costs with the mirror cell free (as `collapsed` scoring makes it,
+top-2 ceiling on mirror-free differences included). Where the cuts first apply, the search
+decides whether they can have pruned a row that selection needs (the mirror-free best can have
+more differences than the genomic best when the genomic best is gapped, or a `-R` stop can come
+before the mirror-free strata are complete); if so, the cap is 0, for both ends of a pair. The
+paired-end mirror-free pairing uses only the loci of that selection. Measured on a chr22 EM-seq
+simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
+macOS arm64, NEON, clang 21): every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring`
+at the default penalties and with `-M 5 -O 3 -E 1`, `-M 1 -O 3 -E 1`, `-M 2 -O 5 -E 2`, `-e 3`,
+`-e 3 -E 1`, `-R 1`, `-R 2`, `-n 8`, `-l 32 -k 0`, `-m 300`, `-N` and `-M 0`, and no conversion-blind MAPQ
+was above `scoring`'s. At the default penalties no read had its cap set to 0 for possibly pruned
+strata; at `-M 5 -O 3 -E 1`, 4 of 40,000 reads at 40 bp single end, 9 of 40,000 pairs at 40 bp and
+1 of 40,000 pairs at 150 bp did. These are observations from those runs, not a bound for all
+inputs.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
