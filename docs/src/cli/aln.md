@@ -635,6 +635,17 @@ CIGAR/end ordering within a locus, except for the neutral conversion tie-break b
 it does not minimize that cost over every possible CIGAR. Stock aln instead
 cost-selects search paths before separately reward-refining its output.
 
+A refined CIGAR whose differences exceed the read's `-n` limit (an integer `-n`, or
+the per-length limit a fractional `-n` gives) is dropped, as stock aln never reports
+such a hit. Differences are counted as stock aln counts them: mismatches plus gap
+runs, plus gap extensions unless `-e` is positive; conversions are free. The converted
+search cannot see a read C over a reference T (or, for read 2, a read G over a
+reference A), so it can propose a window within `-n` converted differences whose
+original-reference alignment has more. A dropped window is not a locus: it does not
+count toward `X0`/`X1` or MAPQ and is never paired. Its SA lookup still counts
+toward the lookup budget, since the row was resolved to find it
+([#782](https://github.com/fg-labs/bwa-mem3/pull/782)).
+
 `X0` counts best-cost distinct loci. `X1` counts all retained worse-cost loci
 through best cost plus `-M`, or all returned worse costs with `-N`, not only the
 next distinct cost. Primary selection and MAPQ use stock aln count/cost accounting
@@ -733,8 +744,10 @@ backend scratch). A candidate window longer than 65535 bases (only a 65535-base
 read with a deletion produces one) cannot be refined: it is dropped and the read is
 marked incomplete. Invalid results and other resource failures exit with an error. A refined candidate with more
 than 255 mismatches, gap opens or gap extensions cannot be recorded and is dropped;
-if its cost is within `-M` of the best retained cost (or with `-N`), the read is
-marked incomplete as above (MAPQ 0, no exact `X0`/`X1`/`XA`). `-v 4` reports
+if it is within the `-n` limit and its cost is within `-M` of the best retained cost
+(or with `-N`), the read is marked incomplete as above (MAPQ 0, no exact
+`X0`/`X1`/`XA`). A candidate over the `-n` limit is dropped first and never marks
+the read incomplete, even with `-N`. `-v 4` reports
 lookup, window, dropped and incomplete counts.
 
 ## Notes

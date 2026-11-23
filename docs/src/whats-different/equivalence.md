@@ -33,6 +33,20 @@ unmapped. Those comparisons found no end crossing MAPQ 20 and no proper-pair fla
 observations are limited to those slices on an Intel r7i.4xlarge host (x86_64, AVX-512 tier), built
 with clang 19.1.7. They do not establish concordance rates for other inputs, hosts or SIMD tiers.
 
+Since [#782](https://github.com/fg-labs/bwa-mem3/pull/782), `aln --meth` drops a refined window
+whose original-reference alignment has more differences than the read's `-n` limit allows (an
+integer `-n`, or the per-length limit a fractional `-n` gives), as stock aln never reports such a
+hit. Differences are mismatches plus gap opens, plus gap extensions unless `-e` is positive;
+conversions are free. A dropped window is not a locus, so it no longer counts toward `X0`/`X1` or
+MAPQ and is never paired. An affected read can change its primary `POS`/`CIGAR`, `MAPQ`,
+`X0`/`X1`/`XA`, or become unmapped (`0x4`); in paired-end runs its mate's placement, mate fields
+and proper-pair flag can change through pairing. On ultrashort EM-seq and 5-base slices (1 million
+reads or pairs each, hg19, an x86_64 AVX-512 host, clang 19.1.7), 0.61% to 1.46% of ends changed
+and 0.32% to 0.47% became unmapped; unlike the comparisons above, ends crossed MAPQ 20 in both
+directions, mostly downward ([measured table](https://github.com/fg-labs/bwa-mem3/pull/782)).
+Output without `--meth` is byte-identical by construction: the check runs only in the `--meth`
+refinement.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:
