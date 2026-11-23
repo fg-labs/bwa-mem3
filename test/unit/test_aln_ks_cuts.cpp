@@ -56,6 +56,7 @@ struct site_t {
 struct KsCase {
     bwa_tests::TempDir tmp{"aln_ks_cuts_unit"};
     std::string dir = tmp.path(), ref, oracle, vcf, fq;
+    size_t n_reads = 0; // reads r0, r1, ... in order
 
     KsCase(const std::string &c1, const std::vector<site_t> &sites, const std::vector<std::string> &reads)
     {
@@ -75,6 +76,7 @@ struct KsCase {
         for (const site_t &s : sorted) fprintf(fp, "c1\t%d\t.\t%c\t%s\t.\tPASS\t.\n", s.pos + 1, s.ref, s.alts.c_str());
         REQUIRE(fclose(fp) == 0);
         fq = dir + "/r.fq";
+        n_reads = reads.size();
         fp = fopen(fq.c_str(), "w");
         REQUIRE(fp != nullptr);
         for (size_t i = 0; i < reads.size(); ++i)
@@ -305,18 +307,33 @@ std::vector<std::string> loci(const std::vector<std::string> &r)
     return out;
 }
 
+// "c1,+<1-based pos>,<CIGAR>": a locus as loci() lists it.
+std::string locus(int pos0, const std::string &cigar) { return "c1,+" + std::to_string(pos0 + 1) + "," + cigar; }
+
 // Every read's summary under --known-snvs equals the oracle's (no --known-snvs, ALT substituted).
 // The oracle's own primary among equal-best loci is a draw, so a tie compares the locus sets
-// (primary and XA together) instead of which one is primary.
-void same_as_oracle(const KsCase &k, std::vector<std::string> opts, const std::string &label)
+// (primary and XA together) instead of which one is primary. Each run must hold one record per
+// read, in order. want_loci, when given, is each read's planted loci, which the oracle must report
+// (so that two runs that both miss them cannot agree).
+void same_as_oracle(const KsCase &k, std::vector<std::string> opts, const std::string &label,
+                    const std::vector<std::vector<std::string>> &want_loci = {})
 {
     auto ks_opts = opts;
     ks_opts.insert(ks_opts.end(), {"--known-snvs", k.vcf});
     const auto got = k.run(ks_opts, k.ref, label + ".ks");
     const auto oracle = k.run(opts, k.oracle, label + ".oracle");
-    REQUIRE(got.size() == oracle.size());
+    REQUIRE(got.size() == k.n_reads);
+    REQUIRE(oracle.size() == k.n_reads);
+    REQUIRE((want_loci.empty() || want_loci.size() == k.n_reads));
     for (size_t i = 0; i < got.size(); ++i) {
         CAPTURE(label); CAPTURE(i); CAPTURE(summary(got[i])); CAPTURE(summary(oracle[i]));
+        CHECK(got[i][0] == "r" + std::to_string(i));
+        CHECK(oracle[i][0] == "r" + std::to_string(i));
+        if (!want_loci.empty()) {
+            std::vector<std::string> want = want_loci[i];
+            std::sort(want.begin(), want.end());
+            CHECK(loci(oracle[i]) == want);
+        }
         CHECK((std::stoi(got[i][1]) & 4) == (std::stoi(oracle[i][1]) & 4));
         CHECK(got[i][4] == oracle[i][4]);
         CHECK(tag(got[i], "X0:i") == tag(oracle[i], "X0:i"));
@@ -337,6 +354,7 @@ TEST_CASE("aln_ks_cuts: a site near reference Ns: window fill cannot hide an equ
     std::string c1 = aln_test::lcg_dna(st, 48000);
     std::vector<std::string> reads;
     std::vector<site_t> sites;
+    std::vector<std::vector<std::string>> planted;
     for (int v = 0; v < 16; ++v) {
         std::string read = no_c(st, 60);
         const int p = 1000 + v * 2800, q = p + 1400;
@@ -346,9 +364,10 @@ TEST_CASE("aln_ks_cuts: a site near reference Ns: window fill cannot hide an equ
         c1.replace(q, 60, with_mm(read, {10, 50}));
         sites.push_back({p + 40, seg_p[40], std::string(1, read[40]), read[40]});
         reads.push_back(read);
+        planted.push_back({locus(p, "60M"), locus(q, "60M")});
     }
     const KsCase k(c1, sites, reads);
-    same_as_oracle(k, {"--meth", "-n", "3"}, "nfill");
+    same_as_oracle(k, {"--meth", "-n", "3"}, "nfill", planted);
 }
 
 TEST_CASE("aln_ks_cuts: a long read with two gaps and a distant site matches the one-ALT oracle")
@@ -364,7 +383,7 @@ TEST_CASE("aln_ks_cuts: a long read with two gaps and a distant site matches the
     seg_p[site_in_seg] = mm_base(seg_p[site_in_seg]);
     c1.replace(p, seg_p.size(), seg_p);
     const KsCase k(c1, {{p + site_in_seg, seg_p[site_in_seg], std::string(1, read[140]), read[140]}}, {read});
-    same_as_oracle(k, {"--meth", "-n", "6", "-o", "2", "-e", "2"}, "long");
+    same_as_oracle(k, {"--meth", "-n", "6", "-o", "2", "-e", "2"}, "long", {{locus(p, "50M1I50M2D49M")}});
 }
 
 TEST_CASE("aln_ks_cuts: a terminal gap with a site matches the one-ALT oracle")
@@ -380,7 +399,7 @@ TEST_CASE("aln_ks_cuts: a terminal gap with a site matches the one-ALT oracle")
     seg_p[30] = mm_base(seg_p[30]);
     c1.replace(p, seg_p.size(), seg_p);
     const KsCase k(c1, {{p + 30, seg_p[30], std::string(1, read[31]), read[31]}}, {read});
-    same_as_oracle(k, {"--meth", "-n", "3", "-i", "0"}, "terminal");
+    same_as_oracle(k, {"--meth", "-n", "3", "-i", "0"}, "terminal", {{locus(p, "1S59M")}});
 }
 
 TEST_CASE("aln_ks_cuts: two sites' windows over one terminal-gap locus each refine it with their own ALT")
@@ -422,7 +441,8 @@ TEST_CASE("aln_ks_cuts: one ALT needed beside a second site in the same CpG matc
     c1.replace(p, 80, seg_p);
     const KsCase k(c1, {{p + 40, 'C', "T", 'C'}, {p + 41, 'A', "G", 'G'}}, {read});
     for (const std::string scoring : {"genomic", "neutral"})
-        same_as_oracle(k, {"--meth=taps", "--meth-context", "cpg", "--meth-scoring", scoring, "-n", "3"}, "cpg2." + scoring);
+        same_as_oracle(k, {"--meth=taps", "--meth-context", "cpg", "--meth-scoring", scoring, "-n", "3"}, "cpg2." + scoring,
+                       {{locus(p, "80M")}});
 }
 
 TEST_CASE("aln_ks_cuts: --meth: the ALT-window search does not take a ceiling from its own gapped best")
@@ -582,6 +602,10 @@ TEST_CASE("aln_ks_cuts: neutral conversion ties retain the better one-ALT haplot
         CHECK(tag(got[0], "X0:i") == tag(oracle[0], "X0:i"));
         CHECK(tag(got[0], "X1:i") == tag(oracle[0], "X1:i"));
         CHECK(got[0][4] == oracle[0][4]);
+        // both planted loci, either one primary
+        const std::vector<std::string> both = {locus(a, "60M"), locus(b, "60M")};
+        CHECK(loci(oracle[0]) == both);
+        CHECK(loci(got[0]) == both);
     }
 }
 

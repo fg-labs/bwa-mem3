@@ -29,6 +29,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <unistd.h>
 #include <fcntl.h>
@@ -1107,13 +1108,14 @@ TEST_CASE("aln_known_snvs: duplicate copies of a flagged ALT-window search keep 
     const OffsiteStop &x = offsite();
     OffsiteSearch s;
     const int locus = OffsiteStop::locus;
-    // Four windows hold the read beside their sites, and a two-row lookup budget binds the window
-    // search: it is incomplete but keeps every row it found, which a copy must not trim to its main
-    // hit (max_xa_hits 0 trims any trimmed result to it).
-    OffsiteSearch::site_set_t &w = s.site_set({locus + 79, locus + 85, locus + 91, locus + 97});
+    // Five windows hold the read: four beside their sites, and one over its site at locus + 10,
+    // whose ALT the read carries (a site-covering row, a candidate for the main search). A two-row
+    // lookup budget binds the window search: it is incomplete but keeps every row it found, which a
+    // copy must not trim to its main hit (max_xa_hits 0 trims any trimmed result to it).
+    OffsiteSearch::site_set_t &w = s.site_set({locus + 10, locus + 79, locus + 85, locus + 91, locus + 97});
     s.mr.known_snvs = &w.sites;
     ba::aln_meth_opt_t mo; mo.p_best = 2; mo.p_second = 0; ba::aln_meth_opt_finish(&mo);
-    std::string converted = x.oriented(false);
+    std::string converted = x.oriented(false, locus + 10, transversion(x.c1[locus + 10]));
     for (char &b : converted) if (b == 'C') b = 'T';
     const int n = 8;
     std::vector<std::pair<std::string, std::string>> fq_reads;
@@ -1133,13 +1135,30 @@ TEST_CASE("aln_known_snvs: duplicate copies of a flagged ALT-window search keep 
                                     batch.data()) == n - 1);
     ba::aln_meth_extra_t want;
     ba::ks_meth_candidates(&w.windows, s.mr.bns, single, &want);
+    REQUIRE(!want.rows.empty()); // the site-covering row
+    // A hit as the copies must hold it: its place, counts and CIGAR.
+    auto hit_key = [](const ba::aln_meth_read_t &r, const ba::aln_meth_hit_t &h) {
+        return std::make_tuple(h.rid, h.pos, h.strand, h.hyp, h.span, h.cost, h.n_mm, h.n_gapo, h.n_gape, h.n_conv,
+                               h.alt, std::vector<uint32_t>(ba::aln_meth_hit_cigar(r, h),
+                                                            ba::aln_meth_hit_cigar(r, h) + h.n_cig));
+    };
     for (int i = 0; i < n; ++i) {
         CAPTURE(i);
         CHECK(batch[i].flags == single.flags); CHECK(batch[i].horizon == single.horizon);
-        CHECK(batch[i].hits.size() == single.hits.size());
+        REQUIRE(batch[i].hits.size() == single.hits.size());
+        for (size_t h = 0; h < single.hits.size(); ++h) {
+            CAPTURE(h);
+            CHECK(hit_key(batch[i], batch[i].hits[h]) == hit_key(single, single.hits[h]));
+        }
         ba::aln_meth_extra_t got_extra;
         ba::ks_meth_candidates(&w.windows, s.mr.bns, batch[i], &got_extra);
-        CHECK(got_extra.rows.size() == want.rows.size());
+        REQUIRE(got_extra.rows.size() == want.rows.size());
+        for (size_t r = 0; r < want.rows.size(); ++r) {
+            CAPTURE(r);
+            const ba::aln_meth_candidate_t &a = got_extra.rows[r], &b = want.rows[r];
+            CHECK(a.rid == b.rid); CHECK(a.strand == b.strand); CHECK(a.hyp == b.hyp);
+            CHECK(a.rb == b.rb); CHECK(a.re == b.re); CHECK(a.cig == b.cig);
+        }
         CHECK(got_extra.horizon == want.horizon); CHECK(got_extra.flags == want.flags);
     }
     ba::bwa_free_read_seq(n, reads);
@@ -1991,24 +2010,32 @@ TEST_CASE("aln_known_snvs: a range over more site alleles than the cap lists the
     const bwa_aln::ks_rescue_ctx_t ctx = {&sites, bns};
     bwa_aln::ks_site_cap_warned() = false;
     const std::string warning = "more than " + std::to_string(KS_RESCUE_MAX_SITES) + " site alleles";
-    std::string err;
-    {
+    // Each call's stderr on its own, so the once-only latch cannot hide which call warned.
+    auto call = [&](int64_t end, std::vector<std::pair<int64_t, uint8_t>> *got) -> std::string {
         bwa_tests::StderrCapture capture;
-        std::vector<std::pair<int64_t, uint8_t>> got;
-        bwa_aln::ks_rescue_sites(&ctx, 100, 100 + KS_RESCUE_MAX_SITES, &got); // exactly the cap: no warning
-        CHECK(got.size() == (size_t)KS_RESCUE_MAX_SITES);
-        for (int pass = 0; pass < 2; ++pass) {
-            got.clear();
-            bwa_aln::ks_rescue_sites(&ctx, 100, 200, &got);
-            REQUIRE(got.size() == (size_t)KS_RESCUE_MAX_SITES);
-            CHECK(got.front().first == 100); CHECK(got.back().first == 100 + KS_RESCUE_MAX_SITES - 1);
+        got->clear();
+        bwa_aln::ks_rescue_sites(&ctx, 100, end, got);
+        return capture.text();
+    };
+    std::vector<std::pair<int64_t, uint8_t>> got;
+    const std::string at_cap = call(100 + KS_RESCUE_MAX_SITES, &got); // exactly the cap
+    CAPTURE(at_cap);
+    CHECK(got.size() == (size_t)KS_RESCUE_MAX_SITES);
+    CHECK(at_cap.find(warning) == std::string::npos);
+    for (int pass = 0; pass < 2; ++pass) {
+        CAPTURE(pass);
+        const std::string err = call(200, &got);
+        CAPTURE(err);
+        REQUIRE(got.size() == (size_t)KS_RESCUE_MAX_SITES);
+        CHECK(got.front().first == 100); CHECK(got.back().first == 100 + KS_RESCUE_MAX_SITES - 1);
+        const size_t at = err.find(warning);
+        if (pass == 0) {
+            CHECK(at != std::string::npos); // the first call over the cap warns
+            CHECK(err.find(warning, at + 1) == std::string::npos); // once
+        } else {
+            CHECK(at == std::string::npos); // and later calls do not
         }
-        err = capture.text();
     }
-    CAPTURE(err);
-    const size_t at = err.find(warning);
-    CHECK(at != std::string::npos);
-    CHECK(err.find(warning, at + 1) == std::string::npos); // once
     bns_destroy(bns);
 }
 
