@@ -2555,22 +2555,19 @@ TEST_CASE("aln_known_snvs: --meth ALT-window candidates without a path are reali
     ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
     ba::bwa_seq_close(input);
     REQUIRE(n == 1);
-    const ba::gap_opt_t discovery = ba::ks_discovery_opt(gap);
+    // The ALT-window search runs as ks_meth_search runs it: with the read's own options, as a
+    // candidate generator.
     ba::aln_meth_read_t window;
-    ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &discovery, 1, 1, 0, 1, 1000, nullptr,
-                              &window, nullptr, nullptr, true);
-    std::vector<ba::aln_meth_candidate_t> extra;
+    ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &gap, 1, 1, 0, 1, 1000, nullptr, &window);
+    ba::aln_meth_extra_t extra;
     ba::ks_meth_candidates(&windows, mr.bns, window, &extra);
-    REQUIRE(!extra.empty());
-    for (ba::aln_meth_candidate_t &c : extra) {
+    REQUIRE(!extra.rows.empty());
+    for (ba::aln_meth_candidate_t &c : extra.rows) {
         CHECK(c.cig == std::vector<uint32_t>{1u << 4 | 1, 40u << 4}); // the premise: a path ...
         c.cig.clear(); // ... which this test removes
     }
-    const ba::aln_meth_alt_bound_t certificate = ba::aln_meth_alt_certificate(window);
-    const int flags = window.flags;
     ba::aln_meth_read_t genomic;
-    ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, &gap, 1, 1, 0, 1, 1000, nullptr, &genomic, &extra,
-                              &certificate, false, &flags);
+    ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, &gap, 1, 1, 0, 1, 1000, nullptr, &genomic, &extra);
     REQUIRE(genomic.main >= 0);
     CHECK(genomic.flags == 0);
     CHECK(genomic.c1 == 1); CHECK(genomic.c2 == 0);
