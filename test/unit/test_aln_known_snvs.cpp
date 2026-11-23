@@ -2406,7 +2406,7 @@ TEST_CASE("aln_known_snvs: --meth ALT-window candidates without a path are reali
     const ba::aln_meth_hit_t &h = genomic.hits[genomic.main];
     CHECK(h.rid == 0); CHECK(h.pos == 0); CHECK(h.strand == 0);
     CHECK(h.n_mm == 4); CHECK(h.n_gapo == 1); CHECK(h.n_gape == 0);
-    CHECK(h.alt != 0);
+    CHECK(h.alt == 1); // the credited ALT: the first (only) site from the placement
     const uint32_t *cig = ba::aln_meth_hit_cigar(genomic, h);
     // The display alignment, as the soft-clipped insertion case above reports it: 1S40M at c1:1.
     CHECK(std::vector<uint32_t>(cig, cig + h.n_cig) == std::vector<uint32_t>{1u << 4 | 4, 40u << 4});
