@@ -17,6 +17,8 @@
 #   E. `shm` does not read BWA3_COMPACT_OCC: with it set, `shm` stages the
 #      default layout, and `shm -u` is not refused;
 #   F. `shm --compact-occ` with -u (any value), -l or -d is refused;
+#   G. huge-page checks live in shm_compact_occ_hugepage_test.sh so a host
+#      refusal there does not mark the normal-layout checks here skipped;
 #   H. a seed-only `shm --meth --compact-occ` stage, attached by
 #      `mem --meth`, gives the disk-loaded run's SAM.
 # @PG is excluded from the comparisons (its CL: records argv).
