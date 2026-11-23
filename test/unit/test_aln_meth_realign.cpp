@@ -449,6 +449,18 @@ TEST_CASE("aln_realign: the hole bins give the ambiguity bits the run search giv
         ba::aln_meth_amb_bits(without.ref, rb, len, &b);
         CHECK(a == b);
     }
+    // a run before the reference start (malformed): no bins, so every window searches the runs
+    std::vector<bntamb1_t> bad = {{-5, 20, 'N'}, {3 * B + 10, 9, 'N'}};
+    Ref neg(bases), neg_without(bases);
+    for (Ref *r : {&neg, &neg_without}) { r->bns.n_holes = (int)bad.size(); r->bns.ambs = bad.data(); }
+    ba::aln_meth_ref_index_holes(&neg.ref);
+    CHECK(neg.ref.hole_bins.empty());
+    for (int64_t rb : {(int64_t)0, (int64_t)10, 3 * B}) {
+        std::vector<uint64_t> a, b;
+        ba::aln_meth_amb_bits(neg.ref, rb, 64, &a);
+        ba::aln_meth_amb_bits(neg_without.ref, rb, 64, &b);
+        CHECK(a == b);
+    }
     // no runs: no bins, and nothing to find
     Ref clear(bases);
     ba::aln_meth_ref_index_holes(&clear.ref);

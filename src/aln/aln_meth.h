@@ -65,7 +65,8 @@ struct aln_meth_ref_t {
 	std::vector<uint64_t> hole_bins;
 };
 enum { ALN_METH_HOLE_SHIFT = 16 };
-/* Builds r->hole_bins from r->bns (aln_meth_ref_load and aln_meth_ref_adopt call it). */
+/* Builds r->hole_bins from r->bns (aln_meth_ref_load and aln_meth_ref_adopt call it); leaves them
+ * empty when a run starts before the reference (malformed), so that every window searches the runs. */
 void aln_meth_ref_index_holes(aln_meth_ref_t *r);
 int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads);
 /* Takes ownership of an in-memory original reference (bns, pac) and checks it pairs with

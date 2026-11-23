@@ -97,7 +97,10 @@ void aln_meth_ref_index_holes(aln_meth_ref_t *r)
 	r->hole_bins.assign((n_bins + 63) / 64, 0);
 	for (int i = 0; i < r->bns->n_holes; ++i) {
 		const bntamb1_t &a = r->bns->ambs[i];
-		if (a.len <= 0 || a.offset < 0) continue;
+		if (a.len <= 0) continue; // no bases
+		// A run before the reference start is malformed: leave the bins unbuilt so that every window
+		// searches the runs, as it does without them, rather than miss that run's bases.
+		if (a.offset < 0) { r->hole_bins.clear(); return; }
 		const uint64_t first = (uint64_t)a.offset >> ALN_METH_HOLE_SHIFT;
 		const uint64_t last = std::min<uint64_t>(((uint64_t)a.offset + (uint64_t)a.len - 1) >> ALN_METH_HOLE_SHIFT, n_bins - 1);
 		for (uint64_t b = first; b <= last; ++b) r->hole_bins[b >> 6] |= 1ULL << (b & 63);
@@ -882,8 +885,8 @@ static void resolve_located(aln_meth_slot_t *x, const aln_meth_pend_t &h, const 
     // An ungapped row's window cannot repeat within a read: the read's ungapped hits are distinct
     // strings of its length (aln_meth_hit keeps one per interval), so their SA rows, and the windows
     // those rows locate, are distinct; and a gapped key never equals an ungapped one. Under
-    // --known-snvs the read's ALT-window candidates are deduplicated against these keys, so there
-    // every row's key goes into the set.
+    // --known-snvs the read's ALT-window candidates are scored first (aln_meth_score_extras) and
+    // their keys are in the set, so there every row's key is checked against it and kept.
     const bool dedup = key.lay.n != 0 || g->ref->known_snvs || g->ref->ks_window;
     if (dedup && !x->windows.insert(key, 0).second) return;
     // A 65535-base read with a deletion spans more than a window holds. Drop the window as
