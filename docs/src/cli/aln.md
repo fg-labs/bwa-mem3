@@ -599,21 +599,22 @@ has been resolved, and the difference ceiling drops to the fewest differences am
 rows at `B`, plus one (stock's top-2 rule, at most `-n`); the retained loci obey the same
 ceiling. More than `-R` best loci within that ceiling then end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
 not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). Under `--meth-mapq conversion-blind` (the EM-seq
-`genomic` default) every cut must also keep what the mirror-free strata need, which is stock's
-selection on costs with the mirror cell free (as `collapsed` scoring computes it): a row is
-dropped only when its mirror-free cost is past `B + M`; the ceiling is at least
-`floor(B / mu) + 1`, with `mu` the smallest penalty of a counted difference (`-M`, `-O`, and `-E`
-unless `-e` is positive), which bounds the mirror-free strata's own ceiling and equals stock's when
-the best rows are mismatch-only (no ceiling when `mu` is 0); and the `-R` stop also waits until
-the next entry's score is past the mirror-free best plus `M`, unless the mirror-free best loci
-within their own ceiling are themselves more than `-R`. The mirror-free strata apply stock's
-top-2 ceiling on mirror-free differences. The genomic result is unchanged: a hit that only the
-wider ceiling or a search continued past stock's `-R` stop reaches feeds the mirror-free strata
-alone, and its lookups come from a budget of their own (the size of the read's); if that budget
-runs out the cap is 0. The wider search does share the `-m` queue limit: when the smallest
-penalty is below `-M` (for example `-M 5 -O 3 -E 1`) a long read's search can exceed `-m` and end
-incomplete where it would not with `--meth-mapq scoring`. With `--meth-mapq scoring` the cuts are
-stock's alone.
+`genomic` default) the search, its cuts and its limits (`-m`, the lookup budget, the CIGAR budget)
+are those of `--meth-mapq scoring`, so every field but `MAPQ` and `YQ:i` is the same; the cap only
+observes the search. The mirror-free strata (stock's selection on costs with the mirror cell free,
+as `collapsed` scoring computes it, top-2 ceiling on mirror-free differences included) come from
+the rows the search resolved, each locus at its lowest mirror-free row (if that row is over the
+mirror-free ceiling and above the mirror-free best, its lowest one within the ceiling, the row a
+mirror-free run that takes the cuts reaches). They are complete unless
+the cuts pruned a row they need, which is decided where the cuts first apply (the next entry's
+score `next` above `B`): every row below `next` is resolved, so the mirror-free best `B_mf`, the
+fewest mirror-free differences `D_mf` among its loci and their count are final. A needed row that
+is not yet resolved costs at most `B_mf + M` mirror-free and has at most `min(-n, D_mf + 1)`
+differences, so the strata are complete when `next` is past `B_mf + M`; otherwise, when the search
+stops on `-R` there, only if more than `-R` loci at `B_mf` are within their own ceiling (a
+mirror-free run stops too), and when it continues, only if `min(-n, D_mf + 1)` is within the
+ceiling the search applies (`D_mf` can exceed the genomic best's differences when that best is
+gapped). When they are not complete the cap is 0, for both ends of a pair.
 These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
 set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
 search instead stops early only on the earlier certified bound: for current best cost `B`,
@@ -697,13 +698,15 @@ free it is within the limit, as under `collapsed`), and a locus that is then che
 primary gives a cap of 0. Under the stock cuts (above) those strata also take stock's top-2
 ceiling on mirror-free differences, so they are the loci and counts `collapsed` scoring selects.
 Paired-end ends take the MAPQ `collapsed` gives them after its stock pairing and its mate rescue.
-The pairing runs on those loci (including the loci only the mirror-free strata keep), from the
-main hits `collapsed` draws for its ends, with `collapsed`'s single-end MAPQs and the insert size
-it infers from them. The rescue reruns, with `collapsed`'s scoring matrix and insert size, on a
-pair the pairing leaves improper, and lowers the anchor's MAPQ too. An end that `collapsed`
-places elsewhere, or leaves unmapped, gets 0. An end with more than `--max-occ` such loci is not
-paired, as under `collapsed`, so each end keeps `collapsed`'s single-end MAPQ (unless its mate
-rescue moves it), or gets 0 if that is at another locus.
+The pairing runs on the loci of those strata alone (a hit outside them is not a locus of a
+mirror-free run; the loci only the mirror-free strata keep are included), from the main hits
+`collapsed` draws for its ends, with `collapsed`'s single-end MAPQs and the insert size it infers
+from them. The rescue reruns, with `collapsed`'s scoring matrix and insert size, on a pair the
+pairing leaves improper, and lowers the anchor's MAPQ too. An end that `collapsed` places
+elsewhere, or leaves unmapped, gets 0. An end with more than `--max-occ` such loci is not paired,
+as under `collapsed`, so each end keeps `collapsed`'s single-end MAPQ (unless its mate rescue
+moves it), or gets 0 if that is at another locus. When either end's strata are not known (the
+64 MiB budget below, or strata the stock cuts may have pruned) both ends' caps are 0.
 Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
 and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. At a `--known-snvs` ALT window the
 rows come from the window search's `genomic` selection, and a window without a search path is
