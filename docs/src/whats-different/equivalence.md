@@ -77,6 +77,23 @@ clang 19.1.7), 0.095% (EM-seq) and 0.142% (5-base) of reads changed, most of the
 filter; the incomplete-read rate was unchanged. Output without `--meth` is byte-identical: the
 stock instantiation of the search is unchanged, and only the `--meth` one records a path.
 
+Since [#785](https://github.com/fg-labs/bwa-mem3/pull/785), an `aln --meth` search without `-N`,
+negative penalties or `--known-snvs` takes stock aln's cuts from its best verified row cost `B`: it
+stops past `B + M`; once the best stratum is complete it applies stock's top-2 difference ceiling
+(the fewest differences among the rows at `B`, plus one), and the finish drops retained rows above
+that ceiling; and more than `-R` best loci within the ceiling end the search as a complete repeat
+with the full best count in `X0` and no `X1`. An affected read can change its `MAPQ` and
+`X0`/`X1`/`XA`, can become complete where the lookup budget previously left it incomplete (and so
+gain `X0`/`X1` and pairing), and in paired-end runs can change its mate's placement, mate fields and
+proper-pair flag through pairing. On ultrashort EM-seq and 5-base slices (200,000 reads each, hg19,
+an x86_64 Sapphire Rapids host at its default AVX-512BW dispatch tier, clang 19.1.7), the reads complete both with the cuts and in an uncut
+search with a 65,536-row lookup budget were identical. Against the previous implementation, 4.3% (EM-seq) and 3.1% (5-base) of reads changed, almost all of them reads the lookup
+budget had left incomplete (the incomplete-read rate fell from 8.52% to 4.32% and from 10.48% to
+7.49%), plus about 11 EM-seq reads per million whose competitor exceeded the ceiling (MAPQ 23 to
+37). With `--short-insert` (1 million pairs), proper pairs rose by 4.1 (EM-seq) and 0.85 (5-base)
+percentage points, and peak RSS rose by 0.7 to 1.1 GB because a repeat end keeps all its best loci
+for pairing. Output without `--meth` is byte-identical: the cuts run only in the `--meth` search.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:
