@@ -2591,6 +2591,36 @@ TEST_CASE("aln_meth: the difference ceiling comes from the stored best rows")
     free(opt);
 }
 
+TEST_CASE("aln_meth: under conversion-blind the search ceiling bounds the mirror-free differences")
+{
+    // Default penalties (M=3, O=11, E=4), -n 5. The best locus is one gap open (cost 11, one
+    // difference), so stock's ceiling is 2. With the mirror cell free a locus can cost less than
+    // 11 with more differences (three real mismatches and one mirror: 12, mirror-free 9), and the
+    // mirror-free strata then need rows of up to four differences. A row of mirror-free cost c has
+    // at most c / min penalty differences, and the mirror-free best is at most 11, so under
+    // conversion-blind the search keeps floor(11 / 3) + 1 = 4; with a zero penalty, no ceiling.
+    namespace ba = bwa_aln;
+    for (int blind = 0; blind < 2; ++blind)
+        for (int s_mm : {3, 0}) {
+            CAPTURE(blind); CAPTURE(s_mm);
+            ba::gap_opt_t *opt = ba::gap_init_opt();
+            opt->s_mm = s_mm; opt->max_diff = 5;
+            ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+            ba::aln_meth_ref_t mr;
+            ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = opt;
+            ba::aln_meth_slot_t slot; slot.grp = &group; slot.blind = blind;
+            ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 5; job.score_cut = INT_MAX;
+            slot.job = &job;
+            ba::aln_meth_read_t result; slot.res = &result;
+            ba::aln_meth_occ_t gapped{}; gapped.cost = 11; gapped.n_gapo = 1; gapped.pos = 1000;
+            result.occ.push_back(gapped);
+            slot.best = 11;
+            CHECK(ba::aln_meth_boundary(&slot, 12) == 0);
+            CHECK(job.max_diff == (!blind ? 2 : s_mm ? 4 : 5));
+            free(opt);
+        }
+}
+
 TEST_CASE("aln_meth: the finish applies the difference ceiling only to a search that takes the cuts")
 {
     // M=1, O=3: a one-gap best (cost 3, one difference) and a four-mismatch row (cost 4, within

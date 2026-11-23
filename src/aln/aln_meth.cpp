@@ -217,8 +217,30 @@ __attribute__((noinline, cold)) int aln_meth_gap_arena(aln_meth_slot_t *x, const
  *   never cuts a path to a retained row.
  * - -R: with the best stratum complete, more than -R loci at B within the ceiling (under the
  *   TAPS/5base tie-break, the fewest-conversion ones of them) end the search, as stock's top2b
- *   stop does. */
+ *   stop does.
+ * --meth-mapq conversion-blind: every cut must also keep what the mirror-free strata need
+ * (meth_blind_strata, stock's selection on mirror-free costs). A row's converted score is at most
+ * its mirror-free cost, which is at most its cost, so a cut on converted score taken from a bound
+ * that holds for both selections is safe for both. The score cut is: the mirror-free best is at
+ * most B. The ceiling and the -R stop are not, and take the bounds of search_ceiling and
+ * blind_stop_ok. */
 static bool conv_tiebreak(const aln_meth_opt_t *mo);
+/* The difference ceiling the search may apply, given stock's (ceiling, from the stored best rows).
+ * Under conversion-blind the mirror-free strata keep rows of up to their own best rows' fewest
+ * mirror-free differences + 1, which can exceed stock's when the best is gapped. A row of
+ * mirror-free cost c has at most c / mu differences (mu: the smallest penalty of a counted
+ * difference), and the mirror-free best is at most B, so floor(B / mu) + 1 bounds the mirror-free
+ * ceiling; no later row can raise it, since B only falls. It equals stock's when the best rows are
+ * mismatch-only and mu is M. With a zero penalty there is no bound. */
+static int64_t search_ceiling(const aln_meth_slot_t *x, int64_t ceiling)
+{
+    if (!x->blind) return ceiling;
+    const gap_opt_t &opt = x->job->opt;
+    int mu = std::min(opt.s_mm, opt.s_gapo);
+    if (opt.mode & BWA_MODE_GAPE) mu = std::min(mu, opt.s_gape);
+    if (mu <= 0) return INT64_MAX;
+    return std::max(ceiling, x->best / mu + 1);
+}
 int aln_meth_boundary(aln_meth_slot_t *x, int next)
 {
     gap_job_t *job = x->job;
@@ -230,7 +252,8 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     int64_t fewest_d = INT64_MAX;
     for (const auto &o : x->res->occ) if (o.cost == x->best) fewest_d = std::min(fewest_d, diffs(o));
     const int64_t ceiling = fewest_d >= INT_MAX - 1 ? INT_MAX : fewest_d + 1;
-    if (ceiling < job->max_diff) job->max_diff = (int)ceiling;
+    const int64_t search = search_ceiling(x, ceiling);
+    if (search < job->max_diff) job->max_diff = (int)search;
     // Count the best loci the finish keeps: those within the ceiling, and under the TAPS/5base
     // tie-break the fewest-conversion ones of them.
     auto kept = [&](const aln_meth_occ_t &o) { return o.cost == x->best && diffs(o) <= ceiling; };
