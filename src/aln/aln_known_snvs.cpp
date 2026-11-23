@@ -26,6 +26,7 @@
 #include <string>
 #include <unordered_map>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 namespace bwa_aln {
@@ -284,12 +285,24 @@ void ks_text_key(const uint8_t *text, int64_t l_text, int sa_compx, int meth, ui
 }
 
 /* Reads the cached arrays for the text with this key into *out (as MemSink allocates them).
- * Returns 0, or -1 with the reason in *why (no file, or a file not used). */
+ * Returns 0, -1 for a cache miss, or -2 when the path must not be rewritten; failures set *why. */
 int ks_cache_load(const char *path, const uint64_t key[2], int64_t l_text, int sa_compx, int meth, FmArrays *out,
 				  std::string *why)
 {
-	FILE *fp = fopen(path, "rb");
-	if (!fp) { *why = errno == ENOENT ? "no file yet" : strerror(errno); return -1; }
+	const int fd = open(path, O_RDONLY | O_NONBLOCK);
+	if (fd < 0) {
+		const int err = errno;
+		*why = err == ENOENT ? "no file yet" : strerror(err);
+		return err == ENOENT ? -1 : -2;
+	}
+	struct stat st;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) {
+		*why = "not a readable regular file";
+		close(fd);
+		return -2;
+	}
+	FILE *fp = fdopen(fd, "rb");
+	if (!fp) { *why = strerror(errno); close(fd); return -2; }
 	struct closer { FILE *f; ~closer() { fclose(f); } } c{fp};
 	ks_cache_hdr_t h;
 	if (fread(&h, sizeof h, 1, fp) != 1) { *why = "short header"; return -1; }
@@ -307,7 +320,6 @@ int ks_cache_load(const char *path, const uint64_t key[2], int64_t l_text, int s
 	if (h.cp_occ_count != L.cp_occ_count || h.sa_sample_count != L.sa_sample_count) { *why = "bad header"; return -1; }
 	const size_t n_cp = (size_t)L.cp_occ_count * sizeof(CP_OCC), n_ms = (size_t)L.sa_sample_count,
 				 n_ls = (size_t)L.sa_sample_count * sizeof(uint32_t);
-	struct stat st;
 	if (fstat(fileno(fp), &st) != 0 || (uint64_t)st.st_size != sizeof h + n_cp + n_ms + n_ls + sizeof(uint64_t)) {
 		*why = "truncated or oversized";
 		return -1;
@@ -375,9 +387,16 @@ int ks_cache_save(const char *path, const uint64_t key[2], int64_t l_text, int m
 	tmp = tmpl.data();
 	FILE *fp = fdopen(fd, "wb");
 	if (!fp) { *why = strerror(errno); close(fd); unlink(tmp.c_str()); return -1; }
-	const mode_t mask = umask(0); // mkstemp makes the file 0600: give it a new file's mode instead
-	umask(mask);
-	bool ok = fchmod(fd, 0666 & ~mask) == 0 && fwrite(&h, sizeof h, 1, fp) == 1 && fwrite(a.cp_occ, 1, n_cp, fp) == n_cp &&
+	// mkstemp makes the file 0600: give it the mode of the file it replaces, else a new file's mode
+	struct stat old;
+	mode_t mode;
+	if (stat(path, &old) == 0) mode = old.st_mode & 07777;
+	else {
+		const mode_t mask = umask(0);
+		umask(mask);
+		mode = 0666 & ~mask;
+	}
+	bool ok = fchmod(fd, mode) == 0 && fwrite(&h, sizeof h, 1, fp) == 1 && fwrite(a.cp_occ, 1, n_cp, fp) == n_cp &&
 			  fwrite(a.sa_ms_byte, 1, n_ms, fp) == n_ms && fwrite(a.sa_ls_word, 1, n_ls, fp) == n_ls &&
 			  fwrite(&sum, sizeof sum, 1, fp) == 1 && fflush(fp) == 0;
 	if (!ok) *why = strerror(errno);
@@ -398,13 +417,15 @@ int ks_index_text(const uint8_t *text, int64_t l_text, const LibsaisBuildOpts &b
 	if (cache_path) {
 		ks_text_key(text, l_text, bo.sa_compx, meth, key);
 		std::string why;
-		if (ks_cache_load(cache_path, key, l_text, bo.sa_compx, meth, out, &why) == 0) {
+		const int cached = ks_cache_load(cache_path, key, l_text, bo.sa_compx, meth, out, &why);
+		if (cached == 0) {
 			*loaded = true;
 			return 0;
 		}
 		if (bwa_verbose >= 3)
 			fprintf(stderr, "[M::aln] --known-snvs-cache: not using '%s' (%s); building the ALT-window index\n",
 					cache_path, why.c_str());
+		if (cached == -2) cache_path = nullptr; // Ignore special or unreadable files, without replacing them.
 	}
 	const int rc = libsais_build_fm_memory(text, l_text, bo, out);
 	if (rc != 0 || !cache_path) return rc;

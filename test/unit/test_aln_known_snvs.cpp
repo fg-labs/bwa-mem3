@@ -3501,7 +3501,8 @@ TEST_CASE("aln_known_snvs: an ALT-window candidate carries its hit's search path
     }
 }
 
-TEST_CASE("aln_known_snvs: --known-snvs-cache reads back the same index and rebuilds a stale or damaged one")
+TEST_CASE("aln_known_snvs: --known-snvs-cache reads back the same index and rebuilds a stale or damaged one"
+          * doctest::test_suite("unit/aln_known_snvs"))
 {
     for (bool meth : {false, true}) {
         CAPTURE(meth);
@@ -3563,8 +3564,69 @@ TEST_CASE("aln_known_snvs: --known-snvs-cache reads back the same index and rebu
         }
         build(all, want, cache, false);
         build(all, want, cache, true);
+        { // a rewrite keeps the mode of the file it replaces, not a new file's (0644 under umask 022)
+            const mode_t mask = umask(022);
+            REQUIRE(chmod(cache.c_str(), 0600) == 0);
+            build(fewer, want_fewer, cache, false);
+            struct stat st;
+            REQUIRE(stat(cache.c_str(), &st) == 0);
+            CHECK((st.st_mode & 07777) == 0600);
+            umask(mask);
+        }
         build(all, want, f.dir + "/no/such/dir/ks.cache", false); // an unwritable path: a warning only
         bwa_aln::ks_windows_free(&want);
         bwa_aln::ks_windows_free(&want_fewer);
+    }
+}
+
+TEST_CASE("aln_known_snvs: --known-snvs-cache ignores a FIFO without waiting or replacing it"
+          * doctest::test_suite("unit/aln_known_snvs"))
+{
+    const char *child_env = "BWA_TEST_KS_FIFO_CHILD";
+    if (!getenv(child_env)) {
+        bwa_tests::TempDir tmp{"ks_fifo_child"};
+        const std::string err = tmp.path() + "/stderr";
+        const std::string executable = doctest::getContextOptions()->binary_name.c_str();
+        REQUIRE(setenv(child_env, "1", 1) == 0);
+        // Exec avoids inheriting worker TLS; the alarm bounds a blocking cache open.
+        const int status = bwa_tests::run_in_child([&] {
+            alarm(20);
+            execl(executable.c_str(), executable.c_str(),
+                  "--test-case=aln_known_snvs: --known-snvs-cache ignores a FIFO without waiting or replacing it",
+                  "--no-colors", (char *)nullptr);
+            _exit(127);
+        }, err.c_str());
+        REQUIRE(unsetenv(child_env) == 0);
+        INFO(slurp(err));
+        INFO("FIFO child signal: ", WIFSIGNALED(status) ? WTERMSIG(status) : 0);
+        REQUIRE(WIFEXITED(status));
+        CHECK(WEXITSTATUS(status) == 0);
+        return;
+    }
+    for (bool meth : {false, true}) {
+        CAPTURE(meth);
+        KsWinFixture f;
+        const auto &w = f.win.front();
+        const int64_t k = f.bns->anns[w.rid].offset + w.site_pos;
+        const uint8_t refc = (f.pac[k >> 2] >> ((~k & 3) << 1)) & 3;
+        bwa_aln::ks_sites_t sites;
+        sites.by_contig.assign(f.bns->n_seqs, {});
+        sites.by_contig[w.rid].push_back({w.site_pos, refc, w.alt});
+        sites.n_sites = 1;
+        bwa_aln::ks_windows_t want, got;
+        REQUIRE(bwa_aln::ks_windows_build(&sites, f.bns, f.pac, 1, meth, &want) == 0);
+        const std::string fifo = f.dir + "/cache.fifo";
+        REQUIRE(mkfifo(fifo.c_str(), 0600) == 0);
+        struct stat before, after;
+        REQUIRE(lstat(fifo.c_str(), &before) == 0);
+        REQUIRE(bwa_aln::ks_windows_build(&sites, f.bns, f.pac, 1, meth, &got, fifo.c_str()) == 0);
+        CHECK_FALSE(got.from_cache);
+        expect_fmi_equal(got.fmi, want.fmi, !meth);
+        REQUIRE(lstat(fifo.c_str(), &after) == 0);
+        CHECK(S_ISFIFO(after.st_mode));
+        CHECK(after.st_dev == before.st_dev);
+        CHECK(after.st_ino == before.st_ino);
+        bwa_aln::ks_windows_free(&got);
+        bwa_aln::ks_windows_free(&want);
     }
 }

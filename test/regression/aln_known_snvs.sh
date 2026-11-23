@@ -377,7 +377,106 @@ rc=0
     echo "FAIL: --known-snvs-cache without --known-snvs: exit $rc" >&2
     exit 1
 }
-echo 'PASS: cache (written, read back, stale rebuilt; same output)'
+# A cache path that names a file the run reads or writes is refused before any file is written.
+cp "$tmp/r1.fq" "$tmp/r1.keep"
+cp "$tmp/sites.vcf" "$tmp/sites.keep"
+cp "$reference.pac" "$tmp/pac.keep"
+for victim in r1.fq sites.vcf pac stdout out; do
+    case $victim in
+        pac) cpath=$reference.pac ;;
+        stdout) cpath=$tmp/alias.stdout.o ;;
+        out) cpath=$tmp/alias.out.sam ;;
+        *) cpath=$tmp/$victim ;;
+    esac
+    fopt=()
+    if [ "$victim" = out ]; then fopt=(-f "$cpath"); fi
+    rc=0
+    "$bin" aln "${fopt[@]}" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cpath" "$reference" "$tmp/r1.fq" "$tmp/r2.fq" \
+        > "$tmp/alias.$victim.o" 2> "$tmp/alias.$victim.err" || rc=$?
+    if [ "$rc" != 1 ] || ! grep -qF -- 'which this run reads or writes' "$tmp/alias.$victim.err"; then
+        echo "FAIL: --known-snvs-cache naming $victim: exit $rc" >&2
+        exit 1
+    fi
+done
+# Differently spelled new destinations alias before either path exists.
+mkdir "$tmp/alias-dir"
+ln -s "$tmp/alias-dir" "$tmp/alias-link"
+alias_bad=0
+for spelling in relative absolute dotdot parent-link dangling-output; do
+    target=$tmp/alias.$spelling.cache
+    cpath=alias.$spelling.cache
+    opath=$cpath
+    case $spelling in
+        relative) cpath=./$cpath ;;
+        absolute) opath=$target ;;
+        dotdot) opath=alias-dir/../$cpath ;;
+        parent-link)
+            target=$tmp/alias-dir/new.cache
+            cpath=alias-dir/new.cache
+            opath=alias-link/new.cache
+            ;;
+        dangling-output)
+            opath=alias.dangling-output.sam
+            ln -s "$cpath" "$tmp/$opath"
+            ;;
+    esac
+    rc=0
+    (cd "$tmp" && "$bin" aln -f "$opath" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cpath" \
+        "$reference" "$tmp/r1.fq" "$tmp/r2.fq") > "$tmp/new-alias.$spelling.out" 2> "$tmp/new-alias.$spelling.err" || rc=$?
+    if [ "$rc" != 1 ] || ! grep -qF -- 'which this run reads or writes' "$tmp/new-alias.$spelling.err" || [ -e "$target" ]; then
+        echo "FAIL: new output/cache alias ($spelling): exit $rc, cache must not be created" >&2
+        alias_bad=1
+    fi
+    if [ "$spelling" = dangling-output ] && [ ! -L "$tmp/$opath" ]; then
+        echo 'FAIL: refusing a dangling output alias changed its symlink' >&2
+        alias_bad=1
+    fi
+done
+# Distinct new output/cache paths still work and the cache can be read back.
+"$bin" aln -v 3 -f "$tmp/distinct.sam" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/distinct.cache" \
+    "$reference" "$tmp/r1.fq" "$tmp/r2.fq" > "$tmp/distinct.out" 2> "$tmp/distinct.err"
+grep -q 'wrote the ALT-window index' "$tmp/distinct.err"
+[ ! -s "$tmp/distinct.out" ] && [ -s "$tmp/distinct.sam" ] && [ -s "$tmp/distinct.cache" ]
+run distinct.read -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/distinct.cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+grep -q 'loaded the index of' "$tmp/distinct.read.err"
+body "$tmp/distinct.sam" "$tmp/distinct.body"
+body "$tmp/distinct.read.sam" "$tmp/distinct.read.body"
+cmp "$tmp/distinct.body" "$tmp/distinct.read.body"
+# A case-insensitive filesystem can reveal an alias only once the new cache exists.
+printf x > "$tmp/case-probe"
+if [ -e "$tmp/CASE-PROBE" ]; then
+    rc=0
+    "$bin" aln -v 3 -f "$tmp/CASE.cache" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/case.cache" \
+        "$reference" "$tmp/r1.fq" "$tmp/r2.fq" > "$tmp/case.out" 2> "$tmp/case.err" || rc=$?
+    if [ "$rc" != 1 ] || ! grep -q 'overwrite the cache' "$tmp/case.err"; then
+        echo "FAIL: case-insensitive output/cache alias: exit $rc" >&2
+        alias_bad=1
+    fi
+    run case.read -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/case.cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    if ! grep -q 'loaded the index of' "$tmp/case.read.err"; then
+        echo 'FAIL: case-insensitive output alias overwrote the cache' >&2
+        alias_bad=1
+    fi
+    body "$tmp/case.read.sam" "$tmp/case.read.body"
+    cmp "$tmp/distinct.body" "$tmp/case.read.body"
+else
+    echo 'SKIP: case-insensitive alias (case-sensitive filesystem)'
+fi
+[ "$alias_bad" = 0 ] || exit 1
+echo 'PASS: new resolved output/cache aliases refused before writing; distinct destinations work'
+
+if ! cmp "$tmp/r1.fq" "$tmp/r1.keep" || ! cmp "$tmp/sites.vcf" "$tmp/sites.keep" || ! cmp "$reference.pac" "$tmp/pac.keep"; then
+    echo "FAIL: a refused --known-snvs-cache changed an input" >&2
+    exit 1
+fi
+rc=0
+(cd "$tmp" && "$bin" aln --known-snvs "$tmp/sites.vcf" --known-snvs-cache - "$reference" "$tmp/se.fq") \
+    > "$tmp/dash.out" 2> "$tmp/dash.err" || rc=$?
+[ "$rc" = 1 ] && grep -qF -- "not '-'" "$tmp/dash.err" && [ ! -e "$tmp/-" ] || {
+    echo "FAIL: --known-snvs-cache -: exit $rc" >&2
+    exit 1
+}
+echo 'PASS: cache (written, read back, stale rebuilt; same output; a path the run uses is refused)'
 
 # 5. --bam carries XV:Z.
 if command -v samtools > /dev/null; then

@@ -263,9 +263,14 @@ How it works:
   their ALTs, converted under `--meth`), its length, the SA sample rate and the mode, and the
   file's contents must also match a checksum. Otherwise (no file, other sites, reference or
   mode, or a damaged file) the index is built in memory as without the option and FILE is
-  rewritten through a temporary file and a rename; a failed write is a warning. The index, and so
-  the output, is the same either way. FILE is about 6.5 bytes per window base under `--meth`
-  (about 0.5 GB for 250k sites).
+  rewritten through a temporary file and a rename, keeping an existing FILE's permissions; a
+  failed write is a warning. Non-regular or unreadable cache files are ignored without replacing
+  them; the index is used from memory. The index, and so the output, is the same either way. FILE
+  must not be `-` or a file the run reads or writes (the reads, the sites, the output or an index
+  file). Resolved output/cache aliases are refused before cache construction, including new paths;
+  file identity is checked again before opening the output, so a case-insensitive alias cannot
+  overwrite a newly written cache. FILE is about 6.5 bytes per window base
+  under `--meth` (about 0.5 GB for 250k sites).
 - Each read is also searched against the windows. A hit there that covers its window's site is
   a hit at the same reference position with the ALT credited, and the cheaper of the two costs
   wins. Then MAPQ, the primary hit and the alternative hits are recomputed with `aln`'s usual

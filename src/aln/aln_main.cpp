@@ -1405,6 +1405,38 @@ static int aln_same_file(const char *out, const char *in)
 	return so.st_dev == si.st_dev && so.st_ino == si.st_ino;
 }
 
+/* Resolve a destination even when its leaf does not exist. Output follows leaf symlinks;
+ * a cache rename replaces the leaf itself, so only its parent is resolved. */
+static std::string aln_resolved_destination(const char *path, bool follow_leaf)
+{
+	if (!path || strcmp(path, "-") == 0) return {};
+	std::string current(path);
+	for (int links = 0; links <= 40; ++links) {
+		const size_t slash = current.find_last_of('/');
+		const std::string parent = slash == std::string::npos ? "." : slash == 0 ? "/" : current.substr(0, slash);
+		const std::string leaf = current.substr(slash == std::string::npos ? 0 : slash + 1);
+		if (leaf.empty()) return {};
+		char *dir = realpath(parent.c_str(), nullptr);
+		if (!dir) return {};
+		std::string resolved(dir);
+		free(dir);
+		if (resolved != "/") resolved += '/';
+		const std::string prefix = resolved;
+		resolved += leaf;
+		if (!follow_leaf) return resolved;
+		struct stat st;
+		if (lstat(resolved.c_str(), &st) != 0) return errno == ENOENT ? resolved : std::string();
+		if (!S_ISLNK(st.st_mode)) return resolved;
+		if (links == 40) return {};
+		char target[PATH_MAX];
+		const ssize_t n = readlink(resolved.c_str(), target, sizeof target);
+		if (n <= 0 || (size_t)n == sizeof target) return {};
+		const std::string to(target, (size_t)n);
+		current = to[0] == '/' ? to : prefix + to;
+	}
+	return {};
+}
+
 /* With --bam, every @SQ line of an -r text (which replaces the index's @SQ lines, as in stock
  * samse) that names an index contig must give that contig's length: htslib would otherwise
  * write records past the declared end of the reference. A name the index lacks is left to the
@@ -1791,10 +1823,10 @@ int main_aln(int argc, char *argv[])
 			return 1;
 		}
 	}
+	static const char *const idx_sfx[] = {"", ".bwt.2bit.64", ".pac", ".ann", ".amb", ".0123", ".alt",
+										  ".meth.bwt.2bit.64", ".meth.pac", ".meth.ann", ".meth.amb"};
 	{ // -f naming an index file would truncate it before (or while) the index is read; the
 	  // `.meth.*` files are an `index --meth` converted index, which `aln --meth` and `mem --meth` read
-		static const char *const idx_sfx[] = {"", ".bwt.2bit.64", ".pac", ".ann", ".amb", ".0123", ".alt",
-											  ".meth.bwt.2bit.64", ".meth.pac", ".meth.ann", ".meth.amb"};
 		for (const std::string &base : {std::string(prefix), meth_orig}) { // --meth also reads the original index
 			if (base.empty()) continue;
 			for (const char *sfx : idx_sfx) {
@@ -1837,6 +1869,51 @@ int main_aln(int argc, char *argv[])
 	if (ks_cache_path && !ks_path) {
 		fprintf(stderr, "[E::aln] --known-snvs-cache needs --known-snvs\n");
 		return 1;
+	}
+	if (ks_cache_path) { // FILE is replaced by a rename: it must not be a file this run reads or writes
+		if (strcmp(ks_cache_path, "-") == 0) {
+			fprintf(stderr, "[E::aln] --known-snvs-cache needs a file name, not '-'\n");
+			return 1;
+		}
+		std::vector<std::string> used = {fn_fq, ks_path};
+		if (paired) used.push_back(argv[optind + 2]);
+		for (const std::string &base : {std::string(prefix), meth_orig}) {
+			if (base.empty()) continue;
+			for (const char *sfx : idx_sfx) used.push_back(base + sfx);
+		}
+		if (!meth_orig.empty()) {
+			char *dict_path = bwa_index_dict_path(meth_orig.c_str());
+			if (dict_path == nullptr) {
+				fprintf(stderr, "[E::aln] out of memory checking --known-snvs-cache '%s'\n", ks_cache_path);
+				return 1;
+			}
+			used.push_back(meth_orig + ".hdr");
+			used.push_back(dict_path);
+			free(dict_path);
+		}
+		const char *alias = nullptr;
+		if (out_path && (strcmp(out_path, ks_cache_path) == 0 || aln_same_file(ks_cache_path, out_path))) alias = out_path;
+		if (out_path && !alias) {
+			const std::string output = aln_resolved_destination(out_path, true);
+			const std::string cache = aln_resolved_destination(ks_cache_path, false);
+			if (!output.empty() && output == cache) alias = out_path;
+		}
+		for (const std::string &u : used)
+			if (!alias && aln_same_file(ks_cache_path, u.c_str())) alias = u.c_str();
+		const bool stdin_read = strcmp(fn_fq, "-") == 0 || strcmp(ks_path, "-") == 0 ||
+								(paired && strcmp(argv[optind + 2], "-") == 0);
+		if (!alias && stdin_read && aln_out_is_stdin(ks_cache_path)) alias = "standard input";
+		if (!alias && (!out_path || strcmp(out_path, "-") == 0)) { // the SAM goes to standard output
+			struct stat sc, so;
+			if (stat(ks_cache_path, &sc) == 0 && fstat(STDOUT_FILENO, &so) == 0 && S_ISREG(so.st_mode) &&
+				sc.st_dev == so.st_dev && sc.st_ino == so.st_ino)
+				alias = "standard output";
+		}
+		if (alias) {
+			fprintf(stderr, "[E::aln] --known-snvs-cache '%s' is also '%s', which this run reads or writes; "
+					"rewriting the cache would replace it\n", ks_cache_path, alias);
+			return 1;
+		}
 	}
 	if (!aln_output_ok(out_path)) return 1;
 	FMI_search *fmi = new FMI_search(prefix);
@@ -1905,7 +1982,11 @@ int main_aln(int argc, char *argv[])
 	}
 	else aln_print_sam_hdr(&hdr, bns, rg_line.get(), bwa_pg);
 	free(meth_hdr_lines);
-	aln_out_t *out = (!bam || aln_bam_sq_lengths_ok(rg_line.get(), bns))
+	// Recheck after cache creation: case-insensitive names can now identify the same inode.
+	const bool cache_alias = ks_cache_path && aln_same_file(out_path, ks_cache_path);
+	if (cache_alias)
+		fprintf(stderr, "[E::aln] output '%s' would overwrite the cache '%s'\n", out_path, ks_cache_path);
+	aln_out_t *out = !cache_alias && (!bam || aln_bam_sq_lengths_ok(rg_line.get(), bns))
 		? aln_out_open(out_path, bam, bam_level, hdr.s, opt->n_threads) : NULL;
 	free(hdr.s);
 	int ret = 1;
