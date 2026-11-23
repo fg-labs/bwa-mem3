@@ -2524,6 +2524,32 @@ TEST_CASE("aln_meth: the finish audits the cuts a search took on a best that was
     CHECK(ba::bwa_seq_close(input) == 0);
 }
 
+TEST_CASE("aln_meth: a locus keeps its row with the fewest differences among its equal-cost rows")
+{
+    // At one locus, five mismatches (15, five differences, no conversions) and a 2-base gap
+    // (11 + 4 = 15, two differences, three conversions). The locus keeps the gapped row, so the
+    // top-2 ceiling, taken from the stored rows, is the fewest differences at the best cost (2, so
+    // 3) whichever row the search found first.
+    namespace ba = bwa_aln;
+    ba::aln_meth_occ_t mm, gap;
+    mm.cost = 15; mm.n_mm = 5; mm.alignment.cigar = {50u << 4};
+    gap.cost = 15; gap.n_gapo = 1; gap.n_gape = 1; gap.n_conv = 3;
+    gap.alignment.cigar = {20u << 4, 2u << 4 | 1, 28u << 4};
+    for (bool conv : {false, true}) for (bool gape : {false, true}) {
+        CAPTURE(conv); CAPTURE(gape);
+        CHECK(ba::aln_meth_row_better(gap, mm, conv, gape));
+        CHECK_FALSE(ba::aln_meth_row_better(mm, gap, conv, gape));
+    }
+    // cost first; equal differences: fewer conversions under the tie-break, else the CIGARs
+    ba::aln_meth_occ_t cheaper = mm;
+    cheaper.cost = 12;
+    CHECK(ba::aln_meth_row_better(cheaper, gap, true, true));
+    ba::aln_meth_occ_t gap2 = gap;
+    gap2.n_conv = 0; gap2.alignment.cigar = {30u << 4, 2u << 4 | 1, 18u << 4};
+    CHECK(ba::aln_meth_row_better(gap2, gap, true, true));
+    CHECK(ba::aln_meth_row_better(gap, gap2, false, true)); // 20M before 30M
+}
+
 TEST_CASE("aln_meth: --known-snvs takes the stock cuts in both searches but no certificates")
 {
     namespace ba = bwa_aln;
@@ -6059,6 +6085,47 @@ TEST_CASE("aln_meth: a path's seed gap differences are the same from its gap eve
             }
     }
     CHECK(checked == 8000);
+}
+
+TEST_CASE("aln_meth: -R counts only the best rows the finish retains, within the ceiling it applies")
+{
+    namespace ba = bwa_aln;
+    auto *opt = ba::gap_init_opt(); // M 3, O 11, E 4, -R 30, gap extensions count as differences
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_ref_t mr;
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::gap_job_t job = ba::gap_job_t();
+    job.opt = *opt;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group; slot.job = &job;
+    ba::aln_meth_read_t result;
+    slot.res = &result;
+    // At cost 15: a two-base gap (11 + 4, two differences) and five mismatches (5 x 3, five
+    // differences). The ceiling is 3, so the finish retains only the gap rows at the best.
+    auto run = [&](int n_gap_rows, int n_mm_rows) {
+        result = ba::aln_meth_read_t();
+        job.max_diff = 5; job.score_cut = ba::GAP_SCORE_LIMIT - 1;
+        slot.gen = 0; slot.cut = 1; slot.cert = 0; slot.r_stop = 0; slot.ceil_applied = INT_MAX;
+        slot.best = 15; // the ceiling comes from the stored rows: the gap rows, so 3
+        for (int k = 0; k < n_gap_rows + n_mm_rows; ++k) {
+            ba::aln_meth_occ_t o;
+            o.rid = 0; o.hyp = 1; o.strand = 0; o.cost = 15; o.pos = 1000 * k;
+            if (k < n_gap_rows) { o.n_gapo = 1; o.n_gape = 1; }
+            else o.n_mm = 5;
+            result.occ.push_back(o);
+        }
+        return ba::aln_meth_boundary(&slot, 16);
+    };
+    // 1 retained locus and 31 over the ceiling: not more than -R, so no stop
+    CHECK(run(1, 31) == 0);
+    CHECK(slot.r_stop == 0);
+    CHECK(job.max_diff == 3);
+    // 31 retained loci: stock's -R stop
+    CHECK(run(31, 0) == 1);
+    CHECK(slot.r_stop == 1);
+    free(opt);
 }
 
 TEST_SUITE_END;

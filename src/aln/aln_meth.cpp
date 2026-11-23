@@ -357,17 +357,19 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     }
     if (x->best == next) return 0;
     const bool conv = conv_tiebreak(x->grp->mo), gape = opt.mode & BWA_MODE_GAPE;
-    auto diffs = [&](const aln_meth_occ_t &o) { return (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0); };
     const int64_t ceiling = best_ceiling(x);
     if (ceiling < job->max_diff) job->max_diff = (int)ceiling;
     x->ceil_applied = (int)std::min<int64_t>(x->ceil_applied, ceiling);
-    // Count the best loci the finish keeps: those within the ceiling, and under the TAPS/5base
-    // tie-break the fewest-conversion ones of them.
-    auto kept = [&](const aln_meth_occ_t &o) { return o.cost == x->best && diffs(o) <= ceiling; };
+    // The best stratum's loci as the finish counts them (c1): rows at B within the ceiling just
+    // applied (an equal-cost row with more differences is not retained), not a drawn primary, and
+    // under the TAPS/5base tie-break the fewest-conversion ones of them.
+    auto counted = [&](const aln_meth_occ_t &o) {
+        return o.cost == x->best && !o.drawn && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
+    };
     int fewest = INT_MAX;
-    if (conv) for (const auto &o : x->res->occ) if (kept(o)) fewest = std::min(fewest, o.n_conv);
+    if (conv) for (const auto &o : x->res->occ) if (counted(o)) fewest = std::min(fewest, o.n_conv);
     long n = 0;
-    for (const auto &o : x->res->occ) n += kept(o) && (!conv || o.n_conv == fewest);
+    for (const auto &o : x->res->occ) n += counted(o) && (!conv || o.n_conv == fewest);
     if (n <= opt.max_top2) return 0;
     x->r_stop = 1;
     return 1;
@@ -461,11 +463,17 @@ static int conv_mapq_cap(int gap)
     return gap < 10 ? 6 * gap : 60;
 }
 
-// Rank the fixed-refinement CIGAR by stock cost, not by its refinement reward.
-static bool alignment_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, bool conversions)
+// Rank the fixed-refinement CIGAR by stock cost, not by its refinement reward; then by stock
+// differences (see aln_meth_search.h).
+bool aln_meth_row_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, bool conversions, bool gape)
 {
     if (a.cost != b.cost) return a.cost < b.cost;
+    const int64_t da = (int64_t)a.n_mm + a.n_gapo + (gape ? a.n_gape : 0);
+    const int64_t db = (int64_t)b.n_mm + b.n_gapo + (gape ? b.n_gape : 0);
+    if (da != db) return da < db;
     if (conversions && a.n_conv != b.n_conv) return a.n_conv < b.n_conv;
+    // --known-snvs: the reference, then the lower (position, ALT) site allele (aln_site_key, -1 first)
+    if (a.ks_site != b.ks_site) return (uint64_t)(a.ks_site + 1) < (uint64_t)(b.ks_site + 1);
     if (a.alignment.cigar != b.alignment.cigar) return a.alignment.cigar < b.alignment.cigar;
     if (a.alignment.re != b.alignment.re) return a.alignment.re < b.alignment.re;
     return a.alignment.raw_cigar < b.alignment.raw_cigar;
@@ -785,14 +793,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     if (ins.second) x->res->occ.push_back(std::move(o));
     else {
         const size_t at = x->loci.val[ins.first];
-        const aln_meth_occ_t &cur = x->res->occ[at];
-        // --known-snvs: the cheaper wins; on equal cost the reference, then the lower
-        // (position, ALT) site allele (aln_site_key order, -1 first). Two rows of the same allele
-        // (the reference, or one site allele) compare as reference rows do.
-        const bool better = o.ks_site == cur.ks_site ? alignment_better(o, cur, conv_tiebreak(g->mo))
-                          : o.cost != cur.cost ? o.cost < cur.cost
-                          : (uint64_t)(o.ks_site + 1) < (uint64_t)(cur.ks_site + 1);
-        if (better) x->res->occ[at] = std::move(o);
+        if (aln_meth_row_better(o, x->res->occ[at], conv_tiebreak(g->mo), gape)) x->res->occ[at] = std::move(o);
     }
 }
 // Scores a row along path L as the reference and, under --known-snvs, once per site allele in its
