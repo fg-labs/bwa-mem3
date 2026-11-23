@@ -304,7 +304,10 @@ How it works:
   that contig). The locus keeps its best row: the lowest cost, then the fewest differences, then
   (under the neutral TAPS/5base tie-break) the fewest conversions, then the reference, then the
   lower (position, ALT). An alignment in a window that only the ALT-window search proposed is kept
-  only within the read's difference limit, as the read's own search would be. When a realigned
+  only within the read's difference limit, as the read's own search would be. A realigned
+  candidate is also held to `-k`: its differences inside the seed are counted as a path's are,
+  and over `-k` it is dropped. A mate-rescue window ignores `-k`, as stock rescue does
+  ([#799](https://github.com/fg-labs/bwa-mem3/pull/799)). When a realigned
   candidate's best-scoring alignment breaks the read's `-n`, `-o` or `-e` limits, the window is
   realigned once more with its indels held to the window's own extent (ungapped when the window is
   the read's length), and that alignment is kept if it is within the limits. A pair whose

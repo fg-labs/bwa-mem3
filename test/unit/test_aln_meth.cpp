@@ -2371,6 +2371,72 @@ TEST_CASE("aln_meth: an ALT-window candidate's path counts its seed gaps toward 
     ba::aln_meth_ref_free(&mr);
 }
 
+TEST_CASE("aln_meth: an ALT-window candidate realigned without a path counts its seed mismatches toward -k")
+{
+    // A 50-base read: c1[500, 550) with one transversion (never a conversion) near one end or the
+    // other, or c1[500, 551) with one base deleted there (a 51-base window). The candidate has no
+    // path (no CIGAR), so the window DP realigns it. Under -k 0 a seeded read drops the alignment
+    // whose difference is in the seed and keeps the other; an unseeded read keeps both, as does
+    // any read under -k 1.
+    namespace ba = bwa_aln;
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::gap_slot_core_t core = {};
+    ba::bwt_width_t seed_width = {};
+    const int64_t rb = mr.bns->anns[0].offset + 500;
+    auto transversion = [](char b) { return b == 'A' ? 'C' : b == 'C' ? 'A' : b == 'G' ? 'T' : 'G'; };
+    for (bool gap : {false, true}) for (int k : {0, 1}) for (bool seeded : {false, true}) {
+        opt->max_seed_diff = k;
+        const int span = gap ? 51 : 50;
+        const std::string window = ref().c1.substr(500, span);
+        long dropped = 0;
+        for (int at : {3, 46}) {
+            CAPTURE(gap); CAPTURE(k); CAPTURE(seeded); CAPTURE(at);
+            std::string read = window;
+            if (gap) read.erase(at, 1);
+            else read[at] = transversion(read[at]);
+            const std::string fq = write_fq("seed-dp.fq", {conv(read, 'C', 'T')});
+            ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+            int n = 0;
+            ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+            REQUIRE(n == 1);
+            ba::aln_meth_slot_t slot;
+            slot.grp = &group;
+            ba::aln_meth_read_t result;
+            ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 0);
+            slot.job = &core.job;
+            core.job.seed_width = seeded ? &seed_width : nullptr;
+            core.job.c.seed_off = (int)reads->len - 32;
+            ba::aln_meth_extra_t extra;
+            extra.rows = {{0, 0, 1, rb, rb + span, {}}}; // no path: realigned by the window DP
+            slot.extra = &extra;
+            ba::aln_meth_score_extras(&slot);
+            CHECK(result.n_over_seed + (long)result.occ.size() == 1);
+            for (const auto &o : result.occ) {
+                CHECK(o.alignment.rb == rb); CHECK(o.alignment.re == rb + span);
+                CHECK(o.n_mm == (gap ? 0 : 1)); CHECK(o.n_gapo == (gap ? 1 : 0)); CHECK(o.n_del == (gap ? 1 : 0));
+            }
+            // stock aln's seed is the read's first -l (32) bases: only the difference at 3 is in it
+            if (result.n_over_seed) CHECK(at == 3);
+            dropped += result.n_over_seed;
+            slot.extra = nullptr;
+            slot.job = nullptr;
+            ba::bwa_free_read_seq(n, reads);
+            CHECK(ba::bwa_seq_close(input) == 0);
+        }
+        CHECK(dropped == (seeded && k == 0 ? 1 : 0));
+    }
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+}
+
 TEST_CASE("aln_meth: stopped searches still score known-SNV extra windows unless CIGAR-capped"
           * doctest::test_suite("unit/aln_meth"))
 {
@@ -5577,6 +5643,57 @@ TEST_CASE("aln_meth: mate rescue drops a candidate whose counts overflow a recor
         }
         for(int j=0;j<2;++j){ba::bwa_free_read_seq(1,seqs[j]);ba::bwa_seq_close(inputs[j]);}
     }
+    free(pe);free(opt);ba::aln_meth_ref_free(&mr);
+}
+
+TEST_CASE("aln_meth: mate rescue ignores -k, as stock rescue does")
+{
+    // Mate rescue with a valid insert size and a unique anchor, under -k 0: the mate is 50 bases of
+    // c1 with two transversions (never conversions), one in each end's 32-base seed, so its seed
+    // holds a difference in either orientation. Stock rescue ignores -k, so the mate is rescued, with
+    // and without a known SNV in the rescue window (the site-aware rescue's trials).
+    namespace ba=bwa_aln;
+    FMI_search fmi((ref().fa+".meth").c_str());fmi.load_index(false,1);
+    ba::aln_meth_ref_t mr;REQUIRE(ba::aln_meth_ref_load(&mr,ref().fa.c_str(),fmi.idx->bns,1)==0);
+    ba::aln_meth_opt_t mo;ba::aln_meth_opt_finish(&mo);
+    auto *opt=ba::gap_init_opt();opt->max_seed_diff=0;
+    auto *pe=ba::bwa_init_pe_opt();ba::bwase_initialize();
+    const int anchor=100,start=600,span=50;
+    auto transversion=[](char b){return b=='A'?'C':b=='C'?'A':b=='G'?'T':'G';};
+    std::string seg=ref().c1.substr(start,span);
+    seg[10]=transversion(seg[10]);seg[39]=transversion(seg[39]);
+    const std::string mate=aln_test::revcomp(seg);
+    const int ref_code=(int)std::string("ACGT").find(ref().c1[start+25]);
+    REQUIRE(ref_code>=0);
+    ba::ks_sites_t sites;
+    sites.by_contig.assign(mr.bns->n_seqs,{});
+    sites.by_contig[0]={{(int64_t)start+25,(uint8_t)ref_code,(uint8_t)((ref_code+1)&3)}};
+    sites.n_sites=1;
+    for(bool site : {false,true}) {
+        CAPTURE(site);
+        mr.known_snvs=site?&sites:nullptr;
+        ba::bwa_seq_t *seqs[2];ba::bwa_seqio_t *inputs[2];int n[2];
+        for(int j=0;j<2;++j) {
+            inputs[j]=ba::bwa_seq_open(write_fq(j?"seed-rescue2.fq":"seed-rescue1.fq",{j?mate:std::string(50,'A')}).c_str());
+            seqs[j]=ba::bwa_read_seq(inputs[j],1,&n[j],BWA_MODE_COMPREAD,0);REQUIRE(n[j]==1);
+        }
+        ba::aln_meth_read_t result[2];ba::aln_meth_read_t *r[2]={result,result+1};
+        ba::aln_meth_occ_t o{};o.rid=0;o.strand=0;o.hyp=1;
+        o.pos=mr.bns->anns[0].offset+anchor;o.alignment.rb=o.pos;o.alignment.re=o.pos+50;
+        o.alignment.cigar={50u<<4};result[0].occ.push_back(o);result[0].main=0;result[0].c1=1;
+        store_pair(r);ba::aln_meth_pe_stage1(opt,1,seqs,r);
+        REQUIRE((int)seqs[0]->mapQ>=17);REQUIRE((int)seqs[1]->type==BWA_TYPE_NO_MATCH);
+        ba::isize_info_t ii={};ii.avg=start+span-anchor;ii.std=10;ii.ap_prior=1e-5;
+        ii.low=100;ii.high=2000;ii.high_bayesian=2000;
+        uint64_t total[2]={},mapped[2]={};ba::aln_meth_pe_stage2(&mr,&mo,opt,pe,&ii,1,seqs,r,total,mapped);
+        CHECK(total[1]==1);CHECK(mapped[1]==1);
+        REQUIRE((int)seqs[1]->type==BWA_TYPE_MATESW);
+        CHECK(seqs[1]->pos==(bwtint_t)(mr.bns->anns[0].offset+start));
+        CHECK((int)seqs[1]->strand==1);
+        CHECK((int)seqs[1]->n_mm==2);CHECK((int)seqs[1]->n_gapo==0);
+        for(int j=0;j<2;++j){ba::bwa_free_read_seq(1,seqs[j]);ba::bwa_seq_close(inputs[j]);}
+    }
+    mr.known_snvs=nullptr;
     free(pe);free(opt);ba::aln_meth_ref_free(&mr);
 }
 

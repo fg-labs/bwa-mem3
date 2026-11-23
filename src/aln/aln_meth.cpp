@@ -598,20 +598,23 @@ static int seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool ga
     }
     return d;
 }
+// One gap's share of layout_seed_diffs: a gap of gl bases (a deletion when del) at query position qpos.
+static int gap_seed_diffs(int qpos, int gl, bool del, int strand, int len, int seed_off, bool gape)
+{
+    const int s0 = strand ? qpos : del ? len - qpos : len - qpos - gl;
+    const int i = del ? s0 - 1 : s0 + gl - 1; // the S index of the gap's first step
+    int d = i > seed_off; // the open
+    if (!gape) return d;
+    if (del) d += i > seed_off ? gl - 1 : 0;
+    else for (int s = i - 1; s > i - gl; --s) d += s > seed_off;
+    return d;
+}
 // seed_gap_diffs for a path given as a layout (meth_layout's inverse for each gap): an ALT-window
 // candidate's path, which comes as a CIGAR.
 static int layout_seed_diffs(const aln_meth_layout_t &L, int strand, int len, int seed_off, bool gape)
 {
     int d = 0;
-    for (int g = 0; g < L.n; ++g) {
-        const int gl = L.len[g], del = L.del[g];
-        const int s0 = strand ? L.qpos[g] : del ? len - L.qpos[g] : len - L.qpos[g] - gl;
-        const int i = del ? s0 - 1 : s0 + gl - 1; // the S index of the gap's first step
-        if (i > seed_off) ++d; // the open
-        if (!gape) continue;
-        if (del) d += i > seed_off ? gl - 1 : 0;
-        else for (int s = i - 1; s > i - gl; --s) d += s > seed_off;
-    }
+    for (int g = 0; g < L.n; ++g) d += gap_seed_diffs(L.qpos[g], L.len[g], L.del[g], strand, len, seed_off, gape);
     return d;
 }
 int aln_meth_seed_gap_diffs(const uint32_t *gap, int n_gapo, int seed_off, bool gape)
@@ -890,8 +893,37 @@ static void resolve_rows(aln_meth_slot_t *x, const aln_meth_pend_t &h, const bwt
         }
     }
 }
+/* The seed differences of a window-DP alignment o of query over win (its raw CIGAR), as the search
+ * counts them against -k for a path: strict mismatches in the seed's constrained part (score_path's
+ * seed_mm; conversions are free) plus the gap differences there (layout_seed_diffs). 0 for an
+ * unseeded read. */
+static int realigned_seed_diffs(const aln_meth_slot_t *x, const aln_meth_occ_t &o, const std::vector<uint8_t> &win,
+                                const ubyte_t *query)
+{
+    if (!(x->job && x->job->seed_width)) return 0;
+    const aln_meth_group_t *g = x->grp;
+    const int len = x->len, ori = o.strand ? 1 : 0, seed_off = x->job->c.seed_off;
+    const bool gape = g->opt->mode & BWA_MODE_GAPE;
+    int m;
+    const int8_t *mat = meth_mat(g->mo, o.hyp, &m);
+    int d = 0, q = 0, t = 0;
+    for (uint32_t item : o.alignment.raw_cigar) {
+        const int op = item & 15, n = (int)(item >> 4);
+        if (op == 0) {
+            for (int k = 0; k < n; ++k, ++q, ++t) {
+                const int read = query[q], base = win[t];
+                if ((read > 3 || mat[base * m + read] < 0) && seed_pos(q, ori, len, seed_off)) ++d;
+            }
+        } else {
+            d += gap_seed_diffs(q, n, op == 2, o.strand, len, seed_off, gape);
+            if (op == 1) q += n; else t += n;
+        }
+    }
+    return d;
+}
 // A --known-snvs candidate window without a path (its CIGAR is not one): refined by the window DP,
-// as before path costs, and filtered by store_row without -k (it has no seed).
+// as before path costs, and filtered by store_row with -k on the refined alignment's seed
+// differences (realigned_seed_diffs), as a path row is.
 static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidate, const ubyte_t *query,
                         int64_t site, int n_ins, int n_del, bool bounded)
 {
@@ -934,7 +966,7 @@ static void resolve_one(aln_meth_slot_t *x, const aln_meth_candidate_t &candidat
         return;
     }
     o.pos = o.alignment.rb;
-    store_row(x, o, 0, bounded);
+    store_row(x, o, realigned_seed_diffs(x, o, win, query), bounded);
 }
 static inline int pend_score(const aln_meth_slot_t *x, const aln_meth_pend_t &h)
 {
