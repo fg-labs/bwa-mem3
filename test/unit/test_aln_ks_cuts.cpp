@@ -301,9 +301,8 @@ void window_overlap_case(bool meth)
     check_against_oracle(k, meth, {"-n", "5"}, {want});
 }
 
-/* The ALT-window search is capped at U + M, where U is the cost of a row the main search's probe
- * (its exact stratum) verified. U is that row's cost on the original reference, not its converted
- * score:
+/* The ALT-window search's cap is taken from U, the cost of a row the main search's probe (its exact
+ * stratum) verified. U is that row's cost on the original reference, not its converted score:
  * P: R over a reference T where R has its one C: an exact match in converted space, but a
  *    mismatch on the original reference (cost 3). It is the read's best.
  * Q: R with three mismatches, one at a site whose ALT is R's base: 6 with the ALT (two
@@ -717,7 +716,7 @@ TEST_CASE("aln_ks_cuts: neutral conversion ties retain the better one-ALT haplot
     }
 }
 
-TEST_CASE("aln_ks_cuts: --meth: the ALT-window cap is the probe row's verified cost plus M")
+TEST_CASE("aln_ks_cuts: --meth: a row retained at the probe row's verified cost plus M is proposed under the cap")
 {
     cap_at_verified_cost_case();
 }
@@ -727,22 +726,51 @@ TEST_CASE("aln_ks_cuts: --meth: a read with no probe row runs its ALT-window sea
     no_probe_row_case();
 }
 
-TEST_CASE("aln_ks_cuts: --meth: the ALT-window seed is U for single-end reads and U + M for paired reads")
+TEST_CASE("aln_ks_cuts: --meth: the ALT-window seed is U + M for every capped read")
 {
     bwa_aln::gap_opt_t *o = bwa_aln::gap_init_opt();
     const int fits = KS_WINDOW_HALF - (o->max_gapo - 1) - o->max_gape; // the longest read that fits a window (154)
-    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, 0, false) == 4);
-    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, 1, false) == 4 + o->s_mm);
-    CHECK(bwa_aln::ks_meth_window_seed(INT64_MAX, 100, o, 1, false) == INT64_MAX); // no probe row
-    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, 0, true) == INT64_MAX);          // --meth-context cpg
-    CHECK(bwa_aln::ks_meth_window_seed(4, fits, o, 1, false) == 4 + o->s_mm);
-    CHECK(bwa_aln::ks_meth_window_seed(4, fits + 1, o, 0, false) == INT64_MAX);    // past its window
+    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, false) == 4 + o->s_mm);
+    CHECK(bwa_aln::ks_meth_window_seed(0, 100, o, false) == o->s_mm);
+    CHECK(bwa_aln::ks_meth_window_seed(INT64_MAX, 100, o, false) == INT64_MAX); // no probe row
+    CHECK(bwa_aln::ks_meth_window_seed(4, 100, o, true) == INT64_MAX);          // --meth-context cpg
+    CHECK(bwa_aln::ks_meth_window_seed(4, fits, o, false) == 4 + o->s_mm);
+    CHECK(bwa_aln::ks_meth_window_seed(4, fits + 1, o, false) == INT64_MAX);    // past its window
     free(o);
 }
 
 TEST_CASE("aln_ks_cuts: --meth: a paired read stopped on -R pairs on a window row at U + 2M")
 {
     rstop_pair_case();
+}
+
+/* The single-end form of rstop_pair_case: a read whose own search stops on -R prints the other loci
+ * it retains as XA, and those are the rows it found and the ALT-window search's candidates:
+ * A1, A2: R exact, two best loci (more than -R 1). The probe verifies one: U = 0.
+ * C: R with one mismatch (3 = B + M). R carries the REF of a site under C, so C costs 6 = U + 2M
+ *    in that site's ALT window.
+ * R's search stops on -R at its best stratum, before C; only the window search proposes C, which it
+ * delivers only when it reaches U + 2M. The record then lists all three loci. This test fails with
+ * a seed of U (a window search stopped at U + M). */
+TEST_CASE("aln_ks_cuts: --meth: a single-end read stopped on -R lists a window row at U + 2M as XA")
+{
+    uint32_t st = 2718;
+    const std::string read = no_c(st, 100);
+    std::string c1 = aln_test::lcg_dna(st, 12000);
+    const int a1 = 1000, a2 = 4000, c = 8000, site = c + 60;
+    c1.replace(a1, 100, read);
+    c1.replace(a2, 100, read);
+    c1.replace(c, 100, with_mm(read, {30}));
+    const KsCase k(c1, {{site, c1[site], std::string(1, mm_base(read[60])), c1[site]}}, {read});
+    const auto got = k.run({"--meth", "-n", "5", "-R", "1", "--known-snvs", k.vcf}, k.ref, "se");
+    REQUIRE(got.size() == 1);
+    CAPTURE(summary(got[0]));
+    CHECK(tag(got[0], "X0:i") == "2");
+    CHECK(got[0][4] == "0");
+    // the two exact loci, either one primary, and C as an alternative
+    std::vector<std::string> all = {locus(a1, "100M"), locus(a2, "100M"), locus(c, "100M")};
+    std::sort(all.begin(), all.end());
+    CHECK(loci(got[0]) == all);
 }
 
 TEST_SUITE_END();

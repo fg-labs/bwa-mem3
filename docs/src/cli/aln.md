@@ -647,12 +647,16 @@ final best (the ceiling and `-R`) are taken only once both have delivered their 
   its rows within `B + M`, also when it stops early, and states how far they are complete.
 - Before it, a probe of the main search runs the read's exact stratum (converted score 0) and
   verifies at most 32 rows. A verified row is one the main search keeps or beats, so its cost `U`
-  bounds the final best from above, and the window search stops at `U + M` for single-end reads
-  and `U + 2M` for paired-end reads. A window differs from the reference at one base, so a row
+  bounds the final best from above, and the window search stops at `U + 2M` for every capped
+  read. A window differs from the reference at one base, so a row
   costs at most `M` more there than in the read, and a row credited that ALT costs the same. A
-  read's own search finds its reference rows unless it stops at `-R`; paired-end pairing then
-  uses every row within `B + M` it has, which a window can hold at up to `U + 2M`, while
-  single-end output keeps only the read's main hit. A read with no probe row, a read that does not
+  read's own search finds its reference rows unless it stops at `-R`. The read then has only the
+  rows it found and the window search's, and it retains every one within `B + M`: paired-end
+  pairing uses them and single-end output lists them as `XA`. A window can hold such a row at up
+  to `U + 2M`, and a window row above that gives no row the read retains. The capped search does
+  less work, so under a small `-m` it can finish where an uncapped search would run out of
+  entries and leave the read incomplete.
+  A read with no probe row, a read that does not
   fit an ALT window, and every read under `--meth-context cpg` (where an ALT can change the CpG
   context of its neighbour) run the window search uncapped. Under `-N` or a negative penalty there
   is no probe and no cap.
