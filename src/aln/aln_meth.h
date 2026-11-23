@@ -202,6 +202,9 @@ struct aln_meth_read_t {
     // The mirror table outgrew its CIGAR budget: the mirror-free strata are not known, so each
     // end's conversion-blind cap is 0.
     int blind_partial = 0;
+    // --meth-mapq conversion-blind: the lookups of the rows only the mirror-free strata need ran out
+    // (their own budget, separate from the read's), so the strata are incomplete and the cap is 0.
+    int blind_incomplete = 0;
     // The MAPQ cap the record's end carries to emission (255: none), and the MAPQ it replaced
     // when the cap lowered it (YQ:i), else -1.
     int blind_cap = 255, yq = -1;

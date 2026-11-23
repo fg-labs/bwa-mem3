@@ -2901,35 +2901,52 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
     auto *opt = ba::gap_init_opt();
     opt->fnr = -1; opt->max_diff = 5;
     // the planted cases' arithmetic is at the default penalties; the random families also run at
-    // M=1, O=3, E=1, where gaps are cheap against mismatches
+    // M=1, O=3, E=1, where gaps are cheap against mismatches, and at M=5, O=3, E=1, where the
+    // smallest penalty is below M, so the conversion-blind search ceiling is wider than stock's
+    // even for a mismatch-only best
     using Key = std::tuple<int, bwtint_t, int64_t>; // strand, position, mirror-free cost
     long compared = 0, with_blind_rows = 0;
-    for (const auto &pen : {std::vector<int>{3, 11, 4}, std::vector<int>{1, 3, 1}})
+    for (const auto &pen : {std::vector<int>{3, 11, 4}, std::vector<int>{1, 3, 1}, std::vector<int>{5, 3, 1}})
         for (int max_top2 : {30, 2})
             for (int seed_len : {1024, 20}) {
                 CAPTURE(pen[0]); CAPTURE(max_top2); CAPTURE(seed_len);
                 opt->s_mm = pen[0]; opt->s_gapo = pen[1]; opt->s_gape = pen[2];
                 opt->max_top2 = max_top2; opt->seed_len = seed_len;
-                std::vector<ba::aln_meth_read_t> res[2];
-                for (int collapsed = 0; collapsed < 2; ++collapsed) {
+                // 0: genomic, conversion-blind; 1: collapsed; 2: genomic, scoring
+                std::vector<ba::aln_meth_read_t> res[3];
+                for (int mode = 0; mode < 3; ++mode) {
                     ba::aln_meth_opt_t mo;
                     mo.m.meth_mode = 1;
-                    mo.m.meth_scoring = collapsed ? MEM_METH_SCORING_COLLAPSED : MEM_METH_SCORING_GENOMIC;
-                    mo.m.meth_mapq = collapsed ? MEM_METH_MAPQ_SCORING : MEM_METH_MAPQ_CONVERSION_BLIND;
+                    mo.m.meth_scoring = mode == 1 ? MEM_METH_SCORING_COLLAPSED : MEM_METH_SCORING_GENOMIC;
+                    mo.m.meth_mapq = mode == 0 ? MEM_METH_MAPQ_CONVERSION_BLIND : MEM_METH_MAPQ_SCORING;
                     ba::aln_meth_opt_finish(&mo);
                     auto *input = ba::bwa_seq_open(fq.c_str());
                     int n = 0;
                     auto *seqs = ba::bwa_read_seq(input, n_reads, &n, BWA_MODE_COMPREAD, 0);
                     REQUIRE(n == n_reads);
-                    res[collapsed].resize(n);
+                    res[mode].resize(n);
                     ba::aln_dup_state_t dup;
-                    ba::aln_meth_search_batch(bwt, &mr, &mo, n, seqs, opt, 1, 1, 0, 1, 1000, &dup, res[collapsed].data());
+                    ba::aln_meth_search_batch(bwt, &mr, &mo, n, seqs, opt, 1, 1, 0, 1, 1000, &dup, res[mode].data());
                     ba::bwa_free_read_seq(n, seqs);
                     ba::bwa_seq_close(input);
                 }
                 for (int i = 0; i < n_reads; ++i) {
                     CAPTURE(i);
-                    const ba::aln_meth_read_t &g = res[0][i], &c = res[1][i];
+                    const ba::aln_meth_read_t &g = res[0][i], &c = res[1][i], &s = res[2][i];
+                    // conversion-blind changes no genomic result: the same loci, counts and flags
+                    // as --meth-mapq scoring
+                    using Hit = std::tuple<int, int, int, bwtint_t, int32_t, int, int, int, int, int>;
+                    auto hits = [](const ba::aln_meth_read_t &r) {
+                        std::vector<Hit> v;
+                        for (const auto &h : r.hits)
+                            v.emplace_back(h.rid, h.hyp, h.strand, h.pos, h.cost, h.span, h.n_mm, h.n_gapo, h.n_gape, h.n_mirror);
+                        return v;
+                    };
+                    CHECK(hits(g) == hits(s));
+                    CHECK(g.c1 == s.c1);
+                    CHECK(g.c2 == s.c2);
+                    CHECK(g.flags == s.flags);
+                    CHECK(g.main == s.main);
                     if (g.flags || c.flags || g.hits.empty() || c.hits.empty()) continue;
                     if (c.c1 > max_top2 || g.blind_c1 > max_top2) continue;
                     const bool gape = opt->mode & BWA_MODE_GAPE;
@@ -2962,7 +2979,7 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
                 for (auto &v : res) v.clear();
             }
     // the test compares most reads, and some of them through rows only the mirror-free strata keep
-    CHECK(compared > 8 * 100);
+    CHECK(compared > 12 * 100);
     CHECK(with_blind_rows > 0);
     free(opt);
     ba::aln_meth_ref_free(&mr);

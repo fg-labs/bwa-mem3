@@ -18,7 +18,9 @@ namespace bwa_aln {
 // to pick its best-known placement: that flush makes the read incomplete either way.
 enum { ALN_METH_BIND_ROWS = 64 };
 // A hit waiting for the next flush: its interval, entry and the path's gaps (aln_meth_hit unpacks them).
-struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; uint32_t gap[ALN_METH_MAX_GAPS]; };
+// blind_only: under --meth-mapq conversion-blind, a hit past stock's difference ceiling that only
+// the widened search ceiling reaches (aln_meth_hit); its rows feed the mirror-free strata alone.
+struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; uint32_t gap[ALN_METH_MAX_GAPS]; int blind_only = 0; };
 /* A flat, open-addressed index of distinct keys (insertion order kept in key, a value per key),
  * cleared per read. Only membership and lookup are used, as the std::set / std::map it replaces
  * were, so the results do not depend on the container. K needs operator== and a hash(). */
@@ -140,7 +142,13 @@ struct aln_meth_slot_t {
     // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row. flushed: a
     // flush has run. blind: --meth-mapq conversion-blind, so every cut must also keep what the
     // mirror-free strata need (meth_blind_strata).
-    int cut = 0, flushed = 0, blind = 0;
+    // gen_max_diff: stock's difference ceiling as the search applies it without conversion-blind
+    // (aln_meth_boundary); under conversion-blind the search's own ceiling can be wider.
+    // gen_stopped: stock's -R stop was reached, but the mirror-free strata are not complete yet.
+    // blind_only: the rows being resolved come from a blind_only hit. blind_lookups: the lookups
+    // of blind_only hits, from a budget of their own (aln_meth_flush_parked).
+    int cut = 0, flushed = 0, blind = 0, gen_max_diff = INT_MAX, blind_only = 0, gen_stopped = 0;
+    int64_t blind_lookups = 0;
     int64_t best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
@@ -151,6 +159,8 @@ struct aln_meth_slot_t {
     // that a path with other gaps reaches again. Cleared per read.
     aln_flat_index_t<aln_meth_kl_key_t> sa_ix;
     std::vector<bwtint_t> sa_rows;
+    // per sa_ix entry: its rows were counted as genomic lookups (0: only a blind_only hit's)
+    std::vector<uint8_t> sa_gen;
     // Refinement queries for each strand; any code above 4 (aln reads '-' as 5) is stored as 4.
     std::vector<ubyte_t> vseq, rd_fwd, rd_rev;
     std::vector<aln_meth_pend_t> pend;
