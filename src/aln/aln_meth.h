@@ -127,7 +127,8 @@ enum { ALN_METH_BIND_BEST = 1, ALN_METH_BIND_UNREP = 2, ALN_METH_BIND_CIGAR = 4,
  * a lower bound, MAPQ 0). */
 enum { ALN_METH_CERT_REPEAT = 1, ALN_METH_CERT_CROWDED = 2 };
 /* The finish-time audit of a complete read's cuts (aln_meth_slot_finish): HORIZON, the ALT-window
- * search stopped below the costs the read retains (B + M, or B when more than -R loci tie at B);
+ * search stopped below the costs the read retains (B + M, or B when more than -R loci tie at B;
+ * any cost under -N, or for a read with no row retained);
  * CEILING, the search applied a top-2 difference ceiling tighter than the final best's; REPEAT, the
  * search stopped on -R but the final best has at most -R loci. Under --known-snvs a read that fails
  * is incomplete; otherwise it is only counted (aln_meth_report). */

@@ -2524,6 +2524,62 @@ TEST_CASE("aln_meth: the finish audits the cuts a search took on a best that was
     CHECK(ba::bwa_seq_close(input) == 0);
 }
 
+TEST_CASE("aln_meth: the finish audit fails an incomplete window search under -N and for a read with no row")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("audit-nonstop.fq", {conv(ref().c1.substr(500, 50), 'C', 'T')});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1);
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::ks_sites_t no_sites; // a --known-snvs run whose sites are elsewhere
+    no_sites.by_contig.assign(mr.bns->n_seqs, {});
+    auto *opt = ba::gap_init_opt();
+    ba::aln_meth_opt_t mo;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group;
+    const int64_t rb = mr.bns->anns[0].offset + 500;
+    // The window search stopped at horizon 4, above the 0 + M = 3 a read with the cuts retains:
+    // complete for it, but under -N the read keeps rows at any cost within -n. A read whose window
+    // rows were all dropped (here: none handed on) has no best to bound what it could keep.
+    struct case_t { bool nonstop, row; int64_t horizon; int want; };
+    for (const case_t &c : {case_t{false, true, 4, 0}, case_t{true, true, 4, ba::ALN_METH_AUDIT_HORIZON},
+                            case_t{true, true, INT64_MAX, 0}, case_t{false, false, 4, ba::ALN_METH_AUDIT_HORIZON},
+                            case_t{false, false, INT64_MAX, 0}})
+        for (const ba::ks_sites_t *sites : {(const ba::ks_sites_t *)nullptr, (const ba::ks_sites_t *)&no_sites}) {
+            CAPTURE(c.nonstop); CAPTURE(c.row); CAPTURE(c.horizon); CAPTURE(sites != nullptr);
+            mr.known_snvs = sites;
+            if (c.nonstop) opt->mode |= BWA_MODE_NONSTOP;
+            else opt->mode &= ~BWA_MODE_NONSTOP;
+            ba::aln_meth_read_t result;
+            ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+            ba::aln_meth_extra_t extra;
+            if (c.row) extra.rows = {{0, 0, 1, rb, rb + 50, {50u << 4}}};
+            extra.horizon = c.horizon;
+            extra.flags = c.horizon == INT64_MAX ? 0 : ba::ALN_METH_BIND_M;
+            slot.extra = &extra;
+            ba::aln_meth_slot_finish(&slot);
+            CHECK(result.audit == c.want);
+            // under --known-snvs a failed audit makes the read incomplete with the window flags
+            CHECK(result.flags == (c.want && sites ? ba::ALN_METH_BIND_M : 0));
+            CHECK((result.main >= 0) == c.row);
+            slot.extra = nullptr;
+        }
+    mr.known_snvs = nullptr;
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads);
+    CHECK(ba::bwa_seq_close(input) == 0);
+}
+
 TEST_CASE("aln_meth: a locus keeps its row with the fewest differences among its equal-cost rows")
 {
     // At one locus, five mismatches (15, five differences, no conversions) and a 2-base gap

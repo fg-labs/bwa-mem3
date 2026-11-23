@@ -1376,9 +1376,12 @@ static __attribute__((noinline)) void meth_audit(aln_meth_slot_t *x, int64_t bes
     aln_meth_read_t *r = x->res;
     const gap_opt_t *opt = x->grp->opt;
     int audit = 0, wflags = 0;
-    if (x->extra) {
+    if (x->extra && x->extra->horizon != INT64_MAX) {
+        // Under -N the read keeps every row within -n, at any cost: a window search that stopped
+        // anywhere can have missed one. Otherwise it keeps rows up to B + M (B past -R).
+        const bool nonstop = opt->mode & BWA_MODE_NONSTOP;
         const int64_t need = r->c1 > opt->max_top2 ? best : best + opt->s_mm;
-        if (x->extra->horizon <= need) { audit |= ALN_METH_AUDIT_HORIZON; wflags = x->extra->flags; }
+        if (nonstop || x->extra->horizon <= need) { audit |= ALN_METH_AUDIT_HORIZON; wflags = x->extra->flags; }
     }
     if (ceiling != INT64_MAX && (int64_t)x->ceil_applied < std::min<int64_t>(x->max_diff, ceiling))
         audit |= ALN_METH_AUDIT_CEILING;
@@ -1441,6 +1444,13 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
     if (r->occ.empty()) {
         // Every candidate was dropped: any of them could have been the best locus.
         if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
+        // --known-snvs: with no row retained, any window row the ALT-window search left unfound
+        // (a finite horizon) could have been the read's best, so the audit fails as meth_audit's
+        // horizon check does for a read with a best.
+        if (!r->flags && x->extra && x->extra->horizon != INT64_MAX) {
+            r->audit = ALN_METH_AUDIT_HORIZON;
+            if (x->grp->ref->known_snvs) r->flags |= x->extra->flags ? x->extra->flags : ALN_METH_BIND_BEST;
+        }
         return;
     }
     aln_meth_locus_key_t drawn{};

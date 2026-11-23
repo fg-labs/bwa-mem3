@@ -642,8 +642,8 @@ final best (the ceiling and `-R`) are taken only once both have delivered their 
   its rows within `B + M`, also when it stops early, and states how far they are complete.
 - The main search scores those rows before its first step, so its cuts start from them.
 - At its finish each read is audited: the window search was complete below the costs the read
-  retains (`B + M`, or `B` past `-R`), no ceiling applied was tighter than the final one, and an
-  `-R` stop left more than `-R` best loci. A read that fails is reported incomplete, with the
+  retains (`B + M`, or `B` past `-R`; any cost under `-N` or for a read with no row), no ceiling
+  applied was tighter than the final one, and an `-R` stop left more than `-R` best loci. A read that fails is reported incomplete, with the
   window search's limit (and so no TAPS/5base conversion tie-break). A window search that stopped
   early above those costs leaves the read complete. Without `--known-snvs` the audit only counts
   (shown with `-v 4`).

@@ -193,9 +193,9 @@ The twin of a paired read is a pair, so `twin_mapq` is the twin pair's paired MA
   takes none of stock's cuts in its main search, so it runs to its `-n` and a highly repetitive
   one can use up the lookup budget (MAPQ 0, no `X0`/`X1`).
 - **Work limits under `--meth`.** If a read's ALT-window search hits a work limit (the lookup
-  budget or the `-m` stack cap) below the costs the read keeps (its best cost plus one mismatch),
-  the read is reported as incomplete even when none of its placements covers a site: it gets
-  MAPQ 0 with no `X0`/`X1`. If its genomic search hits the lookup budget instead, the ALT-window
+  budget or the `-m` stack cap) below the costs the read keeps (its best cost plus one mismatch;
+  any cost under `-N`, or when the read keeps no placement), the read is reported as incomplete
+  even when none of its placements covers a site: it gets MAPQ 0 with no `X0`/`X1`. If its genomic search hits the lookup budget instead, the ALT-window
   placements already found are still evaluated (unless the read has also reached its 64 MiB
   candidate CIGAR cap), and the read is likewise incomplete. For paired input, neither end of that
   pair can then be promoted by pairing or mate rescue, so the mate's record can change too. A
