@@ -534,12 +534,12 @@ TEST_CASE("aln_meth: converted repeats do not trigger a rescored -R early stop")
     CHECK(c[0].mapq == 0);
 }
 
-TEST_CASE("aln_meth: a repeat certificate reports X0 as a lower bound and draws its primary uniformly")
+TEST_CASE("aln_meth: a repeat certificate reports the full X0 and draws its primary uniformly")
 {
-    // Under collapsed scoring read_r has 31 exact loci. With -R 5 the search ends once more than 5 of
-    // them are verified (a repeat certificate): MAPQ 0, X0 the verified count (6 to 31), no X1. The
-    // primary is drawn over all 31, verified or not, per read: over 1,240 copies of the read every
-    // locus is drawn about 40 times (chi-square, 30 degrees of freedom, p < 0.001 at 59.7).
+    // Under collapsed scoring read_r has 31 exact loci. With -R 5 the search ends once the best
+    // stratum is complete with more than 5 of them (a repeat certificate): MAPQ 0, X0 the full count
+    // (31), no X1. The primary is drawn per read: over 1,240 copies of the read every locus is drawn
+    // about 40 times (chi-square, 30 degrees of freedom, p < 0.001 at 59.7).
     const int n = 31 * 40;
     const std::string fq = write_fq("cert-draw.fq", std::vector<std::string>(n, ref().read_r));
     const auto v = run_aln({"--meth=taps", "--meth-scoring", "collapsed", "-n", "2", "-l", "1024", "-R", "5"}, {fq});
@@ -548,8 +548,7 @@ TEST_CASE("aln_meth: a repeat certificate reports X0 as a lower bound and draws 
     for (const auto &r : v) {
         CHECK(r.mapq == 0);
         CHECK(tag_value(r, "XT:A") == "R");
-        const int x0 = std::stoi(tag_value(r, "X0:i"));
-        CHECK(x0 > 5); CHECK(x0 <= 31);
+        CHECK(tag_value(r, "X0:i") == "31");
         CHECK(r.tag.count("X1:i") == 0);
         ++drawn[r.rname + ":" + std::to_string(r.pos) + (r.flag & 16 ? "-" : "+")];
     }
@@ -579,13 +578,14 @@ TEST_CASE("aln_meth: a repeat certificate's draws do not depend on the thread co
     }
 }
 
-TEST_CASE("aln_meth: a repeat certificate's drawn gapped row does not lower the verified loci's ceiling")
+TEST_CASE("aln_meth: a gapped best row's ceiling drops equal-cost mismatch loci before any certificate")
 {
     // Default penalties (M 3, O 11, E 4): 31 loci where the read has five transversions (cost 15,
     // five differences) and one where it lacks two bases (cost 11 + 4 = 15, two differences). With
-    // -R 5 the repeat certificate fires in the cost-15 stratum, and the primary is drawn over all 32.
-    // A drawn gapped row is placed but not verified: it must neither set the top-2 ceiling (which
-    // would drop every verified locus, leaving X0:0 and a nonzero MAPQ) nor be counted.
+    // -R 5 a certificate waits for the cost-15 stratum to be complete, so the gapped row is verified
+    // and its top-2 ceiling (three differences) drops the 31 mismatch loci: every copy is a unique
+    // hit at the gapped locus, as stock's ceiling gives. A certificate inside the stratum would have
+    // counted the mismatch loci (X0 > 5, MAPQ 0).
     bwa_tests::TempDir tmp{"aln_meth_cert_gap"};
     const std::string dir = tmp.path(), fa = dir + "/cert-gap.fa";
     uint32_t st = 2718;
@@ -609,19 +609,17 @@ TEST_CASE("aln_meth: a repeat certificate's drawn gapped row does not lower the 
     optreset = 1;
 #endif
     REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
-    const int n = 256; // copies draw with their own seeds: some draw the gapped locus
+    const int n = 256; // copies with their own draw seeds: none may draw a dropped locus
     const auto v = run_aln({"--meth", "-n", "5", "-l", "1024", "-R", "5"},
                            {write_fq_in(dir, "cert-gap.fq", std::vector<std::string>(n, read))}, fa, dir);
     REQUIRE((int)v.size() == n);
-    int gapped = 0;
     for (const auto &r : v) {
         CAPTURE(r.rname);
-        CHECK(r.mapq == 0);
-        const int x0 = std::stoi(tag_value(r, "X0:i"));
-        CHECK(x0 > 5); CHECK(x0 <= 32);
-        gapped += r.rname == "gap";
+        CHECK(r.rname == "gap");
+        CHECK(tag_value(r, "XT:A") == "U");
+        CHECK(tag_value(r, "X0:i") == "1");
+        CHECK(r.mapq > 0);
     }
-    CHECK(gapped > 0); // the case the ceiling must survive
 }
 
 TEST_CASE("aln_meth: a certificate counts only the best rows within the top-2 ceiling")
@@ -670,6 +668,48 @@ TEST_CASE("aln_meth: a certificate counts only the best rows within the top-2 ce
     CHECK(tag_value(v[0], "XT:A") == "R");
     CHECK(tag_value(v[0], "X0:i") == "3");
     CHECK(v[0].mapq == 0);
+}
+
+TEST_CASE("aln_meth: a certificate waits for the best stratum to be complete")
+{
+    // Default penalties (M 3, O 11, E 4); every locus costs 18 and is found in stratum 18. Six
+    // distinct loci with six transversions (six differences) are verified first, then one where the
+    // read lacks two bases and has a transversion (three differences). The gapped row sets the top-2
+    // ceiling at four differences, which drops the six mismatch loci: the read is a unique hit. With
+    // -R 5, a repeat certificate taken inside stratum 18, before the gapped row is verified, would
+    // count the six mismatch loci against a ceiling that is not final (X0:6, MAPQ 0).
+    bwa_tests::TempDir tmp{"aln_meth_cert_stratum"};
+    const std::string dir = tmp.path(), fa = dir + "/cert-stratum.fa";
+    uint32_t st = 3141;
+    const std::string read = aln_test::lcg_dna(st, 40);
+    auto tv = [](char b) { return b == 'A' ? 'T' : b == 'T' ? 'A' : b == 'C' ? 'G' : 'C'; };
+    std::vector<std::pair<std::string, std::string>> contigs;
+    for (int i = 0; i < 6; ++i) {
+        std::string mm = read;
+        for (int at : {1, 7, 13, 19, 25, 33}) mm[at + i] = tv(mm[at + i]);
+        contigs.push_back({"mm" + std::to_string(i), aln_test::lcg_dna(st, 100) + mm + aln_test::lcg_dna(st, 100)});
+    }
+    std::string gap = read;
+    gap[5] = tv(gap[5]);
+    gap = gap.substr(0, 12) + "CA" + gap.substr(12);
+    contigs.push_back({"gap", aln_test::lcg_dna(st, 100) + gap + aln_test::lcg_dna(st, 100)});
+    REQUIRE(aln_test::write_test_fasta(fa, contigs));
+    std::vector<std::string> index_args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &arg : index_args) argv.push_back(&arg[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
+    const auto v = run_aln({"--meth", "-n", "6", "-l", "1024", "-R", "5"},
+                           {write_fq_in(dir, "cert-stratum.fq", {read})}, fa, dir);
+    REQUIRE(v.size() == 1);
+    CHECK(v[0].rname == "gap");
+    CHECK(tag_value(v[0], "XT:A") == "U");
+    CHECK(tag_value(v[0], "X0:i") == "1");
+    CHECK(v[0].mapq > 0);
 }
 
 TEST_CASE("aln_meth: -N preserves best placements while retaining more worse costs")

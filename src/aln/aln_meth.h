@@ -141,9 +141,10 @@ struct aln_meth_alt_bound_t {
     int value = 0;
     bool valid = false;
 };
-/* A complete read whose row work ended on a saturation certificate (aln_meth_read_t::cert): REPEAT,
- * more than -R loci at the best cost (X0 is a lower bound, MAPQ 0); CROWDED, a unique best and at
- * least ALN_METH_CROWDED retained worse loci (X1 is a lower bound, MAPQ 0). */
+/* A complete read whose row work ended on a saturation certificate (aln_meth_read_t::cert), taken
+ * once its best stratum is complete: REPEAT, more than -R loci at the best cost (X0 their full
+ * count, MAPQ 0); CROWDED, a unique best and at least ALN_METH_CROWDED retained worse loci (X1 is
+ * a lower bound, MAPQ 0). */
 enum { ALN_METH_CERT_REPEAT = 1, ALN_METH_CERT_CROWDED = 2 };
 enum { ALN_METH_CROWDED = 255 };
 // Best loci that give MAPQ 0 under the TAPS/5base tie-break whichever has the fewest conversions:

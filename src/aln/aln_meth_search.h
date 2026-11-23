@@ -159,10 +159,9 @@ struct aln_meth_slot_t {
     // which meth_blind_strata takes the strata; the mirror table is not kept past that point.
     int cut = 0, flushed = 0, blind = 0, need_next = -1, top2_next = -1, blind_need = 0, mf_stop = 0;
     int64_t best = INT64_MAX, mf_best = INT64_MAX;
-    // cert: rows are verified stratum by stratum and certificates end the read (single-end, under
-    // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
-    // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
-    int cert = 0, collect = 0;
+    // cert: rows are verified stratum by stratum and certificates end the read once its best
+    // stratum is complete (single-end, under cut). ivs: every hit flushed, for the draw.
+    int cert = 0;
     std::vector<aln_meth_pend_t> ivs;
     uint64_t perm_rng = 0;
     uint64_t rng = 0, alignment_bytes = 0;
