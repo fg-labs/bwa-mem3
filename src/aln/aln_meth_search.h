@@ -141,10 +141,9 @@ struct aln_meth_slot_t {
     // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row. flushed: a
     // flush has run.
     int cut = 0, flushed = 0;
-    // cert: rows are verified stratum by stratum and certificates end the read (single-end, under
-    // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
-    // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
-    int cert = 0, collect = 0;
+    // cert: rows are verified stratum by stratum and certificates end the read once its best
+    // stratum is complete (single-end, under cut). ivs: every hit flushed, for the draw.
+    int cert = 0;
     std::vector<aln_meth_pend_t> ivs;
     uint64_t perm_rng = 0;
     int64_t best = INT64_MAX;

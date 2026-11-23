@@ -78,19 +78,14 @@ percentage points, and peak RSS rose by 0.7 to 1.1 GB because a repeat end keeps
 for pairing. Output without `--meth` is byte-identical: the cuts run only in the `--meth` search.
 
 Since [#786](https://github.com/fg-labs/bwa-mem3/pull/786), a single-end `aln --meth` read that
-takes those cuts verifies its rows stratum by stratum and ends on a saturation certificate once
-more rows cannot change stock's output: a *repeat* (more than `-R` best loci) or a *crowded* read
-(a unique best with at least 255 retained worse loci). See [`aln`](../cli/aln.md) for the
-conditions. A certified read has `MAPQ` 0. A repeat reports the verified count in `X0` (a lower
-bound) with no `X1`, and its primary (`POS`, `CIGAR`, strand) is drawn uniformly over every row
-of the hits that can hold a best row, not only the verified ones. A crowded read reports the
-verified count in `X1` (a lower bound). Other reads verify up to 16,384 rows instead of 4,596,
-so fewer reads end incomplete. On ultrashort EM-seq and 5-base slices (200,000 reads each, hg19,
-an x86_64 AVX-512 host, clang 19.1.7), every read complete without a certificate both with the
-certificates and in an uncut search with a 65,536-row lookup budget was identical, and every
-certified read had the same `MAPQ` (crowded reads also the same placement). Incomplete reads fell
-from 4.32% to 0.15% (EM-seq) and from 7.49% to 1.44% (5-base); about 11% of reads changed, almost
-all of them formerly incomplete reads and repeats. Paired-end `--meth` input keeps the previous
+takes those cuts verifies its rows stratum by stratum and, once its best stratum is complete (so
+the best loci and stock's top-2 difference ceiling are final), ends on a saturation certificate
+when more rows cannot change stock's output: a *repeat* (more than `-R` best loci) or a *crowded*
+read (a unique best with at least 255 retained worse loci). See [`aln`](../cli/aln.md) for the
+conditions. A certified read has `MAPQ` 0. A repeat reports the full best count in `X0` with no
+`X1`, and its primary (`POS`, `CIGAR`, strand) is drawn uniformly over the rows of the hits that
+can hold a best row. A crowded read reports the verified count in `X1` (a lower bound). Other
+reads verify up to 16,384 rows instead of 4,596, so fewer reads end incomplete. Paired-end `--meth` input keeps the previous
 search and is unchanged. Output without `--meth` is byte-identical.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
