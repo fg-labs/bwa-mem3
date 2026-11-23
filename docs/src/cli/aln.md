@@ -642,26 +642,31 @@ through `M*k`; a seeded read only when `k` is also at most `-k`
 
 **Saturation certificates (single-end).** Under the stock cuts, a single-end read's rows are
 verified stratum by stratum in converted score, narrow hits first and wide ones (more than 256
-rows) in a pseudo-random order seeded from the read, and the search ends as soon as more rows
-cannot change the stock output ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)):
+rows) in a pseudo-random order seeded from the read
+([#786](https://github.com/fg-labs/bwa-mem3/pull/786)). Once the best stratum is complete (the
+best cost `B` is below the current stratum), every row that can cost `B` is verified, so the best
+loci and the difference ceiling (their fewest differences plus one) are final. The search can
+then end under either rule below; every count is of the loci within the ceiling:
 
-- *repeat*: more than `-R` loci at the best cost `B`, with every lower stratum verified and `B`
-  at most the current one. MAPQ is 0 and `X0` is the verified count, a lower bound (`X1` is not
-  printed, as for stock's `-R` stop). Under the TAPS/5base tie-break the loci must have no
-  conversions, or number at least 179 (stock MAPQ is then 0 whichever has the fewest) with a best
-  cost below the read's `-n` mismatches. The primary is drawn uniformly over every row of the
-  hits that can hold a best row (rejection sampling, seeded from the read), verified or not,
-  among the best-cost rows within the verified loci's difference ceiling (their fewest
-  differences plus one). A drawn row is placed but not counted, and sets no ceiling. After 256
-  draws without such a row, the primary is drawn among the verified best loci instead.
+- *repeat*: more than `-R` loci at `B` (under the TAPS/5base tie-break, more than `-R` with the
+  fewest conversions). `X0` is the full best count and `X1` is not printed, as for stock's `-R`
+  stop. MAPQ is 0 with multiple best loci; at `-R 0`, a single best locus can certify with positive
+  stock MAPQ. The primary is selected by rejection sampling, seeded from the read: propose a
+  row uniformly over the hits that can hold a best row and accept only a best-cost row within
+  the ceiling, with the fewest conversions under the tie-break. After 256 unsuccessful attempts,
+  fall back to a reservoir draw among the retained best loci.
 - *crowded*: a unique best locus (under the TAPS/5base tie-break, a unique one among the best loci
   with the fewest conversions; not using all of `-n`, where stock MAPQ is 25) and at least 255
   retained worse loci: MAPQ 0, `X0` 1 and `X1` the verified count, a lower bound.
 
 Other reads verify every row up to a row budget of 16,384 (4,596 without the certificates: with
 `-N`, a negative penalty, `--known-snvs` or before pairing is decided for paired-end input). A
-tie-break repeat that neither certificate closes ends incomplete past 4,596 rows, as before. A
-read that reaches the budget without a certificate is incomplete, as below.
+tie-break repeat whose best stratum is still open (more than `-R` retained best-cost loci so far)
+ends incomplete once 4,596 rows have been looked up, as before; it need not have conversions.
+Otherwise the lookup budget makes a read incomplete only when it leaves a required interval
+unfinished, not merely when the last interval exactly fills the budget. While the best stratum
+is open, later conversion ties can increase the best count or a lower-conversion locus can
+decrease it, so the provisional `X0` and `X1` are not claimed even as lower bounds.
 
 **Path cost.** Each row is scored on the original reference along the search path that
 found it, as stock aln scores a hit by its path: the path's alignment (its gaps where the
@@ -821,8 +826,10 @@ so that batch resolves at most 64 more rows (in discovery order) to choose the
 best-known placement instead of spending the rest of the budget
 ([#777](https://github.com/fg-labs/bwa-mem3/pull/777)). A read verified with certificates
 resolves its rows 64 at a time, checking the certificates after each chunk, until a certificate
-ends it or the 16,384-row budget is spent; a read that spends it is incomplete, placed among the
-rows it resolved. `-N` does not remove these resource
+ends it or the 16,384-row budget leaves a required interval unfinished. Only the latter makes
+it incomplete, placed among the rows it resolved; exactly filling the budget with no required
+interval unfinished does not. The open-stratum tie-break give-up above still applies.
+`-N` does not remove these resource
 limits. Candidate CIGAR retention is capped cumulatively at 64 MiB per read: a read that reaches the cap is
 marked incomplete in the same way, stays unmapped if it has no retained placement,
 and later reads continue; the run does not exit. Window refinement (mate rescue, and

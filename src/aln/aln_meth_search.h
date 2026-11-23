@@ -134,6 +134,25 @@ enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t:
 // stock's -R stop under the cut (aln_meth_boundary), CERT a saturation certificate (a read with
 // aln_meth_slot_t::cert; one that gives up incomplete instead stops with LOOKUP)
 enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2, ALN_METH_STOP_TOP2 = 3, ALN_METH_STOP_CERT = 4 };
+// Once the best stratum closes, only retained worse loci can change the certificate counts.
+// Store mutations update their old/new contribution; a best-row mutation invalidates the snapshot.
+struct aln_meth_cert_counts_t {
+    int64_t best = INT64_MAX, ceiling = INT64_MAX, cut = INT64_MAX;
+    long c1 = 0, worse = 0;
+    int fewest = INT_MAX, only_mm = 0;
+    size_t n_occ = 0;
+    bool ready = false, gape = false;
+
+    void update(const aln_meth_occ_t *before, const aln_meth_occ_t &after, size_t size) {
+        if (!ready) return;
+        if (after.cost <= best || (before && before->cost <= best)) { ready = false; return; }
+        auto retained = [&](const aln_meth_occ_t &o) {
+            return o.cost <= cut && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
+        };
+        worse += (int)retained(after) - (int)(before && retained(*before));
+        n_occ = size;
+    }
+};
 struct aln_meth_slot_t {
     aln_meth_group_t *grp = nullptr;
     gap_job_t *job = nullptr;
@@ -159,10 +178,10 @@ struct aln_meth_slot_t {
     // which meth_blind_strata takes the strata; the mirror table is not kept past that point.
     int cut = 0, flushed = 0, blind = 0, need_next = -1, top2_next = -1, blind_need = 0, mf_stop = 0;
     int64_t best = INT64_MAX, mf_best = INT64_MAX;
-    // cert: rows are verified stratum by stratum and certificates end the read (single-end, under
-    // cut). collect: a repeat certificate fired inside the best stratum, which the search finishes
-    // to find its hits for the draw, without verifying them. ivs: every hit flushed, for the draw.
-    int cert = 0, collect = 0;
+    // cert: rows are verified stratum by stratum and certificates end the read once its best
+    // stratum is complete (single-end, under cut). ivs: every hit flushed, for the draw.
+    int cert = 0;
+    aln_meth_cert_counts_t cert_counts;
     std::vector<aln_meth_pend_t> ivs;
     uint64_t perm_rng = 0;
     uint64_t rng = 0, alignment_bytes = 0;

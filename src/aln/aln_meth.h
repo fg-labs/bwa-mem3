@@ -141,14 +141,13 @@ struct aln_meth_alt_bound_t {
     int value = 0;
     bool valid = false;
 };
-/* A complete read whose row work ended on a saturation certificate (aln_meth_read_t::cert): REPEAT,
- * more than -R loci at the best cost (X0 is a lower bound, MAPQ 0); CROWDED, a unique best and at
- * least ALN_METH_CROWDED retained worse loci (X1 is a lower bound, MAPQ 0). */
+/* A complete read whose row work ended on a saturation certificate (aln_meth_read_t::cert), taken
+ * once its best stratum is complete: REPEAT, more than -R loci at the best cost (fewest conversions
+ * under the tie-break): X0 their full count, X1 omitted, MAPQ 0 with multiple best loci (a single
+ * best can certify at -R 0 with positive stock MAPQ). CROWDED, a unique best and at least
+ * ALN_METH_CROWDED retained worse loci: X1 is a lower bound, MAPQ 0. */
 enum { ALN_METH_CERT_REPEAT = 1, ALN_METH_CERT_CROWDED = 2 };
 enum { ALN_METH_CROWDED = 255 };
-// Best loci that give MAPQ 0 under the TAPS/5base tie-break whichever has the fewest conversions:
-// stock MAPQ is 0 from 178 worse loci (bwa_approx_mapQ), and all but one are displaced to X1.
-enum { ALN_METH_SAT_ROWS = 179 };
 struct aln_meth_read_t {
     // The search's candidate loci; finishing the read moves the retained ones to hits and frees it.
     std::vector<aln_meth_occ_t> occ;

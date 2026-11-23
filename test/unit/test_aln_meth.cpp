@@ -548,12 +548,12 @@ TEST_CASE("aln_meth: converted repeats do not trigger a rescored -R early stop")
     CHECK(c[0].mapq == 0);
 }
 
-TEST_CASE("aln_meth: a repeat certificate reports X0 as a lower bound and draws its primary uniformly")
+TEST_CASE("aln_meth: a repeat certificate reports the full X0 and draws its primary uniformly")
 {
-    // Under collapsed scoring read_r has 31 exact loci. With -R 5 the search ends once more than 5 of
-    // them are verified (a repeat certificate): MAPQ 0, X0 the verified count (6 to 31), no X1. The
-    // primary is drawn over all 31, verified or not, per read: over 1,240 copies of the read every
-    // locus is drawn about 40 times (chi-square, 30 degrees of freedom, p < 0.001 at 59.7).
+    // Under collapsed scoring read_r has 31 exact loci. With -R 5 the search ends once the best
+    // stratum is complete with more than 5 of them (a repeat certificate): MAPQ 0, X0 the full count
+    // (31), no X1. The primary is drawn per read: over 1,240 copies of the read every locus is drawn
+    // about 40 times (chi-square, 30 degrees of freedom, p < 0.001 at 59.7).
     const int n = 31 * 40;
     const std::string fq = write_fq("cert-draw.fq", std::vector<std::string>(n, ref().read_r));
     const auto v = run_aln({"--meth=taps", "--meth-scoring", "collapsed", "-n", "2", "-l", "1024", "-R", "5"}, {fq});
@@ -562,12 +562,15 @@ TEST_CASE("aln_meth: a repeat certificate reports X0 as a lower bound and draws 
     for (const auto &r : v) {
         CHECK(r.mapq == 0);
         CHECK(tag_value(r, "XT:A") == "R");
-        const int x0 = std::stoi(tag_value(r, "X0:i"));
-        CHECK(x0 > 5); CHECK(x0 <= 31);
+        CHECK(tag_value(r, "X0:i") == "31");
         CHECK(r.tag.count("X1:i") == 0);
         ++drawn[r.rname + ":" + std::to_string(r.pos) + (r.flag & 16 ? "-" : "+")];
     }
-    CHECK(drawn.size() == 31u);
+    std::set<std::string> expected;
+    for (int k = 0; k < 31; ++k) expected.insert("c3:" + std::to_string(381 + 100 * k) + "+");
+    std::set<std::string> observed;
+    for (const auto &d : drawn) observed.insert(d.first);
+    CHECK(observed == expected);
     double chi2 = 0;
     for (const auto &d : drawn) chi2 += (d.second - 40.0) * (d.second - 40.0) / 40.0;
     CAPTURE(chi2);
@@ -593,13 +596,14 @@ TEST_CASE("aln_meth: a repeat certificate's draws do not depend on the thread co
     }
 }
 
-TEST_CASE("aln_meth: a repeat certificate's drawn gapped row does not lower the verified loci's ceiling")
+TEST_CASE("aln_meth: a gapped best row's ceiling drops equal-cost mismatch loci before any certificate")
 {
     // Default penalties (M 3, O 11, E 4): 31 loci where the read has five transversions (cost 15,
     // five differences) and one where it lacks two bases (cost 11 + 4 = 15, two differences). With
-    // -R 5 the repeat certificate fires in the cost-15 stratum, and the primary is drawn over all 32.
-    // A drawn gapped row is placed but not verified: it must neither set the top-2 ceiling (which
-    // would drop every verified locus, leaving X0:0 and a nonzero MAPQ) nor be counted.
+    // -R 5 a certificate waits for the cost-15 stratum to be complete, so the gapped row is verified
+    // and its top-2 ceiling (three differences) drops the 31 mismatch loci: every copy is a unique
+    // hit at the gapped locus, as stock's ceiling gives. A certificate inside the stratum would have
+    // counted the mismatch loci (X0 > 5, MAPQ 0).
     bwa_tests::TempDir tmp{"aln_meth_cert_gap"};
     const std::string dir = tmp.path(), fa = dir + "/cert-gap.fa";
     uint32_t st = 2718;
@@ -623,19 +627,17 @@ TEST_CASE("aln_meth: a repeat certificate's drawn gapped row does not lower the 
     optreset = 1;
 #endif
     REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
-    const int n = 256; // copies draw with their own seeds: some draw the gapped locus
+    const int n = 256; // copies with their own draw seeds: none may draw a dropped locus
     const auto v = run_aln({"--meth", "-n", "5", "-l", "1024", "-R", "5"},
                            {write_fq_in(dir, "cert-gap.fq", std::vector<std::string>(n, read))}, fa, dir);
     REQUIRE((int)v.size() == n);
-    int gapped = 0;
     for (const auto &r : v) {
         CAPTURE(r.rname);
-        CHECK(r.mapq == 0);
-        const int x0 = std::stoi(tag_value(r, "X0:i"));
-        CHECK(x0 > 5); CHECK(x0 <= 32);
-        gapped += r.rname == "gap";
+        CHECK(r.rname == "gap");
+        CHECK(tag_value(r, "XT:A") == "U");
+        CHECK(tag_value(r, "X0:i") == "1");
+        CHECK(r.mapq > 0);
     }
-    CHECK(gapped > 0); // the case the ceiling must survive
 }
 
 TEST_CASE("aln_meth: a certificate counts only the best rows within the top-2 ceiling")
@@ -684,6 +686,48 @@ TEST_CASE("aln_meth: a certificate counts only the best rows within the top-2 ce
     CHECK(tag_value(v[0], "XT:A") == "R");
     CHECK(tag_value(v[0], "X0:i") == "3");
     CHECK(v[0].mapq == 0);
+}
+
+TEST_CASE("aln_meth: a certificate waits for the best stratum to be complete")
+{
+    // Default penalties (M 3, O 11, E 4); every locus costs 18 and is found in stratum 18. Six
+    // distinct loci with six transversions (six differences) are verified first, then one where the
+    // read lacks two bases and has a transversion (three differences). The gapped row sets the top-2
+    // ceiling at four differences, which drops the six mismatch loci: the read is a unique hit. With
+    // -R 5, a repeat certificate taken inside stratum 18, before the gapped row is verified, would
+    // count the six mismatch loci against a ceiling that is not final (X0:6, MAPQ 0).
+    bwa_tests::TempDir tmp{"aln_meth_cert_stratum"};
+    const std::string dir = tmp.path(), fa = dir + "/cert-stratum.fa";
+    uint32_t st = 3141;
+    const std::string read = aln_test::lcg_dna(st, 40);
+    auto tv = [](char b) { return b == 'A' ? 'T' : b == 'T' ? 'A' : b == 'C' ? 'G' : 'C'; };
+    std::vector<std::pair<std::string, std::string>> contigs;
+    for (int i = 0; i < 6; ++i) {
+        std::string mm = read;
+        for (int at : {1, 7, 13, 19, 25, 33}) mm[at + i] = tv(mm[at + i]);
+        contigs.push_back({"mm" + std::to_string(i), aln_test::lcg_dna(st, 100) + mm + aln_test::lcg_dna(st, 100)});
+    }
+    std::string gap = read;
+    gap[5] = tv(gap[5]);
+    gap = gap.substr(0, 12) + "CA" + gap.substr(12);
+    contigs.push_back({"gap", aln_test::lcg_dna(st, 100) + gap + aln_test::lcg_dna(st, 100)});
+    REQUIRE(aln_test::write_test_fasta(fa, contigs));
+    std::vector<std::string> index_args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &arg : index_args) argv.push_back(&arg[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
+    const auto v = run_aln({"--meth", "-n", "6", "-l", "1024", "-R", "5"},
+                           {write_fq_in(dir, "cert-stratum.fq", {read})}, fa, dir);
+    REQUIRE(v.size() == 1);
+    CHECK(v[0].rname == "gap");
+    CHECK(tag_value(v[0], "XT:A") == "U");
+    CHECK(tag_value(v[0], "X0:i") == "1");
+    CHECK(v[0].mapq > 0);
 }
 
 TEST_CASE("aln_meth: -N preserves best placements while retaining more worse costs")
@@ -2797,6 +2841,430 @@ TEST_CASE("aln_meth: identical reads with different --known-snvs candidates do n
     }
     ba::bwa_free_read_seq(n,reads); ba::bwa_seq_close(input);
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
+TEST_CASE("aln_meth: the work report distinguishes certificates from ordinary repeats")
+{
+    namespace ba = bwa_aln;
+    ba::aln_meth_read_t result[4];
+    result[0].c1 = 31; // ordinary repeat, not a certificate
+    result[1].cert = ba::ALN_METH_CERT_REPEAT;
+    result[2].cert = ba::ALN_METH_CERT_CROWDED;
+    result[3].flags = ba::ALN_METH_BIND_BEST;
+    const int verbose = bwa_verbose;
+    bwa_verbose = 4;
+    std::string text;
+    {
+        bwa_tests::StderrCapture capture;
+        ba::aln_meth_report(1, 4, result);
+        text = capture.text();
+    }
+    bwa_verbose = verbose;
+    CHECK(text.find("; 1 repeat certificates; 1 crowded certificates;") != std::string::npos);
+}
+
+TEST_CASE("aln_meth: certificate score and ordinary-budget boundaries preserve give-up decisions")
+{
+    namespace ba = bwa_aln;
+    for (bool conversions : {false, true})
+        for (int next : {2, 3, 4})
+            for (int budget : {0, 4596, 5000})
+                for (int lookups : {0, 4595, 4596, 4597, 5000}) {
+                    CAPTURE(conversions); CAPTURE(next); CAPTURE(budget); CAPTURE(lookups);
+                    auto *opt = ba::gap_init_opt();
+                    opt->max_top2 = 30; opt->max_diff = 5;
+                    ba::aln_meth_opt_t mo;
+                    mo.p_best = budget; mo.p_second = 0;
+                    mo.m.meth_chem = conversions ? METH_CHEM_TAPS : METH_CHEM_EMSEQ;
+                    mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+                    ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo;
+                    ba::gap_job_t job = {}; job.opt = *opt;
+                    job.max_diff = 5; job.score_cut = INT_MAX;
+                    ba::aln_meth_read_t result; result.n_lookups = lookups;
+                    ba::aln_meth_slot_t slot;
+                    slot.grp = &group; slot.job = &job; slot.res = &result;
+                    slot.best = 3; slot.max_diff = 5; slot.cert = slot.cut = 1;
+                    for (int i = 0; i < 32; ++i) {
+                        ba::aln_meth_occ_t row;
+                        row.cost = 3; row.n_mm = row.n_conv = 1;
+                        row.pos = row.alignment.rb = 100 * i;
+                        result.occ.push_back(row);
+                    }
+                    const bool repeat = next > 3;
+                    const bool give_up = next == 3 && conversions && lookups >= budget;
+                    CHECK(ba::aln_meth_boundary(&slot, next) == (repeat || give_up));
+                    CHECK(result.cert == (repeat ? ba::ALN_METH_CERT_REPEAT : 0));
+                    CHECK(result.flags == (give_up ? ba::ALN_METH_BIND_BEST : 0));
+                    CHECK(slot.stop == (repeat ? ba::ALN_METH_STOP_CERT : give_up ? ba::ALN_METH_STOP_LOOKUP : 0));
+                    CHECK(result.n_lookups == lookups);
+                    free(opt);
+                }
+}
+
+TEST_CASE("aln_meth: closed certificate counts follow real stored insertions and replacements")
+{
+    namespace ba = bwa_aln;
+    // 254 one-mismatch loci, one exact best, and a locus first reached with a deletion.
+    // Its 1M1D31M path costs 3 (outside best + M); its 32M path costs 1 (inside).
+    bwa_tests::TempDir tmp{"aln_meth_cert_store"};
+    const std::string fa = tmp.path() + "/ref.fa", read = "G" + std::string(31, 'A');
+    std::string worse = read; worse[16] = 'C';
+    std::string outside = worse; outside[20] = 'C';
+    std::string genome;
+    std::vector<int64_t> positions;
+    auto append = [&](const std::string &s) {
+        positions.push_back(genome.size());
+        genome += s + std::string(32, 'C');
+    };
+    for (int i = 0; i < 254; ++i) append(worse);
+    append(read); // 254: exact best
+    append("GC" + std::string(31, 'A')); // 255: replacement target
+    append(outside); // 256: insertion outside best + M
+    append(worse); // 257: insertion inside best + M
+    append(outside); // 258: a found ALT window, resolved only at finish
+    REQUIRE(aln_test::write_test_fasta(fa, {{"loci", genome}}));
+    std::vector<std::string> args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &s : args) argv.push_back(&s[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)args.size(), argv.data()) == 0);
+    FMI_search fmi((fa + ".meth").c_str()); fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, fa.c_str(), fmi.idx->bns, 1) == 0);
+    // Map these forward OT windows to real SA rows once; no injected occurrences or SA cache.
+    std::vector<bwtint_t> rows(positions.size(), (bwtint_t)-1);
+    bwtint_t deletion_row = (bwtint_t)-1;
+    for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
+        int strand = 0;
+        const auto sa = ba::bwt_sa(bwt, k);
+        const auto del_pos = ba::bwa_pos_from_sa(mr.conv_bns, sa, 33, &strand);
+        if (del_pos == (bwtint_t)(mr.conv_bns->anns[1].offset + positions[255]) && !strand)
+            deletion_row = k;
+        const auto pos = ba::bwa_pos_from_sa(mr.conv_bns, sa, 32, &strand);
+        if (pos == (bwtint_t)-1 || strand || bns_pos2rid(mr.conv_bns, pos) != 1) continue;
+        const int64_t rb = pos - mr.conv_bns->anns[1].offset;
+        const auto at = std::lower_bound(positions.begin(), positions.end(), rb);
+        if (at != positions.end() && *at == rb) rows[at - positions.begin()] = k;
+    }
+    for (auto row : rows) REQUIRE(row != (bwtint_t)-1);
+    REQUIRE(deletion_row != (bwtint_t)-1);
+    const auto fq = write_fq_in(tmp.path(), "read.fq", {read});
+    auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+    auto *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1);
+    auto *opt = ba::gap_init_opt();
+    opt->s_mm = 1; opt->s_gapo = 3; opt->s_gape = 1;
+    opt->max_diff = 5; opt->max_top2 = 30;
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group;
+    group.opt = opt; group.mo = &mo; group.ref = &mr; group.bwt = bwt;
+    group.n_slots = 1; group.slot.resize(1);
+    ba::gap_slot_core_t core = {}; group.cores = &core;
+    core.job.opt = *opt; core.job.max_diff = 5; core.job.score_cut = INT_MAX;
+    auto &slot = group.slot[0]; slot.grp = &group; slot.job = &core.job;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 5, 0);
+    // Populate before closure, without the cuts, so even the cost-3 path is stored.
+    slot.cert = slot.cut = 0;
+    ba::gap_entry_t exact = {}, deletion = {};
+    deletion.n_del = deletion.n_gapo = 1;
+    deletion.last_diff_pos = (int)ALN_METH_GAP(30, 1, 1); // deletion after the first query base
+    auto flush = [&] {
+        core.state = ba::GAP_SLOT_PARKED;
+        ba::aln_meth_flush_parked(&group);
+    };
+    for (int i = 0; i < 255; ++i) ba::aln_meth_hit(&slot, &exact, rows[i], rows[i]);
+    ba::aln_meth_hit(&slot, &deletion, deletion_row, deletion_row);
+    flush();
+    REQUIRE(result.occ.size() == 256);
+    REQUIRE(result.occ.back().cost == 3);
+    REQUIRE(result.occ.back().n_gapo == 1);
+    slot.cert = slot.cut = 1;
+    CHECK(ba::aln_meth_boundary(&slot, 1) == 0);
+    CHECK(slot.cert_counts.worse == 254);
+    CHECK(result.cert == 0);
+    // Leave cuts off so the losing path and out-of-window insertion reach real storage.
+    slot.cut = 0;
+    deletion.last_diff_pos = (int)ALN_METH_GAP(29, 1, 1);
+    ba::aln_meth_hit(&slot, &deletion, deletion_row, deletion_row);
+    ba::aln_meth_hit(&slot, &exact, rows[256], rows[256]);
+    flush();
+    CHECK(result.occ.size() == 257);
+    CHECK(result.occ[255].cost == 3);
+    CHECK(ba::aln_meth_boundary(&slot, 1) == 0);
+    CHECK(slot.cert_counts.worse == 254);
+    slot.cut = 1;
+    SUBCASE("a same-size winning replacement enters the count") {
+        ba::aln_meth_hit(&slot, &exact, rows[255], rows[255]);
+        flush();
+        REQUIRE(result.occ.size() == 257);
+        CHECK(result.occ[255].cost == 1);
+        CHECK(result.occ[255].n_mm == 1);
+        CHECK(result.occ[255].n_gapo == 0);
+    }
+    SUBCASE("an insertion enters the count") {
+        ba::aln_meth_hit(&slot, &exact, rows[257], rows[257]);
+        flush();
+        CHECK(result.occ.size() == 258);
+    }
+    CHECK(ba::aln_meth_boundary(&slot, 1) == 1);
+    CHECK(slot.cert_counts.worse == 255);
+    CHECK(result.cert == ba::ALN_METH_CERT_CROWDED);
+    CHECK(result.flags == 0);
+    // Finish must still resolve found windows after a certificate: this ALT removes one of
+    // the outside locus's two mismatches, so the retained worse count becomes 256.
+    ba::ks_sites_t sites;
+    sites.by_contig = {{{positions[258] + 20, 1, 0}}};
+    sites.n_sites = 1; mr.known_snvs = &sites;
+    std::vector<ba::aln_meth_candidate_t> extra = {{0, 0, 1, positions[258], positions[258] + 32}};
+    extra[0].cig = {32u << 4};
+    slot.extra = &extra;
+    slot.keep = ba::ALN_METH_KEEP_STRATA;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK_FALSE(slot.cert_counts.ready);
+    CHECK(result.c1 == 1);
+    CHECK(result.c2 == 256);
+    CHECK(result.n_rescored == 261);
+    REQUIRE(result.hits.size() == 257);
+    CHECK(result.hits.back().pos == positions[258]);
+    CHECK(result.hits.back().alt != 0);
+    CHECK(result.hits.back().cost == 1);
+    CHECK(result.hits.back().n_mm == 1);
+    REQUIRE(result.main >= 0);
+    CHECK(result.hits[result.main].pos == positions[254]);
+    free(opt); ba::bwt_destroy(bwt); ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+}
+
+TEST_CASE("aln_meth: finishing ends the certificate cache lifetime on every return path")
+{
+    namespace ba = bwa_aln;
+    auto *opt = ba::gap_init_opt(); opt->max_diff = 5; opt->max_top2 = 1;
+    ba::aln_meth_opt_t mo;
+    bntseq_t bns = {};
+    ba::aln_meth_ref_t reference; reference.bns = &bns;
+    ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo; group.ref = &reference;
+    ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 5; job.score_cut = INT_MAX;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group; slot.job = &job; slot.res = &result;
+    slot.best = 3; slot.max_diff = 5; slot.cert = slot.cut = 1;
+    ba::aln_meth_occ_t best; best.cost = 3; best.n_mm = 1;
+    best.pos = best.alignment.rb = 100; best.alignment.re = 120;
+    best.alignment.cigar = {20u << 4};
+    auto worse = best; worse.cost = 6; worse.n_mm = 2;
+    worse.pos = worse.alignment.rb = 200; worse.alignment.re = 220;
+    result.occ = {best, worse};
+    bool empty = false, repeat = false;
+    SUBCASE("empty early return") { result.occ.clear(); empty = true; }
+    SUBCASE("trimmed result") { group.max_xa_hits = 0; }
+    SUBCASE("retained strata") { slot.keep = ba::ALN_METH_KEEP_STRATA; }
+    SUBCASE("retained duplicate-copy loci") { slot.keep = ba::ALN_METH_KEEP_COPIES; }
+    SUBCASE("repeat certificate with verified-locus fallback") {
+        result.occ[1] = best;
+        result.occ[1].pos = result.occ[1].alignment.rb = 200;
+        result.occ[1].alignment.re = 220;
+        repeat = true;
+    }
+    CHECK(ba::aln_meth_boundary(&slot, 4) == (repeat ? 1 : 0));
+    REQUIRE(slot.cert_counts.ready);
+    ba::aln_meth_slot_finish(&slot);
+    CHECK_FALSE(slot.cert_counts.ready);
+    CHECK(result.flags == 0);
+    CHECK(result.c1 == (empty ? 0 : repeat ? 2 : 1));
+    CHECK(result.c2 == (empty || repeat ? 0 : 1));
+    if (empty) {
+        CHECK(result.main == -1);
+        CHECK(result.hits.empty());
+    } else {
+        REQUIRE(result.main >= 0);
+        CHECK(result.hits.size() == (group.max_xa_hits == 0 ? 1 : 2));
+        CHECK(result.hits[result.main].cost == 3);
+        CHECK(cigar_of(result, result.hits[result.main]) == std::vector<uint32_t>{20u << 4});
+    }
+    if (slot.keep == ba::ALN_METH_KEEP_COPIES || repeat) {
+        ba::aln_meth_read_t copy;
+        ba::aln_meth_copy_dup(&copy, &result, 17, 1, 3);
+        CHECK(copy.c1 == result.c1);
+        CHECK(copy.c2 == result.c2);
+        REQUIRE(copy.main >= 0);
+        CHECK(copy.hits.size() == 2);
+        CHECK(copy.hits[copy.main].cost == 3);
+    }
+    free(opt);
+}
+
+TEST_CASE("aln_meth: a reused slot cannot reuse a previous read's certificate counts")
+{
+    namespace ba = bwa_aln;
+    auto *opt = ba::gap_init_opt(); opt->max_top2 = 1;
+    ba::aln_meth_opt_t mo;
+    bntseq_t bns = {};
+    ba::aln_meth_ref_t reference; reference.bns = &bns;
+    ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo; group.ref = &reference;
+    ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 5; job.score_cut = INT_MAX;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group; slot.job = &job; slot.res = &result;
+    slot.best = 3; slot.max_diff = 5; slot.cert = slot.cut = 1;
+    ba::aln_meth_occ_t best; best.cost = 3; best.n_mm = 1;
+    auto worse = best; worse.cost = 6; worse.n_mm = 2;
+    result.occ = {best, worse};
+    CHECK(ba::aln_meth_boundary(&slot, 4) == 0);
+    ubyte_t bases[] = {0};
+    ba::bwa_seq_t read = {}; read.len = 1; read.seq = read.rseq = bases;
+    ba::aln_meth_slot_start(&slot, &read, &result, 1, 5, 0);
+    slot.best = 3;
+    result.occ = {best, best}; // same size and best cost as the previous read, different best count
+    CHECK(ba::aln_meth_boundary(&slot, 4) == 1);
+    CHECK(result.cert == ba::ALN_METH_CERT_REPEAT);
+    CHECK(result.flags == 0);
+    free(opt);
+}
+
+TEST_CASE("aln_meth: 179 conversion ties do not finish an observable worse count")
+{
+    // One conversion winner among 179 cost-3 loci leaves X1 at 178. A pending cost-6 locus
+    // is within best + M and the two-difference ceiling: it must still be counted, not certified away.
+    namespace ba = bwa_aln;
+    auto *opt = ba::gap_init_opt();
+    opt->max_diff = 2; opt->max_top2 = 5;
+    ba::aln_meth_opt_t mo;
+    mo.m.meth_chem = METH_CHEM_TAPS;
+    mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo;
+    ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 2; job.score_cut = INT_MAX;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group; slot.job = &job; slot.res = &result;
+    slot.best = 3; slot.max_diff = 2; slot.cert = slot.cut = slot.keep = 1;
+    for (int i = 0; i < 179; ++i) {
+        ba::aln_meth_occ_t o{};
+        o.cost = 3; o.n_mm = 1; o.n_conv = i ? 1 : 0;
+        o.pos = o.alignment.rb = 100 * i;
+        result.occ.push_back(o);
+    }
+    CHECK(ba::aln_meth_boundary(&slot, 6) == 0);
+    CHECK(result.cert == 0);
+    CHECK(slot.stop == 0);
+    ba::aln_meth_occ_t pending{};
+    pending.cost = 6; pending.n_mm = 2; pending.pos = pending.alignment.rb = 20000;
+    result.occ.push_back(pending);
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.flags == 0);
+    CHECK(result.c1 == 1);
+    CHECK(result.c2 == 179);
+    CHECK(result.hits.size() == 180);
+    free(opt);
+}
+
+TEST_CASE("aln_meth: an open conversion stratum can change either best count direction")
+{
+    // The first 179 ties have one winner at conversion count 1. More ties at that floor can
+    // exceed -R; a later zero-conversion locus can instead demote several provisional winners.
+    namespace ba = bwa_aln;
+    struct Case { int initial_best, pending_conv, pending_n, want_c1, want_c2; };
+    for (const Case &c : {Case{1, 1, 5, 6, 178}, Case{5, 0, 1, 1, 179}}) {
+        CAPTURE(c.initial_best); CAPTURE(c.pending_conv);
+        auto *opt = ba::gap_init_opt(); opt->max_diff = 2; opt->max_top2 = 5;
+        ba::aln_meth_opt_t mo;
+        mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+        ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo;
+        ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 2; job.score_cut = INT_MAX;
+        ba::aln_meth_read_t result;
+        ba::aln_meth_slot_t slot;
+        slot.grp = &group; slot.job = &job; slot.res = &result;
+        slot.best = 3; slot.max_diff = 2; slot.cert = slot.cut = slot.keep = 1;
+        auto add = [&](int conv) {
+            ba::aln_meth_occ_t o{};
+            o.cost = 3; o.n_mm = 1; o.n_conv = conv;
+            o.pos = o.alignment.rb = 100 * result.occ.size();
+            result.occ.push_back(o);
+        };
+        for (int i = 0; i < 179; ++i) add(i < c.initial_best ? 1 : 2);
+        CHECK(ba::aln_meth_boundary(&slot, 3) == 0);
+        CHECK(result.cert == 0);
+        for (int i = 0; i < c.pending_n; ++i) add(c.pending_conv);
+        // Finish the whole stratum before its best count can certify.
+        CHECK(ba::aln_meth_boundary(&slot, 4) == (c.want_c1 > 5 ? 1 : 0));
+        CHECK(result.cert == (c.want_c1 > 5 ? ba::ALN_METH_CERT_REPEAT : 0));
+        // No draw intervals are needed here: the fallback uses the fully verified set.
+        ba::aln_meth_slot_finish(&slot);
+        CHECK(result.c1 == c.want_c1);
+        CHECK(result.c2 == c.want_c2);
+        free(opt);
+    }
+}
+
+TEST_CASE("aln_meth: a repeat draw ignores the conversion floor of dropped rows")
+{
+    namespace ba = bwa_aln;
+    const std::string fq = write_fq("cert-floor.fq", {conv(ref().c1.substr(501, 50), 'C', 'T')});
+    auto *input = ba::bwa_seq_open(fq.c_str());
+    REQUIRE(input != nullptr);
+    int n = 0;
+    auto *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 1); REQUIRE(reads != nullptr);
+    FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt(); opt->s_mm = 1; opt->s_gapo = 3; opt->s_gape = 1; opt->max_top2 = 0;
+    ba::aln_meth_opt_t mo;
+    mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group; group.bwt = bwt; group.ref = &mr; group.opt = opt; group.mo = &mo;
+    group.n_slots = 1; group.slot.resize(1);
+    ba::gap_slot_core_t core = {}; core.job.opt = *opt; core.job.max_diff = 3;
+    group.cores = &core;
+    auto &slot = group.slot[0]; slot.grp = &group; slot.job = &core.job;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 1);
+    bwtint_t row = (bwtint_t)-1;
+    for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
+        int strand = 0;
+        const auto pos = ba::bwa_pos_from_sa(mr.conv_bns, ba::bwt_sa(bwt, k), 51, &strand);
+        if (pos == (bwtint_t)(mr.conv_bns->anns[1].offset + 500) && strand == 0) { row = k; break; }
+    }
+    REQUIRE(row != (bwtint_t)-1);
+    ba::gap_entry_t leading_del = {};
+    leading_del.n_del = leading_del.n_gapo = 1;
+    leading_del.last_diff_pos = (int)ALN_METH_GAP(49, 1, 1);
+    ba::aln_meth_hit(&slot, &leading_del, row, row);
+    core.state = ba::GAP_SLOT_PARKED;
+    ba::aln_meth_flush_parked(&group);
+    REQUIRE(result.occ.size() == 1);
+    REQUIRE(result.occ[0].cost == 3);
+    REQUIRE(result.occ[0].n_conv > 0);
+    REQUIRE(result.occ[0].n_gapo == 1);
+    // Equal cost, but three differences exceeds the gapped best's ceiling of two. Its zero
+    // conversions must not make the one real eligible row fail every rejection-sampling attempt.
+    auto dropped = result.occ[0];
+    dropped.n_gapo = dropped.n_gape = 0; dropped.n_mm = 3; dropped.n_conv = 0;
+    dropped.pos = dropped.alignment.rb = 100;
+    result.occ.push_back(dropped);
+    REQUIRE(ba::aln_meth_boundary(&slot, 4) == 1);
+    REQUIRE(result.cert == ba::ALN_METH_CERT_REPEAT);
+    const std::vector<int64_t> copies = {1}; slot.copy_ords = &copies;
+    ba::aln_meth_slot_finish(&slot);
+    CHECK(result.c1 == 1);
+    CHECK(result.c2 == 0);
+    REQUIRE(result.copy_draw.size() == 1);
+    CHECK(result.copy_draw[0].ord == 1);
+    CHECK(result.copy_draw[0].rid == 0);
+    CHECK(result.copy_draw[0].hyp == 1);
+    CHECK(result.copy_draw[0].strand == 0);
+    // Display drops the leading deletion, so the alignment starts at genomic offset 501.
+    CHECK(result.copy_draw[0].pos == (bwtint_t)(mr.bns->anns[0].offset + 501));
+    ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt); free(opt);
+    ba::bwa_free_read_seq(n, reads); CHECK(ba::bwa_seq_close(input) == 0);
 }
 
 TEST_CASE("aln_meth: the -R stop counts only best loci within the final difference ceiling")

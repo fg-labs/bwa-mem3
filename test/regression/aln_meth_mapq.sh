@@ -759,10 +759,14 @@ echo 'PASS: blind-genomic-identity'
 # has nothing to lower, whether or not the mirror-free strata are known where the read ends).
 for pen in '' '-M 5 -O 3 -E 1'; do
     # shellcheck disable=SC2086 # pen is a list of options
-    run cert.scoring --meth --meth-mapq scoring -R 5 $pen "$tmp/rep.fa" "$tmp/rep1.fq"
+    run cert.scoring --meth --meth-mapq scoring -v 4 -R 5 $pen "$tmp/rep.fa" "$tmp/rep1.fq"
     # shellcheck disable=SC2086
-    run cert.blind --meth -R 5 $pen "$tmp/rep.fa" "$tmp/rep1.fq"
+    run cert.blind --meth -v 4 -R 5 $pen "$tmp/rep.fa" "$tmp/rep1.fq"
     for mode in scoring blind; do
+        grep -qE '; [1-9][0-9]* repeat certificates;' "$tmp/cert.$mode.err" || {
+            echo "FAIL: blind-certificate ($pen): $mode does not reach a repeat certificate" >&2
+            exit 1
+        }
         [ "$(wc -l < "$tmp/cert.$mode.rec")" -eq 60 ] || {
             echo "FAIL: blind-certificate ($pen): $mode does not give 60 records" >&2
             exit 1

@@ -353,21 +353,22 @@ static void blind_note(aln_meth_slot_t *x, int next, int64_t c, bool stopping)
 /* --meth-mapq conversion-blind: a saturation certificate of kind k ends the read's row work at
  * converted score s (aln_meth_certify), as it does under --meth-mapq scoring, so rows the
  * mirror-free strata need can be left unresolved. Every row below s is resolved, and a row not
- * yet resolved costs at least s mirror-free. The strata are known when s is past B_mf + M (no row
- * they need is left), or when a repeat certificate (this search's -R stop) comes with the
- * mirror-free best stratum complete (B_mf < s, so B_mf and the loci at it are final, as at
- * blind_note_need's boundary) and more than -R loci at B_mf within the mirror-free ceiling: a
- * mirror-free run is a repeat there or earlier in the same search, and its strata past that are
- * partial, as stock's are past a -R stop. Otherwise they are unknown (blind_need) and the cap is
- * 0. A mirror-free -R stop taken before (mf_stop) keeps its rows. Like the other observers it
- * writes only blind_need, so the search is that of --meth-mapq scoring. */
+ * yet resolved costs at least s mirror-free. A certificate needs the best stratum complete
+ * (B < s), so the mirror-free one is too (B_mf <= B), and B_mf and the loci at it are final, as
+ * at blind_note_need's boundary. The strata are known when s is past B_mf + M (no row they need
+ * is left), or when a repeat certificate (this search's -R stop) comes with more than -R loci at
+ * B_mf within the mirror-free ceiling: a mirror-free run is a repeat there or earlier in the same
+ * search, and its strata past that are partial, as stock's are past a -R stop. Otherwise they are
+ * unknown (blind_need) and the cap is 0. A mirror-free -R stop taken before (mf_stop) keeps its
+ * rows. Like the other observers it writes only blind_need, so the search is that of
+ * --meth-mapq scoring. */
 static __attribute__((noinline)) void blind_note_cert(aln_meth_slot_t *x, int s, int k)
 {
     if (x->mf_stop) return;
     const gap_opt_t &opt = x->job->opt;
     const blind_top_t t = blind_top(x);
     if (t.best == INT64_MAX || (int64_t)s > t.best + opt.s_mm) return;
-    if (k == ALN_METH_CERT_REPEAT && t.best < s && t.n > opt.max_top2) return;
+    if (k == ALN_METH_CERT_REPEAT && t.n > opt.max_top2) return;
     x->blind_need = 1;
 }
 /* Stock's top-2 ceiling from the stored rows: the fewest differences of a verified row at the best
@@ -376,80 +377,84 @@ static __attribute__((noinline)) void blind_note_cert(aln_meth_slot_t *x, int s,
  * not set it. slot_finish takes the same ceiling. */
 static int64_t best_ceiling(const aln_meth_slot_t *x)
 {
+    const auto &counts = x->cert_counts;
+    if (counts.ready && counts.best == x->best && counts.n_occ == x->res->occ.size()) return counts.ceiling;
     const bool gape = x->grp->opt->mode & BWA_MODE_GAPE;
     int64_t fewest_d = INT64_MAX;
     for (const auto &o : x->res->occ)
         if (o.cost == x->best && !o.drawn) fewest_d = std::min(fewest_d, (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0));
     return fewest_d >= INT_MAX - 1 ? INT_MAX : fewest_d + 1;
 }
+// Build once at closure. Later store_row calls maintain the worse-locus count without rescanning.
+static const aln_meth_cert_counts_t &cert_counts(aln_meth_slot_t *x)
+{
+    auto &c = x->cert_counts;
+    if (c.ready && c.best == x->best && c.n_occ == x->res->occ.size()) return c;
+    c = aln_meth_cert_counts_t();
+    c.best = x->best;
+    c.ceiling = best_ceiling(x);
+    c.cut = c.best + (int64_t)x->job->opt.s_mm;
+    c.gape = x->job->opt.mode & BWA_MODE_GAPE;
+    const bool conv = conv_tiebreak(x->grp->mo);
+    auto kept = [&](const aln_meth_occ_t &o) {
+        return (int64_t)o.n_mm + o.n_gapo + (c.gape ? o.n_gape : 0) <= c.ceiling;
+    };
+    for (const auto &o : x->res->occ)
+        if (o.cost == c.best && kept(o)) c.fewest = std::min(c.fewest, o.n_conv);
+    for (const auto &o : x->res->occ) {
+        if (!kept(o)) continue;
+        if (o.cost == c.best && (!conv || o.n_conv == c.fewest)) { ++c.c1; c.only_mm = o.n_mm; }
+        else if (o.cost >= c.best && o.cost <= c.cut) ++c.worse;
+    }
+    c.n_occ = x->res->occ.size();
+    c.ready = true;
+    return c;
+}
 enum { ALN_METH_GIVE_UP = 3 }; // cert_kind: the read ends incomplete instead
 /* The saturation certificates, for a read whose rows of converted score below s are all verified
- * (and some of score s). Each states that more rows cannot change the stock output:
- * - repeat: more than -R loci at the best cost B, with B <= s, so B is the true best: X0 > -R and
- *   MAPQ 0, as when stock's top2b stop ends its search (X0 is a lower bound). Under the TAPS/5base
- *   tie-break the loci must have no conversions, the fewest any can have, or number at least
- *   ALN_METH_SAT_ROWS (below).
- * - crowded: B < s, so the best set is complete; one best locus whose mismatches are not the read's
- *   full -n (stock's MAPQ 25 case), and ALN_METH_CROWDED retained worse loci: MAPQ 0 (X1 is a lower
- *   bound).
- * Every count is of the rows the finish keeps: those within the top-2 ceiling of the verified best
- * rows (best_ceiling), as aln_meth_boundary counts for -R. No row is verified after a certificate,
- * so the finish takes the ceiling the certificate saw.
- * Returns 1 when the search ends: a crowded read, or a repeat with B < s. A repeat with B == s
- * finishes stratum B without verifying its rows (collect), so the draw sees every hit that can hold
- * a best row. */
+ * (and some of score s). Each needs the best stratum complete, B < s: every row that can cost B is
+ * verified, so the best set and its top-2 ceiling (best_ceiling) are final, as aln_meth_boundary
+ * requires for the ceiling and -R. Inside the best stratum a row not yet verified could cost B with
+ * fewer differences and lower the ceiling, dropping rows a count had taken. The stopping rules:
+ * - repeat: more than -R loci at B (under the TAPS/5base tie-break, with the fewest conversions):
+ *   X0 is final and X1 is omitted, as at stock's top2b stop. MAPQ is 0 with multiple best loci;
+ *   one best locus can certify at -R 0 with positive stock MAPQ.
+ * - crowded: one best locus whose mismatches are not the read's full -n (stock's MAPQ 25 case), and
+ *   ALN_METH_CROWDED retained worse loci: MAPQ 0 (X1 is a lower bound).
+ * Every count is of the rows the finish keeps: those within the ceiling. Returns the certificate,
+ * ALN_METH_GIVE_UP for a tie-break repeat past the default budget, or 0. */
 static int cert_kind(aln_meth_slot_t *x, int s)
 {
     if (x->best == INT64_MAX) return 0;
     const int64_t B = x->best;
     const gap_opt_t &opt = x->job->opt;
     const bool conv = conv_tiebreak(x->grp->mo), gape = opt.mode & BWA_MODE_GAPE;
-    const int64_t ceiling = best_ceiling(x);
-    auto kept = [&](const aln_meth_occ_t &o) {
-        return (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
-    };
-    long nb = 0, nb0 = 0;
-    int fewest = INT_MAX;
-    for (const auto &o : x->res->occ)
-        if (o.cost == B && kept(o)) { ++nb; nb0 += o.n_conv == 0; fewest = std::min(fewest, o.n_conv); }
-    if (B <= s && (conv ? nb0 : nb) > opt.max_top2) return ALN_METH_CERT_REPEAT;
-    // Under the tie-break, ALN_METH_SAT_ROWS best loci give MAPQ 0 whichever has the fewest
-    // conversions: either several share the fewest, or one does and the rest (at least 178) join X1.
-    // Unless the best uses all of -n (stock's MAPQ 25), which a cost below -n mismatches excludes.
-    if (B <= s && conv && nb >= ALN_METH_SAT_ROWS && opt.s_mm > 0 && B < (int64_t)x->max_diff * opt.s_mm)
-        return ALN_METH_CERT_REPEAT;
-    // A tie-break repeat that neither certificate closes (more than -R best loci, all with
-    // conversions, fewer than ALN_METH_SAT_ROWS) is a MAPQ-0 or near repeat whose exact count would
-    // need its whole stratum; past the default budget it ends incomplete, as without certificates.
-    if (B <= s && conv && nb > opt.max_top2 &&
-        x->res->n_lookups >= std::max<int64_t>(0, (int64_t)x->grp->mo->p_best + x->grp->mo->p_second))
-        return ALN_METH_GIVE_UP;
-    if (B >= s) return 0;
-    const aln_meth_occ_t *only = nullptr;
-    long c1 = 0;
-    for (const auto &o : x->res->occ)
-        if (o.cost == B && kept(o) && (!conv || o.n_conv == fewest)) { ++c1; only = &o; }
-    if (c1 != 1 || only->n_mm == x->max_diff) return 0;
-    long worse = nb - c1;
-    for (const auto &o : x->res->occ)
-        if (o.cost > B && o.cost <= B + opt.s_mm && kept(o)) ++worse;
-    return worse >= ALN_METH_CROWDED ? ALN_METH_CERT_CROWDED : 0;
+    const bool can_give_up = B == s && conv &&
+        x->res->n_lookups >= std::max<int64_t>(0, (int64_t)x->grp->mo->p_best + x->grp->mo->p_second);
+    // No certificate can fire inside the best stratum; only the budget give-up needs counts.
+    if (B >= s && !can_give_up) return 0;
+    if (B >= s) {
+        // Only the TAPS budget give-up remains reachable; its open-stratum ceiling can still change.
+        const int64_t ceiling = best_ceiling(x);
+        long nb = 0;
+        for (const auto &o : x->res->occ)
+            if (o.cost == B && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling) ++nb;
+        return nb > opt.max_top2 ? ALN_METH_GIVE_UP : 0;
+    }
+    const auto &c = cert_counts(x);
+    if (c.c1 > opt.max_top2) return ALN_METH_CERT_REPEAT;
+    if (c.c1 != 1 || c.only_mm == x->max_diff) return 0;
+    return c.worse >= ALN_METH_CROWDED ? ALN_METH_CERT_CROWDED : 0;
 }
 // Checks the certificates at converted score s. Returns 1, with x->stop set, when the read ends:
 // ALN_METH_STOP_CERT on a certificate, ALN_METH_STOP_LOOKUP when it gives up incomplete.
 static int aln_meth_certify(aln_meth_slot_t *x, int s)
 {
-    if (x->collect) return 0;
     const int k = cert_kind(x, s);
     if (!k) return 0;
     if (k == ALN_METH_GIVE_UP) { x->res->flags |= ALN_METH_BIND_BEST; x->stop = ALN_METH_STOP_LOOKUP; return 1; }
     x->res->cert = k;
     if (x->blind) blind_note_cert(x, s, k); // observes only
-    if (k == ALN_METH_CERT_REPEAT && x->best == s) { // finish stratum B for the draw
-        x->collect = 1;
-        x->job->score_cut = (int)std::min<int64_t>(x->job->score_cut, x->best);
-        return 0;
-    }
     x->stop = ALN_METH_STOP_CERT;
     return 1;
 }
@@ -529,10 +534,11 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 && !x->grp->ref->known_snvs &&
         !x->grp->ref->no_cut;
     x->best = INT64_MAX; x->flushed = 0;
+    x->cert_counts = aln_meth_cert_counts_t();
     x->blind = x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m);
     x->need_next = x->top2_next = -1; x->blind_need = 0; x->mf_best = INT64_MAX; x->mf_stop = 0;
     x->mf_occ.clear(); x->mf_mirror.clear();
-    x->cert = x->cut && !x->grp->keep_strata; x->collect = 0;
+    x->cert = x->cut && !x->grp->keep_strata;
     x->ivs.clear();
     x->perm_rng = x->rng ^ 0x6a09e667f3bcc909ULL;
     return x->vseq.data();
@@ -902,8 +908,10 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     }
     x->alignment_bytes += bytes;
     const auto ins = x->loci.insert(aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb}, x->res->occ.size());
-    if (ins.second) x->res->occ.push_back(std::move(o));
-    else {
+    if (ins.second) {
+        x->cert_counts.update(nullptr, o, x->res->occ.size() + 1);
+        x->res->occ.push_back(std::move(o));
+    } else {
         const size_t at = x->loci.val[ins.first];
         const aln_meth_occ_t &cur = x->res->occ[at];
         // --known-snvs: the cheaper wins; on equal cost the reference, then the lower
@@ -917,7 +925,10 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
         // (store_mirror_row). It passed the read's limits, so it passes them mirror-free too.
         const aln_meth_occ_t &loser = better ? cur : o;
         if (x->cut && x->blind && !x->mf_stop && !loser.n_mirror) store_mirror_row(x, loser, 0, false, 0);
-        if (better) x->res->occ[at] = std::move(o);
+        if (better) {
+            x->cert_counts.update(&cur, o, x->res->occ.size());
+            x->res->occ[at] = std::move(o);
+        }
     }
 }
 // Scores a row along path L as the reference and, under --known-snvs, once per site allele in its
@@ -1069,7 +1080,8 @@ enum { ALN_METH_WIDE = 256, ALN_METH_CHUNK = 64 };
  * converted score, narrow intervals first, wide ones in a pseudo-random order seeded from the
  * read, ALN_METH_CHUNK rows at a time, checking the certificates (cert_kind) after each chunk. Every
  * row of a lower score was verified at an earlier flush (one runs at each score boundary). The row
- * budget is aln_meth_opt_t::cert_budget; a read that runs out of it before a certificate is incomplete. */
+ * budget is aln_meth_opt_t::cert_budget; a read is incomplete if it leaves a required interval
+ * unfinished without a certificate, or takes the open-stratum tie-break give-up. */
 static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
 {
     std::stable_sort(x.pend.begin(), x.pend.end(), [&](const aln_meth_pend_t &a, const aln_meth_pend_t &b) {
@@ -1078,7 +1090,7 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
     });
     for (const auto &h : x.pend) {
         x.ivs.push_back(h);
-        if (x.stop || x.collect) continue;
+        if (x.stop) continue;
         const int s = pend_score(&x, h);
         const bwtint_t width = h.l - h.k + 1;
         size_t pos;
@@ -1115,7 +1127,6 @@ static void flush_cert(aln_meth_group_t *g, aln_meth_slot_t &x)
             for (int k = 0; k < n && !(x.res->flags & ALN_METH_BIND_CIGAR); ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[at + k]); }
             done += n;
             if (aln_meth_certify(&x, s)) { certified = true; break; }
-            if (x.collect) { certified = true; break; }
         }
         if (done == width) x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
         else if (!certified) { // out of budget, or a CIGAR stop (which is final: keep it)
@@ -1590,15 +1601,15 @@ static void meth_draw_index(const aln_meth_slot_t *x, meth_draw_index_t *ix)
         if (pend_score(x, h) <= x->best) { total += h.l - h.k + 1; ix->hit.push_back(&h); ix->end.push_back(total); }
 }
 /* A repeat certificate's primary: a row drawn uniformly from every hit whose converted score is at
- * most the best cost B (the best stratum is closed, so these hold every row that can cost B),
- * weighted by width, and accepted when it is a best-cost locus (under the TAPS/5base tie-break, one
- * with at most the fewest conversions verified): uniform over the best set, whether or not its row
- * was verified. Expected draws: one over the best rows' share of those hits. Gives up after 256
- * draws (the caller then draws among the verified best loci). rng: the read's draw seed (a copy's
- * own, for a duplicate copy); fewest: the fewest conversions of a verified best locus. The drawn
- * locus is added to occ if new, as drawn (not counted); *key gets it. A drawn row with more
- * differences than the verified best rows' plus one (the top-2 ceiling the finish applies) is
- * rejected, as it would not be kept. ix: the hits to draw from (meth_draw_index). */
+ * most the best cost B (the best stratum is complete, so these hold every row that can cost B, all
+ * of them verified), weighted by width, and accepted when it is a best-cost locus (under the
+ * TAPS/5base tie-break, one with at most the fewest conversions verified). Expected draws: one
+ * over the best rows' share of those hits. Gives up after 256 draws (the caller then draws among
+ * the verified best loci). rng: the read's draw seed (a copy's own, for a duplicate copy); fewest:
+ * the fewest conversions of a verified best locus. The drawn locus is added to occ if new, as drawn
+ * (not counted); *key gets it. A drawn row with more differences than the verified best rows' plus
+ * one (the top-2 ceiling the finish applies) is rejected, as it would not be kept. ix: the hits to
+ * draw from (meth_draw_index). */
 static __attribute__((noinline)) bool meth_repeat_draw(aln_meth_slot_t *x, const meth_draw_index_t &ix, uint64_t rng,
                                                        int fewest, aln_meth_locus_key_t *key)
 {
@@ -1628,6 +1639,8 @@ static __attribute__((noinline)) bool meth_repeat_draw(aln_meth_slot_t *x, const
 }
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
+    // Finishing may add, reorder or release loci; the search-only snapshot ends here.
+    x->cert_counts.ready = false;
     aln_meth_read_t *r = x->res;
     if (x->extra) { // --known-snvs: windows the ALT-window search found, resolved as any other
         // The lookup budget ends only the genomic lookups: these windows are already found, so
@@ -1672,8 +1685,13 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
         // The draws over the whole best set: the read's, and each duplicate copy's with its own seed
         // (so a copy draws what a search of its own would). The verified loci fix the conversion
         // floor first, so the draws do not depend on each other.
+        const int64_t ceiling = best_ceiling(x);
+        const bool gape = x->grp->opt->mode & BWA_MODE_GAPE;
         int fewest = INT_MAX;
-        for (const auto &o : r->occ) if (o.cost == x->best) fewest = std::min(fewest, o.n_conv);
+        for (const auto &o : r->occ)
+            if (o.cost == x->best && !o.drawn &&
+                (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling)
+                fewest = std::min(fewest, o.n_conv);
         meth_draw_index_t ix;
         meth_draw_index(x, &ix);
         repeat_draw = meth_repeat_draw(x, ix, x->rng, fewest, &drawn);
@@ -1738,13 +1756,16 @@ void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
 {
     if (bwa_verbose < 4) return;
     long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0, over = 0, blind = 0;
+    long repeat = 0, crowded = 0;
     for (int i = 0; i < n; ++i) {
         lookups += res[i].n_lookups; wrong += res[i].n_wrong_copy; scored += res[i].n_rescored;
         dropped += res[i].n_unrepresentable; over += res[i].n_over_diff + res[i].n_over_seed;
         flushes += res[i].n_flushes; incomplete += res[i].flags != 0; blind += res[i].blind_incomplete;
+        repeat += res[i].cert == ALN_METH_CERT_REPEAT;
+        crowded += res[i].cert == ALN_METH_CERT_CROWDED;
     }
-    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld rows over -n/-k dropped; %ld with mirror-free strata the cuts may have pruned or a certificate left incomplete; stock cost/count MAPQ\n",
-            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over, blind);
+    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld rows over -n/-k dropped; %ld with mirror-free strata the cuts may have pruned or a certificate left incomplete; %ld repeat certificates; %ld crowded certificates; stock cost/count MAPQ\n",
+            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over, blind, repeat, crowded);
 }
 
 /* bwa_cal_md1 with NM counting only the mismatches the mode does not free (and gap lengths); MD

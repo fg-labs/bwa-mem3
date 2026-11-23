@@ -111,8 +111,12 @@ saturation certificate ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)) en
 modes; the cap is 0 unless that selection is complete there, and such a read's MAPQ is 0 already
 unless it is a repeat with one best locus (`-R` below 1). The
 paired-end mirror-free pairing uses only the loci of that selection, and runs even where an end's
-stock loci exceed `--max-occ` (so stock pairing does not) but its loci in that selection do not. Measured on a chr22 EM-seq
-simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
+stock loci exceed `--max-occ` (so stock pairing does not) but its loci in that selection do not.
+
+**Historical measurements:** the following chr22 results predate both the best-stratum-complete
+certificate rule and removal of the 179-locus shortcut in #786. Their zero-cap counts, MAPQ and
+record-agreement results describe those earlier builds, not validation of the revised behavior.
+Measured on a chr22 EM-seq simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
 macOS arm64, NEON, clang 21): every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring`
 at the default penalties and with `-M 5 -O 3 -E 1`, `-M 1 -O 3 -E 1`, `-M 2 -O 5 -E 2`, `-e 3`,
 `-e 3 -E 1`, `-R 1`, `-R 2`, `-n 8`, `-l 32 -k 0`, `-m 300`, `-N` and `-M 0`, and no conversion-blind MAPQ
@@ -143,20 +147,24 @@ fallback, and thus other pairs' conversion-blind MAPQs and known-SNV twin MAPQs.
 estimate and the ordinary read-length floor are unchanged.
 
 Since [#786](https://github.com/fg-labs/bwa-mem3/pull/786), a single-end `aln --meth` read that
-takes those cuts verifies its rows stratum by stratum and ends on a saturation certificate once
-more rows cannot change stock's output: a *repeat* (more than `-R` best loci) or a *crowded* read
-(a unique best with at least 255 retained worse loci). See [`aln`](../cli/aln.md) for the
-conditions. A certified read has `MAPQ` 0. A repeat reports the verified count in `X0` (a lower
-bound) with no `X1`, and its primary (`POS`, `CIGAR`, strand) is drawn uniformly over every row
-of the hits that can hold a best row, not only the verified ones. A crowded read reports the
-verified count in `X1` (a lower bound). Other reads verify up to 16,384 rows instead of 4,596,
-so fewer reads end incomplete. On ultrashort EM-seq and 5-base slices (200,000 reads each, hg19,
-an x86_64 AVX-512 host, clang 19.1.7), every read complete without a certificate both with the
-certificates and in an uncut search with a 65,536-row lookup budget was identical, and every
-certified read had the same `MAPQ` (crowded reads also the same placement). Incomplete reads fell
-from 4.32% to 0.15% (EM-seq) and from 7.49% to 1.44% (5-base); about 11% of reads changed, almost
-all of them formerly incomplete reads and repeats. Paired-end `--meth` input keeps the previous
-search and is unchanged. Output without `--meth` is byte-identical.
+takes those cuts verifies its rows stratum by stratum and can end on a saturation certificate
+only once its best stratum is complete (so the best loci and stock's top-2 difference ceiling
+are final): a *repeat* (more than `-R` best loci, using the fewest conversions under the TAPS/5base
+tie-break) or a *crowded* read (a unique best with at least 255 retained worse loci, excluding
+stock's full-`-n` MAPQ-25 case). See [`aln`](../cli/aln.md) for the conditions. A repeat reports the
+full best count in `X0` with no `X1`. Its MAPQ is 0 with multiple best loci; at `-R 0`, one best
+locus can certify with positive stock MAPQ. Its primary (`POS`, `CIGAR`, strand) is selected by
+rejection sampling over eligible best rows, with a reservoir draw among retained best loci after
+256 unsuccessful attempts. A crowded read has MAPQ 0 and reports the verified count in `X1`
+(a lower bound). The former 179-locus shortcut is not used: MAPQ saturation alone does not
+finalize a printed worse-locus count. An unfinished best stratum can also change the conversion
+winner and either count, so incomplete reads do not claim `X0` or `X1` even as lower bounds.
+Other certificate-enabled reads verify up to 16,384 rows instead of 4,596; the lookup budget
+marks a read incomplete when required work remains, not merely when the final interval fills it
+exactly. The open-stratum tie-break give-up at 4,596 rows still applies. Earlier CPU, incomplete-read
+and simulated-truth measurements predate this revision and are not current performance claims.
+Paired-end `--meth` input keeps the previous search and is unchanged. Output without `--meth`
+is byte-identical.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
