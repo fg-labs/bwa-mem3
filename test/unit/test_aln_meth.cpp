@@ -4190,6 +4190,39 @@ TEST_CASE("aln_meth: incoming window flags precede neutral selection and duplica
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
+TEST_CASE("aln_meth: duplicate reads share a search only with the same candidate paths")
+{
+    namespace ba = bwa_aln;
+    FMI_search fmi((ref().fa + ".meth").c_str()); fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
+    auto *bwt = ba::bwt_from_fmi(&fmi); ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    int c4 = -1;
+    for (int i = 0; i < mr.bns->n_seqs; ++i) if (std::strcmp(mr.bns->anns[i].name, "c4") == 0) c4 = i;
+    REQUIRE(c4 >= 0);
+    auto *opt = ba::gap_init_opt(); opt->fnr = -1; opt->max_diff = 2; opt->seed_len = 1024;
+    ba::aln_meth_opt_t mo; mo.m.meth_chem = METH_CHEM_TAPS; ba::aln_meth_opt_finish(&mo);
+    const auto fq = write_fq("dup-candidate-paths.fq", std::vector<std::string>(2, ref().read_u));
+    auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+    auto *reads = ba::bwa_read_seq(input, 2, &n, BWA_MODE_COMPREAD, 0); REQUIRE(n == 2);
+    // Both copies have a candidate window at read_u's locus; the second reaches it along another
+    // path (an insertion and a deletion, the same span), which scores differently.
+    const int len = (int)ref().read_u.size();
+    const int64_t rb = mr.bns->anns[c4].offset + ref().u_pos - 1;
+    const std::vector<uint32_t> ungapped{(uint32_t)len << 4};
+    const std::vector<uint32_t> gapped{10u << 4, 1u << 4 | 1, 10u << 4, 1u << 4 | 2, (uint32_t)(len - 21) << 4};
+    for (bool same : {true, false}) {
+        CAPTURE(same);
+        std::vector<std::vector<ba::aln_meth_candidate_t>> extra(2);
+        extra[0].push_back({c4, 0, 1, rb, rb + len, ungapped});
+        extra[1].push_back({c4, 0, 1, rb, rb + len, same ? ungapped : gapped});
+        std::vector<ba::aln_meth_read_t> results(n); ba::aln_dup_state_t dup;
+        CHECK(ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, 1, 1, 0, 1, 1000, &dup, results.data(),
+                                        extra.data()) == (same ? 1 : 0));
+    }
+    ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+    free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: ks_meth_search applies incomplete window flags before the genomic search")
 {
     namespace ba = bwa_aln;
