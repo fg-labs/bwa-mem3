@@ -202,9 +202,14 @@ struct aln_meth_read_t {
     // The mirror table outgrew its CIGAR budget: the mirror-free strata are not known, so each
     // end's conversion-blind cap is 0.
     int blind_partial = 0;
-    // --meth-mapq conversion-blind: the lookups of the rows only the mirror-free strata need ran out
-    // (their own budget, separate from the read's), so the strata are incomplete and the cap is 0.
+    // Under the stock cuts the search may have pruned a row of the mirror-free strata
+    // (blind_note_need), so they are not known: the conversion-blind cap is 0, for both ends of
+    // a pair.
     int blind_incomplete = 0;
+    // The mirror-free selection's cost cut (blind_best + s_mm, or none under -N) and difference
+    // ceiling (none without the stock cuts): a hit outside them is not a locus of the mirror-free
+    // run, so the shadow pairing leaves it out (aln_meth_blind_selected).
+    int64_t blind_cut = INT64_MAX, blind_ceiling = INT64_MAX;
     // The MAPQ cap the record's end carries to emission (255: none), and the MAPQ it replaced
     // when the cap lowered it (YQ:i), else -1.
     int blind_cap = 255, yq = -1;
@@ -238,6 +243,13 @@ static inline aln_meth_blind_row_t aln_meth_blind_view(const aln_meth_read_t &r,
     b.cost = (int32_t)((int64_t)h.cost - (int64_t)s_mm * h.n_mirror); // in [0, h.cost]
     b.n_mm = (uint8_t)(h.n_mm - h.n_mirror); b.n_gapo = h.n_gapo; b.n_gape = h.n_gape;
     return b;
+}
+// --meth-mapq conversion-blind: whether hit h of r is a locus of the mirror-free selection
+// (meth_blind_strata's cost cut and ceiling), at its lowest mirror-free row.
+static inline bool aln_meth_blind_selected(const aln_meth_read_t &r, const aln_meth_hit_t &h, int s_mm, int gape)
+{
+    const aln_meth_blind_row_t m = aln_meth_blind_view(r, h, s_mm);
+    return m.cost <= r.blind_cut && (int64_t)m.n_mm + m.n_gapo + (gape ? m.n_gape : 0) <= r.blind_ceiling;
 }
 // The pointer is into h itself (one operation) or into r.cig, so it is valid while both are.
 static inline const uint32_t *aln_meth_hit_cigar(const aln_meth_read_t &r, const aln_meth_hit_t &h)

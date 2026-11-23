@@ -18,9 +18,7 @@ namespace bwa_aln {
 // to pick its best-known placement: that flush makes the read incomplete either way.
 enum { ALN_METH_BIND_ROWS = 64 };
 // A hit waiting for the next flush: its interval, entry and the path's gaps (aln_meth_hit unpacks them).
-// blind_only: under --meth-mapq conversion-blind, a hit past stock's difference ceiling that only
-// the widened search ceiling reaches (aln_meth_hit); its rows feed the mirror-free strata alone.
-struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; uint32_t gap[ALN_METH_MAX_GAPS]; int blind_only = 0; };
+struct aln_meth_pend_t { bwtint_t k, l; gap_entry_t e; uint32_t gap[ALN_METH_MAX_GAPS]; };
 /* A flat, open-addressed index of distinct keys (insertion order kept in key, a value per key),
  * cleared per read. Only membership and lookup are used, as the std::set / std::map it replaces
  * were, so the results do not depend on the container. K needs operator== and a hash(). */
@@ -123,6 +121,13 @@ struct aln_meth_locus_key_t {
     }
     uint64_t hash() const { return aln_flat_mix((uint64_t)rb ^ ((uint64_t)(hyp * 2 + strand) << 60) ^ (uint64_t)rid << 40); }
 };
+// --meth-mapq conversion-blind: a mirror table entry's key, a locus and (under the stock cuts) the
+// row's mirror-free differences, else 0
+struct aln_meth_mirror_key_t {
+    aln_meth_locus_key_t locus; int diffs;
+    bool operator==(const aln_meth_mirror_key_t &o) const { return locus == o.locus && diffs == o.diffs; }
+    uint64_t hash() const { return aln_flat_mix(locus.hash() ^ (uint64_t)(uint32_t)diffs); }
+};
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
 // aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not); TOP2 is
@@ -140,15 +145,12 @@ struct aln_meth_slot_t {
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
     // cut: the search takes stock aln's cuts from the verified best (aln_meth_boundary): set unless
     // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row. flushed: a
-    // flush has run. blind: --meth-mapq conversion-blind, so every cut must also keep what the
-    // mirror-free strata need (meth_blind_strata).
-    // gen_max_diff: stock's difference ceiling as the search applies it without conversion-blind
-    // (aln_meth_boundary); under conversion-blind the search's own ceiling can be wider.
-    // gen_stopped: stock's -R stop was reached, but the mirror-free strata are not complete yet.
-    // blind_only: the rows being resolved come from a blind_only hit. blind_lookups: the lookups
-    // of blind_only hits, from a budget of their own (aln_meth_flush_parked).
-    int cut = 0, flushed = 0, blind = 0, gen_max_diff = INT_MAX, blind_only = 0, gen_stopped = 0;
-    int64_t blind_lookups = 0;
+    // flush has run. blind: --meth-mapq conversion-blind, which only observes the search: the
+    // search, its cuts and its limits are those of --meth-mapq scoring (aln_meth_boundary).
+    // need_next: the score at which the cuts first applied (the best stratum complete), -1 before;
+    // blind_need: at that point the mirror-free strata could still miss a row the cuts prune
+    // (blind_note_need), so they are not known.
+    int cut = 0, flushed = 0, blind = 0, need_next = -1, blind_need = 0;
     int64_t best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
@@ -159,8 +161,6 @@ struct aln_meth_slot_t {
     // that a path with other gaps reaches again. Cleared per read.
     aln_flat_index_t<aln_meth_kl_key_t> sa_ix;
     std::vector<bwtint_t> sa_rows;
-    // per sa_ix entry: its rows were counted as genomic lookups (0: only a blind_only hit's)
-    std::vector<uint8_t> sa_gen;
     // Refinement queries for each strand; any code above 4 (aln reads '-' as 5) is stored as 4.
     std::vector<ubyte_t> vseq, rd_fwd, rd_rev;
     std::vector<aln_meth_pend_t> pend;
@@ -168,9 +168,9 @@ struct aln_meth_slot_t {
     // Exact windows dedup before DP; every distinct span is evaluated before locus collapse.
     aln_flat_index_t<aln_meth_win_key_t> windows;
     aln_flat_index_t<aln_meth_locus_key_t> loci; // value: the locus's index in res->occ
-    // --meth-mapq conversion-blind: the mirror table's loci (value: the index in res->mirror_rows)
+    // --meth-mapq conversion-blind: the mirror table's keys (value: the index in res->mirror_rows)
     // and its CIGAR bytes, under a budget of its own (store_mirror_row). Cleared per read.
-    aln_flat_index_t<aln_meth_locus_key_t> mirror_loci;
+    aln_flat_index_t<aln_meth_mirror_key_t> mirror_loci;
     uint64_t mirror_bytes = 0;
     // The read's two query orientations as bit planes (rd_fwd, then p->rseq), built on first use.
     aln_meth_read_bits_t bits[2];

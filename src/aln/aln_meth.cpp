@@ -218,57 +218,86 @@ __attribute__((noinline, cold)) int aln_meth_gap_arena(aln_meth_slot_t *x, const
  * - -R: with the best stratum complete, more than -R loci at B within the ceiling (under the
  *   TAPS/5base tie-break, the fewest-conversion ones of them) end the search, as stock's top2b
  *   stop does.
- * --meth-mapq conversion-blind: every cut must also keep what the mirror-free strata need
- * (meth_blind_strata, stock's selection on mirror-free costs). A row's converted score is at most
- * its mirror-free cost, which is at most its cost, so a cut on converted score taken from a bound
- * that holds for both selections is safe for both. The score cut is: the mirror-free best is at
- * most B. The ceiling and the -R stop are not, and take the bounds of search_ceiling and
- * blind_stop_ok. */
+ * --meth-mapq conversion-blind only observes the search (blind_note_need): the cuts, and every
+ * limit, are those of --meth-mapq scoring, so the genomic result is the same. */
 static bool conv_tiebreak(const aln_meth_opt_t *mo);
-/* The difference ceiling the search may apply, given stock's (ceiling, from the stored best rows).
- * Under conversion-blind the mirror-free strata keep rows of up to their own best rows' fewest
- * mirror-free differences + 1, which can exceed stock's when the best is gapped. A row of
- * mirror-free cost c has at most c / mu differences (mu: the smallest penalty of a counted
- * difference), and the mirror-free best is at most B, so floor(B / mu) + 1 bounds the mirror-free
- * ceiling; no later row can raise it, since B only falls. It equals stock's when the best rows are
- * mismatch-only and mu is M. With a zero penalty there is no bound. */
-static int64_t search_ceiling(const aln_meth_slot_t *x, int64_t ceiling)
+static bool mirror_free_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, int s_mm);
+// --meth-mapq conversion-blind: the read's loci so far for the mirror-free strata, each with its
+// rows (its occ row and its mirror table rows, rows[first, first + n)), its occ row (null for a
+// locus only the mirror table holds) and its lowest mirror-free row (mirror_free_better). occ loci
+// first, in occ order, then the table's other loci in table order.
+struct blind_locus_t { const aln_meth_occ_t *occ, *best; uint32_t first, n; };
+static void blind_loci(const aln_meth_read_t *r, int s_mm, std::vector<blind_locus_t> &loci,
+                       std::vector<const aln_meth_occ_t *> &rows)
 {
-    if (!x->blind) return ceiling;
-    const gap_opt_t &opt = x->job->opt;
-    int mu = std::min(opt.s_mm, opt.s_gapo);
-    if (opt.mode & BWA_MODE_GAPE) mu = std::min(mu, opt.s_gape);
-    if (mu <= 0) return INT64_MAX;
-    return std::max(ceiling, x->best / mu + 1);
+    loci.clear(); rows.clear();
+    if (r->mirror_rows.empty()) { // the common case: each occ row is its locus's only row
+        for (const auto &o : r->occ) {
+            loci.push_back(blind_locus_t{&o, &o, (uint32_t)rows.size(), 1});
+            rows.push_back(&o);
+        }
+        return;
+    }
+    static thread_local aln_flat_index_t<aln_meth_locus_key_t> ix;
+    static thread_local std::vector<std::pair<uint32_t, const aln_meth_occ_t *>> tmp;
+    ix.clear(); tmp.clear();
+    for (const auto &o : r->occ) {
+        ix.insert(aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb}, loci.size());
+        tmp.emplace_back((uint32_t)loci.size(), &o);
+        loci.push_back(blind_locus_t{&o, &o, 0, 0});
+    }
+    for (const auto &o : r->mirror_rows) {
+        const auto ins = ix.insert(aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb}, loci.size());
+        if (ins.second) loci.push_back(blind_locus_t{nullptr, &o, 0, 0});
+        const uint32_t k = (uint32_t)ix.val[ins.first];
+        tmp.emplace_back(k, &o);
+        if (mirror_free_better(o, *loci[k].best, s_mm)) loci[k].best = &o;
+    }
+    for (const auto &e : tmp) ++loci[e.first].n;
+    uint32_t at = 0;
+    for (auto &l : loci) { l.first = at; at += l.n; l.n = 0; }
+    rows.resize(tmp.size());
+    for (const auto &e : tmp) rows[loci[e.first].first + loci[e.first].n++] = e.second;
 }
-/* Under conversion-blind, whether stock's -R stop (taken at next) also keeps what the mirror-free
- * strata need. Every entry below next is resolved, so they are complete when next is past the
- * mirror-free best + M. Otherwise a mirror-free run stops too only when its own best loci within
- * its own ceiling are over -R. When the mirror-free best equals the best, every best locus is a
- * mirror-free best locus with the same differences, so this holds whenever stock's count does.
- * Counted conservatively: the mirror-free best and fewest differences over the loci and the mirror
- * table (mirror_rows, each locus's lowest mirror-free row with a mirror mismatch), the count over
- * the loci only, so an error can only delay a stop. */
-static bool blind_stop_ok(const aln_meth_slot_t *x, int next)
+/* --meth-mapq conversion-blind: whether the mirror-free strata (meth_blind_strata, stock's selection
+ * on mirror-free costs) can miss a row because of the cuts, decided where they first apply: the
+ * search's next entry has score next, the best stratum is complete, the search has just lowered
+ * its difference ceiling to c, and stopping says whether -R ends it here. It reads the search's
+ * state and writes only blind_need and need_next, so the search is that of --meth-mapq scoring.
+ * A row's converted score is at most its mirror-free cost, which is at most its cost, and the same
+ * for its differences. Every row below next is resolved, under the read's own -n (the ceiling was
+ * not lowered before), so the mirror-free best B_mf (at most B), the fewest mirror-free
+ * differences D_mf among the loci at B_mf (each at its lowest mirror-free row, which the mirror
+ * table holds) and the count of those loci are final. A row the strata still need costs at most
+ * B_mf + M mirror-free, within the score cut (B + M), with at most min(-n, D_mf + 1) differences:
+ * - next past B_mf + M: no such row is left, the strata are complete;
+ * - -R stops the search here: a mirror-free run stops too when more than -R loci at B_mf are
+ *   within its ceiling (its strata past that are partial, as stock's are), else they are unknown;
+ * - otherwise the ceiling keeps every such row when min(-n, D_mf + 1) <= c, else it may not. */
+static __attribute__((noinline)) void blind_note_need(aln_meth_slot_t *x, int next, int64_t c, bool stopping)
 {
     const gap_opt_t &opt = x->job->opt;
     const bool gape = opt.mode & BWA_MODE_GAPE;
-    auto mf = [&](const aln_meth_occ_t &o) { return mirror_free_cost(o.cost, opt.s_mm, o.n_mirror); };
-    auto mf_diffs = [&](const aln_meth_occ_t &o) {
-        return (int64_t)o.n_mm - o.n_mirror + o.n_gapo + (gape ? o.n_gape : 0);
-    };
-    int64_t best = INT64_MAX, fewest = INT64_MAX;
-    auto see = [&](const aln_meth_occ_t &o) {
-        const int64_t c = mf(o);
-        if (c < best) { best = c; fewest = mf_diffs(o); }
-        else if (c == best) fewest = std::min(fewest, mf_diffs(o));
-    };
-    for (const auto &o : x->res->occ) see(o);
-    for (const auto &o : x->res->mirror_rows) see(o);
-    if (best == INT64_MAX || next > best + opt.s_mm) return true;
-    long n = 0;
-    for (const auto &o : x->res->occ) n += mf(o) == best && mf_diffs(o) <= fewest + 1;
-    return n > opt.max_top2;
+    auto mf_diffs = [&](const aln_meth_occ_t &o) { return (int64_t)o.n_mm - o.n_mirror + o.n_gapo + (gape ? o.n_gape : 0); };
+    static thread_local std::vector<blind_locus_t> bl;
+    static thread_local std::vector<const aln_meth_occ_t *> rows;
+    static thread_local std::vector<std::pair<int64_t, int64_t>> loci; // (mirror-free cost, differences)
+    blind_loci(x->res, opt.s_mm, bl, rows);
+    loci.clear();
+    int64_t best = INT64_MAX;
+    for (const auto &l : bl) {
+        loci.emplace_back(mirror_free_cost(l.best->cost, opt.s_mm, l.best->n_mirror), mf_diffs(*l.best));
+        best = std::min(best, loci.back().first);
+    }
+    x->need_next = next;
+    if (best == INT64_MAX || (int64_t)next > best + opt.s_mm) return;
+    int64_t fewest = INT64_MAX;
+    for (const auto &l : loci) if (l.first == best) fewest = std::min(fewest, l.second);
+    if (stopping) {
+        long n = 0;
+        for (const auto &l : loci) n += l.first == best && l.second <= fewest + 1;
+        x->blind_need = n <= opt.max_top2;
+    } else x->blind_need = std::min<int64_t>(x->max_diff, fewest + 1) > c;
 }
 int aln_meth_boundary(aln_meth_slot_t *x, int next)
 {
@@ -281,9 +310,7 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     int64_t fewest_d = INT64_MAX;
     for (const auto &o : x->res->occ) if (o.cost == x->best) fewest_d = std::min(fewest_d, diffs(o));
     const int64_t ceiling = fewest_d >= INT_MAX - 1 ? INT_MAX : fewest_d + 1;
-    const int64_t search = search_ceiling(x, ceiling);
-    if (search < job->max_diff) job->max_diff = (int)search;
-    if (ceiling < x->gen_max_diff) x->gen_max_diff = (int)ceiling;
+    if (ceiling < job->max_diff) job->max_diff = (int)ceiling;
     // Count the best loci the finish keeps: those within the ceiling, and under the TAPS/5base
     // tie-break the fewest-conversion ones of them.
     auto kept = [&](const aln_meth_occ_t &o) { return o.cost == x->best && diffs(o) <= ceiling; };
@@ -291,12 +318,9 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     if (conv) for (const auto &o : x->res->occ) if (kept(o)) fewest = std::min(fewest, o.n_conv);
     long n = 0;
     for (const auto &o : x->res->occ) n += kept(o) && (!conv || o.n_conv == fewest);
-    if (n <= opt.max_top2) return 0;
-    if (!x->blind) return 1;
-    // The genomic search ends here: every later hit feeds the mirror-free strata alone
-    // (aln_meth_hit), so the genomic result is the one this stop gives.
-    x->gen_stopped = 1;
-    return blind_stop_ok(x, next);
+    const bool stop = n > opt.max_top2;
+    if (x->blind && x->need_next < 0) blind_note_need(x, next, job->max_diff, stop);
+    return stop;
 }
 void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
@@ -308,13 +332,6 @@ void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t
     entry_gaps(x, *e, h.gap);
     aln_meth_iv_key_t key{k, l, (uint32_t)e->n_gapo, {h.gap[0], h.gap[1], h.gap[2], h.gap[3]}};
     if (!x->intervals.insert(key, 0).second) return;
-    // Under conversion-blind a path with more differences than stock's ceiling is one only the
-    // widened ceiling (search_ceiling) reaches: without it the search would have pruned it. Its rows
-    // must not change the genomic selection (an equal-cost row could replace a locus's row), so they
-    // go to the mirror-free strata alone. Equal intervals and gaps give equal differences, and the
-    // ceiling only falls, so the dedup above keeps this consistent.
-    const int diffs = (int)e->n_mm + e->n_gapo + ((x->grp->opt->mode & BWA_MODE_GAPE) ? e->n_gape : 0);
-    h.blind_only = x->blind && (x->gen_stopped || diffs > x->gen_max_diff);
     x->pend.push_back(h);
 }
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy)
@@ -334,7 +351,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     }
     x->pend.clear(); x->windows.clear(); x->intervals.clear(); x->loci.clear(); x->garena.clear();
     x->mirror_loci.clear(); x->mirror_bytes = 0;
-    x->sa_ix.clear(); x->sa_rows.clear(); x->sa_gen.clear(); x->blind_lookups = 0;
+    x->sa_ix.clear(); x->sa_rows.clear();
     x->bits_ready = 0;
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
@@ -344,7 +361,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
         !x->grp->ref->no_cut;
     x->best = INT64_MAX; x->flushed = 0;
     x->blind = x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m);
-    x->gen_max_diff = INT_MAX; x->blind_only = 0; x->gen_stopped = 0;
+    x->need_next = -1; x->blind_need = 0;
     return x->vseq.data();
 }
 static bool conv_tiebreak(const aln_meth_opt_t *mo)
@@ -621,12 +638,19 @@ static bool mirror_free_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b,
     if (a.alignment.re != b.alignment.re) return a.alignment.re < b.alignment.re;
     return a.alignment.raw_cigar < b.alignment.raw_cigar;
 }
-// --meth-mapq conversion-blind: notes row o, which has a mirror mismatch, in the mirror table
-// (aln_meth_read_t::mirror_rows) when it is within the read's limits with its mirror mismatches
-// free, as collapsed scoring applies them: -n, -k, a record's fields and, for a bounded window,
-// within_read_limits. A copy is kept; o is not changed, so store_row goes on as under scoring.
-// A row without a mirror mismatch needs no entry: its mirror-free cost is its genomic cost, so a
-// row that beats it in occ is no worse mirror-free (meth_blind_strata takes the better of the two).
+// --meth-mapq conversion-blind: notes row o in the mirror table (aln_meth_read_t::mirror_rows)
+// when it is within the read's limits with its mirror mismatches free, as collapsed scoring
+// applies them: -n, -k, a record's fields and, for a bounded window, within_read_limits. A copy is
+// kept; o is not changed, so store_row goes on as under scoring. The table keeps, per locus, the
+// best row by mirror_free_better. Without the stock cuts only rows with a mirror mismatch need an
+// entry: a row without one costs its genomic cost mirror-free, so the row that beats it in occ is
+// no worse mirror-free (meth_blind_strata takes the better of the two). Under the cuts the
+// mirror-free strata apply a difference ceiling, and a mirror-free run keeps a locus's best row
+// among those it reaches (meth_blind_strata), which can be a row without a mirror mismatch that
+// occ does not hold: store_row then also passes the row its locus's occ row beats or replaces,
+// and the table keeps the best per locus and number of mirror-free differences. A row store_row
+// drops otherwise is not needed: without a mirror mismatch it is over the read's limits or past
+// the best + M on both costs.
 // The table has a CIGAR budget of its own; past it the strata are unknown (blind_partial).
 static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, const aln_meth_occ_t &o, int seed_diffs,
                                                        bool bounded, int seed_mirror)
@@ -640,7 +664,11 @@ static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, const
         || o.n_gapo > 255 || o.n_gape > 255) return;
     if (bounded && !within_read_limits(x, o, true)) return;
     if (r->blind_partial) return;
-    const aln_meth_locus_key_t key{o.rid, o.hyp, o.strand, o.alignment.rb};
+    // Under the cut the mirror-free strata keep rows within M of the mirror-free best, which is at
+    // most the best so far (store_row's drop, on mirror-free costs).
+    if (x->cut && x->best != INT64_MAX && mirror_free_cost(o.cost, op->s_mm, o.n_mirror) > x->best + op->s_mm) return;
+    const aln_meth_mirror_key_t key{aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb},
+                                    x->cut ? (int)differences : 0};
     size_t pos;
     const int32_t at = x->mirror_loci.find(key, &pos);
     if (at >= 0 && !mirror_free_better(o, r->mirror_rows[x->mirror_loci.val[at]], op->s_mm)) return;
@@ -662,11 +690,9 @@ static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, const
 static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, bool bounded = false, int seed_mirror = 0)
 {
     aln_meth_group_t *g = x->grp;
-    // --meth-mapq conversion-blind observes every row before the filters below.
-    // A row only the widened ceiling reaches (blind_only) is for the mirror-free strata alone.
-    if ((o.n_mirror || x->blind_only) && g->mo && meth_mapq_conversion_blind(&g->mo->m))
-        store_mirror_row(x, o, seed_diffs, bounded, seed_mirror);
-    if (x->blind_only) return;
+    // --meth-mapq conversion-blind observes the rows with a mirror mismatch before the filters
+    // below (and, under the cuts, the rows a locus's occ row beats or replaces).
+    if (o.n_mirror && x->blind) store_mirror_row(x, o, seed_diffs, bounded, seed_mirror);
     // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
     // seed than -k allows. The converted search cannot see a read C over a reference T, so it can
     // reach a row within -n (-k) converted differences whose original-reference path has more; drop
@@ -689,10 +715,8 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     if (bounded && !within_read_limits(x, o)) return;
     ++x->res->n_rescored;
     // Under the cut a row above the current best + M can never be retained (the best only falls).
-    // --meth-mapq conversion-blind: the mirror-free strata keep every row within M of the
-    // mirror-free best, which is at most the best, so the row's mirror-free cost decides.
-    if (x->cut && x->best != INT64_MAX
-        && (x->blind ? mirror_free_cost(o.cost, g->opt->s_mm, o.n_mirror) : o.cost) > x->best + g->opt->s_mm) return;
+    // The mirror table saw the row first (a row without a mirror mismatch costs as much mirror-free).
+    if (x->cut && x->best != INT64_MAX && o.cost > x->best + g->opt->s_mm) return;
     x->best = std::min(x->best, o.cost);
     const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
     // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
@@ -713,6 +737,11 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
         const bool better = o.ks_site == cur.ks_site ? alignment_better(o, cur, conv_tiebreak(g->mo))
                           : o.cost != cur.cost ? o.cost < cur.cost
                           : (uint64_t)(o.ks_site + 1) < (uint64_t)(cur.ks_site + 1);
+        // --meth-mapq conversion-blind under the cuts: the losing row of a locus, if it has no
+        // mirror mismatch (the table already holds those), for the mirror-free strata
+        // (store_mirror_row). It passed the read's limits, so it passes them mirror-free too.
+        const aln_meth_occ_t &loser = better ? cur : o;
+        if (x->cut && x->blind && !loser.n_mirror) store_mirror_row(x, loser, 0, false, 0);
         if (better) x->res->occ[at] = std::move(o);
     }
 }
@@ -795,17 +824,13 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
     // A 65535-base read with a deletion spans more than a window holds. Drop the window as
     // unrepresentable, with cost 0 as its bound: any retained placement is then incomplete.
     if (span > ALN_MAX_READ_LEN) {
-        if (h.blind_only) return; // the genomic search would not have reached it
         ++x->res->n_unrepresentable;
         x->unrep_cost = 0;
         return;
     }
     const int seed_gaps = x->job && x->job->seed_width
         ? seed_gap_diffs(h.gap, h.e.n_gapo, x->job->c.seed_off, g->opt->mode & BWA_MODE_GAPE) : 0;
-    x->blind_only = h.blind_only;
-    const bool scored = score_row_sites(x, key.lay, rid, hyp, strand, rb, span, seed_gaps, false);
-    x->blind_only = 0;
-    if (!scored) {
+    if (!score_row_sites(x, key.lay, rid, hyp, strand, rb, span, seed_gaps, false)) {
         fprintf(stderr, "ERROR: --meth search path (%d gaps: %#x %#x %#x %#x) is not an alignment of the %d-base read\n",
                 (int)h.e.n_gapo, h.gap[0], h.gap[1], h.gap[2], h.gap[3], x->len);
         exit(1);
@@ -877,19 +902,10 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             size_t pos;
             return x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos);
         };
-        // --meth-mapq conversion-blind: a blind_only hit (aln_meth_hit) is one the genomic search
-        // would not have made, so its lookups come from a budget of their own (blind_lookups; past
-        // it the mirror-free strata are incomplete, blind_incomplete) and never bind the read. An
-        // interval only such a hit looked up (sa_gen 0) still costs a genomic hit its lookups, as
-        // it would have without them, so the genomic search is the same with and without the cap.
-        auto gen_cached = [&](const aln_meth_pend_t &h) {
-            const int32_t c = cached(h);
-            return c >= 0 && x.sa_gen[c] ? c : -1;
-        };
         // Two paths can reach one uncached interval in the same flush: its rows are looked up once.
         static thread_local std::vector<std::pair<bwtint_t, bwtint_t>> fresh;
         fresh.clear();
-        for (const auto &h : x.pend) if (!h.blind_only && gen_cached(h) < 0) fresh.emplace_back(h.k, h.l);
+        for (const auto &h : x.pend) if (cached(h) < 0) fresh.emplace_back(h.k, h.l);
         std::sort(fresh.begin(), fresh.end());
         fresh.erase(std::unique(fresh.begin(), fresh.end()), fresh.end());
         int64_t limit = budget, pending = 0;
@@ -900,46 +916,20 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             if (x.stop) break;
             const bwtint_t width = h.l - h.k + 1;
             const int32_t c = cached(h);
-            if (c >= 0 && (h.blind_only || x.sa_gen[c])) {
+            if (c >= 0) {
                 const size_t off = x.sa_ix.val[c];
                 for (bwtint_t r = 0; r < width && !x.stop; ++r) resolve_window(&x, h, x.sa_rows[off + r]);
                 continue;
             }
-            if (h.blind_only) {
-                if (x.res->blind_incomplete) continue;
-                const int n = (int)std::min<uint64_t>(width, (uint64_t)std::max<int64_t>(0, budget - x.blind_lookups));
-                const size_t off = x.sa_rows.size();
-                x.sa_rows.resize(off + n);
-                bwtint_t *rows = x.sa_rows.data() + off;
-                for (int k = 0; k < n; ++k) rows[k] = h.k + k;
-                bwt_sa_batch(g->bwt, rows, n, rows);
-                if ((bwtint_t)n == width) {
-                    x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
-                    x.sa_gen.push_back(0);
-                }
-                x.blind_lookups += n;
-                for (int k = 0; k < n && !x.stop; ++k) resolve_window(&x, h, x.sa_rows[off + k]);
-                if ((bwtint_t)n < width) x.res->blind_incomplete = 1;
-                continue;
-            }
             const int64_t remaining = limit - x.res->n_lookups;
             const int n = (int)std::min<uint64_t>(width, (uint64_t)std::max<int64_t>(0, remaining));
-            if (c >= 0) { // rows a blind_only hit looked up: counted as the genomic search looks them up
-                const size_t off = x.sa_ix.val[c];
-                if ((bwtint_t)n == width) x.sa_gen[c] = 1;
-                for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
-            } else {
-                const size_t off = x.sa_rows.size();
-                x.sa_rows.resize(off + n);
-                bwtint_t *rows = x.sa_rows.data() + off;
-                for (int k = 0; k < n; ++k) rows[k] = h.k + k;
-                bwt_sa_batch(g->bwt, rows, n, rows);
-                if ((bwtint_t)n == width) {
-                    x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
-                    x.sa_gen.push_back(1);
-                }
-                for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
-            }
+            const size_t off = x.sa_rows.size();
+            x.sa_rows.resize(off + n);
+            bwtint_t *rows = x.sa_rows.data() + off;
+            for (int k = 0; k < n; ++k) rows[k] = h.k + k;
+            bwt_sa_batch(g->bwt, rows, n, rows);
+            if ((bwtint_t)n == width) x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
+            for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
             // A CIGAR stop on this interval's looked-up rows is final: keep it over the lookup
             // stop, which aln_meth_slot_finish lifts to resolve the ALT-window candidates.
             if ((bwtint_t)n < width) {
@@ -1145,18 +1135,18 @@ static aln_meth_blind_row_t blind_row(const aln_meth_occ_t &o, bwtint_t pos, int
 }
 // --meth-mapq conversion-blind: the strata with the mirror cell freed, over every candidate
 // before the stock cut (a locus the cut drops can still tie or beat the main hit once its mirror
-// mismatches are free), each locus at its lowest mirror-free row: the better (mirror_free_better)
-// of its occ row and its mirror table row, which also holds the loci whose every row the -n (or
-// -k) limit dropped but would keep with the mirror mismatches free. That is the row collapsed
-// scoring keeps there. The search proposed every window within the genomic best cost plus s_mm
-// (aln_meth_can_stop); a mirror-free cost never exceeds the genomic cost, so every locus within
-// s_mm of the mirror-free best was proposed too. A search that takes stock's cuts keeps every row
-// these strata need (aln_meth_boundary, store_row), and the strata then apply stock's top-2
-// ceiling on mirror-free differences too (cuts), so they are stock's selection on mirror-free
-// costs, as collapsed scoring computes it. The loci in the mirror-free strata that are not hits
-// (the genomic finish drops them, on its cost cut, genomic_cut, or its difference ceiling,
-// genomic_ceiling, or they are not in occ) are kept as rows for the paired-end shadow pairing,
-// and a hit whose lowest mirror-free row is not its own as blind_alt. Out of line, as
+// mismatches are free), each locus at its lowest mirror-free row among its occ row and its mirror
+// table rows (blind_loci), which also hold the loci whose every row the -n (or -k) limit dropped
+// but would keep with the mirror mismatches free. That is the row collapsed scoring keeps there.
+// The search proposed every window within the genomic best cost plus s_mm (aln_meth_can_stop); a
+// mirror-free cost never exceeds the genomic cost, so every locus within s_mm of the mirror-free
+// best was proposed too. Under stock's cuts (cuts) the strata also apply stock's top-2 ceiling on
+// mirror-free differences, with each locus at the row a mirror-free run that takes the cuts keeps
+// there, so they are stock's selection on mirror-free costs, as collapsed scoring computes it,
+// unless the cuts may have pruned a row they need (blind_note_need; blind_incomplete). The loci
+// in the strata that are not hits (the genomic finish drops them, on its cost cut, genomic_cut,
+// or its difference ceiling, genomic_ceiling, or they are not in occ) are kept as rows for the
+// paired-end shadow pairing, and a hit whose row is not its own as blind_alt. Out of line, as
 // meth_slot_finish_tail is.
 static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x, aln_meth_read_t *r,
                                                         int64_t genomic_cut, int64_t genomic_ceiling, bool cuts)
@@ -1164,44 +1154,50 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
     const gap_opt_t *opt = x->grp->opt;
     const bool gape = opt->mode & BWA_MODE_GAPE;
     if (r->blind_partial) { std::vector<aln_meth_occ_t>().swap(r->mirror_rows); return; }
-    // Each locus once: its row, and whether it is a hit.
-    std::vector<std::pair<const aln_meth_occ_t *, bool>> cand;
-    cand.reserve(r->occ.size() + r->mirror_rows.size());
-    std::vector<char> in_occ(r->mirror_rows.size(), 0);
-    for (const auto &o : r->occ) {
-        const aln_meth_occ_t *m = &o;
-        size_t pos;
-        const int32_t at = r->mirror_rows.empty() ? -1
-            : x->mirror_loci.find(aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb}, &pos);
-        if (at >= 0) {
-            const size_t k = x->mirror_loci.val[at];
-            in_occ[k] = 1;
-            if (mirror_free_better(r->mirror_rows[k], o, opt->s_mm)) m = &r->mirror_rows[k];
-        }
-        const bool hit = o.cost <= genomic_cut && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= genomic_ceiling;
-        if (hit && m != &o) r->blind_alt.push_back(blind_row(*m, o.pos, opt->s_mm)); // keyed as the hit is
-        cand.emplace_back(m, hit);
+    // the cuts may have pruned a row these strata need (blind_note_need): the cap is 0
+    r->blind_incomplete = x->blind_need;
+    // Each locus once: its row, its occ row (null when only the mirror table holds it), and
+    // whether it is a hit.
+    static thread_local std::vector<blind_locus_t> bl;
+    static thread_local std::vector<const aln_meth_occ_t *> rows;
+    blind_loci(r, opt->s_mm, bl, rows);
+    struct cand_t { const aln_meth_occ_t *row, *occ; bool hit; };
+    static thread_local std::vector<cand_t> cand;
+    cand.clear();
+    for (const auto &l : bl) {
+        const bool hit = l.occ && l.occ->cost <= genomic_cut
+            && (int64_t)l.occ->n_mm + l.occ->n_gapo + (gape ? l.occ->n_gape : 0) <= genomic_ceiling;
+        cand.push_back(cand_t{l.best, l.occ, hit});
     }
-    // sorted for aln_meth_blind_view's binary search (a pair can hold many hits)
-    std::sort(r->blind_alt.begin(), r->blind_alt.end(), [](const aln_meth_blind_row_t &a, const aln_meth_blind_row_t &b) {
-        return a.pos != b.pos ? a.pos < b.pos : a.strand < b.strand;
-    });
-    for (size_t k = 0; k < r->mirror_rows.size(); ++k)
-        if (!in_occ[k]) cand.emplace_back(&r->mirror_rows[k], false);
     auto mf_diffs = [&](const aln_meth_occ_t &o) {
         return (int64_t)o.n_mm - o.n_mirror + o.n_gapo + (gape ? o.n_gape : 0);
     };
+    auto mf = [&](const aln_meth_occ_t &o) { return mirror_free_cost(o.cost, opt->s_mm, o.n_mirror); };
     int64_t best = INT64_MAX;
-    for (const auto &e : cand) best = std::min(best, mirror_free_cost(e.first->cost, opt->s_mm, e.first->n_mirror));
+    for (const auto &e : cand) best = std::min(best, mf(*e.row));
     const int64_t cut = (opt->mode & BWA_MODE_NONSTOP) ? INT64_MAX : best + (int64_t)opt->s_mm;
     // stock's top-2 ceiling on the mirror-free strata: the mirror-free best rows' fewest
     // mirror-free differences + 1, as slot_finish takes it on the genomic rows
     int64_t ceiling = INT64_MAX;
     if (cuts)
         for (const auto &e : cand)
-            if (mirror_free_cost(e.first->cost, opt->s_mm, e.first->n_mirror) == best)
-                ceiling = std::min(ceiling, mf_diffs(*e.first) + 1);
+            if (mf(*e.row) == best) ceiling = std::min(ceiling, mf_diffs(*e.row) + 1);
+    // A mirror-free run that takes the cuts reaches every row at its best cost before it applies
+    // the ceiling, and a row above that cost only within the ceiling: a locus whose lowest
+    // mirror-free row is above the best and over the ceiling holds its best row within the
+    // ceiling instead (if it has none, the ceiling drops the locus below).
+    if (cuts)
+        for (size_t k = 0; k < cand.size(); ++k) {
+            cand_t &e = cand[k];
+            if (mf(*e.row) == best || mf_diffs(*e.row) <= ceiling) continue;
+            const blind_locus_t &l = bl[k];
+            for (uint32_t j = l.first; j < l.first + l.n; ++j)
+                if (mf_diffs(*rows[j]) <= ceiling
+                    && (mf_diffs(*e.row) > ceiling || mirror_free_better(*rows[j], *e.row, opt->s_mm)))
+                    e.row = rows[j];
+        }
     r->blind_best = best;
+    r->blind_cut = cut; r->blind_ceiling = ceiling;
     // The best-cost loci, for the draw of collapsed's main hit (a read that pairs or has
     // duplicate copies). Only the drawn locus is kept, unless the read's copies draw again over
     // them all (blind_ties); the rest are gathered in a per-thread buffer.
@@ -1209,15 +1205,20 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
     std::vector<aln_meth_blind_row_t> &ties = x->keep == ALN_METH_KEEP_COPIES ? r->blind_ties : ties_buf;
     ties.clear();
     for (const auto &e : cand) {
-        const aln_meth_occ_t &o = *e.first;
-        const int64_t c = mirror_free_cost(o.cost, opt->s_mm, o.n_mirror);
+        const aln_meth_occ_t &o = *e.row;
+        // a hit whose row is not its own (the table can hold a copy of the occ row), keyed as the
+        // hit is (aln_meth_blind_view)
+        if (e.hit && e.row != e.occ
+            && (mirror_free_better(*e.row, *e.occ, opt->s_mm) || mirror_free_better(*e.occ, *e.row, opt->s_mm)))
+            r->blind_alt.push_back(blind_row(o, e.occ->pos, opt->s_mm));
+        const int64_t c = mf(o);
         if (c > cut || mf_diffs(o) > ceiling) continue;
         if (c == best) {
             ++r->blind_c1;
             if (x->keep) ties.push_back(blind_row(o, o.alignment.rb, opt->s_mm));
         } else ++r->blind_c2;
         // store_mirror_row and account_alignment bound the cost and counts
-        if (!e.second) r->blind_rows.push_back(blind_row(o, o.alignment.rb, opt->s_mm));
+        if (!e.hit) r->blind_rows.push_back(blind_row(o, o.alignment.rb, opt->s_mm));
     }
     std::sort(r->blind_rows.begin(), r->blind_rows.end(), blind_collapsed_order);
     r->blind_main = blind_draw(ties.size(), x->rng);
@@ -1228,13 +1229,18 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
         else std::nth_element(ties.begin(), ties.begin() + r->blind_main, ties.end(), blind_collapsed_order);
         r->blind_pick = ties[r->blind_main];
     }
+    // sorted for aln_meth_blind_view's binary search (a pair can hold many hits)
+    std::sort(r->blind_alt.begin(), r->blind_alt.end(), [](const aln_meth_blind_row_t &a, const aln_meth_blind_row_t &b) {
+        return a.pos != b.pos ? a.pos < b.pos : a.strand < b.strand;
+    });
     std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
 }
-// The --meth-mapq gate for meth_blind_strata, out of line so slot_finish keeps a single call here.
+// The --meth-mapq gate for meth_blind_strata (x->blind, as store_row's), out of line so
+// slot_finish keeps a single call here.
 static __attribute__((noinline)) void meth_blind_cap(const aln_meth_slot_t *x, aln_meth_read_t *r, int64_t cut,
                                                      int64_t ceiling)
 {
-    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(x, r, cut, ceiling, x->cut);
+    if (x->blind) meth_blind_strata(x, r, cut, ceiling, x->cut);
 }
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
@@ -1318,14 +1324,14 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
 void aln_meth_report(int read_no, int n, const aln_meth_read_t *res)
 {
     if (bwa_verbose < 4) return;
-    long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0, over = 0;
+    long lookups = 0, wrong = 0, scored = 0, flushes = 0, incomplete = 0, dropped = 0, over = 0, blind = 0;
     for (int i = 0; i < n; ++i) {
         lookups += res[i].n_lookups; wrong += res[i].n_wrong_copy; scored += res[i].n_rescored;
         dropped += res[i].n_unrepresentable; over += res[i].n_over_diff + res[i].n_over_seed;
-        flushes += res[i].n_flushes; incomplete += res[i].flags != 0;
+        flushes += res[i].n_flushes; incomplete += res[i].flags != 0; blind += res[i].blind_incomplete;
     }
-    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld rows over -n/-k dropped; stock cost/count MAPQ\n",
-            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over);
+    fprintf(stderr, "[M::aln] --meth read %d: %d reads, %ld SA lookups (%ld wrong-copy), %ld unique windows scored (%ld dropped as unrepresentable), %ld flushes; %ld incomplete; %ld rows over -n/-k dropped; %ld with mirror-free strata the cuts may have pruned; stock cost/count MAPQ\n",
+            read_no ? 1 : 2, n, lookups, wrong, scored, dropped, flushes, incomplete, over, blind);
 }
 
 /* bwa_cal_md1 with NM counting only the mismatches the mode does not free (and gap lengths); MD
@@ -1462,15 +1468,17 @@ static int meth_blind_main_mapq(const aln_meth_read_t *r, const bwa_seq_t *s, co
     return bwa_approx_mapQ(&t, read_max_diff(opt, s->len));
 }
 // --meth-mapq conversion-blind: the stock single-end MAPQ the main hit would get with the mirror
-// cell freed (meth_blind_strata; the main hit's locus at its lowest mirror-free row), or 0 when a
-// mirror-free locus beats it or the strata are unknown (blind_partial); 255 (no cap) when the
-// read has no strata (an incomplete read already has MAPQ 0). Read after meth_set_main, on the
-// same max_diff.
+// cell freed (meth_blind_strata; the main hit's locus at its mirror-free row), or 0 when a
+// mirror-free locus beats it, the mirror-free ceiling drops it, or the strata are unknown
+// (blind_partial, blind_incomplete); 255 (no cap) when the read has no strata (an incomplete read
+// already has MAPQ 0). Read after meth_set_main, on the same max_diff.
 static int meth_blind_se_cap(const aln_meth_read_t *r, const bwa_seq_t *s, const gap_opt_t *opt)
 {
     if (r->main < 0 || r->flags) return 255;
-    if (r->blind_partial || r->blind_incomplete) return 0; // the strata are not known
+    if (r->blind_partial || r->blind_incomplete) return 0;
     if (r->blind_best == INT64_MAX) return 255;
+    // the main hit is not a mirror-free best locus: past the best, or over the mirror-free ceiling
+    if (!aln_meth_blind_selected(*r, r->hits[r->main], opt->s_mm, opt->mode & BWA_MODE_GAPE)) return 0;
     const aln_meth_blind_row_t m = aln_meth_blind_view(*r, r->hits[r->main], opt->s_mm);
     if (m.cost > r->blind_best) return 0;
     bwa_seq_t t = *s;
@@ -1950,15 +1958,17 @@ static void meth_blind_set_row(bwa_seq_t *s, int *hyp, const aln_meth_blind_row_
 // hypothesis in hyp), which the conversion-blind MAPQ caps each end by once that rescue is rerun.
 // An end collapsed places (blind_main) starts at its main hit with collapsed's single-end MAPQ; an
 // end it does not place is unmapped (cs NO_MATCH). With both ends placed it pairs collapsed's
-// candidates: the mirror-free strata (each end's hits within blind_best + s_mm at their lowest
-// mirror-free rows, aln_meth_blind_view, and blind_rows), in collapsed's order, with collapsed's
+// candidates: the mirror-free strata (each end's hits within the mirror-free selection, the cost
+// cut blind_best + s_mm and the ceiling, at their mirror-free rows, aln_meth_blind_view, and
+// blind_rows), in collapsed's order, with collapsed's
 // insert size ii (same_ii: whether it is the genomic pairing's); with more than --max-occ loci on
 // an end collapsed does not pair, and each end stays at its main hit. Pairing then reselects each
 // end's row as the genomic pairing does (the first at its start and strand). Returns
 // METH_BLIND_SAME when nothing differs from the genomic run (the same insert size, no mirror
-// mismatch on any hit, no row only the mirror-free strata have, no moved row, neither single-end
-// cap below its MAPQ), where collapsed's state is the genomic pairing's. Returns METH_BLIND_NONE,
-// with both caps set to 0, when an end's mirror-free strata are unknown (blind_partial) or a
+// mismatch on any hit, no hit outside the mirror-free selection, no row only the mirror-free
+// strata have, no moved row, neither single-end cap below its MAPQ), where collapsed's state is
+// the genomic pairing's. Returns METH_BLIND_NONE, with both caps set to 0, when an end's
+// mirror-free strata are unknown (blind_partial, blind_incomplete) or a
 // row's cost is past the pairing record's 20 bits. Otherwise returns METH_BLIND_PAIRED, with
 // cs[j].cigar null.
 static meth_blind_shadow_t meth_blind_shadow(const aln_meth_ref_t *ref, const gap_opt_t *gopt, const pe_opt_t *popt,
@@ -1966,14 +1976,17 @@ static meth_blind_shadow_t meth_blind_shadow(const aln_meth_ref_t *ref, const ga
                                              aln_meth_read_t *const r[2], bwa_seq_t cs[2], int hyp[2],
                                              meth_blind_scratch_t &sc)
 {
-    if (r[0]->blind_partial || r[1]->blind_partial) {
+    if (r[0]->blind_partial || r[1]->blind_partial || r[0]->blind_incomplete || r[1]->blind_incomplete) {
         r[0]->blind_cap = r[1]->blind_cap = 0;
         return METH_BLIND_NONE;
     }
+    const bool gape = gopt->mode & BWA_MODE_GAPE;
     bool differs = !same_ii;
     for (int j = 0; j < 2 && !differs; ++j) {
         differs = !r[j]->blind_rows.empty() || !r[j]->blind_alt.empty() || r[j]->blind_cap < p[j]->mapQ;
-        for (size_t x = 0; x < r[j]->hits.size() && !differs; ++x) differs = r[j]->hits[x].n_mirror > 0;
+        // a hit outside the mirror-free selection (past its cut or over its ceiling)
+        for (size_t x = 0; x < r[j]->hits.size() && !differs; ++x)
+            differs = r[j]->hits[x].n_mirror > 0 || !aln_meth_blind_selected(*r[j], r[j]->hits[x], gopt->s_mm, gape);
     }
     if (!differs) return METH_BLIND_SAME;
     bool fits = true;
@@ -1995,14 +2008,12 @@ static meth_blind_shadow_t meth_blind_shadow(const aln_meth_ref_t *ref, const ga
     if (r[0]->blind_main < 0 || r[1]->blind_main < 0 || !fits) return METH_BLIND_PAIRED; // no pairing
     sc.arr.clear();
     for (int j = 0; j < 2; ++j) {
-        const int64_t cut = (gopt->mode & BWA_MODE_NONSTOP) ? INT64_MAX : r[j]->blind_best + (int64_t)gopt->s_mm;
-        // the hits (in collapsed's order, as finishing sorts them) merged with blind_rows (sorted)
+        // the hits within the mirror-free selection (aln_meth_blind_selected: its cost cut and
+        // ceiling), in collapsed's order as finishing sorts them, merged with blind_rows (sorted)
         std::vector<aln_meth_blind_row_t> &rows = sc.rows[j];
         rows.clear();
-        for (const aln_meth_hit_t &h : r[j]->hits) {
-            const aln_meth_blind_row_t b = aln_meth_blind_view(*r[j], h, gopt->s_mm);
-            if (b.cost <= cut) rows.push_back(b);
-        }
+        for (const aln_meth_hit_t &h : r[j]->hits)
+            if (aln_meth_blind_selected(*r[j], h, gopt->s_mm, gape)) rows.push_back(aln_meth_blind_view(*r[j], h, gopt->s_mm));
         if (!std::is_sorted(rows.begin(), rows.end(), blind_collapsed_order))
             std::sort(rows.begin(), rows.end(), blind_collapsed_order);
         const size_t n_hits = rows.size();
@@ -2094,7 +2105,8 @@ void aln_meth_blind_isize(const aln_meth_ref_t *ref, const gap_opt_t *gopt, cons
             const bool placed = s->type == BWA_TYPE_UNIQUE || s->type == BWA_TYPE_REPEAT
                 || (s->type == BWA_TYPE_NO_MATCH && r.blind_main >= 0); // collapsed places it
             if (!placed || r.flags) continue;
-            if (r.blind_partial) s->mapQ = 0; // collapsed's selection is unknown: not an observation
+            // collapsed's selection is unknown: not an observation
+            if (r.blind_partial || r.blind_incomplete) s->mapQ = 0;
             else if (r.blind_main >= 0) {
                 const aln_meth_blind_row_t &m = r.blind_pick;
                 s->mapQ = meth_blind_main_mapq(&r, s, gopt);
@@ -2122,6 +2134,7 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 	std::vector<int32_t> span[2]; // --ref-span-insert: each hit's reference span, for pairing
 	std::vector<pair64_t> arr;
 	meth_blind_scratch_t shadow; // --meth-mapq conversion-blind: the shadow pairing's buffers
+	long n_blind_unknown = 0; // pairs with an end whose mirror-free strata are unknown
 	kstring_t str = {0, 0, 0};
     std::vector<std::pair<int,int>> initial_selection(n);
     for(int i=0;i<n;++i) initial_selection[i]={res[0][i].main,res[1][i].main};
@@ -2134,9 +2147,16 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
     const bool same_ii = !blind_ii || (blind_ii->low == ii->low && blind_ii->high == ii->high
         && (ii->high == 0 || (blind_ii->avg == ii->avg && blind_ii->std == ii->std
                               && blind_ii->high_bayesian == ii->high_bayesian)));
+    // An end whose mirror-free strata are unknown (blind_partial, blind_incomplete) leaves the
+    // pair's unknown, whether or not the pairing below runs: both ends get 0, without the shadow.
     if (blind)
-        for (int i = 0; i < n; ++i)
+        for (int i = 0; i < n; ++i) {
             for (int j = 0; j < 2; ++j) res[j][i].blind_cap = meth_blind_se_cap(res[j] + i, seqs[j] + i, gopt);
+            const bool unknown = res[0][i].blind_partial || res[1][i].blind_partial || res[0][i].blind_incomplete
+                || res[1][i].blind_incomplete;
+            if (unknown) res[0][i].blind_cap = res[1][i].blind_cap = 0;
+            n_blind_unknown += res[0][i].blind_incomplete || res[1][i].blind_incomplete;
+        }
     // collapsed scoring's options, for its mate rescue (meth_blind_place): its matrices
     aln_meth_opt_t cmo;
     if (blind) {
@@ -2297,6 +2317,9 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
             } else meth_emit(ref, mo, lim, 1, s, r);
         }
     }
+	if (blind && bwa_verbose >= 4)
+		fprintf(stderr, "[M::aln] --meth-mapq conversion-blind: %ld of %d pairs have an end whose mirror-free strata the cuts may have pruned (both ends capped to 0)\n",
+				n_blind_unknown, n);
 	free(str.s);
 	return cnt_chg;
 }
