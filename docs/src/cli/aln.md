@@ -614,7 +614,13 @@ differences, so the strata are complete when `next` is past `B_mf + M`; otherwis
 stops on `-R` there, only if more than `-R` loci at `B_mf` are within their own ceiling (a
 mirror-free run stops too), and when it continues, only if `min(-n, D_mf + 1)` is within the
 ceiling the search applies (`D_mf` can exceed the genomic best's differences when that best is
-gapped). When they are not complete the cap is 0, for both ends of a pair.
+gapped). A mirror-free run also has its own `-R` stop: since `B_mf` is at most `B`, its best
+stratum is complete at that point or earlier, and up to there it is the same search. If more than
+`-R` of its loci at `B_mf` are within its ceiling there, it stops; unless the search stops at the
+same point or `next` is already past `B_mf + M`, the search goes on to rows that run never reaches,
+and the strata are not complete if it then resolves one they could keep (at most `B_mf + M`
+mirror-free, within `min(-n, D_mf + 1)` differences). When they are not complete the cap is 0, for
+both ends of a pair.
 These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
 set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
 search instead stops early only on the earlier certified bound: for current best cost `B`,

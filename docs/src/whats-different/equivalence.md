@@ -99,7 +99,9 @@ computed from stock's selection on costs with the mirror cell free (as `collapse
 top-2 ceiling on mirror-free differences included). Where the cuts first apply, the search
 decides whether they can have pruned a row that selection needs (the mirror-free best can have
 more differences than the genomic best when the genomic best is gapped, or a `-R` stop can come
-before the mirror-free strata are complete); if so, the cap is 0, for both ends of a pair. The
+before the mirror-free strata are complete), and whether a mirror-free run's own `-R` stop comes
+where the search goes on and the search then resolves a row those strata could keep; if so, the
+cap is 0, for both ends of a pair. The
 paired-end mirror-free pairing uses only the loci of that selection. Measured on a chr22 EM-seq
 simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
 macOS arm64, NEON, clang 21): every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring`
