@@ -164,7 +164,9 @@ bases from `.pac` on demand; that saves the seed's ~13 GB and the original's
 Stages the index on **1 GB huge pages** from the host's hugetlb pool, to cut the
 data-TLB page walks of seeding below what the 2 MB pages of `/dev/shm` allow
 (see [Performance](#1-gb-pages-shm---huge-pages)). `mem`, `shm -l` and `shm -d`
-are used exactly as for any other staged index; `mem` needs no flag.
+are used exactly as for any other staged index; `mem` needs no flag. A 1 GB stage
+holds the default checkpoint layout: it is refused with
+[`--compact-occ`](#--compact-occ--stage-the-compact-checkpoint-layout).
 
 `/dev/shm` cannot hold 1 GB pages, so the index goes into a System V shared
 memory segment created with `SHM_HUGETLB | SHM_HUGE_1GB`, and `/dev/shm` holds
@@ -361,7 +363,11 @@ drops every staged index) and stage again; staging the other layout over a stage
 index is an error. Only this flag selects the layout: `shm` does not read
 `BWA3_COMPACT_OCC`, which applies to `mem`. The conversion uses
 [`-t`](#-t---threads-int--worker-threads) workers. Not combinable with `-u` (any value),
-`-l` or `-d`.
+`-l` or `-d`, nor with
+[`--huge-pages`](#--huge-pages--stage-the-index-on-1-gb-huge-pages-linux-opt-in): a 1 GB
+stage holds the default checkpoint layout only, so `shm --huge-pages --compact-occ` is
+refused, staging nothing, before any host check. `BWA3_COMPACT_OCC` does not change
+`shm --huge-pages`.
 
 ### `-u INT` — densify the staged SA sample table
 
