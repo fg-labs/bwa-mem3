@@ -91,6 +91,13 @@ budget had left incomplete (the incomplete-read rate fell from 8.52% to 4.32% an
 37). With `--short-insert` (1 million pairs), proper pairs rose by 4.1 (EM-seq) and 0.85 (5-base)
 percentage points, and peak RSS rose by 0.7 to 1.1 GB because a repeat end keeps all its best loci
 for pairing. Output without `--meth` is byte-identical: the cuts run only in the `--meth` search.
+Under `--meth-mapq conversion-blind` (the EM-seq `genomic` default since [#816](https://github.com/fg-labs/bwa-mem3/pull/816)) every cut is also
+valid for the mirror-free strata the MAPQ cap is computed from: a row is dropped on its
+mirror-free cost, the search's difference ceiling is at least `floor(B / mu) + 1` (`mu` the
+smallest counted penalty), the `-R` stop waits until those strata are complete or are themselves
+over `-R`, a locus the finish's ceiling drops is kept for the mirror-free pairing, and the strata
+apply stock's top-2 ceiling on mirror-free differences, so they are what `collapsed` scoring
+selects. With `--meth-mapq scoring` the output is unchanged by this rule.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
