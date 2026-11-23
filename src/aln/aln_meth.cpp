@@ -241,6 +241,35 @@ static int64_t search_ceiling(const aln_meth_slot_t *x, int64_t ceiling)
     if (mu <= 0) return INT64_MAX;
     return std::max(ceiling, x->best / mu + 1);
 }
+/* Under conversion-blind, whether stock's -R stop (taken at next) also keeps what the mirror-free
+ * strata need. Every entry below next is resolved, so they are complete when next is past the
+ * mirror-free best + M. Otherwise a mirror-free run stops too only when its own best loci within
+ * its own ceiling are over -R. When the mirror-free best equals the best, every best locus is a
+ * mirror-free best locus with the same differences, so this holds whenever stock's count does.
+ * Counted conservatively: the mirror-free best and fewest differences over the loci and the mirror
+ * table (mirror_rows, each locus's lowest mirror-free row with a mirror mismatch), the count over
+ * the loci only, so an error can only delay a stop. */
+static bool blind_stop_ok(const aln_meth_slot_t *x, int next)
+{
+    const gap_opt_t &opt = x->job->opt;
+    const bool gape = opt.mode & BWA_MODE_GAPE;
+    auto mf = [&](const aln_meth_occ_t &o) { return mirror_free_cost(o.cost, opt.s_mm, o.n_mirror); };
+    auto mf_diffs = [&](const aln_meth_occ_t &o) {
+        return (int64_t)o.n_mm - o.n_mirror + o.n_gapo + (gape ? o.n_gape : 0);
+    };
+    int64_t best = INT64_MAX, fewest = INT64_MAX;
+    auto see = [&](const aln_meth_occ_t &o) {
+        const int64_t c = mf(o);
+        if (c < best) { best = c; fewest = mf_diffs(o); }
+        else if (c == best) fewest = std::min(fewest, mf_diffs(o));
+    };
+    for (const auto &o : x->res->occ) see(o);
+    for (const auto &o : x->res->mirror_rows) see(o);
+    if (best == INT64_MAX || next > best + opt.s_mm) return true;
+    long n = 0;
+    for (const auto &o : x->res->occ) n += mf(o) == best && mf_diffs(o) <= fewest + 1;
+    return n > opt.max_top2;
+}
 int aln_meth_boundary(aln_meth_slot_t *x, int next)
 {
     gap_job_t *job = x->job;
@@ -261,7 +290,7 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     if (conv) for (const auto &o : x->res->occ) if (kept(o)) fewest = std::min(fewest, o.n_conv);
     long n = 0;
     for (const auto &o : x->res->occ) n += kept(o) && (!conv || o.n_conv == fewest);
-    return n > opt.max_top2;
+    return n > opt.max_top2 && (!x->blind || blind_stop_ok(x, next));
 }
 void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
