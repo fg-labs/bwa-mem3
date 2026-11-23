@@ -768,6 +768,43 @@ void ks_format_xv(const bntseq_t *bns, const std::vector<ks_vote_t> &votes, int 
 	}
 }
 
+/* The search path behind an ALT-window hit's display CIGAR c (n operations, reference span span at
+ * window offset off): the display soft-clips a terminal insertion and drops a terminal deletion
+ * (moving the start past a leading one), so S is restored to I, and the deletions the hit's gap
+ * counts hold beyond the display's are restored at its ends. Only the ends' total deletion length
+ * is known, but where it sits does not change the path's cost or its display alignment: it goes
+ * first before the display (one base at the end when both ends lost one), within the window's
+ * len bases. *lead and *trail are the reference bases restored before and after the display. An
+ * empty result: no path is recoverable (the hit is refined by the window DP instead). */
+static std::vector<uint32_t> ks_hit_path(const uint32_t *c, uint32_t n, const aln_meth_hit_t &h, int64_t off,
+										 int64_t len, int *lead, int *trail)
+{
+	*lead = *trail = 0;
+	std::vector<uint32_t> raw(c, c + n);
+	int gapo = 0, gape = 0;
+	for (uint32_t &op : raw) {
+		const int o = op & 15, l = (int)(op >> 4);
+		if (o == 4) op = (op & ~15u) | 1; // a soft clip is a terminal insertion
+		else if (o != 1 && o != 2) continue;
+		++gapo; gape += l - 1;
+	}
+	const int lost_o = (int)h.n_gapo - gapo, lost_e = (int)h.n_gape - gape;
+	if (lost_o < 0 || lost_o > 2 || lost_e < 0 || (lost_o == 0 && lost_e > 0)) return {};
+	if (lost_o == 0) return raw;
+	const int total = lost_o + lost_e; // the lost deletions' bases
+	const int64_t room_after = len - off - h.span;
+	if (lost_o == 1) {
+		if (off >= total) *lead = total;
+		else if (room_after >= total) *trail = total;
+		else return {};
+	} else if (off >= total - 1 && room_after >= 1) *lead = total - 1, *trail = 1;
+	else if (off >= 1 && room_after >= total - 1) *lead = 1, *trail = total - 1;
+	else return {};
+	if (*lead) raw.insert(raw.begin(), (uint32_t)*lead << 4 | 2);
+	if (*trail) raw.push_back((uint32_t)*trail << 4 | 2);
+	return raw;
+}
+
 void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_meth_read_t &wres,
 						std::vector<aln_meth_candidate_t> *out)
 {
@@ -780,8 +817,11 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 		const int64_t beg = win.beg + off;
 		if (win.site_pos < beg || win.site_pos >= beg + h.span) continue; // misses its site
 		const int64_t rb = bns->anns[win.rid].offset + beg;
-		const uint32_t *c = aln_meth_hit_cigar(wres, h);
-		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb, rb + h.span, std::vector<uint32_t>(c, c + h.n_cig)});
+		// The candidate is the search path (raw CIGAR and bounds), not the display alignment: the
+		// genomic search scores it as it scores its own rows, terminal gaps included.
+		int lead, trail;
+		std::vector<uint32_t> path = ks_hit_path(aln_meth_hit_cigar(wres, h), h.n_cig, h, off, win.len, &lead, &trail);
+		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb - lead, rb + h.span + trail, std::move(path)});
 	}
 }
 

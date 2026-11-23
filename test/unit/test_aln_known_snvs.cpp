@@ -3360,3 +3360,66 @@ TEST_CASE("aln_known_snvs: incomplete ALT-window discovery cannot claim unique m
         }
     }
 }
+
+TEST_CASE("aln_known_snvs: an ALT-window candidate carries its hit's search path, terminal gaps included")
+{
+    namespace ba = bwa_aln;
+    // One 100-base window at genome position 1000 (offset 0 of contig 0), its site at 1050; the
+    // window index's contig 0 is that window.
+    bntann1_t wann = {}; wann.len = 100;
+    bntseq_t wbns = {}; wbns.n_seqs = 1; wbns.anns = &wann; wbns.l_pac = 100;
+    bntann1_t ann = {}; ann.len = 5000;
+    bntseq_t bns = {}; bns.n_seqs = 1; bns.anns = &ann; bns.l_pac = 5000;
+    ba::ks_windows_t w;
+    w.win.push_back({0, 1000, 100, 1050, 0});
+    w.bns = &wbns;
+    auto M = [](uint32_t l) { return l << 4; };
+    auto I = [](uint32_t l) { return l << 4 | 1; };
+    auto D = [](uint32_t l) { return l << 4 | 2; };
+    auto S = [](uint32_t l) { return l << 4 | 4; };
+    // A hit as the window search stores it: display CIGAR at window offset off, with the path's
+    // gap counts (terminal gaps included).
+    auto one = [&](std::vector<uint32_t> display, int64_t off, int span, int gapo, int gape) {
+        ba::aln_meth_read_t r;
+        ba::aln_meth_hit_t h = {};
+        h.rid = 0; h.pos = (bwtint_t)off; h.span = span; h.n_gapo = (uint8_t)gapo; h.n_gape = (uint8_t)gape;
+        h.n_cig = (uint32_t)display.size();
+        if (display.size() == 1) h.cig = display[0];
+        else { h.cig = 0; r.cig = display; }
+        r.hits.push_back(h);
+        std::vector<ba::aln_meth_candidate_t> out;
+        ba::ks_meth_candidates(&w, &bns, r, &out);
+        REQUIRE(out.size() == 1);
+        return out[0];
+    };
+    SUBCASE("a soft-clipped terminal insertion is the path's insertion") {
+        const auto c = one({M(39), S(1)}, 20, 39, 1, 0);
+        CHECK(c.cig == std::vector<uint32_t>{M(39), I(1)});
+        CHECK(c.rb == 1020); CHECK(c.re == 1059);
+    }
+    SUBCASE("a dropped leading deletion is restored before the display alignment") {
+        const auto c = one({M(40)}, 20, 40, 1, 1);
+        CHECK(c.cig == std::vector<uint32_t>{D(2), M(40)});
+        CHECK(c.rb == 1018); CHECK(c.re == 1060);
+    }
+    SUBCASE("at the window's start, a dropped deletion is restored after it") {
+        const auto c = one({M(60)}, 0, 60, 1, 0);
+        CHECK(c.cig == std::vector<uint32_t>{M(60), D(1)});
+        CHECK(c.rb == 1000); CHECK(c.re == 1061);
+    }
+    SUBCASE("deletions dropped from both ends are restored at both") {
+        const auto c = one({M(10), I(1), M(29)}, 20, 39, 3, 2);
+        CHECK(c.cig == std::vector<uint32_t>{D(3), M(10), I(1), M(29), D(1)});
+        CHECK(c.rb == 1017); CHECK(c.re == 1060);
+    }
+    SUBCASE("a display alignment without lost gaps is the path") {
+        const auto c = one({M(20), D(2), M(20)}, 20, 42, 1, 1);
+        CHECK(c.cig == std::vector<uint32_t>{M(20), D(2), M(20)});
+        CHECK(c.rb == 1020); CHECK(c.re == 1062);
+    }
+    SUBCASE("gap counts the display cannot hold give no path (the window DP refines it)") {
+        const auto c = one({M(20), D(2), M(20)}, 20, 42, 0, 0);
+        CHECK(c.cig.empty());
+        CHECK(c.rb == 1020); CHECK(c.re == 1062);
+    }
+}
