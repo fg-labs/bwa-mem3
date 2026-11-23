@@ -35,8 +35,9 @@
 # that moves read 1 to the other copy anchors it (no cap) unless read 1's mirror-free loci exceed
 # --max-occ (then collapsed does not pair it, and its cap is 0), and no MAPQ is ever raised; under
 # the stock cuts, strata the search may have pruned give a cap of 0, single end and for both ends
-# of a pair; with the cuts conversion-blind leaves every field but MAPQ and YQ:i as scoring has it,
-# across penalties and -m limits (blind-genomic-identity); and the option's refusals.
+# of a pair (each with scoring's MAPQ in YQ:i); with the cuts conversion-blind leaves every field
+# but MAPQ and YQ:i as scoring has it, across penalties and -m limits (blind-genomic-identity); and
+# the option's refusals.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -126,6 +127,21 @@ records() { grep -v '^@' "$1" || [ $? -eq 1 ]; }
 summary() { awk '{ yq = "-"; for (i = 12; i <= NF; ++i) if (index($i, "YQ:i:") == 1) yq = substr($i, 6); print $1, $2, $3, $4, $5, yq }' "$1"; }
 # the records with MAPQ and YQ:i removed
 strip() { awk 'BEGIN { OFS = "\t" } { $5 = "."; out = $1; for (i = 2; i <= NF; ++i) if (index($i, "YQ:i:") != 1) out = out "\t" $i; print out }' "$1"; }
+# fails (as name) unless records a and b are the same outside MAPQ and YQ:i; each is stripped into
+# a file first, so a strip that fails fails the test rather than comparing empty streams
+same_outside_mapq() {
+    local name=$1 a=$2 b=$3 f
+    for f in "$a" "$b"; do
+        strip "$f" > "$f.strip" || {
+            echo "FAIL: $name: could not strip MAPQ and YQ:i from $f" >&2
+            exit 1
+        }
+    done
+    cmp "$a.strip" "$b.strip" || {
+        echo "FAIL: $name: modes differ outside MAPQ and YQ:i" >&2
+        exit 1
+    }
+}
 run() {
     local out=$1
     shift
@@ -212,10 +228,7 @@ paste -d ' ' "$tmp/se.blind.sum" "$tmp/se.collapsed.sum" | awk '$5 != $11 { bad 
 }
 echo 'PASS: single-end-capped-to-collapsed'
 
-cmp <(strip "$tmp/se.blind.rec") <(strip "$tmp/se.scoring.rec") || {
-    echo "FAIL: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "single-end" "$tmp/se.blind.rec" "$tmp/se.scoring.rec"
 echo 'PASS: only-mapq-and-yq-differ'
 
 # Under -n 1, ab2's other copy (two mirror mismatches) is over the limit genomically, so the search
@@ -306,10 +319,7 @@ expect row-conversion-blind "$tmp/row.blind.sum" "tie 0 tb 101 0 23
 rep 0 rb 101 23 37"
 expect row-collapsed "$tmp/row.collapsed.sum" "tie 0 ta 101 23 -
 rep 0 rb 101 23 -"
-cmp <(strip "$tmp/row.blind.rec") <(strip "$tmp/row.scoring.rec") || {
-    echo "FAIL: row: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "row" "$tmp/row.blind.rec" "$tmp/row.scoring.rec"
 echo 'PASS: single-end-lowest-mirror-free-row'
 
 # Paired end, on a reference of its own (rowpe.fa): read 1 is 'tie' again, at contigs ta (one
@@ -362,10 +372,7 @@ expect rowpe-conversion-blind <(tally "$tmp/rowpe.blind.sum") "11 99 tb 29 60
 13 99 tb 0 60
 24 147 tb 37 60"
 observer rowpe rowpe
-cmp <(strip "$tmp/rowpe.blind.rec") <(strip "$tmp/rowpe.scoring.rec") || {
-    echo "FAIL: rowpe: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "rowpe" "$tmp/rowpe.blind.rec" "$tmp/rowpe.scoring.rec"
 echo 'PASS: paired-lowest-mirror-free-row'
 
 # Paired end, collapsed's starts (on a reference of its own, start.fa): pairing's MAPQ depends on
@@ -419,10 +426,7 @@ awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/start.awk" < /dev/null
 run start.scoring --meth --meth-mapq scoring -A "$tmp/start.fa" "$tmp/start1.fq" "$tmp/start2.fq"
 run start.blind --meth -A "$tmp/start.fa" "$tmp/start1.fq" "$tmp/start2.fq"
 run start.collapsed --meth --meth-scoring collapsed -A "$tmp/start.fa" "$tmp/start1.fq" "$tmp/start2.fq"
-cmp <(strip "$tmp/start.blind.rec") <(strip "$tmp/start.scoring.rec") || {
-    echo "FAIL: start: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "start" "$tmp/start.blind.rec" "$tmp/start.scoring.rec"
 observer start start
 # each pair (its name less the copy number) with the genomic and conversion-blind MAPQs of a record
 shapes() { paste -d ' ' "$tmp/start.scoring.sum" "$tmp/start.blind.sum" | awk '{ sub(/[0-9]+$/, "", $1); print $1, $5, $11 }' | LC_ALL=C sort -u; }
@@ -471,10 +475,7 @@ awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/cut.awk" < /dev/null
 run cut.scoring --meth --meth-mapq scoring "$tmp/cut.fa" "$tmp/cut1.fq" "$tmp/cut2.fq"
 run cut.blind --meth "$tmp/cut.fa" "$tmp/cut1.fq" "$tmp/cut2.fq"
 run cut.collapsed --meth --meth-scoring collapsed "$tmp/cut.fa" "$tmp/cut1.fq" "$tmp/cut2.fq"
-cmp <(strip "$tmp/cut.blind.rec") <(strip "$tmp/cut.scoring.rec") || {
-    echo "FAIL: cut: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "cut" "$tmp/cut.blind.rec" "$tmp/cut.scoring.rec"
 observer cut cut
 # read 1 records the genomic pairing places at ch with a nonzero MAPQ, and their conversion-blind MAPQs
 past=$(awk '$2 % 256 >= 64 && $2 % 256 < 128 && $3 == "ch" && $5 > 0 { print $1 }' "$tmp/cut.scoring.sum")
@@ -593,22 +594,18 @@ grep -qF '; 1 with mirror-free strata the cuts may have pruned;' "$tmp/need.blin
     echo "FAIL: need: the read's mirror-free strata are not marked as possibly pruned" >&2
     exit 1
 }
-cmp <(strip "$tmp/need.blind.rec") <(strip "$tmp/need.scoring.rec") || {
-    echo "FAIL: need: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "need" "$tmp/need.blind.rec" "$tmp/need.scoring.rec"
 echo 'PASS: single-end-pruned-strata'
 run needpe.scoring --meth --meth-mapq scoring -n 5 "$tmp/need.fa" "$tmp/need1.fq" "$tmp/need2.fq"
 run needpe.blind --meth -n 5 "$tmp/need.fa" "$tmp/need1.fq" "$tmp/need2.fq"
-# every pair: both ends at g, capped to 0 with the genomic MAPQ in YQ:i
-awk '$3 != "g" || $5 != 0 || $6 == "-" || $6 == 0 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad || NR != 48 }' "$tmp/needpe.blind.sum" || {
-    echo "FAIL: paired-pruned-strata: an end is not capped to 0" >&2
+# every pair: both ends at g, capped to 0 with scoring's MAPQ for that end (nonzero) in YQ:i
+paste -d ' ' "$tmp/needpe.blind.sum" "$tmp/needpe.scoring.sum" \
+    | awk '$1 != $7 || $2 != $8 || $3 != "g" || $5 != 0 || $11 == 0 || $6 != $11 { bad = 1; print "  " $0 > "/dev/stderr" }
+           END { exit bad || NR != 48 }' || {
+    echo "FAIL: paired-pruned-strata: an end is not capped to 0 with scoring's MAPQ in YQ:i" >&2
     exit 1
 }
-cmp <(strip "$tmp/needpe.blind.rec") <(strip "$tmp/needpe.scoring.rec") || {
-    echo "FAIL: paired-pruned-strata: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "paired-pruned-strata" "$tmp/needpe.blind.rec" "$tmp/needpe.scoring.rec"
 echo 'PASS: paired-pruned-strata'
 
 # conversion-blind only observes the search: with the stock cuts every field but MAPQ and YQ:i is
@@ -674,10 +671,13 @@ for pen in '-M 5 -O 3 -E 1' '-e 3 -E 1'; do
         run rep.scoring --meth --meth-mapq scoring -v 4 $pen ${lim[@]+"${lim[@]}"} "$tmp/rep.fa" "$tmp/rep1.fq" "$tmp/rep2.fq"
         # shellcheck disable=SC2086
         run rep.blind --meth -v 4 $pen ${lim[@]+"${lim[@]}"} "$tmp/rep.fa" "$tmp/rep1.fq" "$tmp/rep2.fq"
-        cmp <(strip "$tmp/rep.blind.rec") <(strip "$tmp/rep.scoring.rec") || {
-            echo "FAIL: blind-genomic-identity ($pen, -m $m): modes differ outside MAPQ and YQ:i" >&2
-            exit 1
-        }
+        for mode in scoring blind; do
+            [ "$(wc -l < "$tmp/rep.$mode.rec")" -eq 120 ] || {
+                echo "FAIL: blind-genomic-identity ($pen, -m $m): $mode does not give 120 records" >&2
+                exit 1
+            }
+        done
+        same_outside_mapq "blind-genomic-identity ($pen, -m $m)" "$tmp/rep.blind.rec" "$tmp/rep.scoring.rec"
         paste -d ' ' "$tmp/rep.blind.sum" "$tmp/rep.scoring.sum" | awk '$5 > $11 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' || {
             echo "FAIL: blind-genomic-identity ($pen, -m $m): a conversion-blind MAPQ is above scoring's" >&2
             exit 1
@@ -719,10 +719,7 @@ grep -q 'infer_isize] (25, 50, 75) percentile' "$tmp/pe.blind.err" || {
     echo "FAIL: fixture: the paired batch gave no insert-size estimate" >&2
     exit 1
 }
-cmp <(strip "$tmp/pe.blind.rec") <(strip "$tmp/pe.scoring.rec") || {
-    echo "FAIL: paired: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "paired" "$tmp/pe.blind.rec" "$tmp/pe.scoring.rec"
 paste -d ' ' "$tmp/pe.blind.sum" "$tmp/pe.scoring.sum" | awk '$5 > $11 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' || {
     echo "FAIL: paired: conversion-blind raised a MAPQ" >&2
     exit 1
@@ -778,6 +775,7 @@ run o2.blind --meth --max-occ 2 "$tmp/ref.fa" "$tmp/o1.fq" "$tmp/o2.fq"
 expect maxocc-moved "$tmp/o2.blind.sum" "maxocc 99 ayz 1281 0 29
 maxocc 147 ayz 1581 37 -"
 echo 'PASS: paired-max-occ-moved'
+
 
 check_error() {
     local name=$1 pattern=$2 rc=0
