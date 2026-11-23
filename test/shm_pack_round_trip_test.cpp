@@ -312,7 +312,22 @@ int main(int argc, char *argv[]) {
     const size_t checkpoint_bytes = ((disk_len >> CP_SHIFT) + 1) * sizeof(CP_OCC);
     std::vector<uint8_t> expected_checkpoints(checkpoint_bytes);
     CHECK_EQ(std::fread(expected_checkpoints.data(), 1, checkpoint_bytes, disk_bwt), checkpoint_bytes);
+    // Then the SA samples (n one-byte high parts, then n 32-bit low words), the sentinel row and,
+    // in the tagged format, the sa_compx tag: n is the one count whose layout fits the rest of
+    // the file (5 * n + 8 or 5 * n + 16 bytes; 5 divides at most one of them).
+    std::vector<uint8_t> disk_tail;
+    for (int c; (c = std::fgetc(disk_bwt)) != EOF;) disk_tail.push_back((uint8_t)c);
     CHECK_EQ(std::fclose(disk_bwt), 0);
+    CHECK(disk_tail.size() >= 8);
+    const size_t tail_extra = (disk_tail.size() - 8) % 5 == 0 ? 8 : 16;
+    CHECK(disk_tail.size() >= tail_extra);
+    CHECK_EQ((disk_tail.size() - tail_extra) % 5, 0u);
+    const size_t disk_samples = (disk_tail.size() - tail_extra) / 5;
+    CHECK(disk_samples > 0);
+    const uint8_t *expected_sa_ms = disk_tail.data();
+    const uint8_t *expected_sa_ls = expected_sa_ms + disk_samples;
+    int64_t disk_sentinel = 0;
+    std::memcpy(&disk_sentinel, expected_sa_ls + 4 * disk_samples, sizeof(disk_sentinel));
 
     /* Registered restaging still succeeds, attaches, and is removed by -d. The checks after
      * staging run in a child: a failed CHECK aborts it, and this process still destroys the
@@ -345,6 +360,11 @@ int main(int argc, char *argv[]) {
             CHECK_EQ(disk.cp_occ_size_bytes(), (int64_t)checkpoint_bytes);
             CHECK_EQ(std::memcmp(disk.cp_occ_data(), expected_checkpoints.data(), checkpoint_bytes), 0);
             for (int i = 0; i < 5; ++i) CHECK_EQ(disk.count_data()[i], disk_counts[i] + 1);
+            // The SA samples too: a hybrid load could take them from the staged index.
+            CHECK_EQ(disk.sentinel_index, disk_sentinel);
+            CHECK_EQ(disk.sa_sample_count(), (int64_t)disk_samples);
+            CHECK_EQ(std::memcmp(disk.sa_ms_byte_data(), expected_sa_ms, disk_samples), 0);
+            CHECK_EQ(std::memcmp(disk.sa_ls_word_data(), expected_sa_ls, 4 * disk_samples), 0);
             CHECK_EQ(disk.idx->bns->n_seqs, 1);
             CHECK(std::strcmp(disk.idx->bns->anns[0].name, "different") == 0);
             if (load_pac) CHECK_EQ(std::memcmp(disk.idx->pac, expected_pac.data(), expected_pac.size()), 0);

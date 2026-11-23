@@ -109,6 +109,9 @@ int main() {
             const int64_t poss[] = {0, 1, 500, 990};
             for (int64_t p : poss) CHECK(view.get_kmer(p, 32) == mapped.get_kmer(p, 32));
         }
+        // The file-backed comparison is done: remove the file now, so a destructor that wrongly
+        // unmaps the caller's mapping below cannot crash the test before the file is gone.
+        unlink(vpath);
         // The same over a caller-owned, page-aligned mapping: an erroneous munmap in the view's
         // destructor would unmap it, which a heap buffer (not page-aligned) can hide.
         {
@@ -124,7 +127,6 @@ int main() {
             CHECK(munmap(map, nb) == 0);
         }
         free(buf);  // view already destroyed; must not have unmapped/closed anything
-        unlink(vpath);
     }
 
     printf("packed_text_test OK\n");

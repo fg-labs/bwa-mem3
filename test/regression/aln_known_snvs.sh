@@ -208,16 +208,17 @@ echo 'PASS: no-snv-identical (single, paired; plain, --meth)'
 run ks.se --known-snvs "$tmp/sites.vcf" "$reference" "$tmp/se.fq"
 run ks.pe --known-snvs "$tmp/sites.vcf" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
 for e in se pe; do
-    # a fragment (a read, or a pair) with no XV on any of its records is unchanged
+    # a fragment (a read, or a pair) with no XV on any of its records is unchanged; a bg fragment
+    # comes from c2, which has no site, so it is unchanged whatever tags it carries
     recs "$tmp/stock.$e.plain.sam" "$tmp/stock.$e.plain.recs"
     recs "$tmp/ks.$e.sam" "$tmp/ks.$e.recs"
     paste -d $'\001' "$tmp/stock.$e.plain.recs" "$tmp/ks.$e.recs" | awk -F $'\001' -v pe="$([ "$e" = pe ] && echo 1 || echo 0)" '
-        function done_frag() { if (!xv && !same) { print "differs: " name > "/dev/stderr"; bad = 1 } }
+        function done_frag() { if ((!xv || name ~ /^bg/) && !same) { print "differs: " name > "/dev/stderr"; bad = 1 } }
         { split($1, f, "\t") }
         !pe || NR % 2 == 1 { if (NR > 1) done_frag(); name = f[1]; xv = 0; same = 1 }
         { if ($2 ~ /\tXV:Z:/) xv = 1; if ($1 != $2) same = 0 }
         END { if (NR) done_frag(); exit bad }' || {
-        echo "FAIL: $e: a read or pair without XV differs from stock" >&2
+        echo "FAIL: $e: a bg read or pair, or one without XV, differs from stock" >&2
         exit 1
     }
     # stock leaves every over-budget read unmapped; crediting places each at its locus, with an A vote

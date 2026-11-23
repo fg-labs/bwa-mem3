@@ -209,6 +209,13 @@ TEST_CASE("libsais_mem: MemSink holds the same bytes the file writer writes"
                     CHECK(arr.sa_ms_byte[L.sa_sample_count - 1] == 0);
                     CHECK(arr.sa_ls_word[L.sa_sample_count - 1] == 0);
                 }
+                if ((N + 1) % CP_BLOCK_SIZE == 0) { // the reserved checkpoint, past every row
+                    const CP_OCC &reserved = arr.cp_occ[L.cp_occ_count - 1];
+                    for (int c = 0; c < 4; ++c) {
+                        CHECK(reserved.cp_count[c] == 0);
+                        CHECK(reserved.one_hot_bwt_str[c] == 0);
+                    }
+                }
             }
     }
 }
