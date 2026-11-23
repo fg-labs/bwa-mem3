@@ -668,16 +668,20 @@ can differ from the raw ranking mismatch/gap count. Records use Bismark
 
 **Conversion-blind MAPQ (`--meth-mapq`).** With EM-seq and `genomic` scoring (the defaults),
 each record's MAPQ is capped at the stock MAPQ its locus gets when the mirror cell (reference T x
-read C on OT, reference A x read G on OB) costs nothing: the read's loci are recounted at their
-cost minus `-M` per mirror mismatch, before the stock cut, together with any row the `-n` (or
-seed `-k`) limit dropped only for its mirror mismatches (with the mirror cell free it is within
-the limit, as under `collapsed`), and a locus that is then cheaper than the primary gives a cap of 0. Paired-end ends take the MAPQ of the same stock pairing run on those
+read C on OT, reference A x read G on OB) costs nothing: the read's loci are recounted before the
+stock cut, each at its cheapest row with the mirror cell free (cost minus `-M` per mirror
+mismatch, among the rows the search scored there; the row `collapsed` keeps), together with any
+row the `-n` (or seed `-k`) limit dropped only for its mirror mismatches (with the mirror cell
+free it is within the limit, as under `collapsed`), and a locus that is then cheaper than the
+primary gives a cap of 0. Paired-end ends take the MAPQ of the same stock pairing run on those
 costs (including the loci only the mirror-free strata keep), and a rescued mate its anchor's.
 An end with more than `--max-occ` such loci would not pair, so each end keeps its single-end cap,
 or gets 0 if pairing moves it.
 Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
-and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. A gapped locus is taken at its
-`genomic` alignment's cost, not realigned. `--meth-mapq scoring` restores the uncapped MAPQ
+and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. At a `--known-snvs` ALT window the
+rows come from the window search's `genomic` selection, and a window without a search path is
+realigned under `genomic` scoring, so a row `collapsed` would keep there can be missing.
+`--meth-mapq scoring` restores the uncapped MAPQ
 ([#816](https://github.com/fg-labs/bwa-mem3/pull/816)). See
 [`--meth-mapq`](../methylation/flags.md#--meth-mapq-conversion-blindscoring).
 

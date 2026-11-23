@@ -185,11 +185,15 @@ comes out too high.
 - `conversion-blind` (**default for `--meth`/`--meth=emseq` with `genomic` scoring**)
   — cap each record's MAPQ at the MAPQ the same run gives with the mirror cell
   freed as a conversion, at the same penalties; a locus that wins with the mirror
-  cell free gives a cap of 0. Each locus is taken at its `genomic` alignment's cost
-  less one mismatch penalty per mirror mismatch: exact for an ungapped locus, while a
-  gapped locus is not realigned with the mirror cell free. A row that `-n` (or the
+  cell free gives a cap of 0. Each locus is taken at its cheapest row with the mirror
+  cell free among the rows the search scored there (one per search path and site allele): the row
+  `collapsed` keeps, ties broken as `collapsed` breaks them. That row's cost,
+  mismatches and gaps set the cap, not those of the row `genomic` keeps, which is the
+  genomically cheapest and can cost more with the mirror cell free
+  ([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). A row that `-n` (or the
   seed's `-k`) dropped only for its mirror mismatches counts too, since with the mirror
-  cell free it is within the limit, as under `collapsed`. Placement, CIGAR, `NM`,
+  cell free it is within the limit, as under `collapsed`. If the rows kept for this
+  outgrow 64 MiB of CIGARs, the strata are unknown and the cap is 0. Placement, CIGAR, `NM`,
   `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
   is `genomic`'s in every field but MAPQ. A record whose MAPQ the cap lowered
   carries the uncapped MAPQ in `YQ:i`, whatever `--meth-tags` selects. The other
@@ -233,8 +237,12 @@ at MAPQ 60 8, 8 and 27. With 160 k simulated SNPs and indels (6.5 M reads), wron
 MAPQ 60 is 14 with the cap and 73 under `collapsed -B 4`.
 
 For `aln` the following is by construction, not a measurement: `aln`'s `genomic` and
-`collapsed` share `-M`, so there the single-end cap estimates the `collapsed` MAPQ at
-`genomic`'s costs: exactly for ungapped loci, and 0 when a mirror-free locus beats the
+`collapsed` share `-M`, so there the single-end cap is the `collapsed` MAPQ from the rows
+`genomic`'s search scored: exactly, except at a `--known-snvs` ALT window. The window
+search hands the main search the rows its own `genomic` selection kept, and a window
+without a search path is realigned under `genomic` scoring rather than with the mirror
+cell free, so a row `collapsed` would keep there can be missing. The cap is 0 when a
+mirror-free locus beats the
 `genomic` primary, even where a `collapsed` run would place the read there with a
 positive MAPQ. A record's MAPQ is the lower of that cap and its `genomic` MAPQ: where
 the cap is higher, the record keeps its `genomic` MAPQ.

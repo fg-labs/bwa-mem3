@@ -151,6 +151,10 @@ struct aln_meth_slot_t {
     // Exact windows dedup before DP; every distinct span is evaluated before locus collapse.
     aln_flat_index_t<aln_meth_win_key_t> windows;
     aln_flat_index_t<aln_meth_locus_key_t> loci; // value: the locus's index in res->occ
+    // --meth-mapq conversion-blind: the mirror table's loci (value: the index in res->mirror_rows)
+    // and its CIGAR bytes, under a budget of its own (store_mirror_row). Cleared per read.
+    aln_flat_index_t<aln_meth_locus_key_t> mirror_loci;
+    uint64_t mirror_bytes = 0;
     // The read's two query orientations as bit planes (rd_fwd, then p->rseq), built on first use.
     aln_meth_read_bits_t bits[2];
     int bits_ready = 0;

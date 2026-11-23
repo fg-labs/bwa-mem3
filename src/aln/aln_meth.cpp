@@ -231,6 +231,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
         x->rd_rev[k] = std::min<ubyte_t>(p->rseq[k], 4);
     }
     x->pend.clear(); x->windows.clear(); x->intervals.clear(); x->loci.clear(); x->garena.clear();
+    x->mirror_loci.clear(); x->mirror_bytes = 0;
     x->sa_ix.clear(); x->sa_rows.clear();
     x->bits_ready = 0;
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
@@ -498,11 +499,63 @@ static bool within_read_limits(const aln_meth_slot_t *x, const aln_meth_occ_t &o
     const int diffs = o.n_mm - (mirror_free ? o.n_mirror : 0) + o.n_gapo + ((op->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
     return diffs <= x->max_diff && o.n_gapo <= std::max(0, op->max_gapo) && o.n_gape <= std::max(0, op->max_gape);
 }
+// --meth-mapq conversion-blind: whether row a is a better row of its locus than b with their
+// mirror mismatches free. Under collapsed scoring a mirror mismatch is a conversion and a row's
+// CIGARs (its search path's) are the same, so this is store_row's order on mirror-free costs:
+// the cost, the site allele, then the CIGARs. The TAPS conversion count is left out
+// (conversion-blind is EM-seq only).
+static bool mirror_free_better(const aln_meth_occ_t &a, const aln_meth_occ_t &b, int s_mm)
+{
+    const int64_t ca = mirror_free_cost(a.cost, s_mm, a.n_mirror), cb = mirror_free_cost(b.cost, s_mm, b.n_mirror);
+    if (ca != cb) return ca < cb;
+    if (a.ks_site != b.ks_site) return (uint64_t)(a.ks_site + 1) < (uint64_t)(b.ks_site + 1);
+    if (a.alignment.cigar != b.alignment.cigar) return a.alignment.cigar < b.alignment.cigar;
+    if (a.alignment.re != b.alignment.re) return a.alignment.re < b.alignment.re;
+    return a.alignment.raw_cigar < b.alignment.raw_cigar;
+}
+// --meth-mapq conversion-blind: notes row o, which has a mirror mismatch, in the mirror table
+// (aln_meth_read_t::mirror_rows) when it is within the read's limits with its mirror mismatches
+// free, as collapsed scoring applies them: -n, -k, a record's fields and, for a bounded window,
+// within_read_limits. A copy is kept; o is not changed, so store_row goes on as under scoring.
+// A row without a mirror mismatch needs no entry: its mirror-free cost is its genomic cost, so a
+// row that beats it in occ is no worse mirror-free (meth_blind_strata takes the better of the two).
+// The table has a CIGAR budget of its own; past it the strata are unknown (blind_partial).
+static __attribute__((noinline)) void store_mirror_row(aln_meth_slot_t *x, const aln_meth_occ_t &o, int seed_diffs,
+                                                       bool bounded, int seed_mirror)
+{
+    const gap_opt_t *op = x->grp->opt;
+    aln_meth_read_t *r = x->res;
+    const int64_t differences = (int64_t)o.n_mm - o.n_mirror + o.n_gapo + ((op->mode & BWA_MODE_GAPE) ? o.n_gape : 0);
+    const bool seeded = x->job && x->job->seed_width;
+    if (differences > x->max_diff || (seeded && seed_diffs - seed_mirror > op->max_seed_diff)) return;
+    if (mirror_free_cost(o.cost, op->s_mm, o.n_mirror) > INT_MAX || o.n_mm - o.n_mirror > 255
+        || o.n_gapo > 255 || o.n_gape > 255) return;
+    if (bounded && !within_read_limits(x, o, true)) return;
+    if (r->blind_partial) return;
+    const aln_meth_locus_key_t key{o.rid, o.hyp, o.strand, o.alignment.rb};
+    size_t pos;
+    const int32_t at = x->mirror_loci.find(key, &pos);
+    if (at >= 0 && !mirror_free_better(o, r->mirror_rows[x->mirror_loci.val[at]], op->s_mm)) return;
+    const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
+    if (bytes > (64ULL << 20) - x->mirror_bytes) {
+        r->blind_partial = 1;
+        std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
+        return;
+    }
+    x->mirror_bytes += bytes;
+    if (at >= 0) r->mirror_rows[x->mirror_loci.val[at]] = o;
+    else {
+        x->mirror_loci.insert(key, r->mirror_rows.size());
+        r->mirror_rows.push_back(o);
+    }
+}
 // Applies the strict -n/-k filters and stores o as its locus's candidate (the cheaper wins).
 // seed_mirror: the mirror-cell mismatches among seed_diffs.
 static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, bool bounded = false, int seed_mirror = 0)
 {
     aln_meth_group_t *g = x->grp;
+    // --meth-mapq conversion-blind observes every row before the filters below.
+    if (o.n_mirror && g->mo && meth_mapq_conversion_blind(&g->mo->m)) store_mirror_row(x, o, seed_diffs, bounded, seed_mirror);
     // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
     // seed than -k allows. The converted search cannot see a read C over a reference T, so it can
     // reach a row within -n (-k) converted differences whose original-reference path has more; drop
@@ -515,19 +568,6 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     const bool over_seed = !over_diff && seed_diffs > g->opt->max_seed_diff && seeded;
     if (over_diff || over_seed) {
         ++(over_diff ? x->res->n_over_diff : x->res->n_over_seed);
-        // --meth-mapq conversion-blind: a row within -n and -k once its mirror mismatches are free
-        // is a mirror-free locus (blind_over), as collapsed scoring keeps it, subject to the same
-        // representability and limits. Its CIGARs are not kept.
-        if (differences - o.n_mirror <= x->max_diff
-            && (!seeded || seed_diffs - seed_mirror <= g->opt->max_seed_diff)
-            && o.cost <= INT_MAX && o.n_mm <= 255 && o.n_gapo <= 255 && o.n_gape <= 255
-            && !(bounded && !within_read_limits(x, o, true))
-            && g->mo && meth_mapq_conversion_blind(&g->mo->m)) {
-            o.pos = o.alignment.rb;
-            std::vector<uint32_t>().swap(o.alignment.raw_cigar);
-            std::vector<uint32_t>().swap(o.alignment.cigar);
-            x->res->blind_over.push_back(std::move(o));
-        }
         return;
     }
     if (!(o.cost <= INT_MAX && o.n_mm <= 255 && o.n_gapo <= 255 && o.n_gape <= 255)) {
@@ -916,60 +956,75 @@ static __attribute__((noinline)) void meth_slot_finish_tail(aln_meth_read_t *res
 }
 // --meth-mapq conversion-blind: the strata with the mirror cell freed, over every candidate
 // before the stock cut (a locus the cut drops can still tie or beat the main hit once its mirror
-// mismatches are free), and over the rows the -n (or -k) limit dropped only for their mirror
-// mismatches (blind_over), which collapsed scoring keeps as loci. The search proposed every window within the genomic best cost plus s_mm
+// mismatches are free), each locus at its lowest mirror-free row: the better (mirror_free_better)
+// of its occ row and its mirror table row, which also holds the loci whose every row the -n (or
+// -k) limit dropped but would keep with the mirror mismatches free. That is the row collapsed
+// scoring keeps there. The search proposed every window within the genomic best cost plus s_mm
 // (aln_meth_can_stop); a mirror-free cost never exceeds the genomic cost, so every locus within
-// s_mm of the mirror-free best was proposed too. The loci in the mirror-free strata that the
-// genomic cut (genomic_cut) drops are kept as rows for the paired-end shadow pairing. Out of
-// line, as meth_slot_finish_tail is.
-static __attribute__((noinline)) void meth_blind_strata(aln_meth_read_t *r, const gap_opt_t *opt,
+// s_mm of the mirror-free best was proposed too. The loci in the mirror-free strata that are not
+// hits (the genomic cut, genomic_cut, drops them, or they are not in occ) are kept as rows for the
+// paired-end shadow pairing, and a hit whose lowest mirror-free row is not its own as blind_alt.
+// Out of line, as meth_slot_finish_tail is.
+static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x, aln_meth_read_t *r,
                                                         int64_t genomic_cut)
 {
-    // The candidates: the loci, and the rows -n or -k dropped that are within those limits
-    // mirror-free (blind_over), one per locus at its lowest mirror-free cost. A locus the genomic
-    // search kept stays as it is.
-    std::vector<const aln_meth_occ_t *> cand;
-    cand.reserve(r->occ.size() + r->blind_over.size());
-    for (const auto &o : r->occ) cand.push_back(&o);
-    if (!r->blind_over.empty()) {
-        auto key = [](const aln_meth_occ_t *o) { return std::make_tuple(o->rid, o->hyp, o->strand, o->pos); };
-        std::set<std::tuple<int, int, int, bwtint_t>> kept;
-        for (const auto &o : r->occ) kept.insert(key(&o));
-        std::map<std::tuple<int, int, int, bwtint_t>, const aln_meth_occ_t *> over;
-        for (const auto &o : r->blind_over) {
-            if (kept.count(key(&o))) continue;
-            auto it = over.emplace(key(&o), &o).first;
-            if (mirror_free_cost(o.cost, opt->s_mm, o.n_mirror)
-                < mirror_free_cost(it->second->cost, opt->s_mm, it->second->n_mirror))
-                it->second = &o;
+    const gap_opt_t *opt = x->grp->opt;
+    if (r->blind_partial) { std::vector<aln_meth_occ_t>().swap(r->mirror_rows); return; }
+    // Each locus once: its row, and whether it is a hit.
+    std::vector<std::pair<const aln_meth_occ_t *, bool>> cand;
+    cand.reserve(r->occ.size() + r->mirror_rows.size());
+    std::vector<char> in_occ(r->mirror_rows.size(), 0);
+    for (const auto &o : r->occ) {
+        const aln_meth_occ_t *m = &o;
+        size_t pos;
+        const int32_t at = r->mirror_rows.empty() ? -1
+            : x->mirror_loci.find(aln_meth_locus_key_t{o.rid, o.hyp, o.strand, o.alignment.rb}, &pos);
+        if (at >= 0) {
+            const size_t k = x->mirror_loci.val[at];
+            in_occ[k] = 1;
+            if (mirror_free_better(r->mirror_rows[k], o, opt->s_mm)) m = &r->mirror_rows[k];
         }
-        for (const auto &e : over) cand.push_back(e.second);
+        const bool hit = o.cost <= genomic_cut;
+        if (hit && m != &o) { // keyed as the hit is (aln_meth_blind_view)
+            aln_meth_blind_row_t row;
+            row.pos = o.pos; row.span = (int32_t)(m->alignment.re - m->alignment.rb);
+            row.cost = (int32_t)mirror_free_cost(m->cost, opt->s_mm, m->n_mirror);
+            row.strand = (uint8_t)o.strand; row.n_mm = (uint8_t)(m->n_mm - m->n_mirror);
+            row.n_gapo = (uint8_t)m->n_gapo; row.n_gape = (uint8_t)m->n_gape;
+            r->blind_alt.push_back(row);
+        }
+        cand.emplace_back(m, hit);
     }
+    // sorted for aln_meth_blind_view's binary search (a pair can hold many hits)
+    std::sort(r->blind_alt.begin(), r->blind_alt.end(), [](const aln_meth_blind_row_t &a, const aln_meth_blind_row_t &b) {
+        return a.pos != b.pos ? a.pos < b.pos : a.strand < b.strand;
+    });
+    for (size_t k = 0; k < r->mirror_rows.size(); ++k)
+        if (!in_occ[k]) cand.emplace_back(&r->mirror_rows[k], false);
     int64_t best = INT64_MAX;
-    for (const auto *o : cand) best = std::min(best, mirror_free_cost(o->cost, opt->s_mm, o->n_mirror));
+    for (const auto &e : cand) best = std::min(best, mirror_free_cost(e.first->cost, opt->s_mm, e.first->n_mirror));
     const int64_t cut = (opt->mode & BWA_MODE_NONSTOP) ? INT64_MAX : best + (int64_t)opt->s_mm;
     r->blind_best = best;
-    for (size_t k = 0; k < cand.size(); ++k) {
-        const aln_meth_occ_t &o = *cand[k];
+    for (const auto &e : cand) {
+        const aln_meth_occ_t &o = *e.first;
         const int64_t c = mirror_free_cost(o.cost, opt->s_mm, o.n_mirror);
         if (c > cut) continue;
         if (c == best) ++r->blind_c1;
         else ++r->blind_c2;
-        // a locus the genomic cut drops, or one only the mirror-free -n keeps
-        if (o.cost > genomic_cut || k >= r->occ.size()) { // account_alignment bounds cost and counts (meth_hit's checks)
+        if (!e.second) { // store_mirror_row and account_alignment bound the cost and counts
             aln_meth_blind_row_t row;
-            row.pos = o.pos; row.span = (int32_t)(o.alignment.re - o.alignment.rb); row.cost = (int32_t)c;
+            row.pos = o.alignment.rb; row.span = (int32_t)(o.alignment.re - o.alignment.rb); row.cost = (int32_t)c;
             row.strand = (uint8_t)o.strand; row.n_mm = (uint8_t)(o.n_mm - o.n_mirror);
             row.n_gapo = (uint8_t)o.n_gapo; row.n_gape = (uint8_t)o.n_gape;
             r->blind_rows.push_back(row);
         }
     }
-    std::vector<aln_meth_occ_t>().swap(r->blind_over);
+    std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
 }
 // The --meth-mapq gate for meth_blind_strata, out of line so slot_finish keeps a single call here.
 static __attribute__((noinline)) void meth_blind_cap(const aln_meth_slot_t *x, aln_meth_read_t *r, int64_t cut)
 {
-    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(r, x->grp->opt, cut);
+    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(x, r, cut);
 }
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
@@ -1002,7 +1057,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
         }
     }
     if (r->occ.empty()) {
-        std::vector<aln_meth_occ_t>().swap(r->blind_over); // no record to cap
+        std::vector<aln_meth_occ_t>().swap(r->mirror_rows); // no record to cap
         // Every candidate was dropped: any of them could have been the best locus.
         if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
         return;
@@ -1180,16 +1235,19 @@ static void meth_set_main(bwa_seq_t *s, aln_meth_read_t *r, const gap_opt_t *opt
 }
 
 // --meth-mapq conversion-blind: the stock single-end MAPQ the main hit would get with the mirror
-// cell freed (meth_blind_strata), or 0 when a mirror-free locus beats it; 255 (no cap) when the
+// cell freed (meth_blind_strata; the main hit's locus at its lowest mirror-free row), or 0 when a
+// mirror-free locus beats it or the strata are unknown (blind_partial); 255 (no cap) when the
 // read has no strata (an incomplete read already has MAPQ 0). Read after meth_set_main, on the
 // same max_diff.
 static int meth_blind_se_cap(const aln_meth_read_t *r, const bwa_seq_t *s, const gap_opt_t *opt)
 {
-    if (r->main < 0 || r->flags || r->blind_best == INT64_MAX) return 255;
-    const aln_meth_hit_t &h = r->hits[r->main];
-    if (mirror_free_cost(h.cost, opt->s_mm, h.n_mirror) > r->blind_best) return 0;
+    if (r->main < 0 || r->flags) return 255;
+    if (r->blind_partial) return 0;
+    if (r->blind_best == INT64_MAX) return 255;
+    const aln_meth_blind_row_t m = aln_meth_blind_view(*r, r->hits[r->main], opt->s_mm);
+    if (m.cost > r->blind_best) return 0;
     bwa_seq_t t = *s;
-    t.c1 = r->blind_c1; t.c2 = r->blind_c2; t.n_mm = h.n_mm - h.n_mirror;
+    t.c1 = r->blind_c1; t.c2 = r->blind_c2; t.n_mm = m.n_mm;
     return bwa_approx_mapQ(&t, read_max_diff(opt, s->len));
 }
 // Lowers a record's MAPQ to its end's cap, keeping the replaced MAPQ for YQ:i.
@@ -1572,8 +1630,8 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 				}
 				pair64_v v;
                 // --meth-mapq conversion-blind: the shadow pairing, which a mirror-free run would make:
-                // each hit at its mirror-free cost and mismatches, plus the loci only the mirror-free
-                // cut keeps (blind_rows), each end at its single-end cap. It runs first, on copies
+                // each hit at its locus's lowest mirror-free row (aln_meth_blind_view), plus the
+                // mirror-free strata's other loci (blind_rows), each end at its single-end cap. It runs first, on copies
                 // (pairing sorts the rows and rewrites the ends), and only its outcome is kept: an end
                 // the shadow pairs where the pairing below places it is capped at the shadow's MAPQ,
                 // any other end at 0. With more than --max-occ mirror-free loci on an end a mirror-free
@@ -1584,12 +1642,18 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
                 const bool blind_fits = (int)(r[0]->hits.size() + r[0]->blind_rows.size()) <= max_occ
                     && (int)(r[1]->hits.size() + r[1]->blind_rows.size()) <= max_occ;
                 bool shadow_pairs = blind && blind_fits;
+                // An end whose mirror-free strata are unknown (blind_partial) leaves the pair's
+                // unknown: both ends get 0, without the shadow.
+                if (blind && (r[0]->blind_partial || r[1]->blind_partial)) {
+                    shadow_pairs = false;
+                    r[0]->blind_cap = r[1]->blind_cap = 0;
+                }
                 if (shadow_pairs) {
-                    // With no mirror mismatch on any row, no extra row and neither end capped, the
-                    // shadow is the pairing below: skip it and leave the ends uncapped.
+                    // With no mirror mismatch on any row, no extra or moved row and neither end
+                    // capped, the shadow is the pairing below: skip it and leave the ends uncapped.
                     bool differs = false;
                     for (int j = 0; j < 2 && !differs; ++j) {
-                        differs = !r[j]->blind_rows.empty() || r[j]->blind_cap < p[j]->mapQ;
+                        differs = !r[j]->blind_rows.empty() || !r[j]->blind_alt.empty() || r[j]->blind_cap < p[j]->mapQ;
                         for (size_t x = 0; x < r[j]->hits.size() && !differs; ++x) differs = r[j]->hits[x].n_mirror > 0;
                     }
                     if (!differs) {
@@ -1602,12 +1666,14 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
                     for (int j = 0; j < 2; ++j) {
                         shadow[j] = *p[j];
                         sa[j].assign(a[j].begin(), a[j].end());
-                        for (size_t x = 0; x < r[j]->hits.size(); ++x) {
-                            const aln_meth_hit_t &o = r[j]->hits[x];
-                            sa[j][x].score = (int)mirror_free_cost(o.cost, gopt->s_mm, o.n_mirror);
-                            sa[j][x].n_mm = o.n_mm - o.n_mirror;
-                        }
                         if (popt->ref_span_insert) sspan[j].assign(span[j].begin(), span[j].end());
+                        // each hit at its locus's lowest mirror-free row
+                        for (size_t x = 0; x < r[j]->hits.size(); ++x) {
+                            const aln_meth_blind_row_t m = aln_meth_blind_view(*r[j], r[j]->hits[x], gopt->s_mm);
+                            sa[j][x].score = m.cost;
+                            sa[j][x].n_mm = m.n_mm; sa[j][x].n_gapo = m.n_gapo; sa[j][x].n_gape = m.n_gape;
+                            if (popt->ref_span_insert) sspan[j][x] = m.span;
+                        }
                         for (const aln_meth_blind_row_t &o : r[j]->blind_rows) {
                             bwt_aln1_t b = bwt_aln1_t();
                             b.n_mm = o.n_mm; b.n_gapo = o.n_gapo; b.n_gape = o.n_gape; b.score = o.cost;

@@ -20,8 +20,9 @@
 # Cs on the C->T strand, the second one past the genomic cut; one retained C on the G->A strand)
 # are capped to collapsed's MAPQ with YQ:i, and controls (a fully converted ambiguous read, a unique
 # read) are not; only MAPQ and YQ:i differ between the modes; under -n 1 (or a seed's -k 0) a copy
-# over the limit only by its mirror mismatches still caps, as collapsed keeps it; the default for collapsed, neutral,
-# TAPS and 5-base is scoring, and collapsed accepts conversion-blind as a no-op; paired end: a pair
+# over the limit only by its mirror mismatches still caps, as collapsed keeps it;
+# a locus with several rows enters the cap, single and paired end, at its cheapest row with the
+# mirror cell free; the default for collapsed, neutral, TAPS and 5-base is scoring, and collapsed accepts conversion-blind as a no-op; paired end: a pair
 # whose MAPQ read 1's retained Cs raised is capped at the mirror-free pairing's MAPQ, a read 1 the
 # mirror-free pairing places at the other copy gets 0, a rescued mate takes its anchor's cap, a mate
 # that moves read 1 to the other copy anchors it (no cap) unless read 1's mirror-free loci exceed
@@ -197,6 +198,111 @@ paste -d ' ' "$tmp/se.k0.blind.sum" "$tmp/se.k0.collapsed.sum" | awk '$5 != $11 
     exit 1
 }
 echo 'PASS: single-end-mirror-free-k-limit'
+
+# A locus holds several rows (search paths with a gap in different places); the genomic search keeps
+# the genomically cheapest, collapsed the cheapest with the mirror cell free, and the cap takes each
+# locus at that row. On a reference of its own (row.fa), read 1 'tie' (50 bp) has ACA at offsets
+# 16-18; contig ta holds it with ATAA there (one base longer) and a mismatch at offset 40, so the
+# deletion gives two rows of genomic cost 17: two mismatches (the lower CIGAR, which the genomic
+# search keeps) or one and a read C over a T (mirror-free 14). Contig tb holds it with a two-base
+# deletion (15). The genomic MAPQ is 23 (ta within tb + 3); with ta at 14 the cap is 0, and
+# collapsed places the read at ta. Read 'rep' has CAC there; contig ra holds TCTA, whose rows cost
+# 17 (two mismatches) and 20 (two mirror mismatches, mirror-free 14): the first replaces the second.
+# Contig rb has four mismatches (12): the genomic MAPQ is 37 (ra past rb + 3); with ra at 14 the cap
+# is collapsed's 23.
+cat > "$tmp/row.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+function alt(c) { return c == "G" ? "A" : "G" }
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+BEGIN {
+    seed_rng(20261123)
+    t = dna(50); t = substr(t, 1, 16) "ACA" substr(t, 20)
+    ta = substr(t, 1, 16) "ATAA" substr(t, 20); ta = put(ta, 41, alt(substr(t, 41, 1)))
+    x = alt(substr(t, 31, 1)); tb = substr(t, 1, 30) x alt(x) substr(t, 31)
+    r = dna(50); r = substr(r, 1, 16) "CAC" substr(r, 20)
+    ra = substr(r, 1, 16) "TCTA" substr(r, 20)
+    rb = r
+    split("5 25 33 44", at, " ")
+    for (k = 1; k <= 4; ++k) rb = put(rb, at[k], alt(substr(r, at[k] + 1, 1)))
+    printf ">ta\n%s\n>tb\n%s\n>ra\n%s\n>rb\n%s\n", dna(100) ta dna(100), dna(100) tb dna(100), dna(100) ra dna(100), dna(100) rb dna(100) > (dir "/row.fa")
+    fq(dir "/row.fq", "tie", t)
+    fq(dir "/row.fq", "rep", r)
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/row.awk" < /dev/null
+"$bin" index --meth "$tmp/row.fa" > "$tmp/row-index.out" 2> "$tmp/row-index.err" || {
+    echo "FAIL: index --meth (row.fa) exited nonzero" >&2
+    cat "$tmp/row-index.err" >&2
+    exit 1
+}
+run row.scoring --meth --meth-mapq scoring -n 5 -l 1024 "$tmp/row.fa" "$tmp/row.fq"
+run row.blind --meth -n 5 -l 1024 "$tmp/row.fa" "$tmp/row.fq"
+run row.collapsed --meth --meth-scoring collapsed -n 5 -l 1024 "$tmp/row.fa" "$tmp/row.fq"
+expect row-scoring "$tmp/row.scoring.sum" "tie 0 tb 101 23 -
+rep 0 rb 101 37 -"
+# the genomic search keeps ta's two-mismatch row (the lower CIGAR), which XA shows
+grep -E '^tie	' "$tmp/row.scoring.rec" | grep -qF '	XA:Z:ta,+101,17M1D33M,3;' || {
+    echo "FAIL: fixture: the genomic search does not keep ta's two-mismatch row" >&2
+    exit 1
+}
+expect row-conversion-blind "$tmp/row.blind.sum" "tie 0 tb 101 0 23
+rep 0 rb 101 23 37"
+expect row-collapsed "$tmp/row.collapsed.sum" "tie 0 ta 101 23 -
+rep 0 rb 101 23 -"
+cmp <(strip "$tmp/row.blind.rec") <(strip "$tmp/row.scoring.rec") || {
+    echo "FAIL: row: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+echo 'PASS: single-end-lowest-mirror-free-row'
+
+# Paired end, on a reference of its own (rowpe.fa): read 1 is 'tie' again, at contigs ta (one
+# deletion row of genomic 17 and mirror-free 14) and tb (a two-base deletion, 15), and read 2 comes
+# from after tb, so the genomic pairing (scoring and conversion-blind alike) places the pair at tb.
+# The shadow pairing must see ta at 14: then read 1 is not the only cheapest locus mirror-free, and
+# the pair's MAPQs drop from 60 to the shadow pairing's 36 and 37. At ta's genomic row (17) the
+# shadow is the real pairing and nothing is capped, as before this check. The shadow pairs the
+# genomic ends, so its MAPQs are not collapsed's here: collapsed starts read 1 at ta and pairs only
+# 11 of the 24 at tb (MAPQ 29).
+cat > "$tmp/rowpe.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+function alt(c) { return c == "G" ? "A" : "G" }
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+function ga(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "G" ? "A" : c) } return out }
+BEGIN {
+    seed_rng(20261123)
+    t = dna(50); t = substr(t, 1, 16) "ACA" substr(t, 20)
+    ta = substr(t, 1, 16) "ATAA" substr(t, 20); ta = put(ta, 41, alt(substr(t, 41, 1)))
+    x = alt(substr(t, 31, 1)); tb = substr(t, 1, 30) x alt(x) substr(t, 31)
+    ca = dna(100) ta dna(100)
+    cb = dna(100) tb dna(900)
+    printf ">ta\n%s\n>tb\n%s\n", ca, cb > (dir "/rowpe.fa")
+    for (st = 340; st <= 800; st += 20) {
+        fq(dir "/rowpe1.fq", "m" st, t)
+        fq(dir "/rowpe2.fq", "m" st, ga(rc(substr(cb, st + 1, 60))))
+    }
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/rowpe.awk" < /dev/null
+"$bin" index --meth "$tmp/rowpe.fa" > "$tmp/rowpe-index.out" 2> "$tmp/rowpe-index.err" || {
+    echo "FAIL: index --meth (rowpe.fa) exited nonzero" >&2
+    cat "$tmp/rowpe-index.err" >&2
+    exit 1
+}
+run rowpe.scoring --meth --meth-mapq scoring -n 5 -l 1024 "$tmp/rowpe.fa" "$tmp/rowpe1.fq" "$tmp/rowpe2.fq"
+run rowpe.blind --meth -n 5 -l 1024 "$tmp/rowpe.fa" "$tmp/rowpe1.fq" "$tmp/rowpe2.fq"
+# FLAG RNAME MAPQ YQ and how many of the 48 records have them
+tally() { awk '{ n[$2 " " $3 " " $5 " " $6]++ } END { for (k in n) print n[k], k }' "$1" | LC_ALL=C sort; }
+expect rowpe-scoring <(tally "$tmp/rowpe.scoring.sum") "24 147 tb 60 -
+24 99 tb 60 -"
+expect rowpe-conversion-blind <(tally "$tmp/rowpe.blind.sum") "24 147 tb 37 60
+24 99 tb 36 60"
+cmp <(strip "$tmp/rowpe.blind.rec") <(strip "$tmp/rowpe.scoring.rec") || {
+    echo "FAIL: rowpe: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+echo 'PASS: paired-lowest-mirror-free-row'
 
 # The default is scoring outside em-seq genomic; collapsed accepts conversion-blind (a no-op).
 for args in '--meth --meth-scoring collapsed' '--meth=taps' '--meth=5base' '--meth --meth-scoring neutral'; do
