@@ -460,11 +460,11 @@ FMI_search::FMI_search(const char *fname)
 FMI_search::~FMI_search()
 {
     /* When attached from shm, cp_occ/sa_*_byte/sa_*_word alias mmap'd pages
-     * owned by the shm segment, so we don't _mm_free them. We do munmap the
+     * owned by the shm segment, so we don't _mm_free them. We do unmap the
      * mapping itself — leaving it would leak VA in long-lived processes that
      * construct and destroy FMI_search repeatedly. */
     if (shm_base != NULL) {
-        munmap(shm_base, shm_len);
+        bwa_shm_detach(shm_base, shm_len);
         shm_base = NULL;
         shm_len  = 0;
     } else {
@@ -477,12 +477,80 @@ FMI_search::~FMI_search()
     if (seed_jump) _mm_free(seed_jump);
 }
 
+int64_t FMI_search::cp_occ_bytes_for(int64_t ref_seq_len) {
+    return ((ref_seq_len >> CP_SHIFT) + 1) * (int64_t)sizeof(CP_OCC);
+}
+
+int64_t FMI_search::sa_count_for(int64_t ref_seq_len, int64_t sa_compx) {
+    return (ref_seq_len >> sa_compx) + 1;
+}
+
 int64_t FMI_search::cp_occ_size_bytes() const {
-    return ((reference_seq_len >> CP_SHIFT) + 1) * (int64_t)sizeof(CP_OCC);
+    return cp_occ_bytes_for(reference_seq_len);
 }
 
 int64_t FMI_search::sa_sample_count() const {
-    return (reference_seq_len >> sa_compx) + 1;
+    return sa_count_for(reference_seq_len, sa_compx);
+}
+
+bool FMI_search::shm_scalars_ok(const uint8_t *scalars, int64_t sizes[3],
+                                char *why, size_t why_len)
+{
+    int64_t ref_len, cnt[5], sentinel, compx;
+    memcpy(&ref_len,  scalars,                       sizeof(int64_t));
+    memcpy(cnt,       scalars + sizeof(int64_t),     sizeof(int64_t) * 5);
+    memcpy(&sentinel, scalars + sizeof(int64_t) * 6, sizeof(int64_t));
+    memcpy(&compx,    scalars + sizeof(int64_t) * 7, sizeof(int64_t));
+    char scratch[160];
+    if (why == NULL) { why = scratch; why_len = sizeof(scratch); }
+
+    /* Validate scalars before reference_seq_len is used in the section sizes.
+     * Bounds match the disk path's asserts in load_index() and the writer-side
+     * checks in bwa_shm_compute(). A corrupt segment would otherwise drive
+     * negative or overflowing section sizes. */
+    if (ref_len <= 0 || ref_len > 0x7fffffffffLL) {
+        snprintf(why, why_len, "reference_seq_len=%lld out of bounds", (long long)ref_len);
+        return false;
+    }
+    /* count[] is +1-adjusted by bwa_shm_compute; range [1, ref_seq_len] (the
+     * raw counts leave out the one sentinel, so the largest is ref_seq_len - 1),
+     * and as the cumulative C[] array it must be non-decreasing. These bounds
+     * match the disk path's post-adjustment asserts in load_index(): a
+     * count[i] == 0 drives smem.k out of cp_occ on the first backwardExt; one
+     * of ref_seq_len + 1 lets an interval start at that row, whose occurrence
+     * block (cp_occ[(ref_seq_len + 1) >> CP_SHIFT]) is one past the table when
+     * ref_seq_len % 64 == 63 (the seed jump table extends even zero-width
+     * intervals); and a non-monotone pair yields a negative smem.s (interval
+     * width) during seed extraction. So a corrupt segment must fail closed
+     * rather than attach with an invalid C array. */
+    for (int i = 0; i < 5; ++i) {
+        if (cnt[i] < 1 || cnt[i] > ref_len) {
+            snprintf(why, why_len, "count[%d]=%lld out of bounds (ref_seq_len=%lld)",
+                     i, (long long)cnt[i], (long long)ref_len);
+            return false;
+        }
+        if (i > 0 && cnt[i] < cnt[i - 1]) {
+            snprintf(why, why_len,
+                     "count[%d]=%lld < count[%d]=%lld (not monotonically non-decreasing)",
+                     i, (long long)cnt[i], i - 1, (long long)cnt[i - 1]);
+            return false;
+        }
+    }
+    if (sentinel < 0 || sentinel >= ref_len) {
+        snprintf(why, why_len, "sentinel_index=%lld out of bounds (ref_seq_len=%lld)",
+                 (long long)sentinel, (long long)ref_len);
+        return false;
+    }
+    /* [0,6]: same range the -u CLI validates and write_fm_index_streaming
+     * enforces (the sample period 1<<sa_compx must divide CP_BLOCK_SIZE=64). */
+    if (compx < 0 || compx > 6) {
+        snprintf(why, why_len, "sa_compx=%lld out of bounds", (long long)compx);
+        return false;
+    }
+    sizes[0] = cp_occ_bytes_for(ref_len);
+    sizes[1] = sa_count_for(ref_len, compx) * (int64_t)sizeof(int8_t);
+    sizes[2] = sa_count_for(ref_len, compx) * (int64_t)sizeof(uint32_t);
+    return true;
 }
 
 /* ===== Seed jump table (see FMI_search.h, seed_jump) =====
@@ -626,7 +694,7 @@ void FMI_search::build_seed_jump_table(int n_threads)
         if (spawned[i]) pthread_join(tids[i], NULL);
 }
 
-void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
+void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
 {
     if (base == NULL) {
         fprintf(stderr, "ERROR! load_index_from_shm called with NULL base\n");
@@ -637,6 +705,14 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SCALARS, &off, &sz) != 0
         || sz != BWA_SHM_FMI_SCALARS_BYTES) {
         fprintf(stderr, "ERROR! shm segment missing or malformed FMI_SCALARS\n");
+        exit(EXIT_FAILURE);
+    }
+    /* Bounds-check the scalars before anything below uses them; bwa_shm's
+     * probe of a 1 GB stage applies the same check (shm_scalars_ok). */
+    int64_t sizes[3];
+    char why[160];
+    if (!shm_scalars_ok(base + off, sizes, why, sizeof(why))) {
+        fprintf(stderr, "ERROR! shm FMI_SCALARS: %s\n", why);
         exit(EXIT_FAILURE);
     }
     memcpy(&reference_seq_len, base + off,                                    sizeof(int64_t));
@@ -652,79 +728,33 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len)
      * tail-detected rate. */
     memcpy(&sa_compx,          base + off + sizeof(int64_t) * 7,              sizeof(int64_t));
 
-    /* Validate scalars before we use reference_seq_len in cp_occ_size_bytes()
-     * and the SA size accessors. Bounds match the disk path's asserts in
-     * load_index() and the writer-side checks in bwa_shm_compute(). A corrupt
-     * segment would otherwise drive negative or overflowing section sizes. */
-    if (reference_seq_len <= 0 || reference_seq_len > 0x7fffffffffLL) {
-        fprintf(stderr,
-            "ERROR! shm FMI_SCALARS: reference_seq_len=%lld out of bounds\n",
-            (long long)reference_seq_len);
-        exit(EXIT_FAILURE);
-    }
-    /* count[] is +1-adjusted by bwa_shm_compute; range [1, ref_seq_len+1], and
-     * as the cumulative C[] array it must be non-decreasing. These bounds match
-     * the disk path's post-adjustment asserts in load_index(): a count[i] == 0
-     * drives smem.k out of cp_occ on the first backwardExt, and a non-monotone
-     * pair yields a negative smem.s (interval width) during seed extraction, so
-     * a corrupt segment must fail closed here rather than attach with an invalid
-     * C array. */
-    for (int i = 0; i < 5; ++i) {
-        if (count[i] < 1 || count[i] > reference_seq_len + 1) {
-            fprintf(stderr,
-                "ERROR! shm FMI_SCALARS: count[%d]=%lld out of bounds (ref_seq_len=%lld)\n",
-                i, (long long)count[i], (long long)reference_seq_len);
-            exit(EXIT_FAILURE);
-        }
-        if (i > 0 && count[i] < count[i - 1]) {
-            fprintf(stderr,
-                "ERROR! shm FMI_SCALARS: count[%d]=%lld < count[%d]=%lld "
-                "(not monotonically non-decreasing)\n",
-                i, (long long)count[i], i - 1, (long long)count[i - 1]);
-            exit(EXIT_FAILURE);
-        }
-    }
-    if (sentinel_index < 0 || sentinel_index >= reference_seq_len) {
-        fprintf(stderr,
-            "ERROR! shm FMI_SCALARS: sentinel_index=%lld out of bounds (ref_seq_len=%lld)\n",
-            (long long)sentinel_index, (long long)reference_seq_len);
-        exit(EXIT_FAILURE);
-    }
-    /* [0,6]: same range the -u CLI validates and write_fm_index_streaming
-     * enforces (the sample period 1<<sa_compx must divide CP_BLOCK_SIZE=64). */
-    if (sa_compx < 0 || sa_compx > 6) {
-        fprintf(stderr,
-            "ERROR! shm FMI_SCALARS: sa_compx=%lld out of bounds\n",
-            (long long)sa_compx);
-        exit(EXIT_FAILURE);
-    }
     /* Only compute the mask once sa_compx is known to be in [0,6]; shifting by
      * an out-of-range value (e.g. a corrupt -1 or 64) would be UB. */
     sa_compx_mask = (1LL << sa_compx) - 1;
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
-        || (int64_t)sz != cp_occ_size_bytes()) {
-        fprintf(stderr, "ERROR! shm segment missing or sized FMI_CP_OCC\n");
+        || (int64_t)sz != sizes[0] || off % alignof(CP_OCC) != 0) {
+        fprintf(stderr, "ERROR! shm segment missing, misaligned or mis-sized FMI_CP_OCC\n");
         exit(EXIT_FAILURE);
     }
     cp_occ = (CP_OCC *)(base + off);
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_MS, &off, &sz) != 0
-        || (int64_t)sz != sa_ms_byte_size_bytes()) {
+        || (int64_t)sz != sizes[1]) {
         fprintf(stderr, "ERROR! shm segment missing or sized FMI_SA_MS\n");
         exit(EXIT_FAILURE);
     }
     sa_ms_byte = (int8_t *)(base + off);
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_LS, &off, &sz) != 0
-        || (int64_t)sz != sa_ls_word_size_bytes()) {
-        fprintf(stderr, "ERROR! shm segment missing or sized FMI_SA_LS\n");
+        || (int64_t)sz != sizes[2] || off % alignof(uint32_t) != 0) {
+        fprintf(stderr, "ERROR! shm segment missing, misaligned or mis-sized FMI_SA_LS\n");
         exit(EXIT_FAILURE);
     }
     sa_ls_word = (uint32_t *)(base + off);
 
     shm_base = base;
-    shm_len  = len;
+    shm_len  = map_len;   /* what the destructor unmaps */
 
     fprintf(stderr, "* FMI attached from shm: ref_seq_len=%ld sentinel_index=%ld\n",
             (long)reference_seq_len, (long)sentinel_index);
@@ -761,13 +791,14 @@ void FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_s
      * cp_occ[sp >> CP_SHIFT] with no bound check, so a non-monotonic or
      * out-of-range C[] would read past cp_occ. The shm and re-sa callers both
      * range-check on their own, but only re-sa checks monotonicity, so guard it
-     * here at the shared chokepoint. Valid adjusted range is [1, ref_seq_len+1]. */
+     * here at the shared chokepoint. Valid adjusted range is [1, ref_seq_len]
+     * (see shm_scalars_ok: a row of ref_seq_len + 1 can have no occurrence block). */
     for (int i = 0; i < 5; ++i) {
-        if (count_src[i] < 1 || count_src[i] > ref_seq_len + 1 ||
+        if (count_src[i] < 1 || count_src[i] > ref_seq_len ||
             (i > 0 && count_src[i] < count_src[i - 1])) {
             fprintf(stderr,
                 "ERROR! densify_sa_into: invalid count[] (non-monotonic or out of "
-                "[1, %lld])\n", (long long)(ref_seq_len + 1));
+                "[1, %lld])\n", (long long)ref_seq_len);
             exit(EXIT_FAILURE);
         }
     }
@@ -868,10 +899,13 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
      * mapping; the segment lifetime belongs to the shm-loading process. */
     {
-        size_t   shm_attach_len = 0;
-        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len);
+        size_t   shm_attach_len = 0, shm_map_len = 0;
+        uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len, &shm_map_len,
+                                                 /*need_pac=*/load_pac);
         if (shm_base_local != NULL) {
-            load_index_from_shm(shm_base_local, shm_attach_len);
+            /* shm_map_len: the whole mapping, which can be longer than the
+             * packed index it holds, is what the destructor unmaps. */
+            load_index_from_shm(shm_base_local, shm_attach_len, shm_map_len);
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
@@ -882,7 +916,9 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             if (huge_pages != BWAMEM_HUGETLB_OFF)
                 fprintf(stderr, "[M::load_index] --huge-pages: no effect on an index "
-                        "attached from shared memory; its pages are the segment's\n");
+                        "attached from shared memory; its pages are the segment's "
+                        "(an index staged with `bwa-mem3 shm --huge-pages` is on 1 GB "
+                        "pages)\n");
             return;
         }
     }
@@ -993,14 +1029,16 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     // makes this overflow-safe: a corrupt count[ii] == INT64_MAX would trigger
     // signed-overflow UB in `count[ii] + 1` before any post-adjustment check
     // could fail closed. On disk count[] is the cumulative C[] array of the
-    // reference, so a valid raw entry lies in [0, reference_seq_len]; the shm
-    // producer (bwa_shm_compute) applies the same +1 and load_index_from_shm
-    // then validates the adjusted [1, ref_seq_len+1] range.
+    // reference, which counts every row but the one sentinel, so a valid raw
+    // entry lies in [0, reference_seq_len - 1]; the shm producer
+    // (bwa_shm_compute) applies the same +1 and load_index_from_shm then
+    // validates the adjusted [1, ref_seq_len] range.
     for (ii = 0; ii < 5; ii++) {
-        // A raw count[ii] outside [0, ref_seq_len] (e.g. a disk -1, or a value
-        // exceeding the reference length) drives smem.k out of cp_occ on the
-        // first backwardExt once adjusted.
-        xassert(count[ii] >= 0 && count[ii] <= reference_seq_len,
+        // A raw count[ii] outside [0, ref_seq_len - 1] (e.g. a disk -1, or a
+        // value reaching the reference length) drives smem.k out of cp_occ on
+        // the first backwardExt once adjusted: an interval at row
+        // ref_seq_len + 1 reads the occurrence block past the table's end.
+        xassert(count[ii] >= 0 && count[ii] <= reference_seq_len - 1,
                 "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
         // count[] is the cumulative C[] array, so it must be non-decreasing; a
         // non-monotone pair yields a negative smem.s (interval width) downstream.
@@ -1012,16 +1050,16 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     {
         count[ii] = count[ii] + 1;
     }
-    // Validate count[] (post +1-adjustment, range [1, ref_seq_len+1]) as
+    // Validate count[] (post +1-adjustment, range [1, ref_seq_len]) as
     // load_index_from_shm does; a count[a] exceeding the reference length drives
     // smem.k out of cp_occ on the first backwardExt.
     for (ii = 0; ii < 5; ii++) {
         // Lower bound is 1, not 0: the +1 adjustment above is applied before
-        // this check (load_index_from_shm instead validates the raw disk value
-        // in [0, ref_seq_len] and adjusts after), so a disk count[ii] == -1
+        // this check (bwa_shm_compute instead validates the raw disk value
+        // in [0, ref_seq_len - 1] and adjusts after), so a disk count[ii] == -1
         // becomes 0 here and would slip past a >= 0 test -- leaving the disk
         // loader open to an invalid FM interval that the shm producer rejects.
-        xassert(count[ii] >= 1 && count[ii] <= reference_seq_len + 1,
+        xassert(count[ii] >= 1 && count[ii] <= reference_seq_len,
                 "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
         // count[] is the cumulative C[] array, so it must be non-decreasing; a
         // non-monotone pair yields a negative smem.s (interval width) downstream.

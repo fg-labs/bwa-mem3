@@ -175,9 +175,11 @@ numbers.
 > drop the segment first before re-indexing:
 >
 > ```bash
-> bwa-mem3 shm -d
-> bwa-mem3 index ref.fa
+> bwa-mem3 shm -d && bwa-mem3 index ref.fa
 > ```
+>
+> Rebuild only if `shm -d` succeeds: when it cannot remove a staged index it exits non-zero and
+> that index stays staged.
 >
 > There is no staleness check. If `bwa-mem3 mem` finds a matching segment in
 > shared memory it will attach to it even when the on-disk index has been updated.

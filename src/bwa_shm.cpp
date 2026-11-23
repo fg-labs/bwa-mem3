@@ -31,11 +31,14 @@
 #include "bntseq.h"        /* bntseq_t, bns_restore, bns_destroy */
 #include "utils.h"         /* err_fread_noeof, err_fclose, xopen */
 #include "bwa_madvise.h"   /* bwamem_madv_hugepage */
+#include "simd_dispatch.h" /* bwa3_host_cpu_identity */
 
 #include <stdio.h>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>      /* shm_open, mmap, munmap */
+#include <sys/ipc.h>
+#include <sys/shm.h>       /* shmget, shmat, shmctl: the 1 GB segment */
 #include <sys/stat.h>      /* mode constants, stat */
 #include <sys/statvfs.h>   /* statvfs — /dev/shm capacity preflight */
 #include <fcntl.h>         /* O_* */
@@ -46,6 +49,8 @@
 #include <limits.h>        /* PATH_MAX */
 #include <signal.h>        /* kill(pid, 0) liveness probe */
 #include <time.h>
+#include <string>
+#include <vector>
 
 /* /bwactl layout: 16-bit n_entries, 16-bit next_write_offset, then packed
  * (int64_t l_mem, char[] basename) entries. The header is 4 bytes total
@@ -76,6 +81,50 @@ static void ctl_header_store(void *m, ctl_header h)
 /* The /dev/shm free-space probe; a test may substitute its own. */
 #ifndef BWA_SHM_STATVFS
 #define BWA_SHM_STATVFS statvfs
+#endif
+
+/* shmget flags and page size of a 1 GB stage (`shm --huge-pages`); a test may
+ * substitute its own. Negative flags: not supported on this platform. */
+#if defined(__linux__) && !defined(SHM_HUGE_1GB)
+#define SHM_HUGE_1GB (30 << 26)   /* log2(1 GiB) << SHM_HUGE_SHIFT */
+#endif
+#ifndef BWA_SHM_HUGE_FLAGS
+#ifdef __linux__
+#define BWA_SHM_HUGE_FLAGS (SHM_HUGETLB | SHM_HUGE_1GB)
+#else
+#define BWA_SHM_HUGE_FLAGS (-1)
+#endif
+#endif
+#ifndef BWA_SHM_HUGE_PAGE
+#define BWA_SHM_HUGE_PAGE (1ull << 30)
+#endif
+#if defined(__linux__) && !defined(MADV_POPULATE_WRITE)
+#define MADV_POPULATE_WRITE 23   /* Linux 5.14 */
+#endif
+
+/* Whether the host is an AMD x86 CPU, and whether its kernel removes a System V
+ * segment when the last process detaches (kernel.shm_rmid_forced): a 1 GB stage
+ * is refused on both (see huge_refused). A test may substitute its own. */
+#ifndef BWA_SHM_HOST_IS_AMD
+#define BWA_SHM_HOST_IS_AMD host_is_amd
+#endif
+#ifndef BWA_SHM_RMID_FORCED
+#define BWA_SHM_RMID_FORCED rmid_forced
+#endif
+
+/* Unlink POSIX index segment `path`; a test may substitute an unlink that fails. */
+#ifndef BWA_SHM_UNLINK
+#define BWA_SHM_UNLINK(path) shm_unlink(path)
+#endif
+
+/* Remove System V segment `id`; a test may substitute a removal that fails. */
+#ifndef BWA_SHM_RMID
+#define BWA_SHM_RMID(id) shmctl((id), IPC_RMID, NULL)
+#endif
+
+/* The per-stage token; a test may substitute its own. */
+#ifndef BWA_SHM_STAGE_TOKEN
+#define BWA_SHM_STAGE_TOKEN stage_token
 #endif
 
 /* How long `shm -d` waits for the stager lock before proceeding without it. */
@@ -302,11 +351,236 @@ static void ctl_remove(void *m, const char *name)
 /* Segment states, from the header (see bwa_shm_header_t). */
 namespace { enum seg_state { SEG_ABSENT, SEG_COMPLETE, SEG_STAGING, SEG_DEAD, SEG_BAD }; }
 
+/* `h` is the stub of a 1 GB stage (see bwa_shm.h), staging or complete. */
+static bool is_huge_stub(const bwa_shm_header_t *h)
+{
+    return h->reserved[2] != 0 && (h->magic == 0 || h->magic == BWA_SHM_HUGE_MAGIC);
+}
+
+/* The System V key of the 1 GB segment staged with `token`. Never IPC_PRIVATE. */
+static key_t huge_key(uint64_t token)
+{
+    const key_t k = (key_t)((token >> 1) & 0x7fffffff);
+    return k != IPC_PRIVATE ? k : 1;
+}
+
+/* The namespace that /proc/self/ns/`kind` names, as its inode number; 0 where
+ * there is none to read (not Linux). The kernel numbers namespaces with 32-bit
+ * inodes; a wider one is taken as unreadable. */
+static uint64_t self_namespace(const char *kind)
+{
+    char path[64];
+    std::snprintf(path, sizeof path, "/proc/self/ns/%s", kind);
+    struct stat st;
+    if (stat(path, &st) != 0) return 0;
+    if ((uint64_t)st.st_ino > 0xffffffffull) {
+        errno = ERANGE;
+        return 0;
+    }
+    return (uint64_t)st.st_ino;
+}
+
+/* This process's IPC namespace. System V keys are per IPC namespace, and
+ * /dev/shm can be shared across namespaces (a bind mount into a container). */
+static uint64_t ipc_namespace(void) { return self_namespace("ipc"); }
+
+/* This process's PID namespace. The kernel reports a segment's creator PID as
+ * seen from the asking process's PID namespace. */
+static uint64_t pid_namespace(void) { return self_namespace("pid"); }
+
+/* A 1 GB stub's reserved[4]: the stager's IPC namespace in the low 32 bits and
+ * its PID namespace in the high 32 bits. 0 records neither (not Linux). */
+static uint64_t stub_namespaces(void) { return ipc_namespace() | (pid_namespace() << 32); }
+static uint64_t stub_ipc_namespace(const bwa_shm_header_t *stub)
+{
+    return stub->reserved[4] & 0xffffffffull;
+}
+static uint64_t stub_pid_namespace(const bwa_shm_header_t *stub)
+{
+    return stub->reserved[4] >> 32;
+}
+
+/* The id of the System V segment that the stage recorded in `stub` created,
+ * or one of:
+ *   HUGE_ABSENT     no segment has the stub's key;
+ *   HUGE_FOREIGN    one does, but this stage did not create it;
+ *   HUGE_ERROR      it could not be inspected (errno kept), which includes a
+ *                   segment this process may not read: that does not show
+ *                   whose it is;
+ *   HUGE_ELSEWHERE  the stub was staged in another IPC namespace
+ *                   (reserved[4]), so its segment cannot be seen from here
+ *                   and nothing about it is concluded;
+ *   HUGE_UNPROVEN   the stage's creator PID is needed to identify the
+ *                   segment, and the stager was in another PID namespace, so
+ *                   the PID the kernel reports here cannot be compared with it.
+ * The stage's own segment is the one whose id the stub records. A stager
+ * killed between creating the segment and recording its id leaves reserved[3]
+ * zero, and then it is the one that the kernel says the stub's PID created, with
+ * the stub's size. The stub holds the PID, token and size before the segment
+ * exists, so another program's segment on the same key never matches, and only
+ * a match is ever removed. */
+namespace {
+enum { HUGE_ABSENT = -1, HUGE_FOREIGN = -2, HUGE_ERROR = -3, HUGE_ELSEWHERE = -4,
+       HUGE_UNPROVEN = -5 };
+}
+static int huge_segment(const bwa_shm_header_t *stub)
+{
+    if (stub->reserved[4] != 0 && stub_ipc_namespace(stub) != ipc_namespace())
+        return HUGE_ELSEWHERE;
+    const int id = shmget(huge_key(stub->reserved[1]), 0, 0);
+    if (id < 0) return errno == ENOENT ? HUGE_ABSENT : HUGE_ERROR;
+    if (stub->reserved[3] != 0) return stub->reserved[3] == (uint64_t)id + 1 ? id : HUGE_FOREIGN;
+    struct shmid_ds ds;
+    if (shmctl(id, IPC_STAT, &ds) < 0)   /* EIDRM, EINVAL: removed meanwhile */
+        return errno == EIDRM || errno == EINVAL ? HUGE_ABSENT : HUGE_ERROR;
+    if (stub_pid_namespace(stub) != 0 && stub_pid_namespace(stub) != pid_namespace())
+        return HUGE_UNPROVEN;
+    return (uint64_t)ds.shm_cpid == stub->reserved[0] &&
+           (uint64_t)ds.shm_segsz == stub->reserved[2] ? id : HUGE_FOREIGN;
+}
+
+/* Why huge_segment's result `id` (< 0, errno as it left it) is not a usable
+ * segment. */
+static const char *huge_trouble(int id)
+{
+    return id == HUGE_ABSENT ? "it is gone" :
+           id == HUGE_FOREIGN ? "it is another program's, not the one the stage created" :
+           id == HUGE_ELSEWHERE ? (ipc_namespace() == 0 ?
+                                   "this process cannot read its IPC namespace "
+                                   "(/proc/self/ns/ipc) to compare with the stage's" :
+                                   "it is in another IPC namespace (the stage, every `mem` "
+                                   "and `shm -d` must share one)") :
+           id == HUGE_UNPROVEN ? "the stage was interrupted before it recorded the segment, "
+                                 "and its stager was in another PID namespace, so the "
+                                 "segment's creator cannot be checked from here" :
+                                 std::strerror(errno);
+}
+
+/* `h` is an incomplete 1 GB stub whose stager was in another PID namespace
+ * than this process. */
+static bool stager_elsewhere(const bwa_shm_header_t *h)
+{
+    return h->magic == 0 && is_huge_stub(h) && stub_pid_namespace(h) != 0 &&
+           stub_pid_namespace(h) != pid_namespace();
+}
+
+/* Whether the complete index at `base`, whose header's total_size the caller
+ * has checked against what is mapped, has the sections that every shm load
+ * reads, within the index, aligned for the types the loads read them as and
+ * of the sizes those loads require, so that a
+ * stage `shm -l` calls usable is one `mem` can load rather than exit on. The
+ * checks are the loaders' own: FMI_search::shm_scalars_ok for the FM-index
+ * scalars and section sizes, indexEle::shm_bns_ok for BNS_STRUCT and the BNS
+ * sections it sizes (BNS_STRUCT itself must be sizeof(bntseq_t)), and
+ * indexEle::shm_names_walk for the names and annotations in BNS_NAMES. PAC and
+ * REF_STRING need not be present: a seed-only (--meth) stage packs them
+ * empty, and the loads that read them check them. A present PAC must be empty
+ * (seed-only) or of the size the PAC load requires. */
+static bool index_sections_ok(const uint8_t *base)
+{
+    uint64_t off = 0, size = 0;
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SCALARS, &off, &size) != 0 ||
+        size != BWA_SHM_FMI_SCALARS_BYTES)
+        return false;
+    int64_t fmi[3];
+    if (!FMI_search::shm_scalars_ok(base + off, fmi, NULL, 0)) return false;
+    /* The loads alias CP_OCC, SA_LS and AMBS in place as typed arrays, so each
+     * must start at an offset aligned for its element type (the packer's
+     * 64-byte layout always is). */
+    static const struct { uint32_t kind; int fmi; size_t align; } sized[] = {
+        {BWA_SHM_SEC_FMI_CP_OCC, 0, alignof(CP_OCC)}, {BWA_SHM_SEC_FMI_SA_MS, 1, 1},
+        {BWA_SHM_SEC_FMI_SA_LS, 2, alignof(uint32_t)} };
+    for (const auto &r : sized)
+        if (bwa_shm_section_find(base, r.kind, &off, &size) != 0 ||
+            (int64_t)size != fmi[r.fmi] || off % r.align != 0)
+            return false;
+    uint64_t off_ambs = 0, sz_ambs = 0, sz_anns = 0, off_names = 0, sz_names = 0;
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_BNS_STRUCT, &off, &size) != 0 ||
+        size != sizeof(bntseq_t) ||
+        bwa_shm_section_find(base, BWA_SHM_SEC_BNS_AMBS, &off_ambs, &sz_ambs) != 0 ||
+        off_ambs % alignof(bntamb1_t) != 0 ||
+        bwa_shm_section_find(base, BWA_SHM_SEC_BNS_ANNS, NULL, &sz_anns) != 0 ||
+        bwa_shm_section_find(base, BWA_SHM_SEC_BNS_NAMES, &off_names, &sz_names) != 0)
+        return false;
+    bntseq_t bns;
+    std::memcpy(&bns, base + off, sizeof(bns));
+    if (!indexEle::shm_bns_ok(&bns, sz_ambs, sz_anns, NULL, 0)) return false;
+    if (!indexEle::shm_names_walk((const char *)(base + off_names), sz_names, bns.n_seqs,
+                                  NULL, NULL, 0))
+        return false;
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_PAC, NULL, &size) == 0 && size != 0 &&
+        (int64_t)size != indexEle::shm_pac_bytes_for(bns.l_pac))
+        return false;
+    return true;
+}
+
+/* Whether the index at `base` (checked as bwa_shm_attach checks it) holds the
+ * packed reference a load with PAC reads: a PAC section of the size
+ * indexEle::shm_pac_bytes_for gives for its BNS_STRUCT's l_pac. A seed-only
+ * (`shm --meth`) stage packs PAC empty, which only a seed load can use. */
+static bool index_pac_ok(const uint8_t *base)
+{
+    uint64_t off = 0, size = 0;
+    if (bwa_shm_section_find(base, BWA_SHM_SEC_BNS_STRUCT, &off, &size) != 0 ||
+        size != sizeof(bntseq_t))
+        return false;
+    bntseq_t bns;
+    std::memcpy(&bns, base + off, sizeof(bns));
+    return bns.l_pac > 0 && bwa_shm_section_find(base, BWA_SHM_SEC_PAC, NULL, &size) == 0 &&
+           (int64_t)size == indexEle::shm_pac_bytes_for(bns.l_pac);
+}
+
+/* Attach the System V segment of complete 1 GB stub `stub` read-only, after
+ * checking that it is usable: the segment that the stub's stage created
+ * (huge_segment), of the size the stub records, and holding the complete index
+ * that stage packed (a header with the stub's token, and the sections every
+ * load reads: index_sections_ok). Returns the attachment,
+ * or (void *)-1 with *why saying why not. *id_out (if given) gets
+ * huge_segment's result. */
+static void *huge_attach(const bwa_shm_header_t *stub, int *id_out, const char **why)
+{
+    const int id = huge_segment(stub);
+    if (id_out != NULL) *id_out = id;
+    *why = id < 0 ? huge_trouble(id) : NULL;
+    struct shmid_ds ds;
+    void *m = (void *)-1;
+    if (*why != NULL) return m;
+    if (shmctl(id, IPC_STAT, &ds) < 0) *why = std::strerror(errno);
+    else if ((uint64_t)ds.shm_segsz != stub->reserved[2])
+        *why = "it is not the size its stub records";
+    else if ((m = shmat(id, NULL, SHM_RDONLY)) == (void *)-1)
+        *why = std::strerror(errno);
+    else {
+        const uint64_t magic = __atomic_load_n((const uint64_t *)m, __ATOMIC_ACQUIRE);
+        bwa_shm_header_t hdr;
+        std::memcpy(&hdr, m, sizeof(hdr));
+        if (magic != BWA_SHM_MAGIC || hdr.reserved[1] != stub->reserved[1])
+            *why = "it is not the index that was staged";
+        else if (hdr.version != BWA_SHM_VERSION || hdr.total_size > stub->reserved[2] ||
+                 hdr.total_size < sizeof(bwa_shm_header_t))
+            *why = "its index header has another version, or a size past the segment or "
+                   "shorter than the header";
+        else if (!index_sections_ok((const uint8_t *)m))
+            *why = "its index lacks a section that every load reads, or has one past its "
+                   "end, misaligned for its type or of a size the load cannot use, or "
+                   "holds names or FM-index scalars a load rejects";
+        if (*why != NULL) {
+            shmdt(m);
+            m = (void *)-1;
+        }
+    }
+    return m;
+}
+
 /* Probe `idx_path`; *hdr gets its header (zeroed if none could be read).
  * SEG_BAD from a failed call sets *failed (if given) to its name, errno kept;
- * otherwise *failed is NULL and SEG_BAD means a foreign magic or version. */
+ * otherwise *failed is NULL and SEG_BAD means a foreign magic or version, or a
+ * complete 1 GB stub whose System V segment is not usable from here, by the
+ * checks bwa_shm_attach makes (huge_attach says why). judge_huge=false skips
+ * that check (a complete 1 GB stub is then SEG_COMPLETE) for a caller that
+ * only needs the header. */
 static seg_state segment_state(const char *idx_path, bwa_shm_header_t *hdr,
-                               const char **failed = NULL)
+                               const char **failed = NULL, bool judge_huge = true)
 {
     const char *dummy;
     if (failed == NULL) failed = &dummy;
@@ -328,12 +602,29 @@ static seg_state segment_state(const char *idx_path, bwa_shm_header_t *hdr,
     if (m == MAP_FAILED) return small ? SEG_DEAD : SEG_BAD;
     const uint64_t magic = __atomic_load_n((const uint64_t *)m, __ATOMIC_ACQUIRE);
     std::memcpy(hdr, m, sizeof(*hdr));
+    hdr->magic = magic;   /* the value judged below, not a later one */
     munmap(m, sizeof(*hdr));
     errno = 0;
+    /* A complete 1 GB stub is as good as its segment: complete only if attach
+     * would take it. One whose segment is gone (removed by hand, or by the
+     * host) is reclaimed like a dead stage. */
+    if (magic == BWA_SHM_HUGE_MAGIC && hdr->version == BWA_SHM_VERSION && is_huge_stub(hdr)) {
+        if (!judge_huge) return SEG_COMPLETE;   /* the caller wants the header only */
+        int id;
+        const char *why;
+        void *seg = huge_attach(hdr, &id, &why);
+        if (seg != (void *)-1) shmdt(seg);
+        errno = 0;
+        return seg != (void *)-1 ? SEG_COMPLETE : id == HUGE_ABSENT ? SEG_DEAD : SEG_BAD;
+    }
     /* Shorter than its header declares: bwa_shm_attach refuses it, so it is bad. */
     if (magic == BWA_SHM_MAGIC && hdr->version == BWA_SHM_VERSION)
         return hdr->total_size <= (uint64_t)st.st_size ? SEG_COMPLETE : SEG_BAD;
     if (magic != 0) return SEG_BAD;
+    /* A 1 GB stager in another PID namespace cannot be checked for life from
+     * here (its PID names another process here, or none): taken as staging,
+     * never as dead, so its live stage is not reclaimed. */
+    if (stager_elsewhere(hdr)) return SEG_STAGING;
     const uint64_t pid = hdr->reserved[0];
     const bool alive = pid != 0 && pid <= (uint64_t)INT_MAX &&
                        (kill((pid_t)pid, 0) == 0 || errno == EPERM);
@@ -341,22 +632,31 @@ static seg_state segment_state(const char *idx_path, bwa_shm_header_t *hdr,
 }
 
 /* segment_state of registry entry `name`'s segment. */
-static seg_state name_state(const char *name)
+static seg_state name_state(const char *name, bwa_shm_header_t *hdr = NULL)
 {
     char idx_path[PATH_MAX];
     path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
-    bwa_shm_header_t hdr;
-    return segment_state(idx_path, &hdr);
+    bwa_shm_header_t own;
+    return segment_state(idx_path, hdr != NULL ? hdr : &own);
 }
 
-/* Sum, over entries whose segment is still being staged, the bytes each has yet
- * to allocate (ctx: uint64_t): l_mem less the segment's allocated blocks. Where
- * st_blocks is unavailable (macOS reports 0) the full l_mem counts. */
+/* For each entry whose segment is still being staged, append to ctx (a
+ * std::vector<staging_need>) its size and the bytes it has already allocated
+ * (st_blocks; where that is unavailable, as macOS reports 0, none count). A
+ * 1 GB stage takes nothing from /dev/shm. */
+namespace { struct staging_need { uint64_t l_mem, allocated; }; }
 static int staging_bytes_cb(int64_t l_mem, const char *name, void *ctx)
 {
-    if (l_mem <= 0 || name_state(name) != SEG_STAGING) return 0;
+    if (l_mem <= 0) return 0;
     char idx_path[PATH_MAX];
     path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
+    /* Header only: a complete 1 GB stub is never SEG_STAGING however it is
+     * judged, so attaching its segment to check its sections would be wasted
+     * work under the stager lock. */
+    bwa_shm_header_t hdr;
+    if (segment_state(idx_path, &hdr, NULL, /*judge_huge=*/false) != SEG_STAGING ||
+        is_huge_stub(&hdr))
+        return 0;
     uint64_t allocated = 0;
     const int fd = shm_open(idx_path, O_RDONLY, 0);
     if (fd >= 0) {
@@ -364,7 +664,118 @@ static int staging_bytes_cb(int64_t l_mem, const char *name, void *ctx)
         if (fstat(fd, &st) == 0 && st.st_blocks > 0) allocated = (uint64_t)st.st_blocks * 512u;
         close(fd);
     }
-    if (allocated < (uint64_t)l_mem) *(uint64_t *)ctx += (uint64_t)l_mem - allocated;
+    ((std::vector<staging_need> *)ctx)->push_back(staging_need{ (uint64_t)l_mem, allocated });
+    return 0;
+}
+
+/* `bytes` rounded up to whole allocation units of `unit` bytes (0: 1). tmpfs
+ * allocates whole pages, so a segment's last, partial page takes a page. */
+static uint64_t round_to_unit(uint64_t bytes, uint64_t unit)
+{
+    return unit <= 1 ? bytes : (bytes + unit - 1) / unit * unit;
+}
+
+/* Remove registry entry `name`'s segment at `idx_path`. Every removal of a
+ * registered segment, by `shm -d`, by the reclaim of an interrupted stage or by
+ * a stage's rollback, goes through here (a stage also removes, by id, the
+ * System V segment it created itself: stage_guard, packing_shmid_remove). For
+ * a 1 GB stub the System V segment goes
+ * first: if that fails, the stub stays to name it and the result is -1, so the
+ * caller keeps the registry entry and a later `shm -d` can retry. So does a
+ * header that cannot be read, since it may be such a stub (unless
+ * own_sysv_settled: the stub's segment is then known to be gone), and a
+ * shm_unlink that fails other than for a segment already gone. Otherwise 0.
+ *
+ * own_sysv_settled: the caller is the stage that made this stub, and it knows
+ * that no System V segment of its own is left (it never created one, or it has
+ * removed it by id), so none is looked up by key: another segment on that key
+ * is never this stage's to remove. */
+static int segment_remove(const char *idx_path, const char *name,
+                          bool own_sysv_settled = false)
+{
+    bwa_shm_header_t hdr;
+    const char *failed;
+    segment_state(idx_path, &hdr, &failed, /*judge_huge=*/false);
+    if (failed != NULL && !own_sysv_settled) {
+        std::fprintf(stderr, "[E::%s] cannot read the header of '%s' (%s(%s): %s), so it may "
+                     "name a 1 GB segment; keeping it and its entry\n", __func__, name,
+                     failed, idx_path, std::strerror(errno));
+        return -1;
+    }
+    if (is_huge_stub(&hdr) && !own_sysv_settled) {
+        const int id = huge_segment(&hdr);
+        if (id == HUGE_ERROR || id == HUGE_ELSEWHERE || id == HUGE_UNPROVEN ||
+            (id >= 0 && BWA_SHM_RMID(id) < 0 && errno != EIDRM && errno != EINVAL)) {
+            const int err = errno;
+            std::fprintf(stderr, "[E::%s] cannot remove the 1 GB segment of '%s' (System V "
+                         "key 0x%x): %s; keeping its entry\n", __func__, name,
+                         (unsigned)huge_key(hdr.reserved[1]),
+                         id == HUGE_ELSEWHERE ? "it is in another IPC namespace; run "
+                                                "bwa-mem3 shm -d there" :
+                         id == HUGE_UNPROVEN ? "the stage was interrupted before it recorded "
+                                               "the segment, and its stager was in another PID "
+                                               "namespace, so the segment's creator cannot be "
+                                               "checked from here" :
+                         id >= 0 && err == EPERM ? "Operation not permitted (it is another "
+                                                   "user's; run bwa-mem3 shm -d as that user "
+                                                   "or as root)" :
+                         id == HUGE_ERROR && err == EACCES ?
+                                         "Permission denied (this user may not inspect the "
+                                         "segment on that key, which may be another user's; "
+                                         "run bwa-mem3 shm -d as root)" : std::strerror(err));
+            /* The end of a PID namespace frees nothing: only the IPC namespace
+             * holds the segment. Without the creator check nothing shows that
+             * the segment on that key is the stage's, so none is suggested for
+             * removal. */
+            if (id == HUGE_UNPROVEN)
+                std::fprintf(stderr, "[E::%s] run bwa-mem3 shm -d in the stager's PID namespace "
+                             "(the container that staged it), which can check the segment. "
+                             "From here nothing shows whether the segment on key 0x%x is the "
+                             "stage's, so it and the stub are left as they are\n", __func__,
+                             (unsigned)huge_key(hdr.reserved[1]));
+            /* A namespace that has ended took its segments with it, and then
+             * nothing but the stub is left and no namespace can remove it. A
+             * container's exit does not end its namespace while another
+             * process, or another container, is still in it. */
+            /* A stage interrupted before it recorded its segment's id is
+             * identified by the segment's creator PID, which only the
+             * stager's PID namespace can compare (HUGE_UNPROVEN), so its
+             * removal needs that namespace too. */
+            if (id == HUGE_ELSEWHERE && hdr.reserved[3] == 0 && stub_pid_namespace(&hdr) != 0)
+                std::fprintf(stderr, "[E::%s] run it in IPC namespace ipc:[%llu] and in the "
+                             "stager's PID namespace pid:[%llu] (sudo nsenter -t <pid of a "
+                             "process in both> --ipc --pid bwa-mem3 shm -d): the stage was "
+                             "interrupted before it recorded the segment's id, so the segment "
+                             "is identified by its creator PID, which only that PID namespace "
+                             "can check. Run from the IPC namespace alone, shm -d cannot check "
+                             "it and keeps it. While it cannot be checked, leave the stub "
+                             "/dev/shm%s: deleting it while the segment lives leaves its pages "
+                             "pinned with nothing that names them\n", __func__,
+                             (unsigned long long)stub_ipc_namespace(&hdr),
+                             (unsigned long long)stub_pid_namespace(&hdr), idx_path);
+            else if (id == HUGE_ELSEWHERE)
+                std::fprintf(stderr, "[E::%s] run it in IPC namespace ipc:[%llu] (sudo nsenter "
+                             "-t <pid of a process in it> --ipc bwa-mem3 shm -d), which removes "
+                             "the segment and the stub. The "
+                             "segment is gone only once that namespace is: no process in it, "
+                             "and nothing holding it open or bind-mounted (a container's exit "
+                             "is not enough, and lsns may not list a namespace held only by "
+                             "an open file). Unless that is certain, leave the stub /dev/shm%s: "
+                             "deleting it while the segment lives leaves its pages pinned "
+                             "with nothing that names them\n", __func__,
+                             (unsigned long long)stub_ipc_namespace(&hdr), idx_path);
+            return -1;
+        }
+        if (id == HUGE_FOREIGN)
+            std::fprintf(stderr, "[W::%s] leaving the System V segment with key 0x%x: the "
+                         "stage of '%s' did not create it\n", __func__,
+                         (unsigned)huge_key(hdr.reserved[1]), name);
+    }
+    if (BWA_SHM_UNLINK(idx_path) != 0 && errno != ENOENT) {
+        std::fprintf(stderr, "[E::%s] cannot remove '%s' (shm_unlink(%s): %s); keeping its "
+                     "entry\n", __func__, name, idx_path, std::strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -438,14 +849,30 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
         return -1;
     }
     /* count[i] read from disk is the cumulative occurrence; +1 mirrors the
-     * adjustment in FMI_search::load_index. Each value must be in
-     * [0, reference_seq_len] after adjustment. */
+     * adjustment in FMI_search::load_index. A raw value is in
+     * [0, reference_seq_len - 1]: the reference holds one sentinel besides the
+     * counted bases. A larger one would let an interval reach row
+     * reference_seq_len + 1, whose occurrence block lies past cp_occ. The
+     * counts are cumulative, so none may be below the one before it (equal is
+     * a base with no occurrences): FMI_search::shm_scalars_ok refuses a
+     * decreasing pair, so a stage of one would succeed and be unusable. */
     for (int i = 0; i < 5; ++i) {
-        if (layout->count[i] < 0 || layout->count[i] > layout->reference_seq_len) {
+        if (layout->count[i] < 0 || layout->count[i] > layout->reference_seq_len - 1) {
             fprintf(stderr,
                 "[E::%s] %s: count[%d]=%lld out of bounds (0..%lld)\n",
                 __func__, cp_path, i, (long long)layout->count[i],
-                (long long)layout->reference_seq_len);
+                (long long)layout->reference_seq_len - 1);
+            err_fclose(cp);
+            bwa_shm_layout_free(layout);
+            return -1;
+        }
+        if (i > 0 && layout->count[i] < layout->count[i - 1] - 1) {
+            /* count[i - 1] is already +1-adjusted. */
+            fprintf(stderr,
+                "[E::%s] %s: count[%d]=%lld < count[%d]=%lld (the counts must not "
+                "decrease)\n",
+                __func__, cp_path, i, (long long)layout->count[i], i - 1,
+                (long long)layout->count[i - 1] - 1);
             err_fclose(cp);
             bwa_shm_layout_free(layout);
             return -1;
@@ -751,7 +1178,10 @@ int bwa_shm_pack_from_disk(const char *prefix, uint8_t **buf_out, uint64_t *len_
     bwa_shm_layout_t layout;
     if (bwa_shm_compute(prefix, &layout) != 0) return -1;
 
-    uint8_t *buf = (uint8_t *)malloc(layout.total_size);
+    /* Zeroed, as a new segment is: bwa_shm_pack_into leaves the alignment
+     * padding between sections unwritten, and a staged index is compared with
+     * this buffer byte for byte. */
+    uint8_t *buf = (uint8_t *)calloc(1, layout.total_size);
     if (buf == NULL) {
         bwa_shm_layout_free(&layout);
         return -1;
@@ -791,11 +1221,40 @@ int bwa_shm_list(void)
     return rc < 0 ? rc : 0;
 }
 
-static int destroy_cb(int64_t /*l_mem*/, const char *name, void * /*ctx*/)
+/* ctx: destroy_result. */
+namespace {
+struct destroy_result {
+    bool locked = false;   /* `shm -d` holds the stager lock */
+    int kept = 0;
+    int live_kept = 0;     /* kept for a stager that may hold the lock */
+    std::vector<std::string> removed;
+};
+}
+static int destroy_cb(int64_t /*l_mem*/, const char *name, void *ctx)
 {
+    destroy_result *r = (destroy_result *)ctx;
     char idx_path[PATH_MAX];
     path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
-    shm_unlink(idx_path);   /* ignore errors (entry may already be gone) */
+    /* Without the lock, a live 1 GB stager that has not recorded its segment
+     * may still be about to create it (it does so under the lock): removing
+     * the stub now would leave that segment with nothing to name it if the
+     * stager were then killed. Keep it until the stager is done or dead. One
+     * in another PID namespace counts as live (segment_state). */
+    bwa_shm_header_t hdr;
+    const seg_state st = r->locked ? SEG_ABSENT : segment_state(idx_path, &hdr);
+    if (st == SEG_STAGING && is_huge_stub(&hdr) && hdr.reserved[3] == 0) {
+        std::fprintf(stderr, "[E::bwa_shm_destroy] '%s' is being staged on 1 GB pages by "
+                     "PID %llu%s, which may still create its segment (the stager lock could "
+                     "not be taken); keeping its entry. Run bwa-mem3 shm -d again once that "
+                     "stage has finished or its stager has exited\n", name,
+                     (unsigned long long)hdr.reserved[0],
+                     stager_elsewhere(&hdr) ? " of another PID namespace" : "");
+        ++r->kept;
+        ++r->live_kept;
+        return 0;
+    }
+    if (segment_remove(idx_path, name) != 0) ++r->kept;
+    else r->removed.push_back(name);
     return 0;
 }
 
@@ -805,8 +1264,12 @@ int bwa_shm_destroy(void)
      * it and shifts a name's suffix into place as an entry. Registry updates
      * take milliseconds; a lock held past the wait was left by a stager killed
      * inside one (no SEM_UNDO), so proceed without it, and unlinking it below
-     * is the recovery. A missing lock (ENOENT) is normal. */
+     * is the recovery. */
+    /* With no lock at all, no stager can be inside a registry update: create
+     * it and take it, so the walk below counts as locked. */
     sem_t *lock = sem_open(BWA_SHM_LOCK_NAME, 0);
+    if (lock == SEM_FAILED && errno == ENOENT)
+        lock = sem_open(BWA_SHM_LOCK_NAME, O_CREAT, 0644, 1);
     bool held = false;
     for (int waited_ms = 0; lock != SEM_FAILED; waited_ms += 10) {
         if (sem_trywait(lock) == 0) { held = true; break; }
@@ -819,17 +1282,98 @@ int bwa_shm_destroy(void)
         }
         usleep(10000);
     }
-    const int rc = ctl_walk(destroy_cb, NULL);
-    if (rc >= 0) {
+    /* A segment that could not be removed keeps the registry and its own
+     * entry, which still leads the next `shm -d` to it; the entries of the
+     * segments that were removed go, but only under the lock: without it a
+     * live stager may be rewriting the registry, so they stay, listed as
+     * `missing`, and the next stage drops them. A lock that could not be
+     * taken is unlinked (the recovery above), unless a 1 GB stager that may
+     * still hold it was kept: a new lock would let the next `shm -d` take it
+     * and remove that stager's stub. */
+    destroy_result r;
+    r.locked = held;
+    const int rc = ctl_walk(destroy_cb, &r);
+    const int kept = r.kept;
+    if (rc >= 0 && kept == 0) {
         shm_unlink(BWA_SHM_CTL_NAME);
         sem_unlink(BWA_SHM_LOCK_NAME);
+    } else if (rc >= 0) {
+        int fd = -1;
+        void *ctl = held ? ctl_open_rw(&fd, /*create=*/false) : NULL;
+        if (ctl != NULL) {
+            for (const std::string &name : r.removed) ctl_remove(ctl, name.c_str());
+            ctl_close(ctl, fd);
+        }
+        if (!held && r.live_kept == 0) sem_unlink(BWA_SHM_LOCK_NAME);
+        if (!held && r.live_kept != 0)
+            std::fprintf(stderr, "[E::%s] left the stager lock %s in place, held by the stager "
+                         "named above: new stages block until it is released. If that "
+                         "stager is dead (for one in another PID namespace, check there), "
+                         "remove the lock (rm /dev/shm/sem.%s on Linux) and run "
+                         "bwa-mem3 shm -d again\n", __func__, BWA_SHM_LOCK_NAME,
+                         &BWA_SHM_LOCK_NAME[1]);
+        std::fprintf(stderr, "[E::%s] %d segment%s could not be removed; kept the registry "
+                     "and %s, so bwa-mem3 shm -d can be run again\n", __func__,
+                     kept, kept == 1 ? "" : "s", kept == 1 ? "its entry" : "their entries");
     }
     if (lock != SEM_FAILED) {
         if (held) sem_post(lock);
         sem_close(lock);
     }
-    return rc < 0 ? rc : 0;
+    return rc < 0 ? rc : kept != 0 ? -1 : 0;
 }
+
+/* The System V segment of a 1 GB stage that this process is packing, or -1.
+ * The pack's file readers exit the process on an I/O error (err_fatal), which
+ * skips the stage_guard, so the segment is also removed at exit: a stage that
+ * fails this way leaves an incomplete stub and no pinned pages. */
+static volatile sig_atomic_t g_packing_shmid = -1;   /* read by packing_sigbus */
+static void packing_shmid_remove(void)
+{
+    if (g_packing_shmid >= 0) BWA_SHM_RMID(g_packing_shmid);
+}
+
+/* SIGBUS while packing a 1 GB stage is a page the kernel would not fault in
+ * (a hugetlb cgroup limit or NUMA policy, on a kernel that cannot prefault,
+ * or a hardware error). Its default action skips atexit, so the handler
+ * removes the segment, says why, and dies of the signal as before: the stage
+ * leaves an incomplete stub and no pinned pages, as for an I/O error. */
+static void packing_sigbus(int sig)
+{
+    /* shmctl is not on POSIX's async-signal-safe list, but it is a bare
+     * system call with no user-space state, like those that are. */
+    const int id = g_packing_shmid;
+    const bool removed = id >= 0 && BWA_SHM_RMID(id) == 0;
+    static const char msg[] = "[E::bwa_shm_stage] SIGBUS while packing on 1 GB pages: a "
+        "page could not be faulted in (a hugetlb cgroup limit, a NUMA memory policy, or a "
+        "hardware memory error). Nothing was staged";
+    static const char gone[] = "; removed the segment\n";
+    static const char kept[] = "; the segment could not be removed: bwa-mem3 shm -d "
+        "removes it\n";
+    if (write(STDERR_FILENO, msg, sizeof(msg) - 1) < 0 ||
+        write(STDERR_FILENO, removed ? gone : kept, (removed ? sizeof(gone) : sizeof(kept)) - 1) < 0)
+        { /* nothing to do */ }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+/* Installs packing_sigbus for its lifetime when `on`, restoring the previous
+ * action after. */
+namespace {
+struct packing_sigbus_guard {
+    bool on;
+    struct sigaction old;
+    explicit packing_sigbus_guard(bool enable) : on(enable) {
+        if (!on) return;
+        struct sigaction sa;
+        std::memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = packing_sigbus;
+        sigemptyset(&sa.sa_mask);
+        on = sigaction(SIGBUS, &sa, &old) == 0;
+    }
+    ~packing_sigbus_guard() { if (on) sigaction(SIGBUS, &old, NULL); }
+};
+} // namespace
 
 /* Everything bwa_shm_stage holds, released on every return path; while
  * `created` is set, destruction also rolls the stage back. */
@@ -841,7 +1385,12 @@ struct stage_guard {
     void  *ctl = NULL;
     int    ctl_fd = -1;
     void  *idx = MAP_FAILED;
+    size_t idx_len = 0;                  /* length of the `idx` mapping */
     int    idx_fd = -1;
+    /* A 1 GB stage: `stub` maps the POSIX segment and `idx` is the attachment
+     * of System V segment `shmid`. */
+    void  *stub = MAP_FAILED;
+    int    shmid = -1;
     bool   created = false, released = false;
 
     stage_guard(const char *n, const char *p, bwa_shm_layout_t *l)
@@ -875,14 +1424,27 @@ struct stage_guard {
      * carries our token. Without the lock, leave the entry: `-l` shows it
      * `missing` and the next stage drops it. */
     ~stage_guard() {
-        if (idx != MAP_FAILED) munmap(idx, (size_t)layout->total_size);
+        g_packing_shmid = -1;
+        /* This process created `shmid`, so it is removed whatever has become
+         * of the stub (`shm -d` may have taken it); and before the detach,
+         * while this attachment still keeps the id this segment's. This
+         * process knows what became of its own System V segment (none was
+         * created, or it is removed here), so the stub's rollback looks up
+         * none by key, unless that removal failed and the stub must keep
+         * naming the segment: a segment found on the key would be another
+         * stage's (two stages of one process can draw the same key). */
+        bool sysv_settled = true;
+        if (created && shmid >= 0 && BWA_SHM_RMID(shmid) < 0 && errno != EIDRM &&
+            errno != EINVAL)
+            sysv_settled = false;
+        if (idx != MAP_FAILED && shmid >= 0) shmdt(idx);
+        else if (idx != MAP_FAILED) munmap(idx, idx_len);
+        if (stub != MAP_FAILED) munmap(stub, sizeof(bwa_shm_header_t));
         if (idx_fd >= 0) close(idx_fd);
         if (created) {
             const bool locked = lock != NULL || lock_registry(/*create=*/false);
-            if (still_ours()) {
-                if (locked) ctl_remove(ctl, name);
-                shm_unlink(idx_path);
-            }
+            if (still_ours() && segment_remove(idx_path, name, sysv_settled) == 0 && locked)
+                ctl_remove(ctl, name);
         }
         unlock();
         bwa_shm_layout_free(layout);
@@ -890,8 +1452,127 @@ struct stage_guard {
 };
 } // namespace
 
+/* errno `err` is EHWPOISON: a page with a memory error the hardware reported. */
+static bool is_hwpoison(int err)
+{
+#ifdef EHWPOISON
+    return err == EHWPOISON;
+#else
+    (void)err;
+    return false;
+#endif
+}
+
+static bool host_is_amd(void)
+{
+    int is_amd = 0;
+    uint32_t family = 0, model = 0;
+    bwa3_host_cpu_identity(&is_amd, &family, &model);
+    return is_amd != 0;
+}
+
+/* kernel.shm_rmid_forced: 1 if set, 0 if read as 0, -1 if it cannot be read
+ * (no such file, masked, or not a number; errno says why, EINVAL for the
+ * last). */
+static int rmid_forced(void)
+{
+    FILE *f = fopen("/proc/sys/kernel/shm_rmid_forced", "r");
+    if (f == NULL) return -1;
+    int v = 0;
+    const bool got = fscanf(f, "%d", &v) == 1;
+    const int err = ferror(f) != 0 ? errno : EINVAL;
+    fclose(f);
+    if (!got) {
+        errno = err;
+        return -1;
+    }
+    return v != 0 ? 1 : 0;
+}
+
+/* Whether this host cannot take a 1 GB stage at all, saying why if so. */
+static bool huge_refused(void)
+{
+    if (BWA_SHM_HUGE_FLAGS < 0) {
+        std::fprintf(stderr, "[E::bwa_shm_stage] --huge-pages needs Linux\n");
+        return true;
+    }
+    /* 1 GB staging is a gain on Intel and on Graviton4. On AMD it measured no
+     * gain (Zen 4: 0.4 to 0.6% slower than /dev/shm on 2 MB pages), so it is
+     * refused there rather than left to make every later run slower. The
+     * environment variable is for measuring another AMD CPU. */
+    const char *amd_anyway = getenv("BWAMEM3_SHM_HUGE_PAGES_AMD");
+    if (BWA_SHM_HOST_IS_AMD() && !(amd_anyway != NULL && std::strcmp(amd_anyway, "1") == 0)) {
+        std::fprintf(stderr, "[E::bwa_shm_stage] --huge-pages is refused on AMD x86 hosts: "
+                     "staging on 1 GB pages measured no gain there (AMD Zen 4: 0.4 to 0.6%% "
+                     "slower than /dev/shm on 2 MB pages). Nothing was staged; stage without "
+                     "--huge-pages. To measure it on this host anyway, set "
+                     "BWAMEM3_SHM_HUGE_PAGES_AMD=1\n");
+        return true;
+    }
+    const int forced = BWA_SHM_RMID_FORCED();
+    if (forced != 0) {
+        if (forced < 0)
+            std::fprintf(stderr, "[E::bwa_shm_stage] --huge-pages cannot read "
+                         "kernel.shm_rmid_forced (/proc/sys/kernel/shm_rmid_forced): %s. If it "
+                         "were 1, the kernel would remove the 1 GB segment as soon as this "
+                         "command exits. Nothing was staged; stage without --huge-pages, or "
+                         "where that setting can be read\n", std::strerror(errno));
+        else
+            std::fprintf(stderr, "[E::bwa_shm_stage] --huge-pages cannot work with "
+                         "kernel.shm_rmid_forced=1: the kernel would remove the 1 GB segment "
+                         "as soon as this command exits. Nothing was staged; stage without "
+                         "--huge-pages, or set it to 0 (sudo sysctl kernel.shm_rmid_forced=0)\n");
+        return true;
+    }
+#ifdef __linux__
+    /* The stub records the stager's IPC and PID namespaces: the first keeps a
+     * process in another IPC namespace from taking the segment for gone, the
+     * second one in another PID namespace from misreading its creator. */
+    for (const char *kind : {"ipc", "pid"}) {
+        if (self_namespace(kind) == 0) {
+            std::fprintf(stderr, "[E::bwa_shm_stage] --huge-pages needs /proc/self/ns/%s, to "
+                         "record the %s namespace of the 1 GB stage: %s. Nothing was staged; "
+                         "stage without --huge-pages\n", kind, kind[0] == 'i' ? "IPC" : "PID",
+                         errno == ERANGE ? "its inode number does not fit in 32 bits"
+                                         : std::strerror(errno));
+            return true;
+        }
+    }
+#endif
+    return false;
+}
+
+/* `prefix`, whose segment header is `hdr`, is already staged: say so and
+ * return 0. A 1 GB stage of an index that is staged on other pages fails (-1)
+ * instead, since it did not get what it asked for; the index is left as it is. */
+static int report_already_staged(const char *prefix, const bwa_shm_header_t *hdr, bool huge)
+{
+    const bool on_huge = is_huge_stub(hdr);
+    if (huge && !on_huge) {
+        std::fprintf(stderr, "[E::bwa_shm_stage] index '%s' is already in shm, and not on "
+                     "1 GB pages; it is left as it is. To move it, run bwa-mem3 shm -d (which "
+                     "removes every staged index) and stage it again\n", prefix);
+        return -1;
+    }
+    std::fprintf(stderr, "[M::bwa_shm_stage] index '%s' is already in shm%s\n", prefix,
+                 on_huge && !huge ? " (on 1 GB pages)" : "");
+    return 0;
+}
+
+/* Whether System V segment `id` is gone or marked for removal (`ipcrm` while
+ * this process is attached leaves it so until the detach). */
+static bool huge_removed(int id)
+{
+    struct shmid_ds ds;
+    if (shmctl(id, IPC_STAT, &ds) < 0) return true;
+#ifdef SHM_DEST
+    if ((ds.shm_perm.mode & SHM_DEST) != 0) return true;
+#endif
+    return false;
+}
+
 int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
-                  int n_threads)
+                  int n_threads, bool huge)
 {
     if (prefix == NULL || prefix[0] == '\0') {
         std::fprintf(stderr, "[E::%s] empty prefix\n", __func__);
@@ -905,12 +1586,13 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
     char idx_path[PATH_MAX];
     path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
 
+    /* A host that cannot take a 1 GB stage refuses one whatever is staged. */
+    if (huge && huge_refused()) return -1;
+
     /* 0. Already staged: skip the disk reads and the lock. Step 2 decides. */
     bwa_shm_header_t hdr;
-    if (bwa_shm_test(prefix) == 1 && segment_state(idx_path, &hdr) == SEG_COMPLETE) {
-        std::fprintf(stderr, "[M::%s] index '%s' is already in shm\n", __func__, prefix);
-        return 0;
-    }
+    if (bwa_shm_test(prefix) == 1 && segment_state(idx_path, &hdr) == SEG_COMPLETE)
+        return report_already_staged(prefix, &hdr, huge);
 
     /* 1. Compute the layout (loads BNS; peeks scalars from the FMI file). */
     bwa_shm_layout_t layout;
@@ -920,7 +1602,13 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         return -1;
     }
     layout.stager_pid  = (uint64_t)getpid();
-    layout.stage_token = stage_token();
+    layout.stage_token = BWA_SHM_STAGE_TOKEN();
+    /* A 1 GB stage puts the index in a System V segment of whole 1 GiB pages
+     * and only a header-sized stub in the POSIX segment. (Rounded here, not by
+     * bwamem_hugetlb_round_up, because a test substitutes the page size.) */
+    const uint64_t huge_bytes = !huge ? 0 :
+        (layout.total_size + BWA_SHM_HUGE_PAGE - 1) / BWA_SHM_HUGE_PAGE * BWA_SHM_HUGE_PAGE;
+    const size_t posix_len = huge ? sizeof(bwa_shm_header_t) : (size_t)layout.total_size;
     stage_guard g(name, idx_path, &layout);
 
     /* 2. Under the lock, decide from the entry and the segment header, then
@@ -938,6 +1626,16 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         pid = (unsigned long long)hdr.reserved[0];
         if (state != SEG_STAGING) break;
         g.unlock();
+        /* Waiting cannot end well for a stager whose life cannot be checked
+         * from here: it would never be seen to exit, nor reclaimed if dead. */
+        if (stager_elsewhere(&hdr)) {
+            std::fprintf(stderr, "[E::%s] '%s' is being staged on 1 GB pages, or was left by "
+                         "an interrupted stage, by PID %llu of another PID namespace, which "
+                         "cannot be checked from here; not reclaiming it. Stage it, or run "
+                         "bwa-mem3 shm -d, in that PID namespace\n",
+                         __func__, name, pid);
+            return -1;
+        }
         if (!announced)
             std::fprintf(stderr, "[M::%s] '%s' is being staged by PID %llu; waiting\n",
                          __func__, name, pid);
@@ -951,14 +1649,90 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         sleep(1);
     }
     const int probe_errno = errno;
-    if (state == SEG_COMPLETE && ctl_find(g.ctl, name) != NULL) {
-        std::fprintf(stderr, "[M::%s] index '%s' is already in shm\n", __func__, prefix);
-        return 0;
-    }
+    if (state == SEG_COMPLETE && ctl_find(g.ctl, name) != NULL)
+        return report_already_staged(prefix, &hdr, huge);
     if (state == SEG_COMPLETE || state == SEG_BAD) {   /* never adopt or replace it */
+        int complete_id = -1;
+        /* `shm -d` walks the registry, so it reaches only a registered stub. */
+        const bool registered = ctl_find(g.ctl, name) != NULL;
+        static const char unreached[] = "; it has no registry entry, so bwa-mem3 shm -d does "
+                                        "not reach it";
         if (failed != NULL)
             std::fprintf(stderr, "[E::%s] %s(%s): %s\n", __func__, failed, idx_path,
                          std::strerror(probe_errno));
+        else if (hdr.magic == BWA_SHM_HUGE_MAGIC && hdr.version != BWA_SHM_VERSION)
+            std::fprintf(stderr, "[E::%s] '%s' has a 1 GB stub %s of version %u (expected "
+                         "%u), staged by another bwa-mem3. Not replacing it%s%s\n", __func__,
+                         name, idx_path, hdr.version, BWA_SHM_VERSION,
+                         registered ? "; bwa-mem3 shm -d removes it" : unreached,
+                         registered ? "" : ". Do not delete the stub while the segment it "
+                                           "names may exist, or that segment's pages stay "
+                                           "pinned with nothing that names them");
+        else if (state == SEG_BAD && hdr.magic == BWA_SHM_HUGE_MAGIC && is_huge_stub(&hdr)) {
+            int id;
+            const char *why;
+            void *seg = huge_attach(&hdr, &id, &why);
+            const bool usable = seg != (void *)-1;
+            if (usable) {   /* usable after all: it changed meanwhile */
+                shmdt(seg);
+                why = "it changed while it was being checked";
+            }
+            std::fprintf(stderr, "[E::%s] '%s' has a 1 GB stub %s, but its 1 GB segment "
+                         "(System V key 0x%x) cannot be used: %s. Not replacing it%s",
+                         __func__, name, idx_path, (unsigned)huge_key(hdr.reserved[1]),
+                         why,
+                         !registered ? unreached :
+                         id == HUGE_FOREIGN ? "; bwa-mem3 shm -d removes the stub and leaves "
+                                              "that segment" :
+                         id == HUGE_ELSEWHERE ? "; run bwa-mem3 shm -d in the IPC namespace "
+                                                "that staged it" :
+                         id >= 0 && !usable ? "; bwa-mem3 shm -d removes it and its segment"
+                                            : "");
+            /* Unregistered: what to do by hand, as for a complete stub
+             * without an entry below. Only the stage's own segment (id >= 0)
+             * may be removed; a stub whose segment may still exist stays. */
+            if (registered)
+                std::fprintf(stderr, "\n");
+            else if (id >= 0 && !usable)
+                std::fprintf(stderr, ". It names System V segment id %d: after checking that "
+                             "no stager is active, that `ipcs -m` still lists id %d with key "
+                             "0x%x, and that it has no attached process (nattch 0 in `ipcs -m "
+                             "-i %d`), remove it with `ipcrm -m %d`, then delete the stub (rm "
+                             "/dev/shm%s)\n", id, id, (unsigned)huge_key(hdr.reserved[1]), id,
+                             id, idx_path);
+            else if (id == HUGE_FOREIGN)
+                std::fprintf(stderr, ". The segment on its key is not the stage's, so delete "
+                             "only the stub (rm /dev/shm%s)\n", idx_path);
+            else if (id == HUGE_ABSENT)
+                std::fprintf(stderr, ". Its segment is gone, so delete the stub (rm "
+                             "/dev/shm%s)\n", idx_path);
+            else
+                std::fprintf(stderr, ". Do not delete the stub while its segment may exist, "
+                             "or that segment's pages stay pinned with nothing that names "
+                             "them\n");
+        }
+        else if (state == SEG_COMPLETE && is_huge_stub(&hdr) &&
+                 (complete_id = huge_segment(&hdr)) >= 0) {
+            /* Complete: huge_segment finds the stage's own segment (unless it
+             * went meanwhile: then the generic message below). */
+            const int id = complete_id;
+            std::fprintf(stderr, "[E::%s] 1 GB stub %s exists without a registry entry; not "
+                         "replacing it. It names System V segment id %d (key 0x%x, %llu "
+                         "bytes). After checking that no stager is active, that `ipcs -m` "
+                         "still lists id %d with that key and size, and that it has no "
+                         "attached process (nattch 0 in `ipcs -m -i %d`), remove it with "
+                         "`ipcrm -m %d`, delete the stub (rm /dev/shm%s), then retry; if "
+                         "the key or size differ, the segment is not this stage's: delete "
+                         "only the stub\n", __func__,
+                         idx_path, id, (unsigned)huge_key(hdr.reserved[1]),
+                         (unsigned long long)hdr.reserved[2], id, id, id, idx_path);
+        }
+        else if (is_huge_stub(&hdr))   /* its segment went between the two looks */
+            std::fprintf(stderr, "[E::%s] 1 GB stub %s exists without a registry entry, and "
+                         "its segment changed while it was being checked; not replacing it. "
+                         "Retry; do not delete the stub while its segment may exist, or its "
+                         "pages stay pinned with nothing that names them\n", __func__,
+                         idx_path);
         else
             std::fprintf(stderr, "[E::%s] segment %s exists %s; not replacing it. Remove "
                          "it with shm_unlink(\"%s\") after checking that no stager is "
@@ -969,9 +1743,13 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         return -1;
     }
     if (state == SEG_DEAD) {
-        std::fprintf(stderr, "[M::%s] reclaiming '%s' left by an interrupted stage (PID %llu)\n",
-                     __func__, name, pid);
-        shm_unlink(idx_path);
+        if (hdr.magic == BWA_SHM_HUGE_MAGIC)
+            std::fprintf(stderr, "[M::%s] reclaiming '%s': its 1 GB segment (System V key "
+                         "0x%x) is gone\n", __func__, name, (unsigned)huge_key(hdr.reserved[1]));
+        else
+            std::fprintf(stderr, "[M::%s] reclaiming '%s' left by an interrupted stage (PID "
+                         "%llu)\n", __func__, name, pid);
+        if (segment_remove(idx_path, name) != 0) return -1;
     }
     ctl_remove(g.ctl, name);   /* a stale entry, if any */
 
@@ -998,16 +1776,30 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
      * would later die of SIGBUS, so refuse up front with the fix. Stages in
      * progress allocate pages as they write, so their unallocated remainder is
      * reserved too. Sampled before free space, so pages written in between count
-     * twice rather than not at all (conservative). f_bavail is in f_frsize units.
-     * A statvfs failure is not fatal. */
-    uint64_t staging = 0;
-    ctl_walk_map(g.ctl, staging_bytes_cb, &staging);
+     * twice rather than not at all (conservative). f_bavail is in f_frsize units,
+     * tmpfs's page, and every segment, this one and those in progress, takes
+     * whole ones: a stub admitted into the bytes left in another stage's last
+     * page would take that page from it. A statvfs failure is not fatal. A 1 GB
+     * stage needs room for its stub only. */
+    std::vector<staging_need> staging_needs;
+    ctl_walk_map(g.ctl, staging_bytes_cb, &staging_needs);
     struct statvfs svfs;
     if (BWA_SHM_STATVFS("/dev/shm", &svfs) == 0) {
-        uint64_t avail = (uint64_t)svfs.f_frsize * (uint64_t)svfs.f_bavail;
+        const uint64_t unit = svfs.f_frsize != 0 ? (uint64_t)svfs.f_frsize
+                                                 : (uint64_t)svfs.f_bsize;
+        uint64_t staging = 0;
+        for (const staging_need &s : staging_needs) {
+            const uint64_t need = round_to_unit(s.l_mem, unit);
+            if (s.allocated < need) staging += need - s.allocated;
+        }
+        uint64_t avail = unit * (uint64_t)svfs.f_bavail;
         avail = avail > staging ? avail - staging : 0;
-        if ((uint64_t)layout.total_size > avail) {
-            std::fprintf(stderr,
+        if (unit != 0 && round_to_unit((uint64_t)posix_len, unit) > avail) {
+            if (huge)
+                std::fprintf(stderr, "[E::%s] /dev/shm has no room for the %llu-byte stub of "
+                             "'%s' (%llu bytes free)\n", __func__,
+                             (unsigned long long)posix_len, name, (unsigned long long)avail);
+            else std::fprintf(stderr,
                 "[E::%s] /dev/shm has %llu bytes free but staging '%s' "
                 "needs %llu bytes. Remount with larger size, e.g. "
                 "`sudo mount -o remount,size=%lluG /dev/shm`.\n",
@@ -1017,20 +1809,28 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
             return -1;
         }
     }
-    if (ftruncate(g.idx_fd, (off_t)layout.total_size) < 0) {
+    if (ftruncate(g.idx_fd, (off_t)posix_len) < 0) {
         std::fprintf(stderr, "[E::%s] ftruncate(%s, %llu) failed: %s\n",
                      __func__, idx_path,
-                     (unsigned long long)layout.total_size, std::strerror(errno));
+                     (unsigned long long)posix_len, std::strerror(errno));
         return -1;
     }
-    g.idx = idx_segment_map(g.idx_fd, (size_t)layout.total_size, PROT_READ | PROT_WRITE);
+    g.idx = idx_segment_map(g.idx_fd, posix_len, PROT_READ | PROT_WRITE);
+    g.idx_len = posix_len;
     if (g.idx == MAP_FAILED) {
         std::fprintf(stderr, "[E::%s] mmap(%s) failed: %s\n",
                      __func__, idx_path, std::strerror(errno));
         return -1;
     }
-    ((bwa_shm_header_t *)g.idx)->reserved[0] = layout.stager_pid;   /* magic stays 0 */
-    ((bwa_shm_header_t *)g.idx)->reserved[1] = layout.stage_token;
+    bwa_shm_header_t *first = (bwa_shm_header_t *)g.idx;   /* magic stays 0 */
+    first->reserved[0] = layout.stager_pid;
+    first->reserved[1] = layout.stage_token;
+    if (huge) {
+        first->version     = BWA_SHM_VERSION;
+        first->total_size  = layout.total_size;
+        first->reserved[2] = huge_bytes;
+        first->reserved[4] = stub_namespaces();
+    }
 
     uint8_t *entry = (uint8_t *)g.ctl + h.next_write;
     const int64_t l_mem = (int64_t)layout.total_size;
@@ -1039,11 +1839,84 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
     h.n_entries  = (uint16_t)(h.n_entries + 1);
     h.next_write = (uint16_t)(h.next_write + entry_bytes);
     ctl_header_store(g.ctl, h);   /* after the entry bytes */
+    if (huge) {
+        /* Created only now, with the stub registered and naming it, so a stage
+         * killed at any point leaves nothing that `shm -d` or a restage cannot
+         * find; and under the lock, so `shm -d` cannot remove the stub in
+         * between. Creating reserves pages that the pool already holds and
+         * writes none, which takes milliseconds. */
+        g.stub = g.idx;
+        g.idx = MAP_FAILED;
+        g.shmid = shmget(huge_key(layout.stage_token), (size_t)huge_bytes,
+                         IPC_CREAT | IPC_EXCL | BWA_SHM_HUGE_FLAGS | 0644);
+        /* Recorded at once: until it is, only the kernel's record of the
+         * creating PID ties the segment to this stub (huge_segment). */
+        if (g.shmid >= 0) first->reserved[3] = (uint64_t)g.shmid + 1;
+        void *m = g.shmid < 0 ? (void *)-1 : shmat(g.shmid, NULL, 0);
+        if (m == (void *)-1) {
+            const int err = errno;
+            const bool made = g.shmid >= 0;
+            std::fprintf(stderr, "[E::%s] cannot %s a System V segment of %llu x 1 GB pages "
+                         "for '%s': %s (%s). Nothing was staged; rerun without --huge-pages "
+                         "to stage in /dev/shm\n", __func__,
+                         made ? "attach" : "create",
+                         (unsigned long long)(huge_bytes / BWA_SHM_HUGE_PAGE), name,
+                         std::strerror(err),
+                         made ? "the address space or mapping limit of this process" :
+                         err == ENOMEM ? "the 1 GB pool has too few unreserved pages "
+                                         "(free_hugepages less resv_hugepages in /sys/kernel/"
+                                         "mm/hugepages/hugepages-1048576kB; nr_hugepages there "
+                                         "sets the pool), or a hugetlb cgroup limit is "
+                                         "reached" :
+                         err == EPERM ? "it needs CAP_IPC_LOCK or membership of the group "
+                                        "named by vm.hugetlb_shm_group (sudo sysctl "
+                                        "vm.hugetlb_shm_group=<gid>)" :
+                         err == ENODEV || err == ENOSYS ?
+                                         "this kernel or CPU has no 1 GB huge page size" :
+                         err == EINVAL ? "the segment exceeds kernel.shmmax, or this host has "
+                                         "no 1 GB page size" :
+                         err == ENOSPC ? "kernel.shmall or kernel.shmmni is exhausted" :
+                         err == EEXIST ? "another segment already has this stage's System V "
+                                         "key; stage again, each stage draws a new key" :
+                                         "shmget");
+            return -1;
+        }
+        g.idx = m;
+        g.idx_len = (size_t)huge_bytes;
+        static bool at_exit = false;
+        if (!at_exit) at_exit = atexit(packing_shmid_remove) == 0;
+        g_packing_shmid = g.shmid;
+    }
     g.unlock();
     g.released = true;
 
-    /* 3. Pack without the lock; the magic, written last, marks it complete. */
-    if (bwa_shm_stage_map_hook) bwa_shm_stage_map_hook(g.idx, (size_t)layout.total_size);
+#ifdef __linux__
+    /* Fault the 1 GB pages in before the pack writes them. The pool reservation
+     * made by shmget does not cover a hugetlb cgroup limit or a NUMA policy
+     * that excludes the nodes holding the free pages; a page refused then is
+     * SIGBUS in the pack, and here it is an error; so is a page that the
+     * hardware reports poisoned (EHWPOISON). Linux before 5.14 has no
+     * MADV_POPULATE_WRITE (EINVAL), and the pack faults the pages itself; a
+     * page refused then is SIGBUS, which removes the segment (packing_sigbus). */
+    if (huge && madvise(g.idx, g.idx_len, MADV_POPULATE_WRITE) != 0 &&
+        (errno == ENOMEM || errno == EFAULT || is_hwpoison(errno))) {
+        const int err = errno;
+        std::fprintf(stderr, "[E::%s] cannot fault in the %llu x 1 GB pages of '%s': %s (%s). "
+                     "Nothing was staged\n", __func__,
+                     (unsigned long long)(huge_bytes / BWA_SHM_HUGE_PAGE), name,
+                     std::strerror(err),
+                     is_hwpoison(err) ? "a page of the pool has a hardware memory error" :
+                                        "a hugetlb cgroup limit, or a NUMA memory policy that "
+                                        "excludes the nodes holding the pool's free pages");
+        return -1;
+    }
+#endif
+
+    /* 3. Pack without the lock; the magic, written last, marks it complete.
+     *    A 1 GB page refused at its first write (a kernel without
+     *    MADV_POPULATE_WRITE) is SIGBUS: remove the segment as it kills us. */
+    const packing_sigbus_guard sigbus(huge);
+    if (bwa_shm_stage_map_hook) bwa_shm_stage_map_hook(g.idx, g.idx_len);
     if (bwa_shm_pack_into(&layout, (uint8_t *)g.idx) != 0) {
         std::fprintf(stderr, "[E::%s] pack_into failed for %s\n", __func__, prefix);
         return -1;
@@ -1057,20 +1930,34 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
                      __func__, name, std::strerror(errno));
         return -1;
     }
-    if (!locked || ctl_find(g.ctl, name) == NULL || !g.still_ours()) {
-        std::fprintf(stderr, "[E::%s] '%s' was removed during staging (by bwa-mem3 shm -d "
-                     "or another stager)\n", __func__, name);
+    if (!locked || ctl_find(g.ctl, name) == NULL || !g.still_ours() ||
+        (huge && huge_removed(g.shmid))) {
+        std::fprintf(stderr, "[E::%s] '%s' was removed during staging (by bwa-mem3 shm -d, "
+                     "another stager, or ipcrm)\n", __func__, name);
         return -1;
     }
     g.created = false;
+    g_packing_shmid = -1;
+    if (huge) {   /* the index is complete; now so is the stub */
+        __atomic_store_n(&((bwa_shm_header_t *)g.stub)->magic, BWA_SHM_HUGE_MAGIC,
+                         __ATOMIC_RELEASE);
+        std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) on %llu x 1 GB pages "
+                     "(System V segment id %d, key 0x%x)\n", __func__, name,
+                     (unsigned long long)layout.total_size,
+                     (unsigned long long)(huge_bytes / BWA_SHM_HUGE_PAGE), g.shmid,
+                     (unsigned)huge_key(layout.stage_token));
+        return 0;
+    }
     std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) as %s\n",
                  __func__, name, (unsigned long long)layout.total_size, idx_path);
     return 0;
 }
 
-uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
+uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out,
+                        bool need_pac)
 {
     if (len_out != NULL) *len_out = 0;
+    if (map_len_out != NULL) *map_len_out = 0;
     if (prefix == NULL || prefix[0] == '\0') return NULL;
 
     /* Cheap pre-check: skip the open if there's no registry entry. */
@@ -1113,22 +2000,51 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
     /* Validate the on-segment header. Acquire-load the magic first: it is
      * published last, so once it reads BWA_SHM_MAGIC the rest is in place. A
      * zero magic is a stage still in progress or one that was interrupted. */
-    const uint64_t magic = __atomic_load_n((const uint64_t *)m, __ATOMIC_ACQUIRE);
+    uint64_t magic = __atomic_load_n((const uint64_t *)m, __ATOMIC_ACQUIRE);
     bwa_shm_header_t hdr;
     std::memcpy(&hdr, m, sizeof(hdr));
+    hdr.magic = magic;
+    /* A complete 1 GB stub: the index is the System V segment that its stage
+     * created, attached by huge_attach after the checks that segment_state
+     * makes too (the size the stub records, the length mapped here, and a
+     * complete header that carries the stub's token). */
+    if (magic == BWA_SHM_HUGE_MAGIC && is_huge_stub(&hdr)) {
+        munmap(m, len);
+        if (hdr.version != BWA_SHM_VERSION) {
+            std::fprintf(stderr, "[E::%s] unsupported 1 GB stub version %u in %s (expected "
+                         "%u)\n", __func__, hdr.version, idx_path, BWA_SHM_VERSION);
+            return NULL;
+        }
+        const bwa_shm_header_t stub = hdr;
+        int id;
+        const char *why;
+        m = huge_attach(&stub, &id, &why);
+        len = (size_t)stub.reserved[2];
+        if (m == (void *)-1) {
+            std::fprintf(stderr, "[M::%s] the 1 GB segment of '%s' (System V key 0x%x) "
+                         "cannot be used: %s; loading from disk%s\n", __func__, name,
+                         (unsigned)huge_key(stub.reserved[1]), why,
+                         id == HUGE_ABSENT ? " (stage it again to use shared memory)" : "");
+            return NULL;
+        }
+        magic = __atomic_load_n((const uint64_t *)m, __ATOMIC_ACQUIRE);
+        std::memcpy(&hdr, m, sizeof(hdr));
+    }
     if (magic != BWA_SHM_MAGIC) {
         if (magic == 0)
             std::fprintf(stderr, "[M::%s] '%s' is not fully staged (being staged or "
                          "interrupted); loading from disk\n", __func__, name);
         else
             std::fprintf(stderr, "[E::%s] bad magic in %s\n", __func__, idx_path);
-        munmap(m, len);
+        bwa_shm_detach((uint8_t *)m, len);
         return NULL;
     }
+    /* For a 1 GB index huge_attach has already checked the version and size
+     * below; they guard the POSIX path. */
     if (hdr.version != BWA_SHM_VERSION) {
         std::fprintf(stderr, "[E::%s] unsupported segment version %u in %s (expected %u)\n",
                      __func__, hdr.version, idx_path, BWA_SHM_VERSION);
-        munmap(m, len);
+        bwa_shm_detach((uint8_t *)m, len);
         return NULL;
     }
     /* total_size is the exact data written; st_size may be page-rounded up.
@@ -1137,12 +2053,29 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out)
         std::fprintf(stderr, "[E::%s] header total_size=%llu exceeds segment size %llu in %s\n",
                      __func__, (unsigned long long)hdr.total_size,
                      (unsigned long long)len, idx_path);
-        munmap(m, len);
+        bwa_shm_detach((uint8_t *)m, len);
+        return NULL;
+    }
+    /* A load that reads the packed reference cannot use a seed-only stage,
+     * and would exit on it: decline it here, so the load reads the disk. */
+    if (need_pac && !index_pac_ok((const uint8_t *)m)) {
+        std::fprintf(stderr, "[M::%s] '%s' is staged without a usable packed reference, "
+                     "which this load needs (a seed-only `shm --meth` stage, for one); "
+                     "loading from disk\n", __func__, name);
+        bwa_shm_detach((uint8_t *)m, len);
         return NULL;
     }
 
     if (len_out != NULL) *len_out = (size_t)hdr.total_size;
+    if (map_len_out != NULL) *map_len_out = len;
     return (uint8_t *)m;
+}
+
+void bwa_shm_detach(uint8_t *base, size_t map_len)
+{
+    /* A 1 GB index is a System V attachment, any other a mapping; shmdt fails
+     * (EINVAL) on an address that is not an attachment's. */
+    if (base != NULL && shmdt(base) != 0) munmap(base, map_len);
 }
 
 int bwa_shm_section_find(const uint8_t *base, uint32_t kind,
@@ -1234,7 +2167,7 @@ static int hint_missing_meth_flag(const char *prefix)
 static void print_shm_usage(void)
 {
     std::fprintf(stderr,
-        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [-u INT] [-t INT] [idxbase]\n\n"
+        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [--huge-pages] [-u INT] [-t INT] [idxbase]\n\n"
         "Options:\n"
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
         "  -l        list indices in shared memory; a third column flags\n"
@@ -1253,6 +2186,16 @@ static void print_shm_usage(void)
         "            per-sample walks are independent, so this scales near-\n"
         "            linearly; has no effect unless -u actually densifies (a\n"
         "            target denser than the on-disk rate).\n"
+        "  --huge-pages\n"
+        "            stage the index on 1 GB huge pages: a System V shared memory\n"
+        "            segment from the host's reserved 1 GB pool (11 pages for a\n"
+        "            default hg38 stage), which `mem` attaches as usual. Cuts dTLB\n"
+        "            page walks on Intel x86 and Graviton4 (arm64). Refused on AMD\n"
+        "            x86, where it measured no gain. Linux only; needs CAP_IPC_LOCK\n"
+        "            or membership of the vm.hugetlb_shm_group group, and one IPC\n"
+        "            namespace for the stage, `mem` and `shm -d`. Fails, staging\n"
+        "            nothing, when the pages cannot be had or the index is already\n"
+        "            staged on other pages.\n"
         "  -h --help print this help and exit\n\n"
         "Stage with no flags: `bwa-mem3 shm <idxbase>` loads the index into\n"
         "POSIX shared memory; subsequent `bwa-mem3 mem <idxbase> ...` runs\n"
@@ -1278,6 +2221,7 @@ int main_shm(int argc, char *argv[])
     int c, to_list = 0, to_drop = 0, meth = 0, ret = 0;
     int target_sa_compx = -1;   /* -1 = stage the on-disk SA rate unchanged */
     int n_threads = 1;          /* worker count for the -u densify pass */
+    int huge = 0;               /* --huge-pages */
 
     /* Pre-scan for --help / -h. getopt_long would treat -h as unknown
      * (no short opt declared) and print a generic error, but the top-level
@@ -1310,12 +2254,14 @@ int main_shm(int argc, char *argv[])
     static struct option long_opts[] = {
         {"meth",    no_argument,       0, 1000},
         {"threads", required_argument, 0, 't' },
+        {"huge-pages", no_argument,    0, 1001},
         {0,         0,                 0, 0   }
     };
     while ((c = getopt_long(argc, argv, "ldu:t:", long_opts, NULL)) >= 0) {
         if      (c == 'l')   to_list = 1;
         else if (c == 'd')   to_drop = 1;
         else if (c == 1000)  meth    = 1;
+        else if (c == 1001)  huge    = 1;
         else if (c == 't') {
             /* Worker count for the -u densify pass. Bare positive integer;
              * clamped to a sane upper bound so a fat-fingered value can't spin
@@ -1374,6 +2320,11 @@ int main_shm(int argc, char *argv[])
             "[W::%s] --threads only affects the -u densify pass; ignoring "
             "without -u\n", __func__);
     }
+    if (huge && (to_list || to_drop)) {
+        std::fprintf(stderr,
+            "[E::%s] --huge-pages cannot be combined with -l or -d\n", __func__);
+        return 1;
+    }
     if (meth && (to_list || to_drop)) {
         std::fprintf(stderr,
             "[E::%s] --meth cannot be combined with -l or -d\n", __func__);
@@ -1399,7 +2350,7 @@ int main_shm(int argc, char *argv[])
         /* --meth stages a SEED-only segment: omit PAC + REF_STRING (.0123),
          * which `mem --meth` never reads. Saves ~14.5 GB of shm on hg38. */
         if (bwa_shm_stage(user_prefix, /*bns_only=*/meth != 0, target_sa_compx,
-                          n_threads) < 0) {
+                          n_threads, huge != 0) < 0) {
             std::fprintf(stderr,
                 "[E::%s] failed to stage '%s' in shared memory\n",
                 __func__, user_prefix);

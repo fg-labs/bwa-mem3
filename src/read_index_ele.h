@@ -80,6 +80,25 @@ public:
 	 * extends against the ORIGINAL pac, so the seed pac is never needed.
 	 */
 	void bwa_idx_load_ele_from_shm(uint8_t *base, size_t len, bool load_pac = true);
+
+	/* Checks a segment's BNS_STRUCT copy `bns` and its BNS_AMBS / BNS_ANNS
+	 * section sizes the way bwa_idx_load_ele_from_shm does. Returns true when
+	 * they pass; otherwise false, with what is wrong written to `why` (if not
+	 * NULL). Also used by bwa_shm's probe of a 1 GB stage. */
+	static bool shm_bns_ok(const bntseq_t *bns, uint64_t sz_ambs, uint64_t sz_anns,
+	                       char *why, size_t why_len);
+	/* Walks the BNS_NAMES section (`sz` bytes at `names`) the way
+	 * bwa_idx_load_ele_from_shm does: a NUL-terminated name and anno per
+	 * sequence, for `n_seqs` sequences, consuming the section exactly (empty
+	 * strings are valid). With `anns` (n_seqs entries), points each one's name
+	 * and anno into the section. Returns true when the walk succeeds;
+	 * otherwise false, with what is wrong written to `why` (if not NULL). Also
+	 * used by bwa_shm's probe of a 1 GB stage. */
+	static bool shm_names_walk(const char *names, uint64_t sz, int n_seqs, bntann1_t *anns,
+	                           char *why, size_t why_len);
+	/* The PAC section size bwa_idx_load_ele_from_shm requires when it loads
+	 * PAC. */
+	static int64_t shm_pac_bytes_for(int64_t l_pac) { return l_pac / 4 + 1; }
 };
 
 /* Slurp the whole of an open .pac stream (`*fp_pac`, opened from `pac_path` and
