@@ -788,8 +788,9 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			aln_meth_copy_dup(&res[i], &res[first], aln_meth_draw_seed(ref, read_no, ord0 + i),
 							  keep_strata && !res[first].flags, max_xa_hits);
 		},
-		// --known-snvs: a copy shares only with the same candidate windows (an incomplete window
-		// search keeps each copy's own drawn hit, so copies' candidates can differ)
+		// --known-snvs: a copy shares only with the same candidate windows and paths (an incomplete
+		// window search keeps each copy's own drawn hit, so copies' candidates can differ; one
+		// window reached along two paths scores differently)
 		[&](int i, int first) {
 			if (incoming_flags && incoming_flags[i] != incoming_flags[first]) return false;
 			if (alt_bounds && (alt_bounds[i].valid != alt_bounds[first].valid ||
@@ -798,7 +799,8 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			const std::vector<aln_meth_candidate_t> &a = extra[i], &b = extra[first];
 			return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
 				[](const aln_meth_candidate_t &x, const aln_meth_candidate_t &y) {
-					return x.rid == y.rid && x.strand == y.strand && x.hyp == y.hyp && x.rb == y.rb && x.re == y.re;
+					return x.rid == y.rid && x.strand == y.strand && x.hyp == y.hyp && x.rb == y.rb && x.re == y.re &&
+						x.cig == y.cig;
 				});
 		});
 	for (int i = 0; i < n_seqs; ++i)

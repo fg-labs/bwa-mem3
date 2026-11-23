@@ -113,8 +113,9 @@ Methylation (shared with bwa-mem3 mem):
                  and other callers that read the per-base calls from XM:Z.
    --set-as-failed f|r
                  flag alignments to the matching strand ('f' or 'r') as QC-fail (0x200)
-   Under --meth, converted search proposes windows; original-reference global realignment
-   refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.
+   Under --meth, each converted-search row is scored along its search path on the original
+   reference with -M/-O/-E. Mate rescue and --known-snvs candidates without a path are
+   realigned globally (match +1, mismatch -3, gaps 5+length), then cost-ranked the same way.
    Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.
    TAPS/5base neutral breaks equal costs by fewest conversions. When this displaces an
    equal-cost locus, an end left there has MAPQ <= min(60,6*delta), delta the smallest

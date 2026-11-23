@@ -1314,8 +1314,9 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "  -P        accepted and ignored (sampe -P loads the index into memory; always so here)\n");
 	fprintf(fp, "\nMethylation (shared with bwa-mem3 mem):\n");
 	meth_opts_usage_shared(fp);
-	fprintf(fp, "   Under --meth, converted search proposes windows; original-reference global realignment\n");
-	fprintf(fp, "   refines each (match +1, mismatch -3, gaps 5+length), then -M/-O/-E cost-ranks its CIGAR.\n");
+	fprintf(fp, "   Under --meth, each converted-search row is scored along its search path on the original\n");
+	fprintf(fp, "   reference with -M/-O/-E. Mate rescue and --known-snvs candidates without a path are\n");
+	fprintf(fp, "   realigned globally (match +1, mismatch -3, gaps 5+length), then cost-ranked the same way.\n");
 	fprintf(fp, "   Strata and MAPQ use stock aln accounting; capped results make no exact strata claims.\n");
 	fprintf(fp, "   TAPS/5base neutral breaks equal costs by fewest conversions. When this displaces an\n");
 	fprintf(fp, "   equal-cost locus, an end left there has MAPQ <= min(60,6*delta), delta the smallest\n");
@@ -1647,6 +1648,14 @@ int main_aln(int argc, char *argv[])
 	if (opte > 0) {
 		opt->max_gape = opte;
 		opt->mode &= ~BWA_MODE_GAPE;
+	}
+	// --meth scores a hit's rows along its search path, whose gap events the search entry keeps for
+	// at most ALN_METH_MAX_GAPS gaps. It counts their extensions in 8 bits: past 255 the count wraps,
+	// a deletion can outgrow its 15-bit length and the path no longer gives the row's span.
+	if (meth_opt.m.meth_mode && (opt->max_gapo > ALN_METH_MAX_GAPS || opt->max_gape > 255)) {
+		fprintf(stderr, "[E::aln] --meth allows at most -o %d gap opens and -e 255 gap extensions\n",
+				ALN_METH_MAX_GAPS);
+		return 1;
 	}
 	if (opt->n_threads < 1) {
 		fprintf(stderr, "[W::aln] -t %d is below 1; using 1 thread\n", opt->n_threads);

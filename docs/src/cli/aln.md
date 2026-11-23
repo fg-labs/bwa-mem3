@@ -269,17 +269,19 @@ How it works:
   leave the mate unrescued, whether they come from two alignments or from one window whose best is
   tied: a pick survives only if it scores above every such tie.
 - `--meth`: the converted search also resolves the windows that the ALT-window search finds. Each
-  candidate window holding a site, and each mate-rescue window holding one, is realigned against
+  candidate window holding a site is scored along the ALT-window search's path to it (its gaps,
+  including a gap at either end of the read, as the converted search scores its own rows), against
   the reference and then once per site allele (each ALT of a multi-allelic site separately) with
-  only that ALT in place, under the same 32-allele cap (a mate-rescue window counts only the sites
-  on its anchor's contig, since rescue never aligns past that contig). The locus keeps the cheapest alignment;
-  on a tie the reference wins, then the lower (position, ALT). An alignment in a window that only
-  the ALT-window search proposed is kept only within the read's difference limit, as the read's
-  own search would be. When its best-scoring alignment breaks the read's `-n`, `-o` or `-e`
-  limits, the window is realigned once more with its indels held to the window's own extent
-  (ungapped when the window is the read's length), and that alignment is kept if it is within
-  the limits. A pair whose placement assumes an ALT is left out of the insert-size
-  estimate.
+  only that ALT in place, under the same 32-allele cap. A candidate whose path cannot be recovered,
+  and each mate-rescue window holding a site, is realigned instead, the same way (a mate-rescue
+  window counts only the sites on its anchor's contig, since rescue never aligns past that
+  contig). The locus keeps the cheapest alignment; on a tie the reference wins, then the lower
+  (position, ALT). An alignment in a window that only the ALT-window search proposed is kept only
+  within the read's difference limit, as the read's own search would be. When a realigned
+  candidate's best-scoring alignment breaks the read's `-n`, `-o` or `-e` limits, the window is
+  realigned once more with its indels held to the window's own extent (ungapped when the window is
+  the read's length), and that alignment is kept if it is within the limits. A pair whose
+  placement assumes an ALT is left out of the insert-size estimate.
 - Without `--meth`, reads longer than about 160 bases, reads with more than 256 candidate
   loci, and reads whose genomic or ALT-window search stopped at the `-m` limit (it may have
   missed equal-best loci) keep their stock search result. For paired input that end still goes
@@ -585,67 +587,58 @@ read 2 G->A for directional discovery. In `aln`, `--set-as-failed` requires
 
 ### Discovery, refinement and accounting
 
-Converted-space backtracking proposes original-reference windows within the user's
-search limits (`-n`, `-o`, `-e`, seeding options, `-M/-O/-E`, `-N` and `-m`).
-Only the directional copy appropriate to the read is retained. Identical windows
-(original contig, conversion hypothesis, strand, start and end) are evaluated once.
-`-R` does not prune original-reference competitors. For current best cost `B`,
+Converted-space backtracking finds hits within the user's search limits (`-n`, `-o`,
+`-e`, seeding options, `-M/-O/-E`, `-N` and `-m`). Each SA row of a hit is a candidate
+locus. Only the directional copy appropriate to the read is retained. `-R` does not
+prune original-reference competitors. For current best cost `B`,
 let `T = B + M` and `k = floor(T / M)`. When `M > 0`, `T < O`, `E >= 0`, the
 configured difference ceiling admits `k` differences, `-N` is off and discovery
 has not hit a cap, the search can stop after fully evaluating converted scores
-through `M*k`. Every retained raw alignment then has no gaps and at most `k`
-strict mismatches, so that stratum already proposes its exact window. A read
+through `M*k`. Every retained alignment then has no gaps and at most `k`
+strict mismatches, so that stratum already reaches its row. A read
 longer than `-l` (a seeded search) can stop this way only when `k` is also at
-most the seed's `-k`, so that seeding cannot have excluded such a window
+most the seed's `-k`, so that seeding cannot have excluded such a row
 ([#778](https://github.com/fg-labs/bwa-mem3/pull/778)). A
 decreasing best cost can only narrow this bound. Other searches retain configured
 generation without a path-cost cutoff ([#751](https://github.com/fg-labs/bwa-mem3/pull/751)). This does not make
 discovery exhaustive or guarantee a globally optimal alignment.
 
-Each window is globally refined on the original reference with a fixed
-chemistry-aware reward model: match +1, mismatch -3, ambiguity -1 and a gap of
-length `k` costing `5+k`. Neutral conversions score 0. **`-M/-O/-E` do not change
-this refinement model.** The five-symbol model uses an actual-matrix band
-certificate when available and otherwise a full band. The existing dispatcher
-may use its SIMD global kernels when their predicates hold. CpG-only scoring
-uses seven reference symbols and full-band scalar refinement, not that certificate
-or SIMD path. In either alphabet, a window as long as the read whose ungapped reward
-exceeds `length - 13` skips the DP: a gapped path needs an insertion and a deletion
-(at least 12) and aligns at most `length - 1` columns, so the ungapped alignment is
-the unique optimum and the result is the one the DP returns.
-Original `.amb` intervals override random packed bases with N at
-alignment time, without rebuilding either index. CpG labels use true contig flanks
-and respect these ambiguity runs.
-`--meth-context cpg` requires TAPS/5base and non-collapsed scoring.
-
-The raw refined CIGAR is then costed using `-M/-O/-E`:
+**Path cost.** Each row is scored on the original reference along the search path that
+found it, as stock aln scores a hit by its path: the path's alignment (its gaps where the
+search placed them) is the row's alignment, and its cost is
 
 ```text
 cost = M * mismatches + O * gap_runs + E * gap_extensions
 ```
 
-A gap run of length `k` has `k-1` extensions. Chemistry-accepted conversions,
-including neutral conversions, have mismatch cost 0. An ambiguous original-reference
-or query base always counts as a mismatch, including N/N, although refinement keeps
-the existing ambiguity reward of -1. Literal MD reports original N bases; XM makes
-no methylation call at an ambiguous reference base. These rules affect `aln --meth`
-only, not stock aln or MEM ([#751](https://github.com/fg-labs/bwa-mem3/pull/751)). Different window spans
-compete before collapsing each final locus (original contig, hypothesis, strand
-and normalized start) to its lowest-cost refined CIGAR. Equal costs use canonical
-CIGAR/end ordering within a locus, except for the neutral conversion tie-break below. This ranks reward-refined CIGARs by stock cost;
-it does not minimize that cost over every possible CIGAR. Stock aln instead
-cost-selects search paths before separately reward-refining its output.
+with strict mismatches counted on the original reference. A gap run of length `k` has `k-1`
+extensions. Chemistry-accepted conversions, including neutral conversions, cost 0. An
+ambiguous original-reference or query base always counts as a mismatch, including N/N.
+Original `.amb` intervals override random packed bases with N, without rebuilding either
+index. A converted mismatch is always a strict mismatch and the gap terms are the same, so a
+row's cost is never below its path's converted score. There is no window realignment in the
+search ([#784](https://github.com/fg-labs/bwa-mem3/pull/784)). Two paths that reach the same interval with different gaps (a gap in a tandem repeat,
+say) are both scored; the second reuses the first's SA rows. The search entry records at most
+4 gaps and counts their extensions in 8 bits, so `--meth` refuses `-o` above 4 and `-e` above 255.
+`--meth-context cpg` requires TAPS/5base and non-collapsed scoring; CpG labels use true
+contig flanks and respect the ambiguity runs.
 
-A refined CIGAR whose differences exceed the read's `-n` limit (an integer `-n`, or
-the per-length limit a fractional `-n` gives) is dropped, as stock aln never reports
-such a hit. Differences are counted as stock aln counts them: mismatches plus gap
-runs, plus gap extensions unless `-e` is positive; conversions are free. The converted
-search cannot see a read C over a reference T (or, for read 2, a read G over a
-reference A), so it can propose a window within `-n` converted differences whose
-original-reference alignment has more. A dropped window is not a locus: it does not
-count toward `X0`/`X1` or MAPQ and is never paired. Its SA lookup still counts
-toward the lookup budget, since the row was resolved to find it
-([#782](https://github.com/fg-labs/bwa-mem3/pull/782)).
+Each final locus (original contig, hypothesis, strand and normalized start) keeps its
+lowest-cost path. Equal costs use canonical CIGAR/end ordering within a locus, except for
+the neutral conversion tie-break below. Literal MD reports original N bases; XM makes no
+methylation call at an ambiguous reference base. These rules affect `aln --meth` only,
+not stock aln or MEM ([#751](https://github.com/fg-labs/bwa-mem3/pull/751)).
+
+A row whose strict differences exceed the read's `-n` limit (an integer `-n`, or the
+per-length limit a fractional `-n` gives), or whose strict differences inside the seed
+exceed `-k`, is dropped, as stock aln never reports such a hit. Differences are counted as
+stock aln counts them: mismatches plus gap runs, plus gap extensions unless `-e` is positive;
+conversions are free. The seed's differences are those the search would count against `-k`.
+The converted search cannot see a read C over a reference T (or, for read 2, a read G over a
+reference A), so it can reach a row within `-n` (`-k`) converted differences whose
+original-reference path has more. A dropped row is not a locus: it does not count toward
+`X0`/`X1` or MAPQ and is never paired. Its SA lookup still counts toward the lookup budget,
+since the row was resolved to find it ([#782](https://github.com/fg-labs/bwa-mem3/pull/782)).
 
 `X0` counts best-cost distinct loci. `X1` counts all retained worse-cost loci
 through best cost plus `-M`, or all returned worse costs with `-N`, not only the
@@ -664,8 +657,8 @@ extra conversions. This is the existing heuristic ceiling, not a new calibration
 claim. The ceiling belongs to the conversion-selected locus: a paired-end read
 that pairing or mate rescue moves to another locus takes the pair's MAPQ instead. EM-seq and other scoring modes retain cost-only placement ranking ([#751](https://github.com/fg-labs/bwa-mem3/pull/751)).
 
-Primary and `XA` output use stored CIGARs without a second refinement. Ranking
-counts and reward include raw terminal gaps. Display changes terminal insertions
+Primary and `XA` output use the stored path CIGARs. Ranking counts include raw terminal
+gaps (a path has none unless `-i` is 0). Display changes terminal insertions
 to soft clips and removes terminal deletions with coordinate adjustment. Trimmed
 tails are restored for primary and alternative alignments on either strand.
 `NM`, literal `MD` and `XM` describe the normalized displayed alignment, so `NM`
@@ -739,11 +732,12 @@ best-known placement instead of spending the rest of the budget
 ([#777](https://github.com/fg-labs/bwa-mem3/pull/777)). `-N` does not remove these resource
 limits. Candidate CIGAR retention is capped cumulatively at 64 MiB per read: a read that reaches the cap is
 marked incomplete in the same way, stays unmapped if it has no retained placement,
-and later reads continue; the run does not exit. Refinement separately checks a
-conservative 64 MiB active-allocation estimate (not total process RSS or retained
-backend scratch). A candidate window longer than 65535 bases (only a 65535-base
-read with a deletion produces one) cannot be refined: it is dropped and the read is
-marked incomplete. Invalid results and other resource failures exit with an error. A refined candidate with more
+and later reads continue; the run does not exit. Window refinement (mate rescue, and
+`--known-snvs` candidates without a search path) separately checks a conservative
+64 MiB active-allocation estimate (not total process RSS or retained backend scratch).
+A candidate window longer than 65535 bases (only a 65535-base read with a deletion
+produces one) is dropped and the read is marked incomplete. Invalid results and other
+resource failures exit with an error. A candidate row with more
 than 255 mismatches, gap opens or gap extensions cannot be recorded and is dropped;
 if it is within the `-n` limit and its cost is within `-M` of the best retained cost
 (or with `-N`), the read is marked incomplete as above (MAPQ 0, no exact
