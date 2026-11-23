@@ -2621,6 +2621,43 @@ TEST_CASE("aln_meth: under conversion-blind the search ceiling bounds the mirror
         }
 }
 
+TEST_CASE("aln_meth: under conversion-blind the -R stop waits for the mirror-free strata")
+{
+    // Default penalties, -n 5, -R 30: 31 best loci at cost 12 (four mismatches) are a repeat. A
+    // locus with one gap open, one mismatch and that mismatch a mirror costs 14 but 11 with the
+    // mirror cell free, so the mirror-free best is 11 and unique: its strata run to 14 and the
+    // entries below that are not all expanded at next 13. Stopping there would lose mirror-free
+    // rows a mirror-free run keeps, so under conversion-blind the stop waits until next is past
+    // 11 + 3, unless the mirror-free best loci are themselves over -R (no such locus: B_mf == B).
+    namespace ba = bwa_aln;
+    for (int blind = 0; blind < 2; ++blind)
+        for (int mirror_row = 0; mirror_row < 2; ++mirror_row) {
+            CAPTURE(blind); CAPTURE(mirror_row);
+            ba::gap_opt_t *opt = ba::gap_init_opt();
+            opt->max_diff = 5; opt->max_top2 = 30;
+            ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+            ba::aln_meth_ref_t mr;
+            ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = opt;
+            ba::aln_meth_slot_t slot; slot.grp = &group; slot.blind = blind;
+            ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 5; job.score_cut = INT_MAX;
+            slot.job = &job;
+            ba::aln_meth_read_t result; slot.res = &result;
+            for (int i = 0; i < 31; ++i) {
+                ba::aln_meth_occ_t o{}; o.cost = 12; o.n_mm = 4; o.pos = 1000 * (i + 1);
+                result.occ.push_back(o);
+            }
+            if (mirror_row) {
+                ba::aln_meth_occ_t o{}; o.cost = 14; o.n_mm = 1; o.n_mirror = 1; o.n_gapo = 1; o.pos = 50000;
+                result.occ.push_back(o);
+            }
+            slot.best = 12;
+            CHECK(ba::aln_meth_boundary(&slot, 13) == (blind && mirror_row ? 0 : 1));
+            CHECK(ba::aln_meth_boundary(&slot, 14) == (blind && mirror_row ? 0 : 1));
+            CHECK(ba::aln_meth_boundary(&slot, 15) == 1);
+            free(opt);
+        }
+}
+
 TEST_CASE("aln_meth: the finish applies the difference ceiling only to a search that takes the cuts")
 {
     // M=1, O=3: a one-gap best (cost 3, one difference) and a four-mismatch row (cost 4, within
