@@ -1057,15 +1057,19 @@ void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng,
     dst->n_lookups = dst->n_wrong_copy = dst->n_rescored = dst->n_flushes = dst->n_unrepresentable = 0;
     dst->n_over_diff = dst->n_over_seed = 0;
     if (src->main >= 0) {
-        // A repeat certificate's copy takes the draw its first copy's search made for it.
+        // A repeat certificate's copy takes the draw its first copy's search made for it. copy_draw
+        // is in ascending ordinal (the copies' order) and hits in (rid, hyp, strand, pos) order
+        // (aln_meth_slot_finish sorts the loci), so both are binary searches.
         int placed = -1;
-        for (const auto &d : src->copy_draw) {
-            if (d.ord != ord) continue;
-            for (size_t h = 0; h < src->hits.size(); ++h) {
-                const aln_meth_hit_t &x = src->hits[h];
-                if (x.rid == d.rid && x.hyp == d.hyp && x.strand == d.strand && x.pos == d.pos) { placed = (int)h; break; }
-            }
-            break;
+        const auto &cd = src->copy_draw;
+        const auto d = std::lower_bound(cd.begin(), cd.end(), ord,
+                                        [](const aln_meth_read_t::copy_draw_t &a, int64_t o) { return a.ord < o; });
+        if (d != cd.end() && d->ord == ord) {
+            auto key = [](const aln_meth_hit_t &x) { return std::make_tuple(x.rid, (int)x.hyp, (int)x.strand, x.pos); };
+            const auto want = std::make_tuple(d->rid, d->hyp, d->strand, d->pos);
+            const auto h = std::lower_bound(src->hits.begin(), src->hits.end(), want,
+                                            [&](const aln_meth_hit_t &x, const decltype(want) &w) { return key(x) < w; });
+            if (h != src->hits.end() && key(*h) == want) placed = (int)(h - src->hits.begin());
         }
         dst->main = placed >= 0 ? placed : draw_main(src->hits, src->n_conv_moved, rng);
     }

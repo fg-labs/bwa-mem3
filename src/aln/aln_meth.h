@@ -160,7 +160,7 @@ struct aln_meth_read_t {
     long n_over_seed = 0; // rows dropped for more strict differences in the seed than -k allows
     int cert = 0; // ALN_METH_CERT_*: the certificate that ended a complete read's row work, or 0
     // A repeat certificate's draws for the read's duplicate copies (each its own search's draw):
-    // the copy's ordinal and its main locus, which is among hits.
+    // the copy's ordinal and its main locus, which is among hits; in ascending ordinal.
     struct copy_draw_t { int64_t ord; int rid, hyp, strand; bwtint_t pos; };
     std::vector<copy_draw_t> copy_draw;
 };
