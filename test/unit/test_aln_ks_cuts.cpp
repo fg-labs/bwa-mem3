@@ -365,10 +365,32 @@ void rstop_pair_case()
     k.pair_with({mate});
     const auto got = k.run({"--meth", "-n", "5", "-R", "1", "--known-snvs", k.vcf}, k.ref, "pe");
     REQUIRE(got.size() == 2);
-    const auto &r1 = (std::stoi(got[0][1]) & 0x40) ? got[0] : got[1];
+    const int f0 = std::stoi(got[0][1]), f1 = std::stoi(got[1][1]);
+    // one record is read 1 and the other read 2, by their flags
+    REQUIRE((f0 & 0xC0) != 0);
+    REQUIRE((f0 & 0xC0) != 0xC0);
+    REQUIRE((f0 & 0xC0) + (f1 & 0xC0) == 0xC0);
+    const auto &r1 = (f0 & 0x40) ? got[0] : got[1];
+    const auto &r2 = (f0 & 0x40) ? got[1] : got[0];
     CAPTURE(summary(r1));
+    CAPTURE(summary(r2));
+    const int g1 = std::stoi(r1[1]), g2 = std::stoi(r2[1]);
+    // read 1 forward at C, read 2 reverse 300 bases downstream: a proper pair, each naming the other
+    CHECK(r1[2] == "c1");
     CHECK(r1[3] == pos1(c));
-    CHECK((std::stoi(r1[1]) & 0x2) != 0);
+    CHECK(r1[5] == "100M");
+    CHECK((g1 & 0x10) == 0);
+    CHECK(r2[2] == "c1");
+    CHECK(r2[3] == pos1(c + 300));
+    CHECK(r2[5] == "100M");
+    CHECK((g2 & 0x10) != 0);
+    for (const auto *r : {&r1, &r2}) CHECK((std::stoi((*r)[1]) & 0xF) == 0x3); // paired, proper, both mapped
+    CHECK((g1 & 0x20) != 0);
+    CHECK((g2 & 0x20) == 0);
+    CHECK(r1[6] == "=");
+    CHECK(r1[7] == r2[3]);
+    CHECK(r2[6] == "=");
+    CHECK(r2[7] == r1[3]);
 }
 
 } // namespace
