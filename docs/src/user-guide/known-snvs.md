@@ -59,7 +59,8 @@ The twin fields are `NA,NA` for:
 - the selected entry when its plain twin search is incomplete.
 
 Without `--meth`, a read with more than 256 candidate loci, too long for an ALT window (its
-length plus `-e` plus `-o` minus one over 160: longer than 154 bases at the defaults), or whose
+length plus `max(0, -o - 1)` plus `E` over 160, where `E` is `-e` when it is positive and 6 (the gap extensions `-e -1` allows) otherwise: longer than 154 bases at
+the defaults), or whose
 genomic or ALT-window search stopped at the `-m` limit keeps its stock search result, but its
 first `R` or `A` site still gets a twin. For paired input, pairing and ALT-aware mate rescue still
 use that end with its mate, so its final record can still differ from stock's, for example when
@@ -179,10 +180,10 @@ The twin of a paired read is a pair, so `twin_mapq` is the twin pair's paired MA
   two sites is credited for one of them only, and may still be misplaced. This holds under
   `--meth` too. A mate-rescue window, or under `--meth` a candidate window, with more than 32
   site alleles tries only its first 32 (in position order); the rest stay at REF.
-- **Long reads.** A read fits an ALT window when its longest placement (its length plus a deleted
-  base per gap open and extension `-o` and `-e` allow) is at most 161 bases, the most a window of
-  321 bases holds over its site: its length plus `-e` plus `-o` minus one at most 160, 154 bases
-  at the defaults. Every placement of it over a site then lies inside that site's window. Without
+- **Long reads.** A read fits an ALT window when its length plus `max(0, -o - 1)` plus `E` is at
+  most 160, where `E` is `-e` when it is positive and 6 (the gap extensions `-e -1` allows) otherwise: 154 bases at the defaults. Its longest
+  placement (its length plus a deleted base per gap open and extension allowed) then spans at most
+  161 bases, the most a window of 321 bases holds over its site. Every placement of it over a site then lies inside that site's window. Without
   `--meth`, a read that does not fit keeps its stock search result; for paired input, pairing and
   ALT-aware mate rescue can still change the final record, for example when the mate is credited.
   Full-read ALT-window discovery, including under `--meth`, cannot independently discover an

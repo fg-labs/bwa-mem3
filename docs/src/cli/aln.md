@@ -309,8 +309,8 @@ How it works:
   realigned once more with its indels held to the window's own extent (ungapped when the window is
   the read's length), and that alignment is kept if it is within the limits. A pair whose
   placement assumes an ALT is left out of the insert-size estimate.
-- Without `--meth`, reads that do not fit an ALT window (length plus `-e` plus `-o` minus one over
-  160: longer than 154 bases at the defaults), reads with more than 256 candidate loci, and reads
+- Without `--meth`, reads that do not fit an ALT window (length plus `max(0, -o - 1)` plus `E`
+  over 160, where `E` is `-e` when it is positive and 6 (the gap extensions `-e -1` allows) otherwise: longer than 154 bases at the defaults), reads with more than 256 candidate loci, and reads
   whose genomic or ALT-window search stopped at the `-m` limit (it may have missed equal-best
   loci) keep their stock search result. For paired input that end still goes through pairing and
   ALT-aware mate rescue with its mate, so its final record can still differ from stock's, for
@@ -330,8 +330,8 @@ methylation call string as usual, and no record carries an ALT-credited mismatch
 candidate placements covers a site, with three exceptions under `--meth`: batch-wide
 insert-size effects for paired input; a read whose ALT-window search hit a work limit below the
 costs the read retains is reported as incomplete (MAPQ 0, and for pairs neither end can be
-promoted by pairing or rescue); and a read that does not fit an ALT window (length plus `-e` plus
-`-o` minus one over 160) takes no cuts in its main search (see
+promoted by pairing or rescue); and a read that does not fit an ALT window (length plus
+`max(0, -o - 1)` plus `E` over 160, as above) takes no cuts in its main search (see
 [what it does not handle](../user-guide/known-snvs.md#what-it-does-not-handle)). For paired input
 that must hold for both mates: when one mate is placed, moved or rescued
 at a site, its mate's flags, mate fields and MAPQ change with it. Under paired `--meth`, excluding
@@ -647,10 +647,11 @@ final best (the ceiling and `-R`) are taken only once both have delivered their 
   window search's limit (and so no TAPS/5base conversion tie-break). A window search that stopped
   early above those costs leaves the read complete. Without `--known-snvs` the audit only counts
   (shown with `-v 4`).
-- The main search takes the cuts only for a read that fits an ALT window: its longest placement
-  (its length plus a deleted base per gap open and extension `-o` and `-e` allow) at most 161
-  bases, which is its length plus `-e` plus `-o` minus one at most 160 (154 bases at the
-  defaults), so that every placement of it over a site lies inside that site's window. A longer read's main search runs to its `-n`; the
+- The main search takes the cuts only for a read that fits an ALT window: its length plus
+  `max(0, -o - 1)` plus `E` at most 160, where `E` is `-e` when it is positive and 6 (the gap extensions `-e -1` allows) otherwise (154 bases at
+  the defaults). Its longest placement (its length plus a deleted base per gap open and extension
+  allowed) then spans at most 161 bases, so that every placement of it over a site lies inside
+  that site's window. A longer read's main search runs to its `-n`; the
   ALT-window search still takes its cuts.
 
 For a read that fits an ALT window, the result equals `--meth` without `--known-snvs` on the
