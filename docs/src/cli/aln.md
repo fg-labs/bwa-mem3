@@ -598,7 +598,17 @@ the best stratum is complete (`B` is below the next entry's score), every row th
 has been resolved, and the difference ceiling drops to the fewest differences among the stored
 rows at `B`, plus one (stock's top-2 rule, at most `-n`); the retained loci obey the same
 ceiling. More than `-R` best loci within that ceiling then end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
-not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
+not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). Under `--meth-mapq conversion-blind` (the EM-seq
+`genomic` default) every cut must also keep what the mirror-free strata need, which is stock's
+selection on costs with the mirror cell free (as `collapsed` scoring computes it): a row is
+dropped only when its mirror-free cost is past `B + M`; the ceiling is at least
+`floor(B / mu) + 1`, with `mu` the smallest penalty of a counted difference (`-M`, `-O`, and `-E`
+unless `-e` is positive), which bounds the mirror-free strata's own ceiling and equals stock's when
+the best rows are mismatch-only (no ceiling when `mu` is 0); and the `-R` stop also waits until
+the next entry's score is past the mirror-free best plus `M`, unless the mirror-free best loci
+within their own ceiling are themselves more than `-R`. The mirror-free strata apply stock's
+top-2 ceiling on mirror-free differences. With `--meth-mapq scoring` the cuts are stock's alone.
+These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
 set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
 search instead stops early only on the earlier certified bound: for current best cost `B`,
 let `T = B + M` and `k = floor(T / M)`. When `M > 0`, `T < O`, `E >= 0`, the configured
@@ -678,16 +688,18 @@ stock cut, each at its cheapest row with the mirror cell free (cost minus `-M` p
 mismatch, among the rows the search scored there; the row `collapsed` keeps), together with any
 row the `-n` (or seed `-k`) limit dropped only for its mirror mismatches (with the mirror cell
 free it is within the limit, as under `collapsed`), and a locus that is then cheaper than the
-primary gives a cap of 0. Paired-end ends take the MAPQ `collapsed` gives them after its stock
-pairing and its mate rescue. The pairing runs on those loci (including the loci only the
-mirror-free strata keep), from the main hits `collapsed` draws for its ends, with `collapsed`'s
-single-end MAPQs and the insert size it infers from them. The rescue reruns, with `collapsed`'s
-scoring matrix and insert size, on a pair the pairing leaves improper, and lowers the anchor's
-MAPQ too. An end that `collapsed` places elsewhere, or leaves unmapped, gets 0. An end with more
-than `--max-occ` such loci is not paired, as under `collapsed`, but the mate rescue still runs:
-both ends start it at `collapsed`'s single-end selections, and each end is capped at the MAPQ
-`collapsed` gives it after that rescue (which can lower the anchor's MAPQ without moving it), or
-gets 0 if `collapsed` then places it at another locus.
+primary gives a cap of 0. Under the stock cuts (above) those strata also take stock's top-2
+ceiling on mirror-free differences, so they are the loci and counts `collapsed` scoring selects.
+Paired-end ends take the MAPQ `collapsed` gives them after its stock pairing and its mate rescue.
+The pairing runs on those loci (including the loci only the mirror-free strata keep), from the
+main hits `collapsed` draws for its ends, with `collapsed`'s single-end MAPQs and the insert size
+it infers from them. The rescue reruns, with `collapsed`'s scoring matrix and insert size, on a
+pair the pairing leaves improper, and lowers the anchor's MAPQ too. An end that `collapsed`
+places elsewhere, or leaves unmapped, gets 0. An end with more than `--max-occ` such loci is not
+paired, as under `collapsed`, but the mate rescue still runs: both ends start it at `collapsed`'s
+single-end selections, and each end is capped at the MAPQ `collapsed` gives it after that rescue
+(which can lower the anchor's MAPQ without moving it), or gets 0 if `collapsed` then places it
+at another locus.
 Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
 and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. At a `--known-snvs` ALT window the
 rows come from the window search's `genomic` selection, and a window without a search path is
