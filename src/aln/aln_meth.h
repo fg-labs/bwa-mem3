@@ -165,13 +165,15 @@ struct aln_meth_read_t {
     long n_over_seed = 0; // rows dropped for more strict differences in the seed than -k allows
     // --meth-mapq conversion-blind: the strata with the mirror cell freed (cost minus s_mm per
     // mirror mismatch), counted over every candidate before the stock cut: the best mirror-free
-    // cost, the loci at it, and the loci up to s_mm above it. blind_best is INT64_MAX when unset.
+    // cost, the loci at it, and the loci up to s_mm above it (under the stock cuts, only those
+    // within stock's top-2 ceiling on mirror-free differences). blind_best is INT64_MAX when unset.
     int64_t blind_best = INT64_MAX;
     int blind_c1 = 0, blind_c2 = 0;
-    // The mirror-free strata's loci that are not hits: the genomic cut drops them (a locus that
-    // costs two or more mirror mismatches more than the genomic best), or the -n (or -k) limit
-    // drops every row of theirs, but not once its mirror mismatches are free (also for a read
-    // with no hit at all). For the paired-end shadow pairing, in collapsed's order.
+    // The mirror-free strata's loci that are not hits: the genomic finish drops them (a locus that
+    // costs two or more mirror mismatches more than the genomic best, or one over the genomic
+    // top-2 ceiling), or the -n (or -k) limit drops every row of theirs, but not once its mirror
+    // mismatches are free (also for a read with no hit at all). For the paired-end shadow pairing,
+    // in collapsed's order.
     std::vector<aln_meth_blind_row_t> blind_rows;
     // The hits whose locus's lowest mirror-free row is not the hit's own row (the genomic search
     // keeps the genomically cheapest row of a locus, and on equal cost the lower CIGAR), at that

@@ -1094,13 +1094,16 @@ static aln_meth_blind_row_t blind_row(const aln_meth_occ_t &o, bwtint_t pos, int
 // -k) limit dropped but would keep with the mirror mismatches free. That is the row collapsed
 // scoring keeps there. The search proposed every window within the genomic best cost plus s_mm
 // (aln_meth_can_stop); a mirror-free cost never exceeds the genomic cost, so every locus within
-// s_mm of the mirror-free best was proposed too. The loci in the mirror-free strata that are not
-// hits (the genomic finish drops them, on its cost cut, genomic_cut, or its difference ceiling,
-// genomic_ceiling, or they are not in occ) are kept as rows for the
-// paired-end shadow pairing, and a hit whose lowest mirror-free row is not its own as blind_alt.
-// Out of line, as meth_slot_finish_tail is.
+// s_mm of the mirror-free best was proposed too. A search that takes stock's cuts keeps every row
+// these strata need (aln_meth_boundary, store_row), and the strata then apply stock's top-2
+// ceiling on mirror-free differences too (cuts), so they are stock's selection on mirror-free
+// costs, as collapsed scoring computes it. The loci in the mirror-free strata that are not hits
+// (the genomic finish drops them, on its cost cut, genomic_cut, or its difference ceiling,
+// genomic_ceiling, or they are not in occ) are kept as rows for the paired-end shadow pairing,
+// and a hit whose lowest mirror-free row is not its own as blind_alt. Out of line, as
+// meth_slot_finish_tail is.
 static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x, aln_meth_read_t *r,
-                                                        int64_t genomic_cut, int64_t genomic_ceiling)
+                                                        int64_t genomic_cut, int64_t genomic_ceiling, bool cuts)
 {
     const gap_opt_t *opt = x->grp->opt;
     const bool gape = opt->mode & BWA_MODE_GAPE;
@@ -1129,9 +1132,19 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
     });
     for (size_t k = 0; k < r->mirror_rows.size(); ++k)
         if (!in_occ[k]) cand.emplace_back(&r->mirror_rows[k], false);
+    auto mf_diffs = [&](const aln_meth_occ_t &o) {
+        return (int64_t)o.n_mm - o.n_mirror + o.n_gapo + (gape ? o.n_gape : 0);
+    };
     int64_t best = INT64_MAX;
     for (const auto &e : cand) best = std::min(best, mirror_free_cost(e.first->cost, opt->s_mm, e.first->n_mirror));
     const int64_t cut = (opt->mode & BWA_MODE_NONSTOP) ? INT64_MAX : best + (int64_t)opt->s_mm;
+    // stock's top-2 ceiling on the mirror-free strata: the mirror-free best rows' fewest
+    // mirror-free differences + 1, as slot_finish takes it on the genomic rows
+    int64_t ceiling = INT64_MAX;
+    if (cuts)
+        for (const auto &e : cand)
+            if (mirror_free_cost(e.first->cost, opt->s_mm, e.first->n_mirror) == best)
+                ceiling = std::min(ceiling, mf_diffs(*e.first) + 1);
     r->blind_best = best;
     // The best-cost loci, for the draw of collapsed's main hit (a read that pairs or has
     // duplicate copies). Only the drawn locus is kept, unless the read's copies draw again over
@@ -1142,7 +1155,7 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
     for (const auto &e : cand) {
         const aln_meth_occ_t &o = *e.first;
         const int64_t c = mirror_free_cost(o.cost, opt->s_mm, o.n_mirror);
-        if (c > cut) continue;
+        if (c > cut || mf_diffs(o) > ceiling) continue;
         if (c == best) {
             ++r->blind_c1;
             if (x->keep) ties.push_back(blind_row(o, o.alignment.rb, opt->s_mm));
@@ -1165,7 +1178,7 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
 static __attribute__((noinline)) void meth_blind_cap(const aln_meth_slot_t *x, aln_meth_read_t *r, int64_t cut,
                                                      int64_t ceiling)
 {
-    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(x, r, cut, ceiling);
+    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(x, r, cut, ceiling, x->cut);
 }
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
