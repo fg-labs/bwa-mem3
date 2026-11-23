@@ -119,6 +119,17 @@ and 5-base comparisons on Sapphire Rapids (x86_64, AVX-512, clang 19.1.7), plain
 at `82b6ab82b` was byte-identical to #789 at `b8673682b`. Those historical observations do not
 exclude differences at other tied loci and are not a fresh validation of the current revision.
 
+Since [#800](https://github.com/fg-labs/bwa-mem3/pull/800), `aln --meth --known-snvs` can cap
+ALT-window discovery using a verified upper bound from the main-search probe. With small `-m`,
+the shorter search can complete where #799 exhausted its work limit, changing `MAPQ`,
+completeness-dependent `X0`/`X1`/`XA`, and downstream pairing, rescue or known-SNV twin output.
+Reported NEON chr22 EM-seq comparisons with 51,888 sites (host and compiler not recorded for
+these runs) found 13 of 40,000 150-base pairs changed at `-m 20000`, and about 5,300 reads from
+those pairs at `-m 2000`. The listed comparisons
+at default `-m` (2,000,000) and `-m 200000` were identical to #799 apart from `@PG`. These are
+historical observations on the tested configurations, not a guarantee for other inputs or fresh
+validation of this documentation change.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:

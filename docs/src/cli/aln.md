@@ -654,7 +654,8 @@ final best (the ceiling and `-R`) are taken only once both have delivered their 
   uses every row within `B + M` it has, which a window can hold at up to `U + 2M`, while
   single-end output keeps only the read's main hit. A read with no probe row, a read that does not
   fit an ALT window, and every read under `--meth-context cpg` (where an ALT can change the CpG
-  context of its neighbour) run the window search uncapped.
+  context of its neighbour) run the window search uncapped. Under `-N` or a negative penalty there
+  is no probe and no cap.
 - The main search scores those rows before its first step, so its cuts start from them.
 - At its finish each read is audited: the window search was complete below the costs the read
   retains (`B + M`, or `B` past `-R`; any cost under `-N` or for a read with no row), no ceiling
