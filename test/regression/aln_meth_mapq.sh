@@ -33,8 +33,10 @@
 # collapsed leaves a pair improper and rescues a mate), a read 1 that collapsed's pairing places at
 # the other copy gets 0, a mate the genomic run rescues and collapsed leaves unmapped gets 0, a mate
 # that moves read 1 to the other copy anchors it (no cap) unless read 1's mirror-free loci exceed
-# --max-occ (then collapsed does not pair it, and its cap is 0), and no MAPQ is ever raised; and
-# the option's refusals.
+# --max-occ (then collapsed does not pair it, and its cap is 0), and no MAPQ is ever raised; under
+# the stock cuts, strata the search may have pruned give a cap of 0, single end and for both ends
+# of a pair; with the cuts conversion-blind leaves every field but MAPQ and YQ:i as scoring has it,
+# across penalties and -m limits (blind-genomic-identity); and the option's refusals.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -539,6 +541,158 @@ grep -E '^target	147	' "$tmp/mresc.collapsed.rec" | grep -q '	XT:A:M	' || {
 expect collapsed-rescue <(pick "$tmp/mresc.blind.sum" target) "target 99 home 101 11 60
 target 147 home 381 11 60"
 echo 'PASS: paired-collapsed-mate-rescue'
+
+# Under the stock cuts the search can prune a row the mirror-free strata need; the cap is then 0,
+# for both ends of a pair. On a reference of its own (need.fa), at -n 5, read 1 (50 bp, keeps
+# the C at offset 12) has three loci: g lacks base 25 (one gap open: 11, one difference, so the
+# search's ceiling is 2 once its best stratum is complete); x has a T under the C and three
+# mismatches (12, mirror-free 9 with three differences); y has four mismatches (12). The
+# mirror-free strata need rows of up to four differences up to 9 + 3, which the ceiling can prune
+# from 12 on: the strata are unknown. Single end the cap is 0 (x beats g mirror-free in any case;
+# collapsed places the read at x); paired end, read 2 comes from after g, so the pair is placed at
+# g with a unique, complete read 2 (MAPQ 60 under scoring), and both ends' caps are 0. Every other
+# field is scoring's.
+cat > "$tmp/need.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+function alt(c) { return c == "G" ? "A" : "G" }
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+function ct(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out ((c == "C" && i != 13) ? "T" : c) } return out }
+function ga(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "G" ? "A" : c) } return out }
+BEGIN {
+    seed_rng(20261125)
+    s = put(dna(50), 12, "C")
+    r = ct(s)
+    g = substr(s, 1, 25) substr(s, 27)
+    x = put(s, 12, "T")
+    split("3 30 44", at, " ")
+    for (k = 1; k <= 3; ++k) x = put(x, at[k], alt(substr(r, at[k] + 1, 1)))
+    y = s
+    split("5 20 35 47", at, " ")
+    for (k = 1; k <= 4; ++k) y = put(y, at[k], alt(substr(r, at[k] + 1, 1)))
+    c = dna(400) g dna(900)
+    printf ">g\n%s\n>x\n%s\n>y\n%s\n", c, dna(400) x dna(400), dna(400) y dna(400) > (dir "/need.fa")
+    fq(dir "/need.fq", "need", r)
+    for (st = 640; st <= 1100; st += 20) {
+        fq(dir "/need1.fq", "m" st, r)
+        fq(dir "/need2.fq", "m" st, ga(rc(substr(c, st + 1, 60))))
+    }
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/need.awk" < /dev/null
+"$bin" index --meth "$tmp/need.fa" > "$tmp/need-index.out" 2> "$tmp/need-index.err" || {
+    echo "FAIL: index --meth (need.fa) exited nonzero" >&2
+    cat "$tmp/need-index.err" >&2
+    exit 1
+}
+run need.scoring --meth --meth-mapq scoring -n 5 "$tmp/need.fa" "$tmp/need.fq"
+run need.blind --meth -n 5 -v 4 "$tmp/need.fa" "$tmp/need.fq"
+expect need-scoring "$tmp/need.scoring.sum" "need 0 g 401 37 -"
+expect need-conversion-blind "$tmp/need.blind.sum" "need 0 g 401 0 37"
+grep -qF '; 1 with mirror-free strata the cuts may have pruned;' "$tmp/need.blind.err" || {
+    echo "FAIL: need: the read's mirror-free strata are not marked as possibly pruned" >&2
+    exit 1
+}
+cmp <(strip "$tmp/need.blind.rec") <(strip "$tmp/need.scoring.rec") || {
+    echo "FAIL: need: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+echo 'PASS: single-end-pruned-strata'
+run needpe.scoring --meth --meth-mapq scoring -n 5 "$tmp/need.fa" "$tmp/need1.fq" "$tmp/need2.fq"
+run needpe.blind --meth -n 5 "$tmp/need.fa" "$tmp/need1.fq" "$tmp/need2.fq"
+# every pair: both ends at g, capped to 0 with the genomic MAPQ in YQ:i
+awk '$3 != "g" || $5 != 0 || $6 == "-" || $6 == 0 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad || NR != 48 }' "$tmp/needpe.blind.sum" || {
+    echo "FAIL: paired-pruned-strata: an end is not capped to 0" >&2
+    exit 1
+}
+cmp <(strip "$tmp/needpe.blind.rec") <(strip "$tmp/needpe.scoring.rec") || {
+    echo "FAIL: paired-pruned-strata: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+echo 'PASS: paired-pruned-strata'
+
+# conversion-blind only observes the search: with the stock cuts every field but MAPQ and YQ:i is
+# what --meth-mapq scoring gives, for any penalties and limits. On a repeat-rich reference of its
+# own (rep.fa: 24 mutated copies of a 1,200-base unit, with copy Ts under read Cs, mismatches and
+# one-base indels), pairs of a 60-150 and a 150-base read run at -M 5 -O 3 -E 1 (a gap open
+# cheaper than a mismatch) and at -e 3 -E 1 (extensions not counted as differences), each at
+# -m 300, 1000, 5000, 20000 and the default. -m binds at 300 on some reads (in both modes), and
+# no MAPQ rises.
+cat > "$tmp/rep.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+# from read base b to t, keeping each b with probability p percent
+function conv(s, b, t, p,   i, c, out) {
+    out = ""
+    for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        out = out ((c == b && ri(100) >= p) ? t : c)
+    }
+    return out
+}
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+BEGIN {
+    seed_rng(20261124)
+    u = dna(1200)
+    c = dna(500)
+    for (k = 0; k < 24; ++k) {
+        v = u
+        n = ri(12)
+        for (j = 0; j < n; ++j) {
+            at = ri(1200)
+            b = substr(v, at + 1, 1)
+            # half of the changes to a C put a T there (the mirror cell for a read that keeps it)
+            v = put(v, at, (b == "C" && ri(2)) ? "T" : other(b))
+        }
+        if (ri(3) == 0) {
+            at = 100 + ri(1000)
+            v = ri(2) ? substr(v, 1, at) substr(v, at + 2) : substr(v, 1, at) other("N") substr(v, at + 1)
+        }
+        c = c v dna(200 + ri(300))
+        cp[k] = v
+    }
+    printf ">rep\n%s\n", c > (dir "/rep.fa")
+    for (i = 0; i < 60; ++i) {
+        v = cp[ri(24)]
+        at = ri(length(v) - 450)
+        fq(dir "/rep1.fq", "r" i, conv(substr(v, at + 1, 60 + ri(91)), "C", "T", 30))
+        fq(dir "/rep2.fq", "r" i, conv(rc(substr(v, at + 301, 150)), "G", "A", 30))
+    }
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/rep.awk" < /dev/null
+"$bin" index --meth "$tmp/rep.fa" > "$tmp/rep-index.out" 2> "$tmp/rep-index.err" || {
+    echo "FAIL: index --meth (rep.fa) exited nonzero" >&2
+    cat "$tmp/rep-index.err" >&2
+    exit 1
+}
+for pen in '-M 5 -O 3 -E 1' '-e 3 -E 1'; do
+    for m in 300 1000 5000 20000 default; do
+        lim=()
+        [ "$m" = default ] || lim=(-m "$m")
+        # shellcheck disable=SC2086 # pen is a list of options
+        run rep.scoring --meth --meth-mapq scoring -v 4 $pen ${lim[@]+"${lim[@]}"} "$tmp/rep.fa" "$tmp/rep1.fq" "$tmp/rep2.fq"
+        # shellcheck disable=SC2086
+        run rep.blind --meth -v 4 $pen ${lim[@]+"${lim[@]}"} "$tmp/rep.fa" "$tmp/rep1.fq" "$tmp/rep2.fq"
+        cmp <(strip "$tmp/rep.blind.rec") <(strip "$tmp/rep.scoring.rec") || {
+            echo "FAIL: blind-genomic-identity ($pen, -m $m): modes differ outside MAPQ and YQ:i" >&2
+            exit 1
+        }
+        paste -d ' ' "$tmp/rep.blind.sum" "$tmp/rep.scoring.sum" | awk '$5 > $11 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' || {
+            echo "FAIL: blind-genomic-identity ($pen, -m $m): a conversion-blind MAPQ is above scoring's" >&2
+            exit 1
+        }
+        if [ "$m" = 300 ]; then
+            for mode in scoring blind; do
+                grep -qE '; [1-9][0-9]* incomplete;' "$tmp/rep.$mode.err" || {
+                    echo "FAIL: blind-genomic-identity ($pen): -m 300 does not bind ($mode)" >&2
+                    exit 1
+                }
+            done
+        fi
+    done
+done
+echo 'PASS: blind-genomic-identity'
 
 # The default is scoring outside em-seq genomic; collapsed accepts conversion-blind (a no-op).
 for args in '--meth --meth-scoring collapsed' '--meth=taps' '--meth=5base' '--meth --meth-scoring neutral'; do

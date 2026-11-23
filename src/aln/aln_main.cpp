@@ -1072,7 +1072,7 @@ int64_t ks_meth_alt(const aln_opt_t *o, const bwa_seq_t *s, const aln_meth_read_
  * blind_main, as aln_meth_blind_isize takes it), else at its own. */
 int64_t ks_meth_blind_alt(const aln_opt_t *o, const bwa_seq_t *s, const aln_meth_read_t &r)
 {
-	if (r.blind_main < 0 || r.blind_partial || r.flags) return ks_meth_alt(o, s, r);
+	if (r.blind_main < 0 || r.blind_partial || r.blind_incomplete || r.flags) return ks_meth_alt(o, s, r);
 	const aln_meth_blind_row_t &m = r.blind_pick;
 	return ks_site_of_rel(o->known_snvs, o->meth_ref->bns, m.rid, (int64_t)m.pos, m.alt);
 }
