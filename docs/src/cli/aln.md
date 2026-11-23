@@ -594,17 +594,19 @@ locus. Only the directional copy appropriate to the read is retained.
 **Stock cuts.** A row costs at least its path's converted score (below), so the search takes
 stock aln's cuts from the best verified row cost `B`. Rows are resolved at the first hit and
 at every converted-score boundary. The search stops past `B + M` (stock's score cut). Once
-`B` is at most the next entry's score, no unresolved row can cost less, and the difference
-ceiling drops to the best row's differences plus one (stock's top-2 rule, at most `-n`); the
-retained loci obey the same ceiling. Once the best stratum is complete, more than `-R` best
-loci within that ceiling end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
+the best stratum is complete (`B` is below the next entry's score), every row that can cost `B`
+has been resolved, and the difference ceiling drops to the fewest differences among the stored
+rows at `B`, plus one (stock's top-2 rule, at most `-n`); the retained loci obey the same
+ceiling. More than `-R` best loci within that ceiling then end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
 not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
 set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
 search instead stops early only on the earlier certified bound: for current best cost `B`,
 let `T = B + M` and `k = floor(T / M)`. When `M > 0`, `T < O`, `E >= 0`, the configured
-difference ceiling admits `k` differences, `-N` is off and discovery has not hit a cap, the search can stop
-after fully evaluating converted scores through `M*k`; a seeded read only when `k` is also at
-most `-k` ([#778](https://github.com/fg-labs/bwa-mem3/pull/778)). This does not make discovery exhaustive or guarantee a globally optimal alignment.
+difference ceiling admits `k` differences, `-N` is off, discovery has not hit a cap, the read is
+at most 160 bases long and the read's ALT-window search gives a lower bound, greater than `k`, on
+the mismatches of every ungapped placement over a known site with its ALT in place, the search can stop after fully evaluating converted scores
+through `M*k`; a seeded read only when `k` is also at most `-k`
+([#778](https://github.com/fg-labs/bwa-mem3/pull/778)). If any condition fails, discovery continues. This does not make discovery exhaustive or guarantee a globally optimal alignment.
 
 **Path cost.** Each row is scored on the original reference along the search path that
 found it, as stock aln scores a hit by its path: the path's alignment (its gaps where the
