@@ -744,8 +744,10 @@ backend scratch). A candidate window longer than 65535 bases (only a 65535-base
 read with a deletion produces one) cannot be refined: it is dropped and the read is
 marked incomplete. Invalid results and other resource failures exit with an error. A refined candidate with more
 than 255 mismatches, gap opens or gap extensions cannot be recorded and is dropped;
-if its cost is within `-M` of the best retained cost (or with `-N`), the read is
-marked incomplete as above (MAPQ 0, no exact `X0`/`X1`/`XA`). `-v 4` reports
+if it is within the `-n` limit and its cost is within `-M` of the best retained cost
+(or with `-N`), the read is marked incomplete as above (MAPQ 0, no exact
+`X0`/`X1`/`XA`). A candidate over the `-n` limit is dropped first and never marks
+the read incomplete, even with `-N`. `-v 4` reports
 lookup, window, dropped and incomplete counts.
 
 ## Notes
