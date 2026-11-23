@@ -392,6 +392,9 @@ enum { ALN_METH_GIVE_UP = 3 }; // cert_kind: the read ends incomplete instead
  * - crowded: B < s, so the best set is complete; one best locus whose mismatches are not the read's
  *   full -n (stock's MAPQ 25 case), and ALN_METH_CROWDED retained worse loci: MAPQ 0 (X1 is a lower
  *   bound).
+ * Every count is of the rows the finish keeps: those within the top-2 ceiling of the verified best
+ * rows (best_ceiling), as aln_meth_boundary counts for -R. No row is verified after a certificate,
+ * so the finish takes the ceiling the certificate saw.
  * Returns 1 when the search ends: a crowded read, or a repeat with B < s. A repeat with B == s
  * finishes stratum B without verifying its rows (collect), so the draw sees every hit that can hold
  * a best row. */
@@ -400,11 +403,15 @@ static int cert_kind(aln_meth_slot_t *x, int s)
     if (x->best == INT64_MAX) return 0;
     const int64_t B = x->best;
     const gap_opt_t &opt = x->job->opt;
-    const bool conv = conv_tiebreak(x->grp->mo);
+    const bool conv = conv_tiebreak(x->grp->mo), gape = opt.mode & BWA_MODE_GAPE;
+    const int64_t ceiling = best_ceiling(x);
+    auto kept = [&](const aln_meth_occ_t &o) {
+        return (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
+    };
     long nb = 0, nb0 = 0;
     int fewest = INT_MAX;
     for (const auto &o : x->res->occ)
-        if (o.cost == B) { ++nb; nb0 += o.n_conv == 0; fewest = std::min(fewest, o.n_conv); }
+        if (o.cost == B && kept(o)) { ++nb; nb0 += o.n_conv == 0; fewest = std::min(fewest, o.n_conv); }
     if (B <= s && (conv ? nb0 : nb) > opt.max_top2) return ALN_METH_CERT_REPEAT;
     // Under the tie-break, ALN_METH_SAT_ROWS best loci give MAPQ 0 whichever has the fewest
     // conversions: either several share the fewest, or one does and the rest (at least 178) join X1.
@@ -421,13 +428,11 @@ static int cert_kind(aln_meth_slot_t *x, int s)
     const aln_meth_occ_t *only = nullptr;
     long c1 = 0;
     for (const auto &o : x->res->occ)
-        if (o.cost == B && (!conv || o.n_conv == fewest)) { ++c1; only = &o; }
+        if (o.cost == B && kept(o) && (!conv || o.n_conv == fewest)) { ++c1; only = &o; }
     if (c1 != 1 || only->n_mm == x->max_diff) return 0;
-    const bool gape = opt.mode & BWA_MODE_GAPE;
-    const int64_t ceiling = best_ceiling(x); // final: B < s
     long worse = nb - c1;
     for (const auto &o : x->res->occ)
-        if (o.cost > B && o.cost <= B + opt.s_mm && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling) ++worse;
+        if (o.cost > B && o.cost <= B + opt.s_mm && kept(o)) ++worse;
     return worse >= ALN_METH_CROWDED ? ALN_METH_CERT_CROWDED : 0;
 }
 // Checks the certificates at converted score s. Returns 1, with x->stop set, when the read ends:
