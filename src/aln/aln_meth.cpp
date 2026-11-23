@@ -208,28 +208,32 @@ __attribute__((noinline, cold)) int aln_meth_gap_arena(aln_meth_slot_t *x, const
  * the search pops next: every entry below it has been expanded and every hit it made resolved.
  * - Score cut: no row of a path above B + M can be retained, and a path's rows cost at least its
  *   score, so the search stops past B + M (job->score_cut), at any time.
- * - Difference ceiling: once B <= next, no unverified row can cost less than B, so B is final and
- *   every row at B is verified: stock's top-2 ceiling (best differences + 1, at most -n) applies.
- *   A row's converted differences are at most its strict ones, so the ceiling never cuts a path
- *   to a retained row (slot_finish applies the same ceiling to the stored rows).
- * - -R: once B < next the best stratum is complete; more than -R loci at B (under the TAPS/5base
- *   tie-break, at B with the fewest conversions) end the search, as stock's top2b stop does. */
+ * - Difference ceiling: once B < next, every row that can cost B has been resolved, so the stored
+ *   rows at B are final and stock's top-2 ceiling (their fewest differences + 1, at most -n)
+ *   applies. It is taken from the stored rows, as slot_finish takes it: a row a same-locus
+ *   replacement discarded does not lower it. While B == next, a later row at B could still
+ *   replace the stored row with the fewest differences and raise the finish's ceiling, so the
+ *   ceiling waits. A row's converted differences are at most its strict ones, so the ceiling
+ *   never cuts a path to a retained row.
+ * - -R: with the best stratum complete, more than -R loci at B within the ceiling (under the
+ *   TAPS/5base tie-break, the fewest-conversion ones of them) end the search, as stock's top2b
+ *   stop does. */
 static bool conv_tiebreak(const aln_meth_opt_t *mo);
 int aln_meth_boundary(aln_meth_slot_t *x, int next)
 {
     gap_job_t *job = x->job;
     const gap_opt_t &opt = job->opt;
     job->score_cut = std::min(job->score_cut, gap_score_cut(x->best, opt.s_mm));
-    if (x->best > next) return 0;
-    const int ceiling = x->best_d >= INT_MAX - 1 ? INT_MAX : x->best_d + 1;
-    if (ceiling < job->max_diff) job->max_diff = ceiling;
-    if (x->best == next) return 0;
-    // Count the best loci the finish keeps: those within the final difference ceiling (a row with
-    // more is dropped there), and under the TAPS/5base tie-break the fewest-conversion ones of them.
+    if (x->best >= next) return 0;
     const bool conv = conv_tiebreak(x->grp->mo), gape = opt.mode & BWA_MODE_GAPE;
-    auto kept = [&](const aln_meth_occ_t &o) {
-        return o.cost == x->best && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= (int64_t)ceiling;
-    };
+    auto diffs = [&](const aln_meth_occ_t &o) { return (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0); };
+    int64_t fewest_d = INT64_MAX;
+    for (const auto &o : x->res->occ) if (o.cost == x->best) fewest_d = std::min(fewest_d, diffs(o));
+    const int64_t ceiling = fewest_d >= INT_MAX - 1 ? INT_MAX : fewest_d + 1;
+    if (ceiling < job->max_diff) job->max_diff = (int)ceiling;
+    // Count the best loci the finish keeps: those within the ceiling, and under the TAPS/5base
+    // tie-break the fewest-conversion ones of them.
+    auto kept = [&](const aln_meth_occ_t &o) { return o.cost == x->best && diffs(o) <= ceiling; };
     int fewest = INT_MAX;
     if (conv) for (const auto &o : x->res->occ) if (kept(o)) fewest = std::min(fewest, o.n_conv);
     long n = 0;
@@ -273,7 +277,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     const gap_opt_t *o = x->grp->opt;
     x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 && !x->grp->ref->known_snvs &&
         !x->grp->ref->no_cut;
-    x->best = INT64_MAX; x->best_d = INT_MAX; x->flushed = 0;
+    x->best = INT64_MAX; x->flushed = 0;
     return x->vseq.data();
 }
 static bool conv_tiebreak(const aln_meth_opt_t *mo)
@@ -616,8 +620,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     ++x->res->n_rescored;
     // Under the cut a row above the current best + M can never be retained (the best only falls).
     if (x->cut && x->best != INT64_MAX && o.cost > x->best + g->opt->s_mm) return;
-    if (o.cost < x->best) { x->best = o.cost; x->best_d = (int)differences; }
-    else if (o.cost == x->best) x->best_d = std::min(x->best_d, (int)differences);
+    x->best = std::min(x->best, o.cost);
     const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
     // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.
     if (bytes > (64ULL << 20) - x->alignment_bytes) {
@@ -1147,12 +1150,13 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
     for (const auto &o : r->occ) best = std::min(best, o.cost);
     const bool nonstop = x->grp->opt->mode & BWA_MODE_NONSTOP;
     const int64_t cut = nonstop ? INT64_MAX : best + (int64_t)x->grp->opt->s_mm;
-    // Stock's top-2 ceiling: a retained row has at most the best row's differences + 1 (the search
-    // applies the same ceiling once the best is final, aln_meth_boundary).
+    // Stock's top-2 ceiling, for a search that takes the cuts: a retained row has at most the best
+    // rows' fewest differences + 1 (the search applies the same ceiling once the best stratum is
+    // complete, aln_meth_boundary). A search without the cuts keeps the cost window alone.
     const bool gape = x->grp->opt->mode & BWA_MODE_GAPE;
     auto diffs = [&](const aln_meth_occ_t &o) { return (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0); };
     int64_t ceiling = INT64_MAX;
-    if (!nonstop) for (const auto &o : r->occ) if (o.cost == best) ceiling = std::min(ceiling, diffs(o) + 1);
+    if (x->cut) for (const auto &o : r->occ) if (o.cost == best) ceiling = std::min(ceiling, diffs(o) + 1);
     // A dropped candidate that could be a best or retained worse locus leaves X0/X1 unknown.
     if (r->n_unrepresentable && x->unrep_cost <= cut) r->flags |= ALN_METH_BIND_UNREP;
     meth_blind_cap(x, r, cut);

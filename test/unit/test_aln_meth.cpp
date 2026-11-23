@@ -2553,7 +2553,10 @@ TEST_CASE("aln_meth: the -R stop counts only best loci within the final differen
     }
     ba::aln_meth_occ_t gapped; gapped.cost = 3; gapped.n_gapo = 1; gapped.pos = 50000;
     result.occ.push_back(gapped);
-    slot.best = 3; slot.best_d = 1;
+    slot.best = 3;
+    // While the next entry is at the best cost the stratum is incomplete: no ceiling, no -R stop.
+    CHECK(ba::aln_meth_boundary(&slot, 3) == 0);
+    CHECK(job.max_diff == 3);
     CHECK(ba::aln_meth_boundary(&slot, 4) == 0);
     CHECK(job.max_diff == 2);
     // 31 best loci within the ceiling are a repeat
@@ -2562,6 +2565,54 @@ TEST_CASE("aln_meth: the -R stop counts only best loci within the final differen
         result.occ.push_back(o);
     }
     CHECK(ba::aln_meth_boundary(&slot, 4) == 1);
+    free(opt);
+}
+
+TEST_CASE("aln_meth: the difference ceiling comes from the stored best rows")
+{
+    // M=1, O=3, E=1, -n 4. The best locus holds a three-mismatch row at cost 3 (a one-gap row at
+    // the same locus and cost may have been resolved and replaced by it). Only stored rows set the
+    // ceiling, as at the finish: 3 + 1 = 4, so the search keeps paths a four-mismatch row needs.
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    opt->s_mm = 1; opt->s_gapo = 3; opt->s_gape = 1; opt->max_diff = 4;
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_ref_t mr;
+    ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::aln_meth_slot_t slot; slot.grp = &group;
+    ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 4; job.score_cut = INT_MAX;
+    slot.job = &job;
+    ba::aln_meth_read_t result; slot.res = &result;
+    ba::aln_meth_occ_t o; o.cost = 3; o.n_mm = 3; o.pos = 1000;
+    result.occ.push_back(o);
+    slot.best = 3;
+    CHECK(ba::aln_meth_boundary(&slot, 4) == 0);
+    CHECK(job.max_diff == 4);
+    free(opt);
+}
+
+TEST_CASE("aln_meth: the finish applies the difference ceiling only to a search that takes the cuts")
+{
+    // M=1, O=3: a one-gap best (cost 3, one difference) and a four-mismatch row (cost 4, within
+    // best + M). Under the cuts the ceiling (1 + 1) drops the second; a search without them
+    // (--known-snvs, -N, a negative penalty) keeps the cost window alone.
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    opt->s_mm = 1; opt->s_gapo = 3; opt->s_gape = 1;
+    ba::aln_meth_group_t group; group.opt = opt;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_t slot; slot.grp = &group; slot.res = &result; slot.keep = 1;
+    for (int cut = 0; cut < 2; ++cut) {
+        CAPTURE(cut);
+        result = ba::aln_meth_read_t();
+        ba::aln_meth_occ_t gapped{}; gapped.rid = 0; gapped.hyp = 1; gapped.pos = 100; gapped.cost = 3; gapped.n_gapo = 1;
+        ba::aln_meth_occ_t mm{}; mm.rid = 0; mm.hyp = 1; mm.pos = 200; mm.cost = 4; mm.n_mm = 4;
+        result.occ.push_back(gapped); result.occ.push_back(mm);
+        slot.cut = cut;
+        ba::aln_meth_slot_finish(&slot);
+        CHECK(result.c1 == 1);
+        CHECK(result.c2 == (cut ? 0 : 1));
+    }
     free(opt);
 }
 
