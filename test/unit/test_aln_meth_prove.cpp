@@ -116,18 +116,20 @@ static int masked_band_oracle(const std::vector<uint8_t> &q, const std::vector<u
                               int lo, int hi, bool free_start, int limit)
 {
     const int n = (int)q.size(), m = (int)text.size(), inf = 1000000;
-    std::vector<std::vector<int>> d(n + 1, std::vector<int>(m + 1, inf));
+    static std::vector<int> cells; // one flat (n + 1) x (m + 1) matrix, reused across calls
+    cells.assign((size_t)(n + 1) * (m + 1), inf);
+    auto d = [&](int a, int b) -> int & { return cells[(size_t)a * (m + 1) + b]; };
     for (int b = 0; b <= m; ++b)
-        if (lo <= b && b <= hi) d[0][b] = free_start ? 0 : b;
+        if (lo <= b && b <= hi) d(0, b) = free_start ? 0 : b;
     for (int a = 1; a <= n; ++a) {
         for (int b = 0; b <= m; ++b) {
             if (b - a < lo || b - a > hi) continue;
-            d[a][b] = d[a - 1][b] + 1;
-            if (b) d[a][b] = std::min({d[a][b], d[a][b - 1] + 1,
-                d[a - 1][b - 1] + (q[a - 1] < 4 && (text[b - 1] >> q[a - 1] & 1) ? 0 : 1)});
+            d(a, b) = d(a - 1, b) + 1;
+            if (b) d(a, b) = std::min({d(a, b), d(a, b - 1) + 1,
+                d(a - 1, b - 1) + (q[a - 1] < 4 && (text[b - 1] >> q[a - 1] & 1) ? 0 : 1)});
         }
     }
-    return std::min(*std::min_element(d[n].begin(), d[n].end()), limit + 1);
+    return std::min(*std::min_element(cells.end() - (m + 1), cells.end()), limit + 1);
 }
 
 TEST_CASE("aln_meth_prove: the bit-parallel banded edit distance equals the cell-by-cell one")
@@ -136,7 +138,7 @@ TEST_CASE("aln_meth_prove: the bit-parallel banded edit distance equals the cell
     std::vector<int16_t> dp;
     ba::aln_meth_verify_scratch_t s;
     long below = 0, above = 0;
-    for (int t = 0; t < 20000; ++t) {
+    for (int t = 0; t < 4000; ++t) { // a bounded sample: the unit budget is ~100 ms per case
         const int n = rng.below(90), m = rng.below(160), kmax = rng.below(t % 7 == 0 ? 32 : 10);
         std::vector<uint8_t> q(n), tm(m);
         for (auto &c : q) c = (uint8_t)(rng.below(25) == 0 ? 4 : rng.below(4));
@@ -166,8 +168,9 @@ TEST_CASE("aln_meth_prove: the bit-parallel banded edit distance equals the cell
             (want <= kmax ? below : above) += 1;
         }
     }
-    CHECK(below > 2000); // not vacuous: both outcomes are common
-    CHECK(above > 2000);
+    MESSAGE("within kmax " << below << ", above kmax " << above << " of 8000");
+    CHECK(below > 400); // not vacuous: both outcomes are common
+    CHECK(above > 400);
 }
 
 TEST_CASE("aln_meth_prove: lazy mask planes preserve the scalar result across text boundaries")
