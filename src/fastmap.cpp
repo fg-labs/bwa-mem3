@@ -2001,6 +2001,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "                 no proper-pair flag or mate rescue there. As in bwa/bwa-mem2. [inferred]\n");
     fprintf(stderr, "Methylation (--meth) options:\n");
     meth_opts_usage_shared(stderr);
+    meth_opts_usage_mapq(stderr);
     meth_opts_usage_mem_only(stderr);
     fprintf(stderr, "Supplementary MAPQ rescoring (fg-labs extension):\n");
     fprintf(stderr, "   --supp-rep-hard-cap INT\n");
@@ -2290,6 +2291,7 @@ int main_mem(int argc, char *argv[])
     memset(&opt0, 0, sizeof(mem_opt_t));
     meth_cli_t meth_cli;
     memset(&meth_cli, 0, sizeof(meth_cli));
+    meth_cli.mapq_supported = 1; // mem implements --meth-mapq (METH_LONG_OPTION_MAPQ below)
 
     /* Parse input arguments */
     // comment: added option '5' in the list
@@ -2373,6 +2375,7 @@ int main_mem(int argc, char *argv[])
         {"extend-tie-floor",         required_argument, 0, OPT_EXTEND_TIE_FLOOR},
         {"extend-csub",              no_argument,       0, OPT_EXTEND_CSUB},
         METH_LONG_OPTIONS_SHARED
+        METH_LONG_OPTION_MAPQ
         METH_LONG_OPTIONS_MEM_ONLY
         {"supp-rep-hard-cap",        required_argument, 0, OPT_SUPP_REP_HARD_CAP},
         {"proper-pair-from-emitted", no_argument,       0, OPT_PROPER_PAIR_FROM_EMITTED},

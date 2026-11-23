@@ -345,7 +345,17 @@ NEON tier), every other field of every record was byte-identical to the previous
 three `--meth-scoring` modes, and the non-`--meth` records (`@PG` excluded) were byte-identical on
 that set and on phiX. See
 [how `NM`/`MD` are computed](../methylation/overview.md#how-nmmd-are-computed-under---meth).
-[`--md short` or `--md none`](../cli/mem.md#--md-str--which-md-tag-to-write) opts out of the literal `MD`. The
+[`--md short` or `--md none`](../cli/mem.md#--md-str--which-md-tag-to-write) opts out of the literal `MD`.
+For EM-seq with `genomic` scoring, `--meth` MAPQ (of every read, unless
+`--meth-mapq-max-len` limits it) is by default capped at a conversion-blind MAPQ
+(`--meth-mapq`): only MAPQ (and the MAPQ that `MQ:i` and `SA:Z` repeat) can drop, a lowered
+record's uncapped MAPQ is kept in `YQ:i`, and `--meth-mapq scoring` gives the previous alignment
+records byte for byte; the `@PG` line differs because it records the command line
+([#817](https://github.com/fg-labs/bwa-mem3/pull/817)). Measured on NA12878 EM-seq (SRR10532145)
+against hg38: 400 k single-end reads of 20–50 bp and 200 k pairs (2×99 bp, and with read 1 cut to
+25 bp or both ends to 30 bp), on an Apple M2 Max (macOS, arm64, NEON tier) and an AWS Graviton4
+(Linux, arm64, NEON tier); without `--meth`, the
+same 100 k pairs and 100 k single-end reads were also byte-identical (`@PG` excluded). The
 `FG-METH-DIVERGENCE` row in the catalog below is generated from the divergence registry and does
 not yet carry this change.
 

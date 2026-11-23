@@ -17,7 +17,12 @@ no [bwameth.py](https://github.com/brentp/bwa-meth) dependency. The default
 drop-in, not a byte-for-byte clone). `--meth=5base` (Illumina 5-base)
 selects the TAPS chemistry and is record-for-record identical to `--meth=taps`
 ([5-base libraries](../methylation/5base.md),
-[#650](https://github.com/fg-labs/bwa-mem3/pull/650)).
+[#650](https://github.com/fg-labs/bwa-mem3/pull/650)). For EM-seq with `genomic` scoring (the
+defaults), `--meth-mapq conversion-blind` (the default there) caps the MAPQ of each read (at
+every length unless `--meth-mapq-max-len` limits it) at an estimate of the MAPQ it gets with
+the mirror cell free (its alignments repriced on their genomic gap placement), so a retained
+methylated `C` does not make a read look unique; a lowered record keeps its uncapped MAPQ in
+`YQ:i`, and `--meth-mapq scoring` gives the previous output ([#817](https://github.com/fg-labs/bwa-mem3/pull/817)).
 
 ```bash
 bwa-mem3 index --meth ref.fa          # once per reference

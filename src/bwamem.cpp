@@ -797,6 +797,9 @@ mem_opt_t *mem_opt_init()
     o->meth_seed_prune = 0;                        /* base default off; --meth turns it on
                                                       (SPEC30), set in fastmap.cpp */
     o->meth_chem    = METH_CHEM_EMSEQ;             /* --meth default chemistry: bisulfite/em-seq */
+    o->meth_mapq    = MEM_METH_MAPQ_SCORING;       /* the em-seq default is resolved by meth_opts_finalize */
+    o->meth_mapq_max_len = 0;                      /* --meth-mapq-max-len: every length (the uncapped
+                                                      MAPQ's bias persists at full length in repeats) */
     o->meth_context = METH_CTX_ALL;                /* --meth-context default: every C converts */
     o->meth_tags    = MEM_METH_TAGS_ALL;           /* --meth default: emit XR/XG/XM (Bismark set) */
     o->compat       = &COMPAT_TARGET_OFF;          /* --compat off: bwa-mem3's native output */
@@ -4949,17 +4952,15 @@ static void worker_sam(void *data, int seqid, int batch_size, int tid)
              * Pure hint -> byte-identical. */
             if (i + 1 < seqid + batch_size && w->regs[i+1].n > 0)
                 mem_prefetch_cigar_ref(mem_aln_bns(w), mem_aln_pac(w), w->regs[i+1].a[0].rb);
-            mem_mark_primary_se(w->opt, w->regs[i].n,
-                                w->regs[i].a,
-                                mem_tie_break_id(w->opt, w->seqs[i].name,
-                                                 w->n_processed + i));
+            const int64_t mark_id = mem_tie_break_id(w->opt, w->seqs[i].name, w->n_processed + i);
+            mem_mark_primary_se(w->opt, w->regs[i].n, w->regs[i].a, mark_id);
 #if V17  // Feature from v0.7.17 of orig. bwa-mem
             if (w->opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(w->opt->T, &w->regs[i]);
 #endif
             mem_seed_capped_sub(&w->regs[i], w->opt->a);  /* --extend-csub (no-op when off) */
             /* D3 (--meth): emit in ORIGINAL coords/alphabet via mem_aln_bns/pac. */
             mem_reg2sam(w->opt, mem_aln_bns(w), mem_aln_pac(w), &w->seqs[i],
-                        &w->regs[i], 0, 0, w->alt_oa ? &w->alt_oa[i] : NULL);
+                        &w->regs[i], 0, 0, w->alt_oa ? &w->alt_oa[i] : NULL, mark_id);
             free(w->regs[i].a);
         }
     }
@@ -5396,7 +5397,10 @@ struct mark_primary_scratch_t {
     ~mark_primary_scratch_t() { kv_destroy(v); }
 };
 
-int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id)
+/* keep_hash: sort and mark with the hashes a[] already carries instead of assigning
+ * hash_64(id + i) by input position (--meth-mapq's conversion-blind shadow re-marks regions the
+ * real pass already sorted, and must break equal-score ties as that pass did). */
+static int mem_mark_primary_se_impl(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id, bool keep_hash)
 {
     int i, n_pri;
     /* Per-thread scratch for the overlap index set. Reused across every read on
@@ -5419,13 +5423,14 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
     if (n == 1) {
         a[0].sub = a[0].alt_sc = 0;
         a[0].secondary = a[0].secondary_all = -1;
-        a[0].hash = hash_64(id);
+        if (!keep_hash) a[0].hash = hash_64(id);
         return a[0].is_alt ? 0 : 1;
     }
 
     for (i = n_pri = 0; i < n; ++i)
     {
-        a[i].sub = a[i].alt_sc = 0, a[i].secondary = a[i].secondary_all = -1, a[i].hash = hash_64(id+i);
+        a[i].sub = a[i].alt_sc = 0, a[i].secondary = a[i].secondary_all = -1;
+        if (!keep_hash) a[i].hash = hash_64(id+i);
         if (!a[i].is_alt) ++n_pri;
     }
     primary_sort_by_hash(n, a);   /* == ks_introsort(mem_ars_hash), see the wrapper */
@@ -5462,6 +5467,11 @@ int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id
     /* z.a intentionally NOT freed here: it is a thread-lifetime scratch buffer,
      * released by z_scratch's destructor at thread exit. */
     return n_pri;
+}
+
+int mem_mark_primary_se(const mem_opt_t *opt, int n, mem_alnreg_t *a, int64_t id)
+{
+    return mem_mark_primary_se_impl(opt, n, a, id, false);
 }
 
 /************************
@@ -5650,11 +5660,21 @@ void mem_aln_oa_string(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t 
     free(o.cigar);
 }
 
+static int mem_meth_blind_se_caps(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                                  const bseq1_t *s, const mem_alnreg_v *a, int64_t id, int *cap);
+
 void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                  bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
-                 const mem_alnreg_t *oa)
+                 const mem_alnreg_t *oa, int64_t id)
 {
-    mem_reg2sam_anchored(opt, bns, pac, s, a, extra_flag, m, -1, NULL, oa);
+    // --meth-mapq conversion-blind: each region's cap (id: the mem_mark_primary_se id)
+    static thread_local std::vector<int> cap;
+    const int *caps = NULL;
+    if (id >= 0 && meth_mapq_conversion_blind(opt)) {
+        cap.assign(a->n, 255);
+        if (mem_meth_blind_se_caps(opt, bns, pac, s, a, id, cap.data())) caps = cap.data();
+    }
+    mem_reg2sam_anchored(opt, bns, pac, s, a, extra_flag, m, -1, NULL, oa, caps);
 }
 
 // TODO (future plan): group hits into a uint64_t[] array. This will be cleaner and more flexible
@@ -5668,7 +5688,7 @@ void mem_reg2sam(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
 void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
                           bseq1_t *s, mem_alnreg_v *a, int extra_flag, const mem_aln_t *m,
                           int anchor_k, const mem_aln_t *anchor,
-                          const mem_alnreg_t *alt_oa)
+                          const mem_alnreg_t *alt_oa, const int *mapq_cap)
 {
     kstring_t str;
     kvec_t(mem_aln_t) aa;
@@ -5701,17 +5721,25 @@ void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8
             *q = mem_reg2aln(opt, bns, pac, s->l_seq, s->seq, p, s->meth_orig_seq);
         }
         assert(q->rid >= 0); // this should not happen with the new code
+        /* --meth-mapq conversion-blind: the MAPQ the record would have without the cap (unc), taken
+         * through the same supplementary rules below as the capped one; YQ:i when they differ. */
+        int unc = (int)q->mapq;
+        if (mapq_cap && p->secondary < 0 && (int)q->mapq > mapq_cap[k]) q->mapq = (uint32_t)mapq_cap[k];
         q->XA = XA? XA[k] : 0;
         q->HN = HN? HN[k] : -1;
         q->flag |= extra_flag; // flag secondary
         if (p->secondary >= 0) q->sub = -1; // don't output sub-optimal score
         if (l && p->secondary < 0) // if supplementary
             q->flag |= (opt->flag&MEM_F_NO_MULTI)? 0x10000 : 0x800;
+        // the primary's MAPQ without the cap, for unc
+        const int unc0 = l ? (aa.a[0].yq1 ? aa.a[0].yq1 - 1 : (int)aa.a[0].mapq) : 0;
 #if V17
         if (!(opt->flag & MEM_F_KEEP_SUPP_MAPQ) && l && !p->is_alt && q->mapq > aa.a[0].mapq)
             q->mapq = aa.a[0].mapq; // lower mapq for supplementary mappings, unless -5 or -q is applied
+        if (!(opt->flag & MEM_F_KEEP_SUPP_MAPQ) && l && !p->is_alt && unc > unc0) unc = unc0;
 #else
         if (l && !p->is_alt && q->mapq > aa.a[0].mapq) q->mapq = aa.a[0].mapq;
+        if (l && !p->is_alt && unc > unc0) unc = unc0;
 #endif
         // fg-labs: supp alnregs whose chain contains a repetitive seed (many
         // genome occurrences) inherit primary MAPQ despite being ambiguous on
@@ -5719,7 +5747,8 @@ void mem_reg2sam_anchored(const mem_opt_t *opt, const bntseq_t *bns, const uint8
         // force MAPQ=0 when the chain's most-repetitive seed exceeds the cap.
         if (opt->supp_rep_hard_cap > 0 && l && p->secondary < 0 &&
             p->chain_n_hits >= opt->supp_rep_hard_cap)
-            q->mapq = 0;
+            q->mapq = 0, unc = 0;
+        if (mapq_cap && (int)q->mapq < unc) q->yq1 = (uint8_t)(unc + 1);
         ++l;
     }
     if (aa.n == 0) { // no alignments good enough; then write an unaligned record
@@ -6072,6 +6101,39 @@ int mem_core_key_equal(const bntseq_t *bns, const uint8_t *pac, const mem_core_k
         && bns_pac_fwd_equal(bns->l_pac, pac, x->fb, y->fb, x->rlen);
 }
 
+/* Region ar's global CIGAR, as emission makes it (mem_reg2aln_global; --meth-mapq's
+ * mem_meth_blind_rescore reprices the same alignment): the band inferred from its spans and truesc
+ * (at least the --alt-project lift floor; see mem_reg2aln_global), capped by its own w past -w,
+ * then widened (to at most 4*w) up to twice while the global score stays below truesc - a. q is
+ * the region's query span in nt4 codes; on the reverse strand bwa_gen_cigar4 reverses it in place on
+ * every call, retries included. */
+static uint32_t *mem_reg_global_cigar(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                                      const mem_alnreg_t *ar, const int8_t *mat, int m, uint8_t *q,
+                                      int *score, int *n_cigar, int *NM, int nm_from_mat, int want_md)
+{
+    int i = 0, w2, tmp, last_sc = -(1<<30);
+    const int qb = ar->qb, qe = ar->qe;
+    const int64_t rb = ar->rb, re = ar->re;
+    const int lift_bw = opt->alt_lift != NULL ? (int) ar->alt_bw - 1 : -1;
+    tmp = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_del, opt->e_del, lift_bw >= 0);
+    w2  = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_ins, opt->e_ins, lift_bw >= 0);
+    w2 = w2 > tmp? w2 : tmp;
+    if (bwa_verbose >= 4) fprintf(stderr, "* Band width: inferred=%d, cmd_opt=%d, alnreg=%d\n", w2, opt->w, ar->w);
+    if (w2 > opt->w) w2 = w2 < ar->w? w2 : ar->w;
+    if (w2 < lift_bw) w2 = lift_bw;
+    uint32_t *cigar = 0;
+    do {
+        free(cigar);
+        w2 = w2 < opt->w<<2? w2 : opt->w<<2;
+        cigar = bwa_gen_cigar4(mat, m, bns, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, q, rb, re, score, n_cigar, NM, nm_from_mat, want_md);
+        if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, *score, ar->truesc);
+        if (*score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
+        last_sc = *score;
+        w2 <<= 1;
+    } while (++i < 3 && *score < ar->truesc - opt->a);
+    return cigar;
+}
+
 /* The global alignment step of mem_reg2aln: the CIGAR ops of region `ar` (followed by
  * its MD when want_md) in a->cigar / a->n_cigar, and its NM in *NM.
  * mem_gen_alt reuses this result for every region with an equal mem_core_key: any new
@@ -6079,9 +6141,9 @@ int mem_core_key_equal(const bntseq_t *bns, const uint8_t *pac, const mem_core_k
  * above all) must be added to mem_core_key and mem_core_key_equal. */
 static void mem_reg2aln_global(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac, int l_query, const char *query_, const mem_alnreg_t *ar, const char *meth_orig_query, int want_md, mem_aln_t *a, int *NM)
 {
-    int i, w2, tmp, score, last_sc = -(1<<30);
+    int i, score;
     const int qb = ar->qb, qe = ar->qe;
-    const int64_t rb = ar->rb, re = ar->re;
+    const int64_t rb = ar->rb;
     /* Shallow same-call prefetch of this alignment's CIGAR-emission window,
      * hidden behind the ~dozens of setup instructions below. The emit loops also
      * issue a deeper look-ahead prefetch of the NEXT read/pair's window (see
@@ -6131,15 +6193,8 @@ static void mem_reg2aln_global(const mem_opt_t *opt, const bntseq_t *bns, const 
      * the band once more. That costs one extra bwa_gen_cigar4 call for a lifted
      * region whose score the wider band does not change (score == last_sc ends
      * the loop), and never more than the two extra calls the loop allows any
-     * region. */
-    const int lift_bw = opt->alt_lift != NULL ? (int) ar->alt_bw - 1 : -1;
-    tmp = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_del, opt->e_del, lift_bw >= 0);
-    w2  = infer_bw(qe - qb, re - rb, ar->truesc, opt->a, opt->o_ins, opt->e_ins, lift_bw >= 0);
-    w2 = w2 > tmp? w2 : tmp;
-    if (bwa_verbose >= 4) fprintf(stderr, "* Band width: inferred=%d, cmd_opt=%d, alnreg=%d\n", w2, opt->w, ar->w);
-    if (w2 > opt->w) w2 = w2 < ar->w? w2 : ar->w;
-    if (w2 < lift_bw) w2 = lift_bw;
-    i = 0; a->cigar = 0;
+     * region. The band, its floor and the retry loop live in
+     * mem_reg_global_cigar. */
     /* D3 (--meth, PR-5): native-alphabet output regen.
      *   - `regen_query` is the ORIGINAL read (meth_orig_query) under --meth, else
      *     the projected read for non-meth (legacy, unchanged).
@@ -6190,15 +6245,8 @@ static void mem_reg2aln_global(const mem_opt_t *opt, const bntseq_t *bns, const 
     int regen_m = 5;
     const int8_t *regen_mat = use_meth_orig
         ? meth_model_mat(opt, regen_hyp, &regen_m) : opt->mat;
-    do {
-        free(a->cigar);
-        w2 = w2 < opt->w<<2? w2 : opt->w<<2;
-        a->cigar = bwa_gen_cigar4(regen_mat, regen_m, bns, opt->o_del, opt->e_del, opt->o_ins, opt->e_ins, w2, bns->l_pac, pac, qe - qb, (uint8_t*)&query[qb], rb, re, &score, &a->n_cigar, NM, use_meth_orig, want_md);
-        if (bwa_verbose >= 4) fprintf(stderr, "* Final alignment: w2=%d, global_sc=%d, local_sc=%d\n", w2, score, ar->truesc);
-        if (score == last_sc || w2 == opt->w<<2) break; // it is possible that global alignment and local alignment give different scores
-        last_sc = score;
-        w2 <<= 1;
-    } while (++i < 3 && score < ar->truesc - opt->a);
+    a->cigar = mem_reg_global_cigar(opt, bns, pac, ar, regen_mat, regen_m, &query[qb], &score, &a->n_cigar, NM,
+                                    use_meth_orig, want_md);
     /* bwa_gen_cigar4 legitimately returns NULL (with n_cigar = 0) on its
      * geometry rejects -- empty query, rb >= re, or a window bridging the
      * forward/reverse strands -- and the CIGAR moves below (and the strlen,
@@ -6320,6 +6368,315 @@ static inline int infer_bw(int l1, int l2, int score, int a, int q, int r, int n
     w = ((double)((l1 < l2? l1 : l2) * a - score - q) / r + 2.);
     if (w < abs(l1 - l2)) w = abs(l1 - l2);
     return w;
+}
+
+/* --meth-mapq conversion-blind (mem_meth_mapq): the MAPQ a read would get with the mirror cell
+ * (read C x reference T on the C->T strand, read G x reference A on the G->A strand) free, at the
+ * same penalties, computed on a copy of its regions after their selection; see
+ * docs/src/methylation/flags.md (--meth-mapq). */
+
+/* The strand-adjusted hypothesis a region is scored with (as mem_reg2aln_global regenerates it):
+ * 1 frees reference C x read T, 0 reference G x read A; -1 for a non-meth region. */
+static inline int meth_blind_region_hyp(const bntseq_t *bns, const mem_alnreg_t *ar)
+{
+    int h = ar->meth_hypothesis;
+    if (h >= 0 && ar->rb >= bns->l_pac) h ^= 1;
+    return h;
+}
+
+void mem_meth_blind_prefix(const char *orig, int l_query, std::vector<int> *pc, std::vector<int> *pg,
+                           std::vector<uint8_t> *query)
+{
+    pc->assign(l_query + 1, 0);
+    pg->assign(l_query + 1, 0);
+    query->resize(l_query);
+    for (int i = 0; i < l_query; ++i) {
+        const unsigned char b = nst_nt4_decode((unsigned char)orig[i], 5);
+        (*query)[i] = b;
+        (*pc)[i + 1] = (*pc)[i] + (b == 1);
+        (*pg)[i + 1] = (*pg)[i] + (b == 2);
+    }
+}
+
+/* Whether region ar is certainly gap-free, as mem_reg2aln_global decides it (infer_bw == 0 under
+ * both gap penalties): equal spans and too few differences for two gaps. An equal-span region
+ * can still hold an insertion and a deletion, so equal spans alone do not say it. */
+static inline bool meth_blind_ungapped(const mem_opt_t *opt, const mem_alnreg_t *ar)
+{
+    const int ql = ar->qe - ar->qb;
+    const int64_t rl = ar->re - ar->rb;
+    // a --alt-project lifted region: emission turns the shortcut off (mem_reg_global_cigar)
+    if (ql != rl || (opt->alt_lift != NULL && ar->alt_bw > 0)) return false;
+    return infer_bw(ql, (int)rl, ar->truesc, opt->a, opt->o_del, opt->e_del, 0) == 0
+        && infer_bw(ql, (int)rl, ar->truesc, opt->a, opt->o_ins, opt->e_ins, 0) == 0;
+}
+
+int mem_meth_blind_bound(const mem_opt_t *opt, const bntseq_t *bns, const std::vector<int> &pc,
+                         const std::vector<int> &pg, const mem_alnreg_t *ar)
+{
+    const int h = meth_blind_region_hyp(bns, ar);
+    const int l_query = (int)pc.size() - 1;
+    if (h < 0 || ar->qb < 0 || ar->qe > l_query || ar->qe <= ar->qb) return 0;
+    const std::vector<int> &p = h ? pc : pg; // the read base of the mirror cell: C, or G
+    const int in_span = p[ar->qe] - p[ar->qb];
+    /* A region, gapped or not, can also extend past its span once a mirror cell is free
+     * (mem_meth_blind_rescore): at most a+b per mirror-able base out there, plus a match for every
+     * base it then covers. With no mirror-able base outside the span the extension scores as the
+     * genomic one did. */
+    const int outside = p[l_query] - in_span;
+    return (in_span + outside) * (opt->a + opt->b) + (outside ? opt->a * (ar->qb + l_query - ar->qe) : 0);
+}
+
+void mem_meth_blind_rescore(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                            int l_query, const uint8_t *query, mem_alnreg_t *ar)
+{
+    const int h = meth_blind_region_hyp(bns, ar);
+    if (h < 0 || query == NULL || ar->qe <= ar->qb || ar->re <= ar->rb || l_query <= 0) return;
+    int m = 5;
+    const int8_t *gen = meth_model_mat(opt, h, &m);
+    if (m != 5) return; // --meth-context cpg: refused with em-seq, so never here
+    const int ref_m = h ? 3 : 0, read_m = h ? 1 : 2; // the mirror cell: T x C, or A x G
+    int8_t mf[25];
+    memcpy(mf, gen, sizeof mf);
+    mf[ref_m * 5 + read_m] = (int8_t)opt->a;
+    const int64_t l_pac = bns->l_pac;
+    static thread_local u8vec_scratch_t t_ref;
+    int gain = 0;
+    if (meth_blind_ungapped(opt, ar)) {
+        /* Ungapped, on the region's diagonal. Its score is a local maximum, which its span can run
+         * past (an extension taken to the read end keeps the maximum as its score), so the path it
+         * scores is its span unless it was taken past its peak (the running genomic sum from qb
+         * peaks at the score while the whole span's sum is less): then only up to that peak. The
+         * mirror mismatches on that path gain a+b each, and freed, the path may run on past it,
+         * within the read and the region's contig: the best mirror-free extension on each side,
+         * less what the genomic one already earned; or a freed seed may anchor the best
+         * mirror-free stretch of the diagonal, where the genomic path was held to a worse one. */
+        const int64_t rb0 = ar->rb - ar->qb; // the reference position of read base 0
+        int64_t rb = rb0 < 0 ? 0 : rb0, re = rb0 + l_query;
+        int rid = -1;
+        bns_fetch_bounds(bns, &rb, ar->rb, &re, &rid); // the region's contig and strand
+        if (rb > ar->rb || re < ar->re) return;
+        if (t_ref.v.m < (size_t)(re - rb)) kv_resize(uint8_t, t_ref.v, (size_t)(re - rb));
+        uint8_t *ref = t_ref.v.a;
+        int64_t len = 0;
+        bns_get_seq_into(l_pac, pac, rb, re, ref, &len);
+        if (len != re - rb) return;
+        auto at = [&](int i) -> int { return (int)(rb0 + i - rb); }; // ref index of read base i
+        auto inside = [&](int i) { const int64_t t = rb0 + i; return t >= rb && t < re; };
+        int run = 0, peak = INT_MIN, q1 = ar->qb;
+        for (int i = ar->qb; i < ar->qe; ++i) {
+            run += gen[ref[at(i)] * 5 + query[i]];
+            if (run > peak) { peak = run; q1 = i; }
+        }
+        const int q0 = ar->qb;
+        // only a span taken past its peak to the read end (the peak is the score, the whole span's
+        // sum is not) leaves cells out of its score
+        if (run == ar->score || peak != ar->score) q1 = ar->qe - 1;
+        int n_mirror = 0;
+        for (int i = q0; i <= q1; ++i) n_mirror += ref[at(i)] == ref_m && query[i] == read_m;
+        // the best mirror-free extension on each side (left, right), and what the genomic one past
+        // the core already earned (gleft, gright), which is in the score: credit only what freeing
+        // the mirror cell adds to it
+        // (lq, rq: where each mirror-free extension peaks, the read base it then reaches)
+        int left = 0, right = 0, gleft = 0, gright = 0, grun = 0, lq = ar->qb, rq = ar->qe - 1;
+        run = 0;
+        for (int i = q0 - 1; i >= 0 && inside(i); --i) {
+            const int c = ref[at(i)] * 5 + query[i];
+            run += mf[c], grun += gen[c];
+            if (run > left) left = run, lq = i;
+            if (grun > gleft) gleft = grun;
+        }
+        run = grun = 0;
+        for (int i = q1 + 1; i < l_query && inside(i); ++i) {
+            const int c = ref[at(i)] * 5 + query[i];
+            run += mf[c], grun += gen[c];
+            if (run > right) right = run, rq = i > rq ? i : rq;
+            if (grun > gright) gright = grun;
+        }
+        // and the best mirror-free stretch of the diagonal (within the read and the contig), which a
+        // freed seed can anchor where the genomic path was held to a worse one ([bq0, bq1])
+        int best = 0, bq0 = 0, bq1 = -1;
+        run = 0;
+        for (int i = 0, st = 0; i < l_query; ++i) {
+            if (!inside(i)) { run = 0, st = i + 1; continue; }
+            run += mf[ref[at(i)] * 5 + query[i]];
+            if (run < 0) run = 0, st = i + 1;
+            if (run > best) best = run, bq0 = st, bq1 = i;
+        }
+        const int path = (opt->a + opt->b) * n_mirror + (left - gleft) + (right - gright);
+        gain = path > best - ar->score ? path : best - ar->score;
+        // the span the raised score is taken over, so that MAPQ's identity reads it on its own span
+        if (gain > 0) {
+            int nqb = lq, nqe = rq + 1;
+            if (path < best - ar->score) nqb = bq0, nqe = bq1 + 1;
+            ar->qb = nqb, ar->qe = nqe, ar->rb = rb0 + nqb, ar->re = rb0 + nqe;
+        }
+    } else {
+        /* Gapped: the mirror mismatches on the region's genomic alignment (its CIGAR, as emission
+         * makes it: mem_reg_global_cigar), a+b each, and, as in the gap-free case, what the path
+         * then gains by running on past where the genomic one stopped: on the diagonal of its
+         * first cell to the left, past its peak and then on the diagonal of its last cell to the
+         * right, within the read and the region's contig. */
+        const int ql = ar->qe - ar->qb;
+        const int64_t rl = ar->re - ar->rb;
+        int64_t lo = ar->rb - ar->qb, hi = ar->re + (l_query - ar->qe);
+        if (lo < 0) lo = 0;
+        int rid = -1;
+        bns_fetch_bounds(bns, &lo, ar->rb, &hi, &rid); // the region's contig and strand
+        if (lo > ar->rb || hi < ar->re) return;
+        if (t_ref.v.m < (size_t)(hi - lo)) kv_resize(uint8_t, t_ref.v, (size_t)(hi - lo));
+        uint8_t *win = t_ref.v.a;
+        int64_t len = 0;
+        bns_get_seq_into(l_pac, pac, lo, hi, win, &len);
+        if (len != hi - lo) return;
+        const uint8_t *ref = win + (ar->rb - lo); // the region's reference span
+        int score, n_cigar = 0, NM;
+        // bwa_gen_cigar4 reverses its query in place on the reverse strand: give it a copy
+        static thread_local std::vector<uint8_t> span;
+        span.assign(query + ar->qb, query + ar->qe);
+        uint32_t *cigar = mem_reg_global_cigar(opt, bns, pac, ar, gen, 5, span.data(), &score, &n_cigar, &NM, 1, 0);
+        if (cigar == NULL) return;
+        /* The alignment's columns in read order (on the reverse strand the CIGAR is over both
+         * sequences reversed; bwa_gen_cigar4), each with its genomic and mirror-free score (a
+         * gap's penalty on its first column) and whether it is a mirror mismatch. As in the
+         * ungapped case, only the mirror mismatches on the path the score was taken from count:
+         * all of them, unless the alignment was taken past its peak (the running score peaks at
+         * the score). */
+        const bool rev = ar->rb >= l_pac;
+        struct col_t { int gen, mf, mirror; };
+        static thread_local std::vector<col_t> cols;
+        cols.clear();
+        int q = 0, t = 0;
+        for (int k = 0; k < n_cigar; ++k) {
+            const int op = cigar[k] & 0xf, n = cigar[k] >> 4;
+            if (op == 0) {
+                for (int j = 0; j < n; ++j, ++q, ++t) {
+                    const int qi = rev ? ql - 1 - q : q;
+                    const int64_t ti = rev ? rl - 1 - t : t;
+                    if (qi < 0 || qi >= ql || ti < 0 || ti >= rl) continue;
+                    const int c = ref[ti] * 5 + query[ar->qb + qi];
+                    cols.push_back({ gen[c], mf[c], ref[ti] == ref_m && query[ar->qb + qi] == read_m });
+                }
+            } else if (op == 1) {
+                const int pen = -(opt->o_ins + n * opt->e_ins);
+                cols.push_back({ pen, pen, 0 });
+                q += n;
+            } else if (op == 2) {
+                const int pen = -(opt->o_del + n * opt->e_del);
+                cols.push_back({ pen, pen, 0 });
+                t += n;
+            } else if (op == 4) q += n;
+        }
+        free(cigar);
+        if (rev) std::reverse(cols.begin(), cols.end());
+        const int nc = (int)cols.size();
+        int run = 0, peak = INT_MIN, c1 = 0;
+        for (int i = 0; i < nc; ++i) {
+            run += cols[i].gen;
+            if (run > peak) { peak = run; c1 = i; }
+        }
+        // as in the gap-free case: only an alignment taken past its peak leaves cells out
+        if (run == ar->score || peak != ar->score) c1 = nc - 1;
+        int n_mirror = 0;
+        for (int i = 0; i <= c1 && i < nc; ++i) n_mirror += cols[i].mirror;
+        // the best mirror-free extension on each side (left, right), less what the genomic one
+        // already earned (gleft, gright), as in the gap-free case
+        // (lq: the read base the left extension peaks at; rq: how far past qe the right one does)
+        int left = 0, right = 0, gleft = 0, gright = 0, grun = 0, lq = ar->qb, rq = 0;
+        run = 0;
+        for (int i = ar->qb - 1; i >= 0; --i) {
+            const int64_t at = ar->rb - (ar->qb - i);
+            if (at < lo) break;
+            const int c = win[at - lo] * 5 + query[i];
+            run += mf[c], grun += gen[c];
+            if (run > left) left = run, lq = i;
+            if (grun > gleft) gleft = grun;
+        }
+        run = grun = 0;
+        for (int i = c1 + 1; i < nc; ++i) { // past the peak, then past the span
+            run += cols[i].mf, grun += cols[i].gen;
+            if (run > right) right = run;
+            if (grun > gright) gright = grun;
+        }
+        for (int i = ar->qe; i < l_query; ++i) {
+            const int64_t at = ar->re + (i - ar->qe);
+            if (at >= hi) break;
+            const int c = win[at - lo] * 5 + query[i];
+            run += mf[c], grun += gen[c];
+            if (run > right) right = run, rq = i - ar->qe + 1;
+            if (grun > gright) gright = grun;
+        }
+        gain = (opt->a + opt->b) * n_mirror + (left - gleft) + (right - gright);
+        // the span the raised score is taken over, so that MAPQ's identity reads it on its own span
+        if (gain > 0) {
+            ar->rb -= ar->qb - lq, ar->qb = lq;
+            ar->qe += rq, ar->re += rq;
+        }
+    }
+    if (gain > 0) { ar->score += gain; ar->truesc += gain; }
+}
+
+/* After mem_mark_primary_se(id) (and --primary5, --extend-csub) on a: cap[k] for each region, the
+ * MAPQ the same selection gives on a copy whose regions are rescored (0 for a region that is not
+ * primary there). Returns 0, leaving cap alone, when no competitor's bound can reach a primary's
+ * sub or near-tie margin and no primary can gain beside another primary, or every primary's MAPQ
+ * is already 0 (the cap cannot lower anything). */
+static int mem_meth_blind_se_caps(const mem_opt_t *opt, const bntseq_t *bns, const uint8_t *pac,
+                                  const bseq1_t *s, const mem_alnreg_v *a, int64_t id, int *cap)
+{
+    if (!meth_mapq_conversion_blind(opt) || s->meth_orig_seq == NULL || a->n == 0
+        || !meth_mapq_blind_len(opt, s->l_seq))
+        return 0;
+    const int n = (int)a->n;
+    const int tmp = mem_meth_blind_tmp(opt);
+    // A competitor can lower a primary's MAPQ only by reaching its sub (or its score less tmp,
+    // which counts it in sub_n). Bound each region's mirror-free gain; skip the read when none can.
+    static thread_local std::vector<int> bound;
+    bound.assign(n, 0);
+    int64_t thr = INT64_MAX;
+    bool any_mapq = false; // a cap can only lower a MAPQ above 0
+    for (int k = 0; k < n && !any_mapq; ++k)
+        any_mapq = a->a[k].secondary < 0 && mem_approx_mapq_se(opt, &a->a[k]) > 0;
+    if (!any_mapq) return 0;
+    static thread_local std::vector<int> pc, pg;
+    static thread_local std::vector<uint8_t> query;
+    mem_meth_blind_prefix(s->meth_orig_seq, s->l_seq, &pc, &pg, &query);
+    for (int k = 0; k < n; ++k) {
+        const mem_alnreg_t *p = &a->a[k];
+        bound[k] = mem_meth_blind_bound(opt, bns, pc, pg, p);
+        if (p->secondary >= 0) continue;
+        int sub = p->sub ? p->sub : opt->min_seed_len * opt->a;
+        sub = p->csub > sub ? p->csub : sub;
+        thr = std::min<int64_t>(thr, std::min<int64_t>(sub, (int64_t)p->score - tmp));
+    }
+    /* A secondary can lower a primary's MAPQ only by reaching thr. A primary gaining can lower
+     * another primary's: extended mirror-free over it, it may make that one a secondary (cap 0).
+     * With a single primary, its gain only raises its own MAPQ. */
+    int n_pri = 0;
+    for (int k = 0; k < n; ++k) n_pri += a->a[k].secondary < 0;
+    bool any = false;
+    for (int k = 0; k < n && !any; ++k)
+        any = bound[k] > 0
+              && (a->a[k].secondary >= 0 ? (int64_t)a->a[k].score + bound[k] >= thr : n_pri > 1);
+    if (!any) return 0;
+    static thread_local std::vector<mem_alnreg_t> c;
+    c.assign(a->a, a->a + n);
+    for (int k = 0; k < n; ++k) {
+        c[k].dedup_re_rank = k; // identity through the re-sort below (a scratch field)
+        c[k].sub_n = 0;         // mem_mark_primary_se counts it up from 0
+        if (bound[k] > 0 && (c[k].secondary < 0 || (int64_t)c[k].score + bound[k] >= thr))
+            mem_meth_blind_rescore(opt, bns, pac, s->l_seq, query.data(), &c[k]);
+    }
+    mem_alnreg_v v = { (size_t)n, (size_t)n, c.data(), a->capped_w };
+    // with the real pass's hashes: re-deriving them from the sorted order could swap equal scores
+    mem_mark_primary_se_impl(opt, n, v.a, id, true);
+#if V17
+    if (opt->flag & MEM_F_PRIMARY5) mem_reorder_primary5(opt->T, &v);
+#endif
+    mem_seed_capped_sub(&v, opt->a);
+    for (int j = 0; j < n; ++j)
+        cap[c[j].dedup_re_rank] = c[j].secondary < 0 ? mem_approx_mapq_se(opt, &c[j]) : 0;
+    return 1;
 }
 
 static inline int get_rlen(int n_cigar, const uint32_t *cigar)

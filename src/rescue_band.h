@@ -249,7 +249,7 @@ private:
         int32_t len2, quanta, r0, nrows, dlo, w, parent, key, target;
     };
     struct pstate {
-        int32_t regid, L, S, te, qe, s2, te2, rbuf, rec, round;
+        int32_t regid, L, S, te, qe, s2, te2, ub, rbuf, rec, round; // ub: kswr_t::score2_ub
     };
     /* A queued pass-1 job: the prepared pair, its reversed row count and band [-imax, dmax]. */
     struct p1job {

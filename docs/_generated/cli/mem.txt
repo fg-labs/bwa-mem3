@@ -214,6 +214,24 @@ Methylation (--meth) options:
                  that recompute calls from the reference and the read.
                  Keep XM for Bismark-family tools (bismark_methylation_extractor)
                  and other callers that read the per-base calls from XM:Z.
+   --meth-mapq conversion-blind|scoring
+                 how MAPQ is computed. conversion-blind (default for em-seq with
+                 genomic scoring): MAPQ is capped at an estimate of what the same
+                 scoring gives with C/T (and G/A) interchangeable, at the same
+                 penalties (the alignments found, repriced on their gap
+                 placement); the record's placement, CIGAR and other tags are
+                 unchanged, but for the MAPQ that MQ:i and SA:Z repeat; when
+                 the cap lowers MAPQ the original is kept in YQ:i. Without it a
+                 retained (methylated) C makes a short read look unique, so
+                 filtering on MAPQ inflates CpG methylation. scoring: MAPQ
+                 follows --meth-scoring; the default for collapsed (where the
+                 two agree) and for taps/5base and neutral (which refuse
+                 conversion-blind).
+   --meth-mapq-max-len INT
+                 conversion-blind caps only reads of at most INT bases (a pair:
+                 both ends, when either end is); longer reads keep the scoring
+                 MAPQ, trading a small bias in repeats for less CPU. 0: every
+                 length [0]
    --meth-seed-prune[=spec30|baseline|off]
                  prune the 3-letter alphabet's short, repetitive spurious SMEMs
                  before SA resolution: ~30% faster --meth at ~0 accuracy cost

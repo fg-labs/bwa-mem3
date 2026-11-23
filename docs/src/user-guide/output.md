@@ -205,6 +205,13 @@ per-tag reference, including the `XM:Z` character alphabet and the
 | `XG:Z` | string | Genome strand of the alignment: `CT` (OT) or `GA` (OB) |
 | `XM:Z` | string | Per-base methylation call string (length = `SEQ`) |
 
+`--meth` also writes `YQ:i` (integer) on a record whose MAPQ the conversion-blind cap (the em-seq
+`genomic` default) lowered: the MAPQ it would have without the cap
+([`--meth-mapq`](../methylation/flags.md#--meth-mapq-conversion-blindscoring)). The cap applies to
+every read by default; `--meth-mapq-max-len INT` limits it to reads of at most `INT` bases, except
+that a pair is capped as a whole when either end is that short, so a 100-base mate of a 40-base
+read can carry `YQ:i` under `--meth-mapq-max-len 60`.
+
 The bwameth-style `YS:Z` / `YC:Z` tags exist only as an internal carrier
 on `bseq1_t.comment` for SEQ restoration and `XR:Z` derivation; they
 are suppressed at BAM emit and never appear in output. The bwameth
