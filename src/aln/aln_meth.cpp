@@ -283,6 +283,7 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     const int64_t ceiling = fewest_d >= INT_MAX - 1 ? INT_MAX : fewest_d + 1;
     const int64_t search = search_ceiling(x, ceiling);
     if (search < job->max_diff) job->max_diff = (int)search;
+    if (ceiling < x->gen_max_diff) x->gen_max_diff = (int)ceiling;
     // Count the best loci the finish keeps: those within the ceiling, and under the TAPS/5base
     // tie-break the fewest-conversion ones of them.
     auto kept = [&](const aln_meth_occ_t &o) { return o.cost == x->best && diffs(o) <= ceiling; };
@@ -290,7 +291,12 @@ int aln_meth_boundary(aln_meth_slot_t *x, int next)
     if (conv) for (const auto &o : x->res->occ) if (kept(o)) fewest = std::min(fewest, o.n_conv);
     long n = 0;
     for (const auto &o : x->res->occ) n += kept(o) && (!conv || o.n_conv == fewest);
-    return n > opt.max_top2 && (!x->blind || blind_stop_ok(x, next));
+    if (n <= opt.max_top2) return 0;
+    if (!x->blind) return 1;
+    // The genomic search ends here: every later hit feeds the mirror-free strata alone
+    // (aln_meth_hit), so the genomic result is the one this stop gives.
+    x->gen_stopped = 1;
+    return blind_stop_ok(x, next);
 }
 void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t l)
 {
@@ -302,6 +308,13 @@ void aln_meth_hit(aln_meth_slot_t *x, const gap_entry_t *e, bwtint_t k, bwtint_t
     entry_gaps(x, *e, h.gap);
     aln_meth_iv_key_t key{k, l, (uint32_t)e->n_gapo, {h.gap[0], h.gap[1], h.gap[2], h.gap[3]}};
     if (!x->intervals.insert(key, 0).second) return;
+    // Under conversion-blind a path with more differences than stock's ceiling is one only the
+    // widened ceiling (search_ceiling) reaches: without it the search would have pruned it. Its rows
+    // must not change the genomic selection (an equal-cost row could replace a locus's row), so they
+    // go to the mirror-free strata alone. Equal intervals and gaps give equal differences, and the
+    // ceiling only falls, so the dedup above keeps this consistent.
+    const int diffs = (int)e->n_mm + e->n_gapo + ((x->grp->opt->mode & BWA_MODE_GAPE) ? e->n_gape : 0);
+    h.blind_only = x->blind && (x->gen_stopped || diffs > x->gen_max_diff);
     x->pend.push_back(h);
 }
 const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_read_t *res, int64_t ord, int max_diff, int has_copy)
@@ -321,7 +334,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     }
     x->pend.clear(); x->windows.clear(); x->intervals.clear(); x->loci.clear(); x->garena.clear();
     x->mirror_loci.clear(); x->mirror_bytes = 0;
-    x->sa_ix.clear(); x->sa_rows.clear();
+    x->sa_ix.clear(); x->sa_rows.clear(); x->sa_gen.clear(); x->blind_lookups = 0;
     x->bits_ready = 0;
     x->alignment_bytes = 0; x->unrep_cost = INT64_MAX;
     x->final_flush = x->stop = 0;
@@ -331,6 +344,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
         !x->grp->ref->no_cut;
     x->best = INT64_MAX; x->flushed = 0;
     x->blind = x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m);
+    x->gen_max_diff = INT_MAX; x->blind_only = 0; x->gen_stopped = 0;
     return x->vseq.data();
 }
 static bool conv_tiebreak(const aln_meth_opt_t *mo)
@@ -649,7 +663,10 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
 {
     aln_meth_group_t *g = x->grp;
     // --meth-mapq conversion-blind observes every row before the filters below.
-    if (o.n_mirror && g->mo && meth_mapq_conversion_blind(&g->mo->m)) store_mirror_row(x, o, seed_diffs, bounded, seed_mirror);
+    // A row only the widened ceiling reaches (blind_only) is for the mirror-free strata alone.
+    if ((o.n_mirror || x->blind_only) && g->mo && meth_mapq_conversion_blind(&g->mo->m))
+        store_mirror_row(x, o, seed_diffs, bounded, seed_mirror);
+    if (x->blind_only) return;
     // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
     // seed than -k allows. The converted search cannot see a read C over a reference T, so it can
     // reach a row within -n (-k) converted differences whose original-reference path has more; drop
@@ -778,13 +795,17 @@ static void resolve_window(aln_meth_slot_t *x, const aln_meth_pend_t &h, bwtint_
     // A 65535-base read with a deletion spans more than a window holds. Drop the window as
     // unrepresentable, with cost 0 as its bound: any retained placement is then incomplete.
     if (span > ALN_MAX_READ_LEN) {
+        if (h.blind_only) return; // the genomic search would not have reached it
         ++x->res->n_unrepresentable;
         x->unrep_cost = 0;
         return;
     }
     const int seed_gaps = x->job && x->job->seed_width
         ? seed_gap_diffs(h.gap, h.e.n_gapo, x->job->c.seed_off, g->opt->mode & BWA_MODE_GAPE) : 0;
-    if (!score_row_sites(x, key.lay, rid, hyp, strand, rb, span, seed_gaps, false)) {
+    x->blind_only = h.blind_only;
+    const bool scored = score_row_sites(x, key.lay, rid, hyp, strand, rb, span, seed_gaps, false);
+    x->blind_only = 0;
+    if (!scored) {
         fprintf(stderr, "ERROR: --meth search path (%d gaps: %#x %#x %#x %#x) is not an alignment of the %d-base read\n",
                 (int)h.e.n_gapo, h.gap[0], h.gap[1], h.gap[2], h.gap[3], x->len);
         exit(1);
@@ -856,10 +877,19 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             size_t pos;
             return x.sa_ix.find(aln_meth_kl_key_t{h.k, h.l}, &pos);
         };
+        // --meth-mapq conversion-blind: a blind_only hit (aln_meth_hit) is one the genomic search
+        // would not have made, so its lookups come from a budget of their own (blind_lookups; past
+        // it the mirror-free strata are incomplete, blind_incomplete) and never bind the read. An
+        // interval only such a hit looked up (sa_gen 0) still costs a genomic hit its lookups, as
+        // it would have without them, so the genomic search is the same with and without the cap.
+        auto gen_cached = [&](const aln_meth_pend_t &h) {
+            const int32_t c = cached(h);
+            return c >= 0 && x.sa_gen[c] ? c : -1;
+        };
         // Two paths can reach one uncached interval in the same flush: its rows are looked up once.
         static thread_local std::vector<std::pair<bwtint_t, bwtint_t>> fresh;
         fresh.clear();
-        for (const auto &h : x.pend) if (cached(h) < 0) fresh.emplace_back(h.k, h.l);
+        for (const auto &h : x.pend) if (!h.blind_only && gen_cached(h) < 0) fresh.emplace_back(h.k, h.l);
         std::sort(fresh.begin(), fresh.end());
         fresh.erase(std::unique(fresh.begin(), fresh.end()), fresh.end());
         int64_t limit = budget, pending = 0;
@@ -870,20 +900,46 @@ void aln_meth_flush_parked(aln_meth_group_t *g)
             if (x.stop) break;
             const bwtint_t width = h.l - h.k + 1;
             const int32_t c = cached(h);
-            if (c >= 0) {
+            if (c >= 0 && (h.blind_only || x.sa_gen[c])) {
                 const size_t off = x.sa_ix.val[c];
                 for (bwtint_t r = 0; r < width && !x.stop; ++r) resolve_window(&x, h, x.sa_rows[off + r]);
                 continue;
             }
+            if (h.blind_only) {
+                if (x.res->blind_incomplete) continue;
+                const int n = (int)std::min<uint64_t>(width, (uint64_t)std::max<int64_t>(0, budget - x.blind_lookups));
+                const size_t off = x.sa_rows.size();
+                x.sa_rows.resize(off + n);
+                bwtint_t *rows = x.sa_rows.data() + off;
+                for (int k = 0; k < n; ++k) rows[k] = h.k + k;
+                bwt_sa_batch(g->bwt, rows, n, rows);
+                if ((bwtint_t)n == width) {
+                    x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
+                    x.sa_gen.push_back(0);
+                }
+                x.blind_lookups += n;
+                for (int k = 0; k < n && !x.stop; ++k) resolve_window(&x, h, x.sa_rows[off + k]);
+                if ((bwtint_t)n < width) x.res->blind_incomplete = 1;
+                continue;
+            }
             const int64_t remaining = limit - x.res->n_lookups;
             const int n = (int)std::min<uint64_t>(width, (uint64_t)std::max<int64_t>(0, remaining));
-            const size_t off = x.sa_rows.size();
-            x.sa_rows.resize(off + n);
-            bwtint_t *rows = x.sa_rows.data() + off;
-            for (int k = 0; k < n; ++k) rows[k] = h.k + k;
-            bwt_sa_batch(g->bwt, rows, n, rows);
-            if ((bwtint_t)n == width) x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
-            for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
+            if (c >= 0) { // rows a blind_only hit looked up: counted as the genomic search looks them up
+                const size_t off = x.sa_ix.val[c];
+                if ((bwtint_t)n == width) x.sa_gen[c] = 1;
+                for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
+            } else {
+                const size_t off = x.sa_rows.size();
+                x.sa_rows.resize(off + n);
+                bwtint_t *rows = x.sa_rows.data() + off;
+                for (int k = 0; k < n; ++k) rows[k] = h.k + k;
+                bwt_sa_batch(g->bwt, rows, n, rows);
+                if ((bwtint_t)n == width) {
+                    x.sa_ix.insert(aln_meth_kl_key_t{h.k, h.l}, off);
+                    x.sa_gen.push_back(1);
+                }
+                for (int k = 0; k < n && !x.stop; ++k) { ++x.res->n_lookups; resolve_window(&x, h, x.sa_rows[off + k]); }
+            }
             // A CIGAR stop on this interval's looked-up rows is final: keep it over the lookup
             // stop, which aln_meth_slot_finish lifts to resolve the ALT-window candidates.
             if ((bwtint_t)n < width) {
@@ -1413,7 +1469,7 @@ static int meth_blind_main_mapq(const aln_meth_read_t *r, const bwa_seq_t *s, co
 static int meth_blind_se_cap(const aln_meth_read_t *r, const bwa_seq_t *s, const gap_opt_t *opt)
 {
     if (r->main < 0 || r->flags) return 255;
-    if (r->blind_partial) return 0;
+    if (r->blind_partial || r->blind_incomplete) return 0; // the strata are not known
     if (r->blind_best == INT64_MAX) return 255;
     const aln_meth_blind_row_t m = aln_meth_blind_view(*r, r->hits[r->main], opt->s_mm);
     if (m.cost > r->blind_best) return 0;
