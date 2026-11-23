@@ -2805,6 +2805,196 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata take the mirror-
     }
 }
 
+TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's selection")
+{
+    // A property test of the conversion-blind cuts: on a seeded synthetic reference, the strata a
+    // genomic search builds with the mirror cell freed (blind_best, blind_c1, blind_c2, and the
+    // loci: the hits within them plus blind_rows) must be what collapsed scoring, which frees the
+    // mirror cell itself, selects (its best, c1, c2 and hits). Each family is a 50-base segment
+    // whose read 1 keeps some Cs; its copies carry mirror cells (a T under a kept C), real
+    // mismatches and one-base gaps. Planted families: the gapped-best triple (a one-gap best, a
+    // mirror-free best with three mismatches and a mirror, a four-mismatch locus only the
+    // mirror-free ceiling keeps), the -R case (three best loci at 12, a gapped mirror locus at
+    // mirror-free 11, and a locus at 14 past the stop), and a copy past the genomic cut that the
+    // search reaches after the best. Reads where either side stops on -R are skipped: past such a
+    // stop the second stratum is partial, as in stock aln.
+    namespace ba = bwa_aln;
+    bwa_tests::TempDir tmp{"aln_meth_blind_property"};
+    const std::string fa = tmp.path() + "/blind-property.fa";
+    uint32_t st = 20261123;
+    const int len = 50;
+    auto rnd = [&](int n) { st = st * 1103515245u + 12345u; return (int)((st >> 8) % (uint32_t)n); };
+    auto alt = [](char c) { return c == 'G' ? 'A' : 'G'; }; // never T: cannot match a converted C
+    auto convert = [](std::string s, const std::set<int> &keep) {
+        for (int i = 0; i < (int)s.size(); ++i)
+            if (s[i] == 'C' && !keep.count(i)) s[i] = 'T';
+        return s;
+    };
+    // A copy of seg: a T under each position of mirror, a mismatch against the read at each of
+    // real (read is seg converted, so the substitute is never T and never C), then one gap at
+    // gap_at (del: the copy lacks a base, so the read has an insertion; ins: the copy has one more).
+    auto copy_of = [&](std::string seg, const std::set<int> &mirror, const std::set<int> &real, int gap_at, bool del) {
+        const std::string read = convert(seg, {});
+        for (int p : mirror) seg[p] = 'T';
+        for (int p : real) seg[p] = alt(read[p]);
+        if (gap_at >= 0) {
+            if (del) seg.erase(gap_at, 1);
+            else seg.insert(gap_at, 1, alt(seg[gap_at]));
+        }
+        return seg;
+    };
+    // A segment with Cs at the positions of meth (the methylated Cs a read can keep).
+    auto segment = [&](const std::set<int> &meth) {
+        std::string s = aln_test::lcg_dna(st, len);
+        for (int p : meth) s[p] = 'C';
+        return s;
+    };
+    // Distinct positions in [lo, hi) outside avoid.
+    auto positions = [&](int n, int lo, int hi, const std::set<int> &avoid) {
+        std::set<int> out;
+        while ((int)out.size() < n) {
+            const int p = lo + rnd(hi - lo);
+            if (!avoid.count(p)) out.insert(p);
+        }
+        return out;
+    };
+    std::vector<std::pair<std::string, std::string>> contigs;
+    std::vector<std::string> reads;
+    auto family = [&](const std::vector<std::string> &copies) {
+        std::string c = aln_test::lcg_dna(st, 80);
+        for (const auto &k : copies) c += k + aln_test::lcg_dna(st, 60 + rnd(60));
+        contigs.emplace_back("f" + std::to_string(contigs.size()), c);
+    };
+    {   // the gapped-best triple
+        const std::set<int> meth = {12};
+        const std::string seg = segment(meth);
+        family({copy_of(seg, {}, {}, 25, true), copy_of(seg, meth, positions(3, 0, len, meth), -1, false),
+                copy_of(seg, {}, positions(4, 0, len, meth), -1, false)});
+        reads.push_back(convert(seg, meth));
+    }
+    {   // -R: three loci at 12, one at genomic 14 / mirror-free 11, one at 14 past the stop
+        const std::set<int> meth = {12};
+        const std::string seg = segment(meth);
+        std::vector<std::string> copies;
+        for (int k = 0; k < 3; ++k) copies.push_back(copy_of(seg, {}, positions(4, 0, len, meth), -1, false));
+        copies.push_back(copy_of(seg, meth, {}, 30, true));
+        copies.push_back(copy_of(seg, {}, positions(1, 0, len, meth), 30, true));
+        family(copies);
+        reads.push_back(convert(seg, meth));
+    }
+    {   // a copy past the genomic cut, reached after the best
+        const std::set<int> meth = {20};
+        const std::string seg = segment(meth);
+        family({seg, copy_of(seg, meth, positions(1, 0, len, meth), -1, false)});
+        reads.push_back(convert(seg, meth));
+    }
+    for (int f = 0; f < 80; ++f) {
+        const std::set<int> meth = positions(1 + rnd(3), 5, len - 5, {});
+        const std::string seg = segment(meth);
+        std::vector<std::string> copies;
+        const int n_copies = 2 + rnd(6);
+        for (int k = 0; k < n_copies; ++k) {
+            std::set<int> mirror;
+            for (int p : meth)
+                if (rnd(3) == 0) mirror.insert(p);
+            const int gap = rnd(10);
+            copies.push_back(copy_of(seg, mirror, positions(rnd(5), 0, len, meth), gap < 3 ? 15 + rnd(20) : -1, gap == 0));
+        }
+        family(copies);
+        reads.push_back(convert(seg, meth));
+        std::set<int> some;
+        for (int p : meth)
+            if (rnd(2)) some.insert(p);
+        reads.push_back(convert(seg, some));
+    }
+    REQUIRE(aln_test::write_test_fasta(fa, contigs));
+    std::vector<std::string> args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &s : args) argv.push_back(&s[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)args.size(), argv.data()) == 0);
+    FMI_search fmi((fa + ".meth").c_str());
+    fmi.load_index(false, 1, true, BWAMEM_HUGETLB_OFF, false);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, fa.c_str(), fmi.idx->bns, 1) == 0);
+    const auto fq = write_fq_in(tmp.path(), "blind-property.fq", reads);
+    const int n_reads = (int)reads.size();
+    auto *opt = ba::gap_init_opt();
+    opt->fnr = -1; opt->max_diff = 5;
+    // the planted cases' arithmetic is at the default penalties; the random families also run at
+    // M=1, O=3, E=1, where gaps are cheap against mismatches
+    using Key = std::tuple<int, bwtint_t, int64_t>; // strand, position, mirror-free cost
+    long compared = 0, with_blind_rows = 0;
+    for (const auto &pen : {std::vector<int>{3, 11, 4}, std::vector<int>{1, 3, 1}})
+        for (int max_top2 : {30, 2})
+            for (int seed_len : {1024, 20}) {
+                CAPTURE(pen[0]); CAPTURE(max_top2); CAPTURE(seed_len);
+                opt->s_mm = pen[0]; opt->s_gapo = pen[1]; opt->s_gape = pen[2];
+                opt->max_top2 = max_top2; opt->seed_len = seed_len;
+                std::vector<ba::aln_meth_read_t> res[2];
+                for (int collapsed = 0; collapsed < 2; ++collapsed) {
+                    ba::aln_meth_opt_t mo;
+                    mo.m.meth_mode = 1;
+                    mo.m.meth_scoring = collapsed ? MEM_METH_SCORING_COLLAPSED : MEM_METH_SCORING_GENOMIC;
+                    mo.m.meth_mapq = collapsed ? MEM_METH_MAPQ_SCORING : MEM_METH_MAPQ_CONVERSION_BLIND;
+                    ba::aln_meth_opt_finish(&mo);
+                    auto *input = ba::bwa_seq_open(fq.c_str());
+                    int n = 0;
+                    auto *seqs = ba::bwa_read_seq(input, n_reads, &n, BWA_MODE_COMPREAD, 0);
+                    REQUIRE(n == n_reads);
+                    res[collapsed].resize(n);
+                    ba::aln_dup_state_t dup;
+                    ba::aln_meth_search_batch(bwt, &mr, &mo, n, seqs, opt, 1, 1, 0, 1, 1000, &dup, res[collapsed].data());
+                    ba::bwa_free_read_seq(n, seqs);
+                    ba::bwa_seq_close(input);
+                }
+                for (int i = 0; i < n_reads; ++i) {
+                    CAPTURE(i);
+                    const ba::aln_meth_read_t &g = res[0][i], &c = res[1][i];
+                    if (g.flags || c.flags || g.hits.empty() || c.hits.empty()) continue;
+                    if (c.c1 > max_top2 || g.blind_c1 > max_top2) continue;
+                    const bool gape = opt->mode & BWA_MODE_GAPE;
+                    std::vector<std::pair<Key, int>> cand; // a locus and its mirror-free differences
+                    for (const auto &h : g.hits)
+                        cand.emplace_back(Key{h.strand, h.pos, (int64_t)h.cost - (int64_t)opt->s_mm * h.n_mirror},
+                                          h.n_mm - h.n_mirror + h.n_gapo + (gape ? h.n_gape : 0));
+                    for (const auto &b : g.blind_rows)
+                        cand.emplace_back(Key{b.strand, b.pos, b.cost}, b.n_mm + b.n_gapo + (gape ? b.n_gape : 0));
+                    int64_t best = INT64_MAX;
+                    for (const auto &e : cand) best = std::min(best, std::get<2>(e.first));
+                    int fewest = INT_MAX;
+                    for (const auto &e : cand)
+                        if (std::get<2>(e.first) == best) fewest = std::min(fewest, e.second);
+                    std::set<Key> blind, want;
+                    for (const auto &e : cand)
+                        if (std::get<2>(e.first) <= best + opt->s_mm && e.second <= fewest + 1) blind.insert(e.first);
+                    int64_t c_best = INT64_MAX;
+                    for (const auto &h : c.hits) {
+                        want.emplace(h.strand, h.pos, h.cost);
+                        c_best = std::min(c_best, (int64_t)h.cost);
+                    }
+                    CHECK(g.blind_best == c_best);
+                    CHECK(g.blind_c1 == c.c1);
+                    CHECK(g.blind_c2 == c.c2);
+                    CHECK(blind == want);
+                    ++compared;
+                    with_blind_rows += !g.blind_rows.empty();
+                }
+                for (auto &v : res) v.clear();
+            }
+    // the test compares most reads, and some of them through rows only the mirror-free strata keep
+    CHECK(compared > 8 * 100);
+    CHECK(with_blind_rows > 0);
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
+}
+
 TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few more rows")
 {
     namespace ba = bwa_aln;
