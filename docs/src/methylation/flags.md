@@ -189,10 +189,13 @@ comes out too high.
   less one mismatch penalty per mirror mismatch: exact for an ungapped locus, while a
   gapped locus is not realigned with the mirror cell free. A row that `-n` (or the
   seed's `-k`) dropped only for its mirror mismatches counts too, since with the mirror
-  cell free it is within the limit, as under `collapsed`. Placement, CIGAR, `NM`,
+  cell free it is within the limit, as under `collapsed`; under `--known-snvs` that
+  includes such a row of the ALT-window search, which can be the only search to reach a
+  placement with a site's ALT ([#820](https://github.com/fg-labs/bwa-mem3/pull/820)). Placement, CIGAR, `NM`,
   `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
-  is `genomic`'s in every field but MAPQ. A record whose MAPQ the cap lowered
-  carries the uncapped MAPQ in `YQ:i`, whatever `--meth-tags` selects. The other
+  is `genomic`'s in every field but MAPQ and, under `--known-snvs`, the `XV:Z`
+  twin MAPQ. A record whose MAPQ the cap lowered carries the uncapped MAPQ in
+  `YQ:i`, whatever `--meth-tags` selects. The other
   confidence fields stay `genomic`'s: `XT:A`, `X0:i`/`X1:i` and, for paired reads,
   `SM:i`/`AM:i` (the single-end MAPQs), so filter on MAPQ, not on those
   ([#816](https://github.com/fg-labs/bwa-mem3/pull/816)).

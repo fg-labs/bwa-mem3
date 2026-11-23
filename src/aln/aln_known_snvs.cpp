@@ -809,19 +809,43 @@ void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const aln_me
 						std::vector<aln_meth_candidate_t> *out)
 {
 	out->clear();
-	for (const aln_meth_hit_t &h : wres.hits) {
-		if (h.rid < 0 || h.rid >= (int)w->win.size()) continue;
-		const ks_window_t &win = w->win[h.rid];
-		const int64_t off = (int64_t)h.pos - w->bns->anns[h.rid].offset;
-		if (off < 0 || off + h.span > win.len) continue;
+	// The original-reference start of a window-index row at pos spanning span bases of window rid,
+	// or -1 when the row leaves its window or misses its site.
+	auto genomic_rb = [&](int rid, int64_t pos, int64_t span) -> int64_t {
+		if (rid < 0 || rid >= (int)w->win.size()) return -1;
+		const ks_window_t &win = w->win[rid];
+		const int64_t off = pos - w->bns->anns[rid].offset;
+		if (off < 0 || off + span > win.len) return -1;
 		const int64_t beg = win.beg + off;
-		if (win.site_pos < beg || win.site_pos >= beg + h.span) continue; // misses its site
-		const int64_t rb = bns->anns[win.rid].offset + beg;
+		if (win.site_pos < beg || win.site_pos >= beg + span) return -1; // misses its site
+		return bns->anns[win.rid].offset + beg;
+	};
+	for (const aln_meth_hit_t &h : wres.hits) {
+		const int64_t rb = genomic_rb(h.rid, (int64_t)h.pos, h.span);
+		if (rb < 0) continue;
+		const ks_window_t &win = w->win[h.rid];
 		// The candidate is the search path (raw CIGAR and bounds), not the display alignment: the
 		// genomic search scores it as it scores its own rows, terminal gaps included.
 		int lead, trail;
-		std::vector<uint32_t> path = ks_hit_path(aln_meth_hit_cigar(wres, h), h.n_cig, h, off, win.len, &lead, &trail);
+		std::vector<uint32_t> path = ks_hit_path(aln_meth_hit_cigar(wres, h), h.n_cig, h,
+												 (int64_t)h.pos - w->bns->anns[h.rid].offset, win.len, &lead, &trail);
 		out->push_back({win.rid, (int)h.strand, (int)h.hyp, rb - lead, rb + h.span + trail, std::move(path)});
+	}
+	// --meth-mapq conversion-blind: the rows the window search's -n (or -k) limit dropped only for
+	// their mirror mismatches (blind_over, display bounds and search path). The main search
+	// rescores them along their paths for its mirror-free strata alone (blind: never a locus, so
+	// placement and every field but MAPQ stay as they are), as collapsed scoring keeps such a row
+	// as a locus. Without them a placement that only an ALT window reaches is missing from those
+	// strata.
+	for (const aln_meth_occ_t &o : wres.blind_over) {
+		const std::vector<uint32_t> &path = o.alignment.raw_cigar;
+		const int64_t span = o.alignment.re - o.alignment.rb;
+		const int64_t rb = path.empty() ? -1 : genomic_rb(o.rid, o.alignment.rb, span);
+		if (rb < 0) continue;
+		// a terminal deletion is on the path, not in the display bounds
+		const int64_t lead = (path.front() & 15) == 2 ? path.front() >> 4 : 0;
+		const int64_t trail = path.size() > 1 && (path.back() & 15) == 2 ? path.back() >> 4 : 0;
+		out->push_back({w->win[o.rid].rid, o.strand, o.hyp, rb - lead, rb + span + trail, path, true});
 	}
 }
 

@@ -499,8 +499,11 @@ static bool within_read_limits(const aln_meth_slot_t *x, const aln_meth_occ_t &o
     return diffs <= x->max_diff && o.n_gapo <= std::max(0, op->max_gapo) && o.n_gape <= std::max(0, op->max_gape);
 }
 // Applies the strict -n/-k filters and stores o as its locus's candidate (the cheaper wins).
-// seed_mirror: the mirror-cell mismatches among seed_diffs.
-static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, bool bounded = false, int seed_mirror = 0)
+// seed_mirror: the mirror-cell mismatches among seed_diffs. blind_only (a row of a candidate from
+// the ALT-window search's blind_over, ks_meth_candidates): o is never a locus; it is kept only for
+// the mirror-free strata (blind_over), under the same mirror-free limits as a row over -n or -k.
+static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, bool bounded = false, int seed_mirror = 0,
+                      bool blind_only = false)
 {
     aln_meth_group_t *g = x->grp;
     // Stock aln never reports a hit with more differences than the read's -n allows, or more in its
@@ -513,18 +516,19 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     const bool seeded = x->job && x->job->seed_width;
     const bool over_diff = differences > x->max_diff;
     const bool over_seed = !over_diff && seed_diffs > g->opt->max_seed_diff && seeded;
-    if (over_diff || over_seed) {
-        ++(over_diff ? x->res->n_over_diff : x->res->n_over_seed);
+    if (blind_only || over_diff || over_seed) {
+        if (!blind_only) ++(over_diff ? x->res->n_over_diff : x->res->n_over_seed);
         // --meth-mapq conversion-blind: a row within -n and -k once its mirror mismatches are free
         // is a mirror-free locus (blind_over), as collapsed scoring keeps it, subject to the same
-        // representability and limits. Its CIGARs are not kept.
+        // representability and limits. Its CIGARs are not kept, but for the search path of an
+        // ALT-window search's row (--known-snvs), which the main search rescores (ks_meth_candidates).
         if (differences - o.n_mirror <= x->max_diff
             && (!seeded || seed_diffs - seed_mirror <= g->opt->max_seed_diff)
             && o.cost <= INT_MAX && o.n_mm <= 255 && o.n_gapo <= 255 && o.n_gape <= 255
             && !(bounded && !within_read_limits(x, o, true))
             && g->mo && meth_mapq_conversion_blind(&g->mo->m)) {
             o.pos = o.alignment.rb;
-            std::vector<uint32_t>().swap(o.alignment.raw_cigar);
+            if (!g->ref || !g->ref->is_window()) std::vector<uint32_t>().swap(o.alignment.raw_cigar);
             std::vector<uint32_t>().swap(o.alignment.cigar);
             x->res->blind_over.push_back(std::move(o));
         }
@@ -563,7 +567,7 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
 // window with that ALT alone in place (as resolve_with_sites does for a refined window); a site the
 // row does not cover leaves it as the reference's. false: L is not an alignment of the read.
 static bool score_row_sites(aln_meth_slot_t *x, const aln_meth_layout_t &L, int rid, int hyp, int strand,
-                            int64_t rb, int span, int seed_gaps, bool bounded)
+                            int64_t rb, int span, int seed_gaps, bool bounded, bool blind_only = false)
 {
     aln_meth_group_t *g = x->grp;
     auto one = [&](int64_t site) {
@@ -574,7 +578,7 @@ static bool score_row_sites(aln_meth_slot_t *x, const aln_meth_layout_t &L, int 
             o.alt = ks_site_rel(g->ref->known_snvs, g->ref->bns, rid, o.alignment.rb, site);
             if (aln_site_key_pos(site) < o.alignment.rb || aln_site_key_pos(site) >= o.alignment.re || !o.alt) return true;
         }
-        store_row(x, o, seed_mm + seed_gaps, bounded, seed_mirror);
+        store_row(x, o, seed_mm + seed_gaps, bounded, seed_mirror, blind_only);
         return true;
     };
     if (!one(-1)) return false;
@@ -966,10 +970,15 @@ static __attribute__((noinline)) void meth_blind_strata(aln_meth_read_t *r, cons
     }
     std::vector<aln_meth_occ_t>().swap(r->blind_over);
 }
-// The --meth-mapq gate for meth_blind_strata, out of line so slot_finish keeps a single call here.
+// The --meth-mapq gate for meth_blind_strata, out of line so each of slot_finish's exits keeps a
+// single call here. cut < 0: the read has no locus, so no record to cap; blind_over is released. An ALT-window
+// search (--known-snvs) caps no record either way: it keeps its blind_over rows for the main
+// search (ks_meth_candidates), whose strata count them.
 static __attribute__((noinline)) void meth_blind_cap(const aln_meth_slot_t *x, aln_meth_read_t *r, int64_t cut)
 {
-    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(r, x->grp->opt, cut);
+    if (x->grp->ref && x->grp->ref->is_window()) return;
+    if (cut >= 0 && x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(r, x->grp->opt, cut);
+    else std::vector<aln_meth_occ_t>().swap(r->blind_over);
 }
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
@@ -989,6 +998,8 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
             const bool path = !c.cig.empty() && cigar_layout(c.cig.data(), c.cig.size(), &key.lay) &&
                 layout_span(key.lay, x->len) == span;
             if (!path) key.lay.n = -1;
+            // a blind_over row is scored along its path only, and never makes the read incomplete
+            if (c.blind && (!path || span > ALN_MAX_READ_LEN)) continue;
             if (!x->windows.insert(key, 0).second) continue;
             // As in resolve_window: a span past a window's limit is dropped as unrepresentable.
             if (span > ALN_MAX_READ_LEN) {
@@ -996,13 +1007,13 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
                 x->unrep_cost = 0;
                 continue;
             }
-            if (path) { score_row_sites(x, key.lay, c.rid, c.hyp, c.strand, c.rb, (int)span, 0, true); continue; }
+            if (path) { score_row_sites(x, key.lay, c.rid, c.hyp, c.strand, c.rb, (int)span, 0, true, c.blind); continue; }
             const ubyte_t *query = c.strand ? x->rd_rev.data() : x->rd_fwd.data();
             resolve_with_sites(x, c, query, std::max(0, x->len - (int)span), std::max(0, (int)span - x->len), true);
         }
     }
     if (r->occ.empty()) {
-        std::vector<aln_meth_occ_t>().swap(r->blind_over); // no record to cap
+        meth_blind_cap(x, r, -1); // no record to cap: releases blind_over (an ALT-window search keeps it)
         // Every candidate was dropped: any of them could have been the best locus.
         if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
         return;

@@ -6,7 +6,10 @@ namespace bwa_aln {
 /* Original forward-reference half-open window. Query is already oriented to this strand. */
 /* cig, when set: the raw CIGAR of a search path to the window (a --known-snvs window hit's), which
  * the main search scores as one of its own paths. */
-struct aln_meth_candidate_t { int rid, strand, hyp; int64_t rb, re; std::vector<uint32_t> cig; };
+// blind: a row the ALT-window search's -n (or -k) limit dropped only for its mirror mismatches
+// (ks_meth_candidates), which only the --meth-mapq conversion-blind strata count. Brace-initialize
+// a candidate: an omitted blind is false.
+struct aln_meth_candidate_t { int rid, strand, hyp; int64_t rb, re; std::vector<uint32_t> cig; bool blind; };
 enum class aln_meth_eval_status { ok, invalid_input, resource_error, no_alignment };
 /* Fetch a validated forward-reference window (length <=65535), masking .amb runs to code N
  * before CpG labelling. Used only by aln's methylation refinement, accounting and emission. */

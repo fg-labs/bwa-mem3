@@ -800,7 +800,7 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 			return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(),
 				[](const aln_meth_candidate_t &x, const aln_meth_candidate_t &y) {
 					return x.rid == y.rid && x.strand == y.strand && x.hyp == y.hyp && x.rb == y.rb && x.re == y.re &&
-						x.cig == y.cig;
+						x.cig == y.cig && x.blind == y.blind;
 				});
 		});
 	for (int i = 0; i < n_seqs; ++i)
