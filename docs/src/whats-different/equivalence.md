@@ -23,6 +23,10 @@ MAPQ is by default capped at a conversion-blind MAPQ, with a lowered record's un
 The cap takes each locus at its cheapest row with the mirror cell free (the row `collapsed`
 keeps), not at the row the `genomic` search keeps there, so where a locus has several rows
 the cap can differ from that of earlier versions ([PR #821](https://github.com/fg-labs/bwa-mem3/pull/821)).
+In paired-end runs the cap reruns the pairing `collapsed` makes, from the main hits `collapsed`
+draws for its ends, at its single-end MAPQs and with the insert size it infers, so paired-end
+MAPQs can differ from those of earlier versions; placement and every other field are unchanged
+([PR #822](https://github.com/fg-labs/bwa-mem3/pull/822)).
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,

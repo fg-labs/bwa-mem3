@@ -673,10 +673,14 @@ stock cut, each at its cheapest row with the mirror cell free (cost minus `-M` p
 mismatch, among the rows the search scored there; the row `collapsed` keeps), together with any
 row the `-n` (or seed `-k`) limit dropped only for its mirror mismatches (with the mirror cell
 free it is within the limit, as under `collapsed`), and a locus that is then cheaper than the
-primary gives a cap of 0. Paired-end ends take the MAPQ of the same stock pairing run on those
-costs (including the loci only the mirror-free strata keep), and a rescued mate its anchor's.
-An end with more than `--max-occ` such loci would not pair, so each end keeps its single-end cap,
-or gets 0 if pairing moves it.
+primary gives a cap of 0. Paired-end ends take the MAPQ of the stock pairing `collapsed` makes:
+on those loci (including the loci only the mirror-free strata keep), from the main hits
+`collapsed` draws for its ends, with `collapsed`'s single-end MAPQs and the insert size it infers
+from them. An end that pairing places elsewhere gets 0, and a rescued mate its anchor's cap
+(and at most that pairing's MAPQ there when it pairs the ends properly; `collapsed`'s own mate
+rescue is not rerun). An
+end with more than `--max-occ` such loci is not paired, as under `collapsed`, so each end keeps
+`collapsed`'s single-end MAPQ, or gets 0 if that is at another locus.
 Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
 and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. At a `--known-snvs` ALT window the
 rows come from the window search's `genomic` selection, and a window without a search path is
