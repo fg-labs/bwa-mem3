@@ -1780,10 +1780,10 @@ TEST_CASE("aln_meth: the -R stop counts only best loci within the final differen
     slot.job = &job;
     ba::aln_meth_read_t result; slot.res = &result;
     for (int i = 0; i < 31; ++i) {
-        ba::aln_meth_occ_t o; o.cost = 3; o.n_mm = 3; o.pos = 1000 * (i + 1);
+        ba::aln_meth_occ_t o{}; o.cost = 3; o.n_mm = 3; o.pos = 1000 * (i + 1);
         result.occ.push_back(o);
     }
-    ba::aln_meth_occ_t gapped; gapped.cost = 3; gapped.n_gapo = 1; gapped.pos = 50000;
+    ba::aln_meth_occ_t gapped{}; gapped.cost = 3; gapped.n_gapo = 1; gapped.pos = 50000;
     result.occ.push_back(gapped);
     slot.best = 3;
     // While the next entry is at the best cost the stratum is incomplete: no ceiling, no -R stop.
@@ -1793,7 +1793,7 @@ TEST_CASE("aln_meth: the -R stop counts only best loci within the final differen
     CHECK(job.max_diff == 2);
     // 31 best loci within the ceiling are a repeat
     for (int i = 0; i < 30; ++i) {
-        ba::aln_meth_occ_t o; o.cost = 3; o.n_mm = 1; o.n_gapo = 0; o.pos = 100000 + 1000 * i;
+        ba::aln_meth_occ_t o{}; o.cost = 3; o.n_mm = 1; o.n_gapo = 0; o.pos = 100000 + 1000 * i;
         result.occ.push_back(o);
     }
     CHECK(ba::aln_meth_boundary(&slot, 4) == 1);
@@ -1815,7 +1815,7 @@ TEST_CASE("aln_meth: the difference ceiling comes from the stored best rows")
     ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 4; job.score_cut = INT_MAX;
     slot.job = &job;
     ba::aln_meth_read_t result; slot.res = &result;
-    ba::aln_meth_occ_t o; o.cost = 3; o.n_mm = 3; o.pos = 1000;
+    ba::aln_meth_occ_t o{}; o.cost = 3; o.n_mm = 3; o.pos = 1000;
     result.occ.push_back(o);
     slot.best = 3;
     CHECK(ba::aln_meth_boundary(&slot, 4) == 0);
@@ -1844,6 +1844,22 @@ TEST_CASE("aln_meth: the finish applies the difference ceiling only to a search 
         ba::aln_meth_slot_finish(&slot);
         CHECK(result.c1 == 1);
         CHECK(result.c2 == (cut ? 0 : 1));
+        // the retained loci, as stored for pairing and output: the gapped best, then (without the
+        // cuts) the four-mismatch row
+        CHECK(result.occ.empty());
+        REQUIRE(result.hits.size() == (cut ? 1u : 2u));
+        CHECK(result.main == 0);
+        for (const auto &h : result.hits) CHECK((h.rid == 0 && h.hyp == 1 && h.strand == 0));
+        CHECK(result.hits[0].pos == 100);
+        CHECK(result.hits[0].cost == 3);
+        CHECK(result.hits[0].n_mm == 0);
+        CHECK(result.hits[0].n_gapo == 1);
+        if (!cut) {
+            CHECK(result.hits[1].pos == 200);
+            CHECK(result.hits[1].cost == 4);
+            CHECK(result.hits[1].n_mm == 4);
+            CHECK(result.hits[1].n_gapo == 0);
+        }
     }
     free(opt);
 }
