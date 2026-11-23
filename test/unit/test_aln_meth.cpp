@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <set>
 #include <sstream>
@@ -575,8 +576,10 @@ TEST_CASE("aln_meth: a repeat certificate reports X0 as a lower bound and draws 
 
 TEST_CASE("aln_meth: a repeat certificate's draws do not depend on the thread count")
 {
-    // 96 copies of read_r (a repeat certificate under -R 5) in 64-read chunks, so -t 4 splits them
-    // over threads: each copy's drawn primary and X0 must match the single-threaded run.
+    // 96 copies of read_r (a repeat certificate under -R 5) from the command line: each copy's drawn
+    // primary and X0 must match the single-threaded run. Duplicate sharing (the default) searches
+    // the copies once; the per-copy searches split over threads are tested through the library
+    // ("... match per-copy searches at any thread count").
     const std::string fq = write_fq("cert-threads.fq", std::vector<std::string>(96, ref().read_r));
     const std::vector<std::string> opts = {"--meth=taps", "--meth-scoring", "collapsed", "-n", "2", "-l", "1024", "-R", "5"};
     auto with = [&](const char *t) { auto o = opts; o.push_back("-t"); o.push_back(t); return run_aln(o, {fq}); };
@@ -771,9 +774,11 @@ TEST_CASE("aln_meth: an index built with --meth still aligns without --meth (sto
 
 namespace {
 
-// A single-end --meth run through the library, so the test hooks of aln_opt_t can be set.
+// A single-end --meth run through the library, so the test hooks of aln_opt_t can be set. tweak,
+// when given, adjusts the options last, before the --meth matrices are built.
 std::string run_se_api(const std::string &fq, int share_dup_search, int batch_size, const char *chem_taps,
-                       const std::string &mate = "", int barcode_len = 0)
+                       const std::string &mate = "", int barcode_len = 0,
+                       const std::function<void(bwa_aln::aln_opt_t &, bwa_aln::aln_meth_opt_t &)> &tweak = {})
 {
     namespace ba = bwa_aln;
     ba::aln_opt_t o;
@@ -788,6 +793,7 @@ std::string run_se_api(const std::string &fq, int share_dup_search, int batch_si
     mo.m.meth_mode = 1;
     mo.m.meth_chem = chem_taps ? 1 : 0;
     mo.m.meth_scoring = chem_taps ? MEM_METH_SCORING_NEUTRAL : MEM_METH_SCORING_COLLAPSED;
+    if (tweak) tweak(o, mo);
     ba::aln_meth_opt_finish(&mo);
     const std::string conv = ref().fa + ".meth";
     FMI_search fmi(conv.c_str());
@@ -842,6 +848,33 @@ TEST_CASE("aln_meth: aln_run_pe_meth bounds the joined barcode to BWA_MAX_BCLEN"
         CHECK(bc == want); // both mates carry the same joined barcode
     }
     CHECK(n_rec == 10);
+}
+
+TEST_CASE("aln_meth: a repeat certificate's draws match per-copy searches at any thread count")
+{
+    // 96 copies of read_r (a repeat certificate under -R 5 and collapsed TAPS scoring). Without
+    // duplicate sharing each copy is searched on its own and -t 4 splits them over threads: every
+    // copy's primary and X0 must match the single-threaded run, and the shared search, whose first
+    // copy makes the other copies' draws, must match both.
+    const std::string fq = write_fq("cert-threads-api.fq", std::vector<std::string>(96, ref().read_r));
+    auto run = [&](int share, int threads) {
+        return run_se_api(fq, share, 0x40000, "taps", "", 0, [&](bwa_aln::aln_opt_t &o, bwa_aln::aln_meth_opt_t &mo) {
+            o.gap.n_threads = threads;
+            o.gap.max_top2 = 5;
+            mo.m.meth_scoring = MEM_METH_SCORING_COLLAPSED;
+        });
+    };
+    const std::string alone1 = run(0, 1);
+    int n_rec = 0;
+    std::istringstream sam(alone1);
+    for (std::string line; std::getline(sam, line);) {
+        if (line.empty() || line[0] == '@') continue;
+        ++n_rec;
+        CHECK(line.find("\tXT:A:R\t") != std::string::npos);
+    }
+    CHECK(n_rec == 96);
+    CHECK(run(0, 4) == alone1);
+    CHECK(run(1, 4) == alone1);
 }
 
 TEST_CASE("aln_meth: identical reads share a search and still draw their own main hit")
