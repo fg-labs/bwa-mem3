@@ -9,6 +9,8 @@
 #   ab  copies A (pos 401) and B (pos 541) differ at two C/T positions (offsets 10 and 25)
 #   ef  copies E (pos 401) and F (pos 841) differ at one C/T position (offset 20)
 #   gh  copies G (pos 401) and H (pos 841) differ at one G/A position (offset 20)
+#   lw  copies L (pos 401) and W (pos 841) differ at one C/T position (offset 20) and also at
+#       one other base (offset 30)
 #
 # A read 1 that kept such a C (a methylated C) and converted the rest is unique under genomic
 # scoring, because at the other copy the C sits over a T (the mirror cell) and costs a mismatch.
@@ -19,10 +21,12 @@
 # Checks: the default equals an explicit conversion-blind; single-end reads (one and two retained
 # Cs on the C->T strand, the second one past the genomic cut; one retained C on the G->A strand)
 # are capped to collapsed's MAPQ with YQ:i, and controls (a fully converted ambiguous read, a unique
-# read) are not; only MAPQ and YQ:i differ between the modes; under -n 1 (or a seed's -k 0) a copy
-# over the limit only by its mirror mismatches still caps, as collapsed keeps it;
-# a locus with several rows enters the cap, single and paired end, at its cheapest row with the
-# mirror cell free; the default for collapsed, neutral, TAPS and 5-base is scoring, and collapsed accepts conversion-blind as a no-op; paired end: each
+# read) are not; a copy past the genomic cut that the search reaches after the best is still
+# counted (the search drops rows on their mirror-free cost); only MAPQ and YQ:i differ between the
+# modes; under -n 1 (or a seed's -k 0) a copy over the limit only by its mirror mismatches still
+# caps, as collapsed keeps it; a locus with several rows enters the cap, single and paired end, at
+# its cheapest row with the mirror cell free; the default for collapsed, neutral, TAPS and 5-base is
+# scoring, and collapsed accepts conversion-blind as a no-op; paired end: each
 # record's conversion-blind MAPQ is collapsed's, capped at the genomic one, where collapsed places
 # it, else 0 (including where collapsed starts an end at a tied mirror-free locus, and where the
 # genomic pairing places read 1 at a genomic tie past collapsed's mirror-free cut, and where
@@ -78,7 +82,12 @@ BEGIN {
     z = put(ka, 5, alt(substr(ka, 6, 1)))
     y = put(put(ka, 10, "T"), 33, alt(substr(ka, 34, 1)))
     ayz = dna(400) ka dna(400) y dna(400) z dna(400)
-    printf ">ab\n%s\n>ef\n%s\n>gh\n%s\n>ayz\n%s\n", ab, ef, gh, ayz > (dir "/ref.fa")
+    # copy L is unique; copy W has a T at L's C and one mismatch: genomic 6, mirror-free 3, and a
+    # converted score of 3, so the search reaches it only after the best (0) is stored
+    kl = put(dna(40), 20, "C")
+    w = put(put(kl, 20, "T"), 30, alt(substr(kl, 31, 1)))
+    lw = dna(400) kl dna(400) w dna(400)
+    printf ">ab\n%s\n>ef\n%s\n>gh\n%s\n>ayz\n%s\n>lw\n%s\n", ab, ef, gh, ayz, lw > (dir "/ref.fa")
     # single end
     fq(dir "/se.fq", "ab2", conv(a, "C", "T", " 10 25 "))
     fq(dir "/se.fq", "ab1", conv(a, "C", "T", " 10 "))
@@ -98,6 +107,8 @@ BEGIN {
     fq(dir "/q1.fq", "anchor", conv(e, "C", "T", " 20 ")); fq(dir "/q2.fq", "anchor", mate(ef, 1180, 60))
     # paired end, a single pair on ayz: read 2 from the flank after copy Z moves read 1 there
     fq(dir "/o1.fq", "maxocc", conv(ka, "C", "T", " 10 ")); fq(dir "/o2.fq", "maxocc", mate(ayz, 1580, 60))
+    # single end on lw: read 1 keeps L's C
+    fq(dir "/l.fq", "cutlate", conv(kl, "C", "T", " 20 "))
 }
 EOF
 awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/gen.awk" < /dev/null
@@ -228,6 +239,19 @@ paste -d ' ' "$tmp/se.k0.blind.sum" "$tmp/se.k0.collapsed.sum" | awk '$5 != $11 
     exit 1
 }
 echo 'PASS: single-end-mirror-free-k-limit'
+
+# cutlate: copy W costs 6 genomically, past the genomic cut, but 3 with the mirror cell free, and
+# the search reaches it only after the best (copy L, 0) is stored. A row the search drops on its
+# genomic cost is lost to the mirror-free strata, so the search must drop on the mirror-free
+# cost: the cap is collapsed's (one best, one worse locus) and YQ:i keeps the genomic 37.
+run l.blind --meth "$tmp/ref.fa" "$tmp/l.fq"
+run l.collapsed --meth --meth-scoring collapsed "$tmp/ref.fa" "$tmp/l.fq"
+expect cut-late "$tmp/l.blind.sum" "cutlate 0 lw 401 23 37"
+paste -d ' ' "$tmp/l.blind.sum" "$tmp/l.collapsed.sum" | awk '$5 != $11 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' || {
+    echo "FAIL: cut-late: the conversion-blind MAPQ differs from collapsed's" >&2
+    exit 1
+}
+echo 'PASS: single-end-cut-late'
 
 # A locus holds several rows (search paths with a gap in different places); the genomic search keeps
 # the genomically cheapest, collapsed the cheapest with the mirror cell free, and the cap takes each

@@ -278,6 +278,7 @@ const ubyte_t *aln_meth_slot_start(aln_meth_slot_t *x, bwa_seq_t *p, aln_meth_re
     x->cut = !(o->mode & BWA_MODE_NONSTOP) && o->s_mm >= 0 && o->s_gapo >= 0 && o->s_gape >= 0 && !x->grp->ref->known_snvs &&
         !x->grp->ref->no_cut;
     x->best = INT64_MAX; x->flushed = 0;
+    x->blind = x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m);
     return x->vseq.data();
 }
 static bool conv_tiebreak(const aln_meth_opt_t *mo)
@@ -619,7 +620,10 @@ static void store_row(aln_meth_slot_t *x, aln_meth_occ_t &o, int seed_diffs, boo
     if (bounded && !within_read_limits(x, o)) return;
     ++x->res->n_rescored;
     // Under the cut a row above the current best + M can never be retained (the best only falls).
-    if (x->cut && x->best != INT64_MAX && o.cost > x->best + g->opt->s_mm) return;
+    // --meth-mapq conversion-blind: the mirror-free strata keep every row within M of the
+    // mirror-free best, which is at most the best, so the row's mirror-free cost decides.
+    if (x->cut && x->best != INT64_MAX
+        && (x->blind ? mirror_free_cost(o.cost, g->opt->s_mm, o.n_mirror) : o.cost) > x->best + g->opt->s_mm) return;
     x->best = std::min(x->best, o.cost);
     const uint64_t bytes = (o.alignment.raw_cigar.size() + o.alignment.cigar.size()) * sizeof(uint32_t);
     // Cumulative CIGAR bytes conservatively bound ownership even when a locus is replaced.

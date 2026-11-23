@@ -138,8 +138,9 @@ struct aln_meth_slot_t {
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
     // cut: the search takes stock aln's cuts from the verified best (aln_meth_boundary): set unless
     // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row. flushed: a
-    // flush has run.
-    int cut = 0, flushed = 0;
+    // flush has run. blind: --meth-mapq conversion-blind, so every cut must also keep what the
+    // mirror-free strata need (meth_blind_strata).
+    int cut = 0, flushed = 0, blind = 0;
     int64_t best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
