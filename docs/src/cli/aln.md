@@ -269,17 +269,19 @@ How it works:
   leave the mate unrescued, whether they come from two alignments or from one window whose best is
   tied: a pick survives only if it scores above every such tie.
 - `--meth`: the converted search also resolves the windows that the ALT-window search finds. Each
-  candidate window holding a site, and each mate-rescue window holding one, is realigned against
+  candidate window holding a site is scored along the ALT-window search's path to it (its gaps,
+  including a gap at either end of the read, as the converted search scores its own rows), against
   the reference and then once per site allele (each ALT of a multi-allelic site separately) with
-  only that ALT in place, under the same 32-allele cap (a mate-rescue window counts only the sites
-  on its anchor's contig, since rescue never aligns past that contig). The locus keeps the cheapest alignment;
-  on a tie the reference wins, then the lower (position, ALT). An alignment in a window that only
-  the ALT-window search proposed is kept only within the read's difference limit, as the read's
-  own search would be. When its best-scoring alignment breaks the read's `-n`, `-o` or `-e`
-  limits, the window is realigned once more with its indels held to the window's own extent
-  (ungapped when the window is the read's length), and that alignment is kept if it is within
-  the limits. A pair whose placement assumes an ALT is left out of the insert-size
-  estimate.
+  only that ALT in place, under the same 32-allele cap. A candidate whose path cannot be recovered,
+  and each mate-rescue window holding a site, is realigned instead, the same way (a mate-rescue
+  window counts only the sites on its anchor's contig, since rescue never aligns past that
+  contig). The locus keeps the cheapest alignment; on a tie the reference wins, then the lower
+  (position, ALT). An alignment in a window that only the ALT-window search proposed is kept only
+  within the read's difference limit, as the read's own search would be. When a realigned
+  candidate's best-scoring alignment breaks the read's `-n`, `-o` or `-e` limits, the window is
+  realigned once more with its indels held to the window's own extent (ungapped when the window is
+  the read's length), and that alignment is kept if it is within the limits. A pair whose
+  placement assumes an ALT is left out of the insert-size estimate.
 - Without `--meth`, reads longer than about 160 bases, reads with more than 256 candidate
   loci, and reads whose genomic or ALT-window search stopped at the `-m` limit (it may have
   missed equal-best loci) keep their stock search result. For paired input that end still goes
