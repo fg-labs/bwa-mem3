@@ -2699,6 +2699,65 @@ TEST_CASE("aln_meth: the finish applies the difference ceiling only to a search 
     free(opt);
 }
 
+namespace {
+// A finish-only slot (no search) for the conversion-blind finish tests, default penalties.
+struct BlindFinish {
+    bwa_aln::gap_opt_t *opt = bwa_aln::gap_init_opt();
+    bwa_aln::aln_meth_opt_t mo;
+    bwa_aln::aln_meth_group_t group;
+    bwa_aln::aln_meth_read_t result;
+    bwa_aln::aln_meth_slot_t slot;
+    explicit BlindFinish(int cut)
+    {
+        mo.m.meth_mode = 1; mo.m.meth_mapq = MEM_METH_MAPQ_CONVERSION_BLIND;
+        bwa_aln::aln_meth_opt_finish(&mo);
+        group.opt = opt; group.mo = &mo;
+        slot.grp = &group; slot.res = &result; slot.keep = 1; slot.cut = cut; slot.blind = 1;
+    }
+    ~BlindFinish() { free(opt); }
+    void add(bwtint_t pos, int64_t cost, int n_mm, int n_mirror, int n_gapo)
+    {
+        bwa_aln::aln_meth_occ_t o{};
+        o.rid = 0; o.hyp = 1; o.pos = pos; o.cost = cost; o.n_mm = n_mm; o.n_mirror = n_mirror; o.n_gapo = n_gapo;
+        o.alignment.rb = (int64_t)pos; o.alignment.re = (int64_t)pos + 40;
+        result.occ.push_back(o);
+    }
+    std::vector<std::pair<bwtint_t, int32_t>> blind_rows() const
+    {
+        std::vector<std::pair<bwtint_t, int32_t>> v;
+        for (const auto &b : result.blind_rows) v.emplace_back(b.pos, b.cost);
+        std::sort(v.begin(), v.end());
+        return v;
+    }
+};
+} // namespace
+
+TEST_CASE("aln_meth: a locus the finish's ceiling drops is a conversion-blind row")
+{
+    // Default penalties. G: one gap open (cost 11, one difference). X: four mismatches, one a
+    // mirror (12, mirror-free 9 with three). X2: four mismatches (12). Under the cuts stock keeps
+    // G alone (ceiling 2); the mirror-free strata are X (best), then G and X2 (within 9 + 3, and
+    // four differences within X's 3 + 1). X and X2 are within the genomic cost window but over
+    // its ceiling, so they are neither hits nor counted genomically: the shadow pairing can see
+    // them only as blind rows. Without the cuts all three are hits.
+    for (int cut = 0; cut < 2; ++cut) {
+        CAPTURE(cut);
+        BlindFinish f(cut);
+        f.add(100, 11, 0, 0, 1);
+        f.add(200, 12, 4, 1, 0);
+        f.add(300, 12, 4, 0, 0);
+        bwa_aln::aln_meth_slot_finish(&f.slot);
+        CHECK(f.result.c1 == 1);
+        CHECK(f.result.c2 == (cut ? 0 : 2));
+        CHECK(f.result.hits.size() == (cut ? 1u : 3u));
+        CHECK(f.result.blind_best == 9);
+        CHECK(f.result.blind_c1 == 1);
+        CHECK(f.result.blind_c2 == 2);
+        using Rows = std::vector<std::pair<bwtint_t, int32_t>>;
+        CHECK(f.blind_rows() == (cut ? Rows{{200, 9}, {300, 12}} : Rows{}));
+    }
+}
+
 TEST_CASE("aln_meth: the flush that binds the lookup budget resolves only a few more rows")
 {
     namespace ba = bwa_aln;

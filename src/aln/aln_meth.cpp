@@ -1095,13 +1095,15 @@ static aln_meth_blind_row_t blind_row(const aln_meth_occ_t &o, bwtint_t pos, int
 // scoring keeps there. The search proposed every window within the genomic best cost plus s_mm
 // (aln_meth_can_stop); a mirror-free cost never exceeds the genomic cost, so every locus within
 // s_mm of the mirror-free best was proposed too. The loci in the mirror-free strata that are not
-// hits (the genomic cut, genomic_cut, drops them, or they are not in occ) are kept as rows for the
+// hits (the genomic finish drops them, on its cost cut, genomic_cut, or its difference ceiling,
+// genomic_ceiling, or they are not in occ) are kept as rows for the
 // paired-end shadow pairing, and a hit whose lowest mirror-free row is not its own as blind_alt.
 // Out of line, as meth_slot_finish_tail is.
 static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x, aln_meth_read_t *r,
-                                                        int64_t genomic_cut)
+                                                        int64_t genomic_cut, int64_t genomic_ceiling)
 {
     const gap_opt_t *opt = x->grp->opt;
+    const bool gape = opt->mode & BWA_MODE_GAPE;
     if (r->blind_partial) { std::vector<aln_meth_occ_t>().swap(r->mirror_rows); return; }
     // Each locus once: its row, and whether it is a hit.
     std::vector<std::pair<const aln_meth_occ_t *, bool>> cand;
@@ -1117,7 +1119,7 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
             in_occ[k] = 1;
             if (mirror_free_better(r->mirror_rows[k], o, opt->s_mm)) m = &r->mirror_rows[k];
         }
-        const bool hit = o.cost <= genomic_cut;
+        const bool hit = o.cost <= genomic_cut && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= genomic_ceiling;
         if (hit && m != &o) r->blind_alt.push_back(blind_row(*m, o.pos, opt->s_mm)); // keyed as the hit is
         cand.emplace_back(m, hit);
     }
@@ -1160,9 +1162,10 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
     std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
 }
 // The --meth-mapq gate for meth_blind_strata, out of line so slot_finish keeps a single call here.
-static __attribute__((noinline)) void meth_blind_cap(const aln_meth_slot_t *x, aln_meth_read_t *r, int64_t cut)
+static __attribute__((noinline)) void meth_blind_cap(const aln_meth_slot_t *x, aln_meth_read_t *r, int64_t cut,
+                                                     int64_t ceiling)
 {
-    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(x, r, cut);
+    if (x->grp->mo && meth_mapq_conversion_blind(&x->grp->mo->m)) meth_blind_strata(x, r, cut, ceiling);
 }
 void aln_meth_slot_finish(aln_meth_slot_t *x)
 {
@@ -1196,7 +1199,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
     }
     if (r->occ.empty()) {
         // No record to cap, but collapsed can still place the read (its mate's shadow pairing)
-        meth_blind_cap(x, r, -1);
+        meth_blind_cap(x, r, -1, -1);
         std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
         // Every candidate was dropped: any of them could have been the best locus.
         if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
@@ -1215,7 +1218,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
     if (x->cut) for (const auto &o : r->occ) if (o.cost == best) ceiling = std::min(ceiling, diffs(o) + 1);
     // A dropped candidate that could be a best or retained worse locus leaves X0/X1 unknown.
     if (r->n_unrepresentable && x->unrep_cost <= cut) r->flags |= ALN_METH_BIND_UNREP;
-    meth_blind_cap(x, r, cut);
+    meth_blind_cap(x, r, cut, ceiling);
     std::vector<aln_meth_occ_t> keep;
     for (auto &o : r->occ) {
         if (o.cost > cut || diffs(o) > ceiling) continue;
