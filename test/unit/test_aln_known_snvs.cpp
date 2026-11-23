@@ -14,6 +14,7 @@
 #include "../../src/aln/aln_known_snvs.h"
 #include "../../src/aln/aln_meth_realign.h"
 #include "../../src/aln/aln_meth_search.h"
+#include "../../src/meth_opts.h"
 #include "../../src/aln/bwape.h"
 #include "../../src/aln/bwaseqio.h"
 #include "../../src/aln/bwtgap.h"
@@ -2303,15 +2304,14 @@ TEST_CASE("aln_known_snvs: --meth ALT-window placements are scored along their s
     }
 }
 
-TEST_CASE("aln_known_snvs: --meth ALT-window candidates without a path are realigned within the window's extent"
+TEST_CASE("aln_known_snvs: --meth an ALT-window hit's soft-clipped insertion is scored as its search path"
           * doctest::test_suite("unit/aln_known_snvs")) {
     bwa_tests::TempDir tmp{"ks_meth_retry"}; const std::string dir = tmp.path();
     // The read starts one base before c1, so the ALT-window search's hit soft-clips that base
-    // (1S40M): its CIGAR is not a search path, and the window DP refines it. The read carries the
-    // ALT (A>C at c1:30) and a stretch shifted one base right (TACAT read as TTACA): four
-    // mismatches. The DP's best realignment trades them for an insertion and a deletion: three gap
-    // opens with the leading insertion, over -o 1. Realigned with its indels held to the window's
-    // extent (one inserted base), it is 1S40M with the four mismatches and the ALT: within -n 5.
+    // (1S40M). The candidate restores the clip as the search path's leading insertion (1I40M) and
+    // the row is scored along it. The read carries the ALT (A>C at c1:30) and a stretch shifted one
+    // base right (TACAT read as TTACA): four mismatches, one gap open, within -n 5 -o 1. (A window
+    // DP would trade the mismatches for an insertion and a deletion: three gap opens, over -o 1.)
     uint32_t state = 4242;
     const std::string core = "GCTAAAGACAATTACATAACATACACGTCAGCACGAAACT";
     const std::string read = "TGCTAAAGACAATTTACAAACATACACGTCCGCACGAAACT";
@@ -2339,6 +2339,83 @@ TEST_CASE("aln_known_snvs: --meth ALT-window candidates without a path are reali
     CHECK(tag(r, "NM:i:") == "NM:i:5");
     CHECK(tag(r, "MD:Z:") == "MD:Z:13A0C0A0T12A10");
     CHECK(tag(r, "XV:Z:") == "XV:Z:c1:30:A>C,A,5,5,1,37");
+}
+
+TEST_CASE("aln_known_snvs: --meth ALT-window candidates without a path are realigned within the window's extent"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    namespace ba = bwa_aln;
+    bwa_tests::TempDir tmp{"ks_meth_pathless"};
+    // The reference, read and site of the soft-clipped insertion case above, searched directly so
+    // the genomic search is given the window search's candidates with their paths removed: each
+    // is then refined by the window DP. The DP's best realignment trades the four mismatches for an
+    // insertion and a deletion: three gap opens with the leading insertion, over -o 1. Retried with
+    // its indels held to the window's extent (one inserted base), it is the leading insertion and
+    // 40 aligned bases with the four mismatches and the ALT: within -n 5.
+    uint32_t state = 4242;
+    const std::string core = "GCTAAAGACAATTACATAACATACACGTCAGCACGAAACT";
+    const std::string bases = "TGCTAAAGACAATTTACAAACATACACGTCCGCACGAAACT";
+    const std::string c1 = core + aln_test::lcg_dna(state, 300);
+    const std::string prefix = tmp.unique_file();
+    REQUIRE(aln_test::write_test_fasta(prefix, {{"c1", c1}}));
+    build_meth_index(prefix);
+    FMI_search fmi((prefix + ".meth").c_str());
+    fmi.load_index(/*load_pac=*/false, 1, /*build_seed_jump=*/false, BWAMEM_HUGETLB_OFF, /*allow_shm=*/false);
+    ba::bwt_t *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, prefix.c_str(), fmi.idx->bns, 1) == 0);
+    ba::ks_sites_t sites; ba::ks_windows_t windows;
+    const std::string vcf = write_vcf(tmp.file("s.vcf"), {row("c1", 30, 'A', "C")});
+    REQUIRE(ba::ks_load(vcf.c_str(), mr.bns, mr.pac, &sites) == 0);
+    {
+        bwa_tests::StderrCapture quiet;
+        REQUIRE(ba::ks_windows_build(&sites, mr.bns, mr.pac, 1, 1, &windows) == 0);
+    }
+    mr.known_snvs = &sites;
+    ba::gap_opt_t *g = ba::gap_init_opt();
+    ba::gap_opt_t gap = *g; free(g);
+    gap.fnr = -1; gap.max_diff = 5; gap.max_gapo = 1; gap.indel_end_skip = 0; gap.seed_len = 1024;
+    ba::aln_meth_opt_t mo; meth_cli_t cli = {}; // a bare --meth, as aln parses and finishes it
+    REQUIRE(meth_opts_parse_shared(OPT_METH, nullptr, &mo.m, &cli) == 1);
+    meth_opts_finalize_shared(&mo.m, &cli);
+    ba::aln_meth_opt_finish(&mo);
+    const std::string fq = write_fq(tmp.file("r.fq"), {{"r", bases}});
+    ba::bwa_seqio_t *input = ba::bwa_seq_open(fq.c_str());
+    int n = 0;
+    ba::bwa_seq_t *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+    ba::bwa_seq_close(input);
+    REQUIRE(n == 1);
+    const ba::gap_opt_t discovery = ba::ks_discovery_opt(gap);
+    ba::aln_meth_read_t window;
+    ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &discovery, 1, 1, 0, 1, 1000, nullptr,
+                              &window, nullptr, nullptr, true);
+    std::vector<ba::aln_meth_candidate_t> extra;
+    ba::ks_meth_candidates(&windows, mr.bns, window, &extra);
+    REQUIRE(!extra.empty());
+    for (ba::aln_meth_candidate_t &c : extra) {
+        CHECK(c.cig == std::vector<uint32_t>{1u << 4 | 1, 40u << 4}); // the premise: a path ...
+        c.cig.clear(); // ... which this test removes
+    }
+    const ba::aln_meth_alt_bound_t certificate = ba::aln_meth_alt_certificate(window);
+    const int flags = window.flags;
+    ba::aln_meth_read_t genomic;
+    ba::aln_meth_search_batch(bwt, &mr, &mo, 1, reads, &gap, 1, 1, 0, 1, 1000, nullptr, &genomic, &extra,
+                              &certificate, false, &flags);
+    REQUIRE(genomic.main >= 0);
+    CHECK(genomic.flags == 0);
+    CHECK(genomic.c1 == 1); CHECK(genomic.c2 == 0);
+    const ba::aln_meth_hit_t &h = genomic.hits[genomic.main];
+    CHECK(h.rid == 0); CHECK(h.pos == 0); CHECK(h.strand == 0);
+    CHECK(h.n_mm == 4); CHECK(h.n_gapo == 1); CHECK(h.n_gape == 0);
+    CHECK(h.alt != 0);
+    const uint32_t *cig = ba::aln_meth_hit_cigar(genomic, h);
+    // The display alignment, as the soft-clipped insertion case above reports it: 1S40M at c1:1.
+    CHECK(std::vector<uint32_t>(cig, cig + h.n_cig) == std::vector<uint32_t>{1u << 4 | 4, 40u << 4});
+    CHECK(h.span == 40);
+    ba::bwa_free_read_seq(1, reads);
+    mr.known_snvs = nullptr;
+    ba::ks_windows_free(&windows);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
 }
 
 TEST_CASE("aln_known_snvs: negative gap-open limits allow ungapped methylation ALT reads only"
