@@ -1183,8 +1183,8 @@ TEST_CASE("aln_meth: the conversion-blind strata are collapsed's selection, locu
     // a genomic search builds with the mirror cell freed (blind_best, blind_c1, blind_c2, and each
     // locus within them: a hit at its mirror-free row, aln_meth_blind_view, or a blind_rows row)
     // must be what collapsed scoring, which frees the mirror cell itself, selects: its best, c1,
-    // c2, each hit's cost, mismatches, gaps and span, and its main hit (blind_main, the draw among
-    // the mirror-free best loci, blind_ties, with the read's seed). Each family is a 50-base
+    // c2, each hit's cost, mismatches, gaps and span, and its main hit (blind_pick, the locus
+    // blind_main draws among the mirror-free best loci with the read's seed). Each family is a 50-base
     // segment whose read 1 keeps some Cs; its copies carry mirror cells (a T under a kept C), real
     // mismatches and one-base gaps. Planted families: a one-gap best with a mirror-free best and a locus only
     // the mirror-free cut keeps, three best loci with a gapped mirror locus, and a copy past the
@@ -1394,8 +1394,8 @@ TEST_CASE("aln_meth: the conversion-blind strata are collapsed's selection, locu
                     // collapsed's main hit is the conversion-blind draw: the loci at the best
                     // mirror-free cost, in collapsed's order, drawn with the read's seed
                     REQUIRE(g.blind_main >= 0);
-                    CHECK(g.blind_ties.size() == (size_t)c.c1);
-                    const ba::aln_meth_blind_row_t &bm = g.blind_ties[g.blind_main];
+                    CHECK(g.blind_main < c.c1);
+                    const ba::aln_meth_blind_row_t &bm = g.blind_pick;
                     const ba::aln_meth_hit_t &cm = c.hits[c.main], &gm = g.hits[g.main];
                     CHECK(bm.rid == cm.rid);
                     CHECK((int)bm.hyp == (int)cm.hyp);
@@ -4065,6 +4065,7 @@ TEST_CASE("aln_meth: shadow pairing uses filtered counts independently of genomi
         REQUIRE(result[j].blind_main < result[j].blind_c1);
         result[j].blind_ties.resize(result[j].blind_c1);
         result[j].blind_ties[result[j].blind_main] = pick;
+        result[j].blind_pick = pick;
     }
     ba::isize_info_t ii{};
     ii.low = 300; ii.avg = ii.std = -1;

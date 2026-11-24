@@ -838,14 +838,15 @@ static bool blind_collapsed_order(const aln_meth_blind_row_t &a, const aln_meth_
 {
     return std::make_tuple(a.rid, a.hyp, a.strand, a.pos) < std::make_tuple(b.rid, b.hyp, b.strand, b.pos);
 }
-// --meth-mapq conversion-blind: the main hit collapsed scoring draws among the mirror-free best
-// loci (ties, in blind_collapsed_order): draw_main over them with the same seed. collapsed draws
-// over all its loci in that order, but only a best-cost locus takes a draw, and conversion-blind
-// is EM-seq only (no TAPS conversion tie-break). -1 when there are none.
-static int blind_draw(const std::vector<aln_meth_blind_row_t> &ties, uint64_t rng)
+// --meth-mapq conversion-blind: the index of the main hit collapsed scoring draws among the n
+// mirror-free best loci (in blind_collapsed_order): draw_main over them with the same seed.
+// collapsed draws over all its loci in that order, but only a best-cost locus takes a draw, and
+// conversion-blind is EM-seq only (no TAPS conversion tie-break). The draw reads only how many
+// loci there are, not the loci. -1 when there are none.
+static int blind_draw(size_t n, uint64_t rng)
 {
     int held = -1;
-    for (int i = 0; i < (int)ties.size(); ++i) // draw_main's loop over loci that all take a draw
+    for (int i = 0; i < (int)n; ++i) // draw_main's loop over loci that all take a draw
         if (i == 0 || (splitmix64(&rng) % (uint64_t)(i + 1)) == 0) held = i;
     return held;
 }
@@ -957,14 +958,16 @@ void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng,
     // Copy every field except the loci: src's are set aside for the assignment, then restored.
     std::vector<aln_meth_hit_t> hits, copied;
     std::vector<uint32_t> cig, copied_cig;
-    hits.swap(src->hits); cig.swap(src->cig);
+    std::vector<aln_meth_blind_row_t> ties; // a copy keeps only the locus it draws (blind_pick)
+    hits.swap(src->hits); cig.swap(src->cig); ties.swap(src->blind_ties);
     *dst = *src;
-    src->hits.swap(hits); src->cig.swap(cig);
+    src->hits.swap(hits); src->cig.swap(cig); src->blind_ties.swap(ties);
     // a copy ran no search: the work counters (aln_meth_report) stay with its first copy
     dst->n_lookups = dst->n_wrong_copy = dst->n_rescored = dst->n_flushes = dst->n_unrepresentable = 0;
     dst->n_over_diff = dst->n_over_seed = 0;
     if (src->main >= 0) dst->main = draw_main(src->hits, src->n_conv_moved, rng);
-    dst->blind_main = blind_draw(src->blind_ties, rng); // its own draw, as the main hit's
+    dst->blind_main = blind_draw(src->blind_ties.size(), rng); // its own draw, as the main hit's
+    if (dst->blind_main >= 0) dst->blind_pick = src->blind_ties[dst->blind_main];
     if (src->main >= 0 && !keep_all && trims(src, src->hits.size(), max_xa_hits)) {
         // Copy only the drawn primary, not the representative's whole locus list.
         aln_meth_hit_t main = src->hits[dst->main];
@@ -994,7 +997,8 @@ static __attribute__((noinline)) void meth_slot_finish_tail(aln_meth_read_t *res
 static aln_meth_blind_row_t blind_row(const aln_meth_occ_t &o, bwtint_t pos, int s_mm)
 {
     aln_meth_blind_row_t row;
-    row.pos = pos; row.span = (int32_t)(o.alignment.re - o.alignment.rb);
+    xassert(o.alignment.re - o.alignment.rb <= ALN_MAX_READ_LEN, "--meth-mapq locus spans more than a row holds");
+    row.pos = pos; row.span = (uint16_t)(o.alignment.re - o.alignment.rb);
     row.cost = (int32_t)mirror_free_cost(o.cost, s_mm, o.n_mirror);
     row.rid = o.rid; row.strand = (uint8_t)o.strand; row.hyp = (uint8_t)o.hyp; row.alt = (uint8_t)o.alt;
     row.n_mm = (uint8_t)(o.n_mm - o.n_mirror);
@@ -1046,20 +1050,32 @@ static __attribute__((noinline)) void meth_blind_strata(const aln_meth_slot_t *x
     for (const auto &e : cand) best = std::min(best, mirror_free_cost(e.first->cost, opt->s_mm, e.first->n_mirror));
     const int64_t cut = (opt->mode & BWA_MODE_NONSTOP) ? INT64_MAX : best + (int64_t)opt->s_mm;
     r->blind_best = best;
+    // The best-cost loci, for the draw of collapsed's main hit (a read that pairs or has
+    // duplicate copies). Only the drawn locus is kept, unless the read's copies draw again over
+    // them all (blind_ties); the rest are gathered in a per-thread buffer.
+    static thread_local std::vector<aln_meth_blind_row_t> ties_buf;
+    std::vector<aln_meth_blind_row_t> &ties = x->keep == ALN_METH_KEEP_COPIES ? r->blind_ties : ties_buf;
+    ties.clear();
     for (const auto &e : cand) {
         const aln_meth_occ_t &o = *e.first;
         const int64_t c = mirror_free_cost(o.cost, opt->s_mm, o.n_mirror);
         if (c > cut) continue;
         if (c == best) {
             ++r->blind_c1;
-            if (x->keep) r->blind_ties.push_back(blind_row(o, o.alignment.rb, opt->s_mm));
+            if (x->keep) ties.push_back(blind_row(o, o.alignment.rb, opt->s_mm));
         } else ++r->blind_c2;
         // store_mirror_row and account_alignment bound the cost and counts
         if (!e.second) r->blind_rows.push_back(blind_row(o, o.alignment.rb, opt->s_mm));
     }
-    std::sort(r->blind_ties.begin(), r->blind_ties.end(), blind_collapsed_order);
     std::sort(r->blind_rows.begin(), r->blind_rows.end(), blind_collapsed_order);
-    r->blind_main = blind_draw(r->blind_ties, x->rng);
+    r->blind_main = blind_draw(ties.size(), x->rng);
+    if (r->blind_main >= 0) {
+        // The loci are distinct in blind_collapsed_order (one row per locus), so the drawn index
+        // names the same locus whether the ties are sorted or only partitioned around it.
+        if (&ties == &r->blind_ties) std::sort(ties.begin(), ties.end(), blind_collapsed_order);
+        else std::nth_element(ties.begin(), ties.begin() + r->blind_main, ties.end(), blind_collapsed_order);
+        r->blind_pick = ties[r->blind_main];
+    }
     std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
 }
 // The --meth-mapq gate for meth_blind_strata. ALT-window searches keep their mirror table's
@@ -1287,7 +1303,7 @@ static void meth_set_main(bwa_seq_t *s, aln_meth_read_t *r, const gap_opt_t *opt
 static int meth_blind_main_mapq(const aln_meth_read_t *r, const bwa_seq_t *s, const gap_opt_t *opt)
 {
     bwa_seq_t t = *s;
-    t.c1 = r->blind_c1; t.c2 = r->blind_c2; t.n_mm = r->blind_ties[r->blind_main].n_mm;
+    t.c1 = r->blind_c1; t.c2 = r->blind_c2; t.n_mm = r->blind_pick.n_mm;
     return bwa_approx_mapQ(&t, read_max_diff(opt, s->len));
 }
 // --meth-mapq conversion-blind: the stock single-end MAPQ the main hit would get with the mirror
@@ -1679,7 +1695,7 @@ static bool meth_blind_shadow(const aln_meth_ref_t *ref, const gap_opt_t *gopt, 
     bwa_seq_t shadow[2];
     bool fits = true;
     for (int j = 0; j < 2; ++j) {
-        const aln_meth_blind_row_t &m = r[j]->blind_ties[r[j]->blind_main];
+        const aln_meth_blind_row_t &m = r[j]->blind_pick;
         shadow[j] = *p[j];
         shadow[j].mapQ = shadow[j].seQ = meth_blind_main_mapq(r[j], p[j], gopt);
         shadow[j].pos = m.pos; shadow[j].strand = m.strand;
@@ -1764,7 +1780,7 @@ void aln_meth_blind_isize(const aln_meth_ref_t *ref, const gap_opt_t *gopt, cons
             if (!placed || r.flags) continue;
             if (r.blind_partial) s->mapQ = 0; // collapsed's selection is unknown: not an observation
             else if (r.blind_main >= 0) {
-                const aln_meth_blind_row_t &m = r.blind_ties[r.blind_main];
+                const aln_meth_blind_row_t &m = r.blind_pick;
                 s->mapQ = meth_blind_main_mapq(&r, s, gopt);
                 s->pos = m.pos; s->strand = m.strand; s->ref_shift = m.span - (int)s->len;
             }
