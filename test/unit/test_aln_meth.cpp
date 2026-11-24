@@ -2841,6 +2841,43 @@ TEST_CASE("aln_meth: under conversion-blind a mirror-free run's own -R stop keep
     }
 }
 
+TEST_CASE("aln_meth: a mirror-free -R stop at the search's own boundary leaves the need test out")
+{
+    // Default penalties, -n 5, -R 1. G lacks a base (one gap open: 11, one difference), so the
+    // search's ceiling is 2 once its best stratum is complete. The mirror table holds X1 and X2,
+    // four mismatches each, one a mirror (12, mirror-free 9 with three differences). The next
+    // entry scores 12: both best strata are complete at this one boundary (nothing scored 10 or
+    // 11). Two loci at mirror-free 9 are over -R 1, so a mirror-free run stops here, and the
+    // search (one best locus) goes on: the strata are the rows resolved here (mf_stop). The need
+    // test would read the strata's ceiling (min(-n, 3 + 1) = 4) against the search's (2) and mark
+    // them unknown, but a mirror-free run that stops here needs no row past it: they are known.
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *opt = ba::gap_init_opt();
+    opt->max_diff = 5; opt->max_top2 = 1;
+    ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_ref_t mr;
+    ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = opt;
+    ba::aln_meth_slot_t slot; slot.grp = &group; slot.blind = 1; slot.max_diff = 5;
+    ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 5; job.score_cut = INT_MAX;
+    slot.job = &job;
+    ba::aln_meth_read_t result; slot.res = &result;
+    ba::aln_meth_occ_t g{}; g.cost = 11; g.n_gapo = 1; g.pos = 1000; g.alignment.rb = 1000;
+    result.occ.push_back(g);
+    for (int i = 0; i < 2; ++i) {
+        ba::aln_meth_occ_t x{}; x.cost = 12; x.n_mm = 4; x.n_mirror = 1; x.pos = 5000 + 1000 * i;
+        x.alignment.rb = (int64_t)x.pos;
+        result.mirror_rows.push_back(x);
+    }
+    slot.mf_best = 9; slot.best = 11;
+    CHECK(ba::aln_meth_boundary(&slot, 12) == 0); // one best locus: the search goes on
+    CHECK(job.max_diff == 2);
+    CHECK(slot.mf_stop == 1);
+    CHECK(slot.mf_mirror.size() == 2u);
+    CHECK(slot.need_next == 12);
+    CHECK(slot.blind_need == 0); // known: the cap is not 0 for it
+    free(opt);
+}
+
 TEST_CASE("aln_meth: the finish applies the difference ceiling only to a search that takes the cuts")
 {
     // M=1, O=3: a one-gap best (cost 3, one difference) and a four-mismatch row (cost 4, within
