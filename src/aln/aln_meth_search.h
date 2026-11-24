@@ -150,13 +150,13 @@ struct aln_meth_slot_t {
     // need_next: the score at which the cuts first applied (the best stratum complete), -1 before;
     // top2_next: the same for a mirror-free run (its best stratum complete), whose -R stop
     // blind_note_top2 checks there; blind_need: the mirror-free strata could miss a row the cuts
-    // prune, or hold one a mirror-free run's -R stop never reaches (blind_note_need,
-    // blind_note_late), so they are not known. mf_best: the lowest mirror-free cost of a row in the
-    // mirror table (store_mirror_row); the mirror-free best so far is the lower of it and best.
-    // late_cut, late_ceiling: after a mirror-free -R stop this search goes on past, the mirror-free
-    // cost and differences within which a later row could enter the strata (-1: no such stop).
-    int cut = 0, flushed = 0, blind = 0, need_next = -1, top2_next = -1, blind_need = 0;
-    int64_t best = INT64_MAX, mf_best = INT64_MAX, late_cut = -1, late_ceiling = 0;
+    // prune (blind_note_need), so they are not known. mf_best: the lowest mirror-free cost of a row
+    // in the mirror table (store_mirror_row); the mirror-free best so far is the lower of it and
+    // best. mf_stop: a mirror-free run stopped on -R where this search goes on, and mf_occ and
+    // mf_mirror hold the rows it had resolved there (res->occ and res->mirror_rows then), from
+    // which meth_blind_strata takes the strata; the mirror table is not kept past that point.
+    int cut = 0, flushed = 0, blind = 0, need_next = -1, top2_next = -1, blind_need = 0, mf_stop = 0;
+    int64_t best = INT64_MAX, mf_best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     // Gap lists of the search's paths with more than one gap, ALN_METH_MAX_GAPS words each (see
@@ -187,6 +187,9 @@ struct aln_meth_slot_t {
     // the ambiguity bits of a row's window (score_path).
     std::vector<uint8_t> win;
     std::vector<uint64_t> amb;
+    // --meth-mapq conversion-blind: the rows a mirror-free run had resolved where it stopped on -R
+    // and this search went on (mf_stop). Cleared per read.
+    std::vector<aln_meth_occ_t> mf_occ, mf_mirror;
 };
 struct aln_meth_group_t {
     const bwt_t *bwt = nullptr;

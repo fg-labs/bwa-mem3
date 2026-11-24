@@ -1143,8 +1143,8 @@ TEST_CASE("aln_meth: aln_meth_blind_view takes a hit at its moved row, else at i
     namespace ba = bwa_aln;
     ba::aln_meth_read_t r;
     auto alt = [](bwtint_t pos, int strand, int32_t span, int32_t cost, int n_mm, int n_gapo, int n_gape) {
-        ba::aln_meth_blind_row_t b;
-        b.pos = pos; b.strand = (uint8_t)strand; b.span = span; b.cost = cost;
+        ba::aln_meth_blind_row_t b = ba::aln_meth_blind_row_t();
+        b.pos = pos; b.strand = (uint8_t)strand; b.span = (uint16_t)span; b.cost = cost;
         b.n_mm = (uint8_t)n_mm; b.n_gapo = (uint8_t)n_gapo; b.n_gape = (uint8_t)n_gape;
         return b;
     };
@@ -2702,23 +2702,23 @@ TEST_CASE("aln_meth: under conversion-blind the -R stop is stock's, and notes un
             }
 }
 
-TEST_CASE("aln_meth: under conversion-blind a mirror-free run's own -R stop is watched where the search goes on")
+TEST_CASE("aln_meth: under conversion-blind a mirror-free run's own -R stop keeps the rows it resolved")
 {
     // Default penalties (M=3), -n 5, -R 1. A is exact (0). The mirror table holds B, two mirror
     // mismatches (6, mirror-free 0) and, with two mirror loci, C (the same). Two loci at mirror-free
     // 0 are over -R, so a mirror-free run stops at its first boundary; this search, with one best
-    // locus, goes on and can resolve a row (an ordinary one-mismatch locus at 3, say) a mirror-free
-    // run never reaches. From there a row within 0 + 3 mirror-free and 0 + 1 differences leaves the
-    // strata unknown (late_cut, late_ceiling), unless next is already past 0 + 3 or the search
-    // stops there too.
+    // locus, goes on and can resolve rows (an ordinary one-mismatch locus at 3, say) a mirror-free
+    // run never reaches. The rows resolved there are the mirror-free run's: they are kept
+    // (mf_stop, mf_occ, mf_mirror) for the strata, unless next is already past 0 + 3 (no later row
+    // enters them) or the search stops there too (it resolves nothing later).
     // With a_cost 3 (A has one mismatch) the mirror-free best (0) is below this search's (3): with
     // B and C over -R the mirror-free run stops at an earlier boundary (pre: next 1), before this
-    // search stores any row at 3, and it is watched from there whether or not this search stops at
-    // its own boundary.
+    // search stores any row at 3, and its rows are kept from there whether or not this search stops
+    // at its own boundary.
     namespace ba = bwa_aln;
     // pre: an earlier boundary at next 1, where only the mirror-free best stratum is complete;
     // extra_best: a second locus like A (two best loci are over -R: this search stops too)
-    struct Case { int a_cost, n_mirror_loci, extra_best, pre, next, stop, watch; };
+    struct Case { int a_cost, n_mirror_loci, extra_best, pre, next, stop, keep; };
     for (const Case &k : {Case{0, 1, 0, 0, 1, 0, 1}, Case{0, 1, 0, 0, 4, 0, 0}, Case{0, 0, 0, 0, 1, 0, 0},
                           Case{0, 1, 1, 0, 1, 1, 0}, Case{3, 2, 0, 0, 1, 0, 1}, Case{3, 2, 1, 1, 4, 1, 1},
                           Case{3, 2, 0, 1, 4, 0, 1}, Case{3, 1, 0, 0, 1, 0, 0}, Case{3, 2, 0, 0, 5, 0, 0}}) {
@@ -2745,16 +2745,24 @@ TEST_CASE("aln_meth: under conversion-blind a mirror-free run's own -R stop is w
                 result.mirror_rows.push_back(b);
                 slot.mf_best = 0;
             }
+            const size_t n_occ = result.occ.size(), n_mirror = result.mirror_rows.size();
             slot.best = k.a_cost;
             if (k.pre) {
                 CHECK(ba::aln_meth_boundary(&slot, 1) == 0);
                 CHECK(job.max_diff == 5); // this search's best stratum is not complete: no cut
             }
             CHECK(ba::aln_meth_boundary(&slot, k.next) == k.stop);
-            // nothing resolved later yet: not unknown
+            // the strata are known either way (the cap is not 0 for it)
             CHECK(slot.blind_need == 0);
-            CHECK(slot.late_cut == (blind && k.watch ? 3 : -1));
-            if (blind && k.watch) CHECK(slot.late_ceiling == 1);
+            CHECK(slot.mf_stop == (blind && k.keep));
+            if (blind && k.keep) { // the rows as they were; the mirror table stops
+                CHECK(slot.mf_occ.size() == n_occ);
+                CHECK(slot.mf_mirror.size() == n_mirror);
+                CHECK(result.mirror_rows.empty());
+            } else {
+                CHECK(slot.mf_occ.empty());
+                CHECK(result.mirror_rows.size() == n_mirror);
+            }
             // decided once, at the mirror-free run's first boundary
             CHECK(slot.top2_next == (blind ? (k.pre ? 1 : k.next) : -1));
             free(opt);
@@ -2862,6 +2870,52 @@ TEST_CASE("aln_meth: a locus the finish's ceiling drops is a conversion-blind ro
     }
 }
 
+TEST_CASE("aln_meth: after a mirror-free -R stop the conversion-blind strata are the rows resolved there")
+{
+    // Default penalties, under the cuts. A is exact (0); the mirror table holds B and C, two mirror
+    // mismatches each (6, mirror-free 0). Three loci at mirror-free 0 are over -R 2, so a
+    // mirror-free run stops where it has resolved A, B and C (mf_stop: the rows kept as they were
+    // there), while this search, with one best locus, goes on to D, one mismatch (3), within the
+    // mirror-free strata's cut (0 + 3) and ceiling (0 + 1). The strata are the mirror-free run's:
+    // three loci at 0 and nothing above, B and C as rows; D, a hit the run never reaches, is not
+    // in its selection (unreached), and the strata are known (not blind_incomplete). Taken from
+    // every row instead (no stop kept), D would be a second-stratum locus.
+    for (int kept = 0; kept < 2; ++kept) {
+        CAPTURE(kept);
+        BlindFinish f(1);
+        f.add(1000, 0, 0, 0, 0);
+        auto row = [](bwtint_t pos) {
+            bwa_aln::aln_meth_occ_t o{};
+            o.rid = 0; o.hyp = 1; o.pos = pos; o.cost = 6; o.n_mm = 2; o.n_mirror = 2;
+            o.alignment.rb = (int64_t)pos; o.alignment.re = (int64_t)pos + 40;
+            return o;
+        };
+        if (kept) {
+            f.slot.mf_stop = 1;
+            f.slot.mf_occ = f.result.occ;
+            f.slot.mf_mirror = {row(5000), row(6000)};
+        } else f.result.mirror_rows = {row(5000), row(6000)};
+        f.add(2000, 3, 1, 0, 0); // D, resolved after the mirror-free stop
+        bwa_aln::aln_meth_slot_finish(&f.slot);
+        // the genomic result is the same either way
+        CHECK(f.result.c1 == 1);
+        CHECK(f.result.c2 == 1);
+        REQUIRE(f.result.hits.size() == 2u);
+        CHECK(f.result.blind_incomplete == 0);
+        CHECK(f.result.blind_best == 0);
+        CHECK(f.result.blind_c1 == 3);
+        CHECK(f.result.blind_c2 == (kept ? 0 : 1));
+        using Rows = std::vector<std::pair<bwtint_t, int32_t>>;
+        CHECK(f.blind_rows() == (Rows{{5000, 0}, {6000, 0}}));
+        for (const auto &h : f.result.hits) {
+            CAPTURE(h.pos);
+            const bool sel = bwa_aln::aln_meth_blind_selected(f.result, h, f.opt->s_mm, 1);
+            CHECK(sel == (h.pos == 1000 || !kept));
+        }
+        CHECK(f.slot.mf_occ.empty()); // released with the read
+    }
+}
+
 TEST_CASE("aln_meth: under the cuts the conversion-blind strata take the mirror-free ceiling")
 {
     // Default penalties. G: one gap open (cost 11, one difference); Y: four mismatches (12). Under
@@ -2894,10 +2948,11 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
     // mirror-free best with three mismatches and a mirror, a four-mismatch locus only the
     // mirror-free ceiling keeps), the -R case (three best loci at 12, a gapped mirror locus at
     // mirror-free 11, and a locus at 14 past the stop), a copy past the genomic cut that the
-    // search reaches after the best, and a -R stop on the mirror-free side alone. Reads whose strata the cuts may have pruned (blind_incomplete,
-    // cap 0) are skipped, and counted: among them those where a mirror-free run stops on -R where
-    // this search goes on. Every other read is compared, a collapsed -R stop included: this search
-    // stopped at the same boundary, so the two have resolved the same rows.
+    // search reaches after the best, and a -R stop on the mirror-free side alone. Reads whose
+    // strata the cuts may have pruned (blind_incomplete, cap 0) are skipped, and counted. Every
+    // other read is compared, a collapsed -R stop included: where this search stops at the same
+    // boundary the two have resolved the same rows, and where it goes on the strata are taken from
+    // the rows resolved at the mirror-free stop (counted apart: mirror-free side alone).
     // The loci compared are the ones the paired-end shadow pairing consumes: the hits it keeps
     // (aln_meth_blind_selected) and blind_rows. conversion-blind must leave the genomic search as
     // --meth-mapq scoring runs it: loci, counts, flags, the main hit, and the search's own work
@@ -2976,7 +3031,7 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
     {   // -R on the mirror-free side alone: one exact copy (0) and two with a T under the kept C
         // (3, mirror-free 0) are three mirror-free best loci, over -R 2, so a mirror-free run stops
         // at its first boundary; this search has one best locus and goes on to a one-mismatch copy
-        // (3), which a mirror-free run never reaches: unknown strata under -R 2
+        // (3), which a mirror-free run never reaches: under -R 2 the strata leave it out
         const std::set<int> meth = {25};
         const std::string seg = segment(meth);
         family({seg, copy_of(seg, meth, {}, -1, false), copy_of(seg, meth, {}, -1, false),
@@ -3030,8 +3085,9 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
     // M=1, O=3, E=1, where gaps are cheap against mismatches, at M=5, O=3, E=1, where a gap open
     // costs less than a mismatch, and at -e 3 -E 1 (extensions not counted as differences); each
     // also (once per penalty set) with a -m queue limit that binds on some reads
-    using Key = std::tuple<int, bwtint_t, int64_t, int, int, int>; // strand, position, mirror-free cost, counts
-    long compared = 0, with_blind_rows = 0, incomplete = 0, se_zero = 0, bound = 0, top2 = 0;
+    // strand, position, mirror-free cost, counts, reference span (--ref-span-insert reads it)
+    using Key = std::tuple<int, bwtint_t, int64_t, int, int, int, int>;
+    long compared = 0, with_blind_rows = 0, incomplete = 0, se_zero = 0, bound = 0, top2 = 0, top2_mf = 0;
     const int max_entries0 = opt->max_entries, max_gape0 = opt->max_gape, mode0 = opt->mode;
     for (const auto &pen : {std::vector<int>{3, 11, 4, 0}, std::vector<int>{1, 3, 1, 0}, std::vector<int>{5, 3, 1, 0},
                             std::vector<int>{3, 11, 1, 3}})
@@ -3098,21 +3154,24 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
                             || m.cost > g.blind_best || g.blind_c1 > 1;
                         continue;
                     }
-                    top2 += c.c1 > max_top2; // collapsed stopped on -R, as this search did there
+                    // collapsed stopped on -R; this search with it, or (mirror-free side alone) it
+                    // went on
+                    top2 += c.c1 > max_top2;
+                    top2_mf += c.c1 > max_top2 && g.c1 <= max_top2;
                     // the loci the shadow pairing consumes
                     std::set<Key> blind, want;
                     for (const auto &h : g.hits) {
                         if (!ba::aln_meth_blind_selected(g, h, opt->s_mm, gape)) continue;
                         const ba::aln_meth_blind_row_t m = ba::aln_meth_blind_view(g, h, opt->s_mm);
-                        blind.emplace(m.strand, m.pos, m.cost, m.n_mm, m.n_gapo, m.n_gape);
+                        blind.emplace(m.strand, m.pos, m.cost, m.n_mm, m.n_gapo, m.n_gape, m.span);
                     }
                     for (const auto &b : g.blind_rows) {
-                        CHECK(blind.count(Key{b.strand, b.pos, b.cost, b.n_mm, b.n_gapo, b.n_gape}) == 0);
-                        blind.emplace(b.strand, b.pos, b.cost, b.n_mm, b.n_gapo, b.n_gape);
+                        CHECK(blind.count(Key{b.strand, b.pos, b.cost, b.n_mm, b.n_gapo, b.n_gape, b.span}) == 0);
+                        blind.emplace(b.strand, b.pos, b.cost, b.n_mm, b.n_gapo, b.n_gape, b.span);
                     }
                     int64_t c_best = INT64_MAX;
                     for (const auto &h : c.hits) {
-                        want.emplace(h.strand, h.pos, h.cost, h.n_mm, h.n_gapo, h.n_gape);
+                        want.emplace(h.strand, h.pos, h.cost, h.n_mm, h.n_gapo, h.n_gape, h.span);
                         c_best = std::min(c_best, (int64_t)h.cost);
                     }
                     CHECK(g.blind_best == c_best);
@@ -3130,7 +3189,9 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
     CHECK(with_blind_rows > 0);
     CHECK(bound > 0);
     CHECK(incomplete > 0); // the need test runs end to end
-    MESSAGE("compared " << compared << " (collapsed stopped on -R: " << top2 << "), incomplete " << incomplete
+    CHECK(top2_mf > 0);    // and the strata kept at a mirror-free -R stop
+    MESSAGE("compared " << compared << " (collapsed stopped on -R: " << top2 << ", mirror-free side alone: "
+            << top2_mf << "), incomplete " << incomplete
             << " (single-end MAPQ 0 regardless: " << se_zero << "), -m bound " << bound);
     free(opt);
     ba::aln_meth_ref_free(&mr);
