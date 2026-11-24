@@ -1211,9 +1211,16 @@ static __attribute__((noinline)) void meth_blind_strata(aln_meth_slot_t *x, aln_
 {
     const gap_opt_t *opt = x->grp->opt;
     const bool gape = opt->mode & BWA_MODE_GAPE;
-    if (r->blind_partial) { std::vector<aln_meth_occ_t>().swap(r->mirror_rows); return; }
-    // the cuts may have pruned a row these strata need (blind_note_need): the cap is 0
-    r->blind_incomplete = x->blind_need;
+    if (r->blind_partial) {
+        std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
+        x->mf_occ.clear(); x->mf_mirror.clear();
+        return;
+    }
+    // the cuts may have pruned a row these strata need (blind_note_need): the cap is 0. So it is
+    // when the search went on past a mirror-free -R stop (mf_stop) and its result is then
+    // incomplete (flags): a mirror-free run, complete at its stop, would pair the read, and with
+    // this one left out of pairing its mate's cap would not follow that pairing.
+    r->blind_incomplete = x->blind_need || (x->mf_stop && r->flags);
     // Each locus once: its row, its occ row (null when only the mirror table holds it), and
     // whether it is a hit. After a mirror-free -R stop (mf_stop) the loci are those of the rows
     // resolved there (mf_occ, mf_mirror), each with its row in occ now (null if none).
@@ -1272,8 +1279,10 @@ static __attribute__((noinline)) void meth_blind_strata(aln_meth_slot_t *x, aln_
     // A mirror-free run that takes the cuts reaches every row at its best cost before it applies
     // the ceiling, and a row above that cost only within the ceiling: a locus whose lowest
     // mirror-free row is above the best and over the ceiling holds its best row within the
-    // ceiling instead (if it has none, the ceiling drops the locus below).
-    if (cuts)
+    // ceiling instead (if it has none, the ceiling drops the locus below). After a mirror-free -R
+    // stop (mf_stop) that run never applied the ceiling to the search: it resolved every row
+    // kept there and keeps each locus at its lowest one, which the ceiling then keeps or drops.
+    if (cuts && !x->mf_stop)
         for (size_t k = 0; k < cand.size(); ++k) {
             cand_t &e = cand[k];
             if (mf(*e.row) == best || mf_diffs(*e.row) <= ceiling) continue;
@@ -1361,11 +1370,13 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
         }
     }
     if (r->occ.empty()) {
+        // Every candidate was dropped: any of them could have been the best locus. Set before
+        // the strata, which read the flags after a mirror-free -R stop (as the nonempty branch).
+        if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
         // No record to cap, but collapsed can still place the read (its mate's shadow pairing)
         meth_blind_cap(x, r, -1, -1);
         std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
-        // Every candidate was dropped: any of them could have been the best locus.
-        if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
+        x->mf_occ.clear(); x->mf_mirror.clear();
         return;
     }
     int64_t best = INT64_MAX;
@@ -2197,25 +2208,34 @@ void aln_meth_blind_isize(const aln_meth_ref_t *ref, const gap_opt_t *gopt, cons
     // Each end's fields infer_isize reads, set to collapsed's single-end selection and then restored.
     struct saved_t { bwtint_t pos; int strand, mapq, ref_shift; };
     std::vector<saved_t> saved[2];
+    std::vector<uint8_t> span_excluded;
     for (int j = 0; j < 2; ++j) {
         saved[j].resize(n);
         for (int i = 0; i < n; ++i) {
             bwa_seq_t *s = seqs[j] + i;
             const aln_meth_read_t &r = res[j][i];
             saved[j][i] = saved_t{s->pos, (int)s->strand, (int)s->mapQ, s->ref_shift};
+            // An unknown selection supplies neither an observation nor a reference-span floor.
+            if (r.blind_partial || r.blind_incomplete) {
+                s->mapQ = 0;
+                if (popt->ref_span_insert) {
+                    if (span_excluded.empty()) span_excluded.resize(n, 0);
+                    span_excluded[i] |= 1u << j;
+                }
+                continue;
+            }
             const bool placed = s->type == BWA_TYPE_UNIQUE || s->type == BWA_TYPE_REPEAT
                 || (s->type == BWA_TYPE_NO_MATCH && r.blind_main >= 0); // collapsed places it
             if (!placed || r.flags) continue;
-            // collapsed's selection is unknown: not an observation
-            if (r.blind_partial || r.blind_incomplete) s->mapQ = 0;
-            else if (r.blind_main >= 0) {
+            if (r.blind_main >= 0) {
                 const aln_meth_blind_row_t &m = r.blind_pick;
                 s->mapQ = meth_blind_main_mapq(&r, s, gopt);
                 s->pos = m.pos; s->strand = m.strand; s->ref_shift = m.span - (int)s->len;
             }
         }
     }
-    bwa_pe_isize_ref(ref->bns->l_pac, n, seqs, ii, popt, last_ii, ref->bns, 0, excluded);
+    bwa_pe_isize_ref(ref->bns->l_pac, n, seqs, ii, popt, last_ii, ref->bns, 0, excluded,
+                     span_excluded.empty() ? nullptr : span_excluded.data());
     for (int j = 0; j < 2; ++j)
         for (int i = 0; i < n; ++i) {
             bwa_seq_t *s = seqs[j] + i;

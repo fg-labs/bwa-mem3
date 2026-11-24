@@ -57,10 +57,13 @@ pe_opt_t *bwa_init_pe_opt(void);
  * lower fence's floor is then the longest reference span (len + ref_shift) rather than the longest read.
  * Returns 0, or -1 (ii->avg = -1) when it cannot; prints its findings to stderr when `report`
  * is set. With `bns` (--meth), pairs whose ends lie on different contigs are not counted;
- * excluded[i] skips pair i from both the observations and the span floor; the defaults are stock's. */
+ * excluded[i] skips pair i from both the observations and the span floor. With ref_span,
+ * bit j of span_excluded[i] excludes only end j's reference span from the floor, not observations.
+ * The defaults are stock's. */
 int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
                 const bntseq_t *bns = nullptr, int report = 1, bool short_insert = false,
-                bool ref_span = false, const uint8_t *excluded = nullptr);
+                bool ref_span = false, const uint8_t *excluded = nullptr,
+                const uint8_t *span_excluded = nullptr);
 
 /* Single-end positions, then pairing, for one batch. Each read's alignments are its aln /
  * n_aln. Consumes drand48(): call serially, in read order. When the batch gives no estimate
@@ -87,10 +90,12 @@ void bwa_pe_se_pos(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t 
 void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, const pe_opt_t *opt,
 				  const isize_info_t *last_ii);
 /* Same stock inference/fallback policy with an explicit original reference length; with `bns`,
- * only same-contig pairs are counted (as --meth pairs them), and the reports follow `report`. */
+ * only same-contig pairs are counted (as --meth pairs them), and the reports follow `report`.
+ * The exclusion masks have the same meaning as in infer_isize. */
 void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
                       const pe_opt_t *opt, const isize_info_t *last_ii,
-                      const bntseq_t *bns = nullptr, int report = 1, const uint8_t *excluded = nullptr);
+                      const bntseq_t *bns = nullptr, int report = 1, const uint8_t *excluded = nullptr,
+                      const uint8_t *span_excluded = nullptr);
 /* With `hits` (--known-snvs), a pair where hits[j][i] is non-empty for either end pairs that end on
  * those hits, by position, instead of its SA rows; its extra hits come from the same list. With
  * `moved_span`, moved_span[j][i] is the reference span of the hit pairing moved end j of pair i

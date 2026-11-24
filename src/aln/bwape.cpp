@@ -68,7 +68,8 @@ pe_opt_t *bwa_init_pe_opt(void)
 #define OUTLIER_BOUND 2.0
 
 int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prior, int64_t L,
-                const bntseq_t *bns, int report, bool short_insert, bool ref_span, const uint8_t *excluded)
+                const bntseq_t *bns, int report, bool short_insert, bool ref_span, const uint8_t *excluded,
+                const uint8_t *span_excluded)
 {
 	uint64_t x, *isizes, n_ap = 0;
 	int n, i, j, tot, p25, p75, p50, max_len = 1, tmp;
@@ -96,6 +97,7 @@ int infer_isize(int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii, double ap_prio
 		// The fence's floor is the longest read, or with ref_span its longest reference span, so that
 		// it is in the same units as the observations.
 		for (j = 0; j < 2; ++j) {
+			if (ref_span && span_excluded && (span_excluded[i] & (1u << j))) continue;
 			const int64_t extent = ref_span ? (int64_t)p[j]->len + p[j]->ref_shift : (int64_t)p[j]->len;
 			if (extent > max_len) max_len = (int)extent;
 		}
@@ -436,11 +438,11 @@ void bwa_pe_isize(const bwt_t *bwt, int n_seqs, bwa_seq_t *seqs[2], isize_info_t
 
 void bwa_pe_isize_ref(int64_t reference_len, int n_seqs, bwa_seq_t *seqs[2], isize_info_t *ii,
                       const pe_opt_t *opt, const isize_info_t *last_ii, const bntseq_t *bns, int report,
-                      const uint8_t *excluded)
+                      const uint8_t *excluded, const uint8_t *span_excluded)
 {
 	// Shared stock inference/fallback; converted indices must supply the original length.
 	infer_isize(n_seqs, seqs, ii, opt->ap_prior, reference_len, bns, report, opt->short_insert,
-	            opt->ref_span_insert, excluded);
+	            opt->ref_span_insert, excluded, span_excluded);
 	if (ii->avg < 0.0 && last_ii->avg > 0.0) *ii = *last_ii;
 	if (opt->force_isize) {
 		if (report) fprintf(stderr, "[%s] discard insert size estimate as user's request.\n", "bwa_cal_pac_pos_pe");

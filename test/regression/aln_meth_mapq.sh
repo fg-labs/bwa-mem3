@@ -529,10 +529,7 @@ awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/mresc.awk" < /dev/null
 run mresc.scoring --meth --meth-mapq scoring "$tmp/mresc.fa" "$tmp/mresc1.fq" "$tmp/mresc2.fq"
 run mresc.blind --meth "$tmp/mresc.fa" "$tmp/mresc1.fq" "$tmp/mresc2.fq"
 run mresc.collapsed --meth --meth-scoring collapsed "$tmp/mresc.fa" "$tmp/mresc1.fq" "$tmp/mresc2.fq"
-cmp <(strip "$tmp/mresc.blind.rec") <(strip "$tmp/mresc.scoring.rec") || {
-    echo "FAIL: mresc: modes differ outside MAPQ and YQ:i" >&2
-    exit 1
-}
+same_outside_mapq "mresc" "$tmp/mresc.blind.rec" "$tmp/mresc.scoring.rec"
 observer mresc mresc
 expect collapsed-rescue-genomic <(pick "$tmp/mresc.scoring.sum" target) "target 99 home 101 60 -
 target 147 home 381 60 -"

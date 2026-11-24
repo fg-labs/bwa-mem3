@@ -1348,7 +1348,7 @@ TEST_CASE("aln_meth: the conversion-blind strata are collapsed's selection, locu
                     CHECK(g.c2 == s.c2);
                     CHECK(g.flags == s.flags);
                     CHECK(g.main == s.main);
-                    if (g.flags || c.flags || g.hits.empty() || c.hits.empty() || g.blind_incomplete) continue;
+                    if (g.flags || c.flags || g.blind_incomplete) continue;
                     if (g.c1 > max_top2 || c.c1 > max_top2 || g.blind_c1 > max_top2) continue;
                     const bool gape = opt->mode & BWA_MODE_GAPE;
                     // each locus: (strand, position) -> (cost, mismatches, gap opens, extensions, span)
@@ -1376,15 +1376,22 @@ TEST_CASE("aln_meth: the conversion-blind strata are collapsed's selection, locu
                     CHECK(blind == want);
                     // collapsed's main hit is the conversion-blind draw: the loci at the best
                     // mirror-free cost, in collapsed's order, drawn with the read's seed
-                    REQUIRE(g.blind_main >= 0);
-                    CHECK(g.blind_main < c.c1);
-                    const ba::aln_meth_blind_row_t &bm = g.blind_pick;
-                    const ba::aln_meth_hit_t &cm = c.hits[c.main], &gm = g.hits[g.main];
-                    CHECK(bm.rid == cm.rid);
-                    CHECK((int)bm.hyp == (int)cm.hyp);
-                    CHECK((int)bm.strand == (int)cm.strand);
-                    CHECK(bm.pos == cm.pos);
-                    with_other_main += bm.pos != gm.pos || bm.strand != gm.strand;
+                    if (c.main >= 0) {
+                        REQUIRE((size_t)c.main < c.hits.size());
+                        REQUIRE(g.blind_main >= 0);
+                        CHECK(g.blind_main < c.c1);
+                        const ba::aln_meth_blind_row_t &bm = g.blind_pick;
+                        const ba::aln_meth_hit_t &cm = c.hits[c.main];
+                        CHECK(bm.rid == cm.rid);
+                        CHECK((int)bm.hyp == (int)cm.hyp);
+                        CHECK((int)bm.strand == (int)cm.strand);
+                        CHECK(bm.pos == cm.pos);
+                        if (g.main >= 0) {
+                            REQUIRE((size_t)g.main < g.hits.size());
+                            const auto &gm = g.hits[g.main];
+                            with_other_main += bm.pos != gm.pos || bm.strand != gm.strand;
+                        } else ++with_other_main;
+                    } else CHECK(g.blind_main < 0);
                     ++compared;
                     with_blind_rows += !g.blind_rows.empty();
                 }
@@ -1445,6 +1452,64 @@ static void check_blind_observes_collapsed(const std::vector<Rec> &blind, const 
         const bool same = b.rname == c.rname && b.pos == c.pos && (b.flag & 0x10) == (c.flag & 0x10);
         CHECK(b.mapq == (same ? std::min(s.mapq, c.mapq) : 0));
     }
+}
+
+TEST_CASE("aln_meth: conversion-blind rows retain collapsed-only placements")
+{
+    namespace ba = bwa_aln;
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    opt->fnr = -1; opt->max_diff = 0; opt->max_gapo = 0;
+    opt->seed_len = 1024; opt->max_top2 = 1000;
+    const auto fq = write_fq("collapsed-only.fq", {ref().read_r});
+    ba::aln_meth_read_t result[2];
+    for (int mode = 0; mode < 2; ++mode) {
+        ba::aln_meth_opt_t mo;
+        mo.m.meth_mode = 1;
+        mo.m.meth_scoring = mode ? MEM_METH_SCORING_COLLAPSED : MEM_METH_SCORING_GENOMIC;
+        mo.m.meth_mapq = mode ? MEM_METH_MAPQ_SCORING : MEM_METH_MAPQ_CONVERSION_BLIND;
+        ba::aln_meth_opt_finish(&mo);
+        auto *input = ba::bwa_seq_open(fq.c_str());
+        int n = 0;
+        auto *seqs = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+        REQUIRE(n == 1);
+        ba::aln_dup_state_t dup;
+        ba::aln_meth_search_batch(bwt, &mr, &mo, n, seqs, opt, 1, 1, 0, 1, 1000, &dup, &result[mode]);
+        ba::bwa_free_read_seq(n, seqs);
+        ba::bwa_seq_close(input);
+    }
+    REQUIRE(result[0].flags == 0);
+    REQUIRE(result[1].flags == 0);
+    REQUIRE(result[0].hits.empty());
+    REQUIRE(result[1].c1 == 31);
+    REQUIRE(result[1].main >= 0);
+    REQUIRE((size_t)result[1].main < result[1].hits.size());
+    CHECK(result[0].blind_partial == 0);
+    CHECK(result[0].blind_incomplete == 0);
+    CHECK(result[0].blind_best == 0);
+    CHECK(result[0].blind_c1 == result[1].c1);
+    CHECK(result[0].blind_c2 == result[1].c2);
+    using Key = std::tuple<int, int, int, bwtint_t, int64_t, int, int, int, int>;
+    std::set<Key> blind, want;
+    for (const auto &b : result[0].blind_rows)
+        blind.emplace(b.rid, (int)b.hyp, (int)b.strand, b.pos, b.cost, b.n_mm, b.n_gapo, b.n_gape, b.span);
+    for (const auto &h : result[1].hits)
+        want.emplace(h.rid, (int)h.hyp, (int)h.strand, h.pos, h.cost, h.n_mm, h.n_gapo, h.n_gape, h.span);
+    CHECK(blind == want);
+    REQUIRE(result[0].blind_main >= 0);
+    const auto &picked = result[0].blind_pick;
+    const auto &main = result[1].hits[result[1].main];
+    CHECK(picked.rid == main.rid);
+    CHECK((int)picked.hyp == (int)main.hyp);
+    CHECK((int)picked.strand == (int)main.strand);
+    CHECK(picked.pos == main.pos);
+    free(opt);
+    ba::aln_meth_ref_free(&mr);
+    ba::bwt_destroy(bwt);
 }
 
 TEST_CASE("aln_meth: the conversion-blind pair MAPQ is collapsed's pairing's, capped at the genomic one")
@@ -1523,6 +1588,8 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQ is collapsed's pairing's, ca
     const auto blind = run({});
     const auto collapsed = run({"--meth-scoring", "collapsed"});
     REQUIRE(blind.size() == 2 * names.size());
+    REQUIRE(blind.size() == scoring.size());
+    REQUIRE(blind.size() == collapsed.size());
     check_blind_only_mapq(blind, scoring); // placement is the genomic search's
     check_blind_observes_collapsed(blind, scoring, collapsed);
     // each shape, as (pair, genomic MAPQ, conversion-blind MAPQ) of some record
@@ -1691,6 +1758,8 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQs are collapsed's, capped at 
         const auto blind = run({});
         const auto collapsed = run({"--meth-scoring", "collapsed"});
         REQUIRE(blind.size() == 2 * names.size());
+        REQUIRE(blind.size() == scoring.size());
+        REQUIRE(blind.size() == collapsed.size());
         check_blind_only_mapq(blind, scoring); // conversion-blind changes only MAPQ (and YQ:i)
         for (size_t i = 0; i < blind.size(); ++i) {
             CAPTURE(blind[i].name);
@@ -1803,6 +1872,8 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQ follows collapsed's mate res
         const auto blind = run({});
         const auto collapsed = run({"--meth-scoring", "collapsed"});
         REQUIRE(blind.size() == 2 * names.size());
+        REQUIRE(blind.size() == scoring.size());
+        REQUIRE(blind.size() == collapsed.size());
         check_blind_only_mapq(blind, scoring); // placement is the genomic search's
         check_blind_observes_collapsed(blind, scoring, collapsed);
         // the target pair, as described: genomic proper at home; collapsed rescues read 2 home,
@@ -2916,6 +2987,152 @@ TEST_CASE("aln_meth: after a mirror-free -R stop the conversion-blind strata are
     }
 }
 
+TEST_CASE("aln_meth: a mirror-free -R stop before the genomic best leaves that best out of the conversion-blind selection")
+{
+    // Default penalties, under the cuts. The mirror table holds B and C, two mirror mismatches
+    // each (6, mirror-free 0): over -R 1, a mirror-free run stops at its first boundary (next 1),
+    // before this search stores A, its best, with one mismatch (3). A mirror-free run never
+    // reaches A: it is not in the selection, so the single-end cap is 0 (meth_blind_se_cap's
+    // first test). Taken from every row instead, A would be a second-stratum locus.
+    for (int kept = 0; kept < 2; ++kept) {
+        CAPTURE(kept);
+        BlindFinish f(1);
+        auto row = [](bwtint_t pos) {
+            bwa_aln::aln_meth_occ_t o{};
+            o.rid = 0; o.hyp = 1; o.pos = pos; o.cost = 6; o.n_mm = 2; o.n_mirror = 2;
+            o.alignment.rb = (int64_t)pos; o.alignment.re = (int64_t)pos + 40;
+            return o;
+        };
+        if (kept) {
+            f.slot.mf_stop = 1;
+            f.slot.mf_mirror = {row(5000), row(6000)}; // mf_occ empty: no genomic row yet
+        } else f.result.mirror_rows = {row(5000), row(6000)};
+        f.add(1000, 3, 1, 0, 0); // A
+        bwa_aln::aln_meth_slot_finish(&f.slot);
+        REQUIRE(f.result.hits.size() == 1u);
+        CHECK(f.result.blind_incomplete == 0);
+        CHECK(f.result.blind_best == 0);
+        CHECK(f.result.blind_c1 == 2);
+        CHECK(f.result.blind_c2 == (kept ? 0 : 1));
+        using Rows = std::vector<std::pair<bwtint_t, int32_t>>;
+        CHECK(f.blind_rows() == (Rows{{5000, 0}, {6000, 0}}));
+        const auto &h = f.result.hits[f.result.main];
+        CHECK(bwa_aln::aln_meth_blind_selected(f.result, h, f.opt->s_mm, 1) == !kept);
+        CHECK(bwa_aln::aln_meth_blind_view(f.result, h, f.opt->s_mm).unreached == kept);
+    }
+}
+
+TEST_CASE("aln_meth: a read with no locus past a mirror-free -R stop and a dropped candidate has unknown strata")
+{
+    // Default penalties, under the cuts. A mirror-free run stopped on -R at B and C (mirror rows,
+    // 6, mirror-free 0), and every genomic candidate was dropped as unrepresentable, so occ is
+    // empty. The dropped candidate leaves the read incomplete (ALN_METH_BIND_UNREP); the strata
+    // must see that flag, as the nonempty branch's do, and be unknown (blind_incomplete).
+    BlindFinish f(1);
+    auto row = [](bwtint_t pos) {
+        bwa_aln::aln_meth_occ_t o{};
+        o.rid = 0; o.hyp = 1; o.pos = pos; o.cost = 6; o.n_mm = 2; o.n_mirror = 2;
+        o.alignment.rb = (int64_t)pos; o.alignment.re = (int64_t)pos + 40;
+        return o;
+    };
+    f.slot.mf_stop = 1;
+    f.slot.mf_mirror = {row(5000), row(6000)};
+    f.result.n_unrepresentable = 1;
+    f.slot.unrep_cost = 0;
+    bwa_aln::aln_meth_slot_finish(&f.slot);
+    CHECK(f.result.hits.empty());
+    CHECK((f.result.flags & bwa_aln::ALN_METH_BIND_UNREP) != 0);
+    CHECK(f.result.blind_incomplete == 1);
+}
+
+TEST_CASE("aln_meth: after a mirror-free -R stop a locus whose occ row changed keeps the row it had there")
+{
+    // Default penalties, under the cuts. At the mirror-free stop A's locus holds a row with one
+    // mismatch that is a mirror (3, mirror-free 0); B and C are mirror rows (6, mirror-free 0).
+    // Later the search replaces A's occ row with one ordinary mismatch (3, mirror-free 3) at the
+    // same locus. The strata take A at the row it had at the stop: a hit at mirror-free 0, not
+    // unreached, one of three best loci.
+    BlindFinish f(1);
+    auto row = [](bwtint_t pos, int64_t cost, int n_mm, int n_mirror) {
+        bwa_aln::aln_meth_occ_t o{};
+        o.rid = 0; o.hyp = 1; o.pos = pos; o.cost = cost; o.n_mm = n_mm; o.n_mirror = n_mirror;
+        o.alignment.rb = (int64_t)pos; o.alignment.re = (int64_t)pos + 40;
+        o.alignment.cigar = {40u << 4};
+        return o;
+    };
+    f.slot.mf_stop = 1;
+    f.slot.mf_occ = {row(1000, 3, 1, 1)};
+    f.slot.mf_mirror = {row(5000, 6, 2, 2), row(6000, 6, 2, 2)};
+    f.result.occ.push_back(row(1000, 3, 1, 0)); // A's row now, a different CIGAR
+    f.result.occ.back().alignment.cigar = {39u << 4, 1u << 4};
+    bwa_aln::aln_meth_slot_finish(&f.slot);
+    REQUIRE(f.result.hits.size() == 1u);
+    const auto &h = f.result.hits[f.result.main];
+    const bwa_aln::aln_meth_blind_row_t m = bwa_aln::aln_meth_blind_view(f.result, h, f.opt->s_mm);
+    CHECK(m.unreached == 0);
+    CHECK(m.cost == 0);
+    CHECK(m.n_mm == 0);
+    CHECK(bwa_aln::aln_meth_blind_selected(f.result, h, f.opt->s_mm, 1));
+    CHECK(f.result.blind_best == 0);
+    CHECK(f.result.blind_c1 == 3);
+    CHECK(f.result.blind_c2 == 0);
+}
+
+TEST_CASE("aln_meth: after a mirror-free -R stop a locus over the ceiling keeps its lowest row")
+{
+    // -M 3 -O 1 -E 1, under the cuts. O is exact (0, the best; ceiling 0 + 1). Locus L holds X,
+    // one gap open and one extension (2, two differences), and Y, one mismatch (3, one). A
+    // mirror-free run that goes on past its best stratum applies the ceiling before it reaches a
+    // costlier row, so the strata hold L at Y (within the ceiling). One that stops on -R at its
+    // first boundary has resolved both and keeps L at X, its lowest row, which the ceiling drops.
+    for (int kept = 0; kept < 2; ++kept) {
+        CAPTURE(kept);
+        BlindFinish f(1);
+        f.opt->s_mm = 3; f.opt->s_gapo = 1; f.opt->s_gape = 1;
+        auto row = [](bwtint_t pos, int64_t cost, int n_mm, int n_gapo, int n_gape) {
+            bwa_aln::aln_meth_occ_t o{};
+            o.rid = 0; o.hyp = 1; o.pos = pos; o.cost = cost; o.n_mm = n_mm; o.n_gapo = n_gapo; o.n_gape = n_gape;
+            o.alignment.rb = (int64_t)pos; o.alignment.re = (int64_t)pos + 40;
+            return o;
+        };
+        f.result.occ = {row(1000, 0, 0, 0, 0), row(2000, 2, 0, 1, 1)}; // O, L at X
+        const bwa_aln::aln_meth_occ_t y = row(2000, 3, 1, 0, 0);
+        if (kept) {
+            f.slot.mf_stop = 1;
+            f.slot.mf_occ = f.result.occ;
+            f.slot.mf_mirror = {y};
+        } else f.result.mirror_rows = {y};
+        bwa_aln::aln_meth_slot_finish(&f.slot);
+        CHECK(f.result.blind_best == 0);
+        CHECK(f.result.blind_c1 == 1);
+        CHECK(f.result.blind_c2 == (kept ? 0 : 1));
+        CHECK(f.result.blind_rows.size() == (kept ? 0u : 1u));
+    }
+}
+
+TEST_CASE("aln_meth: a read left incomplete past a mirror-free -R stop has unknown conversion-blind strata")
+{
+    // As above (A exact, B and C mirror rows over -R): the search goes on past the mirror-free stop
+    // and then binds -m. A mirror-free run is complete at its stop and would pair the read, so
+    // the strata are unknown (both ends' caps 0); without the stop the flags alone leave them be.
+    for (int kept = 0; kept < 2; ++kept) {
+        CAPTURE(kept);
+        BlindFinish f(1);
+        f.add(1000, 0, 0, 0, 0);
+        bwa_aln::aln_meth_occ_t b{};
+        b.rid = 0; b.hyp = 1; b.pos = 5000; b.cost = 6; b.n_mm = 2; b.n_mirror = 2;
+        b.alignment.rb = 5000; b.alignment.re = 5040;
+        if (kept) {
+            f.slot.mf_stop = 1;
+            f.slot.mf_occ = f.result.occ;
+            f.slot.mf_mirror = {b};
+        } else f.result.mirror_rows = {b};
+        f.result.flags |= bwa_aln::ALN_METH_BIND_M;
+        bwa_aln::aln_meth_slot_finish(&f.slot);
+        CHECK(f.result.blind_incomplete == kept);
+    }
+}
+
 TEST_CASE("aln_meth: under the cuts the conversion-blind strata take the mirror-free ceiling")
 {
     // Default penalties. G: one gap open (cost 11, one difference); Y: four mismatches (12). Under
@@ -3140,7 +3357,7 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
                     CHECK(g.n_flushes == s.n_flushes);
                     CHECK(g.n_rescored == s.n_rescored);
                     bound += (s.flags & ba::ALN_METH_BIND_M) != 0;
-                    if (g.flags || c.flags || g.hits.empty() || c.hits.empty()) continue;
+                    if (g.flags || c.flags) continue;
                     const bool gape = opt->mode & BWA_MODE_GAPE;
                     if (g.blind_incomplete) {
                         // Counted: whether the single-end MAPQ is 0 without that rule too (the
@@ -3148,10 +3365,13 @@ TEST_CASE("aln_meth: under the cuts the conversion-blind strata are collapsed's 
                         // alone at the mirror-free best within its ceiling). Not guaranteed: the
                         // main locus's mirror-free row can be a moved row with more differences.
                         ++incomplete;
-                        const ba::aln_meth_hit_t &h = g.hits[g.main];
-                        const ba::aln_meth_blind_row_t m = ba::aln_meth_blind_view(g, h, opt->s_mm);
-                        se_zero += g.c1 > 1 || !ba::aln_meth_blind_selected(g, h, opt->s_mm, gape)
-                            || m.cost > g.blind_best || g.blind_c1 > 1;
+                        if (g.main >= 0) {
+                            REQUIRE((size_t)g.main < g.hits.size());
+                            const ba::aln_meth_hit_t &h = g.hits[g.main];
+                            const ba::aln_meth_blind_row_t m = ba::aln_meth_blind_view(g, h, opt->s_mm);
+                            se_zero += g.c1 > 1 || !ba::aln_meth_blind_selected(g, h, opt->s_mm, gape)
+                                || m.cost > g.blind_best || g.blind_c1 > 1;
+                        }
                         continue;
                     }
                     // collapsed stopped on -R; this search with it, or (mirror-free side alone) it
@@ -4739,6 +4959,87 @@ TEST_CASE("aln_meth: insert inference counts only same-contig pairs, as --meth p
     CHECK(stock.avg<want.avg-50); // not vacuous: the straddling pairs pull stock's estimate down
     CHECK(meth.avg==want.avg);CHECK(meth.std==want.std);
     CHECK(meth.low==want.low);CHECK(meth.high==want.high);CHECK(meth.high_bayesian==want.high_bayesian);
+    ba::aln_meth_ref_free(&mr);
+}
+
+TEST_CASE("aln_meth: unknown collapsed spans do not raise the insert-size floor")
+{
+    namespace ba = bwa_aln;
+    int unknown_end = 0, unknown_len = 40;
+    bool incomplete = false, unknown = true, excluded_pair = false, ref_span = true, short_insert = false;
+    ba::isize_info_t previous{};
+    previous.avg = 300; previous.std = 30;
+    previous.low = 200; previous.high = 400; previous.high_bayesian = 500;
+    previous.ap_prior = 1e-5;
+    SUBCASE("unknown read 1, retaining its known mate's span") {}
+    SUBCASE("unknown read 2 longer than its reference span") { unknown_end = 1; unknown_len = 50; }
+    SUBCASE("incomplete mirror-free strata") { incomplete = true; }
+    SUBCASE("no previous estimate") { previous.avg = previous.std = -1; }
+    SUBCASE("pair exclusion still excludes both spans") { excluded_pair = true; }
+    SUBCASE("ordinary read-length inference is unchanged") { ref_span = false; }
+    SUBCASE("ordinary inference retains an unknown end's read length") { ref_span = false; unknown_len = 50; }
+    SUBCASE("short inserts keep their own floor") { short_insert = true; }
+    SUBCASE("a known long span still invalidates the estimate") { unknown = false; }
+    FMI_search fmi((ref().fa + ".meth").c_str());
+    fmi.load_index(false, 1);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, ref().fa.c_str(), fmi.idx->bns, 1) == 0);
+    const int calibration = 30, n = calibration + 1;
+    std::vector<ba::bwa_seq_t> ends[2];
+    std::vector<ba::aln_meth_read_t> results[2];
+    for (int j = 0; j < 2; ++j) {
+        ends[j].resize(n); results[j].resize(n);
+        for (int i = 0; i < n; ++i) {
+            auto &s = ends[j][i];
+            s.type = BWA_TYPE_UNIQUE; s.mapQ = s.seQ = 37;
+            s.len = s.full_len = 40; s.strand = j;
+            s.pos = 100 + 60 * i + (j ? 1 + i % 5 : 0);
+            auto &r = results[j][i];
+            r.blind_best = 0; r.blind_main = 0; r.blind_c1 = 1;
+            r.blind_pick.pos = s.pos; r.blind_pick.strand = j;
+            r.blind_pick.rid = 0; r.blind_pick.hyp = 1; r.blind_pick.span = 40;
+        }
+    }
+    // The good observations are 41..45 (upper fence 48). The unknown span 49 must not
+    // trigger fallback, but its known mate's span 43 must still set the lower floor.
+    for (int j = 0; j < 2; ++j) {
+        const int span = j == unknown_end ? 49 : 43;
+        auto &s = ends[j][calibration];
+        s.len = s.full_len = j == unknown_end ? unknown_len : 40;
+        s.ref_shift = span - (int)s.len;
+        results[j][calibration].blind_pick.span = span;
+    }
+    if (unknown) {
+        auto &r = results[unknown_end][calibration];
+        r.blind_partial = !incomplete; r.blind_incomplete = incomplete;
+    }
+    std::vector<uint8_t> excluded(n, 0);
+    excluded[calibration] = excluded_pair;
+    const std::vector<ba::bwa_seq_t> saved[2] = {ends[0], ends[1]};
+    ba::bwa_seq_t *seqs[2] = {ends[0].data(), ends[1].data()};
+    ba::aln_meth_read_t *res[2] = {results[0].data(), results[1].data()};
+    auto *gap = ba::gap_init_opt();
+    auto *pe = ba::bwa_init_pe_opt();
+    pe->ref_span_insert = ref_span; pe->short_insert = short_insert;
+    ba::isize_info_t ii{};
+    ba::aln_meth_blind_isize(&mr, gap, pe, n, seqs, res, excluded.data(), &previous, &ii);
+    const bool fallback = !unknown || (!ref_span && unknown_len > 48);
+    const int expected_low = fallback ? 200 : short_insert ? 38 : !ref_span || excluded_pair ? 40 : 43;
+    const int expected_high = fallback ? 400 : 48;
+    const double expected_avg = fallback ? 300 : ref_span && !short_insert && !excluded_pair ? 44 : 43;
+    CHECK(ii.low == expected_low);
+    CHECK(ii.high == expected_high);
+    CHECK(ii.avg == doctest::Approx(expected_avg));
+    CHECK(ii.std > 0);
+    for (int j = 0; j < 2; ++j)
+        for (int i = 0; i < n; ++i) {
+            CHECK(ends[j][i].pos == saved[j][i].pos);
+            CHECK((int)ends[j][i].strand == (int)saved[j][i].strand);
+            CHECK((int)ends[j][i].mapQ == (int)saved[j][i].mapQ);
+            CHECK((int)ends[j][i].len == (int)saved[j][i].len);
+            CHECK(ends[j][i].ref_shift == saved[j][i].ref_shift);
+        }
+    free(pe); free(gap);
     ba::aln_meth_ref_free(&mr);
 }
 
