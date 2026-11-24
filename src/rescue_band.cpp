@@ -3,7 +3,6 @@
  * See rescue_band.h for the design and the exactness argument, and
  * docs/src/developer-guide/rescue-banding.md for the overview and its gates. */
 #include "rescue_band.h"
-#include "kswv_score2.h"
 #include "rescue_env.h"
 #include "simd_dispatch.h"
 #include "utils.h"
@@ -21,11 +20,9 @@
  * rb_score2_vec feed it the qualifying rows their vector prefilter finds. */
 struct rb_score2_scan {
     int low, high, s2 = -1, t2 = -1, bs = -1, bp = -2;
-    kswv_score2_ub ub; // score2_ub, over the same lagged-zeroed rows as kswv's u8 kernels
-    rb_score2_scan(int lo, int hi, int minsc) : low(lo), high(hi), ub(lo, hi, minsc, true) {}
+    rb_score2_scan(int lo, int hi) : low(lo), high(hi) {}
     void row(int i, int val)
     {
-        ub.row(i, val);
         if (bp + 1 != i) {
             if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
             bs = val; bp = i;
@@ -33,12 +30,11 @@ struct rb_score2_scan {
             bs = val; bp = i;
         }
     }
-    void finish(int *score2, int *te2, int *score2_ub)
+    void finish(int *score2, int *te2)
     {
         if (bp >= 0 && (bp < low || bp > high) && bs > s2) { s2 = bs; t2 = bp; }
         *score2 = s2;
         *te2 = t2;
-        *score2_ub = ub.value();
     }
 };
 
@@ -1167,10 +1163,9 @@ static inline void rb_merge_max(uint8_t *buf, const uint8_t *Rl, int n)
  * lagged rising-row zeroing (a row followed by a higher one is 0; the last row and every row
  * followed by a 0 row stay), then the b[] emulation, zone [te - Z, te + Z]. The lagged zeroing and the
  * >= minsc test run 16 rows per vector; only qualifying rows reach the scalar b[] emulation. */
-static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int minsc, int *score2, int *te2,
-                          int *score2_ub)
+static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int minsc, int *score2, int *te2)
 {
-    rb_score2_scan sc(te - Z, te + Z, minsc);
+    rb_score2_scan sc(te - Z, te + Z);
     const uint8x16_t ms = vdupq_n_u8((uint8_t)minsc);
     alignas(16) uint8_t vb[16];
     for (int k0 = 0; k0 < n; k0 += 16) {
@@ -1185,7 +1180,7 @@ static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int 
             sc.row(row0 + k0 + t, vb[t]);
         } while (m);
     }
-    sc.finish(score2, te2, score2_ub);
+    sc.finish(score2, te2);
 }
 #endif
 
@@ -1357,8 +1352,8 @@ void RescueBandBatch::run_jobs(bool pass1)
             if (p.rbuf < 0) {   // the parent's only band: its outputs are the parent's
                 p.S = g8; p.te = te; p.qe = qe;
                 const int minsc = recs_[p.rec].minsc;
-                if (g8 >= minsc) rb_score2_vec(Rl, J.nrows, J.r0, sc_.zone(g8), te, minsc, &p.s2, &p.te2, &p.ub);
-                else p.s2 = p.te2 = p.ub = -1;
+                if (g8 >= minsc) rb_score2_vec(Rl, J.nrows, J.r0, sc_.zone(g8), te, minsc, &p.s2, &p.te2);
+                else p.s2 = p.te2 = -1;
             } else {
                 /* rbuf has >= 32 bytes of zeroed slack past the hull, and Rl is zero past nrows,
                  * so whole vector chunks can be max-merged. */
@@ -1380,12 +1375,12 @@ void RescueBandBatch::finish_parent(pstate &p)
         const int minsc = recs_[p.rec].minsc;
         if (p.S >= minsc) {
 #if RB_HAVE_SIMD
-            rb_score2_vec(rpool_.data() + p.rbuf, p.L, 0, sc_.zone(p.S), p.te, minsc, &p.s2, &p.te2, &p.ub);
+            rb_score2_vec(rpool_.data() + p.rbuf, p.L, 0, sc_.zone(p.S), p.te, minsc, &p.s2, &p.te2);
 #else
             assert(!"banded rescue needs a SIMD kernel: rescue_band_enabled() is false without one");
 #endif
         } else
-            p.s2 = p.te2 = p.ub = -1;
+            p.s2 = p.te2 = -1;
     }
 }
 
@@ -1399,7 +1394,7 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
     size_t rused = 0;
     auto add_jobs = [&](int pi, const SeqPair &sp, const rb_band *bb, int nbb, int round) {
         pstate &p = ps_[pi];
-        p.S = 0; p.te = -1; p.qe = 0; p.s2 = p.te2 = p.ub = -1; p.round = round;
+        p.S = 0; p.te = -1; p.qe = 0; p.s2 = p.te2 = -1; p.round = round;
         p.rbuf = -1;
         if (nbb > 1) {   // merged row-max buffer: the hull rows + 32 zero bytes of slack
             p.rbuf = (int32_t)rused;
@@ -1424,8 +1419,8 @@ void RescueBandBatch::run_pass0(const SeqPair *pairs, int nb, const uint8_t *seq
         a.score = p.S + shift < 255 ? p.S : 255;
         a.te = p.te;
         a.qe = p.qe;
-        if (a.score == 255) { a.score2 = a.te2 = a.score2_ub = -1; }
-        else { a.score2 = p.s2; a.te2 = p.te2; a.score2_ub = p.ub; }
+        if (a.score == 255) { a.score2 = a.te2 = -1; }
+        else { a.score2 = p.s2; a.te2 = p.te2; }
     };
     /* ---- round 1: every banded parent's components at T1 ---- */
     ps_.resize(nb);

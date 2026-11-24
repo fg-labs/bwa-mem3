@@ -482,10 +482,9 @@ static inline void rb_merge_max(uint8_t *buf, const uint8_t *Rl, int n)
 
 /* kswv's score2 / te2 for a CONTIGUOUS row-max array R[k] of rows row0 + k, k in [0, n), whose
  * slack R[n, n + 16] is zero: the NEON section's rb_score2_vec (see there), 16 rows per vector. */
-static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int minsc, int *score2, int *te2,
-                          int *score2_ub)
+static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int minsc, int *score2, int *te2)
 {
-    rb_score2_scan sc(te - Z, te + Z, minsc);
+    rb_score2_scan sc(te - Z, te + Z);
     const __m128i ms = _mm_set1_epi8((char)(uint8_t)minsc);
     alignas(16) uint8_t vb[16];
     for (int k0 = 0; k0 < n; k0 += 16) {
@@ -502,7 +501,7 @@ static void rb_score2_vec(const uint8_t *R, int n, int row0, int Z, int te, int 
             sc.row(row0 + k0 + t, vb[t]);
         } while (m);
     }
-    sc.finish(score2, te2, score2_ub);
+    sc.finish(score2, te2);
 }
 
 #endif

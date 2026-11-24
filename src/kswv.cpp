@@ -432,9 +432,8 @@ static inline void kswv_score2_none(const SeqPair *p, kswr_t *aln, int po_ind,
                                     int32_t numPairs, int width)
 {
     for (int l = 0; l < width && (po_ind + l) < numPairs; l++) {
-        aln[p[l].regid].score2    = -1;
-        aln[p[l].regid].te2       = -1;
-        aln[p[l].regid].score2_ub = -1;
+        aln[p[l].regid].score2 = -1;
+        aln[p[l].regid].te2    = -1;
     }
 }
 
@@ -2299,21 +2298,18 @@ int kswv::kswv_neon_u8_impl(uint8_t seq1SoA[],
          * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
          * mask have minsc[l] zero-initialized and must skip the scan. */
         if (!qe[l] || !(minsc_msk_a & (1u << l))) {
-            aln[ind].score2    = -1;
-            aln[ind].te2       = -1;
-            aln[ind].score2_ub = -1;
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
             continue;
         }
 
         const int len1_l = (int)p[l].len1;
         const int nrows  = processed_rows < len1_l ? processed_rows : len1_l;
-        int score2, te2, score2_ub;
+        int score2, te2;
         kswv_score2_scan_bits_u8<SIMD_WIDTH8>(rowMax, score2Bits, nrows, l, (int)minsc[l],
-                                              (int)low[l], (int)high[l], &score2, &te2,
-                                              &score2_ub);
-        aln[ind].score2    = score2;
-        aln[ind].te2       = te2;
-        aln[ind].score2_ub = score2_ub;
+                                              (int)low[l], (int)high[l], &score2, &te2);
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;
@@ -3196,9 +3192,8 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
          * not rewrite to te[l] < 0 without also reverting that
          * liveness-flag overwrite. */
         if (!qe[l] || !(minsc_msk_a & (1u << l))) {
-            aln[ind].score2    = -1;
-            aln[ind].te2       = -1;
-            aln[ind].score2_ub = -1;
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
             continue;
         }
 
@@ -3210,13 +3205,11 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
         int te2     = -1;
         int b_score = -1;
         int b_pos   = -2;
-        kswv_score2_ub ub(low_l, high_l, minsc_l, false); // a plain row max: nothing zeroed
 
         int nrows = processed_rows < len1_l ? processed_rows : len1_l;
         for (int i2 = 0; i2 < nrows; i2++) {
             int imax = (int)rowMax[i2 * SIMD_WIDTH16 + l];
             if (imax < minsc_l) continue;
-            ub.row(i2, imax);
 
             if (b_pos + 1 != i2) {
                 if (b_pos >= 0 &&
@@ -3240,9 +3233,8 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
             te2    = b_pos;
         }
 
-        aln[ind].score2    = score2;
-        aln[ind].te2       = te2;
-        aln[ind].score2_ub = ub.value();
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;
@@ -3886,21 +3878,18 @@ int kswv::kswv256_u8_impl(uint8_t seq1SoA[],
          * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
          * mask have minsc[l] zero-initialized and must skip the scan. */
         if (!qe[l] || !(minsc_msk_a & (1u << l))) {
-            aln[ind].score2    = -1;
-            aln[ind].te2       = -1;
-            aln[ind].score2_ub = -1;
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
             continue;
         }
 
         const int len1_l = (int)p[l].len1;
         const int nrows  = processed_rows < len1_l ? processed_rows : len1_l;
-        int score2, te2, score2_ub;
+        int score2, te2;
         kswv_score2_scan_bits_u8<SIMD_WIDTH8>(rowMax, score2Bits, nrows, l, (int)minsc[l],
-                                              (int)low[l], (int)high[l], &score2, &te2,
-                                              &score2_ub);
-        aln[ind].score2    = score2;
-        aln[ind].te2       = te2;
-        aln[ind].score2_ub = score2_ub;
+                                              (int)low[l], (int)high[l], &score2, &te2);
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;
@@ -4391,9 +4380,8 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
     for (int l = 0; l < SIMD_WIDTH16 && (po_ind + l) < numPairs; l++) {
         int ind = p[l].regid;
         if (!qe[l] || !(minsc_msk_a & (1u << l))) {
-            aln[ind].score2    = -1;
-            aln[ind].te2       = -1;
-            aln[ind].score2_ub = -1;
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
             continue;
         }
 
@@ -4405,13 +4393,11 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
         int te2     = -1;
         int b_score = -1;
         int b_pos   = -2;
-        kswv_score2_ub ub(low_l, high_l, minsc_l, false); // a plain row max: nothing zeroed
 
         int nrows = processed_rows < len1_l ? processed_rows : len1_l;
         for (int i2 = 0; i2 < nrows; i2++) {
             int imax = (int)rowMax[i2 * SIMD_WIDTH16 + l];
             if (imax < minsc_l) continue;
-            ub.row(i2, imax);
 
             if (b_pos + 1 != i2) {
                 if (b_pos >= 0 &&
@@ -4435,9 +4421,8 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
             te2    = b_pos;
         }
 
-        aln[ind].score2    = score2;
-        aln[ind].te2       = te2;
-        aln[ind].score2_ub = ub.value();
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;
@@ -5412,21 +5397,18 @@ int kswv::kswv512_u8_impl(uint8_t seq1SoA[],
          * minsc_msk_a tracks lanes with KSW_XSUBO set; lanes not in the
          * mask have minsc[l] zero-initialized and must skip the scan. */
         if (!qe[l] || !(minsc_msk_a & ((__mmask64)1 << l))) {
-            aln[ind].score2    = -1;
-            aln[ind].te2       = -1;
-            aln[ind].score2_ub = -1;
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
             continue;
         }
 
         const int len1_l = (int)p[l].len1;
         const int nrows  = processed_rows < len1_l ? processed_rows : len1_l;
-        int score2, te2, score2_ub;
+        int score2, te2;
         kswv_score2_scan_bits_u8<SIMD_WIDTH8>(rowMax, score2Bits, nrows, l, (int)minsc[l],
-                                              (int)low[l], (int)high[l], &score2, &te2,
-                                              &score2_ub);
-        aln[ind].score2    = score2;
-        aln[ind].te2       = te2;
-        aln[ind].score2_ub = score2_ub;
+                                              (int)low[l], (int)high[l], &score2, &te2);
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;   
@@ -5992,9 +5974,8 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
          * gmax is recorded, so te[l] < 0 cleanly marks lanes with no
          * primary alignment. */
         if (te[l] < 0 || !(minsc_msk_a & ((__mmask32)1 << l))) {
-            aln[ind].score2    = -1;
-            aln[ind].te2       = -1;
-            aln[ind].score2_ub = -1;
+            aln[ind].score2 = -1;
+            aln[ind].te2    = -1;
             continue;
         }
 
@@ -6008,13 +5989,11 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
          * on the first qualifying row. */
         int b_score = -1;
         int b_pos   = -2;
-        kswv_score2_ub ub(low_l, high_l, minsc_l, false); // a plain row max: nothing zeroed
 
         int nrows = processed_rows < len1_l ? processed_rows : len1_l;
         for (int i2 = 0; i2 < nrows; i2++) {
             int imax = (int)rowMax[i2 * SIMD_WIDTH16 + l];
             if (imax < minsc_l) continue;
-            ub.row(i2, imax);
 
             if (b_pos + 1 != i2) {
                 /* APPEND: flush outgoing b[] entry to score2 first. */
@@ -6041,9 +6020,8 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
             te2    = b_pos;
         }
 
-        aln[ind].score2    = score2;
-        aln[ind].te2       = te2;
-        aln[ind].score2_ub = ub.value();
+        aln[ind].score2 = score2;
+        aln[ind].te2    = te2;
     }
 
     return 1;

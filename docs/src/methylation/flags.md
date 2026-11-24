@@ -220,7 +220,7 @@ the other alignments a mirror-free gain could bring within reach of a primary; a
 gain, since the pairing MAPQ counts near-ties of the second-best pair, which can lie far below
 the chosen one. A mate found by mate rescue also takes its rescue window's second-best alignment
 as a competitor (`csub`); the shadow aligns that window again with the mirror cell free, when
-that could change the mate's MAPQ, and keeps the higher second-best. With
+the mate has a base the mirror cell can free, and keeps the higher second-best. With
 [`--rescue-kmer`](../cli/mem.md#--rescue-kmerk----rescue-band-int--banded-mate-rescue-opt-in-not-byte-identical),
 the genomic second-best comes from a narrowed window, so the shadow's estimate can differ from
 `collapsed -B 4`'s. A read whose MAPQ is already 0 is skipped. The cost is +3.2 % user CPU on NA12878 read 1

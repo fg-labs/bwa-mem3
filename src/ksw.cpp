@@ -123,8 +123,7 @@ static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 			  int xtra) // the first gap costs -(_o+_e)
 {
 	int slen, i, m_b, n_b, te = -1, gmax = 0, minsc, endsc;
-	uint64_t *b, *u; // u: every column >= minsc, unmerged (score2_ub)
-	int m_u, n_u;
+	uint64_t *b;
 	__m128i zero, oe_del, e_del, oe_ins, e_ins, shift, *H0, *H1, *E, *Hmax;
 	kswr_t r;
 
@@ -141,7 +140,6 @@ static kswr_t ksw_u8(kswq_t *q, int tlen, const uint8_t *target,
 	minsc = (xtra & KSW_XSUBO)? xtra & 0xffff : 0x10000;
 	endsc = (xtra & KSW_XSTOP)? xtra & 0xffff : 0x10000;
 	m_b = n_b = 0; b = 0;
-	m_u = n_u = 0; u = 0;
 	zero = _mm_set1_epi32(0);
 	oe_del = _mm_set1_epi8(_o_del + _e_del);
 	e_del = _mm_set1_epi8(_e_del);
@@ -212,12 +210,6 @@ end_loop16:
 				}
 				b[n_b++] = (uint64_t)imax<<32 | i;
 			} else if ((int)(b[n_b-1]>>32) < imax) b[n_b-1] = (uint64_t)imax<<32 | i; // modify the last
-			if (n_u == m_u) {
-				m_u = m_u? m_u<<1 : 8;
-				u = (uint64_t*)realloc(u, 8 * m_u);
-				xassert(u != NULL, "out of memory: u");
-			}
-			u[n_u++] = (uint64_t)imax<<32 | i;
 		}
 		if (imax > gmax) {
 			gmax = imax; te = i; // te is the end position on the target
@@ -243,25 +235,17 @@ end_loop16:
 				int e = (int32_t)b[i];
 				if ((e < low || e > high) && (int)(b[i]>>32) > r.score2)
 					r.score2 = b[i]>>32, r.te2 = e;
-			}
-			// score2_ub: every column, before the merge above folds a column into its neighbour
-			for (i = 0; i < n_u; ++i) {
-				int e = (int32_t)u[i];
-				if ((e < low || e > high) && (int)(u[i]>>32) > r.score2_ub)
-					r.score2_ub = u[i]>>32;
 			}			
 		}
 	}
 	free(b);
-	free(u);
 	return r;
 }
 
 static kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, int _e_del, int _o_ins, int _e_ins, int xtra) // the first gap costs -(_o+_e)
 {
 	int slen, i, m_b, n_b, te = -1, gmax = 0, minsc, endsc;
-	uint64_t *b, *u; // u: every column >= minsc, unmerged (score2_ub)
-	int m_u, n_u;
+	uint64_t *b;
 	__m128i zero, oe_del, e_del, oe_ins, e_ins, *H0, *H1, *E, *Hmax;
 	kswr_t r;
 
@@ -277,7 +261,6 @@ static kswr_t ksw_i16(kswq_t *q, int tlen, const uint8_t *target, int _o_del, in
 	minsc = (xtra&KSW_XSUBO)? xtra&0xffff : 0x10000;
 	endsc = (xtra&KSW_XSTOP)? xtra&0xffff : 0x10000;
 	m_b = n_b = 0; b = 0;
-	m_u = n_u = 0; u = 0;
 	zero = _mm_set1_epi32(0);
 	oe_del = _mm_set1_epi16(_o_del + _e_del);
 	e_del = _mm_set1_epi16(_e_del);
@@ -335,12 +318,6 @@ end_loop8:
 				}
 				b[n_b++] = (uint64_t)imax<<32 | i;
 			} else if ((int)(b[n_b-1]>>32) < imax) b[n_b-1] = (uint64_t)imax<<32 | i; // modify the last
-			if (n_u == m_u) {
-				m_u = m_u? m_u<<1 : 8;
-				u = (uint64_t*)realloc(u, 8 * m_u);
-				xassert(u != NULL, "out of memory: u");
-			}
-			u[n_u++] = (uint64_t)imax<<32 | i;
 		}
 		if (imax > gmax) {
 			gmax = imax; te = i;
@@ -365,17 +342,10 @@ end_loop8:
 				if ((e < low || e > high) && (int)(b[i]>>32) > r.score2)
 					r.score2 = b[i]>>32, r.te2 = e;
 			}
-			// score2_ub: every column, before the merge above folds a column into its neighbour
-			for (i = 0; i < n_u; ++i) {
-				int e = (int32_t)u[i];
-				if ((e < low || e > high) && (int)(u[i]>>32) > r.score2_ub)
-					r.score2_ub = u[i]>>32;
-			}
 		}
 	}
 
 	free(b);
-	free(u);
 	return r;
 }
 

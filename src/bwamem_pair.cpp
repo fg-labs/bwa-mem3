@@ -1284,8 +1284,7 @@ struct blind_rescue_prov_t {
     int64_t rb, re;       // the region rescue added
     int qb, qe, rid;
     int is_rev, hyp;      // the mate's orientation and the matrix hypothesis it was scored with
-    int score, te, score2; // the window's best score, its end (window coordinates) and the csub
-    int score2_ub;         // kswr_t::score2_ub: bounds every column score2's merge can drop
+    int score, te;        // the window's best score and its end (window coordinates)
 };
 static thread_local bool t_rescue_prov_on = false;
 static thread_local std::vector<blind_rescue_prov_t> t_rescue_prov[2];
@@ -1789,18 +1788,6 @@ struct blind_reprice_ctx_t {
     const mem_meth_blind_pe_t *b;
 };
 
-/* The single-end MAPQ terms a region's csub enters: mem_approx_mapq_se and the pairing's tandem
- * cap, raw_mapq(score - csub), each clipped to [0, 60]. Both fall as csub rises. */
-static inline void blind_csub_terms(const mem_opt_t *opt, mem_alnreg_t *x, int csub, int t[2])
-{
-    const int keep = x->csub;
-    x->csub = csub;
-    t[0] = mem_approx_mapq_se(opt, x);
-    x->csub = keep;
-    const int r = raw_mapq((int64_t)x->score - csub, opt->a);
-    t[1] = r < 0 ? 0 : r > 60 ? 60 : r;
-}
-
 /* --meth-mapq conversion-blind: reprice the csub of a shadow region x of end `end` that mate rescue
  * added. Its csub is the rescue window's second-best score (ksw_align2's score2: the best column
  * maximum ending outside te +- ceil(score / max) of the window's best end te), under genomic
@@ -1810,14 +1797,10 @@ static inline void blind_csub_terms(const mem_opt_t *opt, mem_alnreg_t *x, int c
  * and its second best outside, csub becomes that; otherwise (Z moved, an artifact of the zone)
  * csub is kept. csub only rises, so the MAPQ only falls.
  *
- * Every column counted lies outside Z, where the genomic column maximum is at most
- * max(score2_ub, minsc - 1) (not score2: its adjacent-column merge can drop a column outside Z for
- * a higher neighbour inside it, which freeing the mirror cell can then overtake), and freeing
- * the mirror cell raises a path by at most a+b per mirror-able base of the mate (C, or G, as the
- * window's matrix sees it). The window is aligned only when that
- * bound could change one of x's csub terms; the skip depends on the read's bases only through a
- * bound that cannot change the result, so the cap stays independent of methylation. Done once per
- * region; x->dedup_re_rank indexes it. */
+ * Every such region whose mate has a mirror-able base (C, or G, as the window's matrix sees it) is
+ * aligned again: a skip bounded by the genomic score2 is not safe, since its adjacent-column merge
+ * can drop a column outside Z for a higher neighbour inside it, which freeing the mirror cell can
+ * then overtake. Done once per region; x->dedup_re_rank indexes it. */
 static void mem_meth_blind_reprice(const blind_reprice_ctx_t *rp, int end, mem_alnreg_t *x)
 {
     const mem_opt_t *opt = rp->opt;
@@ -1835,17 +1818,10 @@ static void mem_meth_blind_reprice(const blind_reprice_ctx_t *rp, int end, mem_a
     // the mirror cell's read base as the window's matrix sees the oriented mate: C (hyp 1) or G;
     // on the forward read, its complement when the mate is reverse-complemented
     const int mb = pv->hyp ? 1 : 2, fb = pv->is_rev ? 3 - mb : mb;
-    int n_mirror = 0;
-    for (int i = 0; i < l_ms; ++i) n_mirror += nst_nt4_decode((unsigned char)s->meth_orig_seq[i], 4) == fb;
-    if (n_mirror == 0) return;
+    bool any_mirror = false;
+    for (int i = 0; i < l_ms && !any_mirror; ++i) any_mirror = nst_nt4_decode((unsigned char)s->meth_orig_seq[i], 4) == fb;
+    if (!any_mirror) return;
     const int minsc = opt->min_seed_len * opt->a;
-    const int64_t hi = (int64_t)std::max(pv->score2_ub, minsc - 1) + (int64_t)(opt->a + opt->b) * n_mirror;
-    const int cu = (int)std::min<int64_t>(hi, INT_MAX);
-    if (cu <= x->csub) return;
-    int t0[2], t1[2];
-    blind_csub_terms(opt, x, x->csub, t0);
-    blind_csub_terms(opt, x, cu, t1);
-    if (t0[0] == t1[0] && t0[1] == t1[1]) return;
     int m = 5;
     const int8_t *gen = meth_model_mat(opt, pv->hyp, &m);
     if (m != 5) return; // --meth-context cpg: refused with em-seq, so never here
@@ -3215,7 +3191,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             if (index == MATESW_GAR_PROVEN_FAIL) {
                 /* Proven score < min_seed_len: the gate below fails exactly as for a real SW. */
                 memset(&aln, 0, sizeof aln);
-                aln.qb = aln.qe = aln.tb = aln.te = aln.score2 = aln.te2 = aln.score2_ub = -1;
+                aln.qb = aln.qe = aln.tb = aln.te = aln.score2 = aln.te2 = -1;
             }
             else if (index == -1) {
                 // fprintf(stderr, "Re-routing: Encountered -ve index for "
@@ -3316,8 +3292,7 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 if (t_rescue_prov_on && meth_won_hyp >= 0 && mate_meth_ot >= 0)
                     t_rescue_prov[mate_meth_ot ^ 1].push_back({ wrb, re, b.rb, b.re, b.qb, b.qe, b.rid, is_rev,
                                                                  meth_won_hyp, aln.score,
-                                                                 aln.te + (int)(rb - wrb), aln.score2,
-                                                                 aln.score2_ub });
+                                                                 aln.te + (int)(rb - wrb) });
                 b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
                 b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 
