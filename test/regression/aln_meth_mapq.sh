@@ -33,11 +33,12 @@
 # collapsed leaves a pair improper and rescues a mate), a read 1 that collapsed's pairing places at
 # the other copy gets 0, a mate the genomic run rescues and collapsed leaves unmapped gets 0, a mate
 # that moves read 1 to the other copy anchors it (no cap) unless read 1's mirror-free loci exceed
-# --max-occ (then collapsed does not pair it, and its cap is 0), and no MAPQ is ever raised; under
-# the stock cuts, strata the search may have pruned give a cap of 0, single end and for both ends
-# of a pair (each with scoring's MAPQ in YQ:i); with the cuts conversion-blind leaves every field
-# but MAPQ and YQ:i as scoring has it, across penalties and -m limits (blind-genomic-identity); and
-# the option's refusals.
+# --max-occ (then collapsed does not pair it, and its cap is 0), a mate the mirror-free pairing
+# moves while read 1's stock loci exceed --max-occ (no stock pairing) gets 0, and no MAPQ is ever
+# raised; under the stock cuts, strata the search may have pruned give a cap of 0, single end and
+# for both ends of a pair (each with scoring's MAPQ in YQ:i); with the cuts conversion-blind leaves
+# every field but MAPQ and YQ:i as scoring has it, across penalties and -m limits
+# (blind-genomic-identity); and the option's refusals.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -776,6 +777,55 @@ expect maxocc-moved "$tmp/o2.blind.sum" "maxocc 99 ayz 1281 0 29
 maxocc 147 ayz 1581 37 -"
 echo 'PASS: paired-max-occ-moved'
 
+# The other way round: read 1's stock loci are over --max-occ 2 and its mirror-free ones are not,
+# so the pairing does not run but a mirror-free run pairs. On a reference of its own (occ.fa), read
+# 1 (40 bp, keeps the Cs at offsets 10 and 25) has three loci: p with one mismatch (3, the primary),
+# q with a T under each kept C (6, mirror-free 0) and x with two mismatches (6). With the mirror
+# cell free the loci are q and p (x is past 0 + 3), two. Read 2 is exact on contig m and has one
+# mismatch after q: the stock run leaves it on m, the mirror-free pairing moves it next to q, so its
+# cap is 0 (read 1's is 0 single end: q is cheaper mirror-free). Under the default --max-occ the
+# pairing itself moves both ends next to q.
+cat > "$tmp/occ.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+function alt(c) { return c == "G" ? "A" : "G" }
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+function ct(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out ((c == "C" && i != 11 && i != 26) ? "T" : c) } return out }
+function ga(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "G" ? "A" : c) } return out }
+BEGIN {
+    seed_rng(20261126)
+    k = put(put(dna(40), 10, "C"), 25, "C")
+    r = ct(k)
+    p = put(k, 33, alt(substr(r, 34, 1)))
+    q = put(put(k, 10, "T"), 25, "T")
+    x = put(put(k, 5, alt(substr(r, 6, 1))), 30, alt(substr(r, 31, 1)))
+    m = dna(60)
+    m2 = put(m, 30, other(substr(m, 31, 1)))
+    printf ">pqx\n%s\n>m\n%s\n", dna(400) p dna(400) q dna(200) m2 dna(400) x dna(400), dna(400) m dna(400) > (dir "/occ.fa")
+    fq(dir "/occ1.fq", "occ", r)
+    fq(dir "/occ2.fq", "occ", ga(rc(m)))
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/occ.awk" < /dev/null
+"$bin" index --meth "$tmp/occ.fa" > "$tmp/occ-index.out" 2> "$tmp/occ-index.err" || {
+    echo "FAIL: index --meth (occ.fa) exited nonzero" >&2
+    cat "$tmp/occ-index.err" >&2
+    exit 1
+}
+run occ.scoring --meth --meth-mapq scoring --max-occ 2 "$tmp/occ.fa" "$tmp/occ1.fq" "$tmp/occ2.fq"
+run occ.blind --meth --max-occ 2 "$tmp/occ.fa" "$tmp/occ1.fq" "$tmp/occ2.fq"
+expect maxocc-stock-over-scoring "$tmp/occ.scoring.sum" "occ 97 pqx 401 20 -
+occ 145 m 401 23 -"
+expect maxocc-stock-over "$tmp/occ.blind.sum" "occ 97 pqx 401 0 20
+occ 145 m 401 0 23"
+same_outside_mapq "maxocc-stock-over" "$tmp/occ.blind.rec" "$tmp/occ.scoring.rec"
+run occ.default --meth "$tmp/occ.fa" "$tmp/occ1.fq" "$tmp/occ2.fq"
+[ "$(awk '{ print $3, $4 }' "$tmp/occ.default.sum" | tr '\n' ' ')" = "pqx 841 pqx 1081 " ] || {
+    echo "FAIL: fixture: the default --max-occ pairing does not move both ends next to q" >&2
+    cat "$tmp/occ.default.sum" >&2
+    exit 1
+}
+echo 'PASS: paired-max-occ-stock-over'
 
 check_error() {
     local name=$1 pattern=$2 rc=0

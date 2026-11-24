@@ -222,7 +222,8 @@ read's seed), at `collapsed`'s single-end MAPQ. The insert size is the one `coll
 infers from those single-end selections, batch by batch. An end placed where that
 pairing places it is capped at the MAPQ that pairing gives it, any other end at 0. An
 end with more than `--max-occ` mirror-free loci is not paired, as under `collapsed`:
-both ends stay at their `collapsed` single-end selections. An end the `genomic` search
+both ends stay at their `collapsed` single-end selections. That pairing runs even where an
+end's `genomic` loci exceed `--max-occ` and `genomic` pairing does not run. An end the `genomic` search
 leaves unmapped, but whose rows `-n` (or `-k`) dropped only for their mirror mismatches, is
 placed as `collapsed` places it, so its mate is still capped by that pairing. Where
 `collapsed` then leaves the pair improper, its mate rescue is rerun too, with `collapsed`'s
