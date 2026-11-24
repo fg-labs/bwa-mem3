@@ -216,12 +216,16 @@ pairing places it is capped at the MAPQ that pairing gives it, any other end at 
 end with more than `--max-occ` mirror-free loci is not paired, as under `collapsed`:
 both ends stay at their `collapsed` single-end selections. An end the `genomic` search
 leaves unmapped, but whose rows `-n` (or `-k`) dropped only for their mirror mismatches, is
-placed as `collapsed` places it, so its mate is still capped by that pairing. A rescued mate
-takes its anchor's cap and, where `collapsed` pairs the ends properly, at most that pairing's
-MAPQ for the mate at the rescued position (0 elsewhere). `collapsed`'s own mate rescue and
-cap rescue are not rerun: where `collapsed` leaves a pair improper and rescues a mate, the
-cap can differ from `collapsed`'s MAPQ. `--known-snvs` twin MAPQs (`XV:Z`) are computed the
-same way as the record's.
+placed as `collapsed` places it, so its mate is still capped by that pairing. Where
+`collapsed` then leaves the pair improper, its mate rescue is rerun too, with `collapsed`'s
+scoring matrix and insert size: a rescue lowers the anchor's MAPQ as well as placing the
+mate, so the anchor is capped at that lowered MAPQ, and a mate the `genomic` run rescues is
+capped at the MAPQ `collapsed` gives it where `collapsed` places it there (0 where it places
+it elsewhere or leaves it unmapped). Each such pair costs one extra local alignment.
+A pair with an incomplete end (cap rescue) is not rerun: there both runs give the incomplete
+end MAPQ 0 and the anchor its single-end MAPQ or 0. A rescue window past the rescue's
+allocation bound, or anything else that would stop a `collapsed` run's rescue, gives both ends 0.
+`--known-snvs` twin MAPQs (`XV:Z`) are computed the same way as the record's.
 
 **Measured** on public NA12878 EM-seq (SRR10532145, 2×99 bp, 2 M pairs), read 1
 cut to 20–50 bp and aligned single-end with `aln` on an Apple M2 Max (12 cores; macOS, arm64, NEON
