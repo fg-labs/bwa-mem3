@@ -112,8 +112,18 @@ was above `scoring`'s. At the default penalties 2 of 40,000 reads at 40 bp singl
 pairs at 40 bp had their cap set to 0 for strata the search may have left incomplete (none at 150 bp);
 at `-M 5 -O 3 -E 1`, 7 and 16, and 2 of 40,000 pairs at 150 bp. Reads whose mirror-free best has more
 than `-R` loci, where a mirror-free run stops but the search goes on, are no longer among them: their
-caps come from the rows resolved at that stop. These are observations from those runs,
-not a bound for all inputs.
+caps come from the rows resolved at that stop. Against `--meth-scoring collapsed` itself, no
+conversion-blind MAPQ was above `collapsed`'s at the same placement in any of those runs, single
+or paired end, but one 40 bp paired record at `-m 300`: there `collapsed`'s own search spends its
+`-m` work budget on other reads than the `genomic` search does (8,412 incomplete reads against
+8,550), so its insert-size estimate differs slightly from the one the cap infers from the
+`genomic` search, and that difference moves a suboptimal pair across stock pairing's `10 × M`
+threshold (at the default `-m` the two estimates are the same). At the default penalties the
+conversion-blind MAPQ equals `collapsed`'s for 39,987 of 40,000 and 79,861 of 80,000 records at
+40 bp (single, paired end) and 40,000 of 40,000 and 79,999 of 80,000 at 150 bp; the rest are
+records where `collapsed`'s MAPQ is above the `genomic` one (the cap never raises a MAPQ) or where
+`collapsed` places the end elsewhere. These are observations from those runs, not a bound for
+all inputs.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
