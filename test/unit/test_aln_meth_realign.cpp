@@ -1,5 +1,6 @@
 #include "doctest/doctest.h"
 #include "aln/aln_meth_realign.h"
+#include "stderr_capture.h"
 #include "bwa.h"
 #include "ksw.h"
 #include "meth_model.h"
@@ -95,7 +96,17 @@ TEST_CASE("aln_realign: terminal normalization contig checks and resource refusa
     std::vector<uint8_t> huge(20000,0);Ref large(huge);c.re=20000;
     CHECK(ba::aln_meth_realign_window(large.ref,mo,c,huge.data(),20000,0,0,&a)==ba::aln_meth_eval_status::ok);
     mo.m.meth_context=METH_CTX_CPG;
-    CHECK(ba::aln_meth_realign_window(large.ref,mo,c,huge.data(),20000,0,0,&a)==ba::aln_meth_eval_status::resource_error);
+    {
+        bwa_tests::StderrCapture capture;
+        CHECK(ba::aln_meth_realign_window(large.ref,mo,c,huge.data(),20000,0,0,&a)==ba::aln_meth_eval_status::resource_error);
+        CHECK(capture.text().find("ERROR: --meth candidate realignment:") != std::string::npos);
+    }
+    { // quiet: the same status, for a caller that recovers from it, without the ERROR line
+        bwa_tests::StderrCapture capture;
+        CHECK(ba::aln_meth_realign_window(large.ref,mo,c,huge.data(),20000,0,0,&a,-1,nullptr,-1,true)
+              ==ba::aln_meth_eval_status::resource_error);
+        CHECK(capture.text().empty());
+    }
 }
 
 TEST_CASE("aln_realign: unequal tiny windows match independent oracle") {

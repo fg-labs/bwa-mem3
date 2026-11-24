@@ -26,7 +26,10 @@ the cap can differ from that of earlier versions ([PR #821](https://github.com/f
 In paired-end runs the cap reruns the pairing `collapsed` makes, from the main hits `collapsed`
 draws for its ends, at its single-end MAPQs and with the insert size it infers, so paired-end
 MAPQs can differ from those of earlier versions; placement and every other field are unchanged
-([PR #822](https://github.com/fg-labs/bwa-mem3/pull/822)).
+([PR #822](https://github.com/fg-labs/bwa-mem3/pull/822)). It also reruns `collapsed`'s mate
+rescue of a pair `collapsed` leaves improper, which lowers the anchor's MAPQ as well, so such
+pairs' MAPQs can be lower than in earlier versions
+([PR #823](https://github.com/fg-labs/bwa-mem3/pull/823)).
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,

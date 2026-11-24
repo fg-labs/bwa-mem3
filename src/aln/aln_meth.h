@@ -184,8 +184,8 @@ struct aln_meth_read_t {
     std::vector<aln_meth_blind_row_t> blind_ties;
     aln_meth_blind_row_t blind_pick = aln_meth_blind_row_t();
     int blind_main = -1;
-    // Where the shadow pairing leaves this end of a proper pair, and its MAPQ there
-    // (blind_place_mapq -1: no such pair), for a mate that mate rescue moves.
+    // Where collapsed scoring's pairing and mate rescue leave this end, and its MAPQ there (0: it
+    // leaves the end unmapped; blind_place_mapq -1: not known, see aln_meth_pe_stage2).
     bwtint_t blind_place_pos = 0;
     int blind_place_strand = 0, blind_place_mapq = -1;
     // The mirror table, while the read is searched: per locus, the lowest mirror-free row among

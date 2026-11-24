@@ -17,9 +17,9 @@
 namespace bwa_aln {
 namespace {
 
-aln_meth_eval_status error(aln_meth_eval_status status, const char *message)
+aln_meth_eval_status error(aln_meth_eval_status status, const char *message, bool quiet = false)
 {
-    std::fprintf(stderr, "ERROR: --meth candidate realignment: %s\n", message);
+    if (!quiet) std::fprintf(stderr, "ERROR: --meth candidate realignment: %s\n", message);
     return status;
 }
 
@@ -91,27 +91,27 @@ void aln_meth_fetch_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
 
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &c, const ubyte_t *query, int len, int n_ins, int n_del,
-    aln_meth_alignment_t *out, int64_t site, std::vector<uint8_t> *window, int band_limit)
+    aln_meth_alignment_t *out, int64_t site, std::vector<uint8_t> *window, int band_limit, bool quiet)
 {
     if (out) *out = aln_meth_alignment_t();
     if (!out || !query || !ref.bns || !ref.pac || !ref.bns->anns || len <= 0 || len > 65535 ||
         c.rid < 0 || c.rid >= ref.bns->n_seqs || c.strand < 0 || c.strand > 1 ||
         c.hyp < 0 || c.hyp > 1 || n_ins < 0 || n_del < 0 || c.rb < 0 || c.re <= c.rb ||
         c.re > ref.bns->l_pac)
-        return error(aln_meth_eval_status::invalid_input, "invalid query, reference or window");
+        return error(aln_meth_eval_status::invalid_input, "invalid query, reference or window", quiet);
     const bntann1_t &ann = ref.bns->anns[c.rid];
     if (ann.offset < 0 || ann.len < 0 || c.rb < ann.offset || c.re - ann.offset > ann.len || c.re - c.rb > 65535)
-        return error(aln_meth_eval_status::invalid_input, "window crosses a contig or exceeds 65535 bases");
+        return error(aln_meth_eval_status::invalid_input, "window crosses a contig or exceeds 65535 bases", quiet);
     for (int i = 0; i < len; ++i)
         if (query[i] > 4)
-            return error(aln_meth_eval_status::invalid_input, "query code is outside the DNA alphabet");
+            return error(aln_meth_eval_status::invalid_input, "query code is outside the DNA alphabet", quiet);
     const int span = (int)(c.re - c.rb);
     const int m = mo.m.meth_context == METH_CTX_CPG ? METH_M : 5;
     const int8_t *mat = m == 5 ? (c.hyp ? mo.mat_ot : mo.mat_ob) : (c.hyp ? mo.mat7_ot : mo.mat7_ob);
     // Enforce the fixed model's score bound before entering existing int32 kernels.
     for (int i = 0; i < m * m; ++i)
         if (mat[i] < -3 || mat[i] > 1)
-            return error(aln_meth_eval_status::invalid_input, "matrix is not the initialized match-1/mismatch-3 model");
+            return error(aln_meth_eval_status::invalid_input, "matrix is not the initialized match-1/mismatch-3 model", quiet);
     try {
         std::vector<uint8_t> local;
         std::vector<uint8_t> &target = window ? *window : local;
@@ -129,7 +129,7 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
         const uint64_t longest = full, columns = std::min<int64_t>(len, 2LL * band + 1);
         const uint64_t bytes = columns * ((uint64_t)len + span) + 64 + 128 * (longest + 128) + 8 * ((uint64_t)len + span);
         if (bytes > (64ULL << 20))
-            return error(aln_meth_eval_status::resource_error, "certified/full window exceeds the 64 MiB active-allocation budget");
+            return error(aln_meth_eval_status::resource_error, "certified/full window exceeds the 64 MiB active-allocation budget", quiet);
         aln_meth_alignment_t result;
         result.rb = c.rb;
         result.re = c.re;
@@ -144,7 +144,7 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
             result.reward = ksw_global(len, query, span, target.data(), m, mat, gap_open, gap_extend, band, &n, &raw);
             std::unique_ptr<uint32_t, decltype(&std::free)> owner(raw, &std::free);
             if (n <= 0 || !raw)
-                return error(aln_meth_eval_status::no_alignment, "global alignment returned no CIGAR");
+                return error(aln_meth_eval_status::no_alignment, "global alignment returned no CIGAR", quiet);
             result.raw_cigar.assign(raw, raw + n);
         }
         result.cigar = result.raw_cigar;
@@ -160,11 +160,11 @@ aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const al
             result.cigar.erase(result.cigar.begin());
         }
         if (result.rb >= result.re || result.cigar.empty())
-            return error(aln_meth_eval_status::no_alignment, "terminal normalization left no reference alignment");
+            return error(aln_meth_eval_status::no_alignment, "terminal normalization left no reference alignment", quiet);
         *out = std::move(result);
         return aln_meth_eval_status::ok;
     } catch (const std::bad_alloc &) {
-        return error(aln_meth_eval_status::resource_error, "cannot allocate candidate alignment buffers");
+        return error(aln_meth_eval_status::resource_error, "cannot allocate candidate alignment buffers", quiet);
     }
 }
 

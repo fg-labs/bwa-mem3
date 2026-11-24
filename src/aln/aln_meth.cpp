@@ -1386,12 +1386,15 @@ void aln_meth_pe_stage1(const gap_opt_t *opt, int n, bwa_seq_t *seqs[2], aln_met
 
 /* bwape.cpp's bwa_sw_core with the anchor's matrix (labelled window under cpg) on the original
  * reference; *_cnt's n_mm counts only the mismatches the mode does not free. --known-snvs: with site
- * set the window carries that site allele's ALT (aln_meth_fetch_window), and *score gets the local score. */
+ * set the window carries that site allele's ALT (aln_meth_fetch_window), and *score gets the local score.
+ * With fail set, a window past the allocation budget or a rescue it cannot evaluate sets *fail and
+ * gives no alignment, without an ERROR line, where it otherwise stops the run. */
 static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, int hyp, int rid,
                                  int len, const ubyte_t *raw_seq, int64_t *beg, int64_t end,
                                  int *n_cigar, uint32_t *_cnt,
                                  const gap_opt_t *account_opt = nullptr, aln_meth_occ_t *owned = nullptr,
-                                 int64_t site = -1, int *score = nullptr, int *tie = nullptr)
+                                 int64_t site = -1, int *score = nullptr, int *tie = nullptr,
+                                 bool *fail = nullptr)
 {
     *n_cigar = 0;
     if (len <= 0 || len > 65535 || rid < 0 || rid >= ref->bns->n_seqs) return nullptr;
@@ -1409,6 +1412,7 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
     if (span < SW_MIN_MATCH_LEN) return nullptr;
     // The local-rescue profile and traceback must remain within a bounded evaluation window.
     if (span > 65535 || 2ULL * len * span + 128ULL * (len + span) > (64ULL << 20)) {
+        if (fail) { *fail = true; return nullptr; }
         fprintf(stderr, "ERROR: --meth rescue window exceeds allocation budget\n"); exit(1);
     }
     int ambiguous = 0;
@@ -1427,12 +1431,15 @@ static bwa_cigar_t *meth_sw_core(const aln_meth_ref_t *ref, const aln_meth_opt_t
     // Reuse the bounded, certified global refiner for the selected local rescue segment.
     const aln_meth_candidate_t candidate{rid, 0, hyp, *beg+r.tb, *beg+r.te+1};
     aln_meth_alignment_t alignment;
-    if (aln_meth_realign_window(*ref, *mo, candidate, seq+r.qb, r.qe-r.qb+1, 0, 0, &alignment, site)
-        != aln_meth_eval_status::ok) {
+    // With fail set the caller recovers from a failed realignment, so it prints no ERROR line.
+    if (aln_meth_realign_window(*ref, *mo, candidate, seq+r.qb, r.qe-r.qb+1, 0, 0, &alignment, site,
+                                nullptr, -1, fail != nullptr) != aln_meth_eval_status::ok) {
+        if (fail) { *fail = true; return nullptr; }
         fprintf(stderr, "ERROR: --meth cannot evaluate mate rescue\n"); exit(1);
     }
     if (alignment.reward != r.score) return nullptr; // stock rejects inconsistent local/global scores
     if (alignment.rb < ann.offset || alignment.re > contig_end || alignment.rb >= alignment.re) {
+        if (fail) { *fail = true; return nullptr; }
         fprintf(stderr, "ERROR: --meth rescued interval leaves anchor contig\n"); exit(1);
     }
     int q = r.qb, t = r.tb, mm = 0, opens = 0, extensions = 0;
@@ -1623,11 +1630,138 @@ static int meth_cap_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo,
     fprintf(stderr,"ERROR: --meth cannot allocate cap-rescue candidates\n");exit(1);
 }
 
-// --meth-mapq conversion-blind: where collapsed scoring leaves an end of a pair, and its MAPQ there.
-struct meth_blind_place_t {
-    bwtint_t pos = 0;
-    int strand = 0, mapq = 0;
-    bool proper = false; // a proper pair: collapsed attempts no mate rescue
+/* Mate rescue for one pair whose ends are complete and that qualifies (an end of MAPQ at least
+ * SW_MIN_MAPQ, not a proper pair; standard pair type): bwa_paired_sw_core with the anchor's matrix
+ * (hyp[] is each end's hypothesis), on p[] in place. Returns the rescued end, or -1, and sets *site
+ * to the site allele the rescue substituted (--known-snvs), or -1. The caller gives the rescued end
+ * its anchor's hypothesis. With fail set, what would stop the run (meth_sw_core's, or a rescued
+ * cost past the record) sets *fail instead, and the result is not meaningful; a meth_sw_core
+ * failure stops the rescue there, before p[] changes, and it returns -1. */
+static int meth_mate_rescue(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, const gap_opt_t *gopt,
+                            const pe_opt_t *popt, const isize_info_t *ii, bwa_seq_t *const p[2],
+                            const int hyp[2], int64_t *site, bool *fail = nullptr)
+{
+    const int64_t l_pac = ref->bns->l_pac;
+    int rescued = -1;
+    *site = -1;
+    int n_cigar[2] = {0, 0}, mapQ = 0, mq_adjust[2] = {255, 255};
+    int64_t site_used[2] = {-1, -1};
+    int64_t beg[2], end[2];
+    bwa_cigar_t *cigar[2] = {0, 0};
+    uint32_t cnt[2];
+    for (int k = 0; k < 2; ++k) {
+        bwa_seq_t *pref = p[1 - k], *pmate = p[k];
+        if (pref->type == BWA_TYPE_NO_MATCH) continue;
+        ubyte_t *seq;
+        if (pref->strand == 0) {
+            aln_rescue_window((int64_t)pref->pos, true, pmate->len, ii, popt->exact_rescue_window, &beg[k], &end[k]);
+            if (beg[k] < aln_rescue_window_floor(pref, popt)) beg[k] = aln_rescue_window_floor(pref, popt);
+            if (end[k] > l_pac) end[k] = l_pac;
+            seq = pmate->rseq;
+        } else {
+            aln_rescue_window(aln_rescue_anchor_end(pref, popt), false, pmate->len, ii, popt->exact_rescue_window,
+                              &beg[k], &end[k]);
+            if (beg[k] < 0) beg[k] = 0;
+            if (end[k] > aln_rescue_window_ceiling(pref, popt)) end[k] = aln_rescue_window_ceiling(pref, popt);
+            seq = pmate->seq;
+            seq_reverse(pmate->len, seq, 0);
+        }
+        const int anchor_rid = bns_pos2rid(ref->bns, pref->pos);
+        const int64_t beg0 = beg[k];
+        std::vector<int64_t> keys; // --known-snvs: the window's site alleles
+        if (ref->known_snvs && end[k] > beg0)
+            aln_meth_window_sites(*ref, beg0, (int)std::min<int64_t>(end[k] - beg0, INT_MAX), &keys,
+                                  anchor_rid); // meth_sw_core clips each trial to this contig too
+        if (keys.empty()) {
+            cigar[k] = meth_sw_core(ref, mo, hyp[1-k], anchor_rid, pmate->len, seq,
+                                    &beg[k], end[k], &n_cigar[k], &cnt[k], nullptr, nullptr, -1, nullptr,
+                                    nullptr, fail);
+        } else { // the window as the reference, then with each site allele alone (aln_rescue_pick)
+            std::vector<pe_rescue_trial_t> trials(keys.size() + 1, pe_rescue_trial_t{nullptr, 0, 0, beg0, 0, -1, 0});
+            for (size_t t = 0; t < trials.size(); ++t) {
+                pe_rescue_trial_t &x = trials[t];
+                x.site = t ? keys[t - 1] : -1;
+                x.cigar = meth_sw_core(ref, mo, hyp[1-k], anchor_rid, pmate->len, seq,
+                                       &x.beg, end[k], &x.n_cigar, &x.cnt, nullptr, nullptr, x.site, &x.score,
+                                       &x.tie, fail);
+                if (fail && *fail) break; // the result is no longer meaningful: skip the other alleles
+            }
+            if (fail && *fail) {
+                for (pe_rescue_trial_t &x : trials) free(x.cigar);
+            } else {
+                const int pick = aln_rescue_pick(trials.data(), (int)trials.size(), pref, popt);
+                for (int t = 0; t < (int)trials.size(); ++t) {
+                    if (t != pick) { free(trials[t].cigar); continue; }
+                    cigar[k] = trials[t].cigar, n_cigar[k] = trials[t].n_cigar, cnt[k] = trials[t].cnt;
+                    beg[k] = trials[t].beg, site_used[k] = trials[t].site;
+                }
+            }
+        }
+        if (fail && *fail) { // the result is not meaningful: release this pair's buffers and stop
+            if (pref->strand == 1) seq_reverse(pmate->len, seq, 0);
+            free(cigar[0]); free(cigar[1]);
+            return -1;
+        }
+        if (cigar[k] && popt->short_insert && !aln_rescue_within_fragment(pref, beg[k], cigar[k], n_cigar[k])) {
+            free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
+        }
+        if (cigar[k] && pmate->type != BWA_TYPE_NO_MATCH) {
+            int64_t s_old, s_new; int clip = 0;
+            if (__cigar_op(cigar[k][0]) == 3) clip += __cigar_len(cigar[k][0]);
+            if (__cigar_op(cigar[k][n_cigar[k] - 1]) == 3) clip += __cigar_len(cigar[k][n_cigar[k] - 1]);
+            s_old = (int64_t)(((int64_t)pmate->n_mm * gopt->s_mm + (int64_t)pmate->n_gapo * gopt->s_gapo + (int64_t)pmate->n_gape * gopt->s_gape) / 3. * 8. + .499);
+            s_new = (int64_t)(((int64_t)(cnt[k] >> 16) * gopt->s_mm + (int64_t)(cnt[k] >> 8 & 0xff) * gopt->s_gapo + (int64_t)(cnt[k] & 0xff) * gopt->s_gape + (int64_t)clip * gopt->s_mm) / 3. * 8. + .499);
+            s_old += -4.343 * log(ii->ap_prior / l_pac);
+            s_new += (int)(-4.343 * log(.5 * erfc(M_SQRT1_2 * 1.5) + .499));
+            if (s_old < s_new) {
+                mq_adjust[k] = (int)std::min<int64_t>(255, s_new - s_old);
+                free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
+            } else mq_adjust[k] = (int)std::min<int64_t>(255, s_old - s_new);
+        }
+        if (pref->strand == 1) seq_reverse(pmate->len, seq, 0);
+    }
+    int k = -1;
+    if (cigar[0] && cigar[1]) {
+        k = p[0]->mapQ < p[1]->mapQ ? 0 : 1;
+        mapQ = abs(p[1]->mapQ - p[0]->mapQ);
+    } else if (cigar[0]) k = 0, mapQ = p[1]->mapQ;
+    else if (cigar[1]) k = 1, mapQ = p[0]->mapQ;
+    // an unmapped mate's pos is 0, which is not a placement: a rescue there still installs;
+    // so does one at the mate's own start on the other strand (the rescue takes the strand
+    // opposite the anchor's, so a mate on the anchor's strand is a different placement)
+    if (k >= 0 && (p[k]->type == BWA_TYPE_NO_MATCH || p[k]->pos != (bwtint_t)beg[k] ||
+                   p[k]->strand == p[1 - k]->strand)) {
+        int tmp = (int)p[1 - k]->mapQ - p[k]->mapQ / 2 - 8;
+        if (tmp <= 0) tmp = 1;
+        if (mapQ > tmp) mapQ = tmp;
+        p[k]->mapQ = p[1 - k]->mapQ = mapQ;
+        p[k]->seQ = p[1 - k]->seQ = p[1 - k]->seQ < mapQ ? p[1 - k]->seQ : mapQ;
+        if (p[k]->mapQ > mq_adjust[k]) p[k]->mapQ = mq_adjust[k];
+        if (p[k]->seQ > mq_adjust[k]) p[k]->seQ = mq_adjust[k];
+        free(p[k]->cigar); p[k]->cigar = cigar[k]; cigar[k] = 0;
+        p[k]->n_cigar = n_cigar[k];
+        p[k]->type = BWA_TYPE_MATESW;
+        p[k]->pos = beg[k];
+        p[k]->seQ = p[1 - k]->seQ;
+        p[k]->strand = 1 - p[1 - k]->strand;
+        p[k]->n_mm = cnt[k] >> 16; p[k]->n_gapo = cnt[k] >> 8 & 0xff; p[k]->n_gape = cnt[k] & 0xff;
+        const int64_t cost=(int64_t)p[k]->n_mm*gopt->s_mm+(int64_t)p[k]->n_gapo*gopt->s_gapo+(int64_t)p[k]->n_gape*gopt->s_gape;
+        if(cost>INT_MAX && !fail) { fprintf(stderr,"ERROR: --meth rescued cost exceeds record capacity\n"); exit(1); }
+        if(cost>INT_MAX) *fail = true;
+        p[k]->score=(int)std::min<int64_t>(cost,INT_MAX);
+        p[k]->extra_flag |= SAM_FPP;
+        p[1 - k]->extra_flag |= SAM_FPP;
+        *site = site_used[k], rescued = k;
+    }
+    free(cigar[0]); free(cigar[1]);
+    return rescued;
+}
+
+// --meth-mapq conversion-blind: what meth_blind_shadow knows of collapsed scoring's pairing.
+enum meth_blind_shadow_t {
+    METH_BLIND_NONE = 0, // nothing: the ends' caps are already set
+    METH_BLIND_PAIRED,   // the collapsed state of the ends, after its pairing
+    METH_BLIND_SAME      // collapsed's pairing is the genomic one: its state is the genomic pairing's
 };
 // The shadow pairing's buffers, reused across pairs.
 struct meth_blind_scratch_t {
@@ -1636,96 +1770,144 @@ struct meth_blind_scratch_t {
     std::vector<int32_t> span[2];
     std::vector<pair64_t> arr;
 };
-// --meth-mapq conversion-blind, a pair whose ends are both mapped and complete: the pairing a
-// collapsed run makes, which the conversion-blind MAPQ caps each end at. Each end's candidates are
-// collapsed's: the mirror-free strata (its hits within blind_best + s_mm at their lowest
-// mirror-free rows, aln_meth_blind_view, and blind_rows), in collapsed's order. Each end starts at
-// collapsed's main hit (blind_main) with collapsed's single-end MAPQ. With more than --max-occ loci
-// on an end collapsed does not pair, and each end stays there. ii is collapsed's insert size, and
-// same_ii whether it is the genomic pairing's. place gets each end's resulting locus and MAPQ
-// (true). It does not pair (false) when the ends' caps are already set: 0 for both when an end's
-// mirror-free strata are unknown (blind_partial); 255 for both when nothing differs from the
-// genomic pairing (the same insert size, no mirror mismatch on any hit, no row only the mirror-free
-// strata have, no moved row, neither single-end cap below its MAPQ), where collapsed's pairing is
-// the genomic one; and it leaves the single-end caps when an end has no mirror-free strata
-// (blind_main < 0).
-static bool meth_blind_shadow(const aln_meth_ref_t *ref, const gap_opt_t *gopt, const pe_opt_t *popt,
-                              const isize_info_t *ii, bool same_ii, bwa_seq_t *const p[2], aln_meth_read_t *const r[2],
-                              meth_blind_place_t place[2], meth_blind_scratch_t &sc)
+// The fields of a collapsed end at row m that pairing and mate rescue read (meth_set_main's).
+static void meth_blind_set_row(bwa_seq_t *s, int *hyp, const aln_meth_blind_row_t &m)
+{
+    s->pos = m.pos; s->strand = m.strand; *hyp = m.hyp;
+    s->n_mm = m.n_mm; s->n_gapo = m.n_gapo; s->n_gape = m.n_gape; s->score = m.cost;
+    s->ref_shift = m.span - (int)s->len;
+}
+// --meth-mapq conversion-blind, a pair whose ends are complete and of which the genomic search maps
+// at least one: the state a collapsed run gives the ends before its mate rescue (cs, each end's
+// hypothesis in hyp), which the conversion-blind MAPQ caps each end by once that rescue is rerun.
+// An end collapsed places (blind_main) starts at its main hit with collapsed's single-end MAPQ; an
+// end it does not place is unmapped (cs NO_MATCH). With both ends placed it pairs collapsed's
+// candidates: the mirror-free strata (each end's hits within blind_best + s_mm at their lowest
+// mirror-free rows, aln_meth_blind_view, and blind_rows), in collapsed's order, with collapsed's
+// insert size ii (same_ii: whether it is the genomic pairing's); with more than --max-occ loci on
+// an end collapsed does not pair, and each end stays at its main hit. Pairing then reselects each
+// end's row as the genomic pairing does (the first at its start and strand). Returns
+// METH_BLIND_SAME when nothing differs from the genomic run (the same insert size, no mirror
+// mismatch on any hit, no row only the mirror-free strata have, no moved row, neither single-end
+// cap below its MAPQ), where collapsed's state is the genomic pairing's. Returns METH_BLIND_NONE,
+// with both caps set to 0, when an end's mirror-free strata are unknown (blind_partial) or a
+// row's cost is past the pairing record's 20 bits. Otherwise returns METH_BLIND_PAIRED, with
+// cs[j].cigar null.
+static meth_blind_shadow_t meth_blind_shadow(const aln_meth_ref_t *ref, const gap_opt_t *gopt, const pe_opt_t *popt,
+                                             const isize_info_t *ii, bool same_ii, bwa_seq_t *const p[2],
+                                             aln_meth_read_t *const r[2], bwa_seq_t cs[2], int hyp[2],
+                                             meth_blind_scratch_t &sc)
 {
     if (r[0]->blind_partial || r[1]->blind_partial) {
         r[0]->blind_cap = r[1]->blind_cap = 0;
-        return false;
+        return METH_BLIND_NONE;
     }
-    if (r[0]->blind_main < 0 || r[1]->blind_main < 0) return false; // no strata: the single-end caps
     bool differs = !same_ii;
     for (int j = 0; j < 2 && !differs; ++j) {
         differs = !r[j]->blind_rows.empty() || !r[j]->blind_alt.empty() || r[j]->blind_cap < p[j]->mapQ;
         for (size_t x = 0; x < r[j]->hits.size() && !differs; ++x) differs = r[j]->hits[x].n_mirror > 0;
     }
-    if (!differs) {
-        r[0]->blind_cap = r[1]->blind_cap = 255;
-        return false;
-    }
-    bwa_seq_t shadow[2];
+    if (!differs) return METH_BLIND_SAME;
     bool fits = true;
     for (int j = 0; j < 2; ++j) {
-        const aln_meth_blind_row_t &m = r[j]->blind_pick;
-        shadow[j] = *p[j];
-        shadow[j].mapQ = shadow[j].seQ = meth_blind_main_mapq(r[j], p[j], gopt);
-        shadow[j].pos = m.pos; shadow[j].strand = m.strand;
-        shadow[j].ref_shift = m.span - (int)p[j]->len;
-        shadow[j].extra_flag &= ~SAM_FPP;
+        cs[j] = *p[j];
+        cs[j].cigar = nullptr; cs[j].n_cigar = 0;
+        cs[j].extra_flag &= ~SAM_FPP;
+        if (r[j]->blind_main < 0) { // collapsed leaves it unmapped
+            cs[j].type = BWA_TYPE_NO_MATCH;
+            cs[j].mapQ = cs[j].seQ = 0;
+            hyp[j] = -1;
+            continue;
+        }
+        cs[j].type = r[j]->blind_c1 > 1 ? BWA_TYPE_REPEAT : BWA_TYPE_UNIQUE;
+        cs[j].mapQ = cs[j].seQ = meth_blind_main_mapq(r[j], p[j], gopt);
+        meth_blind_set_row(&cs[j], &hyp[j], r[j]->blind_pick);
         fits = fits && (int64_t)r[j]->blind_c1 + r[j]->blind_c2 <= popt->max_occ;
     }
-    if (fits) {
-        sc.arr.clear();
-        for (int j = 0; j < 2; ++j) {
-            const int64_t cut = (gopt->mode & BWA_MODE_NONSTOP) ? INT64_MAX : r[j]->blind_best + (int64_t)gopt->s_mm;
-            // the hits (in collapsed's order, as finishing sorts them) merged with blind_rows (sorted)
-            std::vector<aln_meth_blind_row_t> &rows = sc.rows[j];
-            rows.clear();
-            for (const aln_meth_hit_t &h : r[j]->hits) {
-                const aln_meth_blind_row_t b = aln_meth_blind_view(*r[j], h, gopt->s_mm);
-                if (b.cost <= cut) rows.push_back(b);
-            }
-            if (!std::is_sorted(rows.begin(), rows.end(), blind_collapsed_order))
-                std::sort(rows.begin(), rows.end(), blind_collapsed_order);
-            const size_t n_hits = rows.size();
-            rows.insert(rows.end(), r[j]->blind_rows.begin(), r[j]->blind_rows.end());
-            std::inplace_merge(rows.begin(), rows.begin() + n_hits, rows.end(), blind_collapsed_order);
-            // a cost past the pairing record's 20 bits stops a collapsed run (as below): unknown
-            for (const aln_meth_blind_row_t &o : rows)
-                if (o.cost > ((1 << 20) - 1)) {
-                    r[0]->blind_cap = r[1]->blind_cap = 0;
-                    return false;
-                }
-            sc.a[j].assign(rows.size(), bwt_aln1_t());
-            sc.span[j].resize(rows.size());
-            for (size_t x = 0; x < rows.size(); ++x) {
-                const aln_meth_blind_row_t &o = rows[x];
-                bwt_aln1_t &b = sc.a[j][x];
-                b.n_mm = o.n_mm; b.n_gapo = o.n_gapo; b.n_gape = o.n_gape; b.score = o.cost;
-                sc.span[j][x] = o.span;
-                pair64_t q;
-                q.x = o.pos;
-                q.y = (uint64_t)x << 2 | (uint64_t)o.strand << 1 | (uint64_t)j;
-                sc.arr.push_back(q);
-            }
-            shadow[j].aln = sc.a[j].data();
+    if (r[0]->blind_main < 0 || r[1]->blind_main < 0 || !fits) return METH_BLIND_PAIRED; // no pairing
+    sc.arr.clear();
+    for (int j = 0; j < 2; ++j) {
+        const int64_t cut = (gopt->mode & BWA_MODE_NONSTOP) ? INT64_MAX : r[j]->blind_best + (int64_t)gopt->s_mm;
+        // the hits (in collapsed's order, as finishing sorts them) merged with blind_rows (sorted)
+        std::vector<aln_meth_blind_row_t> &rows = sc.rows[j];
+        rows.clear();
+        for (const aln_meth_hit_t &h : r[j]->hits) {
+            const aln_meth_blind_row_t b = aln_meth_blind_view(*r[j], h, gopt->s_mm);
+            if (b.cost <= cut) rows.push_back(b);
         }
-        const int32_t *spans[2] = {sc.span[0].data(), sc.span[1].data()};
-        bwa_seq_t *sp[2] = {&shadow[0], &shadow[1]};
-        pair64_v v;
-        v.a = sc.arr.data(); v.n = v.m = sc.arr.size();
-        bwa_pe_pairing_same_contig(ref->bns, sp, &v, popt, std::min(gopt->s_mm, INT_MAX/10), ii,
-                                   popt->ref_span_insert ? spans : nullptr);
+        if (!std::is_sorted(rows.begin(), rows.end(), blind_collapsed_order))
+            std::sort(rows.begin(), rows.end(), blind_collapsed_order);
+        const size_t n_hits = rows.size();
+        rows.insert(rows.end(), r[j]->blind_rows.begin(), r[j]->blind_rows.end());
+        std::inplace_merge(rows.begin(), rows.begin() + n_hits, rows.end(), blind_collapsed_order);
+        // a cost past the pairing record's 20 bits stops a collapsed run (as below): unknown
+        for (const aln_meth_blind_row_t &o : rows)
+            if (o.cost > ((1 << 20) - 1)) {
+                r[0]->blind_cap = r[1]->blind_cap = 0;
+                return METH_BLIND_NONE;
+            }
+        sc.a[j].assign(rows.size(), bwt_aln1_t());
+        sc.span[j].resize(rows.size());
+        for (size_t x = 0; x < rows.size(); ++x) {
+            const aln_meth_blind_row_t &o = rows[x];
+            bwt_aln1_t &b = sc.a[j][x];
+            b.n_mm = o.n_mm; b.n_gapo = o.n_gapo; b.n_gape = o.n_gape; b.score = o.cost;
+            sc.span[j][x] = o.span;
+            pair64_t q;
+            q.x = o.pos;
+            q.y = (uint64_t)x << 2 | (uint64_t)o.strand << 1 | (uint64_t)j;
+            sc.arr.push_back(q);
+        }
+        cs[j].aln = sc.a[j].data();
+    }
+    const int32_t *spans[2] = {sc.span[0].data(), sc.span[1].data()};
+    bwa_seq_t *sp[2] = {&cs[0], &cs[1]};
+    pair64_v v;
+    v.a = sc.arr.data(); v.n = v.m = sc.arr.size();
+    bwa_pe_pairing_same_contig(ref->bns, sp, &v, popt, std::min(gopt->s_mm, INT_MAX/10), ii,
+                               popt->ref_span_insert ? spans : nullptr);
+    // each end's row as aln_meth_pe_stage2 reselects it after pairing: the first at its start and
+    // strand (with --ref-span-insert, also of its span and cost)
+    for (int j = 0; j < 2; ++j) {
+        cs[j].aln = p[j]->aln;
+        for (const aln_meth_blind_row_t &o : sc.rows[j])
+            if (o.pos == cs[j].pos && o.strand == (int)cs[j].strand
+                && (!popt->ref_span_insert || (o.span - (int)cs[j].len == cs[j].ref_shift && o.cost == cs[j].score))) {
+                meth_blind_set_row(&cs[j], &hyp[j], o);
+                break;
+            }
+    }
+    return METH_BLIND_PAIRED;
+}
+
+// --meth-mapq conversion-blind: collapsed's mate rescue of a pair, rerun with collapsed's matrices
+// (cmo) and insert size (ii) from cs, its state before that rescue (with same, the genomic pairing's
+// state, p, which this copies), as aln_meth_pe_stage2 runs it. Each end's blind_place_* get where
+// collapsed then leaves it, and its MAPQ there (0 where it leaves the end unmapped). What would stop
+// a collapsed run's rescue (a window past meth_sw_core's allocation bound, a rescue it cannot
+// evaluate, a rescued cost past the record) leaves both at MAPQ 0 instead.
+static void meth_blind_place(const aln_meth_ref_t *ref, const aln_meth_opt_t *cmo, const gap_opt_t *gopt,
+                             const pe_opt_t *popt, const isize_info_t *ii, bwa_seq_t *const p[2],
+                             aln_meth_read_t *const r[2], bwa_seq_t cs[2], int hyp[2], bool same)
+{
+    if (same)
+        for (int j = 0; j < 2; ++j) {
+            cs[j] = *p[j];
+            cs[j].cigar = nullptr; cs[j].n_cigar = 0;
+            hyp[j] = r[j]->hyp;
+        }
+    bool unknown = false;
+    if (popt->is_sw && ii->avg >= 0.0 && popt->type == BWA_PET_STD
+        && (cs[0].mapQ >= SW_MIN_MAPQ || cs[1].mapQ >= SW_MIN_MAPQ) && (cs[0].extra_flag & SAM_FPP) == 0) {
+        bwa_seq_t *cp[2] = {&cs[0], &cs[1]};
+        int64_t site;
+        const int k = meth_mate_rescue(ref, cmo, gopt, popt, ii, cp, hyp, &site, &unknown);
+        if (k >= 0) { free(cs[k].cigar); cs[k].cigar = nullptr; }
     }
     for (int j = 0; j < 2; ++j) {
-        place[j].pos = shadow[j].pos; place[j].strand = shadow[j].strand; place[j].mapq = shadow[j].mapQ;
-        place[j].proper = (shadow[j].extra_flag & SAM_FPP) != 0;
+        r[j]->blind_place_pos = cs[j].pos; r[j]->blind_place_strand = cs[j].strand;
+        r[j]->blind_place_mapq = unknown || cs[j].type == BWA_TYPE_NO_MATCH ? 0 : cs[j].mapQ;
     }
-    return true;
 }
 
 void aln_meth_blind_isize(const aln_meth_ref_t *ref, const gap_opt_t *gopt, const pe_opt_t *popt, int n,
@@ -1776,8 +1958,8 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
     std::vector<std::pair<int,int>> initial_selection(n);
     for(int i=0;i<n;++i) initial_selection[i]={res[0][i].main,res[1][i].main};
     // --meth-mapq conversion-blind: each end starts capped at its single-end conversion-blind
-    // MAPQ (stage 1's selection); for a mapped, complete pair, meth_blind_shadow's placement
-    // replaces that once the genomic pairing has placed the ends.
+    // MAPQ (stage 1's selection); for a complete pair with a mapped end, where collapsed's pairing
+    // and mate rescue leave each end (meth_blind_shadow, meth_blind_place) replaces that.
     const bool blind = meth_mapq_conversion_blind(&mo->m);
     // whether collapsed's insert size is the genomic pairing's (pairing reads every field)
     // (pairing reads low and high, and with high set avg, std and high_bayesian)
@@ -1787,6 +1969,14 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
     if (blind)
         for (int i = 0; i < n; ++i)
             for (int j = 0; j < 2; ++j) res[j][i].blind_cap = meth_blind_se_cap(res[j] + i, seqs[j] + i, gopt);
+    // collapsed scoring's options, for its mate rescue (meth_blind_place): its matrices
+    aln_meth_opt_t cmo;
+    if (blind) {
+        cmo = *mo;
+        cmo.m.meth_scoring = MEM_METH_SCORING_COLLAPSED;
+        cmo.m.meth_mapq = MEM_METH_MAPQ_SCORING;
+        aln_meth_opt_finish(&cmo);
+    }
 	for (int i = 0; i < n; ++i) {
 		bwa_seq_t *p[2] = {seqs[0] + i, seqs[1] + i};
 		aln_meth_read_t *r[2] = {res[0] + i, res[1] + i};
@@ -1794,17 +1984,16 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 		const bool incomplete = r[0]->flags || r[1]->flags;
 		const bool mapped = (p[0]->type == BWA_TYPE_UNIQUE || p[0]->type == BWA_TYPE_REPEAT)
 			&& (p[1]->type == BWA_TYPE_UNIQUE || p[1]->type == BWA_TYPE_REPEAT);
-		// --meth-mapq conversion-blind: where collapsed scoring leaves each end, and at what MAPQ,
-		// before the pairing below moves the ends (meth_blind_shadow). An end the genomic search
-		// left unmapped is placed by collapsed when it has mirror-free strata (rows -n or -k
-		// dropped only for their mirror mismatches), so its mate is still capped by that pairing.
-		bool shadow_ends = blind && !incomplete;
-		for (int j = 0; j < 2; ++j)
-			shadow_ends = shadow_ends && (p[j]->type == BWA_TYPE_UNIQUE || p[j]->type == BWA_TYPE_REPEAT
-			                              || (p[j]->type == BWA_TYPE_NO_MATCH && r[j]->blind_main >= 0));
-		shadow_ends = shadow_ends && (p[0]->type != BWA_TYPE_NO_MATCH || p[1]->type != BWA_TYPE_NO_MATCH);
-		meth_blind_place_t place[2];
-		const bool placed = shadow_ends && meth_blind_shadow(ref, gopt, popt, blind_ii ? blind_ii : ii, same_ii, p, r, place, shadow);
+		// --meth-mapq conversion-blind: collapsed scoring's state of the ends before its mate rescue
+		// (meth_blind_shadow), from where they start, for a complete pair the genomic search maps an
+		// end of. An end the genomic search left unmapped is placed by collapsed when it has mirror-free
+		// strata (rows -n or -k dropped only for their mirror mismatches).
+		bwa_seq_t cs[2];
+		int cs_hyp[2] = {-1, -1};
+		const meth_blind_shadow_t shadow_st = blind && !incomplete
+			&& (p[0]->type != BWA_TYPE_NO_MATCH || p[1]->type != BWA_TYPE_NO_MATCH)
+			? meth_blind_shadow(ref, gopt, popt, blind_ii ? blind_ii : ii, same_ii, p, r, cs, cs_hyp, shadow)
+			: METH_BLIND_NONE;
 		// pairing on the retained stock-cost occurrences
 		if (mapped) {
 			if (!incomplete && (int)r[0]->hits.size() <= max_occ && (int)r[1]->hits.size() <= max_occ) {
@@ -1863,18 +2052,12 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
 				xassert(!((p[0]->extra_flag & SAM_FPP) && r[0]->hyp != r[1]->hyp), "a proper pair's ends must share a hypothesis");
 			}
 		}
-		// An end that collapsed scoring leaves where the pairing above left it is capped at its
-		// MAPQ there; any other end at 0.
-		if (placed)
-			for (int j = 0; j < 2; ++j) {
-				r[j]->blind_cap = place[j].pos == p[j]->pos && place[j].strand == (int)p[j]->strand ? place[j].mapq : 0;
-				// a mate rescue moves only an end of an improper pair, and collapsed rescues too
-				// then (not rerun here): only a proper shadow pair bounds a rescued end
-				if (place[j].proper) {
-					r[j]->blind_place_pos = place[j].pos; r[j]->blind_place_strand = place[j].strand;
-					r[j]->blind_place_mapq = place[j].mapq;
-				}
-			}
+		// collapsed's mate rescue, rerun from that state with collapsed's matrices and insert size,
+		// and where it leaves each end (meth_blind_place): an end is capped at collapsed's MAPQ where
+		// collapsed places it as the genomic run finally does, else 0
+		if (shadow_st != METH_BLIND_NONE)
+			meth_blind_place(ref, &cmo, gopt, popt, blind_ii ? blind_ii : ii, p, r, cs, cs_hyp,
+			                 shadow_st == METH_BLIND_SAME);
 	}
     if(popt->is_sw && ii->avg>=0 && popt->type==BWA_PET_STD)
         for(int i=0;i<n;++i) {
@@ -1886,115 +2069,22 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
         }
 	// mate rescue (bwa_paired_sw_core with the anchor's matrix; the rescued mate takes its hypothesis)
 	if (popt->is_sw && ii->avg >= 0.0) {
-		const int64_t l_pac = ref->bns->l_pac;
 		for (int i = 0; i < n; ++i) {
 			bwa_seq_t *p[2] = {seqs[0] + i, seqs[1] + i};
 			aln_meth_read_t *r[2] = {res[0] + i, res[1] + i};
 			if (r[0]->flags || r[1]->flags) continue;
 			if (!((p[0]->mapQ >= SW_MIN_MAPQ || p[1]->mapQ >= SW_MIN_MAPQ) && (p[0]->extra_flag & SAM_FPP) == 0)) continue;
-			int n_cigar[2] = {0, 0}, mapQ = 0, mq_adjust[2] = {255, 255};
-			int64_t site_used[2] = {-1, -1};
-			int64_t beg[2], end[2];
-			bwa_cigar_t *cigar[2] = {0, 0};
-			uint32_t cnt[2];
 			const int is_singleton = (p[0]->type == BWA_TYPE_NO_MATCH || p[1]->type == BWA_TYPE_NO_MATCH) ? 1 : 0;
 			++n_tot[is_singleton];
 			if (popt->type != BWA_PET_STD) continue;
-			for (int k = 0; k < 2; ++k) {
-				bwa_seq_t *pref = p[1 - k], *pmate = p[k];
-				if (pref->type == BWA_TYPE_NO_MATCH) continue;
-				ubyte_t *seq;
-				if (pref->strand == 0) {
-					aln_rescue_window((int64_t)pref->pos, true, pmate->len, ii, popt->exact_rescue_window, &beg[k], &end[k]);
-					if (beg[k] < aln_rescue_window_floor(pref, popt)) beg[k] = aln_rescue_window_floor(pref, popt);
-					if (end[k] > l_pac) end[k] = l_pac;
-					seq = pmate->rseq;
-				} else {
-					aln_rescue_window(aln_rescue_anchor_end(pref, popt), false, pmate->len, ii, popt->exact_rescue_window,
-									  &beg[k], &end[k]);
-					if (beg[k] < 0) beg[k] = 0;
-					if (end[k] > aln_rescue_window_ceiling(pref, popt)) end[k] = aln_rescue_window_ceiling(pref, popt);
-					seq = pmate->seq;
-					seq_reverse(pmate->len, seq, 0);
-				}
-                const int anchor_rid = bns_pos2rid(ref->bns, pref->pos);
-                const int64_t beg0 = beg[k];
-                std::vector<int64_t> keys; // --known-snvs: the window's site alleles
-                if (ref->known_snvs && end[k] > beg0)
-                    aln_meth_window_sites(*ref, beg0, (int)std::min<int64_t>(end[k] - beg0, INT_MAX), &keys,
-                                          anchor_rid); // meth_sw_core clips each trial to this contig too
-                if (keys.empty()) {
-                    cigar[k] = meth_sw_core(ref, mo, r[1-k]->hyp, anchor_rid, pmate->len, seq,
-                                            &beg[k], end[k], &n_cigar[k], &cnt[k]);
-                } else { // the window as the reference, then with each site allele alone (aln_rescue_pick)
-                    std::vector<pe_rescue_trial_t> trials(keys.size() + 1, pe_rescue_trial_t{nullptr, 0, 0, beg0, 0, -1, 0});
-                    for (size_t t = 0; t < trials.size(); ++t) {
-                        pe_rescue_trial_t &x = trials[t];
-                        x.site = t ? keys[t - 1] : -1;
-                        x.cigar = meth_sw_core(ref, mo, r[1-k]->hyp, anchor_rid, pmate->len, seq,
-                                               &x.beg, end[k], &x.n_cigar, &x.cnt, nullptr, nullptr, x.site, &x.score,
-                                               &x.tie);
-                    }
-                    const int pick = aln_rescue_pick(trials.data(), (int)trials.size(), pref, popt);
-                    for (int t = 0; t < (int)trials.size(); ++t) {
-                        if (t != pick) { free(trials[t].cigar); continue; }
-                        cigar[k] = trials[t].cigar, n_cigar[k] = trials[t].n_cigar, cnt[k] = trials[t].cnt;
-                        beg[k] = trials[t].beg, site_used[k] = trials[t].site;
-                    }
-                }
-				if (cigar[k] && popt->short_insert && !aln_rescue_within_fragment(pref, beg[k], cigar[k], n_cigar[k])) {
-					free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
-				}
-				if (cigar[k] && pmate->type != BWA_TYPE_NO_MATCH) {
-					int64_t s_old, s_new; int clip = 0;
-					if (__cigar_op(cigar[k][0]) == 3) clip += __cigar_len(cigar[k][0]);
-					if (__cigar_op(cigar[k][n_cigar[k] - 1]) == 3) clip += __cigar_len(cigar[k][n_cigar[k] - 1]);
-					s_old = (int64_t)(((int64_t)pmate->n_mm * gopt->s_mm + (int64_t)pmate->n_gapo * gopt->s_gapo + (int64_t)pmate->n_gape * gopt->s_gape) / 3. * 8. + .499);
-					s_new = (int64_t)(((int64_t)(cnt[k] >> 16) * gopt->s_mm + (int64_t)(cnt[k] >> 8 & 0xff) * gopt->s_gapo + (int64_t)(cnt[k] & 0xff) * gopt->s_gape + (int64_t)clip * gopt->s_mm) / 3. * 8. + .499);
-					s_old += -4.343 * log(ii->ap_prior / l_pac);
-					s_new += (int)(-4.343 * log(.5 * erfc(M_SQRT1_2 * 1.5) + .499));
-					if (s_old < s_new) {
-						mq_adjust[k] = (int)std::min<int64_t>(255, s_new - s_old);
-						free(cigar[k]); cigar[k] = 0; n_cigar[k] = 0;
-					} else mq_adjust[k] = (int)std::min<int64_t>(255, s_old - s_new);
-				}
-				if (pref->strand == 1) seq_reverse(pmate->len, seq, 0);
-			}
-			int k = -1;
-			if (cigar[0] && cigar[1]) {
-				k = p[0]->mapQ < p[1]->mapQ ? 0 : 1;
-				mapQ = abs(p[1]->mapQ - p[0]->mapQ);
-			} else if (cigar[0]) k = 0, mapQ = p[1]->mapQ;
-			else if (cigar[1]) k = 1, mapQ = p[0]->mapQ;
-			// an unmapped mate's pos is 0, which is not a placement: a rescue there still installs;
-			// so does one at the mate's own start on the other strand (the rescue takes the strand
-			// opposite the anchor's, so a mate on the anchor's strand is a different placement)
-			if (k >= 0 && (p[k]->type == BWA_TYPE_NO_MATCH || p[k]->pos != (bwtint_t)beg[k] ||
-						   p[k]->strand == p[1 - k]->strand)) {
+			const int hyp[2] = {r[0]->hyp, r[1]->hyp};
+			int64_t site;
+			const int k = meth_mate_rescue(ref, mo, gopt, popt, ii, p, hyp, &site);
+			if (k >= 0) {
 				++n_mapped[is_singleton];
-				int tmp = (int)p[1 - k]->mapQ - p[k]->mapQ / 2 - 8;
-				if (tmp <= 0) tmp = 1;
-				if (mapQ > tmp) mapQ = tmp;
-				p[k]->mapQ = p[1 - k]->mapQ = mapQ;
-				p[k]->seQ = p[1 - k]->seQ = p[1 - k]->seQ < mapQ ? p[1 - k]->seQ : mapQ;
-				if (p[k]->mapQ > mq_adjust[k]) p[k]->mapQ = mq_adjust[k];
-				if (p[k]->seQ > mq_adjust[k]) p[k]->seQ = mq_adjust[k];
-				free(p[k]->cigar); p[k]->cigar = cigar[k]; cigar[k] = 0;
-				p[k]->n_cigar = n_cigar[k];
-				p[k]->type = BWA_TYPE_MATESW;
-				p[k]->pos = beg[k];
-				p[k]->seQ = p[1 - k]->seQ;
-				p[k]->strand = 1 - p[1 - k]->strand;
-				p[k]->n_mm = cnt[k] >> 16; p[k]->n_gapo = cnt[k] >> 8 & 0xff; p[k]->n_gape = cnt[k] & 0xff;
-                    const int64_t cost=(int64_t)p[k]->n_mm*gopt->s_mm+(int64_t)p[k]->n_gapo*gopt->s_gapo+(int64_t)p[k]->n_gape*gopt->s_gape;
-                    if(cost>INT_MAX) { fprintf(stderr,"ERROR: --meth rescued cost exceeds record capacity\n"); exit(1); }
-                    p[k]->score=(int)cost;
-				p[k]->extra_flag |= SAM_FPP;
-				p[1 - k]->extra_flag |= SAM_FPP;
 				r[k]->hyp = r[1 - k]->hyp; // the rescued mate is on the anchor's genome strand
-				r[k]->ks_site = site_used[k];
+				r[k]->ks_site = site;
 			}
-			free(cigar[0]); free(cigar[1]);
 		}
 	}
     for (int i = 0; i < n; ++i) {
@@ -2007,17 +2097,15 @@ int aln_meth_pe_stage2(const aln_meth_ref_t *ref, const aln_meth_opt_t *mo, cons
             if (r->n_conv_moved && s->type != BWA_TYPE_MATESW &&
                 r->main == (j ? initial_selection[i].second : initial_selection[i].first) &&
                 s->mapQ > conv_mapq_cap(r->conv_gap)) s->mapQ = conv_mapq_cap(r->conv_gap);
-            // A rescued (MATESW) end has no strata of its own: its MAPQ comes from its anchor, so
-            // it takes the anchor's cap, and where collapsed pairs the ends properly (so rescues
-            // neither) at most that pairing's MAPQ for it there (0 elsewhere).
+            // Where collapsed's state is known (meth_blind_place), an end is capped at collapsed's
+            // MAPQ where collapsed leaves it at this end's start and strand, else 0. Otherwise
+            // (no shadow: an incomplete end, or unknown strata or costs, which set the caps) a
+            // rescued (MATESW) end, which has no strata of its own, takes its anchor's cap.
             if (blind) {
                 int cap = r->blind_cap;
-                if (s->type == BWA_TYPE_MATESW) {
-                    cap = res[1 - j][i].blind_cap;
-                    if (r->blind_place_mapq >= 0)
-                        cap = std::min(cap, r->blind_place_pos == s->pos && r->blind_place_strand == (int)s->strand
-                                                ? r->blind_place_mapq : 0);
-                }
+                if (r->blind_place_mapq >= 0)
+                    cap = r->blind_place_pos == s->pos && r->blind_place_strand == (int)s->strand ? r->blind_place_mapq : 0;
+                else if (s->type == BWA_TYPE_MATESW) cap = res[1 - j][i].blind_cap;
                 meth_apply_blind_cap(s, r, cap);
             }
             int lim = popt->n_multi;

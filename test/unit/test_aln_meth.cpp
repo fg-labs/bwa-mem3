@@ -204,7 +204,7 @@ std::string write_fq(const std::string &name, const std::vector<std::string> &re
 }
 
 struct Rec {
-    std::string name, rname, cigar;
+    std::string name, rname, cigar, seq, qual;
     int flag = 0, pos = 0, mapq = 0, pnext = 0, tlen = 0;
     std::string rnext;
     std::map<std::string, std::string> tag; // "XG:Z" -> "CT"
@@ -225,6 +225,7 @@ std::vector<Rec> parse_records(std::istream &in)
         r.name = f[0]; r.flag = atoi(f[1].c_str()); r.rname = f[2]; r.pos = atoi(f[3].c_str());
         r.mapq = atoi(f[4].c_str()); r.cigar = f[5];
         r.rnext=f[6];r.pnext=atoi(f[7].c_str());r.tlen=atoi(f[8].c_str());
+        r.seq = f[9]; r.qual = f[10];
         for (size_t i = 11; i < f.size(); ++i) {
             r.raw_tags.push_back(f[i]);
             REQUIRE(f[i].size() >= 5);
@@ -306,6 +307,19 @@ std::string expected_xm(const std::string &genome, int start, const std::string 
 } // namespace
 
 TEST_SUITE_BEGIN("unit/aln_meth");
+
+TEST_CASE("aln_meth: SAM parser retains sequence and base qualities")
+{
+    std::istringstream in{
+        "mapped\t0\tref\t1\t37\t4M\t*\t0\t0\tACGT\t!I#J\n"
+        "unmapped\t4\t*\t0\t0\t*\t*\t0\t0\tTGCA\tJI!#\n"};
+    const auto records = parse_records(in);
+    REQUIRE(records.size() == 2);
+    CHECK(records[0].seq == "ACGT");
+    CHECK(records[0].qual == "!I#J");
+    CHECK(records[1].seq == "TGCA");
+    CHECK(records[1].qual == "JI!#");
+}
 
 TEST_CASE("aln_meth: read 1 on both genome strands: position, strand, XR/XG, NM and MD")
 {
@@ -1387,6 +1401,33 @@ TEST_CASE("aln_meth: the conversion-blind strata are collapsed's selection, locu
     ba::bwt_destroy(bwt);
 }
 
+// --meth-mapq conversion-blind changes only MAPQ and YQ:i: every other field of each record, mate
+// fields and tags included, is the --meth-mapq scoring run's.
+static void check_blind_only_mapq(const std::vector<Rec> &blind, const std::vector<Rec> &scoring)
+{
+    REQUIRE(blind.size() == scoring.size());
+    auto tags = [](const Rec &r) {
+        std::vector<std::string> v;
+        for (const std::string &t : r.raw_tags)
+            if (t.compare(0, 5, "YQ:i:") != 0) v.push_back(t);
+        return v;
+    };
+    for (size_t i = 0; i < blind.size(); ++i) {
+        CAPTURE(blind[i].name);
+        CHECK(blind[i].name == scoring[i].name);
+        CHECK(blind[i].flag == scoring[i].flag);
+        CHECK(blind[i].rname == scoring[i].rname);
+        CHECK(blind[i].pos == scoring[i].pos);
+        CHECK(blind[i].cigar == scoring[i].cigar);
+        CHECK(blind[i].seq == scoring[i].seq);
+        CHECK(blind[i].qual == scoring[i].qual);
+        CHECK(blind[i].rnext == scoring[i].rnext);
+        CHECK(blind[i].pnext == scoring[i].pnext);
+        CHECK(blind[i].tlen == scoring[i].tlen);
+        CHECK(tags(blind[i]) == tags(scoring[i]));
+    }
+}
+
 // --meth-mapq conversion-blind observes collapsed scoring: each mapped record has the lower of the
 // scoring and collapsed MAPQs where collapsed places it at the same position and strand, else 0.
 // The three runs are of the same input, so their records come in the same order.
@@ -1481,13 +1522,7 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQ is collapsed's pairing's, ca
     const auto blind = run({});
     const auto collapsed = run({"--meth-scoring", "collapsed"});
     REQUIRE(blind.size() == 2 * names.size());
-    for (size_t i = 0; i < blind.size(); ++i) { // placement is the genomic search's
-        CAPTURE(blind[i].name);
-        CHECK(blind[i].flag == scoring[i].flag);
-        CHECK(blind[i].rname == scoring[i].rname);
-        CHECK(blind[i].pos == scoring[i].pos);
-        CHECK(blind[i].cigar == scoring[i].cigar);
-    }
+    check_blind_only_mapq(blind, scoring); // placement is the genomic search's
     check_blind_observes_collapsed(blind, scoring, collapsed);
     // each shape, as (pair, genomic MAPQ, conversion-blind MAPQ) of some record
     std::set<std::tuple<std::string, int, int>> seen;
@@ -1507,9 +1542,12 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQs are collapsed's, capped at 
     // 40-base segment, a gap, read 2's segment. Its copies, on the same contig past a spacer, are
     // of either segment alone or of the whole fragment with a gap of another length (a suboptimal
     // pair), and carry mirror cells (a T under a C a read keeps), real mismatches or neither, as
-    // can read 1's segment at home. Each family gives a few pairs, keeping some of the segments'
-    // Cs, some repeated (a duplicate draws with its own seed). Runs with an insert-size estimate
-    // (collapsed's own) and with -A, both without mate rescue (-s: collapsed's is not rerun). Every
+    // can read 1's segment at home. Read 2's segment at home can carry two real mismatches, with a
+    // mirror copy on a contig of its own (an improper pair under collapsed, which rescues read 2
+    // home). Each family gives a few pairs, keeping some of the segments' Cs, some repeated (a
+    // duplicate draws with its own seed). Plain pairs on contigs of their own give collapsed an
+    // insert size too. Runs with an insert-size estimate
+    // (collapsed's own) and mate rescue (collapsed's is rerun for the cap), and with -A. Every
     // random value is drawn into a local first, so the reference does not depend on the compiler's
     // argument evaluation order.
     bwa_tests::TempDir tmp{"aln_meth_blind_pairs"};
@@ -1555,8 +1593,20 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQs are collapsed's, capped at 
             const std::set<int> two = positions(2, 0, len, meth1);
             h1 = copy_of(s1, meth1, {}, two);
         }
+        // read 2's at home: as the read has it, or (in a third of the families) with two real
+        // mismatches and a copy on a contig of its own with a T under each C read 2 can keep (its
+        // collapsed best, with home past collapsed's cut: an improper pair, whose read 2 collapsed
+        // rescues home)
+        const int home2 = rnd(3);
+        std::string h2 = s2;
+        if (home2 == 2) {
+            const std::set<int> two = positions(2, 0, len, meth2);
+            h2 = copy_of(s2, meth2, {}, two);
+            const std::string before = aln_test::lcg_dna(st, 100), after = aln_test::lcg_dna(st, 100);
+            contigs.emplace_back("m" + std::to_string(f), before + copy_of(s2, meth2, meth2, {}) + after);
+        }
         std::string c = aln_test::lcg_dna(st, 80);
-        c += h1 + mid + s2;
+        c += h1 + mid + h2;
         const int n_copies = 1 + rnd(5);
         for (int k = 0; k < n_copies; ++k) {
             const int spacer = 600 + rnd(200);
@@ -1595,6 +1645,17 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQs are collapsed's, capped at 
             }
         }
     }
+    // plain pairs on contigs of their own, at the families' inserts: an insert-size estimate for
+    // collapsed (whose own selections are mostly repeats) as for the genomic run, so both rescue
+    for (int k = 0; k < 24; ++k) {
+        const int gap = 180 + rnd(120);
+        const std::string s1 = aln_test::lcg_dna(st, len), mid = aln_test::lcg_dna(st, gap);
+        const std::string s2 = aln_test::lcg_dna(st, len), tail = aln_test::lcg_dna(st, 80);
+        const std::string head = aln_test::lcg_dna(st, 80);
+        contigs.emplace_back("p" + std::to_string(k), head + s1 + mid + s2 + tail);
+        r1.push_back(conv(s1, 'C', 'T')); r2.push_back(conv(aln_test::revcomp(s2), 'G', 'A'));
+        names.push_back("p" + std::to_string(k));
+    }
     REQUIRE(aln_test::write_test_fasta(fa, contigs));
     std::vector<std::string> index_args = {"index", "--meth", fa};
     std::vector<char *> argv;
@@ -1613,10 +1674,11 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQs are collapsed's, capped at 
         return path;
     };
     const std::string fq1 = fq("pairs1.fq", r1), fq2 = fq("pairs2.fq", r2);
-    long moved = 0, lowered = 0;
-    // -s: collapsed's own mate rescue is not rerun for the cap, so leave it out of both runs; -A
-    // also drops the insert-size estimates (collapsed's and the genomic one)
-    for (const std::vector<std::string> &extra : {std::vector<std::string>{"-s"}, std::vector<std::string>{"-A"}}) {
+    long moved = 0, lowered = 0, rescued = 0;
+    // with the insert-size estimates (collapsed's and the genomic one) and mate rescue; -s drops the
+    // rescue, -A both
+    for (const std::vector<std::string> &extra :
+         {std::vector<std::string>{}, std::vector<std::string>{"-s"}, std::vector<std::string>{"-A"}}) {
         CAPTURE(extra.size());
         auto run = [&](std::vector<std::string> mode) {
             std::vector<std::string> args = {"--meth"};
@@ -1628,21 +1690,151 @@ TEST_CASE("aln_meth: the conversion-blind pair MAPQs are collapsed's, capped at 
         const auto blind = run({});
         const auto collapsed = run({"--meth-scoring", "collapsed"});
         REQUIRE(blind.size() == 2 * names.size());
-        for (size_t i = 0; i < blind.size(); ++i) { // conversion-blind changes only MAPQ (and YQ:i)
+        check_blind_only_mapq(blind, scoring); // conversion-blind changes only MAPQ (and YQ:i)
+        for (size_t i = 0; i < blind.size(); ++i) {
             CAPTURE(blind[i].name);
-            CHECK(blind[i].flag == scoring[i].flag);
-            CHECK(blind[i].rname == scoring[i].rname);
-            CHECK(blind[i].pos == scoring[i].pos);
-            CHECK(blind[i].cigar == scoring[i].cigar);
             CHECK(blind[i].mapq <= scoring[i].mapq);
             lowered += blind[i].mapq < scoring[i].mapq;
             moved += blind[i].pos != collapsed[i].pos || blind[i].rname != collapsed[i].rname;
+            const auto xt = collapsed[i].tag.find("XT:A");
+            // collapsed rescues an end of the pair, lowering this end below the genomic MAPQ
+            const size_t mate = i ^ 1;
+            const auto xt_mate = collapsed[mate].tag.find("XT:A");
+            const bool pair_rescued = (xt != collapsed[i].tag.end() && xt->second == "M")
+                || (xt_mate != collapsed[mate].tag.end() && xt_mate->second == "M");
+            rescued += pair_rescued && blind[i].mapq < scoring[i].mapq;
         }
         check_blind_observes_collapsed(blind, scoring, collapsed);
     }
-    // the cap lowers some records, and collapsed places some elsewhere
+    // the cap lowers some records, collapsed places some elsewhere, and collapsed's rescue of a pair
+    // lowers some
     CHECK(lowered > 0);
     CHECK(moved > 0);
+    CHECK(rescued > 0);
+}
+
+TEST_CASE("aln_meth: the conversion-blind pair MAPQ follows collapsed's mate rescue")
+{
+    // Collapsed scoring can leave a pair improper that the genomic run pairs, and then rescue a
+    // mate: that lowers the anchor's MAPQ too (to at most its MAPQ less half the mate's, less 8),
+    // so the conversion-blind cap must rerun collapsed's mate rescue. The pair's home contig has
+    // read 1's segment and, 280 bases on, read 2's with two real mismatches; another contig has a
+    // copy of read 2's segment with a T under each of the read's three kept Cs (three mismatches
+    // genomically, in the seed, so -k drops it; none mirror-free). Genomically read 2 is home and
+    // the pair proper (MAPQ 60). Collapsed places read 2 at the copy (home is past its cut), pairs
+    // nothing, and rescues read 2 home from read 1: both ends get 11. A second pair, on contig plain,
+    // has no kept C and read 2's segment there has four real mismatches (past -n): both runs leave
+    // read 2 unmapped and rescue it, so the cap reruns collapsed's rescue of a pair it places one end
+    // of. Pairs on contigs of their own, at inserts from 280 to 349, give both runs an insert size.
+    // Also run with --exact-rescue-window and --short-insert, which the rerun rescue takes too.
+    bwa_tests::TempDir tmp{"aln_meth_blind_rescue"};
+    const std::string dir = tmp.path(), fa = tmp.unique_file();
+    uint32_t st = 20261124;
+    auto dna = [&](int n) { return aln_test::lcg_dna(st, n); };
+    std::vector<std::pair<std::string, std::string>> contigs;
+    std::vector<std::string> r1, r2, names;
+    for (int k = 0; k < 24; ++k) {
+        const std::string head = dna(100), s1 = dna(40), mid = dna(200 + 3 * k), s2 = dna(40), tail = dna(100);
+        contigs.emplace_back("bg" + std::to_string(k), head + s1 + mid + s2 + tail);
+        r1.push_back(conv(s1, 'C', 'T'));
+        r2.push_back(conv(aln_test::revcomp(s2), 'G', 'A'));
+        names.push_back("bg" + std::to_string(k));
+    }
+    std::string s1 = dna(40), s2 = dna(40);
+    const int kept[3] = {10, 20, 30};
+    for (int p : kept) s2[p] = 'C';
+    // two real mismatches at home: a base that is neither the read's nor a conversion of it
+    std::string h2 = s2;
+    for (int p : {5, 35}) {
+        const char read = s2[p] == 'C' ? 'T' : s2[p];
+        h2[p] = read == 'G' ? 'A' : 'G';
+    }
+    std::string copy = s2;
+    for (int p : kept) copy[p] = 'T';
+    const std::string head = dna(100), mid = dna(240), tail = dna(100);
+    contigs.emplace_back("home", head + s1 + mid + h2 + tail);
+    const std::string before = dna(100), after = dna(100);
+    contigs.emplace_back("copy", before + copy + after);
+    std::string b = conv(aln_test::revcomp(s2), 'G', 'A');
+    for (int p : kept) b[39 - p] = 'G';
+    r1.push_back(conv(s1, 'C', 'T')); r2.push_back(b); names.push_back("target");
+    {
+        const std::string p1 = dna(40), p2 = dna(40);
+        std::string m2 = p2; // four real mismatches, two at each end (local rescue clips them)
+        for (int p : {1, 3, 36, 38}) {
+            const char read = p2[p] == 'C' ? 'T' : p2[p];
+            m2[p] = read == 'G' ? 'A' : 'G';
+        }
+        const std::string ph = dna(100), pm = dna(240), pt = dna(100);
+        contigs.emplace_back("plain", ph + p1 + pm + m2 + pt);
+        r1.push_back(conv(p1, 'C', 'T')); r2.push_back(conv(aln_test::revcomp(p2), 'G', 'A'));
+        names.push_back("plain");
+    }
+    REQUIRE(aln_test::write_test_fasta(fa, contigs));
+    std::vector<std::string> index_args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &arg : index_args) argv.push_back(&arg[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
+    auto fq = [&](const std::string &file, const std::vector<std::string> &reads) {
+        const std::string path = dir + "/" + file;
+        std::ofstream out(path);
+        for (size_t i = 0; i < reads.size(); ++i)
+            out << '@' << names[i] << '\n' << reads[i] << "\n+\n" << std::string(reads[i].size(), 'I') << '\n';
+        return path;
+    };
+    const std::string fq1 = fq("rescue1.fq", r1), fq2 = fq("rescue2.fq", r2);
+    auto xt = [](const Rec &r) { const auto it = r.tag.find("XT:A"); return it == r.tag.end() ? std::string() : it->second; };
+    for (const std::vector<std::string> &extra :
+         {std::vector<std::string>{}, std::vector<std::string>{"--exact-rescue-window", "--short-insert"}}) {
+        CAPTURE(extra.size());
+        auto run = [&](std::vector<std::string> mode) {
+            std::vector<std::string> args = {"--meth"};
+            args.insert(args.end(), extra.begin(), extra.end());
+            args.insert(args.end(), mode.begin(), mode.end());
+            return run_aln(args, {fq1, fq2}, fa, dir);
+        };
+        const auto scoring = run({"--meth-mapq", "scoring"});
+        const auto blind = run({});
+        const auto collapsed = run({"--meth-scoring", "collapsed"});
+        REQUIRE(blind.size() == 2 * names.size());
+        check_blind_only_mapq(blind, scoring); // placement is the genomic search's
+        check_blind_observes_collapsed(blind, scoring, collapsed);
+        // the target pair, as described: genomic proper at home; collapsed rescues read 2 home,
+        // which lowers both ends below the genomic MAPQ
+        const size_t t = blind.size() - 4;
+        REQUIRE(blind[t].name == "target");
+        REQUIRE(xt(collapsed[t + 1]) == "M");
+        for (size_t e = t; e < t + 2; ++e) {
+            CAPTURE(e - t);
+            REQUIRE(scoring[e].rname == "home");
+            REQUIRE((scoring[e].flag & 0x2) != 0);
+            REQUIRE(collapsed[e].rname == "home");
+            REQUIRE(collapsed[e].pos == scoring[e].pos);
+            REQUIRE(collapsed[e].mapq < scoring[e].mapq);
+            CHECK(blind[e].mapq == collapsed[e].mapq);
+            CHECK(tag_value(blind[e], "YQ:i") == std::to_string(scoring[e].mapq));
+        }
+        if (extra.empty()) { // the shape described above
+            CHECK(scoring[t].mapq == 60);
+            CHECK(blind[t].mapq == 11);
+            CHECK(blind[t + 1].mapq == 11);
+        }
+        // the plain pair: both runs rescue read 2, and the cap is collapsed's
+        const size_t q = blind.size() - 2;
+        REQUIRE(blind[q].name == "plain");
+        REQUIRE(xt(scoring[q + 1]) == "M");
+        REQUIRE(xt(collapsed[q + 1]) == "M");
+        for (size_t e = q; e < q + 2; ++e) {
+            CAPTURE(e - q);
+            CHECK(collapsed[e].pos == scoring[e].pos);
+            CHECK(blind[e].mapq == std::min(scoring[e].mapq, collapsed[e].mapq));
+        }
+    }
 }
 
 TEST_CASE("aln_meth: rows are scored along their search path, and -k limits the seed's strict differences"
