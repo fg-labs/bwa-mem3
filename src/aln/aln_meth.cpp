@@ -1211,9 +1211,16 @@ static __attribute__((noinline)) void meth_blind_strata(aln_meth_slot_t *x, aln_
 {
     const gap_opt_t *opt = x->grp->opt;
     const bool gape = opt->mode & BWA_MODE_GAPE;
-    if (r->blind_partial) { std::vector<aln_meth_occ_t>().swap(r->mirror_rows); return; }
-    // the cuts may have pruned a row these strata need (blind_note_need): the cap is 0
-    r->blind_incomplete = x->blind_need;
+    if (r->blind_partial) {
+        std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
+        x->mf_occ.clear(); x->mf_mirror.clear();
+        return;
+    }
+    // the cuts may have pruned a row these strata need (blind_note_need): the cap is 0. So it is
+    // when the search went on past a mirror-free -R stop (mf_stop) and its result is then
+    // incomplete (flags): a mirror-free run, complete at its stop, would pair the read, and with
+    // this one left out of pairing its mate's cap would not follow that pairing.
+    r->blind_incomplete = x->blind_need || (x->mf_stop && r->flags);
     // Each locus once: its row, its occ row (null when only the mirror table holds it), and
     // whether it is a hit. After a mirror-free -R stop (mf_stop) the loci are those of the rows
     // resolved there (mf_occ, mf_mirror), each with its row in occ now (null if none).
@@ -1272,8 +1279,10 @@ static __attribute__((noinline)) void meth_blind_strata(aln_meth_slot_t *x, aln_
     // A mirror-free run that takes the cuts reaches every row at its best cost before it applies
     // the ceiling, and a row above that cost only within the ceiling: a locus whose lowest
     // mirror-free row is above the best and over the ceiling holds its best row within the
-    // ceiling instead (if it has none, the ceiling drops the locus below).
-    if (cuts)
+    // ceiling instead (if it has none, the ceiling drops the locus below). After a mirror-free -R
+    // stop (mf_stop) that run never applied the ceiling to the search: it resolved every row
+    // kept there and keeps each locus at its lowest one, which the ceiling then keeps or drops.
+    if (cuts && !x->mf_stop)
         for (size_t k = 0; k < cand.size(); ++k) {
             cand_t &e = cand[k];
             if (mf(*e.row) == best || mf_diffs(*e.row) <= ceiling) continue;
@@ -1364,6 +1373,7 @@ void aln_meth_slot_finish(aln_meth_slot_t *x)
         // No record to cap, but collapsed can still place the read (its mate's shadow pairing)
         meth_blind_cap(x, r, -1, -1);
         std::vector<aln_meth_occ_t>().swap(r->mirror_rows);
+        x->mf_occ.clear(); x->mf_mirror.clear();
         // Every candidate was dropped: any of them could have been the best locus.
         if (r->n_unrepresentable) r->flags |= ALN_METH_BIND_UNREP;
         return;
