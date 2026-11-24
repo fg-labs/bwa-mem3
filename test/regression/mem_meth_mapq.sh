@@ -17,6 +17,8 @@
 #       retained Cs (gains only by extending), and one split across a contig boundary
 #   rs  adjacent copies U1 and U2 differ at three C/T positions, for a mate found only by rescue
 #   zt26, zt40  as rs, but U2 overlaps U1 and ends inside (26) or outside (40) the rescue zone
+#   kq, qk  copies K1 and K2 100 bases apart, K2 two real mismatches below K1 and after it (kq) or
+#       before it (qk), for --rescue-kmer
 #
 # A read 1 that kept such a C (a methylated C) and converted the rest is unique under genomic
 # scoring, because at the other copy the C sits over a T (the mirror cell) and costs a mismatch.
@@ -32,8 +34,9 @@
 # and collapsed accepts conversion-blind as a no-op; paired end, in a batch with an insert-size
 # estimate: only MAPQ and YQ:i (and the MAPQ MQ:i and SA:Z repeat) differ, no MAPQ is raised, a
 # pair whose MAPQ read 1's retained C raised is capped, unpaired ends take their single-end cap, a
-# rescued mate is capped by its rescue window's second-best alignment (outside the best's zone), and
-# every MAPQ equals collapsed -B 4's; --meth-mapq-max-len caps only reads within it (0: every
+# rescued mate is capped by its rescue window's second-best alignment (outside the best's zone;
+# under --rescue-kmer only by one inside the K-mer band, so a kept read and its converted twin get
+# the same MAPQ), and every MAPQ equals collapsed -B 4's; --meth-mapq-max-len caps only reads within it (0: every
 # length), at the boundary inclusive, and a whole pair when one end is; and the options' refusals.
 #
 # Env:
@@ -195,6 +198,34 @@ BEGIN {
             fq(dir "/p1.fq", "z" P (t ? "conv" : "kept"), conv(substr(zt, 111, 40), "C", "T", ""))
             fq(dir "/p2.fq", "z" P (t ? "conv" : "kept"), m)
         }
+    }
+    # --rescue-kmer: K1 (60 bases, a C at offset 20) and K2 (K1 with real mismatches at offsets 5
+    # and 45) sit 100 bases apart. Read 2 comes from K1's reverse strand with a real mismatch every
+    # 13 bases, so it is found only by mate rescue, whose K-mer band leaves K2 out of the SW. kkept
+    # keeps K1's C (a G in read 2), kconv converts it; with or without it the mate's genomic
+    # competitors are the same, so both reads must get the same MAPQ. Written to their own files,
+    # so the runs above keep their reads.
+    k1 = put(put(put(dna(60), 20, "C"), 5, "A"), 45, "A")
+    k2 = put(put(k1, 5, "G"), 45, "G")
+    kq = dna(300) k1 dna(100) k2 dna(300)
+    printf ">kq\n%s\n", kq > (dir "/ref.fa")
+    for (t = 0; t < 2; ++t) {
+        m = conv(rc(k1), "G", "A", t ? "" : " 39 ")
+        for (o = 4; o < 60; o += 13) { c = substr(m, o + 1, 1); m = put(m, o, c == "A" ? "C" : "A") }
+        fq(dir "/kx1.fq", t ? "kconv" : "kkept", conv(substr(kq, 111, 40), "C", "T", ""))
+        fq(dir "/kx2.fq", t ? "kconv" : "kkept", m)
+    }
+    # qk mirrors kq: the copy with the real mismatches (Q2) comes first, so it lies in the rescue
+    # window before the K-mer band around Q1, where read 2 comes from (qkept, qconv)
+    q1 = put(put(put(dna(60), 20, "C"), 5, "A"), 45, "A")
+    q2 = put(put(q1, 5, "G"), 45, "G")
+    qk = dna(300) q2 dna(100) q1 dna(300)
+    printf ">qk\n%s\n", qk > (dir "/ref.fa")
+    for (t = 0; t < 2; ++t) {
+        m = conv(rc(q1), "G", "A", t ? "" : " 39 ")
+        for (o = 4; o < 60; o += 13) { c = substr(m, o + 1, 1); m = put(m, o, c == "A" ? "C" : "A") }
+        fq(dir "/kx1.fq", t ? "qconv" : "qkept", conv(substr(qk, 111, 40), "C", "T", ""))
+        fq(dir "/kx2.fq", t ? "qconv" : "qkept", m)
     }
 }
 EOF
@@ -379,6 +410,80 @@ z40kept 99 zt40 111 60 -
 z40kept 147 zt40 305 0 60
 z40conv 99 zt40 111 60 -
 z40conv 147 zt40 305 0 -"
+# --rescue-kmer: the K-mer band leaves K2 (after the band) and Q2 (before it) out of the rescue SW,
+# and the shadow re-aligns that band only, so each kept read and its converted twin get the same
+# MAPQ: the cap does not depend on the retained C. Without the band, K2 and Q2 are the mates'
+# competitors, two real mismatches below them (42 for both twins), which is what makes the band
+# matter here; with it, nothing competes (60).
+cat "$tmp/p1.fq" "$tmp/kx1.fq" > "$tmp/kp1.fq"
+cat "$tmp/p2.fq" "$tmp/kx2.fq" > "$tmp/kp2.fq"
+run pe.kmer --meth --rescue-kmer "$tmp/ref.fa" "$tmp/kp1.fq" "$tmp/kp2.fq"
+run pe.nokmer --meth "$tmp/ref.fa" "$tmp/kp1.fq" "$tmp/kp2.fq"
+{
+    pick "$tmp/pe.kmer.sum" kkept
+    pick "$tmp/pe.kmer.sum" kconv
+    pick "$tmp/pe.kmer.sum" qkept
+    pick "$tmp/pe.kmer.sum" qconv
+} > "$tmp/kmer.sum"
+expect paired-rescue-kmer "$tmp/kmer.sum" "kkept 99 kq 111 60 -
+kkept 147 kq 305 60 -
+kconv 99 kq 111 60 -
+kconv 147 kq 305 60 -
+qkept 99 qk 111 60 -
+qkept 147 qk 465 60 -
+qconv 99 qk 111 60 -
+qconv 147 qk 465 60 -"
+{
+    pick "$tmp/pe.nokmer.sum" kkept
+    pick "$tmp/pe.nokmer.sum" kconv
+    pick "$tmp/pe.nokmer.sum" qkept
+    pick "$tmp/pe.nokmer.sum" qconv
+} > "$tmp/nokmer.sum"
+expect paired-rescue-kmer-full-window "$tmp/nokmer.sum" "kkept 99 kq 111 60 -
+kkept 147 kq 305 42 -
+kconv 99 kq 111 60 -
+kconv 147 kq 305 42 -
+qkept 99 qk 111 60 -
+qkept 147 qk 465 42 -
+qconv 99 qk 111 60 -
+qconv 147 qk 465 42 -"
+# inside the band the shadow still reprices: r1kept is capped to its converted twin's MAPQ
+{
+    pick "$tmp/pe.kmer.sum" r1kept
+    pick "$tmp/pe.kmer.sum" r1conv
+} > "$tmp/kmer.rescue.sum"
+expect paired-rescue-kmer-csub "$tmp/kmer.rescue.sum" "r1kept 99 rs 111 60 -
+r1kept 147 rs 305 30 60
+r1conv 99 rs 111 60 -
+r1conv 147 rs 305 30 -"
+# and every kept/conv twin of the --rescue-kmer run has one MAPQ per record, in both directions
+awk '{ n = $1; if (sub(/kept$/, "", n)) k[n " " $2] = $5; else if (sub(/conv$/, "", n)) c[n " " $2] = $5 }
+    END { for (x in k) if (!(x in c) || k[x] != c[x]) { bad = 1; print "  " x, k[x], c[x] > "/dev/stderr" }
+          for (x in c) if (!(x in k)) { bad = 1; print "  " x, "-", c[x] > "/dev/stderr" }
+          exit bad }' "$tmp/pe.kmer.sum" || {
+    echo "FAIL: paired-rescue-kmer-twins: a kept read and its converted twin differ in MAPQ" >&2
+    exit 1
+}
+echo 'PASS: paired-rescue-kmer-twins'
+# the --rescue-kmer run, like the default one: only MAPQ and YQ:i differ from scoring's, no MAPQ
+# is raised, YQ:i is the scoring MAPQ of exactly the lowered records, and every MAPQ equals
+# collapsed -B 4's under --rescue-kmer
+run pe.kmer.scoring --meth --rescue-kmer --meth-mapq scoring "$tmp/ref.fa" "$tmp/kp1.fq" "$tmp/kp2.fq"
+run pe.kmer.oracle --meth --rescue-kmer --meth-scoring collapsed -B 4 "$tmp/ref.fa" "$tmp/kp1.fq" "$tmp/kp2.fq"
+cmp <(strip "$tmp/pe.kmer.rec") <(strip "$tmp/pe.kmer.scoring.rec") || {
+    echo "FAIL: paired --rescue-kmer: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+paste -d ' ' "$tmp/pe.kmer.sum" "$tmp/pe.kmer.scoring.sum" | awk 'NF != 12 || $1 != $7 || int($2 / 64) % 4 != int($8 / 64) % 4 || $5 > $11 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' || {
+    echo "FAIL: paired --rescue-kmer: a row is not the same read end in both runs, or conversion-blind raised a MAPQ" >&2
+    exit 1
+}
+yq_is_scoring "$tmp/pe.kmer.sum" "$tmp/pe.kmer.scoring.sum" "paired --rescue-kmer"
+paste -d ' ' "$tmp/pe.kmer.sum" "$tmp/pe.kmer.oracle.sum" | awk 'NF != 12 || $1 != $7 || int($2 / 64) % 4 != int($8 / 64) % 4 || $5 != $11 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' || {
+    echo "FAIL: paired --rescue-kmer: a row is not the same read end in both runs, or the conversion-blind MAPQ differs from collapsed -B 4's" >&2
+    exit 1
+}
+echo 'PASS: paired-rescue-kmer-oracle'
 # in both modes, the records come as mates in order (read 1 and read 2 of one name; an odd count
 # fails), and each carries MQ:i, which repeats its mate's emitted (capped) MAPQ
 for mode in blind scoring; do

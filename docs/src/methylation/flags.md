@@ -222,8 +222,12 @@ the chosen one. A mate found by mate rescue also takes its rescue window's secon
 as a competitor (`csub`); the shadow aligns that window again with the mirror cell free, when
 the mate has a base the mirror cell can free, and keeps the higher second-best. With
 [`--rescue-kmer`](../cli/mem.md#--rescue-kmerk----rescue-band-int--banded-mate-rescue-opt-in-not-byte-identical),
-the genomic second-best comes from a narrowed window, so the shadow's estimate can differ from
-`collapsed -B 4`'s. A read whose MAPQ is already 0 is skipped. The cost is +3.2 % user CPU on NA12878 read 1
+the rescue SW runs on the window's K-mer band when the anchor scan finds one (else on the whole
+window), and the shadow aligns the same columns again, so a competitor outside the band counts for
+neither. The anchor scan treats each converted base as its source (C as T, or G as A), so the
+band does not depend on methylation either.
+
+A read whose MAPQ is already 0 is skipped. The cost is +3.2 % user CPU on NA12878 read 1
 cut to 20–50 bp single-end, +3.7 % and +4.2 % on pairs with read 1 at 25 bp or both ends
 at 30 bp, and +6.4 % on full-length 2×99 bp pairs (median of 5;
 [`--meth-mapq-max-len`](#--meth-mapq-max-len-int) trades it against a bias in repeats).

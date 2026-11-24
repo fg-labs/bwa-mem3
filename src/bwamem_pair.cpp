@@ -130,7 +130,7 @@ struct matesw_anchor_t {
  * query.
  *
  * Only mem_matesw_batch_pre calls this: it runs the scan once per enqueued pair
- * and stores the resulting offset in mmc->rescue_narrow_off[tid] (keyed by regid)
+ * and stores the resulting offset in mmc->rescue_narrow[tid] (keyed by regid)
  * for mem_matesw_batch_post to read back, so _post never re-derives the window.
  * `collapse` reduces the alphabet for the anchor scan only (1 = C->T / OT,
  * 2 = G->A / OB, 0 = none) so exact k-mers survive the bisulfite conversion
@@ -312,19 +312,21 @@ static const int32_t MATESW_GAR_DECLINED = -2;
 static const int32_t MATESW_GAR_PROVEN_FAIL = -3;
 
 /* mem_matesw_batch_pre stores the narrowing offset per enqueued pair (keyed by
- * regid, stable under the batch's sort_classify / length-sort reorder) in
- * mmc->rescue_narrow_off[tid], so mem_matesw_batch_post reads it back instead of
- * re-running the anchor scan. Returns the slot for regid, growing the buffer. */
-static int32_t *matesw_narrow_slot(mem_cache *mmc, int32_t tid, int64_t regid)
+ * regid, stable under the batch's sort_classify / length-sort reorder), and the length of
+ * the window its SW runs on, in mmc->rescue_narrow[tid], so mem_matesw_batch_post reads
+ * them back instead of re-running the anchor scan. Returns the slot for regid, growing the
+ * buffer. */
+static mem_cache::rescue_narrow_t *matesw_narrow_slot(mem_cache *mmc, int32_t tid, int64_t regid)
 {
     if (regid >= mmc->rescue_narrow_cap[tid]) {
         const int64_t cap = regid + 1024;
-        int32_t *grown = (int32_t *) realloc(mmc->rescue_narrow_off[tid], (size_t)cap * sizeof(int32_t));
-        xassert(grown != NULL, "out of memory: rescue_narrow_off");
-        mmc->rescue_narrow_off[tid] = grown;
+        mem_cache::rescue_narrow_t *grown = (mem_cache::rescue_narrow_t *) realloc(
+            mmc->rescue_narrow[tid], (size_t)cap * sizeof(mem_cache::rescue_narrow_t));
+        xassert(grown != NULL, "out of memory: rescue_narrow");
+        mmc->rescue_narrow[tid] = grown;
         mmc->rescue_narrow_cap[tid] = cap;
     }
-    return &mmc->rescue_narrow_off[tid][regid];
+    return &mmc->rescue_narrow[tid][regid];
 }
 
 /* mem_matesw_batch_pre records each anchor's rescue skip set per tid, keyed by gcnt / 4, so
@@ -738,7 +740,7 @@ static const int MATESW_ANY_HYP = INT_MIN;
  * - part: the 8-bit pairs whose regid is_banded() (the banded parents) move to the front, stably,
  *   so the kswv remainder keeps its length sort; *nb_out is their count.
  *
- * Result-safe: aln[] and mmc->rescue_narrow_off[tid] are keyed by regid and seqBuf* by idr/idq,
+ * Result-safe: aln[] and mmc->rescue_narrow[tid] are keyed by regid and seqBuf* by idr/idq,
  * so every key travels with the SeqPair it belongs to.
  *
  * The sort and the partition order an 8-byte (len1, idx) key per pair rather than the 72-byte
@@ -1280,7 +1282,7 @@ void mem_aln2sam(const mem_opt_t *opt, const bntseq_t *bns, kstring_t *str, bseq
  * reprice its csub (mem_meth_blind_reprice). Recorded per mate end by mem_matesw_batch_post while
  * mem_pair_resolve_batch_post runs a pair with the shadow on, and cleared at its next pair. */
 struct blind_rescue_prov_t {
-    int64_t wrb, wre;     // the rescue window [wrb, wre), before any narrowing
+    int64_t wrb, wre;     // the window [wrb, wre) the shadow re-aligns (mem_matesw_batch_post)
     int64_t rb, re;       // the region rescue added
     int qb, qe, rid;
     int is_rev, hyp;      // the mate's orientation and the matrix hypothesis it was scored with
@@ -1800,7 +1802,11 @@ struct blind_reprice_ctx_t {
  * Every such region whose mate has a mirror-able base (C, or G, as the window's matrix sees it) is
  * aligned again: a skip bounded by the genomic score2 is not safe, since its adjacent-column merge
  * can drop a column outside Z for a higher neighbour inside it, which freeing the mirror cell can
- * then overtake. Done once per region; x->dedup_re_rank indexes it. */
+ * then overtake. Under --rescue-kmer the window is the K-mer band the genomic SW ran on, not the
+ * whole rescue window: csub holds no competitor from outside the band, so counting one here would
+ * cap a mate that kept a C, which reaches this shadow, and not its fully converted twin, which
+ * has no region that can gain and so is never repriced. Done once per region; x->dedup_re_rank
+ * indexes it. */
 static void mem_meth_blind_reprice(const blind_reprice_ctx_t *rp, int end, mem_alnreg_t *x)
 {
     const mem_opt_t *opt = rp->opt;
@@ -2834,7 +2840,7 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                         if (recent[c].key != view.key || j < 0 || j >= pcnt) continue;
                         const SeqPair &pj = seqPairArray[j];
                         if (pj.regid == j && pj.h0 == xtra && pj.len1 == l1 && pj.len2 == l_ms
-                            && pj.meth_hyp == hyp && mmc->rescue_narrow_off[tid][j] == ob
+                            && pj.meth_hyp == hyp && mmc->rescue_narrow[tid][j].off == ob
                             && memcmp(seqBufRef + pj.idr, ref + ob, (size_t)l1) == 0
                             && memcmp(seqBufQer + pj.idq, oq.data(), (size_t)l_ms) == 0)
                             reuse = j;
@@ -3041,8 +3047,8 @@ int mem_matesw_batch_pre(const mem_opt_t *opt, const bntseq_t *bns,
                     recent_pos = (recent_pos + 1) % RECENT;
                 }
                 sp.regid = pcnt;
-                if (record_narrow) {   /* record narrow offset by regid for _post */
-                    *matesw_narrow_slot(mmc, tid, pcnt) = narrow_ob;
+                if (record_narrow) {   /* record narrow offset and window length by regid for _post */
+                    *matesw_narrow_slot(mmc, tid, pcnt) = { narrow_ob, (int32_t)(re - rb) };
                 }
                 if (rescue_band_enabled()) matesw_band(mmc, tid).commit(pcnt);
                 seqPairArray[pcnt++] = sp;
@@ -3185,9 +3191,9 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
             /* --rescue-kmer or pruning: apply the same narrowing offset _pre stored
              * for this regid, so aln.tb/te map against the narrowed window start
              * (batched pairs only; index==-1 scalar-fallback pairs were never narrowed). */
-            const int64_t wrb = rb; // the window before narrowing (the shadow rescores all of it)
+            const int64_t wrb = rb; // the window before narrowing
             if (narrowed && index >= 0)
-                rb += mmc->rescue_narrow_off[tid][index];
+                rb += mmc->rescue_narrow[tid][index].off;
             if (index == MATESW_GAR_PROVEN_FAIL) {
                 /* Proven score < min_seed_len: the gate below fails exactly as for a real SW. */
                 memset(&aln, 0, sizeof aln);
@@ -3289,10 +3295,18 @@ int mem_matesw_batch_post(const mem_opt_t *opt, const bntseq_t *bns,
                 b.score = aln.score;
                 b.csub = aln.score2;
                 b.secondary = -1;
-                if (t_rescue_prov_on && meth_won_hyp >= 0 && mate_meth_ot >= 0)
-                    t_rescue_prov[mate_meth_ot ^ 1].push_back({ wrb, re, b.rb, b.re, b.qb, b.qe, b.rid, is_rev,
+                if (t_rescue_prov_on && meth_won_hyp >= 0 && mate_meth_ot >= 0) {
+                    /* The window the shadow re-aligns: under --rescue-kmer the part the SW ran on
+                     * (its K-mer band when the anchor scan narrowed it; pruning does not run then,
+                     * rescue_prune_applies), so csub and the shadow see the same columns; else the
+                     * whole window, which exact pruning's narrowing leaves the genomic result of.
+                     * The scalar route (index -1) is never narrowed. */
+                    const bool kmer = narrowed && index >= 0 && opt->rescue_kmer;
+                    const int64_t pwb = kmer ? rb : wrb, pwe = kmer ? rb + mmc->rescue_narrow[tid][index].len : re;
+                    t_rescue_prov[mate_meth_ot ^ 1].push_back({ pwb, pwe, b.rb, b.re, b.qb, b.qe, b.rid, is_rev,
                                                                  meth_won_hyp, aln.score,
-                                                                 aln.te + (int)(rb - wrb) });
+                                                                 aln.te + (int)(rb - pwb) });
+                }
                 b.seedcov = (b.re - b.rb < b.qe - b.qb? b.re - b.rb : b.qe - b.qb) >> 1;
                 b.chain_n_hits = 1; // mate-rescue has no SMEM evidence; treat as unique anchor
 

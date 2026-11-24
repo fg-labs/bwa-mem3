@@ -683,21 +683,25 @@ typedef struct
     // _post may run on different threads for the same tid. Plain pointer + capacity
     // (not a std::vector) so a zero-filled mem_cache is a valid empty one. Grown on
     // demand by _pre; freed with the other per-tid buffers.
-    int32_t *rescue_narrow_off[MAX_THREADS];
+    // Each entry also holds the length of the window that pair's SW runs on, which
+    // --meth-mapq conversion-blind's shadow reads under --rescue-kmer to re-align the
+    // same columns (mem_meth_blind_reprice).
+    struct rescue_narrow_t { int32_t off, len; };
+    rescue_narrow_t *rescue_narrow[MAX_THREADS];
     int64_t  rescue_narrow_cap[MAX_THREADS];
 
     // Per-tid rescue skip sets (the orientations an anchor needs no rescue SW for; unrelated to
     // the --rescue-skip option), indexed by anchor (gcnt / 4): mem_matesw_batch_pre records each
     // anchor's 4-bit set (scanned, or probed from a sorted copy of the mate list) and
     // mem_pair_resolve_batch_post hands it back to mem_matesw_batch_post while the mate list is
-    // still the one _pre scanned. Same lifetime and growth as rescue_narrow_off.
+    // still the one _pre scanned. Same lifetime and growth as rescue_narrow.
     uint8_t *rescue_skip_set[MAX_THREADS];
     int64_t  rescue_skip_set_cap[MAX_THREADS];
 
     // Per-tid banded-rescue plans (rescue_band.h): mem_matesw_batch_pre plans the
     // banded pass 0 of each enqueued pair and mem_sam_pe_batch runs it, so the plan
     // lives with the batch's other per-tid state for the same reason as
-    // rescue_narrow_off. NULL until the first plan; created by _pre, freed with the
+    // rescue_narrow. NULL until the first plan; created by _pre, freed with the
     // other per-tid buffers (rescue_band_batch_free).
     RescueBandBatch *rescue_band[MAX_THREADS];
 
