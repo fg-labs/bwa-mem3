@@ -198,9 +198,11 @@ comes out too high.
   still enter them (at most the mirror-free best plus `-M`) is unresolved: the search applies a
   difference ceiling below the strata's own top-2 ceiling (the fewest mirror-free differences at
   the mirror-free best, plus one, at most `-n`), or a `-R` stop ends the search but not a
-  mirror-free run, or a mirror-free run's `-R` stop ends it but the search goes on and resolves
-  such a row ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). Once the next score the search would
-  expand is past the mirror-free best plus `-M`, no such row is left. In a pair, an end with
+  mirror-free run ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). Once the next score the search would
+  expand is past the mirror-free best plus `-M`, no such row is left. Where a mirror-free run's
+  `-R` stop ends it but the search goes on, the strata are taken from the rows the search had
+  scored at that stop, which are the mirror-free run's; if the search is then left incomplete
+  (lookup budget, `-m`), they are unknown. In a pair, an end with
   unknown strata gives both ends a cap of 0. Placement, CIGAR, `NM`,
   `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
   is `genomic`'s in every field but MAPQ. A record whose MAPQ the cap lowered

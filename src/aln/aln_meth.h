@@ -207,7 +207,8 @@ struct aln_meth_read_t {
     // end's conversion-blind cap is 0.
     int blind_partial = 0;
     // Under the stock cuts the search may have pruned a row of the mirror-free strata
-    // (blind_note_need), so they are not known: the conversion-blind cap is 0, for both ends of
+    // (blind_note_need), or it went on past a mirror-free -R stop and was then left incomplete
+    // (meth_blind_strata), so they are not known: the conversion-blind cap is 0, for both ends of
     // a pair.
     int blind_incomplete = 0;
     // The mirror-free selection's cost cut (blind_best + s_mm, or none under -N) and difference
