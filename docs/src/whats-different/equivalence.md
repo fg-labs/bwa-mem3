@@ -29,7 +29,10 @@ MAPQs can differ from those of earlier versions; placement and every other field
 ([PR #822](https://github.com/fg-labs/bwa-mem3/pull/822)). It also reruns `collapsed`'s mate
 rescue of a pair `collapsed` leaves improper, which lowers the anchor's MAPQ as well, so such
 pairs' MAPQs can be lower than in earlier versions
-([PR #823](https://github.com/fg-labs/bwa-mem3/pull/823)).
+([PR #823](https://github.com/fg-labs/bwa-mem3/pull/823)). Where either end's mirror-free strata
+are unknown (the mirror table outgrew its budget), both ends of the pair are capped at 0, also when
+the other end is unmapped, where earlier versions kept the mapped end's single-end cap; this only
+lowers MAPQ ([PR #823](https://github.com/fg-labs/bwa-mem3/pull/823)).
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,
