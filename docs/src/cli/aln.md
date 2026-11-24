@@ -711,8 +711,9 @@ from them. The rescue reruns, with `collapsed`'s scoring matrix and insert size,
 pairing leaves improper, and lowers the anchor's MAPQ too. An end that `collapsed` places
 elsewhere, or leaves unmapped, gets 0. An end with more than `--max-occ` such loci is not paired,
 as under `collapsed`, so each end keeps `collapsed`'s single-end MAPQ (unless its mate rescue
-moves it), or gets 0 if that is at another locus. When either end's strata are not known (the
-64 MiB budget below, or strata the stock cuts may have pruned) both ends' caps are 0.
+moves it), or gets 0 if that is at another locus. That pairing runs even when an end has more
+than `--max-occ` stock loci, so stock pairing does not run. When either end's strata are not
+known (the 64 MiB budget below, or strata the stock cuts may have pruned) both ends' caps are 0.
 Selection, pairing and rescue are unchanged; a lowered record keeps its uncapped MAPQ in `YQ:i`,
 and `XT:A`, `X0:i`/`X1:i` and `SM:i`/`AM:i` stay `genomic`'s. At a `--known-snvs` ALT window the
 rows come from the window search's `genomic` selection, and a window without a search path is
