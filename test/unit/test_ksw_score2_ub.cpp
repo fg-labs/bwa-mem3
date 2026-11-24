@@ -151,7 +151,8 @@ void check(const std::string &name, const std::vector<bwa_tests::TestPair> &pair
 
 } // namespace
 
-TEST_CASE("score2_ub bounds every out-of-zone column maximum, merged or not")
+TEST_CASE("score2_ub bounds every out-of-zone column maximum, merged or not"
+          * doctest::test_suite("unit/kswv"))
 {
     const auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
     const auto pairs = windows(20261123, 4000);

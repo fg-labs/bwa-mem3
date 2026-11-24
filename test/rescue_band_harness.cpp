@@ -31,7 +31,8 @@
  * BWA3_RESCUE_BAND_COST=100000000 (band every B2 parent) and BWA3_RESCUE_PRUNE_MAX_HITS. Harness-only:
  * RB_MINSC (the min seed length, default 19; minsc = RB_MINSC * a), RB_SCALAR_STRIDE (default 0: no
  * scalar cross-check; it runs only for batches at the default scoring, so not under an RB_SCORING
- * or RB_METH that changes it) and RB_SCORING (unset: the default scoring;
+ * or RB_METH that changes it, and under RB_16BIT checks score, te, qe and score2_ub only) and
+ * RB_SCORING (unset: the default scoring;
  * "a,b,o_del,e_del,o_ins,e_ins": that scoring; "random": a fresh draw per 2048-job batch, see
  * draw_params), RB_METH (genomic | neutral | collapsed | random: --meth matrices, see batch_matrix)
  * with RB_METH_REL (conv, the default: the filter matches converted copies; expand: genomic and
@@ -90,9 +91,13 @@ struct Res { int score, te, qe, score2, tb, qb; };
 /* ---------------------------------------------------------------------------------------- */
 /* scalar reference                                                                          */
 /* ---------------------------------------------------------------------------------------- */
-static void scalar_dp(const Job &jb, int &S, int &te, int &qe, std::vector<int> &R)
+/* The query is padded as the kernel pads it (i16: the 16-bit kernels' 8 columns, else the 8-bit
+ * kernels' 16): the pad columns score 0, so they carry a score reaching the query end into the
+ * row maxima. */
+static void scalar_dp(const Job &jb, bool i16, int &S, int &te, int &qe, std::vector<int> &R)
 {
-    const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size(), quanta = kswv_query_quantum8(len2);
+    const int len1 = (int)jb.ref.size(), len2 = (int)jb.q.size();
+    const int quanta = i16 ? kswv_query_quantum16(len2) : kswv_query_quantum8(len2);
     std::vector<int> Hp(quanta, 0), Hc(quanta, 0), E(quanta, 0);
     R.assign(len1, 0);
     S = 0; te = -1; qe = 0;
@@ -858,19 +863,24 @@ static int run_eq(std::vector<Job> &all_jobs, int k_default, int max_hits, int s
                 if (mism < 10) fprintf(stderr, "refused scoring but kind=%d\n", kind[t]);
             }
             if (!ok) { mism++; cls_mm[J.cls]++; }
-            /* The scalar model is kswv's 8-bit rowMax (scalar_score2's zeroed rising rows); kswv's
-             * 16-bit kernels keep a plain row max, so their score2 can differ from it (both widths
-             * as in v0.13.0). RB_16BIT checks pruned against full-window kswv16 only. */
-            if (!g_16 && scalar_stride > 0 && rescue_prune_is_default_scoring(pp) && (n % scalar_stride) == 0) {
-                int S, te, qe, om = -1; std::vector<int> R;
-                scalar_dp(J, S, te, qe, R);
-                const int s2 = S >= minsc ? scalar_score2(R, S, te, minsc) : -1;
+            /* The scalar model of score2 is kswv's 8-bit rowMax (scalar_score2's zeroed rising rows);
+             * the AVX2 and NEON 16-bit kernels keep a plain row max, so their score2 can differ from
+             * it (both widths as in v0.13.0), while the AVX-512BW 16-bit kernel zeroes rows as the
+             * 8-bit kernels do. So under RB_16BIT only score, te, qe and score2_ub are checked
+             * against the scalar DP (padded to the 16-bit kernels' quantum), and score2, tb and qb
+             * only pruned against full-window kswv16. */
+            if (scalar_stride > 0 && rescue_prune_is_default_scoring(pp) && (n % scalar_stride) == 0) {
+                int S, te, qe, s2 = -1, om = -1; std::vector<int> R;
+                scalar_dp(J, g_16, S, te, qe, R);
                 bool sok = S == a.score;
                 if (S > 0) sok = sok && te == a.te && qe == a.qe;
-                if (S >= minsc) {
+                if (S >= minsc && !g_16) {
                     int tb, qb;
+                    s2 = scalar_score2(R, S, te, minsc);
                     scalar_pass1(J, S, te, qe, tb, qb);
                     sok = sok && s2 == a.score2 && tb == a.tb && qb == a.qb;
+                }
+                if (S >= minsc) {
                     /* score2_ub bounds every row max >= minsc outside the zone, unmerged: the
                      * pruned window's rows are R's shifted by off[t], so the same rows are outside */
                     for (int i = 0; i < (int)R.size(); i++)

@@ -1,9 +1,14 @@
-/* score2/te2 plateau scan of the 8-bit batched mate-rescue kernels (kswv).
+/* The per-lane score2 epilogue shared by the batched mate-rescue kernels (kswv) and the banded
+ * rescue.
  *
- * After the forward DP, every u8 kernel (NEON, AVX2, AVX-512BW) emulates scalar
- * ksw_u8's b[] build and score2 scan per lane over the row maxima it stored in
- * rowMax (row-major, W lanes per row): consecutive rows at or above minsc collapse
- * into one entry anchored at the run's first strictly-greatest row, and an entry
+ * kswv_score2_ub, used by every kswv kernel (8-bit and 16-bit, all tiers) and by the banded rescue,
+ * computes kswr_t::score2_ub from the row maxima a kernel stored; kswv_rowmax_view names how that
+ * store was made, which decides the bounds it adds.
+ *
+ * The rest is the score2/te2 plateau scan of the 8-bit kernels. After the forward DP, every u8
+ * kernel (NEON, AVX2, AVX-512BW) emulates scalar ksw_u8's b[] build and score2 scan per lane over
+ * the row maxima it stored in rowMax (row-major, W lanes per row): consecutive rows at or above
+ * minsc collapse into one entry anchored at the run's first strictly-greatest row, and an entry
  * anchored inside the primary region [low, high] is excluded.
  *
  * Almost every row is below minsc and takes the scan's `continue`, which changes
@@ -24,20 +29,32 @@
 #include <stdint.h>
 #include <string.h>
 
+/* How a kernel's Block I stores its row maxima, which the score2 scan then reads. Each kernel
+ * names its own at the kswv_score2_ub it builds; the two must agree.
+ *  - plain: every row's maximum (the NEON and AVX2 16-bit kernels).
+ *  - lagged_zeroed: a row the next row exceeds is dropped (stored as 0 by the u8 kernels, -1 by
+ *    the 16-bit one), as is, on AVX-512BW, the row after a kept one (the u8 kernels of every
+ *    tier, the AVX-512BW 16-bit kernel, and the banded rescue). */
+enum class kswv_rowmax_view { plain, lagged_zeroed };
+
 /* kswr_t::score2_ub from a row-max view, fed its rows >= minsc in ascending order (value()): the
- * best of those outside the zone [low, high], plus bounds for the two out-of-zone rows a zeroed view
- * (the u8 kernels' lagged rowMax store) can hide behind a row inside the zone.
+ * best of those outside the zone [low, high], plus, for a lagged_zeroed view only, bounds for the
+ * two out-of-zone rows it can hide behind a row inside the zone.
  *  - Row low - 1, zeroed because it runs up into the zone: the run rises by at least 1 per row up
  *    to the first kept row p >= low, so row low - 1 is at most R[p] - (p - low + 1).
  *  - Row high + 1, after a kept row at high: the AVX-512BW store also zeroes the row after a kept
- *    one (the b[] merge drops it, as it is no higher), so row high + 1 is at most R[high]. Used
- *    whenever row high is kept and row high + 1 is not seen, whatever the view.
+ *    one (the b[] merge drops it, as it is no higher), so row high + 1 is at most R[high]. Applied
+ *    to either zeroed store whenever row high is kept and row high + 1 is not seen (the NEON and
+ *    AVX2 one never hides row high + 1 this way, so there it is only looser); never to a plain one.
  * Any other out-of-zone row the view hides is no higher than a kept row outside the zone (the end
- * of its rising run, or the kept row before it). */
+ * of its rising run, or the kept row before it). Both bounds assume Block I stored every row of the
+ * lane up to the scanned count, i.e. no lane stopped early (KSW_XSTOP) in the scanned phase: the
+ * rescue sets KSW_XSTOP only for phase 1, and every kernel returns before the scan in phase 1. */
 struct kswv_score2_ub {
     int low, high, minsc, ub = -1, v_high = -1;
     bool zeroed, seen_in = false, seen_after_high = false;
-    kswv_score2_ub(int lo, int hi, int ms, bool z) : low(lo), high(hi), minsc(ms), zeroed(z) {}
+    kswv_score2_ub(int lo, int hi, int ms, kswv_rowmax_view view)
+        : low(lo), high(hi), minsc(ms), zeroed(view == kswv_rowmax_view::lagged_zeroed) {}
     inline int value() const
     {
         return zeroed && !seen_after_high && v_high > ub ? v_high : ub;
@@ -102,7 +119,8 @@ static inline void kswv_score2_scan_bits_u8(const uint8_t *rowMax, const uint8_t
                                             int *score2_ub_out)
 {
     int score2 = -1, te2 = -1;
-    kswv_score2_ub ub(low, high, minsc, true); // rowMax is the lagged-zeroed store
+    // as Block I of every u8 kernel stores rowMax
+    kswv_score2_ub ub(low, high, minsc, kswv_rowmax_view::lagged_zeroed);
     /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces an "append" on the
      * first qualifying row. */
     int b_score = -1, b_pos = -2;

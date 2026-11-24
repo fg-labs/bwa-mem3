@@ -22,7 +22,8 @@
 struct rb_score2_scan {
     int low, high, s2 = -1, t2 = -1, bs = -1, bp = -2;
     kswv_score2_ub ub; // score2_ub, over the same lagged-zeroed rows as kswv's u8 kernels
-    rb_score2_scan(int lo, int hi, int minsc) : low(lo), high(hi), ub(lo, hi, minsc, true) {}
+    rb_score2_scan(int lo, int hi, int minsc)
+        : low(lo), high(hi), ub(lo, hi, minsc, kswv_rowmax_view::lagged_zeroed) {}
     void row(int i, int val)
     {
         ub.row(i, val);

@@ -1558,7 +1558,9 @@ jobs:
       # non-Sym form under each band kernel, and random costs with random
       # matrices. Runs 17-19 (RB_16BIT) send every job through kswv's 16-bit
       # kernels, pruned but never banded as in production, with mates up to
-      # 1024 bp: at the default scoring, and with the hit gate opened (x86's
+      # 1024 bp: at the default scoring (every seventh job also checked against
+      # the scalar DP, RB_SCALAR_STRIDE: score, te, qe, and score2_ub as a bound
+      # on every out-of-zone row), and with the hit gate opened (x86's
       # default gate of 400 sends most mates over 250 bp to the full window) at a
       # random scoring per batch and at random --meth matrices. Runs 20-21
       # (RB_METH_REL=expand) filter the genomic and neutral --meth batches under
@@ -1639,7 +1641,7 @@ jobs:
           # records its exit code and prints a line as it finishes, and the
           # report below fails the step for any non-zero or missing one.
           cat > rb_runs.txt <<'EOF'
-          RB_16BIT=1 ./rescue_band_harness eq 30000 17
+          RB_16BIT=1 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 30000 17
           BWA3_RESCUE_BAND_COST=100000000 RB_SCALAR_STRIDE=7 ./rescue_band_harness eq 100000 1
           RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_METH=random RB_METH_REL=expand ./rescue_band_harness eq 10000 21
           RB_16BIT=1 BWA3_RESCUE_PRUNE_MAX_HITS=100000 RB_SCORING=random ./rescue_band_harness eq 10000 18

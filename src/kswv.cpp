@@ -2674,7 +2674,8 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
         /* Block I: write prior-row's pimax to rowMax. No intermediate       \
          * masking -- frozen lanes' imax after the freeze row is still        \
          * produced by the DP but the score2 scan filters by per-lane        \
-         * primary region / minsc / qe, which matches scalar. */             \
+         * primary region / minsc / qe, which matches scalar. A plain store  \
+         * (kswv_rowmax_view::plain in the score2 scan below). */            \
         if (__row > 0)                                                          \
             vst1q_s16(rowMax + (__row - 1) * SIMD_WIDTH16, pimax_vec);          \
         pimax_vec = __imax;                                                     \
@@ -3210,7 +3211,7 @@ int kswv::kswv_neon_16_impl(int16_t seq1SoA[],
         int te2     = -1;
         int b_score = -1;
         int b_pos   = -2;
-        kswv_score2_ub ub(low_l, high_l, minsc_l, false); // a plain row max: nothing zeroed
+        kswv_score2_ub ub(low_l, high_l, minsc_l, kswv_rowmax_view::plain); // Block I: a plain store
 
         int nrows = processed_rows < len1_l ? processed_rows : len1_l;
         for (int i2 = 0; i2 < nrows; i2++) {
@@ -4288,8 +4289,9 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
         /* Close the final (possibly partial) block. */
         _mm256_store_si256((__m256i*)(blockMax + ((ncol - 1) / QE_BLK) * SIMD_WIDTH16), imax_vec);
 
-        /* Block I: write prior row's pimax to rowMax (plain store; the
-         * score2 scan filters per lane, matching the NEON 16-bit kernel). */
+        /* Block I: write prior row's pimax to rowMax (plain store, read as
+         * kswv_rowmax_view::plain; the score2 scan filters per lane, matching
+         * the NEON 16-bit kernel). */
         if (i > 0) {
             _mm256_storeu_si256((__m256i*)(rowMax + (i - 1) * SIMD_WIDTH16), pimax_vec);
         }
@@ -4405,7 +4407,7 @@ int kswv::kswv256_16_impl(int16_t seq1SoA[],
         int te2     = -1;
         int b_score = -1;
         int b_pos   = -2;
-        kswv_score2_ub ub(low_l, high_l, minsc_l, false); // a plain row max: nothing zeroed
+        kswv_score2_ub ub(low_l, high_l, minsc_l, kswv_rowmax_view::plain); // Block I: a plain store
 
         int nrows = processed_rows < len1_l ? processed_rows : len1_l;
         for (int i2 = 0; i2 < nrows; i2++) {
@@ -5842,7 +5844,8 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
         }
 #undef KSWV_AVX512_16_CELL_FS
         
-        // Block I
+        // Block I: the lagged-zeroed store (a row the next exceeds, and the row after a kept
+        // one, are written as -1), read as kswv_rowmax_view::lagged_zeroed in the score2 scan.
         if (i > 0) {
             __mmask32 msk32 = _mm512_cmpgt_epi16_mask(imax512, pimax512);
             msk32 |= mask512;
@@ -6008,7 +6011,10 @@ int kswv::kswv512_16_impl(int16_t seq1SoA[],
          * on the first qualifying row. */
         int b_score = -1;
         int b_pos   = -2;
-        kswv_score2_ub ub(low_l, high_l, minsc_l, false); // a plain row max: nothing zeroed
+        /* Block I above drops rows from rowMax as the u8 kernels do (stored as -1, below any
+         * minsc, which is xtra & 0xffff), unlike the plain store of the AVX2 and NEON 16-bit
+         * kernels, so the bound must cover the rows it hides. */
+        kswv_score2_ub ub(low_l, high_l, minsc_l, kswv_rowmax_view::lagged_zeroed);
 
         int nrows = processed_rows < len1_l ? processed_rows : len1_l;
         for (int i2 = 0; i2 < nrows; i2++) {
