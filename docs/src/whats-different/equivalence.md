@@ -101,22 +101,20 @@ computed from stock's selection on costs with the mirror cell free (as `collapse
 top-2 ceiling on mirror-free differences included). Where the cuts first apply, the search
 decides whether they can have pruned a row that selection needs (the mirror-free best can have
 more differences than the genomic best when the genomic best is gapped, or a `-R` stop can come
-before the mirror-free strata are complete), and whether a mirror-free run's own `-R` stop comes
-where the search goes on and the search then resolves a row those strata could keep; if so, the
-cap is 0, for both ends of a pair. The
+before the mirror-free strata are complete); if so, the cap is 0, for both ends of a pair. Where a
+mirror-free run's own `-R` stop comes before the search's, the selection is taken from the rows
+resolved at that stop, which are the mirror-free run's. The
 paired-end mirror-free pairing uses only the loci of that selection, and runs even where an end's
 stock loci exceed `--max-occ` (so stock pairing does not) but its loci in that selection do not. Measured on a chr22 EM-seq
 simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
 macOS arm64, NEON, clang 21): every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring`
 at the default penalties and with `-M 5 -O 3 -E 1`, `-M 1 -O 3 -E 1`, `-M 2 -O 5 -E 2`, `-e 3`,
 `-e 3 -E 1`, `-R 1`, `-R 2`, `-n 8`, `-l 32 -k 0`, `-m 300`, `-N` and `-M 0`, and no conversion-blind MAPQ
-was above `scoring`'s. At the default penalties 77 of 40,000 reads at 40 bp single end, 145 of
-40,000 pairs at 40 bp and 2 of 40,000 pairs at 150 bp had their cap set to 0 for strata the cuts may
-have left incomplete (none of the 150 bp single-end reads); at `-M 5 -O 3 -E 1`, 78, 149 and 3. Almost
-all are reads whose mirror-free best has more than `-R` loci, so a mirror-free run stops where the
-search goes on: their single-end caps were 0 already (no 40 bp single-end MAPQ changed), but in pairs
-the mirror-free pairing had given them a cap, and 225 of 80,000 records at 40 bp dropped to 0 (both
-ends of 108 pairs, one end of 9 whose other end was 0 already). These are observations from those runs,
+was above `scoring`'s. At the default penalties 2 of 40,000 reads at 40 bp single end and 6 of 40,000
+pairs at 40 bp had their cap set to 0 for strata the search may have left incomplete (none at 150 bp);
+at `-M 5 -O 3 -E 1`, 7 and 16, and 2 of 40,000 pairs at 150 bp. Reads whose mirror-free best has more
+than `-R` loci, where a mirror-free run stops but the search goes on, are no longer among them: their
+caps come from the rows resolved at that stop. These are observations from those runs,
 not a bound for all inputs.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">

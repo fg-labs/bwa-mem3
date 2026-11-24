@@ -618,9 +618,9 @@ gapped). A mirror-free run also has its own `-R` stop: since `B_mf` is at most `
 stratum is complete at that point or earlier, and up to there it is the same search. If more than
 `-R` of its loci at `B_mf` are within its ceiling there, it stops; unless the search stops at the
 same point or `next` is already past `B_mf + M`, the search goes on to rows that run never reaches,
-and the strata are not complete if it then resolves one they could keep (at most `B_mf + M`
-mirror-free, within `min(-n, D_mf + 1)` differences). When they are not complete the cap is 0, for
-both ends of a pair.
+so the rows resolved at that point are kept as they are and the strata are taken from them (a hit
+at a locus that run never reaches is not one of their loci); if the search is then left incomplete
+they are not complete. When they are not complete the cap is 0, for both ends of a pair.
 These cuts apply unless `-N` is given, a penalty is negative or `--known-snvs` is
 set. Under `--known-snvs` (whose ALT haplotypes can cost less than the converted path) the
 search instead stops early only on the earlier certified bound: for current best cost `B`,
