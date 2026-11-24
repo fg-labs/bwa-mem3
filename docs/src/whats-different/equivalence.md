@@ -25,7 +25,8 @@ keeps), not at the row the `genomic` search keeps there, so where a locus has se
 the cap can differ from that of earlier versions ([PR #821](https://github.com/fg-labs/bwa-mem3/pull/821)).
 In paired-end runs the cap reruns the pairing `collapsed` makes, from the main hits `collapsed`
 draws for its ends, at its single-end MAPQs and with the insert size it infers, so paired-end
-MAPQs can differ from those of earlier versions; placement and every other field are unchanged
+MAPQs and the presence of `YQ:i` can differ from those of earlier versions. Under `--known-snvs`,
+the `XV:Z` twin MAPQ can also differ; placement and the remaining fields are unchanged
 ([PR #822](https://github.com/fg-labs/bwa-mem3/pull/822)). It also reruns `collapsed`'s mate
 rescue of a pair `collapsed` leaves improper, which lowers the anchor's MAPQ as well, so such
 pairs' MAPQs can be lower than in earlier versions
@@ -33,8 +34,9 @@ pairs' MAPQs can be lower than in earlier versions
 are unknown (the mirror table outgrew its budget), both ends of the pair are capped at 0, also when
 the other end is unmapped, where earlier versions kept the mapped end's single-end cap; this only
 lowers MAPQ ([PR #823](https://github.com/fg-labs/bwa-mem3/pull/823)). A pair with an incomplete
-end (one whose lookup budget ran out, which has MAPQ 0) is not rerun, so there each end keeps its
-single-end cap: 0 where its own strata are unknown, its single-end conversion-blind MAPQ otherwise.
+end (one whose lookup budget ran out, which has MAPQ 0) is not rerun. When neither end's mirror-free
+strata are unknown, each end keeps its single-end conversion-blind cap; otherwise both ends are
+capped at 0 as above.
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,
@@ -96,7 +98,8 @@ percentage points, and peak RSS rose by 0.7 to 1.1 GB because a repeat end keeps
 for pairing. Output without `--meth` is byte-identical: the cuts run only in the `--meth` search.
 Under `--meth-mapq conversion-blind` (the EM-seq `genomic` default since [#816](https://github.com/fg-labs/bwa-mem3/pull/816)) the search, its
 cuts and its limits are those of `--meth-mapq scoring`; the MAPQ cap only observes it, so every
-field but `MAPQ` and `YQ:i` is the same as with `--meth-mapq scoring` by construction. The cap is
+field but `MAPQ` and `YQ:i` is the same as with `--meth-mapq scoring` by construction, except that
+under `--known-snvs` the `XV:Z` twin MAPQ can also differ. The cap is
 computed from stock's selection on costs with the mirror cell free (as `collapsed` scoring makes it,
 top-2 ceiling on mirror-free differences included). Where the cuts first apply, the search
 decides whether they can have pruned a row that selection needs (the mirror-free best can have
@@ -114,8 +117,25 @@ was above `scoring`'s. At the default penalties 2 of 40,000 reads at 40 bp singl
 pairs at 40 bp had their cap set to 0 for strata the search may have left incomplete (none at 150 bp);
 at `-M 5 -O 3 -E 1`, 7 and 16, and 2 of 40,000 pairs at 150 bp. Reads whose mirror-free best has more
 than `-R` loci, where a mirror-free run stops but the search goes on, are no longer among them: their
-caps come from the rows resolved at that stop. These are observations from those runs,
-not a bound for all inputs.
+caps come from the rows resolved at that stop. Against `--meth-scoring collapsed` itself, no
+conversion-blind MAPQ was above `collapsed`'s at the same placement in any of those runs, single
+or paired end, but one 40 bp paired record at `-m 300`: there `collapsed`'s own search spends its
+`-m` work budget on other reads than the `genomic` search does (8,412 incomplete reads against
+8,550), so its insert-size estimate differs slightly from the one the cap infers from the
+`genomic` search, and that difference moves a suboptimal pair across stock pairing's `10 × M`
+threshold (at the default `-m` the two estimates are the same). At the default penalties the
+conversion-blind MAPQ equals `collapsed`'s for 39,987 of 40,000 and 79,861 of 80,000 records at
+40 bp (single, paired end) and 40,000 of 40,000 and 79,999 of 80,000 at 150 bp; the rest are
+records where `collapsed`'s MAPQ is above the `genomic` one (the cap never raises a MAPQ) or where
+`collapsed` places the end elsewhere. These are observations from those runs, not a bound for
+all inputs.
+
+Under `--ref-span-insert`, an end whose mirror-free selection is unknown supplies neither an insert
+observation nor a reference span for the collapsed estimate's lower floor. Its known mate's span
+still contributes when the pair is otherwise eligible; a pair `--known-snvs` excludes from the
+collapsed estimate (an ALT-credited pair) contributes neither end. Correcting this floor can change the collapsed estimate or its previous-batch
+fallback, and thus other pairs' conversion-blind MAPQs and known-SNV twin MAPQs. The genomic
+estimate and the ordinary read-length floor are unchanged.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>

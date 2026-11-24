@@ -299,8 +299,10 @@ void aln_meth_pe_stage1(const gap_opt_t *opt, int n, bwa_seq_t *seqs[2], aln_met
 /* --meth-mapq conversion-blind, after stage 1: the insert size a collapsed run would infer, from
  * each end at collapsed's single-end selection (aln_meth_read_t::blind_main) with collapsed's
  * single-end MAPQ, with last_ii the previous batch's such estimate (as bwa_pe_isize_ref). An end
- * whose mirror-free strata are unknown (blind_partial) counts as MAPQ 0; one with none keeps its
- * genomic selection. The ends are left as they were; nothing is reported. */
+ * whose mirror-free strata are unknown (blind_partial or blind_incomplete) counts as MAPQ 0 and
+ * does not contribute a reference-span floor under --ref-span-insert; its known mate still does,
+ * unless excluded (--known-snvs) drops the whole pair, which then contributes neither end.
+ * An end with no strata keeps its genomic selection. The ends are restored; nothing is reported. */
 void aln_meth_blind_isize(const aln_meth_ref_t *ref, const gap_opt_t *gopt, const pe_opt_t *popt, int n,
                           bwa_seq_t *seqs[2], aln_meth_read_t *const res[2], const uint8_t *excluded,
                           const isize_info_t *last_ii, isize_info_t *ii);

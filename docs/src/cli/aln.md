@@ -600,8 +600,8 @@ rows at `B`, plus one (stock's top-2 rule, at most `-n`); the retained loci obey
 ceiling. More than `-R` best loci within that ceiling then end the search, as stock's top2b stop does: `X0` is then the full best count and `X1` is
 not printed ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). Under `--meth-mapq conversion-blind` (the EM-seq
 `genomic` default) the search, its cuts and its limits (`-m`, the lookup budget, the CIGAR budget)
-are those of `--meth-mapq scoring`, so every field but `MAPQ` and `YQ:i` is the same; the cap only
-observes the search. The mirror-free strata (stock's selection on costs with the mirror cell free,
+are those of `--meth-mapq scoring`, so every field but `MAPQ` and `YQ:i` is the same, except that
+under `--known-snvs` the `XV:Z` twin MAPQ can also differ. The cap only observes the search. The mirror-free strata (stock's selection on costs with the mirror cell free,
 as `collapsed` scoring computes it, top-2 ceiling on mirror-free differences included) come from
 the rows the search resolved, each locus at its lowest mirror-free row (if that row is over the
 mirror-free ceiling and above the mirror-free best, its lowest one within the ceiling, the row a
