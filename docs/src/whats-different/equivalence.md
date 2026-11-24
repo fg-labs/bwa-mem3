@@ -357,7 +357,16 @@ against hg38: 400 k single-end reads of 20–50 bp and 200 k pairs (2×99 bp, an
 (Linux, arm64, NEON tier); without `--meth`, the
 same 100 k pairs and 100 k single-end reads were also byte-identical (`@PG` excluded). The
 `FG-METH-DIVERGENCE` row in the catalog below is generated from the divergence registry and does
-not yet carry this change.
+not yet carry this change. The cap re-aligns the rescue window of every rescued mate whose shadow MAPQ it
+uses and that has a C (or G) the mirror cell can free, with no skip
+([#824](https://github.com/fg-labs/bwa-mem3/pull/824)): a skip bounded by the rescue kernels'
+second-best score could miss a column that score's adjacent-column merge drops, which on
+AVX-512BW hosts the 16-bit rescue kernel's bound still did, so a rescued mate's MAPQ could be
+left too high there and differ between SIMD tiers. Removing it can only lower the MAPQ of such a
+mate, now on every tier; with the default rescue, the 200 k NA12878 pairs above (2×99 bp, read 1
+at 25 bp, both ends at 30 bp) and four simulated 2×150 bp sets were byte-identical with and
+without the skip on an AWS Graviton4 (Linux, arm64, NEON tier), and under `--rescue-kmer` the
+MAPQ of a rescued mate can change.
 
 `--meth-context` ([#663](https://github.com/fg-labs/bwa-mem3/pull/663)) is opt-in and changes
 nothing by default: with `all`, or without the option, alignment records are byte-identical to

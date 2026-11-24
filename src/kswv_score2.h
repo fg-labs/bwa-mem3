@@ -24,38 +24,6 @@
 #include <stdint.h>
 #include <string.h>
 
-/* kswr_t::score2_ub from a row-max view, fed its rows >= minsc in ascending order (value()): the
- * best of those outside the zone [low, high], plus bounds for the two out-of-zone rows a zeroed view
- * (the u8 kernels' lagged rowMax store) can hide behind a row inside the zone.
- *  - Row low - 1, zeroed because it runs up into the zone: the run rises by at least 1 per row up
- *    to the first kept row p >= low, so row low - 1 is at most R[p] - (p - low + 1).
- *  - Row high + 1, after a kept row at high: the AVX-512BW store also zeroes the row after a kept
- *    one (the b[] merge drops it, as it is no higher), so row high + 1 is at most R[high]. Used
- *    whenever row high is kept and row high + 1 is not seen, whatever the view.
- * Any other out-of-zone row the view hides is no higher than a kept row outside the zone (the end
- * of its rising run, or the kept row before it). */
-struct kswv_score2_ub {
-    int low, high, minsc, ub = -1, v_high = -1;
-    bool zeroed, seen_in = false, seen_after_high = false;
-    kswv_score2_ub(int lo, int hi, int ms, bool z) : low(lo), high(hi), minsc(ms), zeroed(z) {}
-    inline int value() const
-    {
-        return zeroed && !seen_after_high && v_high > ub ? v_high : ub;
-    }
-    inline void row(int i, int v)
-    {
-        if (i == high) v_high = v;
-        else if (i == high + 1) seen_after_high = true;
-        if (i < low || i > high) {
-            if (v > ub) ub = v;
-        } else if (zeroed && !seen_in) {
-            seen_in = true;
-            const int b = v - (i - low + 1);
-            if (low > 0 && b >= minsc && b > ub) ub = b;
-        }
-    }
-};
-
 /* Bitmap bytes per lane (one per block of 8 rows) for nrows rows. */
 static inline int kswv_score2_bits_blocks(int nrows) { return (nrows + 7) >> 3; }
 
@@ -94,15 +62,13 @@ static inline void kswv_score2_row_bits_all(int nrows, uint8_t *bits)
  * set in bits. bits must cover at least nrows rows and include every row of the
  * lane with rowMax >= minsc (kswv_score2_row_bits_u8 at the same minsc, or any
  * superset: extra rows are re-tested and skipped). Writes -1/-1 when no entry
- * outside [low, high] qualifies; score2_ub_out gets kswr_t::score2_ub (kswv_score2_ub). */
+ * outside [low, high] qualifies. */
 template <int W>
 static inline void kswv_score2_scan_bits_u8(const uint8_t *rowMax, const uint8_t *bits,
                                             int nrows, int lane, int minsc, int low,
-                                            int high, int *score2_out, int *te2_out,
-                                            int *score2_ub_out)
+                                            int high, int *score2_out, int *te2_out)
 {
     int score2 = -1, te2 = -1;
-    kswv_score2_ub ub(low, high, minsc, true); // rowMax is the lagged-zeroed store
     /* b_pos = -2 sentinel: (-2 + 1) != any real row, forces an "append" on the
      * first qualifying row. */
     int b_score = -1, b_pos = -2;
@@ -115,7 +81,6 @@ static inline void kswv_score2_scan_bits_u8(const uint8_t *rowMax, const uint8_t
             if (i2 >= nrows) break;
             const int imax = (int)rowMax[(size_t)i2 * W + lane];
             if (imax < minsc) continue;
-            ub.row(i2, imax);
 
             if (b_pos + 1 != i2) {
                 /* APPEND: flush the outgoing b[] entry to score2 first. */
@@ -139,9 +104,8 @@ static inline void kswv_score2_scan_bits_u8(const uint8_t *rowMax, const uint8_t
         score2 = b_score;
         te2    = b_pos;
     }
-    *score2_out    = score2;
-    *te2_out       = te2;
-    *score2_ub_out = ub.value();
+    *score2_out = score2;
+    *te2_out    = te2;
 }
 
 #endif

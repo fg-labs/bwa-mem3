@@ -109,15 +109,13 @@ void check_width(uint64_t seed, int trials)
             const int te = rnd(processed + 1);
             const int val = rnd(12);
             const int low = te - val, high = te + val;
-            int s_dense, t_dense, s_bits, t_bits, s_all, t_all, u_bits, u_all;
+            int s_dense, t_dense, s_bits, t_bits, s_all, t_all;
             dense_scan<W>(rowMax.data(), nrows, l, minsc[l], low, high, &s_dense, &t_dense);
             kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), nrows, l, minsc[l], low,
-                                        high, &s_bits, &t_bits, &u_bits);
+                                        high, &s_bits, &t_bits);
             kswv_score2_scan_bits_u8<W>(rowMax.data(), all_bits.data(), nrows, l, minsc[l], low,
-                                        high, &s_all, &t_all, &u_all);
-            // score2_ub too: the bitmap visits the same qualifying rows as the dense walk
-            if ((s_bits != s_dense || t_bits != t_dense || s_all != s_dense || t_all != t_dense
-                 || u_bits != u_all || u_bits < s_dense)
+                                        high, &s_all, &t_all);
+            if ((s_bits != s_dense || t_bits != t_dense || s_all != s_dense || t_all != t_dense)
                 && bad++ == 0) {
                 bad_l = l; bad_r = nrows;
             }
@@ -163,70 +161,18 @@ TEST_CASE("kswv score2 bitmap scan: hand-built runs"
     CHECK(bits[1 * W + lane] == 0x01);  // row 8
     CHECK(bits[2 * W + lane] == 0x03);  // rows 16,17
 
-    int s2, t2, ub;
-    kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), nrows, lane, 10, 6, 9, &s2, &t2, &ub);
+    int s2, t2;
+    kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), nrows, lane, 10, 6, 9, &s2, &t2);
     CHECK(s2 == 18);
     CHECK(t2 == 17);
 
     // A lane whose len1 stops before run C keeps run A.
-    kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), 16, lane, 10, 6, 9, &s2, &t2, &ub);
+    kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), 16, lane, 10, 6, 9, &s2, &t2);
     CHECK(s2 == 15);
     CHECK(t2 == 3);
 
     // No rows: nothing qualifies.
-    kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), 0, lane, 10, 6, 9, &s2, &t2, &ub);
+    kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), 0, lane, 10, 6, 9, &s2, &t2);
     CHECK(s2 == -1);
     CHECK(t2 == -1);
-}
-
-namespace {
-
-// The row-max views the u8 kernels store, from a lane's plain row maxima R: NEON / AVX2 (and the
-// banded rescue) zero a row the next row exceeds; AVX-512BW also zeroes the row after a kept one
-// (msk64 |= mask512; mask512 = ~msk64), so only the b[] anchors survive. Rows below minsc are 0.
-std::vector<uint8_t> view_of(const std::vector<int> &R, int minsc, bool avx512)
-{
-    const int n = (int)R.size();
-    std::vector<uint8_t> v(n, 0);
-    bool mask = false;
-    for (int r = 0; r < n; r++) {
-        const bool zero = (r + 1 < n && R[r + 1] > R[r]) || (avx512 && mask);
-        mask = !zero;
-        v[r] = (uint8_t)(zero || R[r] < minsc ? 0 : R[r]);
-    }
-    return v;
-}
-
-} // namespace
-
-TEST_CASE("kswv_score2_ub bounds every out-of-zone row max in the NEON/AVX2 and AVX-512BW views")
-{
-    std::mt19937_64 rng(817);
-    auto rnd = [&](int m) { return (int)(rng() % (uint64_t)m); };
-    constexpr int W = 16;
-    long bad[2] = { 0, 0 }, merged_hidden = 0;
-    for (int t = 0; t < 200000; t++) {
-        const int n = 1 + rnd(60), minsc = 10 + rnd(10);
-        std::vector<int> R(n);
-        for (int &x : R) x = rnd(3) ? rnd(minsc + 25) : 0; // runs, ties and plateaus around minsc
-        const int te = rnd(n), z = rnd(12), low = te - z, high = te + z;
-        int om = -1; // the true out-of-zone maximum, unmerged
-        for (int i = 0; i < n; i++)
-            if ((i < low || i > high) && R[i] >= minsc && R[i] > om) om = R[i];
-        for (int a = 0; a < 2; a++) {
-            const std::vector<uint8_t> v = view_of(R, minsc, a == 1);
-            std::vector<uint8_t> rowMax((size_t)n * W, 0), bits((size_t)kswv_score2_bits_blocks(n) * W);
-            uint8_t ms[W];
-            for (int l = 0; l < W; l++) ms[l] = (uint8_t)minsc;
-            for (int i = 0; i < n; i++) rowMax[(size_t)i * W + 3] = v[i];
-            kswv_score2_row_bits_u8<W>(rowMax.data(), n, ms, bits.data());
-            int s2, t2, ub;
-            kswv_score2_scan_bits_u8<W>(rowMax.data(), bits.data(), n, 3, minsc, low, high, &s2, &t2, &ub);
-            if (ub < om) bad[a]++;
-            if (a == 1 && high + 1 < n && R[high + 1] == om && v[high + 1] == 0 && v[high] != 0) merged_hidden++;
-        }
-    }
-    CHECK_MESSAGE(bad[0] == 0, "NEON/AVX2 view: score2_ub below the out-of-zone max in " << bad[0] << " lanes");
-    CHECK_MESSAGE(bad[1] == 0, "AVX-512BW view: score2_ub below the out-of-zone max in " << bad[1] << " lanes");
-    CHECK(merged_hidden > 0); // the AVX-512BW view must hide the maximum after an in-zone anchor sometimes
 }
