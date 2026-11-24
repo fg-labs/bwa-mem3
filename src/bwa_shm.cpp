@@ -44,7 +44,7 @@
 #include <fcntl.h>         /* O_* */
 #include <unistd.h>        /* close, ftruncate */
 #include <getopt.h>        /* getopt_long for `bwa-mem3 shm --meth ...` */
-#include <semaphore.h>     /* sem_open, sem_wait, sem_post, sem_close, sem_unlink */
+#include <semaphore.h>     /* sem_open, sem_trywait, sem_post, sem_close, sem_unlink */
 #include <errno.h>
 #include <limits.h>        /* PATH_MAX */
 #include <signal.h>        /* kill(pid, 0) liveness probe */
@@ -132,6 +132,19 @@ static void ctl_header_store(void *m, ctl_header h)
 #define BWA_SHM_DESTROY_LOCK_WAIT_MS 5000
 #endif
 
+/* How long a process waiting for the stager lock sleeps between tries. */
+#define BWA_SHM_LOCK_RETRY_MS 10
+
+/* Test hooks, no-ops by default: the first runs in `shm -d` once it holds the
+ * stager lock, before it walks the registry; the second runs each time a try
+ * for the stager lock finds it taken. */
+#ifndef BWA_SHM_DESTROY_LOCKED_HOOK
+#define BWA_SHM_DESTROY_LOCKED_HOOK() ((void)0)
+#endif
+#ifndef BWA_SHM_LOCK_BUSY_HOOK
+#define BWA_SHM_LOCK_BUSY_HOOK() ((void)0)
+#endif
+
 /* How long a stage waits for another live stager of the same index. */
 #ifndef BWA_SHM_STAGE_WAIT_S
 #define BWA_SHM_STAGE_WAIT_S 3600
@@ -172,33 +185,62 @@ static void path_concat2(char out[PATH_MAX], const char *a, const char *b)
         err_fatal(__func__, "path too long: '%s%s'", a, b);
 }
 
-/* Acquire the cross-process lock that serializes read-modify-write
- * sequences on /bwactl. POSIX named semaphores work on both Linux and
- * macOS (unlike flock(2) on POSIX shm fds, which macOS rejects with
- * EOPNOTSUPP). Returns the open semaphore on success — held by us until
- * ctl_lock_release — or NULL on failure. */
+/* The cross-process lock that serializes read-modify-write sequences on
+ * /bwactl. POSIX named semaphores work on both Linux and macOS (unlike
+ * flock(2) on POSIX shm fds, which macOS rejects with EOPNOTSUPP).
+ *
+ * The lock is taken by name on every try, not by waiting on one handle:
+ * `shm -d` unlinks the semaphore and leaves the unlinked one taken, so a
+ * waiter that kept its handle would wait forever while a new stager creates
+ * and takes a fresh one under the same name. Reopening on each try moves a
+ * waiter to whatever semaphore the name refers to now, so only one is ever
+ * taken. */
+enum ctl_lock_result { CTL_LOCK_HELD, CTL_LOCK_GONE, CTL_LOCK_TIMEOUT, CTL_LOCK_ERROR };
+
+/* Take the lock, trying every BWA_SHM_LOCK_RETRY_MS. With create, a missing
+ * lock is created; without it, a missing lock is CTL_LOCK_GONE (errno ENOENT).
+ * wait_ms < 0 waits for as long as it takes; otherwise CTL_LOCK_TIMEOUT once
+ * wait_ms have passed. On CTL_LOCK_HELD *out is the held semaphore (release
+ * it with ctl_lock_release); otherwise *out is NULL, and CTL_LOCK_ERROR has
+ * printed the failing call and left its errno. */
+static ctl_lock_result ctl_lock_take(sem_t **out, bool create, int wait_ms)
+{
+    *out = NULL;
+    for (int waited_ms = 0;; waited_ms += BWA_SHM_LOCK_RETRY_MS) {
+        sem_t *s = create ? sem_open(BWA_SHM_LOCK_NAME, O_CREAT, 0644, 1)
+                          : sem_open(BWA_SHM_LOCK_NAME, 0);
+        if (s == SEM_FAILED && !create && errno == ENOENT) return CTL_LOCK_GONE;
+        if (s == SEM_FAILED) {
+            const int err = errno;
+            std::fprintf(stderr, "[E::%s] sem_open(%s) failed: %s\n",
+                         __func__, BWA_SHM_LOCK_NAME, std::strerror(err));
+            errno = err;
+            return CTL_LOCK_ERROR;
+        }
+        int rc;
+        while ((rc = sem_trywait(s)) < 0 && errno == EINTR) {}
+        if (rc == 0) { *out = s; return CTL_LOCK_HELD; }
+        const int err = errno;
+        sem_close(s);
+        if (err != EAGAIN) {
+            std::fprintf(stderr, "[E::%s] sem_trywait(%s) failed: %s\n",
+                         __func__, BWA_SHM_LOCK_NAME, std::strerror(err));
+            errno = err;
+            return CTL_LOCK_ERROR;
+        }
+        BWA_SHM_LOCK_BUSY_HOOK();
+        if (wait_ms >= 0 && waited_ms >= wait_ms) return CTL_LOCK_TIMEOUT;
+        usleep(BWA_SHM_LOCK_RETRY_MS * 1000);
+    }
+}
+
+/* Take the lock for a stager, waiting for as long as it takes. Returns the
+ * held semaphore, or NULL: errno ENOENT when, without create, the lock is
+ * gone (`shm -d` removed it), otherwise the failing call's. */
 static sem_t *ctl_lock_acquire(bool create = true)
 {
-    sem_t *s = create ? sem_open(BWA_SHM_LOCK_NAME, O_CREAT, 0644, 1)
-                      : sem_open(BWA_SHM_LOCK_NAME, 0);
-    if (s == SEM_FAILED && !create && errno == ENOENT) return NULL;   /* removed */
-    if (s == SEM_FAILED) {
-        const int err = errno;
-        std::fprintf(stderr, "[E::%s] sem_open(%s) failed: %s\n",
-                     __func__, BWA_SHM_LOCK_NAME, std::strerror(err));
-        errno = err;
-        return NULL;
-    }
-    while (sem_wait(s) < 0) {
-        const int err = errno;
-        if (err == EINTR) continue;
-        std::fprintf(stderr, "[E::%s] sem_wait(%s) failed: %s\n",
-                     __func__, BWA_SHM_LOCK_NAME, std::strerror(err));
-        sem_close(s);
-        errno = err;
-        return NULL;
-    }
-    return s;
+    sem_t *s = NULL;
+    return ctl_lock_take(&s, create, -1) == CTL_LOCK_HELD ? s : NULL;
 }
 
 static void ctl_lock_release(sem_t *s)
@@ -1261,27 +1303,24 @@ static int destroy_cb(int64_t /*l_mem*/, const char *name, void *ctx)
 int bwa_shm_destroy(void)
 {
     /* Hold the lock across the walk, so no stager compacts the registry under
-     * it and shifts a name's suffix into place as an entry. Registry updates
-     * take milliseconds; a lock held past the wait was left by a stager killed
-     * inside one (no SEM_UNDO), so proceed without it, and unlinking it below
-     * is the recovery. */
-    /* With no lock at all, no stager can be inside a registry update: create
-     * it and take it, so the walk below counts as locked. */
-    sem_t *lock = sem_open(BWA_SHM_LOCK_NAME, 0);
-    if (lock == SEM_FAILED && errno == ENOENT)
-        lock = sem_open(BWA_SHM_LOCK_NAME, O_CREAT, 0644, 1);
-    bool held = false;
-    for (int waited_ms = 0; lock != SEM_FAILED; waited_ms += 10) {
-        if (sem_trywait(lock) == 0) { held = true; break; }
-        if (errno != EAGAIN && errno != EINTR) break;
-        if (waited_ms >= BWA_SHM_DESTROY_LOCK_WAIT_MS) {
-            std::fprintf(stderr, "[W::%s] stager lock %s still held after %d ms; "
-                         "removing everything without it\n", __func__, BWA_SHM_LOCK_NAME,
-                         (int)BWA_SHM_DESTROY_LOCK_WAIT_MS);
-            break;
-        }
-        usleep(10000);
-    }
+     * it and shifts a name's suffix into place as an entry. A missing lock is
+     * created and taken: with no lock, no stager can be inside a registry
+     * update. Registry updates take milliseconds; a lock held past the wait
+     * was left by a stager killed inside one (no SEM_UNDO), so proceed
+     * without it, and unlinking it below is the recovery. Each try reopens
+     * the lock by name (ctl_lock_take), so a lock that a concurrent `shm -d`
+     * unlinked and left taken is not waited on until the timeout. */
+    sem_t *lock = NULL;
+    const ctl_lock_result got = ctl_lock_take(&lock, /*create=*/true,
+                                              BWA_SHM_DESTROY_LOCK_WAIT_MS);
+    const bool held = got == CTL_LOCK_HELD;
+    if (got == CTL_LOCK_TIMEOUT)
+        std::fprintf(stderr, "[W::%s] stager lock %s still held after %d ms; "
+                     "removing everything without it\n", __func__, BWA_SHM_LOCK_NAME,
+                     (int)BWA_SHM_DESTROY_LOCK_WAIT_MS);
+    else if (!held)
+        std::fprintf(stderr, "[W::%s] could not take the stager lock %s (see above); "
+                     "removing everything without it\n", __func__, BWA_SHM_LOCK_NAME);
     /* A segment that could not be removed keeps the registry and its own
      * entry, which still leads the next `shm -d` to it; the entries of the
      * segments that were removed go, but only under the lock: without it a
@@ -1290,13 +1329,16 @@ int bwa_shm_destroy(void)
      * taken is unlinked (the recovery above), unless a 1 GB stager that may
      * still hold it was kept: a new lock would let the next `shm -d` take it
      * and remove that stager's stub. */
+    if (held) BWA_SHM_DESTROY_LOCKED_HOOK();
     destroy_result r;
     r.locked = held;
     const int rc = ctl_walk(destroy_cb, &r);
     const int kept = r.kept;
+    bool unlinked = false;
     if (rc >= 0 && kept == 0) {
         shm_unlink(BWA_SHM_CTL_NAME);
-        sem_unlink(BWA_SHM_LOCK_NAME);
+        /* ENOENT: the name is already gone, so this handle is orphaned too. */
+        unlinked = sem_unlink(BWA_SHM_LOCK_NAME) == 0 || errno == ENOENT;
     } else if (rc >= 0) {
         int fd = -1;
         void *ctl = held ? ctl_open_rw(&fd, /*create=*/false) : NULL;
@@ -1307,7 +1349,7 @@ int bwa_shm_destroy(void)
         if (!held && r.live_kept == 0) sem_unlink(BWA_SHM_LOCK_NAME);
         if (!held && r.live_kept != 0)
             std::fprintf(stderr, "[E::%s] left the stager lock %s in place, held by the stager "
-                         "named above: new stages block until it is released. If that "
+                         "named above: new stages wait until it is released. If that "
                          "stager is dead (for one in another PID namespace, check there), "
                          "remove the lock (rm /dev/shm/sem.%s on Linux) and run "
                          "bwa-mem3 shm -d again\n", __func__, BWA_SHM_LOCK_NAME,
@@ -1316,8 +1358,11 @@ int bwa_shm_destroy(void)
                      "and %s, so bwa-mem3 shm -d can be run again\n", __func__,
                      kept, kept == 1 ? "" : "s", kept == 1 ? "its entry" : "their entries");
     }
-    if (lock != SEM_FAILED) {
-        if (held) sem_post(lock);
+    /* An unlinked lock is left taken: a stager still waiting on it would
+     * otherwise take it while a new stager takes the semaphore now under
+     * that name. Stagers retry by name (ctl_lock_take), so they move on. */
+    if (held) {
+        if (!unlinked) sem_post(lock);
         sem_close(lock);
     }
     return rc < 0 ? rc : kept != 0 ? -1 : 0;
@@ -2208,7 +2253,7 @@ static void print_shm_usage(void)
         "       from disk; rerun `bwa-mem3 shm <idxbase>` to reclaim and restage.\n"
         "       Stagers hold a named POSIX semaphore only for a few ms of\n"
         "       registry update; if one is killed inside that window, later\n"
-        "       stages block, and `bwa-mem3 shm -d` unlinks the semaphore.\n\n"
+        "       stages wait, and `bwa-mem3 shm -d` unlinks the semaphore.\n\n"
         "macOS: POSIX shm has implementation-defined per-segment caps; large\n"
         "       indices may simply fail to stage. Prefer Linux for production.\n"
         "Linux: /dev/shm defaults to ~50%% of RAM on bare metal; in containers\n"

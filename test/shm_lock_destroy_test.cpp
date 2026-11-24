@@ -12,6 +12,7 @@
 #include "framework/temp_dir.h"
 
 #include <semaphore.h>
+#include <stdlib.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -31,6 +32,12 @@ static char private_control[32], private_lock[32], private_index[32];
 // How long destroy waits for a held stager lock; a check shortens it.
 static int g_destroy_wait_ms = 5000;
 #define BWA_SHM_DESTROY_LOCK_WAIT_MS g_destroy_wait_ms
+// Runs in destroy once it holds the lock; a check sets it to act there.
+static std::function<void()> g_destroy_locked_hook;
+#define BWA_SHM_DESTROY_LOCKED_HOOK() do { if (g_destroy_locked_hook) g_destroy_locked_hook(); } while (0)
+// Counts tries for the stager lock that found it taken, in any thread.
+static std::atomic<int> g_lock_busy{0};
+#define BWA_SHM_LOCK_BUSY_HOOK() (++g_lock_busy)
 #undef BWA_SHM_CTL_NAME
 #undef BWA_SHM_LOCK_NAME
 #undef BWA_SHM_IDX_PREFIX
@@ -52,6 +59,21 @@ static int g_destroy_wait_ms = 5000;
 } while (0)
 
 namespace {
+
+// Wait for `done`, polling; a regression that leaves a thread waiting forever
+// fails here within 2 s instead of hanging. The other threads still reference
+// this frame, so a timeout exits the process rather than unwinding.
+void wait_until(const std::function<bool()> &done, const char *what) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!done()) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            std::fprintf(stderr, "FAIL: timed out after 2 s waiting for %s\n", what);
+            std::fflush(stderr);
+            _exit(1);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 
 // Unlink only names for which this object successfully obtained O_EXCL ownership.
 // This also removes our private leftovers when a destroy assertion throws.
@@ -242,6 +264,120 @@ void check_destroy() {
         CHECK(!shm_exists(second.name()));
         CHECK(!shm_exists(registry.name()));
         CHECK(!semaphore_exists(lock.name()));
+        check_sentinels();
+    }
+    // One holder at a time across a destroy that removes the lock. While
+    // destroy holds it, a stager tries and is kept out; destroy then unlinks
+    // the lock and leaves the unlinked semaphore taken, so a handle opened
+    // before the unlink can never be taken. A stager that starts afterwards
+    // and the one that was waiting then take the new semaphore one at a time.
+    {
+        OwnedShm registry(private_control);
+        OwnedSemaphore lock(private_lock);
+        OwnedShm first(std::string(private_index) + "first");
+        write_registry(registry, {"first"});
+        std::atomic<int> inside{0}, most{0}, entered{0};
+        std::atomic<bool> waiter_done{false}, late_done{false};
+        std::atomic<bool> waiter_failed{false}, late_failed{false};
+        // The first holder stays inside until the other stager has been
+        // turned away at least once (or, with the bug, has come in too).
+        auto hold = [&] {
+            sem_t *s = ctl_lock_acquire(/*create=*/true);
+            CHECK(s != NULL);
+            const int busy_at_entry = g_lock_busy.load();
+            const int now = ++inside;
+            int m = most.load();
+            while (now > m && !most.compare_exchange_weak(m, now)) {}
+            if (++entered == 1)
+                wait_until([&] { return g_lock_busy.load() > busy_at_entry || inside.load() > 1; },
+                           "the other stager to try for the lock");
+            --inside;
+            ctl_lock_release(s);
+        };
+        std::thread waiter;
+        sem_t *stale = SEM_FAILED;
+        bool hook_ran = false, excluded = false;
+        g_destroy_locked_hook = [&] {
+            hook_ran = true;
+            stale = sem_open(private_lock, 0);   // the semaphore destroy holds
+            const int busy0 = g_lock_busy.load();
+            waiter = std::thread([&] {
+                try { hold(); } catch (...) { waiter_failed = true; }
+                waiter_done = true;
+            });
+            wait_until([&] { return g_lock_busy.load() > busy0; },
+                       "the waiting stager to try for the lock destroy holds");
+            excluded = entered.load() == 0;
+        };
+        const int rc = test_private_shm_destroy();
+        g_destroy_locked_hook = nullptr;
+        bool stale_taken = false;
+        if (stale != SEM_FAILED) {
+            stale_taken = sem_trywait(stale) == 0;
+            sem_close(stale);
+        }
+        std::thread late([&] {
+            try { hold(); } catch (...) { late_failed = true; }
+            late_done = true;
+        });
+        wait_until([&] { return waiter_done.load() && late_done.load(); },
+                   "both stagers to take and release the lock");
+        late.join();
+        if (waiter.joinable()) waiter.join();
+        CHECK(rc == 0);
+        CHECK(hook_ran);         // destroy held the lock
+        CHECK(stale != SEM_FAILED);
+        CHECK(excluded);         // the waiter tried and was kept out meanwhile
+        CHECK(!stale_taken);     // the unlinked semaphore was left taken
+        CHECK(!waiter_failed);
+        CHECK(!late_failed);
+        CHECK(entered == 2);     // the waiter was not left on the removed lock
+        CHECK(most == 1);
+        CHECK(!shm_exists(first.name()));
+        sem_unlink(private_lock);   // the stagers' lock; the fixture's name is already gone
+        check_sentinels();
+    }
+    // A second destroy that waits while the first holds the lock reopens it
+    // by name on each try, so once the first has unlinked the lock and left
+    // it taken, the second takes the new one at once instead of waiting out
+    // its timeout and proceeding without the lock.
+    {
+        OwnedShm registry(private_control);
+        OwnedSemaphore lock(private_lock);
+        OwnedShm first(std::string(private_index) + "first");
+        write_registry(registry, {"first"});
+        g_destroy_wait_ms = 1000;
+        std::atomic<bool> second_done{false};
+        std::atomic<int> second_rc{-2};
+        std::thread second;
+        bool hook_ran = false;
+        std::atomic<bool> armed{true};
+        std::chrono::steady_clock::time_point released;
+        g_destroy_locked_hook = [&] {
+            if (!armed.exchange(false)) return;   // only the first destroy
+            hook_ran = true;
+            const int busy0 = g_lock_busy.load();
+            second = std::thread([&] {
+                second_rc = test_private_shm_destroy();
+                second_done = true;
+            });
+            wait_until([&] { return g_lock_busy.load() > busy0; },
+                       "the second destroy to try for the lock");
+            released = std::chrono::steady_clock::now();
+        };
+        const int rc = test_private_shm_destroy();
+        wait_until([&] { return second_done.load(); }, "the second destroy to finish");
+        const auto waited = std::chrono::steady_clock::now() - released;
+        if (second.joinable()) second.join();
+        g_destroy_locked_hook = nullptr;
+        g_destroy_wait_ms = 5000;
+        CHECK(rc == 0);
+        CHECK(hook_ran);
+        CHECK(second_rc == 0);
+        CHECK(waited < std::chrono::milliseconds(500));   // not the 1000 ms timeout
+        CHECK(!shm_exists(first.name()));
+        CHECK(!shm_exists(registry.name()));
+        CHECK(!semaphore_exists(lock.name()));   // the second destroy removed its lock too
         check_sentinels();
     }
     // A lock that stays held (a stager killed inside its registry update) does

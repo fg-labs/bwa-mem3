@@ -44,7 +44,7 @@ Interrupted stage: `shm -l` marks it `incomplete` and `mem` loads
        from disk; rerun `bwa-mem3 shm <idxbase>` to reclaim and restage.
        Stagers hold a named POSIX semaphore only for a few ms of
        registry update; if one is killed inside that window, later
-       stages block, and `bwa-mem3 shm -d` unlinks the semaphore.
+       stages wait, and `bwa-mem3 shm -d` unlinks the semaphore.
 
 macOS: POSIX shm has implementation-defined per-segment caps; large
        indices may simply fail to stage. Prefer Linux for production.
