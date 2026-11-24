@@ -120,12 +120,15 @@ static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record"
 /* --meth-mapq conversion-blind: a locus at its lowest mirror-free row (the row collapsed scoring
  * keeps there), at that row's mirror-free cost and mismatches, its gaps and its span. rid and hyp
  * with strand and pos give collapsed's order of its loci (pairing indexes them, the draw of the
- * main hit walks them). */
+ * main hit walks them). unreached (blind_alt only): the hit's locus is not one a mirror-free run
+ * reaches (it stops on -R before this search resolves the locus), so it is not in the mirror-free
+ * selection. A row is built value-initialized (unreached 0): a bit-field has no default. */
 struct aln_meth_blind_row_t {
     bwtint_t pos;
     int32_t cost, rid;
     uint16_t span; // a row never spans more than ALN_MAX_READ_LEN (0xffff): longer windows are dropped
-    uint8_t strand, hyp, n_mm, n_gapo, n_gape;
+    uint8_t strand : 1, unreached : 1; // in strand's byte, so the row stays 24 bytes
+    uint8_t hyp, n_mm, n_gapo, n_gape;
     uint8_t alt; // --known-snvs: the row's credited site allele, ks_site_rel from pos (0: none)
 };
 static_assert(sizeof(aln_meth_blind_row_t) == 24, "aln_meth_blind_row_t is a 24-byte record");
@@ -177,7 +180,8 @@ struct aln_meth_read_t {
     std::vector<aln_meth_blind_row_t> blind_rows;
     // The hits whose locus's lowest mirror-free row is not the hit's own row (the genomic search
     // keeps the genomically cheapest row of a locus, and on equal cost the lower CIGAR), at that
-    // row; pos and strand name the hit, sorted by them. Read through aln_meth_blind_view.
+    // row, and the hits a mirror-free run never reaches (unreached); pos and strand name the hit,
+    // sorted by them. Read through aln_meth_blind_view.
     std::vector<aln_meth_blind_row_t> blind_alt;
     // blind_main: the index, among the mirror-free strata's best-cost loci (blind_best) in
     // collapsed's order (rid, hyp, strand, pos), of the one collapsed scoring draws as the main
@@ -235,7 +239,7 @@ static inline aln_meth_blind_row_t aln_meth_blind_view(const aln_meth_read_t &r,
     auto before = [](const aln_meth_blind_row_t &x, const aln_meth_blind_row_t &y) {
         return x.pos != y.pos ? x.pos < y.pos : x.strand < y.strand;
     };
-    aln_meth_blind_row_t b;
+    aln_meth_blind_row_t b = aln_meth_blind_row_t();
     b.pos = h.pos; b.strand = h.strand; b.rid = h.rid; b.hyp = h.hyp;
     const auto it = std::lower_bound(r.blind_alt.begin(), r.blind_alt.end(), b, before);
     if (it != r.blind_alt.end() && it->pos == h.pos && it->strand == h.strand) return *it;
@@ -249,7 +253,7 @@ static inline aln_meth_blind_row_t aln_meth_blind_view(const aln_meth_read_t &r,
 static inline bool aln_meth_blind_selected(const aln_meth_read_t &r, const aln_meth_hit_t &h, int s_mm, int gape)
 {
     const aln_meth_blind_row_t m = aln_meth_blind_view(r, h, s_mm);
-    return m.cost <= r.blind_cut && (int64_t)m.n_mm + m.n_gapo + (gape ? m.n_gape : 0) <= r.blind_ceiling;
+    return !m.unreached && m.cost <= r.blind_cut && (int64_t)m.n_mm + m.n_gapo + (gape ? m.n_gape : 0) <= r.blind_ceiling;
 }
 // The pointer is into h itself (one operation) or into r.cig, so it is valid while both are.
 static inline const uint32_t *aln_meth_hit_cigar(const aln_meth_read_t &r, const aln_meth_hit_t &h)
