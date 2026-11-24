@@ -120,10 +120,12 @@ static_assert(sizeof(aln_meth_hit_t) == 40, "aln_meth_hit_t is a 40-byte record"
  * main hit walks them). */
 struct aln_meth_blind_row_t {
     bwtint_t pos;
-    int32_t span, cost, rid;
+    int32_t cost, rid;
+    uint16_t span; // a row never spans more than ALN_MAX_READ_LEN (0xffff): longer windows are dropped
     uint8_t strand, hyp, n_mm, n_gapo, n_gape;
     uint8_t alt; // --known-snvs: the row's credited site allele, ks_site_rel from pos (0: none)
 };
+static_assert(sizeof(aln_meth_blind_row_t) == 24, "aln_meth_blind_row_t is a 24-byte record");
 // incomplete: lookup budget, an unrepresentable competitor, CIGAR storage, -m work budget
 enum { ALN_METH_BIND_BEST = 1, ALN_METH_BIND_UNREP = 2, ALN_METH_BIND_CIGAR = 4, ALN_METH_BIND_M = 8 };
 // A same-read ALT-index lower bound; an unavailable bound must never authorize stopping.
@@ -172,12 +174,15 @@ struct aln_meth_read_t {
     // keeps the genomically cheapest row of a locus, and on equal cost the lower CIGAR), at that
     // row; pos and strand name the hit, sorted by them. Read through aln_meth_blind_view.
     std::vector<aln_meth_blind_row_t> blind_alt;
-    // The mirror-free strata's best-cost loci (blind_best) in collapsed's order (rid, hyp, strand,
-    // pos), and blind_main, the one collapsed scoring draws as the main hit: the same draw over
-    // the same loci with the read's seed. A duplicate copy draws again with its own seed.
-    // For the paired-end shadow pairing, which starts each end where collapsed does; kept only
-    // for a read that pairs or has duplicate copies (otherwise empty, and blind_main -1).
+    // blind_main: the index, among the mirror-free strata's best-cost loci (blind_best) in
+    // collapsed's order (rid, hyp, strand, pos), of the one collapsed scoring draws as the main
+    // hit (the same draw over the same loci with the read's seed), and blind_pick that locus. For
+    // the paired-end shadow pairing, which starts each end where collapsed does; drawn only for a
+    // read that pairs or has duplicate copies (otherwise blind_main is -1). blind_ties holds the
+    // loci themselves only while a read's duplicate copies draw again over them, each with its own
+    // seed (aln_meth_copy_dup); aln_meth_search_batch frees them once the copies are drawn.
     std::vector<aln_meth_blind_row_t> blind_ties;
+    aln_meth_blind_row_t blind_pick = aln_meth_blind_row_t();
     int blind_main = -1;
     // Where the shadow pairing leaves this end of a proper pair, and its MAPQ there
     // (blind_place_mapq -1: no such pair), for a mate that mate rescue moves.
@@ -221,7 +226,7 @@ static inline aln_meth_blind_row_t aln_meth_blind_view(const aln_meth_read_t &r,
     b.pos = h.pos; b.strand = h.strand; b.rid = h.rid; b.hyp = h.hyp;
     const auto it = std::lower_bound(r.blind_alt.begin(), r.blind_alt.end(), b, before);
     if (it != r.blind_alt.end() && it->pos == h.pos && it->strand == h.strand) return *it;
-    b.span = h.span;
+    b.span = (uint16_t)h.span;
     b.cost = (int32_t)((int64_t)h.cost - (int64_t)s_mm * h.n_mirror); // in [0, h.cost]
     b.n_mm = (uint8_t)(h.n_mm - h.n_mirror); b.n_gapo = h.n_gapo; b.n_gape = h.n_gape;
     return b;
