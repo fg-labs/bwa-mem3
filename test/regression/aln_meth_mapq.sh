@@ -36,9 +36,10 @@
 # --max-occ (then collapsed does not pair it, and its cap is 0), a mate the mirror-free pairing
 # moves while read 1's stock loci exceed --max-occ (no stock pairing) gets 0, and no MAPQ is ever
 # raised; under the stock cuts, strata the search may have pruned give a cap of 0, single end and
-# for both ends of a pair (each with scoring's MAPQ in YQ:i); with the cuts conversion-blind leaves
-# every field but MAPQ and YQ:i as scoring has it, across penalties and -m limits
-# (blind-genomic-identity); and the option's refusals.
+# for both ends of a pair (each with scoring's MAPQ in YQ:i); past a mirror-free run's own -R stop
+# the strata are that run's (a hit it never reaches stays out of the shadow pairing, and the mate is
+# not capped to 0); with the cuts conversion-blind leaves every field but MAPQ and YQ:i as scoring
+# has it, across penalties and -m limits (blind-genomic-identity); and the option's refusals.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -595,6 +596,64 @@ paste -d ' ' "$tmp/needpe.blind.sum" "$tmp/needpe.scoring.sum" \
 }
 same_outside_mapq "paired-pruned-strata" "$tmp/needpe.blind.rec" "$tmp/needpe.scoring.rec"
 echo 'PASS: paired-pruned-strata'
+
+# A mirror-free run's own -R stop, where the search goes on, on a reference of its own (mfr.fa), at
+# -R 1. Read 1 (40 bp) keeps the Cs at offsets 10 and 25: copies b and c have a T under both (6,
+# mirror-free 0), copy a has one real mismatch (3). Two loci at mirror-free 0 are over -R, so a
+# mirror-free run stops before it reaches a; the search has a unique best (a) and goes on to it.
+# The mirror-free strata are the rows resolved at that stop (b and c): a is a hit that run never
+# reaches (unreached), so read 1's single-end cap is 0 and the shadow pairing leaves a out. Read 2
+# comes from after a: the pairing places the pair at a under every mode, and the shadow pairing,
+# like collapsed's (read 1 at b or c, no pair), cannot pair read 1, so read 1 is capped to 0 and read
+# 2 keeps collapsed's MAPQ. Taking a into the strata would let the shadow pair read 1 at a (a
+# nonzero cap); marking them unknown would cap read 2 to 0 as well.
+cat > "$tmp/mfr.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+function alt(c) { return c == "G" ? "A" : "G" }
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+function ct(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out ((c == "C" && i != 11 && i != 26) ? "T" : c) } return out }
+function ga(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "G" ? "A" : c) } return out }
+BEGIN {
+    seed_rng(20261124)
+    s = put(put(dna(40), 10, "C"), 25, "C")
+    r = ct(s)
+    b = put(put(s, 10, "T"), 25, "T")
+    a = put(s, 30, alt(substr(r, 31, 1)))
+    c = dna(400) a dna(900)
+    printf ">a\n%s\n>b\n%s\n>c\n%s\n", c, dna(400) b dna(400), dna(400) b dna(400) > (dir "/mfr.fa")
+    for (st = 640; st <= 1100; st += 20) {
+        fq(dir "/mfr1.fq", "m" st, r)
+        fq(dir "/mfr2.fq", "m" st, ga(rc(substr(c, st + 1, 40))))
+    }
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/mfr.awk" < /dev/null
+"$bin" index --meth "$tmp/mfr.fa" > "$tmp/mfr-index.out" 2> "$tmp/mfr-index.err" || {
+    echo "FAIL: index --meth (mfr.fa) exited nonzero" >&2
+    cat "$tmp/mfr-index.err" >&2
+    exit 1
+}
+run mfr.scoring --meth --meth-mapq scoring -R 1 "$tmp/mfr.fa" "$tmp/mfr1.fq" "$tmp/mfr2.fq"
+run mfr.blind --meth -R 1 -v 4 "$tmp/mfr.fa" "$tmp/mfr1.fq" "$tmp/mfr2.fq"
+run mfr.collapsed --meth --meth-scoring collapsed -R 1 "$tmp/mfr.fa" "$tmp/mfr1.fq" "$tmp/mfr2.fq"
+# every pair at a; read 1 capped to 0 with scoring's (nonzero) MAPQ in YQ:i; read 2 at collapsed's
+# MAPQ (nonzero, at most scoring's); collapsed places read 1 at b or c with MAPQ 0
+paste -d ' ' "$tmp/mfr.blind.sum" "$tmp/mfr.scoring.sum" "$tmp/mfr.collapsed.sum" \
+    | awk '$1 != $7 || $1 != $13 || $2 != $8 || $3 != "a" || $9 != "a" || $11 == 0 { bad = 1 }
+           $2 < 128 && ($5 != 0 || $6 != $11 || $15 != "b" && $15 != "c" || $17 != 0) { bad = 1 }
+           $2 >= 128 && ($15 != "a" || $5 != $17 || $5 == 0 || $5 > $11) { bad = 1 }
+           bad && !shown { shown = 1; print "  " $0 > "/dev/stderr" }
+           END { exit bad || NR != 48 }' || {
+    echo "FAIL: paired-mirror-free-top2: the caps are not the mirror-free run's" >&2
+    exit 1
+}
+grep -qF ': 0 of 24 pairs have an end whose mirror-free strata the cuts may have pruned' "$tmp/mfr.blind.err" || {
+    echo "FAIL: paired-mirror-free-top2: a pair's mirror-free strata are marked unknown" >&2
+    exit 1
+}
+same_outside_mapq "paired-mirror-free-top2" "$tmp/mfr.blind.rec" "$tmp/mfr.scoring.rec"
+echo 'PASS: paired-mirror-free-top2'
 
 # conversion-blind only observes the search: with the stock cuts every field but MAPQ and YQ:i is
 # what --meth-mapq scoring gives, for any penalties and limits. On a repeat-rich reference of its
