@@ -34,8 +34,6 @@ struct Contig {
     std::string seq;
 };
 
-// Reverse complement over A C G T in either case (case is kept); anything else
-// becomes N.
 // n random bases from ACGT, two bits of each draw: the reference contigs the index tests build.
 inline std::string random_acgt(std::mt19937 &rng, size_t n) {
     std::string s(n, 'A');
@@ -43,6 +41,8 @@ inline std::string random_acgt(std::mt19937 &rng, size_t n) {
     return s;
 }
 
+// Reverse complement over A C G T in either case (case is kept); anything else
+// becomes N.
 inline std::string revcomp(const std::string &s) {
     std::string r(s.rbegin(), s.rend());
     for (char &c : r) {
