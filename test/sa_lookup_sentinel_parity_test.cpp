@@ -51,7 +51,10 @@ int main(int argc, char *argv[]) {
     }
 
     std::unique_ptr<FMI_search> fmi(new FMI_search(argv[1]));
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
 
     const int64_t ref_len = fmi->reference_seq_len;
     fprintf(stderr, "sa_lookup_sentinel_parity_test: reference_seq_len=%lld sentinel_index=%lld\n",

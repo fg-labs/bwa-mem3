@@ -900,7 +900,10 @@ int main(int argc, char *argv[]) {
             (int)SMEM_LOCKSTEP_N);
 
     FMI_search *fmi = new FMI_search(argv[1]);
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
 
     /* Case 1: two simple reads, start at position 0, minSeedLen 19. */
     {
@@ -1701,7 +1704,15 @@ int main(int argc, char *argv[]) {
              * tagged (run_case checks info 0 on both outputs). */
             {
                 FMI_search *fmi_np = new FMI_search(argv[1]);
+                fmi_np->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
                 fmi_np->load_index(/*load_pac=*/false);
+                total_cases++;
+                if (fmi_np->compact_occ() == FMI_search::compact_occ_env()) {
+                    passed_cases++;
+                    fprintf(stderr, "[PASS] Case 18: no-pac index has the requested checkpoint layout\n");
+                } else {
+                    fprintf(stderr, "[FAIL] Case 18: no-pac index has the wrong checkpoint layout\n");
+                }
                 if (fmi_np->s1_text_available()) {
                     total_cases++;
                     fprintf(stderr, "[FAIL] Case 18: s1_text_available() is true on an index "

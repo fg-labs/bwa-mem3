@@ -7,6 +7,7 @@
 #define CP_FILE_ORACLE_H
 
 #include "fmi_seed_api.h"
+#include "fm_index_writer.h"   /* FMI_BWT2BIT_HDR_BYTES */
 
 #include <stdint.h>
 #include <stdio.h>
@@ -20,13 +21,34 @@ static inline std::vector<CP_OCC> cp_file_records(const char *prefix, int64_t re
     FILE *f = fopen(path.c_str(), "rb");
     if (f == NULL) { fprintf(stderr, "cannot open %s\n", path.c_str()); exit(2); }
     std::vector<CP_OCC> v((size_t) ((ref_seq_len >> CP_SHIFT) + 1));
-    if (fseek(f, 6 * (long) sizeof(int64_t), SEEK_SET) != 0 ||
+    if (fseek(f, (long) FMI_BWT2BIT_HDR_BYTES, SEEK_SET) != 0 ||
         fread(v.data(), sizeof(CP_OCC), v.size(), f) != v.size()) {
         fprintf(stderr, "cannot read the checkpoints of %s\n", path.c_str());
         exit(2);
     }
     fclose(f);
     return v;
+}
+
+/* The SA samples exactly as <prefix>.bwt.2bit.64 stores them, after the checkpoints: one high
+ * byte, then one low word, per sample at rate 1/2^compx. The aligner packs the high bytes to a
+ * few bits in memory (sa_hi_at); an oracle built from these does not go through that packing. */
+static inline void sa_file_samples(const char *prefix, int64_t ref_seq_len, int64_t compx,
+                                   std::vector<int8_t> &ms, std::vector<uint32_t> &ls)
+{
+    const std::string path = std::string(prefix) + CP_FILENAME_SUFFIX;
+    FILE *f = fopen(path.c_str(), "rb");
+    if (f == NULL) { fprintf(stderr, "cannot open %s\n", path.c_str()); exit(2); }
+    const size_t n = (size_t) ((ref_seq_len >> compx) + 1);
+    const long at = (long) FMI_BWT2BIT_HDR_BYTES + (long) (((ref_seq_len >> CP_SHIFT) + 1) * (int64_t) sizeof(CP_OCC));
+    ms.resize(n);
+    ls.resize(n);
+    if (fseek(f, at, SEEK_SET) != 0 || fread(ms.data(), sizeof(int8_t), n, f) != n ||
+        fread(ls.data(), sizeof(uint32_t), n, f) != n) {
+        fprintf(stderr, "cannot read the SA samples of %s\n", path.c_str());
+        exit(2);
+    }
+    fclose(f);
 }
 
 static inline int64_t cp_file_occ(const std::vector<CP_OCC> &cp, int b, int64_t p)

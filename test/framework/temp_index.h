@@ -188,6 +188,7 @@ public:
             throw std::runtime_error("bwa_idx_build failed for " + prefix_ + "; log:\n" + read_file(log));
         }
         fmi_.reset(new FMI_search(prefix_.c_str()));
+        fmi_->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
         fmi_->load_index(/*load_pac=*/true, /*n_threads=*/1, build_seed_jump);
     }
 
