@@ -87,16 +87,6 @@ TEST_CASE("hugetlb_round_up: whole 1 GiB pages, 0 for empty or overflowing sizes
     if (sizeof(size_t) == 8) CHECK(bwamem_hugetlb_round_up(SIZE_MAX - G + 1) == SIZE_MAX - G + 1);
 }
 
-namespace {
-
-std::string random_acgt(std::mt19937 &rng, size_t n) {
-    std::string s(n, 'A');
-    for (char &c : s) c = "ACGT"[rng() & 3];
-    return s;
-}
-
-} // namespace
-
 TEST_CASE("hugetlb_map: failures leave the buffer unmapped"
           * doctest::test_suite("unit/huge_pages")) {
     bwamem_hugetlb_buf_t b = {(void *)&b, 123};
@@ -181,11 +171,12 @@ TEST_CASE("hugetlb_map: failures leave the buffer unmapped"
 TEST_CASE("load_index with --huge-pages: mapped table with failed prefault falls back safely"
           * doctest::test_suite("unit/huge_pages")) {
     std::mt19937 rng(20261104);
-    bwa_tests::TempIndex base({{"chrA", random_acgt(rng, 2200)}});
+    bwa_tests::TempIndex base({{"chrA", bwa_tests::random_acgt(rng, 2200)}});
     const int status = bwa_tests::run_in_child([&base] {
         FMI_search *want = base.fmi();
         {
             FMI_search got(base.prefix().c_str());
+            got.set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
             std::string log;
             {
                 bwa_tests::StderrCapture cap;
@@ -228,7 +219,7 @@ TEST_CASE("load_index with --huge-pages: same arrays whether or not the 1 GB map
     // the occurrence table and every SA lookup must match the default load.
     std::mt19937 rng(20261101);
     const std::vector<bwa_tests::Contig> ref = {
-        {"chrA", random_acgt(rng, 1500)}, {"chrB", random_acgt(rng, 700)}};
+        {"chrA", bwa_tests::random_acgt(rng, 1500)}, {"chrB", bwa_tests::random_acgt(rng, 700)}};
     bwa_tests::TempIndex base(ref);
     FMI_search *want = base.fmi();
 
@@ -258,6 +249,7 @@ TEST_CASE("load_index with --huge-pages: same arrays whether or not the 1 GB map
         CAPTURE((int)m);
         std::string log;
         std::unique_ptr<FMI_search> got_owner(new FMI_search(base.prefix().c_str()));
+        got_owner->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
         FMI_search &got = *got_owner;
         {
             bwa_tests::StderrCapture cap;

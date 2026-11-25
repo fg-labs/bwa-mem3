@@ -302,7 +302,8 @@ run() { # out extra...
 # --- keep-alt: the non-vacuity control. ---
 run keep.sam --alt-project keep-alt
 grep -q $'^@SQ\tSN:chrB_alt2\t' keep.sam || fail "keep-alt has no ALT @SQ (the fixture is vacuous)"
-awk -F'\t' '!/^@/ && ($1 ~ /^(both|half)_/) && $3 == "chrB_alt2"' keep.sam | grep -q . \
+# Consume the file: grep -q can SIGPIPE a producer and hide a match under pipefail.
+awk -F'\t' '!/^@/ && ($1 ~ /^(both|half)_/) && $3 == "chrB_alt2" { found = 1 } END { exit !found }' keep.sam \
     || fail "keep-alt wrote no both_/half_ record on chrB_alt2 (the fixture is vacuous)"
 grep -q "alt-project primary" keep.sam.log && fail "keep-alt reported the primary count"
 

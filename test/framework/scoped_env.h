@@ -11,16 +11,17 @@
 
 namespace bwa_tests {
 
-// Set on construction, restore the prior value (or unset if it was absent) on
-// destruction, so doctest run order cannot leak an override into a sibling
-// case that assumes the defaults.
+// Set on construction (a null value unsets the variable instead), restore the
+// prior value (or unset if it was absent) on destruction, so doctest run order
+// cannot leak an override into a sibling case that assumes the defaults.
 class ScopedEnv {
 public:
     ScopedEnv(const char *name, const char *value) : name_(name) {
         const char *cur = getenv(name);
         had_ = cur != nullptr;
         if (had_) saved_ = cur;
-        setenv(name, value, 1);
+        if (value != nullptr) setenv(name, value, 1);
+        else                  unsetenv(name);
     }
     ~ScopedEnv() {
         if (had_) setenv(name_.c_str(), saved_.c_str(), 1);

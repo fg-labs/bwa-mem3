@@ -50,6 +50,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
 #include "io_utils.h"     /* io_request_size, IO_MAX_ONCE */
 #include "FMI_search.h"
+#include "fm_index_writer.h"   /* FMI_BWT2BIT_HDR_BYTES */
 #include "ksort.h"        /* smem_sort_rid_mn: per-rid introsort on (key, idx) pairs */
 #include "smem_parked.h"
 #include "profiling.h"
@@ -128,10 +129,10 @@ void pread_chunk_fail(const char *fmt, ...)
 /* Open a private read descriptor on `path` for one pread worker, or return
  * `shared_fd` if that fails or `path` no longer names the file behind
  * `shared_fd` (replaced since it was opened -- reading it would splice two
- * files' bytes into one array). A private descriptor is what keeps the load
- * fast on S3 Mountpoint: its prefetcher keeps one sequential cursor per open
- * file and resets on every jump, so workers sharing a descriptor stall at
- * random-read throughput (awslabs/mountpoint-s3#1886). */
+ * files' bytes into one array). On filesystems or object-store mounts that
+ * track sequential read-ahead per open handle, a private descriptor keeps each
+ * worker's cursor sequential. Sharing a descriptor can reset read-ahead on
+ * jumps between workers' chunks and stall at random-read throughput. */
 int open_worker_fd(const char *path, int shared_fd)
 {
     int fd = open(path, O_RDONLY | O_CLOEXEC);
@@ -175,9 +176,46 @@ void *pread_chunk_worker(void *arg)
     return NULL;
 }
 
+/* The fork-join scaffold of a parallel index read, for any job type with an `int fd` member:
+ * job 0 reads through `shared_fd` (already open on `path`) and every other job through its own
+ * descriptor from open_worker_fd. Workers that had to fall back to the shared descriptor are
+ * reported (still a correct load, but sharing can stall per-handle sequential read-ahead),
+ * with `func` naming the caller. The main thread runs job 0; a job whose thread cannot be
+ * spawned (e.g. a thread limit) runs inline, so the load still completes, just less parallel.
+ * Joins every thread and closes every private descriptor. */
+template <class Job>
+void run_fd_workers(const char *func, int shared_fd, const char *path, std::vector<Job> &jobs,
+                    void *(*worker)(void *))
+{
+    const int n = (int)jobs.size();
+    std::vector<pthread_t> tids((size_t)n);
+    std::vector<bool>      spawned((size_t)n, false);
+    int n_sharing = 0;
+    for (int i = 0; i < n; i++) {
+        jobs[i].fd = i == 0 ? shared_fd : open_worker_fd(path, shared_fd);
+        if (i > 0 && jobs[i].fd == shared_fd) n_sharing++;
+    }
+    if (n_sharing > 0)
+        fprintf(stderr, "[W::%s] could not reopen %s for %d of %d index-load workers; "
+                "they share one descriptor, which can slow loads on filesystems or "
+                "object-store mounts with per-handle sequential read-ahead\n",
+                func, path, n_sharing, n - 1);
+    for (int i = 1; i < n; i++) {
+        if (pthread_create(&tids[i], NULL, worker, &jobs[i]) == 0)
+            spawned[i] = true;
+        else
+            worker(&jobs[i]);
+    }
+    worker(&jobs[0]);
+    for (int i = 1; i < n; i++)
+        if (spawned[i]) pthread_join(tids[i], NULL);
+    for (int i = 1; i < n; i++)
+        if (jobs[i].fd != shared_fd) close(jobs[i].fd);
+}
+
 // Read `nbytes` at file offset `off` of `path` into `dst` using up to
-// `nthreads` workers. Chunk 0 reads through `shared_fd` (already open on
-// `path`); every other chunk gets its own descriptor from open_worker_fd.
+// `nthreads` workers (run_fd_workers: chunk 0 through `shared_fd`, every other
+// chunk through its own descriptor).
 void parallel_pread(int shared_fd, const char *path, void *dst, size_t nbytes,
                     off_t off, int nthreads)
 {
@@ -185,37 +223,13 @@ void parallel_pread(int shared_fd, const char *path, void *dst, size_t nbytes,
     nthreads = fmi_pread_worker_count(nbytes, nthreads);
 
     std::vector<PreadChunk> chunks((size_t)nthreads);
-    std::vector<pthread_t>  tids((size_t)nthreads);
-    std::vector<bool>       spawned((size_t)nthreads, false);
     size_t base = nbytes / (size_t)nthreads, rem = nbytes % (size_t)nthreads, cum = 0;
-    int n_sharing = 0;
     for (int i = 0; i < nthreads; i++) {
         size_t len = base + ((size_t)i < rem ? 1 : 0);
-        int fd = i == 0 ? shared_fd : open_worker_fd(path, shared_fd);
-        if (i > 0 && fd == shared_fd) n_sharing++;
-        chunks[i] = PreadChunk{ fd, (char *)dst + cum, len, off + (off_t)cum };
+        chunks[i] = PreadChunk{ -1, (char *)dst + cum, len, off + (off_t)cum };
         cum += len;
     }
-    // Still a correct load, but one that can stall on S3 Mountpoint, so say why.
-    if (n_sharing > 0)
-        fprintf(stderr, "[W::%s] could not reopen %s for %d of %d index-load workers; "
-                "they share one descriptor, which is slow on filesystems with "
-                "per-handle read-ahead (e.g. S3 Mountpoint)\n",
-                __func__, path, n_sharing, nthreads - 1);
-    // Main thread takes chunk 0; spawn workers for the rest. If a spawn fails
-    // (e.g. thread limit), fall back to reading that chunk inline so the load
-    // still completes correctly, just less parallel.
-    for (int i = 1; i < nthreads; i++) {
-        if (pthread_create(&tids[i], NULL, pread_chunk_worker, &chunks[i]) == 0)
-            spawned[i] = true;
-        else
-            pread_chunk_worker(&chunks[i]);
-    }
-    pread_chunk_worker(&chunks[0]);
-    for (int i = 1; i < nthreads; i++)
-        if (spawned[i]) pthread_join(tids[i], NULL);
-    for (int i = 1; i < nthreads; i++)
-        if (chunks[i].fd != shared_fd) close(chunks[i].fd);
+    run_fd_workers(__func__, shared_fd, path, chunks, pread_chunk_worker);
 }
 
 }  // namespace
@@ -448,7 +462,16 @@ FMI_search::FMI_search(const char *fname)
     sa_hi = NULL;
     sa_hi_log2 = 0;
     sa_hi_mask = 1;
+    cp_compact = false;   /* the caller picks the layout (set_compact_occ) */
     cp_occ = NULL;
+    cp_planes = NULL;
+    cp_wide = false;
+    cp_span_shift = 32;
+    cp_n_spans = 0;
+    cp_base = NULL;
+    cp_empty_row = -1;
+    cp_sent_after = 0;
+    cp_sent_len = 0;
     shm_base = NULL;
     shm_len = 0;
     cp_occ_huge = bwamem_hugetlb_buf_t{NULL, 0};
@@ -474,7 +497,9 @@ FMI_search::~FMI_search()
         if (sa_ls_word) _mm_free(sa_ls_word);
         if (cp_occ_huge.base != NULL) bwamem_hugetlb_unmap(&cp_occ_huge);
         else if (cp_occ)              _mm_free(cp_occ);
+        else if (cp_planes)           _mm_free(cp_planes);
     }
+    free(cp_base);   /* compact layout only; never part of the shm segment */
     /* Process-private on both paths (never part of the shm segment). */
     if (seed_jump) _mm_free(seed_jump);
 }
@@ -488,7 +513,202 @@ int64_t FMI_search::sa_count_for(int64_t ref_seq_len, int64_t sa_compx) {
 }
 
 int64_t FMI_search::cp_occ_size_bytes() const {
-    return cp_occ_bytes_for(reference_seq_len);
+    return cp_compact ? ((reference_seq_len >> CP_SHIFT) + 1) * (int64_t)sizeof(CP_OCC_PLANES)
+                      : cp_occ_bytes_for(reference_seq_len);
+}
+
+bool FMI_search::compact_occ_env()
+{
+    /* An opt-in switch: on only for a value starting with '1'. A value that
+     * starts with neither '0' nor '1' ("yes", "false") is reported, once, and
+     * ignored, so a typo cannot silently pick a layout. */
+    const char *e = getenv("BWA3_COMPACT_OCC");
+    if (e != NULL && e[0] != '\0' && e[0] != '0' && e[0] != '1') {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true))
+            fprintf(stderr, "[W::%s] ignoring BWA3_COMPACT_OCC=\"%s\" (not 0 or 1)\n", __func__, e);
+        return false;
+    }
+    return e != NULL && e[0] == '1';
+}
+
+void FMI_search::set_compact_occ(bool on)
+{
+    /* Every driver picks its layout's table from cp_compact on each call, so
+     * flipping it on a loaded index would read the other layout's NULL table. */
+    xassert(cp_occ == NULL && cp_planes == NULL && shm_base == NULL,
+            "set_compact_occ called after load_index");
+    cp_compact = on;
+}
+
+/* ---- the compact layout's file-to-memory checkpoint transform -------------- */
+static int  g_cp_span_shift_test = 0;      /* 0: the default (32) */
+static bool g_cp_force_wide_test = false;
+
+void FMI_search::set_cp_layout_for_test(int span_shift, bool force_wide)
+{
+    /* below CP_SHIFT the span-to-block shift goes negative; above 32 a span's
+     * counts no longer fit 32 bits */
+    xassert(span_shift == 0 || (span_shift >= CP_SHIFT && span_shift <= 32),
+            "set_cp_layout_for_test: span_shift out of range");
+    g_cp_span_shift_test = span_shift;
+    g_cp_force_wide_test = force_wide;
+}
+
+static int cp_span_shift_default() { return g_cp_span_shift_test > 0 ? g_cp_span_shift_test : 32; }
+
+bool FMI_search::cp_is_wide(const int64_t raw_count[5])
+{
+    if (g_cp_force_wide_test) return true;
+    for (int b = 0; b < 4; b++)
+        if (raw_count[b + 1] - raw_count[b] >= ((int64_t)1 << 32)) return true;
+    return false;
+}
+
+/* The conversion of the n file records of src (block first + i at src[i]) into dst, serially;
+ * cp_load_worker runs it on each slice it reads. Nonzero if a record is not one-hot, a count
+ * does not fit, or a record's counts are not the running totals: a record's count of base c is
+ * the c's in the rows before its block, so it must equal the previous record's count plus the
+ * popcount of that record's one-hot word for c. run[] carries that expected count from record
+ * to record (and from slice to slice); with *run_set false the first record only sets it, and
+ * the caller checks that record against the one before it. Rows below ref_seq_len with no base
+ * (in a valid index only the sentinel's) are counted into *n_empty, the last one seen kept in
+ * *empty_row: the planes read such a row as A, so a corrupt record that clears a row's bit
+ * would otherwise load as a silent A. */
+static int cp_convert_range(const CP_OCC *src, int64_t first, int64_t n, CP_OCC_PLANES *dst,
+                            const int64_t (*base)[4], int blk_shift, bool wide, int64_t ref_seq_len,
+                            int64_t *n_empty, int64_t *empty_row, uint64_t run[4], bool *run_set)
+{
+    int bad = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        const CP_OCC &r = src[i];
+        const uint64_t *oh = r.one_hot_bwt_str;
+        /* the running totals, in uint64_t so a corrupt count cannot overflow them */
+        if (*run_set)
+            for (int c = 0; c < 4; c++) bad |= (uint64_t)r.cp_count[c] != run[c];
+        for (int c = 0; c < 4; c++) run[c] = (uint64_t)r.cp_count[c] + (uint64_t)__builtin_popcountll(oh[c]);
+        *run_set = true;
+        /* one base per row: no two planes share a bit */
+        bad |= ((oh[0] & (oh[1] | oh[2] | oh[3])) | (oh[1] & (oh[2] | oh[3])) | (oh[2] & oh[3])) != 0;
+        /* rows with no base, among the block's rows below ref_seq_len (bit 63 - j is row j) */
+        const int64_t row0 = (first + i) << CP_SHIFT;
+        const int64_t live = ref_seq_len - row0 >= CP_BLOCK_SIZE ? CP_BLOCK_SIZE : ref_seq_len - row0;
+        const uint64_t live_mask = live >= CP_BLOCK_SIZE ? ~0ULL : live <= 0 ? 0 : ~0ULL << (CP_BLOCK_SIZE - live);
+        const uint64_t none = ~(oh[0] | oh[1] | oh[2] | oh[3]) & live_mask;
+        if (__builtin_expect(none != 0, 0)) {
+            *n_empty += __builtin_popcountll(none);
+            *empty_row = row0 + __builtin_clzll(none);
+        }
+        CP_OCC_PLANES &d = dst[i];
+        d.hi = oh[2] | oh[3];
+        d.lo = oh[1] | oh[3];
+        const int64_t *bs = wide ? base[(first + i) >> blk_shift] : NULL;
+        for (int c = 0; c < 4; c++) {
+            /* Range-check the file's values before subtracting: a corrupt record could make the
+             * difference overflow. With both in [0, INT64_MAX] and cnt >= b it cannot. */
+            const int64_t cnt = r.cp_count[c], b = wide ? bs[c] : 0;
+            const bool ok = cnt >= 0 && b >= 0 && cnt >= b && cnt - b <= (int64_t)UINT32_MAX;
+            bad |= !ok;
+            d.cp_count[c] = ok ? (uint32_t)(cnt - b) : 0;
+        }
+    }
+    return bad;
+}
+
+namespace {
+/* One worker of cp_load_from_file: records [lo, hi), read through its own
+ * descriptor in 1 MiB slices into a private buffer and converted in place. */
+struct CpLoadJob {
+    int fd; off_t rec0_off; int64_t lo, hi, ref_seq_len;
+    CP_OCC_PLANES *dst; const int64_t (*base)[4]; int span_shift; bool wide; int bad;
+    int64_t n_empty, empty_row;
+    /* first: the counts of record lo; run: the counts record hi must have
+     * (record hi - 1's plus its popcounts). cp_load_from_file checks each
+     * worker's first against the previous worker's run. */
+    uint64_t first[4], run[4];
+};
+void *cp_load_worker(void *arg)
+{
+    CpLoadJob *j = static_cast<CpLoadJob *>(arg);
+    const int64_t slice = 16384;   /* records: 1 MiB of the file */
+    CP_OCC *buf = (CP_OCC *)malloc((size_t)slice * sizeof(CP_OCC));
+    if (buf == NULL) pread_chunk_fail("ERROR: out of memory: checkpoint read buffer\n");
+    bool run_set = false;
+    for (int64_t lo = j->lo; lo < j->hi; lo += slice) {
+        const int64_t n = (j->hi - lo < slice) ? j->hi - lo : slice;
+        PreadChunk c{ j->fd, (char *)buf, (size_t)n * sizeof(CP_OCC),
+                      j->rec0_off + (off_t)lo * (off_t)sizeof(CP_OCC) };
+        pread_chunk_worker(&c);
+        /* buf holds the records of blocks lo .. lo + n */
+        if (lo == j->lo)
+            for (int b = 0; b < 4; b++) j->first[b] = (uint64_t)buf[0].cp_count[b];
+        j->bad |= cp_convert_range(buf, lo, n, j->dst + lo, j->base, j->span_shift - CP_SHIFT, j->wide,
+                                   j->ref_seq_len, &j->n_empty, &j->empty_row, j->run, &run_set);
+    }
+    free(buf);
+    return NULL;
+}
+}  // namespace
+
+bool FMI_search::cp_load_from_file(int shared_fd, const char *path, off_t rec0_off, int64_t n,
+                                   int64_t ref_seq_len, const int64_t raw_count[5], CP_OCC_PLANES *dst,
+                                   const int64_t (*base)[4], int span_shift, bool wide,
+                                   int nthreads, int64_t *empty_row)
+{
+    *empty_row = -1;
+    if (n <= 0) return true;
+    const int T = fmi_pread_worker_count((size_t)n * sizeof(CP_OCC), nthreads);
+    std::vector<CpLoadJob> jobs((size_t)T);
+    const int64_t per = n / T, rem = n % T;
+    int64_t at = 0;
+    for (int i = 0; i < T; i++) {
+        const int64_t len = per + (i < rem ? 1 : 0);
+        jobs[i] = CpLoadJob{ -1, rec0_off, at, at + len, ref_seq_len, dst, base, span_shift, wide, 0, 0, -1,
+                             {0, 0, 0, 0}, {0, 0, 0, 0} };
+        at += len;
+    }
+    run_fd_workers(__func__, shared_fd, path, jobs, cp_load_worker);
+    int bad = 0;
+    int64_t n_empty = 0;
+    for (size_t i = 0; i < jobs.size(); i++) {
+        const CpLoadJob &j = jobs[i];
+        bad |= j.bad;
+        n_empty += j.n_empty;
+        if (j.n_empty) *empty_row = j.empty_row;
+        /* the running totals across workers: the first record counts no rows
+         * before it, and each other worker's first record continues the
+         * previous worker's last (every worker has at least one record: T <= n) */
+        for (int b = 0; b < 4; b++)
+            bad |= j.first[b] != (i == 0 ? 0 : jobs[i - 1].run[b]);
+    }
+    /* The last record has no successor to check it, so its counts plus its
+     * popcounts must be the reference's base totals: the raw C[] array's steps
+     * (validated cumulative, in [0, ref_seq_len - 1]), and for T the rows left
+     * after A, C and G and the one sentinel. */
+    for (int b = 0; b < 4; b++) {
+        const int64_t total = b < 3 ? raw_count[b + 1] - raw_count[b] : ref_seq_len - 1 - raw_count[3];
+        bad |= jobs.back().run[b] != (uint64_t)total;
+    }
+    /* exactly one row below ref_seq_len has no base: the sentinel (checked
+     * against sentinel_index once it is read) */
+    return bad == 0 && n_empty == 1;
+}
+
+int64_t (*FMI_search::cp_read_span_bases(int fd, const char *path, int64_t ref_seq_len,
+                                         int span_shift, int64_t *n_spans))[4]
+{
+    const int64_t ns = (ref_seq_len >> span_shift) + 1;
+    int64_t (*base)[4] = (int64_t (*)[4])calloc((size_t)ns, sizeof *base);
+    xassert(base != NULL, "out of memory: checkpoint span bases");
+    for (int64_t sp = 0; sp < ns; sp++) {
+        const int64_t blk = sp << (span_shift - CP_SHIFT);
+        /* the record's cp_count[4] leads it; pread_chunk_worker retries EINTR and short reads */
+        PreadChunk c{ fd, (char *)base[sp], sizeof base[sp],
+                      (off_t)FMI_BWT2BIT_HDR_BYTES + (off_t)blk * (off_t)sizeof(CP_OCC) };
+        pread_chunk_worker(&c);
+    }
+    *n_spans = ns;
+    return base;
 }
 
 int64_t FMI_search::sa_sample_count() const {
@@ -517,8 +737,9 @@ bool FMI_search::shm_scalars_ok(const uint8_t *scalars, int64_t sizes[3],
     /* count[] is +1-adjusted by bwa_shm_compute; range [1, ref_seq_len] (the
      * raw counts leave out the one sentinel, so the largest is ref_seq_len - 1),
      * and as the cumulative C[] array it must be non-decreasing. These bounds
-     * match the disk path's post-adjustment asserts in load_index(): a
-     * count[i] == 0 drives smem.k out of cp_occ on the first backwardExt; one
+     * follow from load_index()'s raw checks in [0, ref_seq_len - 1] and its
+     * uniform +1 adjustment: a count[i] == 0 drives smem.k out of cp_occ on
+     * the first backwardExt; one
      * of ref_seq_len + 1 lets an interval start at that row, whose occurrence
      * block (cp_occ[(ref_seq_len + 1) >> CP_SHIFT]) is one past the table when
      * ref_seq_len % 64 == 63 (the seed jump table extends even zero-width
@@ -537,6 +758,12 @@ bool FMI_search::shm_scalars_ok(const uint8_t *scalars, int64_t sizes[3],
                      i, (long long)cnt[i], i - 1, (long long)cnt[i - 1]);
             return false;
         }
+    }
+    /* every row but the sentinel's holds a base: the last count is ref_seq_len
+     * (raw ref_seq_len - 1, +1), as load_index() requires of the disk count[] */
+    if (cnt[4] != ref_len) {
+        snprintf(why, why_len, "count[4]=%lld != ref_seq_len=%lld", (long long)cnt[4], (long long)ref_len);
+        return false;
     }
     if (sentinel < 0 || sentinel >= ref_len) {
         snprintf(why, why_len, "sentinel_index=%lld out of bounds (ref_seq_len=%lld)",
@@ -599,14 +826,21 @@ static int seed_jump_env_depth()
  * k <-> l, backwardExt with 3 - c, swap back). */
 void FMI_search::seed_jump_children(int L, int64_t first, int64_t n)
 {
+    if (cp_compact) seed_jump_children_t<true>(L, first, n);
+    else            seed_jump_children_t<false>(L, first, n);
+}
+
+template <bool PL>
+void FMI_search::seed_jump_children_t(int L, int64_t first, int64_t n)
+{
     const SeedJumpEntry *par = seed_jump + seed_jump_level_off(L - 1) + first;
     SeedJumpEntry *ch = seed_jump + seed_jump_level_off(L) + first * 4;
     for (int64_t i = 0; i < n; i++) {
 #ifdef ENABLE_PREFETCH
         if (i + SEED_JUMP_PF < n) {
             const SeedJumpEntry &q = par[i + SEED_JUMP_PF];
-            _mm_prefetch((const char *)(&cp_occ[(q.l >> CP_SHIFT)]), _MM_HINT_T0);
-            _mm_prefetch((const char *)(&cp_occ[((q.l + q.s) >> CP_SHIFT)]), _MM_HINT_T0);
+            _mm_prefetch(cp_line<PL>(q.l), _MM_HINT_T0);
+            _mm_prefetch(cp_line<PL>(q.l + q.s), _MM_HINT_T0);
         }
 #endif
         SMEM smem_;
@@ -618,7 +852,7 @@ void FMI_search::seed_jump_children(int L, int64_t first, int64_t n)
          * blocks' loads and popcounts among them (a store to ch[] may alias
          * cp_occ). */
         SMEM r[4];
-        for (int c = 0; c < 4; c++) r[c] = backwardExt(smem_, (uint8_t)(3 - c));
+        for (int c = 0; c < 4; c++) r[c] = backwardExt_t<PL>(smem_, (uint8_t)(3 - c));
         for (int c = 0; c < 4; c++) {
             ch[i * 4 + c].k = r[c].l;
             ch[i * 4 + c].l = r[c].k;
@@ -702,6 +936,9 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
         fprintf(stderr, "ERROR! load_index_from_shm called with NULL base\n");
         exit(EXIT_FAILURE);
     }
+    /* A staged segment holds the file's checkpoint layout only (load_index
+     * never attaches one for the compact layout). */
+    cp_compact = false;
     uint64_t off = 0, sz = 0;
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SCALARS, &off, &sz) != 0
@@ -813,6 +1050,7 @@ bool FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_s
     reference_seq_len = ref_seq_len;
     sentinel_index    = sentinel_idx;
     memcpy(count, count_src, sizeof(int64_t) * 5);
+    cp_compact    = false;   /* cp_occ_src is the file's layout */
     cp_occ        = const_cast<CP_OCC *>(cp_occ_src);
     sa_ls_word    = const_cast<uint32_t *>(src_ls);
     sa_compx      = src_compx;
@@ -945,13 +1183,29 @@ int FMI_search::build_index(bool emit_unpacked_ref, int sa_compx) {
     return libsais_build_fm_index(prefix, pac_len, opts);
 }
 
+/* The compact load's one message for a corrupt checkpoint record, whichever
+ * check finds it (cp_load_from_file, or a base-less row that is not the
+ * sentinel's). */
+static const char kCpCorruptMsg[] =
+    "FMI index: a checkpoint is not one-hot or out of range, or its counts are not "
+    "the running totals (corrupt .bwt.2bit.64?)";
+
 void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                             bwamem_hugetlb_mode_t huge_pages)
 {
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
-     * mapping; the segment lifetime belongs to the shm-loading process. */
-    {
+     * mapping; the segment lifetime belongs to the shm-loading process.
+     * A segment holds the default checkpoint layout only, so the compact
+     * layout never attaches one: it loads from disk, and says so when a
+     * complete segment is staged (a registry entry alone, from a stage in
+     * progress or interrupted, holds no index to duplicate). */
+    if (cp_compact) {
+        if (bwa_shm_test_complete(file_name) == 1)
+            fprintf(stderr, "[W::load_index] compact checkpoint layout: not attaching the index staged in "
+                    "shared memory (it holds the default layout); loading a private copy from disk, "
+                    "which adds to the memory the staged segment already holds\n");
+    } else {
         size_t   shm_attach_len = 0, shm_map_len = 0;
         uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len, &shm_map_len,
                                                  /*need_pac=*/load_pac);
@@ -1049,35 +1303,12 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     // create checkpointed occ
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;
     cp_occ = NULL;
+    cp_planes = NULL;
 
     err_fread_noeof(&count[0], sizeof(int64_t), 5, cpstream);
-    int64_t cp_occ_bytes = cp_occ_size * sizeof(CP_OCC);
-    // A buffer on pre-faulted 1 GB pages needs no page faults while it is
-    // filled, so the read is a plain copy out of the page cache and keeps
-    // scaling past the default worker cap (index_load_threads): read it, and
-    // fault its pages in, with every worker the run has. An explicit
-    // BWA3_LOAD_THREADS (a valid one: a malformed value is ignored, as
-    // index_load_threads says) still wins for both, so a filesystem or host
-    // that wants fewer readers keeps its cap.
-    const int huge_load_nt = load_nt_overridden ? load_nt
-                                                : std::max(load_nt, std::min(n_threads, 64));
-    if (huge_pages != BWAMEM_HUGETLB_OFF) {
-        fmi_map_occ_table_huge(huge_pages, (size_t)cp_occ_bytes, huge_load_nt, &cp_occ_huge);
-    }
-    if (cp_occ_huge.base != NULL) {
-        cp_occ = (CP_OCC *)cp_occ_huge.base;
-        index_alloc += cp_occ_bytes;
-    } else {
-        cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
-        index_alloc += cp_occ_bytes;
-        assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
-        bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
-    }
-
-    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes,
-                          cp_occ_huge.base != NULL ? huge_load_nt : load_nt);
-    int64_t ii = 0;
-    // Validate the RAW on-disk count[] before the +1 adjustment below. Doing the
+    // Validate the RAW on-disk count[] before anything reads it: the compact
+    // layout's count width (cp_is_wide takes count[b + 1] - count[b], which a
+    // corrupt count[] could overflow) and the +1 adjustment below. Doing the
     // bounds/monotonicity checks on the raw values (rather than after +1) is what
     // makes this overflow-safe: a corrupt count[ii] == INT64_MAX would trigger
     // signed-overflow UB in `count[ii] + 1` before any post-adjustment check
@@ -1086,7 +1317,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     // entry lies in [0, reference_seq_len - 1]; the shm producer
     // (bwa_shm_compute) applies the same +1 and load_index_from_shm then
     // validates the adjusted [1, ref_seq_len] range.
-    for (ii = 0; ii < 5; ii++) {
+    for (int ii = 0; ii < 5; ii++) {
         // A raw count[ii] outside [0, ref_seq_len - 1] (e.g. a disk -1, or a
         // value reaching the reference length) drives smem.k out of cp_occ on
         // the first backwardExt once adjusted: an interval at row
@@ -1099,27 +1330,74 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         xassert(ii == 0 || count[ii] >= count[ii - 1],
                 "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
     }
+    // Every row but the sentinel's holds a base, so the last cumulative count is
+    // exactly ref_seq_len - 1. A smaller one would pass the checks above yet
+    // narrow T's interval (count[4] - count[3]) and silently drop T matches.
+    xassert(count[4] == reference_seq_len - 1,
+            "FMI index: count[4] != reference_seq_len - 1 (corrupt .bwt.2bit.64?)");
+    // The compact layout holds 32-byte CP_OCC_PLANES records (half the file's),
+    // converted from the file's records as they are read (below).
+    int64_t cp_occ_bytes = cp_occ_size * (cp_compact ? (int64_t)sizeof(CP_OCC_PLANES) : (int64_t)sizeof(CP_OCC));
+    if (cp_compact) {
+        cp_span_shift = cp_span_shift_default();
+        cp_wide = cp_is_wide(count);
+        /* span bases are read only when the counts are span-relative */
+        if (cp_wide)
+            cp_base = cp_read_span_bases(fileno(cpstream), cp_file_name, reference_seq_len, cp_span_shift,
+                                         &cp_n_spans);
+    }
+    // A buffer on pre-faulted 1 GB pages needs no page faults while it is
+    // filled, so the read is a plain copy out of the page cache and keeps
+    // scaling past the default worker cap (index_load_threads): read it, and
+    // fault its pages in, with every worker the run has. An explicit
+    // BWA3_LOAD_THREADS (a valid one: a malformed value is ignored, as
+    // index_load_threads says) still wins for both, so a filesystem or host
+    // that wants fewer readers keeps its cap.
+    const int huge_load_nt = load_nt_overridden ? load_nt
+                                                : std::max(load_nt, std::min(n_threads, 64));
+    if (huge_pages != BWAMEM_HUGETLB_OFF) {
+        fmi_map_occ_table_huge(huge_pages, (size_t)cp_occ_bytes, huge_load_nt, &cp_occ_huge);
+    }
+    if (cp_compact) {
+        if (cp_occ_huge.base != NULL) {
+            cp_planes = (CP_OCC_PLANES *)cp_occ_huge.base;
+            index_alloc += cp_occ_bytes;
+        } else {
+            cp_planes = (CP_OCC_PLANES *)_mm_malloc(cp_occ_bytes, 64);
+            index_alloc += cp_occ_bytes;
+            assert_not_null(cp_planes, cp_occ_bytes, index_alloc);
+            bwamem_madv_hugepage(cp_planes, cp_occ_bytes);
+        }
+        // Each worker reads its own range of the file's records and converts
+        // it, so the 64-byte records are never all resident and no thread
+        // waits on another between read and convert.
+        const int cp_nt = cp_occ_huge.base != NULL ? huge_load_nt : load_nt;
+        const off_t rec0 = ftello(cpstream);
+        xassert(rec0 >= 0, "ftello failed during index load");
+        xassert(cp_load_from_file(fileno(cpstream), cp_file_name, rec0, cp_occ_size, reference_seq_len,
+                                  count, cp_planes, cp_base, cp_span_shift, cp_wide, cp_nt, &cp_empty_row),
+                kCpCorruptMsg);
+        xassert(fseeko(cpstream, rec0 + (off_t)cp_occ_size * (off_t)sizeof(CP_OCC), SEEK_SET) == 0,
+                "fseeko failed during index load");
+    } else {
+    if (cp_occ_huge.base != NULL) {
+        cp_occ = (CP_OCC *)cp_occ_huge.base;
+        index_alloc += cp_occ_bytes;
+    } else {
+        cp_occ = (CP_OCC *)_mm_malloc(cp_occ_bytes, 64);
+        index_alloc += cp_occ_bytes;
+        assert_not_null(cp_occ, cp_occ_bytes, index_alloc);
+        bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
+    }
+
+    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes,
+                          cp_occ_huge.base != NULL ? huge_load_nt : load_nt);
+    }
+    int64_t ii = 0;
     for(ii = 0; ii < 5; ii++)// update read count structure
     {
         count[ii] = count[ii] + 1;
     }
-    // Validate count[] (post +1-adjustment, range [1, ref_seq_len]) as
-    // load_index_from_shm does; a count[a] exceeding the reference length drives
-    // smem.k out of cp_occ on the first backwardExt.
-    for (ii = 0; ii < 5; ii++) {
-        // Lower bound is 1, not 0: the +1 adjustment above is applied before
-        // this check (bwa_shm_compute instead validates the raw disk value
-        // in [0, ref_seq_len - 1] and adjusts after), so a disk count[ii] == -1
-        // becomes 0 here and would slip past a >= 0 test -- leaving the disk
-        // loader open to an invalid FM interval that the shm producer rejects.
-        xassert(count[ii] >= 1 && count[ii] <= reference_seq_len,
-                "FMI index: count[] out of bounds (corrupt .bwt.2bit.64?)");
-        // count[] is the cumulative C[] array, so it must be non-decreasing; a
-        // non-monotone pair yields a negative smem.s (interval width) downstream.
-        xassert(ii == 0 || count[ii] >= count[ii - 1],
-                "FMI index: count[] not monotonically non-decreasing (corrupt .bwt.2bit.64?)");
-    }
-
     // Suffix-array sample arrays: one entry per sampled row (every row when
     // the SA is not compressed).
     #if SA_COMPRESSION
@@ -1162,6 +1440,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
             "FMI index: sentinel_index out of bounds (corrupt .bwt.2bit.64?)");
     fprintf(stderr, "* sentinel-index: %lld\n", (long long)sentinel_index);
     #endif
+    set_cp_sentinel();
     fclose(cpstream);
 
     int64_t x;
@@ -1182,7 +1461,13 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         #endif
     }
     fprintf(stderr, "\nsentinel_index: %lld\n", (long long)x);
+    set_cp_sentinel();
     #endif
+
+    // The compact layout's one base-less row must be the sentinel's: the planes
+    // read any other such row as A, where the default layout sees no base.
+    if (cp_compact)
+        xassert(cp_empty_row == sentinel_index, kCpCorruptMsg);
 
     // cp_occ, count[] and sentinel_index are in: build the seed jump table.
     if (build_seed_jump) build_seed_jump_table(load_nt);
@@ -1206,7 +1491,8 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     fprintf(stderr, "* Done reading Index!!\n");
 }
 
-void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
+template <bool PL>
+void FMI_search::getSMEMsOnePosOneThread_t(uint8_t *enc_qdb,
                                          int32_t *query_pos_array,
                                          int32_t *min_intv_array,
                                          int32_t *rid_array,
@@ -1266,21 +1552,13 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 next_x = j + 1;
                 if(a < 4)
                 {
-                    SMEM smem_ = smem;
-
                     // Forward extension is backward extension with the BWT of reverse complement:
                     // swap k <-> l, backwardExt, swap back. `l` is LIVE here — after the swap it is
                     // the k that drives the next forward step, and the full backwardExt's
                     // l-cumulation is what produces it. So backwardExt_konly (which drops the
                     // backward-phase-dead l-chain) does NOT apply to the forward pass; the full
                     // backwardExt is required. konly is backward-only by construction.
-                    smem_.k = smem.l;
-                    smem_.l = smem.k;
-                    SMEM newSmem_ = backwardExt(smem_, 3 - a);
-                    //SMEM newSmem_ = forwardExt(smem_, 3 - a);
-                    SMEM newSmem = newSmem_;
-                    newSmem.k = newSmem_.l;
-                    newSmem.l = newSmem_.k;
+                    SMEM newSmem = forwardExt_t<PL>(smem, a);
                     newSmem.n = j;
 
                     int32_t s_neq_mask = newSmem.s != smem.s;
@@ -1298,8 +1576,8 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                      * sp = smem.l, ep = smem.l + smem.s (see ls_advance_forward_step
                      * for the full derivation). Prefetching smem.k targeted an
                      * address never touched; ep was never prefetched. Pure hint. */
-                    _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
-                    _mm_prefetch((const char *)(&cp_occ[(smem.l + smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                    _mm_prefetch(cp_line<PL>(smem.l), _MM_HINT_T0);
+                    _mm_prefetch(cp_line<PL>(smem.l + smem.s), _MM_HINT_T0);
 #endif
                 }
                 else
@@ -1359,7 +1637,7 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 for(p = 0; p < numPrev; p++)
                 {
                     SMEM smem = prev[p];
-                    SMEM newSmem = backwardExt(smem, a);
+                    SMEM newSmem = backwardExt_t<PL>(smem, a);
                     newSmem.m = j;
 
                     if((newSmem.s < min_intv_array[i]) && ((smem.n - smem.m + 1) >= minSeedLen))
@@ -1374,8 +1652,8 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                         curr_s = newSmem.s;
                         prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch(cp_line<PL>(newSmem.k), _MM_HINT_T0);
+                        _mm_prefetch(cp_line<PL>(newSmem.k + newSmem.s), _MM_HINT_T0);
 #endif
                         break;
                     }
@@ -1385,7 +1663,7 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                 {
                     SMEM smem = prev[p];
 
-                    SMEM newSmem = backwardExt(smem, a);
+                    SMEM newSmem = backwardExt_t<PL>(smem, a);
                     newSmem.m = j;
 
 
@@ -1394,8 +1672,8 @@ void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb,
                         curr_s = newSmem.s;
                         prev[numCurr++] = newSmem;
 #ifdef ENABLE_PREFETCH
-                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch(cp_line<PL>(newSmem.k), _MM_HINT_T0);
+                        _mm_prefetch(cp_line<PL>(newSmem.k + newSmem.s), _MM_HINT_T0);
 #endif
                     }
                 }
@@ -1618,13 +1896,14 @@ struct FMI_search::BatchSlot {
     int32_t bsd_intv;
 };
 
+template <bool PL>
 void FMI_search::ls_prefetch_cp_occ(const BatchSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.k + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.k), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.l), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.k + s->smem.s), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.l + s->smem.s), _MM_HINT_T0);
 #else
     (void)s;
 #endif
@@ -1787,6 +2066,7 @@ void FMI_search::ls_bsd_resolve(BatchSlot *s, const uint8_t *enc_qdb, int32_t p)
 // s < min_intv), transitions phase to PH_BWD_INIT. When s1_text is set and the
 // step leaves a unique match (s == 1) with at least LS_S1_MIN_REST read bases
 // to go, transitions to PH_S1_LF instead (ls_s1_lf_step, ls_s1_compare).
+template <bool PL>
 void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
                                          bool s1_text)
 {
@@ -1814,13 +2094,7 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
         return;
     }
 
-    SMEM smem_ = s->smem;
-    smem_.k = s->smem.l;
-    smem_.l = s->smem.k;
-    SMEM newSmem_ = backwardExt(smem_, 3 - a);
-    SMEM newSmem  = newSmem_;
-    newSmem.k = newSmem_.l;
-    newSmem.l = newSmem_.k;
+    SMEM newSmem = forwardExt_t<PL>(s->smem, a);
     newSmem.n = s->j;
 
     int32_t s_neq_mask = (newSmem.s != s->smem.s);
@@ -1847,7 +2121,7 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
         s->lf_row = newSmem.k;
         s->lf_off = 0;
         s->phase  = PH_S1_LF;
-        ls_prefetch_sa_row(newSmem.k);
+        ls_prefetch_sa_row<PL>(newSmem.k);
         return;
     }
 #ifdef ENABLE_PREFETCH
@@ -1859,20 +2133,21 @@ void FMI_search::ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
      * Same targets as bsd_prefetch_cp_occ(), which fixed this for round 3 in
      * #242; the fix was simply never propagated here. Prefetch is a pure hint,
      * so this cannot change output. */
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.l), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.l + s->smem.s), _MM_HINT_T0);
 #endif
 }
 
 // Prefetch what the next call_one_step on row p reads: the SA sample lines
 // for a sampled row, else the row's checkpoint block (the same selection as
 // get_sa_entries_prefetch's prefetch_row). A hint only.
+template <bool PL>
 inline void FMI_search::ls_prefetch_sa_row(int64_t p) const
 {
 #ifdef ENABLE_PREFETCH
     uintptr_t m = (uintptr_t)0 - (uintptr_t)((p & sa_compx_mask) == 0);
     BWA_OPAQUE(m);
-    const uintptr_t cp = (uintptr_t)&cp_occ[p >> CP_SHIFT];
+    const uintptr_t cp = (uintptr_t)cp_line<PL>(p);
     const uintptr_t ms = (uintptr_t)sa_hi_addr(p >> sa_compx);
     const uintptr_t ls = (uintptr_t)&sa_ls_word[p >> sa_compx];
     _mm_prefetch((const char *)((ms & m) | (cp & ~m)), _MM_HINT_T0);
@@ -1967,12 +2242,13 @@ static inline int32_t ls_text_match(const uint8_t *q, int32_t j, int32_t rl,
 // position. call_one_step is the SA resolver's own step, with the exact
 // sentinel offset (drop_sentinel_offset 0) under every --compat, since the
 // position here locates text, not a reported coordinate.
+template <bool PL>
 void FMI_search::ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac)
 {
     int64_t v;
-    if (call_one_step(s->lf_row, v, s->lf_off, 0) == 0) {
+    if (call_one_step_t<PL>(s->lf_row, v, s->lf_off, 0) == 0) {
         s->lf_row = v;
-        ls_prefetch_sa_row(v);
+        ls_prefetch_sa_row<PL>(v);
         return;
     }
     // v = SA[k], where read[m..n] starts in the text; read base j = n + 1
@@ -2046,6 +2322,7 @@ void FMI_search::ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
 // exit (phase 2's min_intv = s + 1 included) and the unique-match hand-off to
 // PH_S1_LF can end the run early. Otherwise the slot steps on from depth
 // jdp + 1 with the same prefetch as a forward step.
+template <bool PL>
 void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
                                           bool s1_text)
 {
@@ -2095,7 +2372,7 @@ void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
             s->lf_row = nw.k;
             s->lf_off = 0;
             s->phase  = PH_S1_LF;
-            ls_prefetch_sa_row(nw.k);
+            ls_prefetch_sa_row<PL>(nw.k);
             return;
         }
     }
@@ -2105,8 +2382,8 @@ void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
     s->next_x = x + dp;
     s->phase = PH_FWD;
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(cur.l) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(cur.l + cur.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(cur.l), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(cur.l + cur.s), _MM_HINT_T0);
 #endif
 }
 
@@ -2114,6 +2391,7 @@ void FMI_search::ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
 // set up backward-phase cursors. The slot leaves as PH_BWD (ready for
 // ls_advance_backward_step) or PH_DONE (the backward outer loop would end on
 // its first step, so go straight to the final prev[0] emit).
+template <bool PL>
 void FMI_search::ls_prepare_backward(BatchSlot *s)
 {
     static_assert(sizeof(void *) != 8 || sizeof(BatchSlot) == 168,
@@ -2146,8 +2424,8 @@ void FMI_search::ls_prepare_backward(BatchSlot *s)
     // into L1 now, a full pass of the other slots ahead of that step. A hint
     // only; nothing reads its result.
     for (int p = 0; p < s->numPrev; p++) {
-        _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k) >> CP_SHIFT]), _MM_HINT_T0);
-        _mm_prefetch((const char *)(&cp_occ[(s->prev[p].k + s->prev[p].s) >> CP_SHIFT]), _MM_HINT_T0);
+        _mm_prefetch(cp_line<PL>(s->prev[p].k), _MM_HINT_T0);
+        _mm_prefetch(cp_line<PL>(s->prev[p].k + s->prev[p].s), _MM_HINT_T0);
     }
 #endif
     s->phase = PH_BWD;
@@ -2158,6 +2436,83 @@ void FMI_search::ls_prepare_backward(BatchSlot *s)
 // in getSMEMsOnePosOneThread. On terminating conditions (numCurr == 0,
 // j < 0 after decrement, or non-ACGT at j), runs the scalar's final
 // prev[0] emit and transitions to PH_DONE.
+/* ls_advance_backward_step's numPrev == 1 step on the compact layout, for query base a
+ * (backwardExt_konly_rt: no per-base dispatch). Returns numCurr (0 or 1); the caller updates
+ * numPrev/j. */
+__attribute__((always_inline)) inline
+int32_t FMI_search::ls_backward_one(BatchSlot *s, int a, int32_t minSeedLen)
+{
+    const CpView cpv = cp_view();
+    SMEM smem = s->prev[0];
+    SMEM newSmem = backwardExt_konly_rt(cpv, count[a], smem, a);
+    newSmem.m = s->j;
+    if (newSmem.s < s->min_intv) {
+        if ((smem.n - smem.m + 1) >= minSeedLen) {
+            s->cur_j = s->j;
+            s->match_buf[s->match_count++] = smem;
+        }
+        return 0;
+    }
+    s->prev[0] = newSmem;
+#ifdef ENABLE_PREFETCH
+    _mm_prefetch((const char *)(&cp_planes[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch((const char *)(&cp_planes[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+    return 1;
+}
+
+/* ls_advance_backward_step's two general loops (numPrev > 1) on the compact
+ * layout, for base A and count layout WIDE. The slot's fields, the checkpoint state and count[A] are
+ * held in locals: read through s and this, clang reloads them after every
+ * prev[] store (the SMEM stores may alias them as far as it can tell). prev[]
+ * and match_buf[] are driver-owned buffers that overlap neither the slot nor
+ * the index, so this is byte-identical. Returns numCurr. */
+template <int A, bool WIDE>
+int32_t FMI_search::ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPrev, int32_t min_intv,
+                                        int32_t j, int32_t minSeedLen, int64_t count_a)
+{
+    const CpView cpv = cp_view();
+    const CP_OCC_PLANES *const cpo = cpv.cp;
+    int32_t numCurr = 0;
+    int32_t curr_s = -1;   /* int32_t, as the loops have always kept it */
+    int p;
+    for (p = 0; p < numPrev; p++) {
+        SMEM smem = prev[p];
+        SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, smem);
+        newSmem.m = j;
+        if ((newSmem.s < min_intv) && ((smem.n - smem.m + 1) >= minSeedLen)) {
+            s->cur_j = j;
+            s->match_buf[s->match_count++] = smem;
+            break;
+        }
+        if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
+            curr_s = newSmem.s;
+            prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+            _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+            _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+            break;
+        }
+    }
+    p++;
+    for (; p < numPrev; p++) {
+        SMEM smem = prev[p];
+        SMEM newSmem = backwardExt_konly_ab<A, WIDE>(cpv, count_a, smem);
+        newSmem.m = j;
+        if ((newSmem.s >= min_intv) && (newSmem.s != curr_s)) {
+            curr_s = newSmem.s;
+            prev[numCurr++] = newSmem;
+#ifdef ENABLE_PREFETCH
+            _mm_prefetch((const char *)(&cpo[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
+            _mm_prefetch((const char *)(&cpo[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+#endif
+        }
+    }
+    return numCurr;
+}
+
+template <bool PL>
 void FMI_search::ls_advance_backward_step(BatchSlot *s,
                                           const uint8_t *enc_qdb,
                                           int32_t minSeedLen)
@@ -2170,6 +2525,32 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
         uint8_t a = enc_qdb[s->offset + s->j];
         if (a > 3) goto DONE;
 
+        if (PL) {
+            /* The compact layout: the base and the count layout pick a step
+             * specialised for both (cp_occ_t), for the numPrev == 1 path and
+             * the general loops alike, with the same bookkeeping as the
+             * default layout's code below. */
+            if (s->numPrev == 1) {
+                numCurr = ls_backward_one(s, a, minSeedLen);
+                s->numPrev = numCurr;
+                s->j--;
+                if (numCurr == 0) goto DONE;
+                return;
+            }
+            SMEM *const prev = s->prev;
+            const int32_t numPrev = s->numPrev;
+            const int32_t min_intv = s->min_intv;
+            const int32_t j = s->j;
+            const int64_t count_a = count[a];
+            numCurr = cp_step_dispatch<int32_t>(cp_wide, a,
+                                                LsBackwardGeneral{this, s, prev, numPrev, min_intv, j, minSeedLen,
+                                                                  count_a});
+            s->numPrev = numCurr;
+            s->j = j - 1;
+            if (numCurr == 0) goto DONE;
+            return;
+        }
+
         /* numPrev==1 straight-line path: the two-loop machinery and the curr_s
          * dedup collapse to a single element. Byte-identical. A hand-kept copy
          * of the general loops below (emit predicate, prefetch pair, numCurr/j--
@@ -2177,10 +2558,13 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
          * (unique matches, the common case) silently diverge; the lockstep
          * parity test's Case 13 guards it. It keeps the member call and s->
          * reads on purpose: one step has no per-iteration reloads for the
-         * general loops' hoisted locals to save. */
+         * general loops' hoisted locals to save. The compact layout runs two
+         * more hand-kept copies of the same logic, ls_backward_one (this path)
+         * and ls_backward_general (the loops below), kept separate so each
+         * layout's step inlines into its own loop: mirror an edit in all four. */
         if (s->numPrev == 1) {
             SMEM smem = s->prev[0];
-            SMEM newSmem = backwardExt_konly(smem, a);
+            SMEM newSmem = backwardExt_konly_file(smem, a);
             newSmem.m = s->j;
             if (newSmem.s < s->min_intv) {
                 if ((smem.n - smem.m + 1) >= minSeedLen) {
@@ -2191,8 +2575,8 @@ void FMI_search::ls_advance_backward_step(BatchSlot *s,
             } else {
                 s->prev[0] = newSmem;
 #ifdef ENABLE_PREFETCH
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k) >> CP_SHIFT]), _MM_HINT_T0);
-                _mm_prefetch((const char *)(&cp_occ[(newSmem.k + newSmem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                _mm_prefetch(cp_line<PL>(newSmem.k), _MM_HINT_T0);
+                _mm_prefetch(cp_line<PL>(newSmem.k + newSmem.s), _MM_HINT_T0);
 #endif
                 numCurr = 1;
             }
@@ -2339,11 +2723,12 @@ static inline int32_t bwtseed_x_end(int32_t readlength, int32_t minSeedLen)
 // NOT smem.k. Prefetching smem.k (the un-swapped field) targets the wrong lines,
 // so every continuation-step prefetch was a no-op and each step paid full cp_occ
 // latency. smem.s is unchanged by the k<->l swap.
+template <bool PL>
 void FMI_search::bsd_prefetch_cp_occ(const BwtSeedSlot *s)
 {
 #ifdef ENABLE_PREFETCH
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l) >> CP_SHIFT]), _MM_HINT_T0);
-    _mm_prefetch((const char *)(&cp_occ[(s->smem.l + s->smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.l), _MM_HINT_T0);
+    _mm_prefetch(cp_line<PL>(s->smem.l + s->smem.s), _MM_HINT_T0);
 #else
     (void)s;
 #endif
@@ -2460,6 +2845,7 @@ void FMI_search::bsd_init_slot(BwtSeedSlot *s,
 //       } else { break; }
 //   }
 //   x = next_x;
+template <bool PL>
 void FMI_search::bsd_advance_step(BwtSeedSlot *s,
                                   const uint8_t *enc_qdb,
                                   int32_t minSeedLen,
@@ -2476,7 +2862,7 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
         s->smem.s = e.s;
         s->smem.n = s->x + jd - 1;
         s->j      = s->x + jd;
-        bsd_prefetch_cp_occ(s);
+        bsd_prefetch_cp_occ<PL>(s);
         return;
     }
 
@@ -2533,13 +2919,7 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
 
     // Forward extension = backward extension on the BWT of the reverse
     // complement: swap k <-> l around backwardExt(., 3-a) and swap back.
-    SMEM smem_ = s->smem;
-    smem_.k = s->smem.l;
-    smem_.l = s->smem.k;
-    SMEM newSmem_ = backwardExt(smem_, 3 - a);
-    SMEM newSmem  = newSmem_;
-    newSmem.k = newSmem_.l;
-    newSmem.l = newSmem_.k;
+    SMEM newSmem = forwardExt_t<PL>(s->smem, a);
     newSmem.n = s->j;
 
     if ((newSmem.s < s->max_intv) && ((newSmem.n - newSmem.m + 1) >= minSeedLen)) {
@@ -2557,7 +2937,7 @@ void FMI_search::bsd_advance_step(BwtSeedSlot *s,
 
     s->smem = newSmem;
     s->j++;
-    bsd_prefetch_cp_occ(s);
+    bsd_prefetch_cp_occ<PL>(s);
 }
 // ===== End lockstep bwtSeed batching =====
 
@@ -2642,7 +3022,8 @@ void FMI_search::getSMEMsAllPosOneThread(uint8_t *enc_qdb,
     _mm_free(query_pos_array);
 }
 
-void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
+template <bool PL>
+void FMI_search::getSMEMsOnePosOneThread_lockstep_t(uint8_t *enc_qdb,
                                                    int32_t *query_pos_array,
                                                    int32_t *min_intv_array,
                                                    int32_t *rid_array,
@@ -2730,7 +3111,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
     for (int32_t s = 0; s < initial; s++) {
         ls_init_slot(&slots[s], s, query_pos_array, min_intv_array,
                      rid_array, seq_, query_cum_len_ar, enc_qdb, bsd_hint);
-        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ(&slots[s]);
+        if (slots[s].phase == PH_FWD) ls_prefetch_cp_occ<PL>(&slots[s]);
     }
     // Any unused slots (numReads < N) start idle: DONE with no input, so the
     // stepping pass does nothing for them.
@@ -2759,32 +3140,32 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
             BatchSlot *sl = &slots[s];
             switch (sl->phase) {
                 case PH_FWD:
-                    ls_advance_forward_step(sl, enc_qdb, s1_text);
+                    ls_advance_forward_step<PL>(sl, enc_qdb, s1_text);
                     // If forward just transitioned to PH_BWD_INIT, run the
                     // between-phases housekeeping immediately. prepare_backward
                     // may transition straight to PH_DONE (e.g. empty prev[]).
                     if (sl->phase == PH_BWD_INIT) {
-                        ls_prepare_backward(sl);
+                        ls_prepare_backward<PL>(sl);
                     }
                     break;
                 case PH_S1_LF:
-                    ls_s1_lf_step(sl, s1_pac, s1_l_pac);
+                    ls_s1_lf_step<PL>(sl, s1_pac, s1_l_pac);
                     break;
                 case PH_S1_CMP:
                     ls_s1_compare(sl, enc_qdb, s1_pac, s1_l_pac);
-                    ls_prepare_backward(sl);
+                    ls_prepare_backward<PL>(sl);
                     break;
                 case PH_FWD_TABLE:
-                    ls_advance_forward_table(sl, enc_qdb, s1_text);
+                    ls_advance_forward_table<PL>(sl, enc_qdb, s1_text);
                     if (sl->phase == PH_BWD_INIT) {
-                        ls_prepare_backward(sl);
+                        ls_prepare_backward<PL>(sl);
                     }
                     break;
                 case PH_BWD_INIT:
-                    ls_prepare_backward(sl);
+                    ls_prepare_backward<PL>(sl);
                     break;
                 case PH_BWD:
-                    ls_advance_backward_step(sl, enc_qdb, minSeedLen);
+                    ls_advance_backward_step<PL>(sl, enc_qdb, minSeedLen);
                     break;
                 case PH_DONE:
                     break;
@@ -2800,7 +3181,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                 if (next_input < numReads && parked.admits(next_input)) {
                     ls_init_slot(sl, next_input, query_pos_array, min_intv_array,
                                  rid_array, seq_, query_cum_len_ar, enc_qdb, bsd_hint);
-                    if (sl->phase == PH_FWD) ls_prefetch_cp_occ(sl);
+                    if (sl->phase == PH_FWD) ls_prefetch_cp_occ<PL>(sl);
                     next_input++;
                 } else {
                     sl->input_idx = -1;
@@ -2823,7 +3204,7 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
                 if (sl->input_idx >= 0) continue;
                 ls_init_slot(sl, next_input, query_pos_array, min_intv_array,
                              rid_array, seq_, query_cum_len_ar, enc_qdb, bsd_hint);
-                if (sl->phase == PH_FWD) ls_prefetch_cp_occ(sl);
+                if (sl->phase == PH_FWD) ls_prefetch_cp_occ<PL>(sl);
                 next_input++;
                 idle--;
             }
@@ -2837,7 +3218,8 @@ void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb,
      * LockstepSmemCache's destructor at thread exit. */
 }
 
-int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
+template <bool PL>
+int64_t FMI_search::bwtSeedStrategyAllPosOneThread_t(uint8_t *enc_qdb,
                                                    int32_t *max_intv_array,
                                                    int32_t numReads,
                                                    const bseq1_t *seq_,
@@ -2885,17 +3267,8 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                     a = enc_qdb[offset + j];
                     if(a < 4)
                     {
-                        SMEM smem_ = smem;
-
                         // Forward extension is backward extension with the BWT of reverse complement
-                        smem_.k = smem.l;
-                        smem_.l = smem.k;
-                        SMEM newSmem_ = backwardExt(smem_, 3 - a);
-                        //SMEM smem = backwardExt(smem, 3 - a);
-                        //smem.n = j;
-                        SMEM newSmem = newSmem_;
-                        newSmem.k = newSmem_.l;
-                        newSmem.l = newSmem_.k;
+                        SMEM newSmem = forwardExt_t<PL>(smem, a);
                         newSmem.n = j;
                         smem = newSmem;
 #ifdef ENABLE_PREFETCH
@@ -2903,8 +3276,8 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
                          * sp = smem.l, ep = smem.l + smem.s after the k<->l swap.
                          * This is the x86 default round-3 path (the lockstep variant
                          * is arm64-gated), so it was missing the #242 fix entirely. */
-                        _mm_prefetch((const char *)(&cp_occ[(smem.l) >> CP_SHIFT]), _MM_HINT_T0);
-                        _mm_prefetch((const char *)(&cp_occ[(smem.l + smem.s) >> CP_SHIFT]), _MM_HINT_T0);
+                        _mm_prefetch(cp_line<PL>(smem.l), _MM_HINT_T0);
+                        _mm_prefetch(cp_line<PL>(smem.l + smem.s), _MM_HINT_T0);
 #endif
 
 
@@ -2944,7 +3317,8 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb,
 // rationale. Prefetch model: same-slot T0 only, at the end of each step
 // (bsd_advance_step) and at slot init; as in the SMEM driver, there is no
 // cross-slot T1 lookahead (see the stepping pass below).
-int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
+template <bool PL>
+int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep_t(uint8_t *enc_qdb,
                                                             int32_t *max_intv_array,
                                                             int32_t numReads,
                                                             const bseq1_t *seq_,
@@ -3011,7 +3385,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
     for (int32_t s = 0; s < initial; s++) {
         bsd_init_slot(&slots[s], s, max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd,
                       minSeedLen, bsd_hint);
-        if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr) bsd_prefetch_cp_occ(&slots[s]);
+        if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr) bsd_prefetch_cp_occ<PL>(&slots[s]);
     }
     // Unused slots get input_idx = -1 so the flush pass skips them.
     for (int32_t s = initial; s < N; s++) {
@@ -3029,7 +3403,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
         // Stepping pass: advance each active slot by one unit of work.
         for (int32_t s = 0; s < N; s++) {
             if (slots[s].phase == BSD_FWD) {
-                bsd_advance_step(&slots[s], enc_qdb, minSeedLen, jlev, jd);
+                bsd_advance_step<PL>(&slots[s], enc_qdb, minSeedLen, jlev, jd);
             }
             // No cross-slot prefetch for another slot's next visit: a slot that
             // steps next already hinted its two cp_occ lines (smem.l and
@@ -3059,7 +3433,7 @@ int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb,
                               max_intv_array, seq_, query_cum_len_ar, enc_qdb, jlev, jd,
                               minSeedLen, bsd_hint);
                 if (slots[s].phase == BSD_FWD && slots[s].jump == nullptr)
-                    bsd_prefetch_cp_occ(&slots[s]);
+                    bsd_prefetch_cp_occ<PL>(&slots[s]);
                 next_input++;
             } else {
                 slots[s].input_idx = -1;
@@ -3310,82 +3684,116 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
 }
 #endif // !SA_COMPRESSION
 
-// sa_compression
-int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
+/* ---- The SA resolver's LF walks (get_sa_entry_compressed, call_one_step) ----
+ * One body each for both checkpoint layouts; only the LF step (the base at sp, the
+ * sentinel test, its occurrence count) depends on the layout. */
+
+/* The SA value of a sampled row (sp & sa_compx_mask == 0). */
+__attribute__((always_inline)) inline int64_t FMI_search::sa_sample_value(int64_t sp) const
 {
-    if ((pos & sa_compx_mask) == 0) {
-        
-        #if  SA_COMPRESSION
-        int64_t sa_entry = sa_hi_at(pos >> sa_compx);
-        #else
-        int64_t sa_entry = sa_hi_at(pos);     // simulation
-        #endif
-        
-        sa_entry = sa_entry << 32;
-        
-        #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];
-        #else
-        sa_entry = sa_entry + sa_ls_word[pos];   // simulation
-        #endif
-        
-        return sa_entry;        
-    }
-    else {
-        // tprof[MEM_CHAIN][tid] ++;
-        int64_t offset = 0; 
-        int64_t sp = pos;
-        while(true)
-        {
-            int64_t occ_id_pp_ = sp >> CP_SHIFT;
-            int64_t y_pp_ = CP_BLOCK_SIZE - (sp & CP_MASK) - 1; 
-            uint64_t *one_hot_bwt_str = cp_occ[occ_id_pp_].one_hot_bwt_str;
-            uint8_t b;
-
-            if((one_hot_bwt_str[0] >> y_pp_) & 1)
-                b = 0;
-            else if((one_hot_bwt_str[1] >> y_pp_) & 1)
-                b = 1;
-            else if((one_hot_bwt_str[2] >> y_pp_) & 1)
-                b = 2;
-            else if((one_hot_bwt_str[3] >> y_pp_) & 1)
-                b = 3;
-            else
-                b = 4;
-
-            if (b == 4) {
-                return offset;
-            }
-
-            GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
-
-            sp = count[b] + occ_sp;
-            
-            offset ++;
-            // tprof[ALIGN1][tid] ++;
-            if ((sp & sa_compx_mask) == 0) break;
-        }
-        // assert((reference_seq_len >> sa_compx) - 1 >= (sp >> sa_compx));
-        #if  SA_COMPRESSION
-        int64_t sa_entry = sa_hi_at(sp >> sa_compx);
-        #else
-        int64_t sa_entry = sa_hi_at(sp);      // simultion
-        #endif
-        
-        sa_entry = sa_entry << 32;
-
-        #if  SA_COMPRESSION
-        sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
-        #else
-        sa_entry = sa_entry + sa_ls_word[sp];      // simulation
-        #endif
-        
-        sa_entry += offset;
-        return sa_entry;
-    }
+#if SA_COMPRESSION
+    int64_t sa_entry = sa_hi_at(sp >> sa_compx);
+    sa_entry = sa_entry << 32;
+    sa_entry = sa_entry + sa_ls_word[sp >> sa_compx];
+#else
+    int64_t sa_entry = sa_hi_at(sp);              // simulation
+    sa_entry = sa_entry << 32;
+    sa_entry = sa_entry + sa_ls_word[sp];         // simulation
+#endif
+    return sa_entry;
 }
 
-void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *coordCountArray, uint32_t count, int32_t max_occ, int tid)
+/* The compact layout's LF step at sp, for both walks: false at the sentinel row (which has no
+ * base; the planes store it as an A, so it is tested by index, before its block is read, on a
+ * branch that is nearly never taken), else sp <- LF(sp). The base at sp is two plane bits: no
+ * branch on it (the bases are near uniform, so a branch would mispredict on most LF steps). */
+__attribute__((always_inline)) inline bool FMI_search::sa_lf_step_planes(int64_t &sp) const
+{
+    if (sp == sentinel_index) return false;
+    /* The row's own plane bits give both its base b and b's plane masks (all ones where
+     * b has that bit clear), so b's rows before sp need no masks derived from b. */
+    const CP_OCC_PLANES &blk = cp_planes[sp >> CP_SHIFT];
+    const int y = CP_MASK - (int)(sp & CP_MASK);
+    const uint64_t hb = (blk.hi >> y) & 1, lb = (blk.lo >> y) & 1;
+    const int b = (int)(hb << 1 | lb);
+    int64_t occ = (int64_t)blk.cp_count[b] + cp_rows(blk, sp, hb - 1, lb - 1);
+    if (__builtin_expect(cp_wide, 0)) occ += cp_base[sp >> cp_span_shift][b];
+    if (__builtin_expect((uint64_t)(sp - cp_sent_after) < cp_sent_len, 0)) occ -= (int64_t)(b == 0);
+    sp = count[b] + occ;
+    return true;
+}
+
+/* get_sa_entry_compressed's LF step: false at the sentinel row, else sp <- LF(sp). The default
+ * layout finds the base plane by plane; its sentinel row sets no plane. */
+template <bool PL>
+__attribute__((always_inline)) inline bool FMI_search::sa_lf_step_walk(int64_t &sp) const
+{
+    if (PL) return sa_lf_step_planes(sp);
+    int64_t occ_id_pp_ = sp >> CP_SHIFT;
+    int64_t y_pp_ = CP_BLOCK_SIZE - (sp & CP_MASK) - 1;
+    const uint64_t *one_hot_bwt_str = cp_occ[occ_id_pp_].one_hot_bwt_str;
+    uint8_t b;
+
+    if((one_hot_bwt_str[0] >> y_pp_) & 1)
+        b = 0;
+    else if((one_hot_bwt_str[1] >> y_pp_) & 1)
+        b = 1;
+    else if((one_hot_bwt_str[2] >> y_pp_) & 1)
+        b = 2;
+    else if((one_hot_bwt_str[3] >> y_pp_) & 1)
+        b = 3;
+    else
+        b = 4;
+
+    if (b == 4) return false;
+
+    GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
+
+    sp = count[b] + occ_sp;
+    return true;
+}
+
+/* Walk LF from pos to the nearest sampled row: its SA value plus the steps walked, or the steps
+ * walked when the walk reaches the sentinel row (SA value 0). */
+template <bool PL>
+__attribute__((always_inline)) inline int64_t FMI_search::get_sa_entry_walk(int64_t pos)
+{
+    if ((pos & sa_compx_mask) == 0) return sa_sample_value(pos);
+    int64_t offset = 0;
+    int64_t sp = pos;
+    while (true) {
+        if (!sa_lf_step_walk<PL>(sp)) return offset;
+        offset ++;
+        if ((sp & sa_compx_mask) == 0) break;
+    }
+    // assert((reference_seq_len >> sa_compx) - 1 >= (sp >> sa_compx));
+    return sa_sample_value(sp) + offset;
+}
+
+// sa_compression
+int64_t FMI_search::get_sa_entry_compressed_file(int64_t pos, int tid)
+{
+    (void)tid;
+    return get_sa_entry_walk<false>(pos);
+}
+
+/* The compact layout's walk (get_sa_entry_compressed_file's contract). */
+int64_t FMI_search::get_sa_entry_compressed_planes(int64_t pos, int tid)
+{
+    (void)tid;
+    return get_sa_entry_walk<true>(pos);
+}
+
+/* get_sa_entry_compressed on this object's checkpoint layout: the compact
+ * layout's walk tests the sentinel row by index (the planes store it as an A),
+ * the default layout's by its empty one-hot planes. */
+int64_t FMI_search::get_sa_entry_compressed(int64_t pos, int tid)
+{
+    return cp_compact ? get_sa_entry_compressed_planes(pos, tid) : get_sa_entry_compressed_file(pos, tid);
+}
+
+template <bool PL>
+void FMI_search::get_sa_entries_t(SMEM *smemArray, int64_t *coordArray, int32_t *coordCountArray, uint32_t count, int32_t max_occ, int tid)
 {
     
     uint32_t i;
@@ -3400,7 +3808,7 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
         for(j = smem.k; (j < hi) && (c < max_occ); j+=step, c++)
         {
             int64_t pos = j;
-            int64_t sa_entry = get_sa_entry_compressed(pos, tid);
+            int64_t sa_entry = get_sa_entry_compressed_t<PL>(pos, tid);
             coordArray[totalCoordCount + c] = sa_entry;
         }
         // coordCountArray[i] = c;
@@ -3409,98 +3817,112 @@ void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *c
     }
 }
 
-// SA_COPMRESSION w/ PREFETCH
-int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
-                                  int drop_sentinel_offset)
+/* call_one_step's LF step: false at the sentinel row, else sp <- LF(sp). The default layout's
+ * is branch-free on the base (below), unlike the walk's plane-at-a-time test. */
+template <bool PL>
+__attribute__((always_inline)) inline bool FMI_search::sa_lf_step_one(int64_t &sp) const
+{
+    if (PL) return sa_lf_step_planes(sp);
+    int64_t occ_id_pp_ = sp >> CP_SHIFT;
+    int64_t y_pp_ = CP_BLOCK_SIZE - (sp & CP_MASK) - 1;
+    const uint64_t *one_hot_bwt_str = cp_occ[occ_id_pp_].one_hot_bwt_str;
+    uint8_t b;
+
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+    /* The BWT symbol at sp is one-hot across the four bit-planes, and the
+     * bases are close to uniformly distributed, so testing the planes one
+     * branch at a time mispredicts on most steps. Test all four at once
+     * and pick the symbol with a ternary over them; the empty case (no plane
+     * set) is the sentinel row, kept as the one real branch since it is
+     * nearly never taken. The occurrence count then reuses the k-only
+     * backward step's NEON popcount, whose d-register loads keep the
+     * masked word out of the general-purpose file. Symbol priority
+     * (lowest plane wins) matches the plane-at-a-time test exactly. */
+    const unsigned t0 = (unsigned)((one_hot_bwt_str[0] >> y_pp_) & 1);
+    const unsigned t1 = (unsigned)((one_hot_bwt_str[1] >> y_pp_) & 1);
+    const unsigned t2 = (unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1);
+    const unsigned t3 = (unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1);
+    if ((t0 | t1 | t2 | t3) == 0) return false;   // the sentinel ($) row: no bit-plane set
+    b = (uint8_t)(t0 ? 0 : t1 ? 1 : t2 ? 2 : 3);
+    const int64_t occ_sp = cp_occ[occ_id_pp_].cp_count[b] +
+        occ_popcount64(&one_hot_bwt_str[b], &one_hot_mask_array[sp & CP_MASK]);
+#else
+    /* As on NEON above: the symbol at sp is one-hot across the four
+     * bit-planes and the bases are near uniform, so a plane-at-a-time
+     * branch chain mispredicts on most LF steps, and in this
+     * multi-lane pipelined resolver a mispredict also discards
+     * the other lanes' in-flight work. Gather the four plane bits into
+     * one 4-bit mask and take its lowest set bit, which matches the
+     * plane-at-a-time test's priority (lowest plane wins). An empty
+     * mask is the sentinel row, kept as the one real branch since it
+     * is nearly never taken. */
+    const unsigned planes =
+          (unsigned)((one_hot_bwt_str[0] >> y_pp_) & 1)
+        | ((unsigned)((one_hot_bwt_str[1] >> y_pp_) & 1) << 1)
+        | ((unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1) << 2)
+        | ((unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1) << 3);
+    if (planes == 0) return false;   // the sentinel ($) row: no bit-plane set
+    b = (uint8_t)__builtin_ctz(planes);
+
+    GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
+#endif
+    
+    sp = count[b] + occ_sp;
+    return true;
+}
+
+/* One LF step of a pipelined lane (get_sa_entries_prefetch). Returns 1 with the SA entry in
+ * sa_entry when pos is a sampled row or the sentinel row, else 0 with sa_entry the next row and
+ * offset advanced. At the sentinel row ($) the SA value is 0 and `offset` LF steps were walked to
+ * reach it, so the SA entry is 0 + offset, as in get_sa_entry_compressed. bwa-mem2 set
+ * sa_entry = 0 there, dropping the walk and reporting positions within the first `offset` bases
+ * of the concatenated reference up to `offset` bases too far left; that is kept only for
+ * --compat=bwa-mem2 (drop_sentinel_offset), whose contract is to reproduce bwa-mem2's records. */
+template <bool PL>
+__attribute__((always_inline)) inline int64_t FMI_search::call_one_step_walk(int64_t pos, int64_t &sa_entry,
+                                                                            int64_t &offset,
+                                                                            int drop_sentinel_offset)
 {
     if ((pos & sa_compx_mask) == 0) {
         // A sampled row: either freshly staged (offset 0) or reached by an LF
         // step on this lane's previous visit (offset = steps walked), whose
         // sample lines the caller has since prefetched.
-        sa_entry = sa_hi_at(pos >> sa_compx);
-        sa_entry = sa_entry << 32;
-        sa_entry = sa_entry + sa_ls_word[pos >> sa_compx];
-        sa_entry += offset;
+        sa_entry = sa_sample_value(pos) + offset;
         return 1;
     }
-    else {
-        // int64_t offset = 0; 
-        int64_t sp = pos;
+    int64_t sp = pos;
+    if (!sa_lf_step_one<PL>(sp)) {
+        sa_entry = drop_sentinel_offset ? 0 : offset;
+        return 1;
+    }
+    offset ++;
+    // Do not read the sample here even when sp is a sampled row: the load
+    // would be an un-prefetched miss into the multi-GB sample arrays. Hand
+    // sp back as a continuation; the caller prefetches its sample lines and
+    // the lane resolves it on its next visit (the sampled-row branch above).
+    sa_entry = sp;
+    return 0;
+}
 
-        int64_t occ_id_pp_ = sp >> CP_SHIFT;
-        int64_t y_pp_ = CP_BLOCK_SIZE - (sp & CP_MASK) - 1; 
-        uint64_t *one_hot_bwt_str = cp_occ[occ_id_pp_].one_hot_bwt_str;
-        uint8_t b;
+// SA_COPMRESSION w/ PREFETCH
+int64_t FMI_search::call_one_step_file(int64_t pos, int64_t &sa_entry, int64_t &offset,
+                                  int drop_sentinel_offset)
+{
+    return call_one_step_walk<false>(pos, sa_entry, offset, drop_sentinel_offset);
+}
 
-#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
-        /* The BWT symbol at sp is one-hot across the four bit-planes, and the
-         * bases are close to uniformly distributed, so testing the planes one
-         * branch at a time mispredicts on most steps. Test all four at once
-         * and pick the symbol with a ternary over them; the empty case (no plane
-         * set) is the sentinel row, kept as the one real branch since it is
-         * nearly never taken. The occurrence count then reuses the k-only
-         * backward step's NEON popcount, whose d-register loads keep the
-         * masked word out of the general-purpose file. Symbol priority
-         * (lowest plane wins) matches the plane-at-a-time test exactly. */
-        const unsigned t0 = (unsigned)((one_hot_bwt_str[0] >> y_pp_) & 1);
-        const unsigned t1 = (unsigned)((one_hot_bwt_str[1] >> y_pp_) & 1);
-        const unsigned t2 = (unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1);
-        const unsigned t3 = (unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1);
-        if ((t0 | t1 | t2 | t3) == 0) {
-            // Sentinel ($) row (no bit-plane set; the x86 arm's planes == 0):
-            // its suffix-array value is 0 and we walked `offset` LF steps to
-            // reach it, so the SA entry is 0 + offset. drop_sentinel_offset
-            // (=> 0) reproduces bwa-mem2's dropped walk for --compat=bwa-mem2;
-            // the default keeps the accumulated offset, matching the x86 arm
-            // and the compressed sibling get_sa_entry_compressed.
-            sa_entry = drop_sentinel_offset ? 0 : offset;
-            return 1;
-        }
-        b = (uint8_t)(t0 ? 0 : t1 ? 1 : t2 ? 2 : 3);
-        const int64_t occ_sp = cp_occ[occ_id_pp_].cp_count[b] +
-            occ_popcount64(&one_hot_bwt_str[b], &one_hot_mask_array[sp & CP_MASK]);
-#else
-        /* As on NEON above: the symbol at sp is one-hot across the four
-         * bit-planes and the bases are near uniform, so a plane-at-a-time
-         * branch chain mispredicts on most LF steps, and in this
-         * multi-lane pipelined resolver a mispredict also discards
-         * the other lanes' in-flight work. Gather the four plane bits into
-         * one 4-bit mask and take its lowest set bit, which matches the
-         * plane-at-a-time test's priority (lowest plane wins). An empty
-         * mask is the sentinel row, kept as the one real branch since it
-         * is nearly never taken. */
-        const unsigned planes =
-              (unsigned)((one_hot_bwt_str[0] >> y_pp_) & 1)
-            | ((unsigned)((one_hot_bwt_str[1] >> y_pp_) & 1) << 1)
-            | ((unsigned)((one_hot_bwt_str[2] >> y_pp_) & 1) << 2)
-            | ((unsigned)((one_hot_bwt_str[3] >> y_pp_) & 1) << 3);
-        if (planes == 0) {
-            // Sentinel ($) row: its suffix-array value is 0, and we have walked
-            // `offset` LF steps to reach it, so the SA entry is 0 + offset. The
-            // compressed sibling get_sa_entry_compressed returns `offset` here for
-            // the same reason. bwa-mem2 set sa_entry = 0 here, dropping the walk
-            // and reporting positions within the first `offset` bases of the
-            // concatenated reference up to `offset` bases too far left; that is
-            // kept only for --compat=bwa-mem2 (drop_sentinel_offset), whose
-            // contract is to reproduce bwa-mem2's records.
-            sa_entry = drop_sentinel_offset ? 0 : offset;
-            return 1;
-        }
-        b = (uint8_t)__builtin_ctz(planes);
+/* The compact layout's step (call_one_step_file's contract). */
+int64_t FMI_search::call_one_step_planes(int64_t pos, int64_t &sa_entry, int64_t &offset,
+                                  int drop_sentinel_offset)
+{
+    return call_one_step_walk<true>(pos, sa_entry, offset, drop_sentinel_offset);
+}
 
-        GET_OCC(sp, b, occ_id_sp, y_sp, occ_sp, one_hot_bwt_str_c_sp, match_mask_sp);
-#endif
-        
-        sp = count[b] + occ_sp;
-        
-        offset ++;
-        // Do not read the sample here even when sp is a sampled row: the load
-        // would be an un-prefetched miss into the multi-GB sample arrays. Hand
-        // sp back as a continuation; the caller prefetches its sample lines and
-        // the lane resolves it on its next visit (the sampled-row branch above).
-        sa_entry = sp;
-        return 0;
-    } // else
+int64_t FMI_search::call_one_step(int64_t pos, int64_t &sa_entry, int64_t &offset,
+                                  int drop_sentinel_offset)
+{
+    return cp_compact ? call_one_step_planes(pos, sa_entry, offset, drop_sentinel_offset)
+                      : call_one_step_file(pos, sa_entry, offset, drop_sentinel_offset);
 }
 
 /* Lane count of the pipelined compressed-SA resolver (get_sa_entries_prefetch);
@@ -3696,7 +4118,10 @@ static double       g_ks_net_m2   = 0.0;  /* Welford sum of squares */
  * break-even fallback; a re-probe confirms the incumbent at the ordinary z (or
  * keeps it on a probe-cap timeout), and only flips at a higher bar (z+1) so
  * noise near break-even cannot flap the decision. */
-static inline void ks_net_observe(double net_ns, int64_t positions)
+/* always_inline: get_sa_entries_prefetch_t has one instantiation per
+ * checkpoint layout, and with two callers clang stops inlining this (and
+ * find_or_insert below), which the single-layout driver always did. */
+__attribute__((always_inline)) static inline void ks_net_observe(double net_ns, int64_t positions)
 {
     if (positions <= 0) return;
     std::lock_guard<std::mutex> lk(g_ks_net_mtx);
@@ -3803,7 +4228,7 @@ struct KsDedupTable {
 
     /* Return the rep entry index for (kk,ss); if absent, insert with rep_base
      * and return -1 (caller then stages this interval as the rep). */
-    int64_t find_or_insert(int64_t kk, int64_t ss, int64_t rep_base) {
+    __attribute__((always_inline)) int64_t find_or_insert(int64_t kk, int64_t ss, int64_t rep_base) {
         uint64_t h = mix(kk, ss) & mask;
         for (;;) {
             uint32_t e = slot[h];
@@ -3850,7 +4275,8 @@ static struct KsDedupStatsDumper {
     }
 } g_ksdedup_stats_dumper;
 
-void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
+template <bool PL>
+void FMI_search::get_sa_entries_prefetch_t(SMEM *smemArray, int64_t *coordArray,
                                          int64_t *coordCountArray, int64_t count,
                                          const int32_t max_occ, int tid, int64_t &id_,
                                          int drop_sentinel_offset, bool trust_s1_tag)
@@ -4130,7 +4556,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             _mm_prefetch(&sa_ls_word[p >> sa_compx], _MM_HINT_T0);
         }
         else
-            _mm_prefetch(&cp_occ[p >> CP_SHIFT], _MM_HINT_T0);
+            _mm_prefetch(cp_line<PL>(p), _MM_HINT_T0);
     };
 
     if (ks_measure) ks_t_kern0 = std::chrono::steady_clock::now();
@@ -4158,7 +4584,7 @@ void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray,
             int64_t sp = 0, pos = 0;
             bool quit;
             if (offset[k] >= 0) {
-                quit = call_one_step(working_set[k], sp, offset[k], drop_sentinel_offset);
+                quit = call_one_step_t<PL>(working_set[k], sp, offset[k], drop_sentinel_offset);
             }
             else
                 continue;
@@ -4295,6 +4721,90 @@ bool FMI_search::sa_hi_pack(const int8_t *src, int64_t first, int64_t n, int log
         bad |= jobs[t].bad;
     }
     return bad == 0;
+}
+
+/* ===== The public drivers: one instantiation per checkpoint layout =====
+ * Each picks the layout once per call (a batch of reads, or of SMEMs to
+ * resolve), so no occurrence lookup tests it; the default layout's
+ * instantiation is that layout's code alone. */
+void FMI_search::getSMEMsOnePosOneThread(uint8_t *enc_qdb, int32_t *query_pos_array, int32_t *min_intv_array,
+                                         int32_t *rid_array, int32_t numReads, int32_t batch_size,
+                                         const bseq1_t *seq_, int32_t *query_cum_len_ar,
+                                         int32_t max_readlength, int32_t minSeedLen, SMEM *matchArray,
+                                         int64_t *__numTotalSmem)
+{
+    if (cp_compact)
+        getSMEMsOnePosOneThread_t<true>(enc_qdb, query_pos_array, min_intv_array, rid_array, numReads,
+                                        batch_size, seq_, query_cum_len_ar, max_readlength, minSeedLen,
+                                        matchArray, __numTotalSmem);
+    else
+        getSMEMsOnePosOneThread_t<false>(enc_qdb, query_pos_array, min_intv_array, rid_array, numReads,
+                                         batch_size, seq_, query_cum_len_ar, max_readlength, minSeedLen,
+                                         matchArray, __numTotalSmem);
+}
+
+void FMI_search::getSMEMsOnePosOneThread_lockstep(uint8_t *enc_qdb, int32_t *query_pos_array,
+                                                  int32_t *min_intv_array, int32_t *rid_array,
+                                                  int32_t numReads, int32_t batch_size, const bseq1_t *seq_,
+                                                  int32_t *query_cum_len_ar, int32_t max_readlength,
+                                                  int32_t minSeedLen, SMEM *matchArray,
+                                                  int64_t *__numTotalSmem, BsdFirstWalkHint *bsd_hint)
+{
+    if (cp_compact)
+        getSMEMsOnePosOneThread_lockstep_t<true>(enc_qdb, query_pos_array, min_intv_array, rid_array,
+                                                 numReads, batch_size, seq_, query_cum_len_ar,
+                                                 max_readlength, minSeedLen, matchArray, __numTotalSmem,
+                                                 bsd_hint);
+    else
+        getSMEMsOnePosOneThread_lockstep_t<false>(enc_qdb, query_pos_array, min_intv_array, rid_array,
+                                                  numReads, batch_size, seq_, query_cum_len_ar,
+                                                  max_readlength, minSeedLen, matchArray, __numTotalSmem,
+                                                  bsd_hint);
+}
+
+int64_t FMI_search::bwtSeedStrategyAllPosOneThread(uint8_t *enc_qdb, int32_t *max_intv_array, int32_t numReads,
+                                                   const bseq1_t *seq_, int32_t *query_cum_len_ar,
+                                                   int32_t minSeedLen, SMEM *matchArray)
+{
+    return cp_compact
+        ? bwtSeedStrategyAllPosOneThread_t<true>(enc_qdb, max_intv_array, numReads, seq_, query_cum_len_ar,
+                                                 minSeedLen, matchArray)
+        : bwtSeedStrategyAllPosOneThread_t<false>(enc_qdb, max_intv_array, numReads, seq_, query_cum_len_ar,
+                                                  minSeedLen, matchArray);
+}
+
+int64_t FMI_search::bwtSeedStrategyAllPosOneThread_lockstep(uint8_t *enc_qdb, int32_t *max_intv_array,
+                                                            int32_t numReads, const bseq1_t *seq_,
+                                                            int32_t *query_cum_len_ar, int32_t minSeedLen,
+                                                            SMEM *matchArray, int32_t max_readlength,
+                                                            const BsdFirstWalkHint *bsd_hint)
+{
+    return cp_compact
+        ? bwtSeedStrategyAllPosOneThread_lockstep_t<true>(enc_qdb, max_intv_array, numReads, seq_,
+                                                          query_cum_len_ar, minSeedLen, matchArray,
+                                                          max_readlength, bsd_hint)
+        : bwtSeedStrategyAllPosOneThread_lockstep_t<false>(enc_qdb, max_intv_array, numReads, seq_,
+                                                           query_cum_len_ar, minSeedLen, matchArray,
+                                                           max_readlength, bsd_hint);
+}
+
+void FMI_search::get_sa_entries(SMEM *smemArray, int64_t *coordArray, int32_t *coordCountArray, uint32_t count,
+                                int32_t max_occ, int tid)
+{
+    if (cp_compact) get_sa_entries_t<true>(smemArray, coordArray, coordCountArray, count, max_occ, tid);
+    else            get_sa_entries_t<false>(smemArray, coordArray, coordCountArray, count, max_occ, tid);
+}
+
+void FMI_search::get_sa_entries_prefetch(SMEM *smemArray, int64_t *coordArray, int64_t *coordCountArray,
+                                         int64_t count, const int32_t max_occ, int tid, int64_t &id_,
+                                         int drop_sentinel_offset, bool trust_s1_tag)
+{
+    if (cp_compact)
+        get_sa_entries_prefetch_t<true>(smemArray, coordArray, coordCountArray, count, max_occ, tid, id_,
+                                        drop_sentinel_offset, trust_s1_tag);
+    else
+        get_sa_entries_prefetch_t<false>(smemArray, coordArray, coordCountArray, count, max_occ, tid, id_,
+                                         drop_sentinel_offset, trust_s1_tag);
 }
 
 static int64_t g_sa_hi_read_chunk = (int64_t)1 << 20;

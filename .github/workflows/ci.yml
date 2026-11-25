@@ -908,6 +908,26 @@ jobs:
           UNIT_JUNIT_PREFIX="unit-results-${JOB_INDEX}" \
             bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit
 
+      - name: Run unit tests under the compact checkpoint layout (BWA3_COMPACT_OCC=1)
+        # The whole unit suite again with the occurrence checkpoints in the
+        # 32-byte compact layout (mem --compact-occ): the test fixtures pick each
+        # FMI_search's layout from BWA3_COMPACT_OCC (as main_mem does; the
+        # library itself never reads it), so the seeding and SA-resolution cases
+        # run that layout's instantiation of the drivers against the same
+        # oracles. The whole suite, not only the index cases, on purpose: it is
+        # the simplest way to be sure no index-touching case is left out. One
+        # row per architecture is enough: the layout's code has a NEON and a
+        # scalar arm, not one per SIMD tier.
+        if: matrix.canonical == true || runner.arch == 'ARM64'
+        env:
+          BWA_MEM3_TEST_MATRIX_ROW: ${{ matrix.name }}
+          BWA_REQUIRE_COMPACTION_TIER: ${{ runner.arch == 'X64' && 'avx2' || 'neon' }}
+          JOB_INDEX: ${{ strategy.job-index }}
+          BWA3_COMPACT_OCC: "1"
+        run: |
+          UNIT_JUNIT_PREFIX="unit-compact-results-${JOB_INDEX}" \
+            bash test/run_unit_shards.sh ./test/bwa_mem3_tests_unit
+
       - name: Real 1 GB hugetlb mapping (unit/huge_pages with a reserved page)
         # The --huge-pages unit test maps the occurrence table on a real 1 GB
         # page only when BWA_TEST_HUGETLB_POOL=1 and a page is free. Hosted
@@ -957,7 +977,9 @@ jobs:
           # name. upload-artifact@v7 technically allows spaces and parens
           # but a sanitized name keeps URLs and downloads clean.
           name: unit-results-${{ matrix.artifact_slug }}
-          path: unit-results-*.xml
+          path: |
+            unit-results-*.xml
+            unit-compact-results-*.xml
 
       - name: Zero-sequence index loads when calloc(0) returns NULL
         # A standalone binary, not a doctest case: it interposes calloc so a
@@ -1249,12 +1271,29 @@ jobs:
             --reporters=junit \
             --out="integration-results-${JOB_INDEX}.xml"
 
+      - name: Run integration tests under the compact checkpoint layout (BWA3_COMPACT_OCC=1)
+        # main_mem reads BWA3_COMPACT_OCC, so every mem run in the suite holds the
+        # checkpoints in the compact layout. Gated like the compact unit step:
+        # one row per architecture (the layout has a NEON and a scalar arm, not
+        # one per SIMD tier).
+        if: matrix.run_integration == true && (matrix.canonical == true || runner.arch == 'ARM64')
+        env:
+          BWA_MEM3_TEST_MATRIX_ROW: ${{ matrix.name }}
+          JOB_INDEX: ${{ strategy.job-index }}
+          BWA3_COMPACT_OCC: "1"
+        run: |
+          ./test/bwa_mem3_tests_integration \
+            --reporters=junit \
+            --out="integration-compact-results-${JOB_INDEX}.xml"
+
       - name: Upload integration-test results
         if: always() && matrix.run_integration == true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: integration-results-${{ matrix.artifact_slug }}
-          path: integration-results-*.xml
+          path: |
+            integration-results-*.xml
+            integration-compact-results-*.xml
 
       - name: Verify mimalloc is linked (when enabled)
         if: matrix.use_mimalloc == '1'
@@ -2092,6 +2131,14 @@ jobs:
           KS_DEDUP_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
           KS_DEDUP_WORK_DIR=/tmp/ks-dedup-bytes \
           bash test/regression/ks_dedup_byte_identity.sh
+
+      - name: byte-identity default==--compact-occ (occurrence checkpoint layout)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          COMPACT_OCC_SYN_FA="$GITHUB_WORKSPACE/test/fixtures/synthetic_1mb.fa" \
+          COMPACT_OCC_PHIX_FA="$GITHUB_WORKSPACE/test/fixtures/phix.fa" \
+          COMPACT_OCC_WORK_DIR=/tmp/compact-occ-bytes \
+          bash test/regression/compact_occ_byte_identity.sh
 
       - name: byte-identity default==--keep-contained-ext (contained-seed skip)
         run: |

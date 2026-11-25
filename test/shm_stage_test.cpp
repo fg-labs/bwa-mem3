@@ -984,6 +984,47 @@ void check_attach_need_pac() {
     std::printf("ok 12 a load that reads PAC declines a stage without it\n");
 }
 
+// A compact-layout load in a child; returns its stderr. It never attaches a
+// segment, so it loads from disk and exits 0 whatever is staged.
+std::string compact_load_stderr(const Names &n, const std::string &prefix) {
+    const std::string log = n.dir.file("compact.log");
+    fflush(NULL);
+    const pid_t pid = fork();
+    CHECK(pid >= 0);
+    if (pid == 0) {
+        alarm(20);
+        if (freopen(log.c_str(), "w", stderr) == NULL) _exit(94);
+        FMI_search fmi(prefix.c_str());
+        fmi.set_compact_occ(true);
+        fmi.load_index(/*load_pac=*/false, /*n_threads=*/1, /*build_seed_jump=*/false);
+        fflush(NULL);
+        _exit(0);
+    }
+    CHECK(exited(wait_status(pid), 0));
+    return slurp(log);
+}
+
+// 13. The compact layout's "not attaching the staged index" warning needs a
+//     complete segment: a registry entry whose segment is missing or still
+//     being staged holds no index, so the load says nothing about one.
+void check_compact_warns_only_on_complete() {
+    const char *warning = "not attaching the index staged in shared memory";
+    Names n({"cmp"});
+    const std::string prefix = n.prefix("cmp");
+    register_entry("cmp", 64);   // registered, no segment
+    CHECK(bwa_shm_test(prefix.c_str()) == 1 && bwa_shm_test_complete(prefix.c_str()) == 0);
+    CHECK(!has(compact_load_stderr(n, prefix), warning));
+    make_segment(n.segment, sizeof(bwa_shm_header_t), 0, (uint64_t)getpid(), 7);   // staging
+    CHECK(bwa_shm_test_complete(prefix.c_str()) == 0);
+    CHECK(!has(compact_load_stderr(n, prefix), warning));
+    CHECK(shm_unlink(n.segment.c_str()) == 0);
+    unregister_entry("cmp");
+    CHECK(exited(wait_status(spawn_stage(prefix, HOOK_NONE)), 0));
+    CHECK(bwa_shm_test_complete(prefix.c_str()) == 1);
+    CHECK(has(compact_load_stderr(n, prefix), warning));
+    std::printf("ok 13 the compact load warns of a staged index only when it is complete\n");
+}
+
 // Stage `prefix` in a child that must exit with `code`; returns its stderr.
 std::string stage_stderr(const Names &n, const std::string &prefix, bool huge, int code) {
     g_child_stderr = n.dir.file("stderr");
@@ -1271,7 +1312,7 @@ void check_huge_foreign() {
     CHECK(names3 != NULL && names3->size >= 2 && scalars3 != NULL);
     int64_t *ref_len3 = (int64_t *)((uint8_t *)index3 + scalars3->offset);
     int64_t *count4_3 = ref_len3 + 1 + 4;   // count[4], after reference_seq_len
-    CHECK(*count4_3 == *ref_len3);          // the largest a real index has
+    CHECK(*count4_3 == *ref_len3);          // the only value a real index has
     const uint64_t names_size3 = names3->size;
     const int64_t count4_value3 = *count4_3;
     CHECK(cp_occ3 != NULL && cp_occ3->size >= sizeof(CP_OCC));
@@ -2012,6 +2053,7 @@ int main(int argc, char *argv[]) {
         check_capacity_allocated();
         check_early_exit();
         check_attach_need_pac();
+        check_compact_warns_only_on_complete();
         if (rmid_forced() != 0 && !(rmid_forced() < 0 && !is_linux())) {
             // The kernel removes every System V segment when its stager exits,
             // or may (the setting cannot be read).

@@ -421,6 +421,57 @@ for lanes in 48 40; do
     fi
 done
 
+# --- the seeding and SA parity tests under the compact checkpoint layout ---
+# BWA3_COMPACT_OCC=1 (mem --compact-occ) holds the occurrence checkpoints in the
+# 32-byte compact layout, read by a separate instantiation of every seeding and
+# SA-resolution driver. Each test below compares a driver or kernel with a
+# reference computed from the index file's own records or with the scalar
+# driver, so it must pass under the compact layout too, and the lockstep tests'
+# per-case lines (seed and SMEM counts) must equal the default layout's.
+compact_case_lines() { grep -E '^\[(PASS|FAIL|SKIP)\]|cases passed$' || true; }
+for t in smem_lockstep_parity_test bwtseed_lockstep_parity_test seed_jump_table_test; do
+    DEF_OUT="$(cd "$HERE" && env -u BWA3_COMPACT_OCC -u BWA3_BWTSEED_JUMP ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
+        || {
+            echo "$DEF_OUT"
+            fail "$t (default layout): non-zero exit"
+        }
+    DEF="$(printf '%s\n' "$DEF_OUT" | compact_case_lines)"
+    printf '%s\n' "$DEF" | grep -qE '^[0-9]+ / [0-9]+ cases passed$' \
+        || {
+            echo "$DEF_OUT"
+            fail "$t (default layout): no case summary to compare the compact layout with"
+        }
+    OUT="$(cd "$HERE" && env -u BWA3_BWTSEED_JUMP BWA3_COMPACT_OCC=1 ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
+        || {
+            echo "$OUT"
+            fail "$t (BWA3_COMPACT_OCC=1): non-zero exit"
+        }
+    [[ "$(printf '%s\n' "$OUT" | compact_case_lines)" == "$DEF" ]] \
+        || {
+            echo "$OUT"
+            fail "$t (BWA3_COMPACT_OCC=1): case lines differ from the default layout"
+        }
+    ok "$t (BWA3_COMPACT_OCC=1)"
+done
+for spec in "backwardext_konly_parity_test:backwardExt_konly PARITY PASS" \
+    "backwardext_parity_test:backwardExt PARITY PASS" \
+    "sa_lookup_sentinel_parity_test:PASS:" \
+    "sa_resolve_parity_test:SA resolve PARITY PASS"; do
+    t="${spec%%:*}"
+    marker="${spec#*:}"
+    if OUT="$(cd "$HERE" && env -u BWA3_SA_LANES BWA3_COMPACT_OCC=1 ./"$t" "$FIXTURES/phix.fa" 2>&1)"; then
+        echo "$OUT" | grep -qF "$marker" \
+            || {
+                echo "$OUT"
+                fail "$t (BWA3_COMPACT_OCC=1): no PASS line"
+            }
+        ok "$t (BWA3_COMPACT_OCC=1)"
+    else
+        echo "$OUT"
+        fail "$t (BWA3_COMPACT_OCC=1): non-zero exit"
+    fi
+done
+
 # --- long-read end-to-end (issue 44) --------------------------------------
 # Pre-fix, reads > 151 bp overran the per-thread SMEM buffer (segfault) and
 # reads > 512 bp tripped the MAX_READ_LEN_FOR_LOCKSTEP assert. Post-fix the

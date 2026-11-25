@@ -619,6 +619,43 @@ See [Memory allocator → Large pages for the index](../user-guide/allocator.md#
 and [Optimization checklist → Reserve 1 GB huge pages](../best-practices/optimization-checklist.md#8-reserve-1-gb-huge-pages-for-the-index-linux-opt-in)
 for reservation and verification.
 
+## `--compact-occ` compact occurrence checkpoints
+
+*Introduced in [PR #830](https://github.com/fg-labs/bwa-mem3/pull/830).*
+
+**Off by default.** `mem --compact-occ` converts the FM-index occurrence
+checkpoints from the on-disk 64-byte records to a 32-byte layout while loading.
+The index files do not change. The design contract is **byte-identical alignment
+records** to the default layout for the same reads and run settings when both
+runs use the same suffix-array sampling (the `--compat=bwa-mem2` exception is
+below): the compact layout losslessly represents the same counts and bases,
+including sentinel handling. Only the `@PG` `CL:` field differs because it
+records the flag.
+See [`mem` → `--compact-occ`](../cli/mem.md#--compact-occ--hold-the-occurrence-checkpoints-in-half-the-memory-opt-in)
+for the loading contract and the scope of the retained macOS arm64 correctness
+run (NEON runtime, clang 21.0.0). That fixture-based evidence is not exhaustive
+validation across inputs, hosts or SIMD tiers. PR #830 records historical
+performance comparisons, whose runtime SIMD tiers were not stamped.
+This halves checkpoint-record storage, not the whole index or peak RSS; it is a
+memory/runtime trade-off, not a universal speedup.
+
+When `--compact-occ` is absent, `BWA3_COMPACT_OCC` selects the same layout without
+changing `@PG`. Only the first character is parsed: a value starting with `1`
+enables it; unset, empty, or a value starting with `0` leaves it off. Any other
+first character (for example `yes` or `false`) produces a warning once per
+process and is ignored. Thus `1x` enables it and `0x` leaves it off; this is not
+full-string boolean parsing. The explicit `--compact-occ` flag enables it without
+reading or validating `BWA3_COMPACT_OCC`, so even a malformed value produces no
+warning. Only `mem` reads the variable: `index`, `shm` and the seed facade use
+their explicitly selected layout.
+
+A compact load **does not attach a staged shared-memory index**, which holds the
+default layout. It warns and loads a private compact copy from disk alongside
+the staged segment: total host memory rises rather than falls, and the run pays
+the full disk-load cost. This applies whether the flag or the variable requested
+compact checkpoints. `--huge-pages` can also be used with the private compact
+table.
+
 ## Certified adaptive extension band (default on; `--no-band-cert` to disable)
 
 By default, `bwa-mem3 mem` now runs the banded Smith-Waterman **seed extension**
@@ -759,6 +796,7 @@ Alignment output is unchanged. Details: [`mem` → Read inputs](../cli/mem.md#re
 | `--extend-tie-frac` / `--extend-tie-floor` score-gated chain-extension cap | [#269](https://github.com/fg-labs/bwa-mem3/pull/269) | — | fork-only (**default on under `--fast`** — including `--meth --fast` — at `0.95` / `1`; opt-in and off elsewhere, not byte-identical — the gate can drop candidate chains before banded-SW, moving secondaries / `XS` / `MAPQ`) |
 | `--extend-csub` pruned-competitor `MAPQ` seed | [#269](https://github.com/fg-labs/bwa-mem3/pull/269) | — | fork-only (**forced on under `--fast`**, including `--meth --fast`; opt-in elsewhere, not byte-identical — changes emitted `MAPQ` on both the scalar SE and batched paired-end paths when the cap/gate prunes) |
 | `--huge-pages` 1 GB huge pages for the index | [#405](https://github.com/fg-labs/bwa-mem3/pull/405), [#716](https://github.com/fg-labs/bwa-mem3/pull/716) | — | fork-only (Linux, opt-in, off by default; alignment records byte-identical, `@PG` `CL:` excepted; hg38 WGS (5 M pairs), `-t 16`, warm page cache, x86-64 AVX-512BW and AVX2: ~0.7 % faster on Sapphire Rapids, within noise on two Zen 4 instances (one other measured 0.6-1.1 % slower); see [Measured effect](../user-guide/allocator.md#measured-effect)) |
+| `--compact-occ` / `BWA3_COMPACT_OCC` compact occurrence checkpoints | [#830](https://github.com/fg-labs/bwa-mem3/pull/830) | — | fork-only (opt-in, off by default; lossless-layout design contract: unchanged alignment records for the same reads and run settings, `@PG` `CL:` excepted; compact loads bypass staged shared memory and load a private disk copy; see [the contract and validation limits](#--compact-occ-compact-occurrence-checkpoints)) |
 | Transparent huge page fallback warning (stderr) | [#587](https://github.com/fg-labs/bwa-mem3/pull/587) | — | fork-only (Linux, stderr-only; at most one two-line `[W::]` warning per run, suppressed at `-v 1`; alignment records byte-identical, `@PG` `CL:` excepted, on 5M-pair WGS and WES slices (hg38), default and both `--compat` targets, on AWS Graviton 4 (arm64, NEON tier) and AMD Zen 5 (x86-64, AVX-512BW tier); CI's phiX smoke test also compares the records at `-v 3` and `-v 4` on the Linux x86-64 AVX2 row) |
 | Missing read inputs reported before the index load | [#645](https://github.com/fg-labs/bwa-mem3/pull/645) | — | fork-only (confirmed missing paths, `ENOENT`/`ENOTDIR`, retain their message and exit status but fail before the load; other metadata errors defer to open/read after the load; a directory input now gets `fail to open file` before the load instead of the reader's error after it; stdin, producers, URLs and the second input under `-p` remain exempt; alignment output unchanged) |
 | Certified adaptive extension band (`--no-band-cert` to disable) | [#420](https://github.com/fg-labs/bwa-mem3/pull/420) | — | fork-only (**default on**, alignment records byte-identical by a per-pair certificate — `@PG` `CL:` excepted; throughput measured on a 5M-read WGS slice, Apple M2 Max / arm64 NEON tier — see [the measurement](#certified-adaptive-extension-band-default-on---no-band-cert-to-disable) for full scope) |

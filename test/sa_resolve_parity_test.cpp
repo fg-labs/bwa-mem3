@@ -35,6 +35,11 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <vector>
+#include "cp_file_oracle.h"
+
+/* The reference reads the file's own checkpoints (cp_file_oracle.h), not the
+ * in-memory form the resolver reads. */
+static std::vector<CP_OCC> g_cp;
 
 /* Scalar LF walk with the pipeline's contract. Returns the resolved text
  * position; at the sentinel row that is the accumulated LF `offset` (sa value 0
@@ -44,15 +49,10 @@ static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel
     int64_t sp = pos, offset = 0;
     *hit_sentinel = 0;
     while ((sp & fmi->sa_compx_mask) != 0) {
-        const CP_OCC &blk = fmi->cp_occ[sp >> CP_SHIFT];
-        const int y = (int)(CP_MASK - (sp & CP_MASK));
-        int b = 4;
-        for (int c = 0; c < 4; c++)
-            if ((blk.one_hot_bwt_str[c] >> y) & 1ULL) { b = c; break; }
+        const int b = cp_file_base(g_cp, sp);
         if (b == 4) { *hit_sentinel = 1; return offset; }
         sym_steps[b]++;
-        const int64_t occ = blk.cp_count[b] +
-            (int64_t) __builtin_popcountll(blk.one_hot_bwt_str[b] & one_hot_mask_array[sp & CP_MASK]);
+        const int64_t occ = cp_file_occ(g_cp, b, sp);
         sp = fmi->count[b] + occ;
         offset++;
     }
@@ -120,6 +120,7 @@ int main(int argc, char *argv[]) {
 
     FMI_search *fmi = new FMI_search(argv[1]);
     fmi->load_index();
+    g_cp = cp_file_records(argv[1], fmi->reference_seq_len);
 
     const int64_t ref_len = fmi->reference_seq_len;
     fprintf(stderr, "sa_resolve_parity_test: reference_seq_len=%lld sentinel_index=%lld SA_COMPX=%d\n",

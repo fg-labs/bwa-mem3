@@ -921,6 +921,16 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
         }
         layout->count[i] += 1;
     }
+    /* Every row but the sentinel's holds a base, so the last count is the
+     * reference length (raw ref_seq_len - 1, +1): FMI_search::shm_scalars_ok
+     * refuses any other, so a stage of one would succeed and be unusable. */
+    if (layout->count[4] != layout->reference_seq_len) {
+        fprintf(stderr, "[E::%s] %s: count[4]=%lld != reference_seq_len - 1 (%lld)\n", __func__, cp_path,
+                (long long)layout->count[4] - 1, (long long)layout->reference_seq_len - 1);
+        err_fclose(cp);
+        bwa_shm_layout_free(layout);
+        return -1;
+    }
 
     /* The disk SA rate, by the same detect_sa_compx() the disk loader uses, so
      * the segment is sized for what that loader would read. */
@@ -1279,6 +1289,13 @@ int bwa_shm_test(const char *prefix)
     return ctl_walk([](int64_t, const char *entry, void *want) {
         return std::strcmp(entry, (const char *)want) == 0 ? 1 : 0;
     }, (void *)prefix_basename(prefix));
+}
+
+int bwa_shm_test_complete(const char *prefix)
+{
+    const int registered = bwa_shm_test(prefix);
+    if (registered != 1) return registered;
+    return name_state(prefix_basename(prefix)) == SEG_COMPLETE ? 1 : 0;
 }
 
 static int list_cb(int64_t l_mem, const char *name, void * /*ctx*/)
