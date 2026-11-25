@@ -656,6 +656,15 @@ the full disk-load cost. This applies whether the flag or the variable requested
 compact checkpoints. `--huge-pages` can also be used with the private compact
 table.
 
+Under `--compat=bwa-mem2`, an LF walk reaching an unsampled sentinel drops its
+accumulated offset, so coordinates can depend on the suffix-array sample rate.
+A default run may attach a denser staged table, stopping the walk at a sample,
+while a compact run always reads the disk table. Their coordinates can therefore
+differ when the sample rates differ. This is existing sample-rate behavior,
+also present when the default layout loads a sparser disk table rather than
+attaching the denser stage; the compact option adds a disk-table route, not a
+new coordinate policy.
+
 ## Certified adaptive extension band (default on; `--no-band-cert` to disable)
 
 By default, `bwa-mem3 mem` now runs the banded Smith-Waterman **seed extension**

@@ -1546,34 +1546,79 @@ for reservation, verification and the measurement conditions.
 
 #### `--compact-occ` — hold the occurrence checkpoints in half the memory (opt-in)
 
+*Introduced in [PR #830](https://github.com/fg-labs/bwa-mem3/pull/830), which records
+the historical measurements.*
+
 Hold the FM-index occurrence checkpoints in a 32-byte compact layout instead of
 the index file's 64-byte records: two bit planes of the base codes and 32-bit
-counts per 64 BWT rows, converted while the index loads. The checkpoints are the
-largest part of the index, so this saves about 3 GB of resident memory on hg38.
-Measured on 5 M hg38 read pairs on AWS Graviton4 (arm64, NEON tier; 3 interleaved
-runs), peak RSS fell 13.1 → 10.2 GB paired-end and 12.8 → 9.7 GB single-end. The
-saving comes from the layout's size (32 rather than 64 bytes per 64 BWT rows), so
-it does not depend on the host or SIMD tier. The **alignment records are
-byte-identical**; with the flag, only the `@PG` record differs, since its `CL:`
-field records the flag. Seeding reads the planes with a few more instructions per
-lookup, so a run can be slightly slower: in the same Graviton4 runs CPU time was
-unchanged on the real reads and 2 % higher on 150 bp pairs simulated from chr21.
-Use it where memory, not time, is the constraint. The index files are unchanged,
-and `BWA3_COMPACT_OCC=1` selects the same layout (a value starting with `1`), with
-no change to `@PG`. `0` or empty leaves it off; any other value (`yes`, `false`)
-is reported once with `[W::compact_occ_env] BWA3_COMPACT_OCC="…" is not 0 or 1;
-keeping the default checkpoint layout` and leaves it off.
+counts per 64 BWT rows, converted while the index loads. This halves the storage
+for the checkpoint records, not the whole index or the process's peak RSS.
+**Off by default.** This is a memory/runtime trade-off, not a universal speedup;
+measure on your workload and host before choosing it.
+
+The design contract is **byte-identical alignment records** for the same reads
+and run settings when both runs use the same suffix-array sampling (under
+`--compat=bwa-mem2` the coordinates can depend on it; see below). The compact
+layout losslessly represents the same occurrence counts and bases, including
+sentinel handling; it changes the representation, not the alignment policy.
+With the flag, only the `@PG` `CL:` field differs because it records the flag.
+
+The retained correctness run of `test/regression/compact_occ_byte_identity.sh`
+passed compact/default comparisons on a macOS arm64 host (NEON runtime,
+clang 21.0.0; CPU model not recorded). It used generated reads from a synthetic
+multi-contig reference with repeats and phiX: 150 bp paired-end reads at `-t 1`
+and `-t 4`, 150 bp single-end reads at `-t 4`, 2-3 kb reads at `-t 1`, and
+100 bp sentinel-reaching reads at `-t 1`. The script also checked
+`--compat=bwa-mem2` for paired-end and sentinel-reaching reads, and `--meth` for
+paired-end and single-end reads. It supplied no `-K` override (default batching)
+and excluded `@PG` from comparisons. This is fixture-based correctness evidence,
+not exhaustive validation of the contract across inputs, hosts or SIMD tiers.
+The historical performance comparisons linked in PR #830 did not stamp their
+runtime SIMD tiers; they do not establish an all-host/all-tier no-harm result.
+
+The index files are unchanged. When `--compact-occ` is absent,
+`BWA3_COMPACT_OCC=1` selects the same layout with no change to `@PG`. Only the
+first character is parsed: a value starting with `1` enables it; unset, empty,
+or a value starting with `0` leaves it off (`1x` enables it and `0x` leaves it
+off). Any other first character (`yes`, `false`) is reported once per process
+with `[W::compact_occ_env] ignoring BWA3_COMPACT_OCC="…" (not 0 or 1)` and leaves
+it off. The explicit `--compact-occ` flag enables it without reading or
+validating `BWA3_COMPACT_OCC`, so even a malformed value produces no warning.
+Only `mem` reads the variable: `index`, `shm` and the
+`fmi_seed_api.h` facade always use the layout they are given. When the layout is on,
+`mem` says so on stderr: `[M::main_mem] occurrence checkpoints: compact layout (--compact-occ)`,
+or `(BWA3_COMPACT_OCC)` when the variable turned it on.
 
 An index staged in shared memory (`bwa-mem3 shm`) holds the default layout and
-is not attached under `--compact-occ`: the index loads from disk instead, and an
-`[M::]` note says so. `--huge-pages` applies to the compact table as it does to
-the default one.
+is not attached under `--compact-occ`: `mem` loads a private copy from disk next to
+the staged one, so on that host the flag raises memory instead of lowering it, and
+the run pays a full index load. A `[W::load_index] compact checkpoint layout: not
+attaching the index staged in shared memory …` warning says so. `--huge-pages`
+applies to the compact table as it does to the default one.
 
-The conversion reads the checkpoint file with `-t` workers, each on its own file
-descriptor. If a worker cannot reopen the file, it shares the first one, and
+Under `--compat=bwa-mem2`, coordinates can depend on the suffix-array sample
+rate: an LF walk that reaches an unsampled sentinel drops its accumulated
+offset. A denser staged table may stop that walk at a sampled row instead.
+A default run attached to that table can therefore report different coordinates
+from a compact run using the sparser disk table. This is existing sample-rate
+behavior, also seen when the default layout loads the disk table instead of
+attaching the denser stage; compact loading adds a route to the disk table,
+not a new coordinate policy.
+
+The conversion reads the checkpoint file with the index-load workers (up to 8 by
+default, `BWA3_LOAD_THREADS` to change it; with `--huge-pages` up to `-t`, at most
+64), each on its own file descriptor. If a worker cannot reopen the file, it shares
+the first one, and
 `[W::cp_load_from_file] could not reopen … for N of M index-load workers; they share one descriptor …`
-says so: the load is still correct, but slower on filesystems with per-handle
-read-ahead (e.g. S3 Mountpoint).
+says so (M counts the workers besides the first, which always uses the shared
+descriptor): the load remains correct, but sharing can slow it on filesystems or
+object-store mounts that track sequential read-ahead per open handle.
+
+A corrupt checkpoint record (a row with two bases, a row other than the sentinel
+with none, a count out of range, or counts that are not the running totals: zero in
+the first record, in every other the previous record's counts plus its rows of each
+base, and after the last record the reference's base totals) stops the load with `FMI index: a checkpoint is not one-hot or out of
+range, or its counts are not the running totals`.
 
 #### Transparent huge page fallback warning (Linux)
 
