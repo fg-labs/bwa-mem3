@@ -410,7 +410,10 @@ int main(int argc, char *argv[]) {
             (int)BWTSEED_LOCKSTEP_N);
 
     FMI_search *fmi = new FMI_search(argv[1]);
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
 
     /* The default max_intv used in bwamem.cpp third-pass is opt->max_mem_intv
      * (default 20). minSeedLen passed to bwtSeed is opt->min_seed_len + 1 = 20.
@@ -1114,6 +1117,7 @@ int main(int argc, char *argv[]) {
              * where every record comes from a forward step. Each index gets its
              * own record-count and canary checks. */
             FMI_search *fmi_np = new FMI_search(argv[1]);
+            fmi_np->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
             fmi_np->load_index(/*load_pac=*/false);
             if (fmi_np->s1_text_available()) {
                 total_cases++;

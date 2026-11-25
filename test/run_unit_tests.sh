@@ -427,14 +427,23 @@ done
 # SA-resolution driver. Each test below compares a driver or kernel with a
 # reference computed from the index file's own records or with the scalar
 # driver, so it must pass under the compact layout too, and the lockstep tests'
-# per-case lines (seed and SMEM counts) must equal the default layout's.
+# per-case lines (seed and SMEM counts) must equal the default layout's. Each
+# binary prints the layout it loaded, and each run must report the one it asked
+# for: a renamed variable, or a constructor that stopped reading it, would
+# otherwise run every compact leg on the default layout and pass.
 compact_case_lines() { grep -E '^\[(PASS|FAIL|SKIP)\]|cases passed$' || true; }
+# layout_is <output> <default|compact>: the binary loaded that layout
+layout_is() { grep -qx "occurrence checkpoint layout: $2" <<< "$1"; }
 for t in smem_lockstep_parity_test bwtseed_lockstep_parity_test seed_jump_table_test; do
     DEF_OUT="$(cd "$HERE" && env -u BWA3_COMPACT_OCC -u BWA3_BWTSEED_JUMP ./"$t" "$FIXTURES/phix.fa" 2>&1)" \
         || {
             echo "$DEF_OUT"
             fail "$t (default layout): non-zero exit"
         }
+    layout_is "$DEF_OUT" default || {
+        echo "$DEF_OUT"
+        fail "$t (default layout): did not report the default checkpoint layout"
+    }
     DEF="$(printf '%s\n' "$DEF_OUT" | compact_case_lines)"
     printf '%s\n' "$DEF" | grep -qE '^[0-9]+ / [0-9]+ cases passed$' \
         || {
@@ -446,6 +455,10 @@ for t in smem_lockstep_parity_test bwtseed_lockstep_parity_test seed_jump_table_
             echo "$OUT"
             fail "$t (BWA3_COMPACT_OCC=1): non-zero exit"
         }
+    layout_is "$OUT" compact || {
+        echo "$OUT"
+        fail "$t (BWA3_COMPACT_OCC=1): did not load the compact checkpoint layout"
+    }
     [[ "$(printf '%s\n' "$OUT" | compact_case_lines)" == "$DEF" ]] \
         || {
             echo "$OUT"
@@ -465,6 +478,10 @@ for spec in "backwardext_konly_parity_test:backwardExt_konly PARITY PASS" \
                 echo "$OUT"
                 fail "$t (BWA3_COMPACT_OCC=1): no PASS line"
             }
+        layout_is "$OUT" compact || {
+            echo "$OUT"
+            fail "$t (BWA3_COMPACT_OCC=1): did not load the compact checkpoint layout"
+        }
         ok "$t (BWA3_COMPACT_OCC=1)"
     else
         echo "$OUT"

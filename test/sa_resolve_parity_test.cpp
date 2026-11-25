@@ -37,9 +37,11 @@
 #include <vector>
 #include "cp_file_oracle.h"
 
-/* The reference reads the file's own checkpoints (cp_file_oracle.h), not the
- * in-memory form the resolver reads. */
+/* The reference reads the file's own checkpoints and SA samples (cp_file_oracle.h), not the
+ * in-memory forms the resolver reads (the converted checkpoints, the packed SA high parts). */
 static std::vector<CP_OCC> g_cp;
+static std::vector<int8_t> g_sa_ms;
+static std::vector<uint32_t> g_sa_ls;
 
 /* Scalar LF walk with the pipeline's contract. Returns the resolved text
  * position; at the sentinel row that is the accumulated LF `offset` (sa value 0
@@ -56,8 +58,9 @@ static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel
         sp = fmi->count[b] + occ;
         offset++;
     }
-    int64_t sa = fmi->sa_hi_at(sp >> fmi->sa_compx);
-    sa = (sa << 32) + fmi->sa_ls_word[sp >> fmi->sa_compx];
+    const size_t k = (size_t) (sp >> fmi->sa_compx);
+    int64_t sa = g_sa_ms[k];
+    sa = (sa << 32) + g_sa_ls[k];
     return sa + offset;
 }
 
@@ -119,8 +122,12 @@ int main(int argc, char *argv[]) {
     setenv("BWA3_KS_DEDUP_STATS", "1", 1);
 
     FMI_search *fmi = new FMI_search(argv[1]);
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
     g_cp = cp_file_records(argv[1], fmi->reference_seq_len);
+    sa_file_samples(argv[1], fmi->reference_seq_len, fmi->sa_compx, g_sa_ms, g_sa_ls);
 
     const int64_t ref_len = fmi->reference_seq_len;
     fprintf(stderr, "sa_resolve_parity_test: reference_seq_len=%lld sentinel_index=%lld SA_COMPX=%d\n",
