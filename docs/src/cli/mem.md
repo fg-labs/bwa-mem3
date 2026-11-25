@@ -1544,6 +1544,37 @@ differs, since its `CL:` field records the `--huge-pages` flag. On hg38 WGS (5 M
 [Memory allocator → Large pages for the index](../user-guide/allocator.md#large-pages-for-the-index-linux-deployment-lever)
 for reservation, verification and the measurement conditions.
 
+#### `--compact-occ` — hold the occurrence checkpoints in half the memory (opt-in)
+
+Hold the FM-index occurrence checkpoints in a 32-byte compact layout instead of
+the index file's 64-byte records: two bit planes of the base codes and 32-bit
+counts per 64 BWT rows, converted while the index loads. The checkpoints are the
+largest part of the index, so this saves about 3 GB of resident memory on hg38.
+Measured on 5 M hg38 read pairs on AWS Graviton4 (arm64, NEON tier; 3 interleaved
+runs), peak RSS fell 13.1 → 10.2 GB paired-end and 12.8 → 9.7 GB single-end. The
+saving comes from the layout's size (32 rather than 64 bytes per 64 BWT rows), so
+it does not depend on the host or SIMD tier. The **alignment records are
+byte-identical**; with the flag, only the `@PG` record differs, since its `CL:`
+field records the flag. Seeding reads the planes with a few more instructions per
+lookup, so a run can be slightly slower: in the same Graviton4 runs CPU time was
+unchanged on the real reads and 2 % higher on 150 bp pairs simulated from chr21.
+Use it where memory, not time, is the constraint. The index files are unchanged,
+and `BWA3_COMPACT_OCC=1` selects the same layout (a value starting with `1`), with
+no change to `@PG`. `0` or empty leaves it off; any other value (`yes`, `false`)
+is reported once with `[W::compact_occ_env] BWA3_COMPACT_OCC="…" is not 0 or 1;
+keeping the default checkpoint layout` and leaves it off.
+
+An index staged in shared memory (`bwa-mem3 shm`) holds the default layout and
+is not attached under `--compact-occ`: the index loads from disk instead, and an
+`[M::]` note says so. `--huge-pages` applies to the compact table as it does to
+the default one.
+
+The conversion reads the checkpoint file with `-t` workers, each on its own file
+descriptor. If a worker cannot reopen the file, it shares the first one, and
+`[W::cp_load_from_file] could not reopen … for N of M index-load workers; they share one descriptor …`
+says so: the load is still correct, but slower on filesystems with per-handle
+read-ahead (e.g. S3 Mountpoint).
+
 #### Transparent huge page fallback warning (Linux)
 
 Not a flag: on Linux, `mem` samples `/proc/self/smaps` after output batches 1, 2,

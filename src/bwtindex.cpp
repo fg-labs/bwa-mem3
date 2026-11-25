@@ -749,6 +749,13 @@ int main_resa(int argc, char *argv[]) // the "re-sa" command
 			return 1;
 		}
 	}
+	/* Every row but the sentinel's holds a base: the last count is ref_seq_len - 1. */
+	if (count_raw[4] != ref_seq_len - 1) {
+		fprintf(stderr, "[re-sa] %s: count[4]=%lld != reference_seq_len - 1 (%lld)\n", cp_path,
+		        (long long)count_raw[4], (long long)ref_seq_len - 1);
+		close(fd);
+		return 1;
+	}
 
 	// Disk SA rate: the trailing tag if present, else the legacy default.
 	const int64_t disk_sa_compx =

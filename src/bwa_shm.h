@@ -140,6 +140,13 @@ extern "C" {
 	/* 1 if `prefix`'s basename is registered (which includes a stage still in
 	 * progress or one that was interrupted), 0 if not, -1 on error. */
 	int       bwa_shm_test(const char *prefix);
+	/* 1 if `prefix`'s basename is registered and its segment is complete (the
+	 * check bwa_shm_stage makes to find an index already staged), 0 if not, -1
+	 * on error. A registered stage still in progress or interrupted, or one
+	 * with no segment or an unusable one, gives 0. Complete does not mean a
+	 * given load can attach it: bwa_shm_attach also refuses, e.g., a seed-only
+	 * stage when the load needs the packed reference. */
+	int       bwa_shm_test_complete(const char *prefix);
 	/* bns_only=true stages a SEED-only segment (D3 --meth): the FM-index + BNS
 	 * are packed, but PAC and REF_STRING (.0123) are omitted (zero-length
 	 * sections) because `mem --meth` never reads the seed pac/.0123. The seed

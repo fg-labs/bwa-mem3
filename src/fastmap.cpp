@@ -1852,6 +1852,7 @@ static void usage(const mem_opt_t *opt)
     fprintf(stderr, "    --dedup-reads STR  whole-read-pair memoization: 'off', 'on', or 'auto' (measure the duplicate rate and net benefit at runtime, latch, and periodically re-probe); aligns once per distinct pair within a chunk and replays the per-read SAM stage, so alignment records are byte-identical in every mode. Benefits amplicon/UMI panels with PCR duplicates; ~no effect on WGS/exome [auto]\n");
     fprintf(stderr, "    --ks-dedup STR  cross-read SA-interval dedup: 'off', 'on' (resolve each distinct (k,s) suffix-array interval once per SA-resolve chunk and copy the coordinates to the reads that repeat it), or 'auto' (measure net benefit at runtime, latch, and periodically re-probe); alignment records byte-identical in every mode [auto]\n");
     fprintf(stderr, "    --huge-pages  put the FM-index occurrence table on 1 GB huge pages from the host's reserved 1 GB pool (6 pages for hg38, about twice that for a --meth index); cuts dTLB page walks in seeding on hosts whose 1 GB pages reach the TLB; Linux 5.14+ only, alignment records byte-identical (only @PG CL differs, recording the flag), falls back to default pages when the pool is missing or too small; a table of 512 MiB or less (a small genome) stays on default pages; no effect on an index attached from shared memory (stage it with `shm --huge-pages` instead) [off]\n");
+    fprintf(stderr, "    --compact-occ  hold the FM-index occurrence checkpoints in a 32-byte compact layout instead of the index file's 64-byte one: half the table's memory (about 3 GB less on hg38), converted while the index loads; alignment records byte-identical for the same suffix-array sampling (only @PG CL differs, since it records the flag; BWA3_COMPACT_OCC=1 leaves @PG unchanged); seeding may be a little slower; an index staged in shared memory is not attached (it holds the default layout): compact mode always loads a private copy from disk, so where a default run would attach the staged index, memory goes up, not down; also set by BWA3_COMPACT_OCC=1 [off]\n");
     fprintf(stderr, "    --keep-contained-ext  opt out of the default contained-seed extension skip and run the reference extension path instead. By default a seed contained (same diagonal) in a longer in-chain seed has its banded-SW extension skipped once the post-extension containment purge confirms it; the skip is byte-identical to the reference path on all read lengths, including under --meth and --compat, so this flag only removes the speedup. Escape hatch / bit-exact A-B handle against older binaries [%s]\n", opt->skip_contained_ext? "off":"on");
     fprintf(stderr, "    --skip-contained-ext  DEPRECATED, accepted no-op: contained-seed skipping is now the default; pass --keep-contained-ext to opt out\n");
     fprintf(stderr, "    --max-extend-chains INT  cap chains extended per read to the top-INT by weight; ~23%% less alignment CPU, high-confidence placement unaffected; ignored for reads with >4096 chains; opt-in, NOT byte-identical (0 = off) [%d]\n", opt->max_extend_chains);
@@ -2168,6 +2169,7 @@ int main_mem(int argc, char *argv[])
                                                     * overridable --compat divergence guard from a
                                                     * hard error to a warning (see the guard below) */
     int          want_huge_pages           = 0;
+    int          want_compact_occ          = 0;   /* --compact-occ (or BWA3_COMPACT_OCC) */
     /* --chunk-cap: upper bound (bases) on the default `chunk_size * n_threads`
      * batch size. 0 = off, which is the DEFAULT and matches bwa and bwa-mem2
      * exactly (both compute `chunk_size * n_threads` with no cap). Capping
@@ -2320,6 +2322,7 @@ int main_mem(int argc, char *argv[])
         OPT_SMEM_DEDUP,
         OPT_FAST,
         OPT_HUGE_PAGES,
+        OPT_COMPACT_OCC,
         OPT_SKIP_CONTAINED_EXT,   /* deprecated no-op (skipping is the default) */
         OPT_KEEP_CONTAINED_EXT,
         OPT_ADAPTIVE_BAND,
@@ -2358,6 +2361,7 @@ int main_mem(int argc, char *argv[])
         {"ks-dedup",                 required_argument, 0, OPT_KS_DEDUP},
         {"fast",                     no_argument,       0, OPT_FAST},
         {"huge-pages",               no_argument,       0, OPT_HUGE_PAGES},
+        {"compact-occ",              no_argument,       0, OPT_COMPACT_OCC},
         {"skip-contained-ext",       no_argument,       0, OPT_SKIP_CONTAINED_EXT},
         {"keep-contained-ext",       no_argument,       0, OPT_KEEP_CONTAINED_EXT},
         {"adaptive-band",            no_argument,       0, OPT_ADAPTIVE_BAND},
@@ -2896,6 +2900,7 @@ int main_mem(int argc, char *argv[])
         }
         else if (c == OPT_FAST) fast = 1;
         else if (c == OPT_HUGE_PAGES) want_huge_pages = 1;
+        else if (c == OPT_COMPACT_OCC) want_compact_occ = 1;
         else if (c == OPT_PROPER_PAIR_FROM_EMITTED) opt->proper_pair_from_emitted = 1;
         else if (c == OPT_ALT_PROJECT) {
             /* keep-alt: lifted hits move, unliftable ALT hits stay on their ALT;
@@ -3992,6 +3997,15 @@ int main_mem(int argc, char *argv[])
 
     fprintf(stderr, "* Ref file: %s\n", ref_prefix);
     aux.fmi = new FMI_search(ref_prefix);
+    /* Opt-in --compact-occ (or BWA3_COMPACT_OCC, read here and nowhere else in
+     * the library): hold the occurrence checkpoints in the 32-byte compact
+     * layout. Chosen before load_index; alignment records are byte-identical
+     * either way for the same SA sampling (see FMI_search::set_compact_occ). */
+    if (want_compact_occ || FMI_search::compact_occ_env()) {
+        aux.fmi->set_compact_occ(true);
+        fprintf(stderr, "[M::%s] occurrence checkpoints: compact layout (%s)\n", __func__,
+                want_compact_occ ? "--compact-occ" : "BWA3_COMPACT_OCC");
+    }
     /* D3 dual-index: the FM-index AND its BNS/PAC come from the `.meth` SEED prefix.
      * The seed BNS is required to decode seed positions into (seed contig, local pos,
      * strand): the seed reference has the f/r-doubled contig layout (r0,f0,r1,f1,...).
@@ -4029,11 +4043,13 @@ int main_mem(int argc, char *argv[])
      * parallelism probe that chases the just-loaded cp_occ checkpoint array
      * (opaque here: base, block count, block stride, and the byte offset of a
      * 64-bit word per block). Width changes scheduling only, never output. */
-    bwa3_init_smem_lockstep_width(
-        aux.fmi->cp_occ_data(),
-        aux.fmi->cp_occ_size_bytes() / (int64_t)sizeof(CP_OCC),
-        sizeof(CP_OCC),
-        offsetof(CP_OCC, one_hot_bwt_str));
+    {
+        const bool cpc = aux.fmi->compact_occ();
+        const size_t rec = cpc ? sizeof(CP_OCC_PLANES) : sizeof(CP_OCC);
+        const size_t woff = cpc ? offsetof(CP_OCC_PLANES, hi) : offsetof(CP_OCC, one_hot_bwt_str);
+        bwa3_init_smem_lockstep_width(aux.fmi->cp_occ_data(),
+                                      aux.fmi->cp_occ_size_bytes() / (int64_t)rec, rec, woff);
+    }
     if (bwa_verbose >= 3)
         fprintf(stderr, "[M::%s] phase-2 SMEM lockstep width: %d (width source: %s)\n",
                 __func__, g_smem_lockstep_n,

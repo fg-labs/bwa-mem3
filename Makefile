@@ -1474,10 +1474,12 @@ test/shm_pack_round_trip_test.o: test/shm_pack_round_trip_test.cpp
 # previously `test:` only built the test harness binaries, not the main
 # executable.
 test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib_alloc_fail_test bwa-mem3
-	./test/bwa_mem3_tests_unit
-	./test/bwa_mem3_tests_integration
+	env -u BWA3_COMPACT_OCC ./test/bwa_mem3_tests_unit
+	env -u BWA3_COMPACT_OCC ./test/bwa_mem3_tests_integration
+	BWA3_COMPACT_OCC=1 ./test/bwa_mem3_tests_unit
+	BWA3_COMPACT_OCC=1 ./test/bwa_mem3_tests_integration
 	MEM_SYNTH_REF=./test/mem_synth_ref ./test/regression/mem_synth_ref_check.sh
-	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; ./$$t || exit 1; done
+	for t in $(STANDALONE_TESTS_IN_TEST_TARGET); do echo "./$$t"; env -u BWA3_COMPACT_OCC ./$$t || exit 1; done
 	./kvec_alloc_fail_test
 	./klib_alloc_fail_test
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
@@ -1493,6 +1495,9 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_seed_cli.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_extend_cli.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/mem_pair_cli.sh
+	d="$$(mktemp -d)" && { BWA_MEM3="$(CURDIR)/bwa-mem3" COMPACT_OCC_SYN_FA="$(CURDIR)/test/fixtures/synthetic_1mb.fa" \
+		COMPACT_OCC_PHIX_FA="$(CURDIR)/test/fixtures/phix.fa" \
+		COMPACT_OCC_WORK_DIR="$$d" ./test/regression/compact_occ_byte_identity.sh; s=$$?; rm -rf "$$d"; exit $$s; }
 	./test/regression/ndebug_gate_lint_selftest.sh
 	./test/regression/ndebug_gate_lint.sh
 	./test/regression/calloc_interpose_flag_lint_selftest.sh
