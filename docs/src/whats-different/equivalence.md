@@ -366,7 +366,10 @@ left too high there and differ between SIMD tiers. Removing it can only lower th
 mate, now on every tier; with the default rescue, the 200 k NA12878 pairs above (2×99 bp, read 1
 at 25 bp, both ends at 30 bp) and four simulated 2×150 bp sets were byte-identical with and
 without the skip on an AWS Graviton4 (Linux, arm64, NEON tier), and under `--rescue-kmer` the
-MAPQ of a rescued mate can change.
+MAPQ of a rescued mate can change. Under `--rescue-kmer` (and so `--fast`), the cap of a mate found by mate rescue re-aligns
+only the K-mer band the rescue SW ran on, not the whole rescue window, so a mate that kept a
+methylated C and its fully converted twin get the same MAPQ
+([#825](https://github.com/fg-labs/bwa-mem3/pull/825)); without `--rescue-kmer` nothing changes.
 
 `--meth-context` ([#663](https://github.com/fg-labs/bwa-mem3/pull/663)) is opt-in and changes
 nothing by default: with `all`, or without the option, alignment records are byte-identical to
