@@ -48,6 +48,7 @@
 #include "bsw_batch.h"
 #include "bsw_compact.h"
 #include "ext_ladder.h"
+#include "x86_tier_caps.h"
 
 #if HAVE_BSW_VECTOR_8_16
 
@@ -85,7 +86,7 @@ std::vector<Tier> compacting_tiers()
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2")) ts.push_back({"avx2", make_bsw_kernel_avx2, 32});
-    if (__builtin_cpu_supports("avx512bw")) ts.push_back({"avx512bw", make_bsw_kernel_avx512bw, 64});
+    if (bwa_tests::host_runs_avx512bw_kernels()) ts.push_back({"avx512bw", make_bsw_kernel_avx512bw, 64});
 #endif
     // A tier this host cannot run is skipped, and an empty list would make every
     // equivalence test loop over zero tiers and pass vacuously, so the skip must be

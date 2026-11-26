@@ -706,7 +706,12 @@ KERNEL_FLAGS_sse41    = -march=x86-64 -msse4.1
 KERNEL_FLAGS_sse42    = -march=x86-64 -msse4.2 -mpopcnt
 KERNEL_FLAGS_avx      = -march=x86-64 -mavx -mpopcnt
 KERNEL_FLAGS_avx2     = -march=x86-64 -mavx -mavx2 -mpopcnt
-KERNEL_FLAGS_avx512bw = -march=x86-64 -mavx -mavx2 -mavx512f -mavx512bw -mpopcnt
+# The avx512bw kernels also get VL and DQ (128/256-bit EVEX forms, 16 more vector registers,
+# mask ops on the narrower widths): every CPU with AVX-512BW has both (Skylake-SP onward, Zen 4),
+# and the dispatcher (bwamem3_x86_kernel_tier in src/simd_dispatch.cpp) requires all three
+# before it picks this tier. Only the kernel objects get them: the arch=avx512bw ARCH_FLAGS
+# (the non-kernel code) stay at F and BW, and that build's host-floor check asks for BW only.
+KERNEL_FLAGS_avx512bw = -march=x86-64 -mavx -mavx2 -mavx512f -mavx512bw -mavx512vl -mavx512dq -mpopcnt
 
 # Source files compiled at every tier on x86_64.
 KERNEL_SRCS = src/bandedSWA.cpp src/kswv.cpp src/ksw.cpp src/sam_encode.cpp

@@ -301,12 +301,16 @@ for tier in "${tier_names[@]}"; do
     read -r -a tier_flags <<< "$("$MAKE" -s -o ext/htslib/htslib_static.mk "${make_args[@]}" "print-KERNEL_FLAGS_$tier")"
     tier_macros=$("${tier_cxx[@]}" "${tier_target[@]}" -march=x86-64-v4 \
         "${tier_flags[@]}" -dM -E -x c++ /dev/null)
-    for feature in SSE4_1 SSE4_2 AVX AVX2 AVX512F AVX512BW; do
+    # The avx512bw kernels also get AVX-512VL and DQ, and the dispatcher
+    # (bwamem3_x86_kernel_tier in src/simd_dispatch.cpp) requires all three of
+    # BW, VL and DQ before it picks that tier.
+    for feature in SSE4_1 SSE4_2 AVX AVX2 AVX512F AVX512BW AVX512VL AVX512DQ; do
         want=0
         case "$tier:$feature" in
             *:SSE4_1 | sse42:SSE4_2 | avx:SSE4_2 | avx2:SSE4_2 | avx512bw:SSE4_2 | \
                 avx:AVX | avx2:AVX | avx512bw:AVX | avx2:AVX2 | avx512bw:AVX2 | \
-                avx512bw:AVX512F | avx512bw:AVX512BW) want=1 ;;
+                avx512bw:AVX512F | avx512bw:AVX512BW | avx512bw:AVX512VL | \
+                avx512bw:AVX512DQ) want=1 ;;
         esac
         got=0
         if grep -q "^#define __${feature}__ 1$" <<< "$tier_macros"; then got=1; fi
@@ -315,6 +319,15 @@ for tier in "${tier_names[@]}"; do
             exit 1
         fi
     done
+    # No AVX-512 subset beyond those four: a kernel built with one the
+    # dispatcher does not check would fault on a CPU that lacks it.
+    extra=$(grep -oE '^#define __AVX512[A-Z0-9_]*__ ' <<< "$tier_macros" \
+        | grep -vE '__AVX512(F|BW|VL|DQ)__ $' || true)
+    if [[ -n $extra ]]; then
+        echo "FAIL: $tier kernel defines an AVX-512 subset the dispatcher does not check:"
+        echo "$extra"
+        exit 1
+    fi
 done
 if ((${#tier_names[@]} > 0)); then
     echo "PASS: kernel tier ISA macros do not inherit a stronger compiler baseline"

@@ -226,16 +226,18 @@ jobs:
         if: matrix.arch == 'x86'
         run: |
           # Prefer AVX-512BW so the widest x86 kswv kernel is exercised; free
-          # GH runners typically do not expose it, so fall back to AVX2. Both
+          # GH runners typically do not expose it, so fall back to AVX2. The
+          # avx512bw kernels also need AVX-512VL and DQ (the dispatcher runs the
+          # avx2 kernels on a host without them), so all three are required. Both
           # are batched mate-rescue builds: the scalar path was removed and the
           # batched kswv kernel now runs on every AVX2+ tier (there is no
           # __AVX512BW__ gate any more), just as NEON does on ARM. So the
           # cross-arch alignment-record identity check compares batched-vs-batched whichever
           # x86 tier the runner provides.
-          if grep -q avx512bw /proc/cpuinfo; then
+          if grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo && grep -qw avx512dq /proc/cpuinfo; then
             echo "MAKE_ARCH=avx512bw" >> "$GITHUB_ENV"
           else
-            echo "::warning::AVX-512BW not available on this runner; falling back to AVX2"
+            echo "::warning::AVX-512BW, VL or DQ not available on this runner; falling back to AVX2"
             echo "MAKE_ARCH=avx2" >> "$GITHUB_ENV"
           fi
 
@@ -433,7 +435,7 @@ jobs:
       - name: Detect x86 ISA
         if: matrix.arch == 'x86'
         run: |
-          if grep -q avx512bw /proc/cpuinfo; then
+          if grep -qw avx512bw /proc/cpuinfo && grep -qw avx512vl /proc/cpuinfo && grep -qw avx512dq /proc/cpuinfo; then
             echo "MAKE_ARCH=avx512bw" >> "$GITHUB_ENV"
           else
             echo "MAKE_ARCH=avx2" >> "$GITHUB_ENV"

@@ -19,9 +19,10 @@
 // kernels broadcast the gap penalties as bytes (set1_epi8), so at gap extends
 // this large they and the scalar code can disagree, gate or no gate.
 //
-// The case runs on whatever getScores8 the build has, so CI checks the lean
-// NEON row on Linux arm64, the Apple gate on macOS, and the AVX2 (and, where
-// the runner has it, AVX-512BW) skip on x86. Each pair is scored alone, as a
+// The case runs on the runtime tier's getScores8 (make_banded_pair_wise_sw, so
+// BWAMEM3_FORCE_TIER selects it), so CI checks the lean NEON row on Linux
+// arm64, the Apple gate on macOS, and the AVX2 and (where the runner has it)
+// AVX-512BW skips on x86, each in the kernel object production runs. Each pair is scored alone, as a
 // batch of copies filling every lane of a group, and through the
 // lane-compaction driver where the tier has one.
 
@@ -34,6 +35,7 @@
 #include "bandedSWA.h"
 #include "bsw_batch.h"
 #include "ext_ladder.h"
+#include "simd_dispatch.h"  // make_banded_pair_wise_sw dispatches on bwamem3_simd_tier()
 
 #if HAVE_BSW_VECTOR_8_16
 
@@ -88,9 +90,9 @@ std::string show(const ExtResult &x)
 /// of compaction superblocks the kernel ran.
 uint64_t check_copies(const ExtScoring &sc, const WrapCase &c, const ExtPair &p, int n, int groups)
 {
-    std::unique_ptr<IBandedPairWiseSW> k(new BandedPairWiseSW(
+    std::unique_ptr<IBandedPairWiseSW> k = make_banded_pair_wise_sw(
         sc.o_del, sc.e_del, sc.o_ins, sc.e_ins, sc.zdrop, sc.pen_clip, sc.mat,
-        (int8_t)sc.a, (int8_t)sc.b, 1));
+        (int8_t)sc.a, (int8_t)sc.b, 1);
     k->set_lane_compaction(groups, 0);
     const std::vector<const ExtPair *> batch(n, &p);
     const std::vector<ExtResult> got = bwa_tests::score_bsw_batch(*k, batch, 8, c.w);
@@ -125,20 +127,11 @@ TEST_CASE("8-bit extension z-drop gates: exact for gap extends whose drift wraps
         check_copies(sc, c, p, 64, 0);    // every lane of a group (16, 32 or 64 wide)
         superblocks += check_copies(sc, c, p, 256, 2);   // the compaction driver, where there is one
     }
-#if defined(__AVX512BW__)
-    const std::string tier = "avx512bw";
-#elif defined(__AVX2__)
-    const std::string tier = "avx2";
-#elif defined(__aarch64__)
-    const std::string tier = "neon";
-#else
-    const std::string tier = "128-bit x86";
-#endif
-    MESSAGE("kernel tier " << tier << "; compaction superblocks run: " << superblocks
-            << " (0 on tiers without a driver)");
-#if defined(__aarch64__) || defined(__AVX2__)
-    CHECK(superblocks > 0);   // this tier has a compaction driver: it must have run
-#endif
+    const int tier = bwamem3_simd_tier();
+    MESSAGE("kernel tier " << std::string(bwamem3_simd_tier_name(tier)) << "; compaction superblocks run: "
+            << superblocks << " (0 on tiers without a driver)");
+    if (tier == BWAMEM3_TIER_NEON || tier == BWAMEM3_TIER_AVX2 || tier == BWAMEM3_TIER_AVX512BW)
+        CHECK(superblocks > 0);   // this tier has a compaction driver: it must have run
 }
 
 #else

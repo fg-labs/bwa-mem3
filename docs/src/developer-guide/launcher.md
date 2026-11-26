@@ -64,7 +64,10 @@ kernel TU; no dispatch table is generated.
 - `bwamem3_simd_init()` — idempotent initializer called from
   `main.cpp`. Caches the host's raw capability into a file-scope
   `g_host_capability` and the effective dispatch tier into a separate
-  `g_tier` (the two differ when `BWAMEM3_FORCE_TIER` is set).
+  `g_tier`. The two differ when `BWAMEM3_FORCE_TIER` is set, and on a host
+  that reports AVX-512BW without AVX-512VL or DQ: its capability is
+  `avx512bw` (what the non-kernel code of an `arch=avx512bw` build needs), but
+  the `avx512bw` kernels need all three, so `g_tier` starts at `avx2`.
 - An enum of supported tiers (`sse41` → `sse42` → `avx` → `avx2` → `avx512bw`,
   plus `neon` on arm64) and `bwamem3_simd_tier_name()` for stderr
   reporting.

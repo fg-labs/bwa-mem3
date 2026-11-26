@@ -83,17 +83,13 @@ using bwa_tests::ScopedEnv;   // scoped_env.h
 
 using bwa_tests::kswr_all_fields_eq;   // strict all-field equality (kswr_cmp.h)
 
-// The kswv tier run_kswv_batch binds (the one this translation unit is
-// compiled for), named in the FSCAN messages so a log shows what ran.
-#if defined(__AVX512BW__)
-const char *const kKswvTier = "AVX-512BW";
-#elif defined(__AVX2__)
-const char *const kKswvTier = "AVX2";
-#elif defined(__ARM_NEON) || defined(__aarch64__)
-const char *const kKswvTier = "NEON";
-#else
-const char *const kKswvTier = "none";
-#endif
+// The kswv tier run_kswv_batch binds (bwa_tests::kswv_batch_tier(): the runtime
+// tier, so BWAMEM3_FORCE_TIER selects it), named in the messages so a log shows
+// what ran.
+const char *kswv_tier() { return bwa_tests::kswv_batch_tier_name(); }
+
+// Whether run_kswv_batch binds the AVX-512BW kernel object.
+bool kswv_avx512bw() { return bwa_tests::kswv_batch_tier() == BWAMEM3_TIER_AVX512BW; }
 
 } // namespace
 
@@ -291,14 +287,17 @@ TEST_CASE("kswv handles every curated edge case identically to scalar"
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_ROWPAIR off == on, and one-row matches scalar"
           * doctest::test_suite("unit/kswv")) {
 
-#if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(__AVX512BW__)
+#if !defined(__ARM_NEON) && !defined(__aarch64__)
     // BWA3_RESCUE_ROWPAIR gates the NEON u8 kernel and the AVX-512BW u8 FScan
-    // body; an AVX2 build's run_kswv_batch binds kswv256_u8, where both arms run
+    // body; on the avx2 tier run_kswv_batch binds kswv256_u8, where both arms run
     // identical code, so this case would pass without exercising the row-pair
-    // logic (test_kswv_rowpair_u8.cpp gates the AVX-512BW pair at runtime tier).
-    MESSAGE("skipped: BWA3_RESCUE_ROWPAIR affects the NEON and AVX-512BW u8 rescue kernels only");
-    return;
-#else
+    // logic.
+    if (!kswv_avx512bw()) {
+        MESSAGE("skipped: BWA3_RESCUE_ROWPAIR affects the NEON and AVX-512BW u8 rescue kernels only, and "
+                "run_kswv_batch binds " << std::string(kswv_tier()));
+        return;
+    }
+#endif
     auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
 
     std::mt19937 rng(1234);
@@ -360,7 +359,6 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_ROWPAIR off == on, and one-row matches sc
             << oracle_mism << " over " << pairs.size() << " pairs");
     CHECK(drift == 0);
     CHECK(oracle_mism == 0);
-#endif
 }
 
 // The two-row sweep recovers the query-end column either inline (a per-cell
@@ -549,7 +547,7 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
           * doctest::test_suite("unit/kswv")) {
 #if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(__AVX2__)
     MESSAGE("skipped: BWA3_RESCUE_USQADD affects the NEON, AVX2 and AVX-512BW u8 rescue kernels only, and "
-            "this build binds " << kKswvTier);
+            "run_kswv_batch binds " << std::string(kswv_tier()));
     return;
 #else
     auto mat = bwa_tests::build_scoring_matrix(1, 4, 1);
@@ -565,11 +563,8 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
 
     // On AVX-512BW the u8 FScan bodies pair rows by default, so also run both
     // bodies with ROWPAIR=0 there to keep their one-row sweeps covered.
-#if defined(__AVX512BW__)
-    const char *const rowpairs[] = {"1", "0"};
-#else
-    const char *const rowpairs[] = {"1"};
-#endif
+    std::vector<const char *> rowpairs = {"1"};
+    if (kswv_avx512bw()) rowpairs.push_back("0");
     for (const char *rowpair : rowpairs) {
         CAPTURE(std::string(rowpair));
         ScopedEnv rp("BWA3_RESCUE_ROWPAIR", rowpair);
@@ -647,11 +642,11 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_USQADD off == on, and biased body matches
 // (NEON, AVX2, AVX-512BW) -- the G-based cell (F opens from G only, one
 // sat(G - oe) shared by both gaps, row max over G), the query-only boundary
 // mask, and no reference-pad mask. Each is argued byte-identical in kswv.cpp;
-// this pins the bodies of the tier the test binary is compiled for
-// (run_kswv_batch binds the compile-time tier; kKswvTier names it in the
-// messages). The CI rows build NEON and AVX2; the AVX-512BW bodies are reached
-// by the canonical row's arch=avx512bw kswv step where the runner has
-// AVX-512BW (it reports SKIP otherwise). For each body the flag reaches -- on
+// this pins the bodies of the tier run_kswv_batch binds (the runtime tier, so
+// BWAMEM3_FORCE_TIER selects it; kswv_tier() names it in the messages). A run
+// with no force covers the host's tier; the CI steps that force each tier cover
+// the AVX2 and AVX-512BW bodies where the runner has AVX-512BW (they report SKIP
+// otherwise). For each body the flag reaches -- on
 // NEON one-row, two-row inline argmax, two-row lazy, and the biased (USQADD=0)
 // two-row body; on x86 the signed-domain form (the default, which USQADD
 // selects) and the biased form of each tier's body, and on AVX-512BW both again
@@ -680,7 +675,7 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
         {"adjacent gaps (B20 O1 E1)", 20, 1, 1},
     };
     struct Config { std::string name; const char *rowpair, *lazyqe, *usqadd; bool oracle; };
-    const Config configs[] = {
+    std::vector<Config> configs = {
 #if defined(__ARM_NEON) || defined(__aarch64__)
         {"one-row",         "0", "1", "1", false},
         {"two-row inline",  "1", "0", "1", false},
@@ -689,14 +684,14 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
 #else
         {"x86",             "1", "1", "1", true},   // AVX2 / AVX-512BW: the signed-domain FScan body
         {"x86 biased",      "1", "1", "0", false},  // AVX2 / AVX-512BW: the biased FScan body (USQADD=0)
-#if defined(__AVX512BW__)
-        // AVX-512BW pairs rows in its u8 FScan bodies, so the defaults above run
-        // the two-row sweep; these keep its one-row sweep under both regimes.
-        {"x86 one-row",        "0", "1", "1", false},
-        {"x86 one-row biased", "0", "1", "0", false},
-#endif
 #endif
     };
+    if (kswv_avx512bw()) {
+        // AVX-512BW pairs rows in its u8 FScan bodies, so the defaults above run
+        // the two-row sweep; these keep its one-row sweep under both regimes.
+        configs.push_back({"x86 one-row",        "0", "1", "1", false});
+        configs.push_back({"x86 one-row biased", "0", "1", "0", false});
+    }
     int oracle_mism = 0;
     for (const Regime &r : regimes) {
         auto mat = bwa_tests::build_scoring_matrix(1, r.mismatch, 1);
@@ -747,7 +742,7 @@ TEST_CASE("kswv u8 rescue: BWA3_RESCUE_FSCAN off == on in every u8 body, and FSC
                     }
                 }
             }
-            MESSAGE("fscan off-vs-on [" << r.name << "] (" << std::string(kKswvTier) << " " << c.name << ") drift=" << drift
+            MESSAGE("fscan off-vs-on [" << r.name << "] (" << std::string(kswv_tier()) << " " << c.name << ") drift=" << drift
                     << " over " << pairs.size() << " pairs");
             CHECK(drift == 0);
         }
@@ -791,17 +786,17 @@ TEST_CASE("kswv u8 FScan: the two-row sweep agrees with FSCAN off and scalar at 
         {"adjacent gaps (B20 O1 E1)", 20, 1, 1},
     };
     struct Config { std::string name; const char *rowpair, *lazyqe, *usqadd; bool oracle; };
-    const Config configs[] = {
+    std::vector<Config> configs = {
         {"two-row lazy",   "1", "1", "1", true},   // the production default
         {"two-row inline", "1", "0", "1", false},
         {"two-row biased", "1", "1", "0", false},
-#if defined(__AVX512BW__)
+    };
+    if (kswv_avx512bw()) {
         // AVX-512BW's default u8 FScan bodies pair rows; keep the one-row sweeps
         // covered at every short query length too.
-        {"one-row",        "0", "1", "1", false},
-        {"one-row biased", "0", "1", "0", false},
-#endif
-    };
+        configs.push_back({"one-row",        "0", "1", "1", false});
+        configs.push_back({"one-row biased", "0", "1", "0", false});
+    }
     int oracle_mism = 0;
     for (const Regime &r : regimes) {
         auto mat = bwa_tests::build_scoring_matrix(1, r.mismatch, 1);
@@ -841,7 +836,7 @@ TEST_CASE("kswv u8 FScan: the two-row sweep agrees with FSCAN off and scalar at 
                     }
                 }
             }
-            MESSAGE("short-query fscan off-vs-on [" << r.name << "] (" << std::string(kKswvTier) << " "
+            MESSAGE("short-query fscan off-vs-on [" << r.name << "] (" << std::string(kswv_tier()) << " "
                     << c.name << ") drift=" << drift << " over " << pairs.size() << " pairs");
             CHECK(drift == 0);
         }
@@ -851,7 +846,7 @@ TEST_CASE("kswv u8 FScan: the two-row sweep agrees with FSCAN off and scalar at 
 
 // The 16-bit twin of the case above: BWA3_RESCUE_FSCAN selects the G-based
 // int16 cell in the NEON (one-row, two-row inline, two-row lazy), AVX2 and
-// AVX-512BW 16-bit bodies (of which the compile-time tier's run here, as
+// AVX-512BW 16-bit bodies (of which the runtime tier's run here, as
 // above). Same two scoring regimes and why, plus the regime
 // the 16-bit kernel exists for -- match 14, scores well past 255 -- whose
 // sub-cluster pairs put the gaps next to high-scoring matches.
@@ -943,7 +938,7 @@ TEST_CASE("kswv u16 rescue: BWA3_RESCUE_FSCAN off == on in every u16 body, and F
                     }
                 }
             }
-            MESSAGE("u16 fscan off-vs-on [" << r.name << "] (" << std::string(kKswvTier) << " " << c.name << ") drift=" << drift
+            MESSAGE("u16 fscan off-vs-on [" << r.name << "] (" << std::string(kswv_tier()) << " " << c.name << ") drift=" << drift
                     << " over " << ps.size() << " pairs");
             CHECK(drift == 0);
         }
@@ -1074,7 +1069,7 @@ TEST_CASE("kswv rescue: the FSCAN gate keeps asymmetric gaps exact"
                     }
                 }
             }
-            MESSAGE("fscan gate [" << g.name << "] " << std::string(kKswvTier) << " " << std::string(use16 ? "u16" : "u8")
+            MESSAGE("fscan gate [" << g.name << "] " << std::string(kswv_tier()) << " " << std::string(use16 ? "u16" : "u8")
                     << ": off-vs-on drift=" << drift << ", scalar mismatches=" << mism
                     << " over " << pairs.size() << " pairs");
             CHECK(drift == 0);
@@ -1131,7 +1126,7 @@ kswr_t run_scalar_gaps(const bwa_tests::TestPair &p, const bwa_tests::ScoringMat
 }
 
 // run_kswv_batch_gaps (phase 0, then phase 1 on the survivors, through the
-// compile-time-tier kswv), taking a GapCosts. Results in input order.
+// runtime tier's kswv), taking a GapCosts. Results in input order.
 std::vector<kswr_t> run_kswv_gaps(const std::vector<bwa_tests::TestPair> &pairs,
                                   const bwa_tests::ScoringMatrix &mat, const GapCosts &g,
                                   bool use16) {
@@ -1161,7 +1156,7 @@ void check_fscan_off_on(const std::string &what, const std::vector<bwa_tests::Te
     REQUIRE(g.o_ins + g.e_ins == g.o_del + g.e_del);
     const auto scalar = scalar_all(pairs, mat, g, use16);
     struct Config { std::string name; const char *rowpair, *lazyqe, *usqadd; bool oracle; };
-    const Config configs[] = {
+    std::vector<Config> configs = {
 #if defined(__ARM_NEON) || defined(__aarch64__)
         {"one-row",        "0", "1", "1", false},
         {"two-row inline", "1", "0", "1", false},
@@ -1170,14 +1165,14 @@ void check_fscan_off_on(const std::string &what, const std::vector<bwa_tests::Te
 #else
         {"x86",            "1", "1", "1", true},   // AVX2 / AVX-512BW: the signed-domain FScan body
         {"x86 biased",     "1", "1", "0", false},  // x86 u8 only: the biased FScan body (USQADD=0)
-#if defined(__AVX512BW__)
-        // u8 only: the AVX-512BW u8 FScan bodies pair rows by default; these keep
-        // their one-row sweep (ROWPAIR does not reach the x86 16-bit bodies).
-        {"x86 one-row",        "0", "1", "1", false},
-        {"x86 one-row biased", "0", "1", "0", false},
-#endif
 #endif
     };
+    if (kswv_avx512bw()) {
+        // u8 only: the AVX-512BW u8 FScan bodies pair rows by default; these keep
+        // their one-row sweep (ROWPAIR does not reach the x86 16-bit bodies).
+        configs.push_back({"x86 one-row",        "0", "1", "1", false});
+        configs.push_back({"x86 one-row biased", "0", "1", "0", false});
+    }
 #if defined(__ARM_NEON) || defined(__aarch64__)
     constexpr bool rowpair16 = true;    // NEON pairs rows in its 16-bit bodies too
 #else
@@ -1243,7 +1238,7 @@ void check_fscan_off_on(const std::string &what, const std::vector<bwa_tests::Te
                 }
             }
         }
-        MESSAGE(what << " (" << std::string(kKswvTier) << " " << c.name << std::string(use16 ? ", u16" : ", u8") << "): fscan off-vs-on drift="
+        MESSAGE(what << " (" << std::string(kswv_tier()) << " " << c.name << std::string(use16 ? ", u16" : ", u8") << "): fscan off-vs-on drift="
                 << drift << " over " << sub.size() << " pairs");
         CHECK(drift == 0);
     }
@@ -1548,7 +1543,7 @@ TEST_CASE("kswv u8 rescue: partial final groups match scalar at every batch size
             auto batched = bwa_tests::run_kswv_batch(pairs, mat);
             REQUIRE(batched.size() == pairs.size());
             for (int i = 0; i < n; i++) {
-                const std::string tier(kKswvTier);
+                const std::string tier(kswv_tier());
                 CAPTURE(tier);
                 const std::string body(b.name);
                 CAPTURE(body);
@@ -1576,7 +1571,7 @@ TEST_CASE("kswv u8 rescue: partial final groups match scalar at every batch size
         }
     }
     MESSAGE("partial-group parity: " << checked << " pair results (" << te2_checked
-            << " with a second best, te2 compared) on tier " << std::string(kKswvTier));
+            << " with a second best, te2 compared) on tier " << std::string(kswv_tier()));
     CHECK(te2_checked > 0);
 }
 

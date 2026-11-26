@@ -117,9 +117,9 @@ performance, specify the architecture that matches your deployment target:
 
 | Flag | Requires | Notes |
 |------|----------|-------|
-| `make` | SSE4.1 or better (x86), any (ARM) | Default; selects best dispatch at runtime on x86 |
+| `make` | AVX2 (x86), any (ARM) | Default (`BASELINE_ARCH=avx2`); kernels dispatch to the best tier at runtime on x86 |
 | `make arch=avx2` | AVX2 (e.g. Haswell, Zen 2) | Recommended for modern x86 servers |
-| `make arch=avx512bw` | AVX-512BW (e.g. Skylake-X, Ice Lake, Sapphire Rapids) | Maximum x86 performance |
+| `make arch=avx512bw` | AVX-512BW (e.g. Skylake-X, Ice Lake, Sapphire Rapids) | Maximum x86 performance; the `avx512bw` kernels also need AVX-512VL and DQ, which these CPUs have |
 | `make arch=arm64` | Apple Silicon / AWS Graviton | NEON-vectorized build |
 
 See [Performance — SIMD dispatch matrix](../performance/simd-dispatch.md) for the full matrix
@@ -154,7 +154,7 @@ Expected output (with mimalloc):
 ```text
 v0.2.0-12-gabcdef1
 Compiler: clang X.Y.Z
-SIMD floor: avx2 (x86-64-v3, Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
+SIMD floor: avx2 (Haswell 2013+); kernels: sse41 sse42 avx avx2 avx512bw
 SIMD runtime: avx2 (BWAMEM3_FORCE_TIER unset)
 mimalloc 3.x.x (active)
 ```

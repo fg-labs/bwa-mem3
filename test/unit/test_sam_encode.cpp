@@ -30,6 +30,7 @@
 
 #include "doctest/doctest.h"
 #include "sam_encode.h"
+#include "x86_tier_caps.h"
 
 #if defined(__x86_64__) || defined(__i386__)
 extern "C" void sam_encode_seq_fwd_sse41(char *dst, const uint8_t *src, int n);
@@ -66,11 +67,11 @@ std::vector<Tier> tiers() {
         ts.push_back({"avx2", sam_encode_seq_fwd_avx2, sam_encode_seq_rev_avx2, sam_encode_qual_rev_avx2});
     else
         WARN_MESSAGE(false, "sam_encode: no AVX2 on this host; the avx2 copy is not checked");
-    if (__builtin_cpu_supports("avx512bw"))
+    if (bwa_tests::host_runs_avx512bw_kernels())
         ts.push_back({"avx512bw", sam_encode_seq_fwd_avx512bw, sam_encode_seq_rev_avx512bw,
                       sam_encode_qual_rev_avx512bw});
     else
-        WARN_MESSAGE(false, "sam_encode: no AVX-512BW on this host; the avx512bw copy is not checked");
+        WARN_MESSAGE(false, "sam_encode: this host lacks AVX-512BW, VL or DQ; the avx512bw copy is not checked");
 #else
     ts.push_back({"baseline", sam_encode_seq_fwd, sam_encode_seq_rev, sam_encode_qual_rev});
 #endif

@@ -55,15 +55,20 @@ at runtime via `__builtin_cpu_supports`. Non-kernel TUs compile once at
 
 ### Single-tier x86 builds
 
-Pass `arch=<target>` to compile a single binary with kernels for **one
-tier only** (no runtime dispatch table — useful on clusters with uniform
-hardware):
+Pass `arch=<target>` to compile the non-kernel code for one tier (useful
+on clusters with uniform hardware); the kernels still dispatch at runtime:
 
 | Command | SIMD level | `ARCH_FLAGS` |
 |---|---|---|
 | `make arch=avx2` | AVX2 | `-mavx2` |
 | `make arch=avx512bw` | AVX-512BW | `-mavx512f -mavx512bw -mprefer-vector-width=256` |
 | `make arch=native` | host CPU features | `-march=native` |
+
+`ARCH_FLAGS` applies to the non-kernel code only. The kernel objects are compiled at every
+tier with their own `KERNEL_FLAGS_<tier>`, whatever `arch=` is, and dispatched at runtime. The
+`avx512bw` kernels also use AVX-512VL and DQ, so they run only on a CPU that reports
+AVX-512BW, VL and DQ; elsewhere the dispatcher runs the `avx2` kernels, including in an
+`arch=avx512bw` binary on a CPU that has AVX-512BW without VL or DQ.
 
 `arch=sse41`, `arch=sse42`, and `arch=avx` are refused at configure time: the batched mate-rescue kernels require AVX2+ and the pre-AVX2 scalar fallback was removed, so AVX2 is the minimum x86 tier.
 

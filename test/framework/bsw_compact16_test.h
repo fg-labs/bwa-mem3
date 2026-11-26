@@ -14,6 +14,7 @@
 #include "bandedSWA.h"
 #include "bsw_batch.h"
 #include "ext_ladder.h"
+#include "x86_tier_caps.h"
 
 #if HAVE_BSW_VECTOR_8_16
 
@@ -71,7 +72,7 @@ std::vector<Tier> compacting_tiers()
 #elif defined(__x86_64__) || defined(__i386__)
     __builtin_cpu_init();
     if (__builtin_cpu_supports("avx2")) ts.push_back({"avx2", make_bsw_kernel_avx2, 16, BSW16_COMPACT_GROUPS_AVX2});
-    if (__builtin_cpu_supports("avx512bw"))
+    if (bwa_tests::host_runs_avx512bw_kernels())
         ts.push_back({"avx512bw", make_bsw_kernel_avx512bw, 32, BSW16_COMPACT_GROUPS_AVX512});
 #endif
     const char *req = std::getenv("BWA_REQUIRE_COMPACTION_TIER");

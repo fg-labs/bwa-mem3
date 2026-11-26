@@ -7,7 +7,9 @@
 # Inputs:
 #   BWA_MEM3        — path to the bwa-mem3 binary under test
 #   EXPECTED_FLOOR  — (optional) expected build floor (e.g. "avx2"); if set,
-#                     the floor line is checked to match exactly
+#                     the floor tier is checked to match exactly, and for avx2
+#                     and avx512bw so is the whole floor line (and, for avx2,
+#                     every example of it quoted in docs/src)
 
 set -euo pipefail
 
@@ -43,12 +45,56 @@ if ! grep -q '^SIMD runtime: ' "$OUT"; then
     exit 1
 fi
 
+floor_line="$(grep '^SIMD floor: ' "$OUT" | head -1)"
+
+# The parenthetical names the oldest CPU the floor runs on, never a psABI level:
+# the floor check verifies only the tier's own subsets, not a full x86-64-v2/-v3/-v4
+# set, so such a label would overstate what the binary was checked for.
+if [[ $floor_line == *x86-64-v* ]]; then
+    echo "FAIL: floor line names a psABI level: $floor_line" >&2
+    exit 1
+fi
+
 if [[ -n "${EXPECTED_FLOOR:-}" ]]; then
-    actual="$(grep '^SIMD floor: ' "$OUT" | sed -E 's/^SIMD floor: ([a-z0-9]+).*/\1/' | head -1)"
+    actual="$(sed -E 's/^SIMD floor: ([a-z0-9]+).*/\1/' <<< "$floor_line")"
     if [[ "$actual" != "$EXPECTED_FLOOR" ]]; then
         echo "FAIL: floor mismatch — expected '$EXPECTED_FLOOR', got '$actual'" >&2
         cat "$OUT" >&2
         exit 1
+    fi
+
+    # The whole line for the x86 floors a build can have (arch=avx2, arch=avx512bw).
+    case "$EXPECTED_FLOOR" in
+        avx2) floor_label="Haswell 2013+" ;;
+        avx512bw) floor_label="Skylake-X 2017+" ;;
+        *) floor_label="" ;;
+    esac
+    if [[ -n $floor_label ]]; then
+        want="SIMD floor: $EXPECTED_FLOOR ($floor_label); kernels: sse41 sse42 avx avx2 avx512bw"
+        if [[ "$floor_line" != "$want" ]]; then
+            echo "FAIL: floor line mismatch — expected '$want', got '$floor_line'" >&2
+            exit 1
+        fi
+
+        # The docs quote the floor line of a default (avx2) build as example output;
+        # each quote must match what the binary prints (runs of spaces aside).
+        docs_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/docs/src"
+        if [[ $EXPECTED_FLOOR == avx2 && -d $docs_dir ]]; then
+            n_quotes=0
+            while IFS= read -r quote; do
+                n_quotes=$((n_quotes + 1))
+                quote_file="${quote%%:*}"
+                quote_line="$(tr -s ' ' <<< "${quote#*:}")"
+                if [[ "$quote_line" != "$want" ]]; then
+                    echo "FAIL: $quote_file quotes '$quote_line'; the binary prints '$want'" >&2
+                    exit 1
+                fi
+            done < <(grep -rE --include='*.md' '^SIMD floor: +avx2 ' "$docs_dir" || true)
+            if ((n_quotes == 0)); then
+                echo "FAIL: no documented 'SIMD floor: avx2' example found under $docs_dir" >&2
+                exit 1
+            fi
+        fi
     fi
 fi
 

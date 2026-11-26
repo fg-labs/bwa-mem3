@@ -12,7 +12,7 @@
 // the same result fields as both switches off, and that reference must match
 // scalar ksw_align2 (ksw_u8 for the 8-bit kernel, ksw_i16 for the 16-bit one).
 // The batch is laid out as explicit lane groups of the kernel's width, 16 on
-// NEON and 64 on AVX-512BW (kGroup; the runner keeps input
+// NEON and 64 on AVX-512BW (kgroup(); the runner keeps input
 // order), so the zero range is non-empty (uniform lengths that are not a multiple
 // of 16, and ragged lengths inside one quantum), empty (a lane whose length is a
 // multiple of 16, mixed quanta), or absent (a partial final group). The rescan
@@ -41,12 +41,9 @@ namespace {
 using bwa_tests::ScopedEnv;   // scoped_env.h
 
 // Lanes per u8 kernel group: a group's zero range is [max len2, min quantum), so
-// the groups below are laid out at the width of the kernel that runs them.
-#if defined(__AVX512BW__) && !defined(__ARM_NEON) && !defined(__aarch64__)
-constexpr int kGroup = 64;
-#else
-constexpr int kGroup = 16;
-#endif
+// the groups below are laid out at the width of the kernel that runs them (the
+// one run_kswv_batch binds, bwa_tests::kswv_batch_tier()).
+int kgroup() { return bwa_tests::kswv_batch_tier() == BWAMEM3_TIER_AVX512BW ? 64 : 16; }
 
 // A query of period `period` (random bases) against a reference holding copies
 // of it with a few substitutions, so a row's max recurs at columns `period` apart.
@@ -88,7 +85,7 @@ bwa_tests::TestPair tie_pair(std::mt19937 &rng, int qlen, int rlen, int period)
 void add_tie_group(std::vector<bwa_tests::TestPair> &pairs, std::mt19937 &rng, int qlo, int qhi)
 {
     std::uniform_int_distribution<int> qd(qlo, qhi);
-    for (int l = 0; l < kGroup; l++) {
+    for (int l = 0; l < kgroup(); l++) {
         const int q = qd(rng);
         std::uniform_int_distribution<int> rd(q / 4, q / 2);
         pairs.push_back(tie_pair(rng, q, rd(rng), 1 + l % 3));
@@ -104,7 +101,7 @@ void add_tie_group(std::vector<bwa_tests::TestPair> &pairs, std::mt19937 &rng, i
 // one that lets a later block's scan overwrite it.
 void add_offset_tie_group(std::vector<bwa_tests::TestPair> &pairs)
 {
-    for (int l = 0; l < kGroup; l++) {
+    for (int l = 0; l < kgroup(); l++) {
         bwa_tests::TestPair p;
         const int s = 7 * (l % 16);
         p.qry.assign(150, 0);
@@ -117,7 +114,7 @@ void add_offset_tie_group(std::vector<bwa_tests::TestPair> &pairs)
 
 // One group whose query lengths are drawn from [qlo, qhi].
 void add_group(std::vector<bwa_tests::TestPair> &pairs, std::mt19937 &rng, int qlo, int qhi,
-               int nlanes = kGroup)
+               int nlanes = kgroup())
 {
     std::uniform_int_distribution<int> qd(qlo, qhi);
     for (int l = 0; l < nlanes; l++) {
@@ -232,11 +229,14 @@ void check_arms(const std::vector<bwa_tests::TestPair> &pairs, bool use16)
 
 TEST_CASE("kswv u8 rescue: BWA3_RESCUE_PADCOLS and BWA3_RESCUE_QE_REVSCAN on == off, in both sweeps"
           * doctest::test_suite("unit/kswv")) {
-#if !defined(__ARM_NEON) && !defined(__aarch64__) && !defined(__AVX512BW__)
-    MESSAGE("skipped: both switches affect the NEON and AVX-512BW u8 rescue kernels only");
-#else
-    check_arms(build_groups(true), false);
+#if !defined(__ARM_NEON) && !defined(__aarch64__)
+    if (bwa_tests::kswv_batch_tier() != BWAMEM3_TIER_AVX512BW) {
+        MESSAGE("skipped: both switches affect the NEON and AVX-512BW u8 rescue kernels only, and "
+                "run_kswv_batch binds " << std::string(bwa_tests::kswv_batch_tier_name()));
+        return;
+    }
 #endif
+    check_arms(build_groups(true), false);
 }
 
 TEST_CASE("kswv u16 rescue: BWA3_RESCUE_QE_REVSCAN on == off, in both sweeps"

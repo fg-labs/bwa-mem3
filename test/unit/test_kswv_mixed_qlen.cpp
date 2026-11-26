@@ -103,15 +103,14 @@ bool batched_kswv_available() {
 // and, with it, the HasFreed=true kernel instantiation. `mat` is the matrix the
 // scalar oracle uses and MUST be the same one, or the comparison is meaningless.
 //
-// Deliberately uses make_kswv() rather than the framework's run_kswv_batch():
-// run_kswv_batch constructs the concrete `kswv` class directly, which binds to
-// whichever tier this translation unit was compiled at (BASELINE_ARCH, i.e.
-// avx2 on x86). make_kswv dispatches on the RUNTIME tier and honors
-// BWAMEM3_FORCE_TIER, so this test reaches the AVX-512BW kernel -- one of the
-// two that regressed -- on a capable host, and can be swept across tiers.
+// Uses make_kswv() rather than the framework's run_kswv_batch(): make_kswv
+// installs `kernel_mat` (run_kswv_batch has no matrix argument), dispatches on
+// the RUNTIME tier and honors BWAMEM3_FORCE_TIER, so this test reaches the
+// AVX-512BW kernel -- one of the two that regressed -- on a capable host, and
+// can be swept across tiers.
 // Both phases run: phase 0 for score/score2/te/qe/te2, then phase 1 for tb/qb.
 // test_kswv_correctness.cpp also drives both, but only through run_kswv_batch's
-// compile-time-tier, symmetric-matrix, independent-ref-and-query configuration,
+// symmetric-matrix, independent-ref-and-query configuration,
 // which is why neither phase's exposure to the padding contract showed up there.
 void compare_batch(uint64_t seed, const std::vector<bwa_tests::TestPair> &pairs,
                    const bwa_tests::ScoringMatrix &mat, const int8_t *kernel_mat,

@@ -13,6 +13,47 @@
 
 namespace bwa_tests {
 
+int kswv_batch_tier() {
+    bwamem3_simd_init();
+    const int tier = bwamem3_simd_tier();
+#if defined(__x86_64__) || defined(__i386__)
+    return tier < BWAMEM3_TIER_AVX2 ? BWAMEM3_TIER_AVX2 : tier;
+#else
+    return tier;
+#endif
+}
+
+const char *kswv_batch_tier_name() {
+    switch (kswv_batch_tier()) {
+        case BWAMEM3_TIER_AVX512BW: return "AVX-512BW";
+        case BWAMEM3_TIER_AVX2:     return "AVX2";
+        case BWAMEM3_TIER_NEON:     return "NEON";
+        default:                    return "none";
+    }
+}
+
+namespace {
+
+// The kswv object run_kswv_batch_gaps drives: kswv_batch_tier()'s kernel object on
+// x86, the single NEON kswv on arm64.
+std::unique_ptr<Ikswv> make_batch_kswv(int o_del, int e_del, int o_ins, int e_ins,
+                                       int8_t w_match, int8_t w_mismatch,
+                                       int32_t maxRefLen, int32_t maxQerLen) {
+#if defined(__x86_64__) || defined(__i386__)
+    Ikswv *raw = kswv_batch_tier() == BWAMEM3_TIER_AVX512BW
+        ? make_kswv_kernel_avx512bw(o_del, e_del, o_ins, e_ins, w_match, w_mismatch, 1,
+                                    maxRefLen, maxQerLen)
+        : make_kswv_kernel_avx2(o_del, e_del, o_ins, e_ins, w_match, w_mismatch, 1,
+                                maxRefLen, maxQerLen);
+    return std::unique_ptr<Ikswv>(raw);
+#else
+    return make_kswv(o_del, e_del, o_ins, e_ins, w_match, w_mismatch, 1, maxRefLen,
+                     maxQerLen);
+#endif
+}
+
+} // namespace
+
 std::vector<kswr_t> run_kswv_batch(const std::vector<TestPair> &pairs,
                                    const ScoringMatrix &mat,
                                    int gap_open,
@@ -56,14 +97,13 @@ std::vector<kswr_t> run_kswv_batch_gaps(const std::vector<TestPair> &pairs,
         }
     }
 
-    // C++11 throughout this tree, so spell out the unique_ptr ctor
-    // rather than std::make_unique. RAII guarantees pwsw is destroyed
-    // even if a later step (prepare_phase1, vector copy) throws.
-    std::unique_ptr<kswv> pwsw(new kswv(
+    // RAII guarantees pwsw is destroyed even if a later step (prepare_phase1,
+    // vector copy) throws.
+    std::unique_ptr<Ikswv> pwsw = make_batch_kswv(
         o_del, e_del, o_ins, e_ins,
         mat[0],   // match weight (diagonal entry, +match)
         mat[1],   // mismatch weight (off-diagonal, -mismatch)
-        1, maxRefLen, maxQerLen));
+        maxRefLen, maxQerLen);
 
     // Phase 0: forward pass.
     if (use16) {

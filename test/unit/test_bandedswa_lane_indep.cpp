@@ -54,6 +54,7 @@
 #include "bsw_batch.h"
 #include "scoped_rescue_env.h"   // ScopedDedupMode
 #include "ext_ladder.h"
+#include "x86_tier_caps.h"
 
 #if HAVE_BSW_VECTOR_8_16
 
@@ -138,10 +139,10 @@ std::vector<Kernel> host_kernels()
     add(__builtin_cpu_supports("avx2"), "avx2 (lane compaction off)", make_compact<make_bsw_kernel_avx2, 0, 0>);
     add(__builtin_cpu_supports("avx2"), "avx2 (lane compaction, 3 groups, every band)",
         make_compact<make_bsw_kernel_avx2, 3, 0>);
-    add(__builtin_cpu_supports("avx512bw"), "avx512bw", make_with<make_bsw_kernel_avx512bw>);
-    add(__builtin_cpu_supports("avx512bw"), "avx512bw (lane compaction off)",
+    add(bwa_tests::host_runs_avx512bw_kernels(), "avx512bw", make_with<make_bsw_kernel_avx512bw>);
+    add(bwa_tests::host_runs_avx512bw_kernels(), "avx512bw (lane compaction off)",
         make_compact<make_bsw_kernel_avx512bw, 0, 0>);
-    add(__builtin_cpu_supports("avx512bw"), "avx512bw (lane compaction, 3 groups, every band)",
+    add(bwa_tests::host_runs_avx512bw_kernels(), "avx512bw (lane compaction, 3 groups, every band)",
         make_compact<make_bsw_kernel_avx512bw, 3, 0>);
     if (!skipped.empty()) MESSAGE("lane independence: this CPU cannot run tier(s)" << skipped << "; not checked here");
 #endif
