@@ -259,10 +259,12 @@ class FMI_search: public indexEle
     /* Read n one-byte high parts at offset `off` of the file open as `fd` (named `path`, for
      * the workers' private descriptors) and pack them into dst, assigning all of its words.
      * Up to nthreads workers (the index load's worker count for n bytes) each read a
-     * whole-word range a piece at a time and pack it at once. Returns 0, SA_HI_READ_OOM, or
-     * SA_HI_READ_RANGE if a byte does not fit (a corrupt index); an I/O error or a short
-     * file exits, as the rest of the index load does. Does not move fd's file offset. */
-    enum { SA_HI_READ_OOM = -1, SA_HI_READ_RANGE = -2 };
+     * whole-word range a piece at a time and pack it at once. Returns 0, SA_HI_READ_OOM,
+     * SA_HI_READ_RANGE if a byte does not fit (a corrupt index), or SA_HI_READ_IO on an I/O
+     * error or short file (diagnostic already emitted). All workers are joined, private
+     * descriptors closed and read buffers freed before returning. On failure dst is partial
+     * and must not be used. Does not move fd's file offset. */
+    enum { SA_HI_READ_OOM = -1, SA_HI_READ_RANGE = -2, SA_HI_READ_IO = -3 };
     static int sa_hi_pread_pack(int fd, const char *path, off_t off, int64_t n, int log2,
                                 uint64_t *dst, int nthreads);
 

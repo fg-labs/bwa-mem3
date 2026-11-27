@@ -23,6 +23,7 @@
 #include <string>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/wait.h>
 #include <vector>
 
 namespace {
@@ -192,6 +193,111 @@ TEST_CASE("sa_hi_pread_pack splits over several workers at whole words") {
     CHECK(FMI_search::sa_hi_pread_pack(bfd, path.c_str(), 64, n, 0, got.data(), 7)
           == FMI_search::SA_HI_READ_RANGE);
     close(bfd);
+}
+
+TEST_CASE("sa_hi_pread_pack returns read failures after joining its workers") {
+    for (const int threads : {1, 3}) {
+        for (const bool bad_fd : {false, true}) {
+            CAPTURE(threads);
+            CAPTURE(bad_fd);
+            bwa_tests::TempDir dir("sa_hi_read_error");
+            std::string path;
+            const int fd = bytes_file(dir, "short", std::vector<int8_t>(64, 0), 0, path);
+            const int64_t n = threads == 1 ? 128 : 3 * (int64_t)FMI_PREAD_MIN_CHUNK;
+            std::vector<uint64_t> got((size_t)FMI_search::sa_hi_words(n, 0));
+            fflush(NULL);
+            const pid_t pid = fork();
+            REQUIRE(pid >= 0);
+            if (pid == 0) {
+                // An absent path keeps all workers on the deliberately invalid fd.
+                const int rc = FMI_search::sa_hi_pread_pack(bad_fd ? -1 : fd,
+                    bad_fd ? dir.file("absent").c_str() : path.c_str(), 0, n, 0,
+                    got.data(), threads);
+                _exit(rc == FMI_search::SA_HI_READ_IO ? 0 : 2);
+            }
+            int status = 0;
+            REQUIRE(waitpid(pid, &status, 0) == pid);
+            CHECK(WIFEXITED(status));
+            CHECK(WEXITSTATUS(status) == 0);
+            close(fd);
+        }
+    }
+}
+
+TEST_CASE("sa_hi_pread_pack reports EOF confined to a spawned worker") {
+    bwa_tests::TempDir dir("sa_hi_spawned_eof");
+    const std::string path = dir.file("short");
+    const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    REQUIRE(fd >= 0);
+    const int64_t n = 3 * (int64_t)FMI_PREAD_MIN_CHUNK;
+    REQUIRE(fmi_pread_worker_count((size_t)n, 3) == 3);
+    // Sparse zero-filled bytes cover the first two readers completely; only
+    // the last spawned worker encounters EOF, so its status must be collected.
+    REQUIRE(ftruncate(fd, (off_t)(2 * FMI_PREAD_MIN_CHUNK)) == 0);
+    std::vector<uint64_t> got((size_t)FMI_search::sa_hi_words(n, 0));
+    fflush(NULL);
+    const pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        const int rc = FMI_search::sa_hi_pread_pack(fd, path.c_str(), 0, n, 0, got.data(), 3);
+        _exit(rc == FMI_search::SA_HI_READ_IO ? 0 : 2);
+    }
+    int status = 0;
+    REQUIRE(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == 0);
+    close(fd);
+}
+
+TEST_CASE("ordinary parallel index reads remain fatal on EOF") {
+    for (const int threads : {1, 3}) {
+        bwa_tests::TempDir dir("ordinary_pread_error");
+        std::string path;
+        const int fd = bytes_file(dir, "short", std::vector<int8_t>(64, 0), 0, path);
+        FILE *fp = fdopen(fd, "rb");
+        REQUIRE(fp != NULL);
+        const size_t n = threads == 1 ? 128 : 3 * FMI_PREAD_MIN_CHUNK;
+        std::vector<char> got(n);
+        fflush(NULL);
+        const pid_t pid = fork();
+        REQUIRE(pid >= 0);
+        if (pid == 0) {
+            fmi_pread_from_stream(fp, path.c_str(), got.data(), n, threads);
+            _exit(2);  // A failed ordinary load must never return to its caller.
+        }
+        int status = 0;
+        REQUIRE(waitpid(pid, &status, 0) == pid);
+        CHECK(WIFEXITED(status));
+        CHECK(WEXITSTATUS(status) == EXIT_FAILURE);
+        fclose(fp);
+    }
+}
+
+TEST_CASE("ordinary parallel index reads remain fatal on spawned-worker-only EOF") {
+    bwa_tests::TempDir dir("ordinary_spawned_eof");
+    const std::string path = dir.file("short");
+    const int fd = open(path.c_str(), O_RDWR | O_CREAT | O_EXCL, 0600);
+    REQUIRE(fd >= 0);
+    const size_t n = 3 * FMI_PREAD_MIN_CHUNK;
+    REQUIRE(fmi_pread_worker_count(n, 3) == 3);
+    // The stream starts at zero: the first two readers succeed and only the
+    // last spawned worker can terminate this ordinary index read.
+    REQUIRE(ftruncate(fd, (off_t)(2 * FMI_PREAD_MIN_CHUNK)) == 0);
+    FILE *fp = fdopen(fd, "rb");
+    REQUIRE(fp != NULL);
+    std::vector<char> got(n);
+    fflush(NULL);
+    const pid_t pid = fork();
+    REQUIRE(pid >= 0);
+    if (pid == 0) {
+        fmi_pread_from_stream(fp, path.c_str(), got.data(), n, 3);
+        _exit(2);  // Ignoring a spawned reader's failure must not return success.
+    }
+    int status = 0;
+    REQUIRE(waitpid(pid, &status, 0) == pid);
+    CHECK(WIFEXITED(status));
+    CHECK(WEXITSTATUS(status) == EXIT_FAILURE);
+    fclose(fp);
 }
 
 TEST_CASE("sa_hi_pack rejects a high part wider than the chosen width") {
