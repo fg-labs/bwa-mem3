@@ -9,6 +9,8 @@
 #   ab  copies A (pos 401) and B (pos 541) differ at two C/T positions (offsets 10 and 25)
 #   ef  copies E (pos 401) and F (pos 841) differ at one C/T position (offset 20)
 #   gh  copies G (pos 401) and H (pos 841) differ at one G/A position (offset 20)
+#   ks  copies KA (pos 401) and KB (pos 841) differ at a C/T position, a real mismatch and a known
+#       site whose ALT is KA's base (--known-snvs)
 #
 # A read 1 that kept such a C (a methylated C) and converted the rest is unique under genomic
 # scoring, because at the other copy the C sits over a T (the mirror cell) and costs a mismatch.
@@ -25,7 +27,9 @@
 # whose MAPQ read 1's retained Cs raised is capped at the mirror-free pairing's MAPQ, a read 1 the
 # mirror-free pairing places at the other copy gets 0, a rescued mate takes its anchor's cap, a mate
 # that moves read 1 to the other copy anchors it (no cap) unless read 1's mirror-free loci exceed
-# --max-occ (then its cap is 0), and no MAPQ is ever raised; and the option's refusals.
+# --max-occ (then its cap is 0), and no MAPQ is ever raised; under --known-snvs and -n 2, a copy
+# that only the ALT-window search reaches, over the limit only by its mirror mismatch, still caps,
+# single-end and through the mirror-free pairing; and the option's refusals.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -93,6 +97,20 @@ BEGIN {
     fq(dir "/q1.fq", "anchor", conv(e, "C", "T", " 20 ")); fq(dir "/q2.fq", "anchor", mate(ef, 1180, 60))
     # paired end, a single pair on ayz: read 2 from the flank after copy Z moves read 1 there
     fq(dir "/o1.fq", "maxocc", conv(ka, "C", "T", " 10 ")); fq(dir "/o2.fq", "maxocc", mate(ayz, 1580, 60))
+    # --known-snvs (drawn last, so the contigs and reads above stay as they were): copy KB differs
+    # from copy KA at a C/T position (offset 10), a real mismatch (offset 20) and a site (offset
+    # 30, KA's A as KB's ALT); the read keeps KA's C and has one error (offset 5)
+    kc = put(put(dna(40), 10, "C"), 30, "A")
+    kb = put(put(put(kc, 10, "T"), 20, alt(substr(kc, 21, 1))), 30, "G")
+    ks = dna(400) kc dna(400) kb dna(400)
+    printf ">ks\n%s\n", ks > (dir "/ref.fa")
+    print "##fileformat=VCFv4.2\n##contig=<ID=ks>\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO" > (dir "/ks.vcf")
+    printf "ks\t871\t.\tG\tA\t.\tPASS\t.\n" > (dir "/ks.vcf")
+    r = conv(kc, "C", "T", " 10 ")
+    r = put(r, 5, alt(substr(r, 6, 1)))
+    fq(dir "/ks.fq", "ks1", r)
+    # paired end, a single pair: read 2 from the flank after copy KB
+    fq(dir "/k1.fq", "kpair", r); fq(dir "/k2.fq", "kpair", mate(ks, 1180, 60))
 }
 EOF
 awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/gen.awk" < /dev/null
@@ -276,6 +294,49 @@ run o2.blind --meth --max-occ 2 "$tmp/ref.fa" "$tmp/o1.fq" "$tmp/o2.fq"
 expect maxocc-moved "$tmp/o2.blind.sum" "maxocc 99 ayz 1281 0 29
 maxocc 147 ayz 1581 37 -"
 echo 'PASS: paired-max-occ-moved'
+
+# --known-snvs, -n 2: the read has one mismatch to KA. KB with its site's ALT has three strict
+# differences (its real mismatch, the read's error and the mirror mismatch), over the limit, and two
+# once the mirror cell is free; its reference path has three differences even on the converted
+# index, so only the ALT-window search reaches KB, and drops it for its mirror mismatch. The cap must
+# still count KB as a worse locus, as collapsed keeps it.
+run ks.scoring --meth --meth-mapq scoring -n 2 --known-snvs "$tmp/ks.vcf" "$tmp/ref.fa" "$tmp/ks.fq"
+run ks.blind --meth -n 2 --known-snvs "$tmp/ks.vcf" "$tmp/ref.fa" "$tmp/ks.fq"
+run ks.collapsed --meth --meth-scoring collapsed -n 2 --known-snvs "$tmp/ks.vcf" "$tmp/ref.fa" "$tmp/ks.fq"
+run ks.nosites --meth --meth-scoring collapsed -n 2 "$tmp/ref.fa" "$tmp/ks.fq"
+run ks.nosites.blind --meth -n 2 "$tmp/ref.fa" "$tmp/ks.fq"
+expect ks-fixture-scoring "$tmp/ks.scoring.sum" "ks1 0 ks 401 37 -"
+# without the site neither collapsed nor the cap reaches KB: the ALT window alone supplies it
+expect ks-fixture-nosites "$tmp/ks.nosites.sum" "ks1 0 ks 401 37 -"
+expect ks-fixture-nosites-blind "$tmp/ks.nosites.blind.sum" "ks1 0 ks 401 37 -"
+# the oracle: collapsed counts KB as KA's worse locus
+expect ks-fixture-collapsed "$tmp/ks.collapsed.sum" "ks1 0 ks 401 23 -"
+expect ks-over-n "$tmp/ks.blind.sum" "ks1 0 ks 401 23 37"
+cmp <(strip "$tmp/ks.blind.rec") <(strip "$tmp/ks.scoring.rec") || {
+    echo "FAIL: --known-snvs: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+echo 'PASS: known-snvs-mirror-free-n-limit'
+
+# The same read 1 paired with a read 2 after copy KB: the genomic pairing cannot use KB (not a
+# locus), so read 1 stays at KA, but the mirror-free pairing places it at KB (as collapsed does), so
+# its cap is 0.
+run kp.blind --meth -n 2 --known-snvs "$tmp/ks.vcf" "$tmp/ref.fa" "$tmp/k1.fq" "$tmp/k2.fq"
+run kp.scoring --meth --meth-mapq scoring -n 2 --known-snvs "$tmp/ks.vcf" "$tmp/ref.fa" "$tmp/k1.fq" "$tmp/k2.fq"
+run kp.collapsed --meth --meth-scoring collapsed -n 2 --known-snvs "$tmp/ks.vcf" "$tmp/ref.fa" "$tmp/k1.fq" "$tmp/k2.fq"
+[ "$(pick "$tmp/kp.collapsed.sum" kpair | awk '$2 == 99 { print $4 }')" = 841 ] || {
+    echo "FAIL: fixture: collapsed does not place kpair's read 1 at copy KB" >&2
+    exit 1
+}
+expect ks-paired-scoring "$tmp/kp.scoring.sum" "kpair 97 ks 401 37 -
+kpair 145 ks 1181 37 -"
+expect ks-paired-elsewhere "$tmp/kp.blind.sum" "kpair 97 ks 401 0 37
+kpair 145 ks 1181 37 -"
+cmp <(strip "$tmp/kp.blind.rec") <(strip "$tmp/kp.scoring.rec") || {
+    echo "FAIL: --known-snvs, paired: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+echo 'PASS: known-snvs-paired-elsewhere'
 
 check_error() {
     local name=$1 pattern=$2 rc=0

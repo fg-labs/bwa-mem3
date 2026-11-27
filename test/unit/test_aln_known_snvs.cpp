@@ -2315,6 +2315,76 @@ TEST_CASE("aln_known_snvs: --meth ALT-window placements are scored along their s
     }
 }
 
+TEST_CASE("aln_known_snvs: --meth-mapq conversion-blind counts an ALT-window row over -n only by its mirror mismatches"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    // Copies A and B of a 40-base segment; the read is A, converted but for one kept C (G on the
+    // reverse strand), with one error. B with its site's ALT credited has three strict differences
+    // under -n 2: the mirror cell (B's T, or A, under the kept base), the read's error, and a real
+    // mismatch or a one-base deletion. Mirror-free it has two, at the limit, and -O 3 puts the
+    // deletion within s_mm of A, so collapsed counts B as A's worse locus. B's reference path has
+    // three differences on the converted index too, so only the ALT-window search reaches B, and
+    // drops it for its mirror mismatch: the cap must still count it.
+    bwa_tests::TempDir tmp{"ks_meth_blind_over"}; const std::string dir = tmp.path();
+    bwa_tests::StderrCapture quiet;
+    for (const bool rev : {false, true})
+        for (const bool gap : {false, true}) {
+            CAPTURE(rev); CAPTURE(gap);
+            uint32_t state = 9182 + 2 * rev + gap;
+            std::string a = aln_test::lcg_dna(state, 40);
+            // forward (OT): read C over reference T is the mirror cell, read A over G a mismatch;
+            // reverse (OB, forward-strand bases): read G over A is the mirror cell, read C over A
+            // and read A over C mismatches
+            a[5] = 'A'; a[10] = rev ? 'G' : 'C'; a[20] = rev ? 'C' : 'A'; a[30] = 'A';
+            std::string b = a;
+            b[10] = rev ? 'A' : 'T';
+            b[30] = rev ? 'C' : 'G'; // the site: REF here, A's base the ALT
+            if (gap) b.insert(15, 1, 'C'); // the read's deletion
+            else b[20] = rev ? 'A' : 'G';
+            const int site = 30 + gap;
+            std::string r = a; // the converted read, in reference orientation
+            for (int k = 0; k < (int)r.size(); ++k)
+                if (k != 10 && r[k] == (rev ? 'G' : 'C')) r[k] = rev ? 'A' : 'T';
+            r[5] = rev ? 'C' : 'G'; // the error
+            const std::string c1 = aln_test::lcg_dna(state, 300) + a + aln_test::lcg_dna(state, 300) + b
+                + aln_test::lcg_dna(state, 300);
+            const std::string prefix = tmp.unique_file(std::string(rev ? ".rev" : ".fwd") + (gap ? ".gap.fa" : ".fa"));
+            REQUIRE(aln_test::write_test_fasta(prefix, {{"c1", c1}}));
+            REQUIRE(bwa_idx_build(prefix.c_str(), prefix.c_str(), 0, 3) == 0);
+            build_meth_index(prefix);
+            const std::string fq = write_fq(dir + "/r.fq", {{"r", rev ? revcomp(r) : r}});
+            const int bpos = 300 + 40 + 300;
+            const std::string vcf = write_vcf(dir + "/s.vcf", {row("c1", bpos + site + 1, b[site], std::string(1, a[30]))});
+            const std::string sam = dir + "/out.sam";
+            auto one = [&](std::vector<std::string> args) {
+                args.insert(args.end(), {"--meth", "-n", "2", "-O", "3", "-f", sam, prefix, fq});
+                REQUIRE(run(args) == 0);
+                const auto rec = records(slurp(sam)); REQUIRE(rec.size() == 1);
+                return rec[0];
+            };
+            const auto scoring = one({"--meth-mapq", "scoring", "--known-snvs", vcf});
+            const auto blind = one({"--known-snvs", vcf});
+            const auto collapsed = one({"--meth-scoring", "collapsed", "--known-snvs", vcf});
+            // the fixture: without the site, neither collapsed nor the cap reaches B
+            const auto nosites = one({"--meth-scoring", "collapsed"});
+            const auto nosites_blind = one({});
+            INFO(slurp(sam));
+            CHECK(scoring[1] == (rev ? "16" : "0")); CHECK(scoring[3] == "301"); CHECK(scoring[4] == "37");
+            CHECK(nosites[3] == "301"); CHECK(nosites[4] == "37");
+            CHECK(nosites_blind[3] == "301"); CHECK(nosites_blind[4] == "37");
+            CHECK(tag(nosites_blind, "YQ:i:").empty());
+            CHECK(collapsed[1] == scoring[1]); CHECK(collapsed[3] == "301"); CHECK(collapsed[4] == "23");
+            // only MAPQ and YQ:i differ from scoring
+            CHECK(blind[4] == collapsed[4]);
+            CHECK(tag(blind, "YQ:i:") == "YQ:i:37");
+            std::vector<std::string> stripped;
+            for (size_t i = 0; i < blind.size(); ++i)
+                if (i != 4 && blind[i].rfind("YQ:i:", 0) != 0) stripped.push_back(blind[i]);
+            std::vector<std::string> want = scoring;
+            want.erase(want.begin() + 4);
+            CHECK(stripped == want);
+        }
+}
+
 TEST_CASE("aln_known_snvs: --meth an ALT-window hit's soft-clipped insertion is scored as its search path"
           * doctest::test_suite("unit/aln_known_snvs")) {
     bwa_tests::TempDir tmp{"ks_meth_retry"}; const std::string dir = tmp.path();

@@ -20,6 +20,10 @@ properties for the rewritten `aln --meth` path. Its stock-shaped MAPQ is a heuri
 on retained loci, not a guarantee of exhaustive discovery. For EM-seq with `genomic` scoring its
 MAPQ is by default capped at a conversion-blind MAPQ, with a lowered record's uncapped MAPQ in
 `YQ:i`; `--meth-mapq scoring` turns the cap off ([PR #816](https://github.com/fg-labs/bwa-mem3/pull/816)).
+Under `--known-snvs` the cap also counts an ALT-window placement that `-n` (or `-k`) drops only for
+its mirror mismatches, as `collapsed` does, so it can lower MAPQ and the `XV:Z` twin MAPQ
+further. A newly capped record gains `YQ:i`; an existing `YQ:i` still holds the uncapped MAPQ.
+No other field changes ([PR #820](https://github.com/fg-labs/bwa-mem3/pull/820)).
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,

@@ -53,6 +53,8 @@ struct aln_meth_ref_t {
 	const struct ks_sites_t *known_snvs = nullptr; // --known-snvs sites (null without); not owned
 	// --known-snvs ALT windows as a reference: contig i's site, as an offset in it (else empty)
 	std::vector<int32_t> window_site;
+	// whether this is the ALT-window reference (its search is the ALT-window search)
+	bool is_window() const { return !window_site.empty(); }
 };
 int aln_meth_ref_load(aln_meth_ref_t *r, const char *orig_prefix, const bntseq_t *conv_bns, int n_threads);
 /* Takes ownership of an in-memory original reference (bns, pac) and checks it pairs with
@@ -165,7 +167,9 @@ struct aln_meth_read_t {
     // Rows the -n (or -k) limit dropped that the limit keeps once their mirror mismatches are free
     // (a read C over a reference T is a mismatch genomically but a conversion mirror-free): the
     // mirror-free strata count them, as collapsed scoring keeps them as loci. Their CIGARs are
-    // not kept. Consumed and cleared when the read finishes.
+    // not kept. Consumed and cleared when the read finishes, but by an ALT-window search
+    // (--known-snvs), which keeps them with their search paths for the main search
+    // (ks_meth_candidates).
     std::vector<aln_meth_occ_t> blind_over;
     // The MAPQ cap the record's end carries to emission (255: none), and the MAPQ it replaced
     // when the cap lowered it (YQ:i), else -1.
