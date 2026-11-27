@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.19.0](https://github.com/fg-labs/bwa-mem3/compare/v0.18.0...v0.19.0) (2026-11-27)
+
+
+### Features
+
+* **mem:** conversion-blind --meth MAPQ (--meth-mapq) ([#817](https://github.com/fg-labs/bwa-mem3/issues/817)) ([c55fb39](https://github.com/fg-labs/bwa-mem3/commit/c55fb3984b00d3346f0e570553d7813adcdbaf63))
+* **meth:** add meth_opts_check, the --meth cross-option checks without exit ([#806](https://github.com/fg-labs/bwa-mem3/issues/806)) ([39d1c28](https://github.com/fg-labs/bwa-mem3/commit/39d1c28de37b8e96e0f7baa7e1756db4bbbc1a09)), closes [#805](https://github.com/fg-labs/bwa-mem3/issues/805)
+* **shm:** stage the index on 1 GB huge pages with shm --huge-pages ([#814](https://github.com/fg-labs/bwa-mem3/issues/814)) ([c9ab06e](https://github.com/fg-labs/bwa-mem3/commit/c9ab06ee2c2ee628f9b5cea805d439085ae19ffe))
+* **simd:** build the avx512bw kernels with AVX-512VL and DQ ([#828](https://github.com/fg-labs/bwa-mem3/issues/828)) ([e14cca8](https://github.com/fg-labs/bwa-mem3/commit/e14cca89c293fd0d106cf579488998a74212c856))
+
+
+### Bug Fixes
+
+* **index:** check the memory budget before writing any index file ([#818](https://github.com/fg-labs/bwa-mem3/issues/818)) ([917fff7](https://github.com/fg-labs/bwa-mem3/commit/917fff73e4c107e282198ac2834a37cfe1f4ed2d))
+* **mem:** reprice a --rescue-kmer mate on its K-mer band only ([#825](https://github.com/fg-labs/bwa-mem3/issues/825)) ([f4654b5](https://github.com/fg-labs/bwa-mem3/commit/f4654b5b3f260d93697b5970993c07e3292d1bd2))
+* **mem:** reprice every rescued mate in the --meth MAPQ cap ([#824](https://github.com/fg-labs/bwa-mem3/issues/824)) ([ba42a1a](https://github.com/fg-labs/bwa-mem3/commit/ba42a1a1dfe9085e3b384cb726b0ba93cab0cf68))
+* **shm:** keep the registry lock single-holder across shm -d ([#819](https://github.com/fg-labs/bwa-mem3/issues/819)) ([07f7251](https://github.com/fg-labs/bwa-mem3/commit/07f72515c46d52985a1e4d90c21926c5e5ce0a87))
+
+
+### Performance
+
+* **index:** pack SA-sample high parts to 1 bit on GRCh38-sized references ([#829](https://github.com/fg-labs/bwa-mem3/issues/829)) ([5d1416f](https://github.com/fg-labs/bwa-mem3/commit/5d1416f4419bc281aae411b9dc07795c483734c4))
+
+
+### Documentation
+
+* **readme:** update performance tables for v0.18.0 ([#804](https://github.com/fg-labs/bwa-mem3/issues/804)) ([6a68ee1](https://github.com/fg-labs/bwa-mem3/commit/6a68ee16da2b26be6ab3b7ce8d507baa62784e68))
+* state bwa-mem2 index compatibility and the --meth memory floor ([#813](https://github.com/fg-labs/bwa-mem3/issues/813)) ([1814595](https://github.com/fg-labs/bwa-mem3/commit/18145958ad75202057a002c40cb145bd9c322964))
+
 ## [0.18.0](https://github.com/fg-labs/bwa-mem3/compare/v0.17.0...v0.18.0) (2026-11-16)
 
 
