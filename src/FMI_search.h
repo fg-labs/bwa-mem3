@@ -215,13 +215,56 @@ class FMI_search: public indexEle
      * validation, and by the round-trip test for byte-equality checks. */
     int64_t cp_occ_size_bytes()      const;
     int64_t sa_sample_count()        const;
-    int64_t sa_ms_byte_size_bytes()  const { return sa_sample_count() * (int64_t)sizeof(int8_t); }
+    /* The high part of each SA sample (bits 32.. of a 2L-space position) is stored packed,
+     * (1 << sa_hi_log2) bits per sample, a whole number of samples per 64-bit word (never
+     * straddling one). On disk it is still one byte per sample; GRCh38-sized references need
+     * one bit (positions < 2^33), which cuts the array 8-fold. */
+    int64_t sa_hi_size_bytes()       const { return sa_hi_bytes_for(reference_seq_len, sa_compx); }
     int64_t sa_ls_word_size_bytes() const { return sa_sample_count() * (int64_t)sizeof(uint32_t); }
 
     /* The same sizes from the scalars alone, for a check made before any
      * FMI_search exists (bwa_shm's probe of a 1 GB stage). */
     static int64_t cp_occ_bytes_for(int64_t ref_seq_len);
     static int64_t sa_count_for(int64_t ref_seq_len, int64_t sa_compx);
+
+    /* log2 of the bits per packed SA-sample high part for a BWT of ref_seq_len rows
+     * (positions run up to ref_seq_len - 1): 1, 2, 4 or 8 bits -> 0..3. */
+    static int sa_hi_log2_for(int64_t ref_seq_len) {
+        uint64_t hi = (uint64_t)(ref_seq_len > 0 ? ref_seq_len - 1 : 0) >> 32;
+        int bits = 0;
+        while (hi) { bits++; hi >>= 1; }
+        return bits <= 1 ? 0 : bits <= 2 ? 1 : bits <= 4 ? 2 : 3;
+    }
+    static int64_t sa_hi_words(int64_t n, int log2) { return ((n << log2) + 63) >> 6; }
+    static uint64_t sa_hi_mask_for(int log2) { return (1ull << (1u << log2)) - 1; }
+    /* Bytes of the packed high parts (the FMI_SA_MS section) of a BWT of ref_seq_len rows
+     * sampled at 1 / 2^sa_compx: the one size the loader, the stager and the attach check use. */
+    static int64_t sa_hi_bytes_for(int64_t ref_seq_len, int64_t sa_compx) {
+        return sa_hi_words(sa_count_for(ref_seq_len, sa_compx), sa_hi_log2_for(ref_seq_len))
+               * (int64_t)sizeof(uint64_t);
+    }
+    /* Pack n one-byte high parts (src[0..n)) into dst, starting at sample index `first`, which
+     * must be a multiple of 64 >> log2 (asserted) so the call owns whole words. Each word the
+     * call touches is assigned, not OR-ed, with unused high fields of a partial last word zero,
+     * so dst need not be zeroed. Returns false if a byte does not fit in (1 << log2) bits (a
+     * corrupt index). Parallel over words when nthreads > 1. */
+    static bool sa_hi_pack(const int8_t *src, int64_t first, int64_t n, int log2, uint64_t *dst,
+                           int nthreads);
+    /* Samples each worker of sa_hi_pread_pack reads and packs at a time (its private
+     * buffer). Default 2^20, so a piece is packed from cache. The setter requires a positive
+     * multiple of 64 (whole words at every width); tests lower it to cross many piece
+     * boundaries on a small index. */
+    static int64_t sa_hi_read_chunk();
+    static void set_sa_hi_read_chunk(int64_t n);
+    /* Read n one-byte high parts at offset `off` of the file open as `fd` (named `path`, for
+     * the workers' private descriptors) and pack them into dst, assigning all of its words.
+     * Up to nthreads workers (the index load's worker count for n bytes) each read a
+     * whole-word range a piece at a time and pack it at once. Returns 0, SA_HI_READ_OOM, or
+     * SA_HI_READ_RANGE if a byte does not fit (a corrupt index); an I/O error or a short
+     * file exits, as the rest of the index load does. Does not move fd's file offset. */
+    enum { SA_HI_READ_OOM = -1, SA_HI_READ_RANGE = -2 };
+    static int sa_hi_pread_pack(int fd, const char *path, off_t off, int64_t n, int log2,
+                                uint64_t *dst, int nthreads);
 
     /* Checks the packed FMI_SCALARS at `scalars` (BWA_SHM_FMI_SCALARS_BYTES
      * bytes) the way load_index_from_shm does. Returns true when they pass,
@@ -234,7 +277,8 @@ class FMI_search: public indexEle
     /* Read-only data accessors. Used by the round-trip test to byte-compare
      * the packed segment payload against the in-memory loader's buffers. */
     const void     *cp_occ_data()     const { return cp_occ; }
-    const int8_t   *sa_ms_byte_data() const { return sa_ms_byte; }
+    const uint64_t *sa_hi_data()      const { return sa_hi; }
+
     const uint32_t *sa_ls_word_data() const { return sa_ls_word; }
     const int64_t  *count_data()      const { return count; }
 
@@ -269,7 +313,7 @@ class FMI_search: public indexEle
 
     /* Attach to a packed bwa-mem3 index segment from bwa_shm_attach: `len` is
      * the packed index size and `map_len` the length of the mapping. Sets
-     * scalars and the cp_occ / sa_ms_byte / sa_ls_word pointers; the
+     * scalars and the cp_occ / sa_hi / sa_ls_word pointers; the
      * destructor unmaps `map_len` bytes at `base` and leaves the aliased
      * buffers untouched. Builds no seed jump table: load_index builds it
      * after the attach. */
@@ -286,18 +330,24 @@ class FMI_search: public indexEle
      * hold. Used by `bwa-mem3 shm -u INT` to stage a denser SA table without
      * rebuilding the on-disk index. All pointer arguments are BORROWED: they
      * are cleared before return so this object's destructor frees nothing.
+     * The high parts go to dst_ms (one byte per sample, the disk format) and/or
+     * dst_hi (packed as sa_hi, sa_hi_words(count, sa_hi_log2_for(ref_seq_len))
+     * words, written directly with no byte temporary); either may be NULL.
      * dst_ms/dst_ls must be sized for (ref_seq_len >> dst_compx) + 1 samples;
      * src_ms/src_ls for (ref_seq_len >> src_compx) + 1. Aborts on invalid
-     * strides (must satisfy 0 <= dst_compx < src_compx <= 6).
+     * strides (must satisfy 0 <= dst_compx < src_compx <= 6). Returns false,
+     * with a message on stderr, if memory for the packed source runs out or a
+     * source or (with dst_hi) densified high part does not fit its width (a
+     * corrupt index), so a caller holding a segment can clean up.
      * n_threads: the per-destination-sample LF-walks are independent and write
      * disjoint slots, so the fill loop parallelizes with no locking; <=1 runs
      * serially. get_sa_entry_compressed only reads shared index state. */
-    void densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
+    bool densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
                          int64_t ref_seq_len, int64_t sentinel_idx,
                          const int8_t *src_ms, const uint32_t *src_ls,
                          int64_t src_compx,
-                         int8_t *dst_ms, uint32_t *dst_ls, int64_t dst_compx,
-                         int n_threads = 1);
+                         int8_t *dst_ms, uint64_t *dst_hi, uint32_t *dst_ls,
+                         int64_t dst_compx, int n_threads = 1);
 
     /* matchArray sizing contract (applies to all four SMEM-emitting methods
      * below). The previous internal `max_smem` capacity guard was removed;
@@ -416,7 +466,7 @@ class FMI_search: public indexEle
                    int32_t readlength,
                    int nthreads,
                    SmemSortScratch &scratch);
-    // Uncompressed SA accessors -- index sa_ms_byte/sa_ls_word by raw BWT row, so
+    // Uncompressed SA accessors -- index sa_hi_at()/sa_ls_word by raw BWT row, so
     // they read out of bounds against the SA_COMPRESSION-sized arrays. Fenced to
     // match their definitions in FMI_search.cpp; the compressed equivalents below
     // are the shipped paths. Every in-tree caller is likewise `#if !SA_COMPRESSION`.
@@ -490,10 +540,24 @@ private:
         char file_name[PATH_MAX];
         int64_t count[5];
         uint32_t *sa_ls_word;
-        int8_t *sa_ms_byte;
+        uint64_t *sa_hi;      /* packed SA-sample high parts; see sa_hi_size_bytes() */
+        int sa_hi_log2;
+        uint64_t sa_hi_mask;
+        void set_sa_hi_geometry() {
+            sa_hi_log2 = sa_hi_log2_for(reference_seq_len);
+            sa_hi_mask = sa_hi_mask_for(sa_hi_log2);
+        }
+        /* The high part of SA sample i, and the address of the word holding it (for prefetch). */
+        inline int64_t sa_hi_at(int64_t i) const {
+            const uint64_t b = (uint64_t)i << sa_hi_log2;
+            return (int64_t)((sa_hi[b >> 6] >> (b & 63)) & sa_hi_mask);
+        }
+        inline const char *sa_hi_addr(int64_t i) const {
+            return (const char *)&sa_hi[((uint64_t)i << sa_hi_log2) >> 6];
+        }
         CP_OCC *cp_occ;
 
-        /* If non-NULL, cp_occ / sa_ms_byte / sa_ls_word point into a shared
+        /* If non-NULL, cp_occ / sa_hi / sa_ls_word point into a shared
          * memory mapping owned by the shm segment rather than being
          * _mm_malloc'd. shm_len is the byte length of the mapping so the
          * destructor can munmap it; the destructor also skips _mm_free on

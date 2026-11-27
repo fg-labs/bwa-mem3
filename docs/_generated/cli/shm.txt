@@ -21,7 +21,7 @@ Options:
             target denser than the on-disk rate).
   --huge-pages
             stage the index on 1 GB huge pages: a System V shared memory
-            segment from the host's reserved 1 GB pool (11 pages for a
+            segment from the host's reserved 1 GB pool (10 pages for a
             default hg38 stage), which `mem` attaches as usual. Cuts dTLB
             page walks on Intel x86 and Graviton4 (arm64). Refused on AMD
             x86, where it measured no gain. Linux only; needs CAP_IPC_LOCK

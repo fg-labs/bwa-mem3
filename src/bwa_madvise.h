@@ -47,8 +47,9 @@ static inline size_t bwamem_page_align_inward(uintptr_t p, size_t sz, size_t pag
 }
 
 // Request transparent huge pages on a large allocation. The bwa-mem3 hg38
-// index runtime working set is ~17 GB (cp_occ ~6 GB, sa_ms_byte ~2 GB,
-// sa_ls_word ~8 GB) plus an ~800 MB pack table. With 4 KB pages the dTLB
+// index runtime working set is ~9.7 GB at the default 1/8 SA sample rate
+// (cp_occ ~6.4 GB, the packed SA-sample high parts sa_hi ~0.1 GB, sa_ls_word
+// ~3.2 GB) plus an ~800 MB pack table. With 4 KB pages the dTLB
 // covers ~256 KB — a rounding error. Promoting to 2 MB THP pages (coverage
 // ~128 MB per 64-entry TLB) dramatically cuts TLB pressure in the SMEM
 // Occ-lookup, SA expansion, and reference-fetch loops. Best-effort: the

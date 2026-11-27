@@ -870,9 +870,12 @@ int main_resa(int argc, char *argv[]) // the "re-sa" command
 		int64_t count_adj[5];
 		for (int i = 0; i < 5; ++i) count_adj[i] = count_raw[i] + 1;
 		FMI_search fmi(prefix);
-		fmi.densify_sa_into(cp_occ, count_adj, ref_seq_len, sentinel_index,
-		                    disk_ms, disk_ls, disk_sa_compx,
-		                    dst_ms, dst_ls, target_sa_compx, n_threads);
+		if (!fmi.densify_sa_into(cp_occ, count_adj, ref_seq_len, sentinel_index,
+		                         disk_ms, disk_ls, disk_sa_compx,
+		                         dst_ms, /*dst_hi=*/NULL, dst_ls, target_sa_compx, n_threads)) {
+			fprintf(stderr, "[re-sa] ERROR: could not densify the SA samples of %s\n", cp_path);
+			exit(EXIT_FAILURE);
+		}
 	} else {
 		// Coarsen: every target-sampled row is also a disk-sampled row (both
 		// periods divide 64 and target > disk), so decimate the disk table --

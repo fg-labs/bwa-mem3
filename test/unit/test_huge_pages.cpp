@@ -199,10 +199,10 @@ TEST_CASE("load_index with --huge-pages: mapped table with failed prefault falls
                 _exit(91);
             if (got.reference_seq_len != want->reference_seq_len || got.sa_compx != want->sa_compx ||
                 got.cp_occ_size_bytes() != want->cp_occ_size_bytes() ||
-                got.sa_ms_byte_size_bytes() != want->sa_ms_byte_size_bytes() ||
+                got.sa_hi_size_bytes() != want->sa_hi_size_bytes() ||
                 got.sa_ls_word_size_bytes() != want->sa_ls_word_size_bytes()) _exit(92);
             if (memcmp(got.cp_occ_data(), want->cp_occ_data(), (size_t)want->cp_occ_size_bytes()) != 0 ||
-                memcmp(got.sa_ms_byte_data(), want->sa_ms_byte_data(), (size_t)want->sa_ms_byte_size_bytes()) != 0 ||
+                memcmp(got.sa_hi_data(), want->sa_hi_data(), (size_t)want->sa_hi_size_bytes()) != 0 ||
                 memcmp(got.sa_ls_word_data(), want->sa_ls_word_data(), (size_t)want->sa_ls_word_size_bytes()) != 0)
                 _exit(93);
             for (int64_t r = 0; r < want->reference_seq_len; ++r)
@@ -298,7 +298,7 @@ TEST_CASE("load_index with --huge-pages: same arrays whether or not the 1 GB map
             const uintptr_t G1 = (uintptr_t)GB;
             CHECK(mapped);
             CHECK(((uintptr_t)got.cp_occ_data() % G1) == 0);
-            CHECK(((uintptr_t)got.sa_ms_byte_data() % G1) != 0);
+            CHECK(((uintptr_t)got.sa_hi_data() % G1) != 0);
             CHECK(((uintptr_t)got.sa_ls_word_data() % G1) != 0);
         }
 #else
@@ -308,8 +308,8 @@ TEST_CASE("load_index with --huge-pages: same arrays whether or not the 1 GB map
         REQUIRE(got.sa_compx == want->sa_compx);
         REQUIRE(got.cp_occ_size_bytes() == want->cp_occ_size_bytes());
         CHECK(memcmp(got.cp_occ_data(), want->cp_occ_data(), (size_t)want->cp_occ_size_bytes()) == 0);
-        CHECK(memcmp(got.sa_ms_byte_data(), want->sa_ms_byte_data(),
-                     (size_t)want->sa_ms_byte_size_bytes()) == 0);
+        CHECK(memcmp(got.sa_hi_data(), want->sa_hi_data(),
+                     (size_t)want->sa_hi_size_bytes()) == 0);
         CHECK(memcmp(got.sa_ls_word_data(), want->sa_ls_word_data(),
                      (size_t)want->sa_ls_word_size_bytes()) == 0);
         int64_t bad = 0;

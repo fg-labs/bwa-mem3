@@ -526,11 +526,11 @@ static bool index_sections_ok(const uint8_t *base)
         return false;
     int64_t fmi[3];
     if (!FMI_search::shm_scalars_ok(base + off, fmi, NULL, 0)) return false;
-    /* The loads alias CP_OCC, SA_LS and AMBS in place as typed arrays, so each
-     * must start at an offset aligned for its element type (the packer's
-     * 64-byte layout always is). */
+    /* The loads alias CP_OCC, SA_MS (packed 64-bit words), SA_LS and AMBS in
+     * place as typed arrays, so each must start at an offset aligned for its
+     * element type (the packer's 64-byte layout always is). */
     static const struct { uint32_t kind; int fmi; size_t align; } sized[] = {
-        {BWA_SHM_SEC_FMI_CP_OCC, 0, alignof(CP_OCC)}, {BWA_SHM_SEC_FMI_SA_MS, 1, 1},
+        {BWA_SHM_SEC_FMI_CP_OCC, 0, alignof(CP_OCC)}, {BWA_SHM_SEC_FMI_SA_MS, 1, alignof(uint64_t)},
         {BWA_SHM_SEC_FMI_SA_LS, 2, alignof(uint32_t)} };
     for (const auto &r : sized)
         if (bwa_shm_section_find(base, r.kind, &off, &size) != 0 ||
@@ -958,7 +958,9 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
     /* SA section sizing uses the STAGED stride (layout->sa_compx), which may be
      * denser than disk when -u densifies. */
     int64_t sa_count     = (layout->reference_seq_len >> layout->sa_compx) + 1;
-    int64_t sa_ms_bytes  = sa_count     * (int64_t)sizeof(int8_t);
+    /* SA_MS holds the packed high parts, not the disk bytes: the same size the attach
+     * check (FMI_search::shm_scalars_ok) requires. */
+    int64_t sa_ms_bytes  = FMI_search::sa_hi_bytes_for(layout->reference_seq_len, layout->sa_compx);
     int64_t sa_ls_bytes  = sa_count     * (int64_t)sizeof(uint32_t);
 
     /* The sentinel_index int64 sits AFTER the on-disk SA arrays in
@@ -1071,13 +1073,13 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
     /* 4. CP_OCC + SA_MS + SA_LS from <prefix>.bwt.2bit.64.
      *
      * No densify (sa_compx == disk_sa_compx): the SA sample arrays on disk are
-     * exactly what we stage, so cp_occ / sa_ms / sa_ls stream contiguously
-     * straight into their sections — one fp, three freads.
+     * what we stage: cp_occ and sa_ls stream straight into their sections, and
+     * the one-byte sa_ms is read in bounded chunks and packed into its section.
      *
      * Densify (sa_compx < disk_sa_compx): cp_occ still streams straight in, but
      * the disk SA arrays are at the coarser disk stride. Read them into heap
      * temporaries, then synthesize the denser sample table directly into the
-     * (larger) sec[2]/sec[3] via FMI_search::densify_sa_into — an LF-walk over
+     * (larger) sec[2] (packed) / sec[3] via FMI_search::densify_sa_into — an LF-walk over
      * the just-staged cp_occ + the disk samples. The result is byte-identical
      * to an index physically built at the denser stride. */
     const bool densify = (layout->sa_compx != layout->disk_sa_compx);
@@ -1093,8 +1095,33 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
     /* CP_OCC first (identical in both modes). */
     err_fread_noeof(dest + sec[1].offset, 1, (size_t)sec[1].size, cp);
 
+    const int hi_log2 = FMI_search::sa_hi_log2_for(layout->reference_seq_len);
+    /* SA_MS: the packed high parts. Both branches assign every word of the section. */
+    uint64_t *hi_dst = (uint64_t *)(dest + sec[2].offset);
     if (!densify) {
-        err_fread_noeof(dest + sec[2].offset, 1, (size_t)sec[2].size, cp);
+        /* The disk's one byte per sample, read and packed into the section a small piece at
+         * a time. One thread: -t only sets the -u densify pass's workers, and the pack is a
+         * fraction of the stage's time. */
+        const int64_t n_s = (layout->reference_seq_len >> layout->sa_compx) + 1;
+        const off_t sa_off = ftello(cp);
+        const int rc = sa_off < 0 ? FMI_search::SA_HI_READ_OOM
+                     : FMI_search::sa_hi_pread_pack(fileno(cp), cp_path, sa_off, n_s, hi_log2,
+                                                    hi_dst, /*nthreads=*/1);
+        if (rc == 0 && fseeko(cp, sa_off + (off_t)n_s, SEEK_SET) != 0) {
+            fprintf(stderr, "[E::%s] fseeko on %s failed\n", __func__, cp_path);
+            err_fclose(cp);
+            return -1;
+        }
+        if (rc != 0) {
+            if (rc == FMI_search::SA_HI_READ_OOM)
+                fprintf(stderr, "[E::%s] could not read the SA samples of %s (out of memory "
+                        "or ftello failed)\n", __func__, cp_path);
+            else
+                fprintf(stderr, "[E::%s] SA sample high part out of range in %s "
+                        "(corrupt or mismatched index?)\n", __func__, cp_path);
+            err_fclose(cp);
+            return -1;
+        }
         err_fread_noeof(dest + sec[3].offset, 1, (size_t)sec[3].size, cp);
         err_fclose(cp);
     } else {
@@ -1117,16 +1144,22 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         /* Resolve the denser samples against the staged cp_occ + disk samples.
          * The FMI_search view borrows all pointers (cleared before its dtor). */
         FMI_search fmi(layout->prefix);
-        fmi.densify_sa_into(
+        const bool densified = fmi.densify_sa_into(
             (const CP_OCC *)(dest + sec[1].offset),
             layout->count,
             layout->reference_seq_len,
             layout->sentinel_index,
             disk_ms, disk_ls, layout->disk_sa_compx,
-            (int8_t   *)(dest + sec[2].offset),
+            /*dst_ms=*/NULL, hi_dst,
             (uint32_t *)(dest + sec[3].offset),
             layout->sa_compx,
             layout->densify_threads);
+        if (!densified) {
+            fprintf(stderr, "[E::%s] could not densify the SA samples of %s "
+                    "(corrupt or mismatched index?)\n", __func__, cp_path);
+            free(disk_ms); free(disk_ls);
+            return -1;
+        }
 
         free(disk_ms);
         free(disk_ls);
@@ -2233,7 +2266,7 @@ static void print_shm_usage(void)
         "            target denser than the on-disk rate).\n"
         "  --huge-pages\n"
         "            stage the index on 1 GB huge pages: a System V shared memory\n"
-        "            segment from the host's reserved 1 GB pool (11 pages for a\n"
+        "            segment from the host's reserved 1 GB pool (10 pages for a\n"
         "            default hg38 stage), which `mem` attaches as usual. Cuts dTLB\n"
         "            page walks on Intel x86 and Graviton4 (arm64). Refused on AMD\n"
         "            x86, where it measured no gain. Linux only; needs CAP_IPC_LOCK\n"

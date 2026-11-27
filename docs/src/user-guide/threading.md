@@ -29,7 +29,7 @@ Thread count and wall-clock alignment time scale well to approximately 16–32
 threads on a modern CPU. Beyond that, several effects conspire to flatten the
 curve:
 
-1. **FM-index bandwidth.** The resident index for hg38 is ~10.57 GiB and does not fit
+1. **FM-index bandwidth.** The resident index for hg38 is ~9.9 GiB and does not fit
    in the L3 cache of any current server. At high thread counts, threads contend
    for memory bandwidth accessing the BWT.
 2. **IO contention.** On spinning disk or a shared network filesystem,
@@ -86,7 +86,7 @@ and [Best Practices: multi-sample workflows](../best-practices/multi-sample.md).
 > independent of `-t`; do this for regression tests, release gating, and any
 > comparison against `bwa`/`bwa-mem2`. See [Aligning → `-K`](aligning.md).
 
-Peak RAM is the resident index (~10.57 GiB for hg38, ~22 GiB under `--meth`) plus a
+Peak RAM is the resident index (~9.9 GiB for hg38, ~22 GiB under `--meth`) plus a
 per-batch working set that scales with the *effective* batch size. The index term
 is fixed with respect to `-t`; the per-batch term is **not**, because the default
 effective batch is `chunk_size × n_threads`. Raising `-t` therefore raises peak
