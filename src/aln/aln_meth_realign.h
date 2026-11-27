@@ -25,7 +25,8 @@ void aln_meth_window_sites(const aln_meth_ref_t &ref, int64_t rb, int len, std::
  * max(band_limit, |len - span|): the best alignment whose indels stay within it (0 with an
  * equal span: ungapped). --known-snvs uses it to re-realign an ALT-window placement whose
  * best-scoring alignment breaks the read's limits.
- * Invalid/resource failures print ERROR and must not be interpreted as an absent candidate.
+ * Invalid/resource failures print ERROR and must not be interpreted as an absent candidate;
+ * quiet withholds the ERROR line for a caller that recovers from the returned status itself.
  * Fixed scoring uses the existing meth matrices and ksw_global; hints never certify a band.
  * Active-backend allocation estimate is capped at 64 MiB; existing retained TLS scratch is separate.
  * Query/window lengths are limited to 65535. No silent coordinate clipping or legacy bitfield casts.
@@ -36,7 +37,7 @@ void aln_meth_window_sites(const aln_meth_ref_t &ref, int64_t rb, int len, std::
 aln_meth_eval_status aln_meth_realign_window(const aln_meth_ref_t &ref, const aln_meth_opt_t &mo,
     const aln_meth_candidate_t &candidate, const ubyte_t *query, int len, int n_ins, int n_del,
     aln_meth_alignment_t *out, int64_t site = -1, std::vector<uint8_t> *window = nullptr,
-    int band_limit = -1);
+    int band_limit = -1, bool quiet = false);
 
 /* The equal-span ungapped scorer: the reward, mismatches and conversions of the [len M] alignment
  * of a query against the reference window [rb, rb + len), as aln_meth_realign_window (ungapped

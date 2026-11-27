@@ -25,8 +25,9 @@
 # mirror cell free; the default for collapsed, neutral, TAPS and 5-base is scoring, and collapsed accepts conversion-blind as a no-op; paired end: each
 # record's conversion-blind MAPQ is collapsed's, capped at the genomic one, where collapsed places
 # it, else 0 (including where collapsed starts an end at a tied mirror-free locus, and where the
-# genomic pairing places read 1 at a genomic tie past collapsed's mirror-free cut), a read 1 that
-# collapsed's pairing places at the other copy gets 0, a rescued mate takes its anchor's cap, a mate
+# genomic pairing places read 1 at a genomic tie past collapsed's mirror-free cut, and where
+# collapsed leaves a pair improper and rescues a mate), a read 1 that collapsed's pairing places at
+# the other copy gets 0, a mate the genomic run rescues and collapsed leaves unmapped gets 0, a mate
 # that moves read 1 to the other copy anchors it (no cap) unless read 1's mirror-free loci exceed
 # --max-occ (then collapsed does not pair it, and its cap is 0), and no MAPQ is ever raised; and
 # the option's refusals.
@@ -138,17 +139,25 @@ expect() {
 
 # The conversion-blind MAPQ observes collapsed's: each record (paired runs in the same order) has
 # the lower of the scoring and collapsed MAPQs where collapsed places it at the same position and
-# strand, else 0. Collapsed's own mate rescue is not rerun (a rescued mate takes its anchor's cap),
-# so a fixture where collapsed rescues a mate holds only if that rescue leaves these MAPQs. Reads
+# strand, else 0 (collapsed's pairing and mate rescue are rerun for the cap). Reads
 # $tmp/<name>.{blind,scoring,collapsed}.sum.
 observer() {
-    local label=$1 name=$2
+    local label=$1 name=$2 rc=0
     paste -d ' ' "$tmp/$name.blind.sum" "$tmp/$name.scoring.sum" "$tmp/$name.collapsed.sum" \
         | awk '{
+            # a line pairs the same record of each run: its QNAME and read 1/read 2 flags agree
+            if ($1 != $7 || $1 != $13 || int($2 / 64) % 4 != int($8 / 64) % 4 || int($2 / 64) % 4 != int($14 / 64) % 4) {
+                ident = 1; print "  " $0 > "/dev/stderr"; next
+            }
             same = $3 == $15 && $4 == $16 && int($2 / 16) % 2 == int($14 / 16) % 2
             want = !same ? 0 : $11 < $17 ? $11 : $17
             if (int($2 / 4) % 2 == 0 && $5 != want) { bad = 1; print "  " $0 > "/dev/stderr" }
-        } END { exit bad }' || {
+        } END { exit ident ? 2 : bad }' || rc=$?
+    [ "$rc" -ne 2 ] || {
+        echo "FAIL: $label: the runs do not list the same records (QNAME, read 1/read 2) in the same order" >&2
+        exit 1
+    }
+    [ "$rc" -eq 0 ] || {
         echo "FAIL: $label: a conversion-blind MAPQ is not collapsed's, capped at the genomic one" >&2
         exit 1
     }
@@ -453,6 +462,60 @@ awk '$2 % 256 >= 64 && $2 % 256 < 128 && $3 == "ch" && $5 != 0 { bad = 1; print 
 }
 echo 'PASS: paired-past-mirror-free-cut'
 
+# Paired end, collapsed's mate rescue (mresc.fa): read 1 is unique on contig home; read 2's segment
+# lies 280 bases on with two real mismatches there, and on contig copy with a T under each of the
+# three Cs read 2 keeps (three mismatches in the seed genomically, so -k drops it; none mirror-free).
+# The genomic pair is proper at home (MAPQ 60). Collapsed places read 2 at copy (home is past its
+# cut), pairs nothing, and rescues read 2 home from read 1, which lowers both ends to 11. So both
+# conversion-blind MAPQs are 11. Pairs on contigs of their own give both runs an insert size.
+cat > "$tmp/mresc.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+function alt(c) { return c == "G" ? "A" : "G" }
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+function ga(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "G" ? "A" : c) } return out }
+function ct(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "C" ? "T" : c) } return out }
+BEGIN {
+    seed_rng(20261124)
+    for (k = 0; k < 24; ++k) {
+        s1 = dna(40); s2 = dna(40)
+        printf ">bg%d\n%s\n", k, dna(100) s1 dna(200 + 3 * k) s2 dna(100) > (dir "/mresc.fa")
+        fq(dir "/mresc1.fq", "bg" k, ct(s1)); fq(dir "/mresc2.fq", "bg" k, ga(rc(s2)))
+    }
+    s1 = dna(40)
+    s2 = put(put(put(dna(40), 10, "C"), 20, "C"), 30, "C")
+    h2 = s2
+    for (p = 5; p <= 35; p += 30) h2 = put(h2, p, alt(substr(ct(s2), p + 1, 1)))
+    printf ">home\n%s\n", dna(100) s1 dna(240) h2 dna(100) > (dir "/mresc.fa")
+    printf ">copy\n%s\n", dna(100) put(put(put(s2, 10, "T"), 20, "T"), 30, "T") dna(100) > (dir "/mresc.fa")
+    fq(dir "/mresc1.fq", "target", ct(s1))
+    fq(dir "/mresc2.fq", "target", put(put(put(ga(rc(s2)), 29, "G"), 19, "G"), 9, "G"))
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/mresc.awk" < /dev/null
+"$bin" index --meth "$tmp/mresc.fa" > "$tmp/mresc-index.out" 2> "$tmp/mresc-index.err" || {
+    echo "FAIL: index --meth (mresc.fa) exited nonzero" >&2
+    cat "$tmp/mresc-index.err" >&2
+    exit 1
+}
+run mresc.scoring --meth --meth-mapq scoring "$tmp/mresc.fa" "$tmp/mresc1.fq" "$tmp/mresc2.fq"
+run mresc.blind --meth "$tmp/mresc.fa" "$tmp/mresc1.fq" "$tmp/mresc2.fq"
+run mresc.collapsed --meth --meth-scoring collapsed "$tmp/mresc.fa" "$tmp/mresc1.fq" "$tmp/mresc2.fq"
+cmp <(strip "$tmp/mresc.blind.rec") <(strip "$tmp/mresc.scoring.rec") || {
+    echo "FAIL: mresc: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+observer mresc mresc
+expect collapsed-rescue-genomic <(pick "$tmp/mresc.scoring.sum" target) "target 99 home 101 60 -
+target 147 home 381 60 -"
+grep -E '^target	147	' "$tmp/mresc.collapsed.rec" | grep -q '	XT:A:M	' || {
+    echo "FAIL: fixture: collapsed does not rescue target's read 2 (XT:A:M)" >&2
+    exit 1
+}
+expect collapsed-rescue <(pick "$tmp/mresc.blind.sum" target) "target 99 home 101 11 60
+target 147 home 381 11 60"
+echo 'PASS: paired-collapsed-mate-rescue'
+
 # The default is scoring outside em-seq genomic; collapsed accepts conversion-blind (a no-op).
 for args in '--meth --meth-scoring collapsed' '--meth=taps' '--meth=5base' '--meth --meth-scoring neutral'; do
     read -r -a options <<< "$args"
@@ -504,8 +567,9 @@ m880 147 ab 881 37 60"
     echo "FAIL: fixture: collapsed does not place m880's read 1 at copy B" >&2
     exit 1
 }
-# resc: read 2 is found only by mate rescue (XT:A:M) next to read 1, so there is no pairing: read 1
-# keeps its single-end cap (0: copy B ties once the mirror cell is free) and read 2 takes it.
+# resc: read 2 is found only by mate rescue (XT:A:M) next to read 1, so there is no pairing. Read 1
+# gets collapsed's MAPQ, 0 (copy B ties once the mirror cell is free), too low to anchor collapsed's
+# rescue, so collapsed leaves read 2 unmapped and its cap is 0.
 grep -E '^resc	' "$tmp/pe.blind.rec" | grep -q '	XT:A:M	' || {
     echo "FAIL: fixture: resc's read 2 is not rescued (XT:A:M)" >&2
     exit 1

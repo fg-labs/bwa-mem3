@@ -1355,9 +1355,9 @@ static int aln_usage(const aln_opt_t *o, FILE *fp)
 	fprintf(fp, "   equal-cost locus, an end left there has MAPQ <= min(60,6*delta), delta the smallest\n");
 	fprintf(fp, "   conversion-count gap; an end that pairing or mate rescue moves takes the pair's MAPQ.\n");
 	fprintf(fp, "   Pair all retained loci up to --max-occ only without lookup/work cutoffs on either end.\n");
-	fprintf(fp, "   Paired, --meth-mapq conversion-blind caps an end by the pairing collapsed makes (its\n");
-	fprintf(fp, "   loci, main hits and insert size; an end it places elsewhere gets 0), and a rescued mate\n");
-	fprintf(fp, "   by its anchor's cap.\n");
+	fprintf(fp, "   Paired, --meth-mapq conversion-blind caps an end by the pairing and mate rescue collapsed\n");
+	fprintf(fp, "   makes (its loci, main hits, insert size and matrix; an end it places elsewhere or leaves\n");
+	fprintf(fp, "   unmapped gets 0).\n");
 	meth_opts_usage_mapq(fp);
 	fprintf(fp, "   Lookup-cap rescue uses <=255 resolved mate loci; rescued MAPQ stays 0, not proper-pair.\n");
 	fprintf(fp, "   aln -B is barcode length, not mem's mismatch penalty. Records carry\n");

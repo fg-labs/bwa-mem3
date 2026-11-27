@@ -216,12 +216,21 @@ pairing places it is capped at the MAPQ that pairing gives it, any other end at 
 end with more than `--max-occ` mirror-free loci is not paired, as under `collapsed`:
 both ends stay at their `collapsed` single-end selections. An end the `genomic` search
 leaves unmapped, but whose rows `-n` (or `-k`) dropped only for their mirror mismatches, is
-placed as `collapsed` places it, so its mate is still capped by that pairing. A rescued mate
-takes its anchor's cap and, where `collapsed` pairs the ends properly, at most that pairing's
-MAPQ for the mate at the rescued position (0 elsewhere). `collapsed`'s own mate rescue and
-cap rescue are not rerun: where `collapsed` leaves a pair improper and rescues a mate, the
-cap can differ from `collapsed`'s MAPQ. `--known-snvs` twin MAPQs (`XV:Z`) are computed the
-same way as the record's.
+placed as `collapsed` places it, so its mate is still capped by that pairing. Where
+`collapsed` then leaves the pair improper, its mate rescue is rerun too, with `collapsed`'s
+scoring matrix and insert size: a rescue lowers the anchor's MAPQ as well as placing the
+mate, so the anchor is capped at that lowered MAPQ, and a mate the `genomic` run rescues is
+capped at the MAPQ `collapsed` gives it where `collapsed` places it there (0 where it places
+it elsewhere or leaves it unmapped). Each mapped end can anchor the rescue of the other, so
+such a pair costs up to two extra local alignments, one per direction; with `--known-snvs`,
+each direction aligns the window as the reference and then once per site allele in it.
+A pair with an incomplete end (cap rescue) is not rerun: there both runs give the incomplete
+end MAPQ 0 and the anchor its single-end MAPQ or 0. A rescue window past the rescue's
+allocation bound, a rescue that cannot be evaluated, a rescued interval that leaves the anchor's
+contig, or a rescued cost past the record, each of which would stop a `collapsed` run, gives both
+ends 0 instead. Any other failed allocation (such as of the rescue window or the rescued CIGAR)
+ends the run, as it does in any `aln` run.
+`--known-snvs` twin MAPQs (`XV:Z`) are computed the same way as the record's.
 
 **Measured** on public NA12878 EM-seq (SRR10532145, 2×99 bp, 2 M pairs), read 1
 cut to 20–50 bp and aligned single-end with `aln` on an Apple M2 Max (12 cores; macOS, arm64, NEON
