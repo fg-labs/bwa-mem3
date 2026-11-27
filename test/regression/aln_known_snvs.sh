@@ -5,8 +5,8 @@
 # SNV leaves single-end, paired-end and --meth output unchanged but for @PG; with sites, records without XV:Z
 # are unchanged, short reads carrying an ALT plus errors (over the mismatch budget, so stock leaves
 # them unmapped) are placed at their true locus with an A vote in XV:Z, single- and paired-end;
-# the output does not depend on the thread count; --bam carries XV:Z; bad VCFs are refused before
-# any output.
+# the output does not depend on the thread count; --known-snvs-cache reads back the same index;
+# --bam carries XV:Z; bad VCFs are refused before any output.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -341,6 +341,142 @@ done
     exit 1
 }
 echo 'PASS: no-temp-files (read-only and non-existent TMPDIR, empty afterwards)'
+
+# 4c. --known-snvs-cache: the first run writes the index, later runs read it, and the output is
+# the same; a cache written for other sites is rebuilt; the option needs --known-snvs.
+for e in pe pe.meth; do
+    args=()
+    [[ $e == *meth ]] && args=(--meth)
+    cache=$tmp/ks.$e.cache
+    run "ks.$e.c1" "${args[@]}" -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    [ -s "$cache" ] && grep -q 'wrote the ALT-window index' "$tmp/ks.$e.c1.err"
+    run "ks.$e.c2" "${args[@]}" -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    grep -q 'loaded the index of' "$tmp/ks.$e.c2.err"
+    body "$tmp/ks.$e.sam" "$tmp/ks.$e.body"
+    for r in c1 c2; do
+        body "$tmp/ks.$e.$r.sam" "$tmp/ks.$e.$r.body"
+        cmp "$tmp/ks.$e.body" "$tmp/ks.$e.$r.body" || {
+            echo "FAIL: $e: --known-snvs-cache ($r) changed the output" >&2
+            exit 1
+        }
+    done
+    head -n 12 "$tmp/sites.vcf" > "$tmp/sites.few.vcf"
+    run "ks.$e.few" "${args[@]}" --known-snvs "$tmp/sites.few.vcf" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    run "ks.$e.few.c" "${args[@]}" -v 3 --known-snvs "$tmp/sites.few.vcf" --known-snvs-cache "$cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    grep -q 'not using .* (stale' "$tmp/ks.$e.few.c.err"
+    body "$tmp/ks.$e.few.sam" "$tmp/ks.$e.few.body"
+    body "$tmp/ks.$e.few.c.sam" "$tmp/ks.$e.few.c.body"
+    cmp "$tmp/ks.$e.few.body" "$tmp/ks.$e.few.c.body" || {
+        echo "FAIL: $e: a stale --known-snvs-cache changed the output" >&2
+        exit 1
+    }
+done
+rc=0
+"$bin" aln --known-snvs-cache "$tmp/x.cache" "$reference" "$tmp/se.fq" > "$tmp/nocache.out" 2> "$tmp/nocache.err" || rc=$?
+[ "$rc" = 1 ] && grep -qF -- 'needs --known-snvs' "$tmp/nocache.err" && [ ! -e "$tmp/x.cache" ] || {
+    echo "FAIL: --known-snvs-cache without --known-snvs: exit $rc" >&2
+    exit 1
+}
+# A cache path that names a file the run reads or writes is refused before any file is written.
+cp "$tmp/r1.fq" "$tmp/r1.keep"
+cp "$tmp/sites.vcf" "$tmp/sites.keep"
+cp "$reference.pac" "$tmp/pac.keep"
+for victim in r1.fq sites.vcf pac stdout out; do
+    case $victim in
+        pac) cpath=$reference.pac ;;
+        stdout) cpath=$tmp/alias.stdout.o ;;
+        out) cpath=$tmp/alias.out.sam ;;
+        *) cpath=$tmp/$victim ;;
+    esac
+    fopt=()
+    if [ "$victim" = out ]; then fopt=(-f "$cpath"); fi
+    rc=0
+    "$bin" aln "${fopt[@]}" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cpath" "$reference" "$tmp/r1.fq" "$tmp/r2.fq" \
+        > "$tmp/alias.$victim.o" 2> "$tmp/alias.$victim.err" || rc=$?
+    if [ "$rc" != 1 ] || ! grep -qF -- 'which this run reads or writes' "$tmp/alias.$victim.err"; then
+        echo "FAIL: --known-snvs-cache naming $victim: exit $rc" >&2
+        exit 1
+    fi
+done
+# Differently spelled new destinations alias before either path exists.
+mkdir "$tmp/alias-dir"
+ln -s "$tmp/alias-dir" "$tmp/alias-link"
+alias_bad=0
+for spelling in relative absolute dotdot parent-link dangling-output; do
+    target=$tmp/alias.$spelling.cache
+    cpath=alias.$spelling.cache
+    opath=$cpath
+    case $spelling in
+        relative) cpath=./$cpath ;;
+        absolute) opath=$target ;;
+        dotdot) opath=alias-dir/../$cpath ;;
+        parent-link)
+            target=$tmp/alias-dir/new.cache
+            cpath=alias-dir/new.cache
+            opath=alias-link/new.cache
+            ;;
+        dangling-output)
+            opath=alias.dangling-output.sam
+            ln -s "$cpath" "$tmp/$opath"
+            ;;
+    esac
+    rc=0
+    (cd "$tmp" && "$bin" aln -f "$opath" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$cpath" \
+        "$reference" "$tmp/r1.fq" "$tmp/r2.fq") > "$tmp/new-alias.$spelling.out" 2> "$tmp/new-alias.$spelling.err" || rc=$?
+    if [ "$rc" != 1 ] || ! grep -qF -- 'which this run reads or writes' "$tmp/new-alias.$spelling.err" || [ -e "$target" ]; then
+        echo "FAIL: new output/cache alias ($spelling): exit $rc, cache must not be created" >&2
+        alias_bad=1
+    fi
+    if [ "$spelling" = dangling-output ] && [ ! -L "$tmp/$opath" ]; then
+        echo 'FAIL: refusing a dangling output alias changed its symlink' >&2
+        alias_bad=1
+    fi
+done
+# Distinct new output/cache paths still work and the cache can be read back.
+"$bin" aln -v 3 -f "$tmp/distinct.sam" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/distinct.cache" \
+    "$reference" "$tmp/r1.fq" "$tmp/r2.fq" > "$tmp/distinct.out" 2> "$tmp/distinct.err"
+grep -q 'wrote the ALT-window index' "$tmp/distinct.err"
+[ ! -s "$tmp/distinct.out" ] && [ -s "$tmp/distinct.sam" ] && [ -s "$tmp/distinct.cache" ]
+run distinct.read -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/distinct.cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+grep -q 'loaded the index of' "$tmp/distinct.read.err"
+body "$tmp/distinct.sam" "$tmp/distinct.body"
+body "$tmp/distinct.read.sam" "$tmp/distinct.read.body"
+cmp "$tmp/distinct.body" "$tmp/distinct.read.body"
+# A case-insensitive filesystem can reveal an alias only once the new cache exists.
+printf x > "$tmp/case-probe"
+if [ -e "$tmp/CASE-PROBE" ]; then
+    rc=0
+    "$bin" aln -v 3 -f "$tmp/CASE.cache" --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/case.cache" \
+        "$reference" "$tmp/r1.fq" "$tmp/r2.fq" > "$tmp/case.out" 2> "$tmp/case.err" || rc=$?
+    if [ "$rc" != 1 ] || ! grep -q 'overwrite the cache' "$tmp/case.err"; then
+        echo "FAIL: case-insensitive output/cache alias: exit $rc" >&2
+        alias_bad=1
+    fi
+    run case.read -v 3 --known-snvs "$tmp/sites.vcf" --known-snvs-cache "$tmp/case.cache" "$reference" "$tmp/r1.fq" "$tmp/r2.fq"
+    if ! grep -q 'loaded the index of' "$tmp/case.read.err"; then
+        echo 'FAIL: case-insensitive output alias overwrote the cache' >&2
+        alias_bad=1
+    fi
+    body "$tmp/case.read.sam" "$tmp/case.read.body"
+    cmp "$tmp/distinct.body" "$tmp/case.read.body"
+else
+    echo 'SKIP: case-insensitive alias (case-sensitive filesystem)'
+fi
+[ "$alias_bad" = 0 ] || exit 1
+echo 'PASS: new resolved output/cache aliases refused before writing; distinct destinations work'
+
+if ! cmp "$tmp/r1.fq" "$tmp/r1.keep" || ! cmp "$tmp/sites.vcf" "$tmp/sites.keep" || ! cmp "$reference.pac" "$tmp/pac.keep"; then
+    echo "FAIL: a refused --known-snvs-cache changed an input" >&2
+    exit 1
+fi
+rc=0
+(cd "$tmp" && "$bin" aln --known-snvs "$tmp/sites.vcf" --known-snvs-cache - "$reference" "$tmp/se.fq") \
+    > "$tmp/dash.out" 2> "$tmp/dash.err" || rc=$?
+[ "$rc" = 1 ] && grep -qF -- "not '-'" "$tmp/dash.err" && [ ! -e "$tmp/-" ] || {
+    echo "FAIL: --known-snvs-cache -: exit $rc" >&2
+    exit 1
+}
+echo 'PASS: cache (written, read back, stale rebuilt; same output; a path the run uses is refused)'
 
 # 5. --bam carries XV:Z.
 if command -v samtools > /dev/null; then
