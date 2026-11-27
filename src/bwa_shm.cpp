@@ -1104,8 +1104,12 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
          * fraction of the stage's time. */
         const int64_t n_s = (layout->reference_seq_len >> layout->sa_compx) + 1;
         const off_t sa_off = ftello(cp);
-        const int rc = sa_off < 0 ? FMI_search::SA_HI_READ_OOM
-                     : FMI_search::sa_hi_pread_pack(fileno(cp), cp_path, sa_off, n_s, hi_log2,
+        if (sa_off < 0) {
+            fprintf(stderr, "[E::%s] ftello on %s failed\n", __func__, cp_path);
+            err_fclose(cp);
+            return -1;
+        }
+        const int rc = FMI_search::sa_hi_pread_pack(fileno(cp), cp_path, sa_off, n_s, hi_log2,
                                                     hi_dst, /*nthreads=*/1);
         if (rc == 0 && fseeko(cp, sa_off + (off_t)n_s, SEEK_SET) != 0) {
             fprintf(stderr, "[E::%s] fseeko on %s failed\n", __func__, cp_path);
@@ -1114,8 +1118,11 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         }
         if (rc != 0) {
             if (rc == FMI_search::SA_HI_READ_OOM)
-                fprintf(stderr, "[E::%s] could not read the SA samples of %s (out of memory "
-                        "or ftello failed)\n", __func__, cp_path);
+                fprintf(stderr, "[E::%s] could not read the SA samples of %s (out of memory)\n",
+                        __func__, cp_path);
+            else if (rc == FMI_search::SA_HI_READ_IO)
+                fprintf(stderr, "[E::%s] could not read the SA samples of %s (read failure)\n",
+                        __func__, cp_path);
             else
                 fprintf(stderr, "[E::%s] SA sample high part out of range in %s "
                         "(corrupt or mismatched index?)\n", __func__, cp_path);
@@ -1402,9 +1409,10 @@ int bwa_shm_destroy(void)
 }
 
 /* The System V segment of a 1 GB stage that this process is packing, or -1.
- * The pack's file readers exit the process on an I/O error (err_fatal), which
- * skips the stage_guard, so the segment is also removed at exit: a stage that
- * fails this way leaves an incomplete stub and no pinned pages. */
+ * SA high-part reads return errors through stage_guard for complete rollback.
+ * Other file readers can call exit (err_fatal), skipping stage_guard: atexit
+ * then removes the segment, leaving an incomplete stub and no pinned pages.
+ * _exit does not run this fallback; worker read failures must return instead. */
 static volatile sig_atomic_t g_packing_shmid = -1;   /* read by packing_sigbus */
 static void packing_shmid_remove(void)
 {
@@ -1415,7 +1423,7 @@ static void packing_shmid_remove(void)
  * (a hugetlb cgroup limit or NUMA policy, on a kernel that cannot prefault,
  * or a hardware error). Its default action skips atexit, so the handler
  * removes the segment, says why, and dies of the signal as before: the stage
- * leaves an incomplete stub and no pinned pages, as for an I/O error. */
+ * leaves an incomplete stub and no pinned pages, as for an err_fatal exit. */
 static void packing_sigbus(int sig)
 {
     /* shmctl is not on POSIX's async-signal-safe list, but it is a bare

@@ -100,29 +100,18 @@ namespace {
 
 struct PreadChunk { int fd; char *dst; size_t nbytes; off_t off; };
 
-/* Bail out of a failed chunk read.
- *
- * _exit, not exit: this runs on a worker thread while its siblings are still
- * inside pread(). exit() would run atexit handlers and static destructors
- * (mimalloc teardown, htslib) against live threads, and two workers reaching it
- * at once -- what a truncated index produces, since every chunk past the real
- * EOF fails together -- is undefined. stderr is unbuffered, but flush anyway so
- * the diagnostic survives if a caller made it buffered.
- *
- * noreturn keeps the caller's `if (r < 0) { ... }` terminating the way the
- * inline exit() it replaced did; format(printf) keeps -Wformat checking the
- * call sites, matching utils.h's err_fatal family. */
-void pread_chunk_fail(const char *fmt, ...)
-    ATTRIBUTE((noreturn)) ATTRIBUTE((format(printf, 1, 2)));
+/* Report before returning a read failure or terminating an ordinary load.
+ * Flush explicitly in case a caller made stderr buffered. */
+void pread_chunk_error(const char *fmt, ...)
+    ATTRIBUTE((format(printf, 1, 2)));
 
-void pread_chunk_fail(const char *fmt, ...)
+void pread_chunk_error(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fflush(stderr);
-    _exit(EXIT_FAILURE);
 }
 
 /* Open a private read descriptor on `path` for one pread worker, or return
@@ -145,9 +134,10 @@ int open_worker_fd(const char *path, int shared_fd)
     return fd;
 }
 
-void *pread_chunk_worker(void *arg)
+/* The bounded SA packer returns failures to its owner, so a stage can roll
+ * back after all readers have joined. Ordinary index reads stay fatal. */
+bool pread_chunk_read(PreadChunk *c)
 {
-    PreadChunk *c = static_cast<PreadChunk *>(arg);
     size_t done = 0;
     /* macOS pread() rejects any count > INT_MAX with EINVAL, so a chunk larger
      * than 2GiB fails outright -- with the 8-worker cap that is every index over
@@ -160,18 +150,28 @@ void *pread_chunk_worker(void *arg)
                           c->off + (off_t)done);
         if (r < 0) {
             if (errno == EINTR) continue;
-            pread_chunk_fail("ERROR: pread failed during index load: %s\n", strerror(errno));
+            pread_chunk_error("ERROR: pread failed during index load: %s\n", strerror(errno));
+            return false;
         }
         if (r == 0) {  // index file shorter than the header says it should be
             // Counts are for THIS worker's chunk, not the whole array: a
             // truncated index trips every chunk past the real EOF, so several
             // of these can interleave, each describing a different slice.
-            pread_chunk_fail("ERROR: unexpected EOF during index load "
-                             "(chunk at offset %lld: %zu of %zu bytes)\n",
-                             (long long)c->off, done, c->nbytes);
+            pread_chunk_error("ERROR: unexpected EOF during index load "
+                              "(chunk at offset %lld: %zu of %zu bytes)\n",
+                              (long long)c->off, done, c->nbytes);
+            return false;
         }
         done += (size_t)r;
     }
+    return true;
+}
+
+void *pread_chunk_worker(void *arg)
+{
+    // exit() would run atexit handlers and static destructors against live
+    // sibling readers. Keep ordinary loads fatal without invoking teardown.
+    if (!pread_chunk_read(static_cast<PreadChunk *>(arg))) _exit(EXIT_FAILURE);
     return NULL;
 }
 
@@ -1147,6 +1147,9 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         xassert(sa_off >= 0, "ftello failed during index load");
         const int rc = sa_hi_pread_pack(fileno(cpstream), cp_file_name, sa_off, sa_count,
                                         sa_hi_log2, sa_hi, load_nt);
+        // Read diagnostics are already emitted. Preserve the ordinary loader's
+        // fatal _exit policy; only the stager can recover from a read failure.
+        if (rc == SA_HI_READ_IO) _exit(EXIT_FAILURE);
         xassert(fseeko(cpstream, sa_off + (off_t)sa_count, SEEK_SET) == 0,
                 "fseeko failed during index load");
         xassert(rc != SA_HI_READ_OOM, "out of memory: SA sample read buffer");
@@ -4302,7 +4305,7 @@ static int64_t g_sa_hi_read_chunk = (int64_t)1 << 20;
 /* One worker of sa_hi_pread_pack: samples [first, first + n) of the call, read a piece at a
  * time into a small private buffer and packed while the piece is still in cache. */
 struct SaHiPreadJob {
-    int fd; off_t off; int64_t first, n, piece; int log2; uint64_t *dst; int bad, oom;
+    int fd; off_t off; int64_t first, n, piece; int log2; uint64_t *dst; int bad, oom, io_error;
 };
 
 static void *sa_hi_pread_worker(void *arg)
@@ -4314,7 +4317,7 @@ static void *sa_hi_pread_worker(void *arg)
     for (int64_t s = 0; s < j->n; s += j->piece) {
         const int64_t m = (j->n - s < j->piece) ? j->n - s : j->piece;
         PreadChunk c{ j->fd, (char *)buf, (size_t)m, j->off + (off_t)s };
-        pread_chunk_worker(&c);   /* exits on an I/O error or a short file, as the load does */
+        if (!pread_chunk_read(&c)) { j->io_error = 1; break; }
         if (!FMI_search::sa_hi_pack(buf, j->first + s, m, j->log2, j->dst, 1)) { j->bad = 1; break; }
     }
     free(buf);
@@ -4336,7 +4339,7 @@ int FMI_search::sa_hi_pread_pack(int fd, const char *path, off_t off, int64_t n,
         const int64_t b = (int64_t)t * per < n ? (int64_t)t * per : n;
         const int64_t e = b + per < n ? b + per : n;
         const int wfd = (t == 0 || e <= b) ? fd : open_worker_fd(path, fd);
-        jobs[(size_t)t] = SaHiPreadJob{ wfd, off + (off_t)b, b, e - b, g_sa_hi_read_chunk, log2, dst, 0, 0 };
+        jobs[(size_t)t] = SaHiPreadJob{ wfd, off + (off_t)b, b, e - b, g_sa_hi_read_chunk, log2, dst, 0, 0, 0 };
     }
     for (int t = 1; t < T; ++t) {
         if (pthread_create(&tids[(size_t)t], NULL, sa_hi_pread_worker, &jobs[(size_t)t]) == 0)
@@ -4345,14 +4348,15 @@ int FMI_search::sa_hi_pread_pack(int fd, const char *path, off_t off, int64_t n,
             sa_hi_pread_worker(&jobs[(size_t)t]);
     }
     sa_hi_pread_worker(&jobs[0]);
-    int bad = 0, oom = 0;
+    int bad = 0, oom = 0, io_error = 0;
     for (int t = 0; t < T; ++t) {
         if (t > 0 && spawned[(size_t)t]) pthread_join(tids[(size_t)t], NULL);
         if (jobs[(size_t)t].fd != fd) close(jobs[(size_t)t].fd);
         bad |= jobs[(size_t)t].bad;
         oom |= jobs[(size_t)t].oom;
+        io_error |= jobs[(size_t)t].io_error;
     }
-    return oom ? SA_HI_READ_OOM : bad ? SA_HI_READ_RANGE : 0;
+    return io_error ? SA_HI_READ_IO : oom ? SA_HI_READ_OOM : bad ? SA_HI_READ_RANGE : 0;
 }
 
 int64_t FMI_search::sa_hi_read_chunk() { return g_sa_hi_read_chunk; }

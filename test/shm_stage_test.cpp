@@ -335,13 +335,14 @@ void register_entry(const char *name, int64_t l_mem) {
 
 // Per-child hook behaviour; the child's map hook dispatches on it.
 enum HookMode { HOOK_NONE, HOOK_PAUSE, HOOK_SIGKILL, HOOK_FIFO_INPUT, HOOK_FATAL_INPUT,
-                HOOK_DESTROY, HOOK_SIGBUS };
+                HOOK_DESTROY, HOOK_SIGBUS, HOOK_SHORT_SA };
 HookMode g_mode = HOOK_NONE;
 int g_ready_fd = -1, g_go_fd = -1;
 // Parent-side pipe ends of live paused stagers; every stage child closes them,
 // so only the parent can release (EOF) a paused stager.
 std::vector<int> g_child_close;
 std::string g_break_path;
+off_t g_truncate_to = 0;
 // When set, a stage child's stderr goes to this file (see stage_stderr).
 std::string g_child_stderr;
 // The ids of the System V segments this test's children created, recorded
@@ -371,6 +372,11 @@ void stage_hook(const void *, size_t) {
     case HOOK_FATAL_INPUT:
         // A missing .pac: the pack's open of it exits the process midway.
         if (unlink(g_break_path.c_str()) != 0) _exit(92);
+        break;
+    case HOOK_SHORT_SA:
+        // Layout validation has completed; lose the last SA high-part byte
+        // before the real packer reads it, without changing the checkpoints.
+        if (truncate(g_break_path.c_str(), g_truncate_to) != 0) _exit(92);
         break;
     case HOOK_DESTROY: if (test_private_shm_destroy() != 0) _exit(93); break;
     case HOOK_NONE: break;
@@ -1418,6 +1424,34 @@ void check_huge_rollback() {
     std::printf("ok h4 failed, destroyed, taken-over or exited 1 GB stage leaves no segment\n");
 }
 
+// An SA high-part short read must return through stage_guard, removing the
+// private registry entry, POSIX stub and (for fake huge pages) System V segment.
+void check_sa_read_rollback() {
+    for (const bool huge : {true, false}) {
+        Names n({"saread"});
+        HugeCase c;
+        const std::string prefix = n.prefix("saread", /*copy=*/true);
+        bwa_shm_layout_t layout;
+        CHECK(bwa_shm_compute(prefix.c_str(), &layout) == 0);
+        const int64_t samples = (layout.reference_seq_len >> layout.sa_compx) + 1;
+        g_truncate_to = (off_t)BWA_BWT_2BIT_HEADER_BYTES +
+                        (off_t)layout.sections[1].size + (off_t)samples - 1;
+        bwa_shm_layout_free(&layout);
+        g_break_path = prefix + ".bwt.2bit.64";
+        const uint64_t token = c.fresh();
+        g_child_stderr = n.dir.file("read.log");
+        const int status = wait_status(spawn_stage(prefix, HOOK_SHORT_SA, huge));
+        g_child_stderr.clear();
+        CHECK(exited(status, 1));
+        CHECK(has(slurp(n.dir.file("read.log")), "unexpected EOF during index load"));
+        CHECK(key_absent(token));
+        CHECK(entries().empty());
+        CHECK(!segment_exists(n.segment));
+        CHECK(lock_free());
+    }
+    std::printf("ok SA read failure rolls back ordinary and fake huge-page stages\n");
+}
+
 // h5. A host that cannot take a 1 GB stage refuses one and stages nothing: an
 //     AMD x86 host unless BWAMEM3_SHM_HUGE_PAGES_AMD=1, one whose kernel
 //     removes a segment when its stager exits or whose setting for that cannot
@@ -1987,8 +2021,9 @@ void check_huge_real_pool() {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        std::fprintf(stderr, "usage: %s <indexed-prefix>\n", argv[0]);
+    const bool read_rollback_only = argc == 3 && strcmp(argv[2], "--read-rollback-only") == 0;
+    if (argc != 2 && !read_rollback_only) {
+        std::fprintf(stderr, "usage: %s <indexed-prefix> [--read-rollback-only]\n", argv[0]);
         return 2;
     }
     char resolved[PATH_MAX];
@@ -1998,6 +2033,14 @@ int main(int argc, char *argv[]) {
     }
     g_source = resolved;
     try {
+        if (read_rollback_only) {
+            // Only normal-exit cases, using private names and ordinary small
+            // System V pages: no signals, global registry, or huge-page pool.
+            check_huge_stage();
+            check_sa_read_rollback();
+            std::printf("shm_stage_test read rollback: OK\n");
+            return 0;
+        }
         check_lock_not_held_during_pack();
         check_wait_then_reclaim();
         check_interrupted_stage();
@@ -2022,6 +2065,7 @@ int main(int argc, char *argv[]) {
             check_huge_interrupted();
             check_huge_foreign();
             check_huge_rollback();
+            check_sa_read_rollback();
             check_huge_refused();
             check_huge_removal_fails();
             check_huge_attach_validation();
