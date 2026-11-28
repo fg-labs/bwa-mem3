@@ -49,6 +49,7 @@ Authors: Sanchit Misra <sanchit.misra@intel.com>; Vasimuddin Md <vasimuddin.md@i
 #include "bwa_shm.h"
 #include "utils.h"        /* ATTRIBUTE, err_fread_noeof */
 #include "io_utils.h"     /* io_request_size, IO_MAX_ONCE */
+#include "simd_dispatch.h" /* bwa3_host_cpu_identity, bwa3_cpu_is_zen3: load-thread cap */
 #include "FMI_search.h"
 #include "fm_index_writer.h"   /* FMI_BWT2BIT_HDR_BYTES */
 #include "ksort.h"        /* smem_sort_rid_mn: per-rid introsort on (key, idx) pairs */
@@ -234,15 +235,71 @@ void parallel_pread(int shared_fd, const char *path, void *dst, size_t nbytes,
 
 }  // namespace
 
-// Worker count for the index load: the caller's -t, capped (bandwidth bound
-// past ~8), with an explicit BWA3_LOAD_THREADS override for tuning.
-// Exposed (declared in FMI_search.h) so the env-parse validation is
-// unit-testable without loading a real index.
-int index_load_threads(int n_threads, bool *override_applied)
+/* Wall time of each phase of the index load, printed once at -v 4 as
+ * `[M::load_index] phases (s): name=seconds ...`. mark() charges the time since
+ * the previous mark to `name`; at the default verbosity it does nothing. The
+ * names are string literals. */
+namespace {
+struct LoadPhases {
+    enum { MAX = 12 };
+    const char *name[MAX];
+    double      dur[MAX];
+    int         n;
+    double      t0, last;
+    bool        on;
+    LoadPhases() : n(0), t0(0), last(0), on(bwa_verbose >= 4) { if (on) t0 = last = realtime(); }
+    void mark(const char *what)
+    {
+        if (!on || n == MAX) return;
+        const double t = realtime();
+        name[n] = what; dur[n] = t - last; n++;
+        last = t;
+    }
+    void report(const char *source, int ordinary, int occurrence, int jump) const
+    {
+        if (!on) return;
+        fprintf(stderr, "[M::load_index] phases (s):");
+        for (int i = 0; i < n; i++) fprintf(stderr, " %s=%.3f", name[i], dur[i]);
+        fprintf(stderr, " total=%.3f source=%s", last - t0, source);
+        if (ordinary > 0)
+            fprintf(stderr, " ordinary_threads=%d occurrence_threads=%d", ordinary, occurrence);
+        fprintf(stderr, " jump_threads=%d\n", jump);
+    }
+};
+}  // namespace
+
+// Default cap for ordinary index-load workers: 4 on AMD Zen 3,
+// 8 otherwise. CPU identity is classified by bwa3_cpu_is_zen3,
+// independently of the selected SIMD tier.
+// The caller's thread request and BWA3_LOAD_THREADS are handled by
+// index_load_threads_capped; the huge-page occurrence-load policy
+// is handled separately when the occurrence table is allocated.
+int index_load_threads_default_cap(int is_amd, uint32_t family, uint32_t model)
+{
+    return bwa3_cpu_is_zen3(is_amd, family, model) ? 4 : 8;
+}
+
+int index_load_threads_host_cap(void)
+{
+    static const int cap = [] {
+        int is_amd = 0;
+        uint32_t family = 0, model = 0;
+        bwa3_host_cpu_identity(&is_amd, &family, &model);
+        return index_load_threads_default_cap(is_amd, family, model);
+    }();
+    return cap;
+}
+
+// Worker count for the index load: the caller's -t, capped at `cap`, with an
+// explicit BWA3_LOAD_THREADS override for tuning. Exposed (declared in
+// io_utils.h) so the env-parse validation is unit-testable without loading a
+// real index or depending on the host's cap.
+int index_load_threads_capped(int n_threads, int cap, bool *override_applied)
 {
     if (override_applied != nullptr) *override_applied = false;
     int t = n_threads > 0 ? n_threads : 1;
-    if (t > 8) t = 8;
+    if (cap < 1) cap = 1;
+    if (t > cap) t = cap;
     const char *e = getenv("BWA3_LOAD_THREADS");
     if (e != NULL && *e != '\0') {
         // Strict parse: atoi silently accepts garbage (abc -> 0, 0x8 -> 0) and
@@ -263,6 +320,27 @@ int index_load_threads(int n_threads, bool *override_applied)
         }
     }
     return t;
+}
+
+int index_load_threads(int n_threads, bool *override_applied)
+{
+    return index_load_threads_capped(n_threads, index_load_threads_host_cap(), override_applied);
+}
+
+/* At -v 3, report per-phase limits, not actual worker counts: a small read can
+ * use fewer workers. An attached index has no ordinary or occurrence reads. */
+static void report_load_threads(int ordinary, int occurrence, int jump, bool overridden)
+{
+    if (bwa_verbose < 3) return;
+    fprintf(stderr, "[M::load_index] index load worker limits:");
+    if (ordinary > 0) fprintf(stderr, " ordinary=%d occurrence=%d", ordinary, occurrence);
+    fprintf(stderr, " jump=%d", jump);
+    const int cap = index_load_threads_host_cap();
+    if (overridden)
+        fprintf(stderr, " (source: BWA3_LOAD_THREADS)\n");
+    else
+        fprintf(stderr, " (source: %s, cap %d)\n",
+                cap == 8 ? "default" : "host default (AMD Zen 3)", cap);
 }
 
 /* Declared in FMI_search.h; see there for the contract. ftello reports the
@@ -1322,6 +1400,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * attaches either and takes its layout, through set_compact_occ; any other
      * attaches only its own layout (bwa_shm_attach declines the other, and
      * this loads from disk). */
+    LoadPhases phases;
     {
         size_t   shm_attach_len = 0, shm_map_len = 0;
         uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len, &shm_map_len,
@@ -1329,6 +1408,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                                                  cp_prefer_staged ? -1
                                                  : cp_compact ? (int)BWA_SHM_CP_LAYOUT_COMPACT
                                                               : (int)BWA_SHM_CP_LAYOUT_DEFAULT);
+        phases.mark("shm_attach");
         if (shm_base_local != NULL) {
             const bool seg_compact = bwa_shm_segment_compact(shm_base_local) != 0;
             if (seg_compact != cp_compact) {
@@ -1355,6 +1435,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
             /* shm_map_len: the whole mapping, which can be longer than the
              * packed index it holds, is what the destructor unmaps. */
             load_index_from_shm(shm_base_local, shm_attach_len, shm_map_len);
+            phases.mark("shm_fmi");
             /* D3 --meth seed segment is staged bns_only: no PAC section, and
              * idx->pac stays NULL (extension uses meth_orig_pac). */
             bwa_idx_load_ele_from_shm(shm_base_local, shm_attach_len, load_pac);
@@ -1362,9 +1443,16 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
                                      /*from_shm=*/true))
                 exit(EXIT_FAILURE);
             bns_build_pos2rid(idx->bns);
+            phases.mark("shm_bns_pac");
             /* The seed jump table is process-private (not part of the staged
              * segment), so an attached index builds its own. */
-            if (build_seed_jump) build_seed_jump_table(index_load_threads(n_threads));
+            bool jump_nt_overridden = false;
+            const int jump_nt = index_load_threads(n_threads, &jump_nt_overridden);
+            if (build_seed_jump) build_seed_jump_table(jump_nt);
+            const int jump_limit = build_seed_jump && seed_jump != NULL ? jump_nt : 0;
+            report_load_threads(0, 0, jump_limit, jump_nt_overridden);
+            phases.mark("jump_table");
+            phases.report("shm", 0, 0, jump_limit);
             fprintf(stderr, "* FMI+BNS%s attached from shm; "
                     "skipping disk load.\n", load_pac ? "+PAC" : "");
             if (huge_pages != BWAMEM_HUGETLB_OFF)
@@ -1476,6 +1564,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         }
     }
 
+    phases.mark("open_header");
     // create checkpointed occ
     int64_t cp_occ_size = (reference_seq_len >> CP_SHIFT) + 1;
     cp_occ = NULL;
@@ -1531,6 +1620,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     if (huge_pages != BWAMEM_HUGETLB_OFF) {
         fmi_map_occ_table_huge(huge_pages, (size_t)cp_occ_bytes, huge_load_nt, &cp_occ_huge);
     }
+    const int occurrence_nt = cp_occ_huge.base != NULL ? huge_load_nt : load_nt;
     if (cp_compact) {
         if (cp_occ_huge.base != NULL) {
             cp_planes = (CP_OCC_PLANES *)cp_occ_huge.base;
@@ -1544,11 +1634,10 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         // Each worker reads its own range of the file's records and converts
         // it, so the 64-byte records are never all resident and no thread
         // waits on another between read and convert.
-        const int cp_nt = cp_occ_huge.base != NULL ? huge_load_nt : load_nt;
         const off_t rec0 = ftello(cpstream);
         xassert(rec0 >= 0, "ftello failed during index load");
         xassert(cp_convert_records(fileno(cpstream), cp_file_name, rec0, cp_occ_size, reference_seq_len,
-                                   count, cp_form, cp_planes, &cp_base, &cp_n_spans, cp_nt, &cp_empty_row),
+                                   count, cp_form, cp_planes, &cp_base, &cp_n_spans, occurrence_nt, &cp_empty_row),
                 kCpCorruptMsg);
         xassert(fseeko(cpstream, rec0 + (off_t)cp_occ_size * (off_t)sizeof(CP_OCC), SEEK_SET) == 0,
                 "fseeko failed during index load");
@@ -1563,9 +1652,9 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         bwamem_madv_hugepage(cp_occ, cp_occ_bytes);
     }
 
-    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes,
-                          cp_occ_huge.base != NULL ? huge_load_nt : load_nt);
+    fmi_pread_from_stream(cpstream, cp_file_name, cp_occ, (size_t)cp_occ_bytes, occurrence_nt);
     }
+    phases.mark("cp_occ");
     int64_t ii = 0;
     for(ii = 0; ii < 5; ii++)// update read count structure
     {
@@ -1604,7 +1693,9 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         xassert(rc != SA_HI_READ_RANGE,
                 "FMI index: SA sample high part out of range (corrupt .bwt.2bit.64?)");
     }
+    phases.mark("sa_hi_read_pack");
     fmi_pread_from_stream(cpstream, cp_file_name, sa_ls_word, (size_t)sa_ls_bytes, load_nt);
+    phases.mark("sa_ls");
 
     sentinel_index = -1;
     #if SA_COMPRESSION
@@ -1644,6 +1735,9 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
 
     // cp_occ, count[] and sentinel_index are in: build the seed jump table.
     if (build_seed_jump) build_seed_jump_table(load_nt);
+    const int jump_limit = build_seed_jump && seed_jump != NULL ? load_nt : 0;
+    report_load_threads(load_nt, occurrence_nt, jump_limit, load_nt_overridden);
+    phases.mark("jump_table");
 
     fprintf(stderr, "* Count:\n");
     for(x = 0; x < 5; x++)
@@ -1663,6 +1757,8 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
      * before the FM arrays. */
     bwa_idx_load_ele(ref_file_name, load_pac ? BWA_IDX_ALL : BWA_IDX_BNS, load_nt,
                      reference_seq_len);
+    phases.mark("bns_pac");
+    phases.report("disk", load_nt, occurrence_nt, jump_limit);
 
     fprintf(stderr, "* Done reading Index!!\n");
 }

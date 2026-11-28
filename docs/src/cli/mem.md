@@ -461,6 +461,13 @@ Controls stderr diagnostic output: `1` = errors only, `2` = warnings,
 At `-v 1` the [transparent huge page warning](#transparent-huge-page-fallback-warning-linux)
 is also suppressed; at `-v 4` each of its samples is logged as a `[D::]` line.
 
+At `-v 4` and above, `[M::load_index] phases (s):` reports wall seconds for
+the disk-load or shared-memory-attach phases, their total, and their worker
+limits. `[M::main_mem] wall (s):` splits the run into setup, index load,
+pre-pipeline, pipeline and teardown time, ending just before `main_mem`
+returns. These reports are absent at the default verbosity. They measure
+elapsed time, not summed worker CPU time.
+
 #### `-a` — all alignments
 
 Output all alignments for single-end or unpaired paired-end reads, including
@@ -1474,6 +1481,29 @@ for measured guidance and per-machine recommendations.
 
 See [User Guide — Threading and resource use](../user-guide/threading.md) for
 guidance on thread counts at various machine sizes.
+
+Disk index loading and process-private seed-jump-table construction use up
+to `-t` workers, capped at 4 on AMD Zen 3 (CPUID family 19h, models 00h-0Fh
+or 20h-5Fh) and 8 elsewhere, including unknown CPU identities. The same cap
+applies when building the jump table after attaching a staged index.
+`BWA3_LOAD_THREADS=<n>` overrides the worker limit on any host: a positive
+decimal integer above 64 is clamped to 64. An unset or empty value leaves
+the default unchanged; a malformed or non-positive value produces a diagnostic
+and is ignored. The override can exceed `-t`.
+
+A successful disk `--huge-pages` allocation lets the occurrence-table read or
+conversion use all `-t` workers (up to 64), unless a valid
+`BWA3_LOAD_THREADS` override sets their limit. Other arrays and the jump table
+keep the ordinary limit. If the allocation falls back to ordinary pages,
+the occurrence table also keeps that limit. At `-v 3` and above,
+`[M::load_index] index load worker limits:` reports the ordinary-array,
+occurrence-table and jump-table limits for disk loads, or just the jump-table
+limit for an attached index, together with their source. A jump-table limit
+of zero means no jump table was built. The verbosity-four phase report
+uses `ordinary_threads`, `occurrence_threads` and `jump_threads` for these
+limits (only `jump_threads` for an attached index). A small input can use fewer
+workers than its limit. These settings change index-loading and jump-table
+parallelism, not alignment records.
 
 With more than one pipeline thread (`-t 2` and up, unless `-1` asks for
 single-threaded I/O), SAM text output is streamed: while a batch's last compute pass is still running, the records of

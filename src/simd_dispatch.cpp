@@ -822,3 +822,8 @@ extern "C" void bwa3_host_cpu_identity(int *is_amd, uint32_t *family, uint32_t *
     *model  = 0;
 #endif
 }
+extern "C" int bwa3_cpu_is_zen3(int is_amd, uint32_t family, uint32_t model)
+{
+    if (!is_amd || family != 0x19u) return 0;
+    return model <= 0x0fu || (model >= 0x20u && model <= 0x5fu);
+}
