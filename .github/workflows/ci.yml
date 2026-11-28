@@ -2147,6 +2147,16 @@ jobs:
           SKIP_CONTAINED_WORK_DIR=/tmp/skip-contained-bytes \
           bash test/regression/skip_contained_byte_identity.sh
 
+      - name: Ordinary index overwrites require --force
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/index_overwrite.sh
+
+      - name: Inconsistent index sets refused at load (generated small references)
+        run: |
+          BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \
+          bash test/regression/index_set_consistency.sh
+
       - name: byte-identity --compat with and without --keep-contained-ext (contained-seed skip)
         run: |
           BWA_MEM3="$GITHUB_WORKSPACE/bwa-mem3" \

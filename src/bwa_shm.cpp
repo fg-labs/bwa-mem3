@@ -26,7 +26,8 @@
 *****************************************************************************************/
 
 #include "bwa_shm.h"
-#include "FMI_search.h"    /* CP_FILENAME_SUFFIX, CP_OCC, CP_SHIFT */
+#include "FMI_search.h"
+#include "fm_index_writer.h"    /* CP_FILENAME_SUFFIX, CP_OCC, CP_SHIFT */
 #include "macro.h"         /* SA_COMPX */
 #include "bntseq.h"        /* bntseq_t, bns_restore, bns_destroy */
 #include "utils.h"         /* err_fread_noeof, err_fclose, xopen */
@@ -953,19 +954,12 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
     }
     memcpy(layout->prefix, prefix, plen + 1);
 
-    /* 1. Load BNS (.ann + .amb + name/anno strings; opens .pac fp which we
-     *    don't need here). */
-    bntseq_t *bns = bns_restore(prefix);
+    /* Staging needs metadata, not the process-private position lookup. Avoid
+     * building that length-scaled table before the FM/PAC checks below. */
+    bntseq_t *bns = bns_restore_metadata(prefix);
     if (bns == NULL) {
         fprintf(stderr, "[E::%s] bns_restore(%s) failed\n", __func__, prefix);
         return -1;
-    }
-    /* Close the .pac stream that bns_restore left open; pack_into re-opens
-     * it via xopen on the .pac path. Zero the field so bns_destroy doesn't
-     * double-close. */
-    if (bns->fp_pac != NULL) {
-        err_fclose(bns->fp_pac);
-        bns->fp_pac = NULL;
     }
     layout->bns = bns;
 
@@ -1058,6 +1052,27 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
             return -1;
         }
         layout->disk_sa_compx = detect_sa_compx(fileno(cp), (int64_t)st.st_size, layout->reference_seq_len, SA_COMPX);
+        /* A mixed index set (e.g. an interrupted `bwa-mem3 index`) must not be staged: the
+         * segment would carry it to every `mem` that attaches. */
+        bool ok = fmi_bwt_size_ok(__func__, cp_path, (int64_t)st.st_size, layout->reference_seq_len,
+                                  layout->disk_sa_compx, fileno(cp))
+               && fmi_bwt_matches_ann(__func__, prefix, layout->reference_seq_len, bns->l_pac);
+        if (ok && !bns_only) {
+            char pac_path[PATH_MAX];
+            path_concat2(pac_path, prefix, ".pac");
+            ok = bns_pac_fp_size_ok(__func__, pac_path, bns->fp_pac, bns->l_pac) != 0;
+        }
+        if (!ok) {
+            err_fclose(cp);
+            bwa_shm_layout_free(layout);
+            return -1;
+        }
+    }
+
+    /* pack_into opens its own stream; the layout owns only metadata. */
+    if (bns->fp_pac != NULL) {
+        err_fclose(bns->fp_pac);
+        bns->fp_pac = NULL;
     }
 
     /* `shm -u`: a target strictly denser than disk (in [0,6]) sizes the SA
@@ -1106,10 +1121,8 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
     /* The sentinel_index int64 sits AFTER the on-disk SA arrays in
      * <prefix>.bwt.2bit.64, so its file offset must be computed from the DISK
      * stride (layout->disk_sa_compx) regardless of what we stage. */
-    int64_t disk_sa_count = (layout->reference_seq_len >> layout->disk_sa_compx) + 1;
-    int64_t sentinel_off  = (int64_t)BWA_BWT_2BIT_HEADER_BYTES + cp_occ_bytes
-                          + disk_sa_count * (int64_t)sizeof(int8_t)
-                          + disk_sa_count * (int64_t)sizeof(uint32_t);
+    const int64_t sentinel_off = fmi_bwt2bit_layout(layout->reference_seq_len,
+                                                   (int)layout->disk_sa_compx).off_sentinel;
     if (fseek(cp, (long)sentinel_off, SEEK_SET) != 0) {
         fprintf(stderr, "[E::%s] fseek(%lld) failed in %s\n",
                 __func__, (long long)sentinel_off, cp_path);
@@ -2719,6 +2732,20 @@ int main_shm(int argc, char *argv[])
         if (meth) {
             if (resolve_meth_prefix(user_prefix, resolved) != 0) return 1;
             user_prefix = resolved;
+            const std::string original(resolved, strlen(resolved) - strlen(".meth"));
+            bntseq_t *seed = bns_restore_metadata(resolved);
+            bntseq_t *orig = bns_restore_metadata(original.c_str());
+            const char *why = bns_meth_seed_mismatch(seed, orig);
+            if (why != NULL) {
+                fprintf(stderr, "[E::main_shm] --meth seed and original have inconsistent %s. "
+                        "Run `bwa-mem3 shm -d` if staged, then rebuild from the original FASTA "
+                        "with `bwa-mem3 index --meth --force` and stage again.\n", why);
+                bns_destroy(seed);
+                bns_destroy(orig);
+                return 1;
+            }
+            bns_destroy(seed);
+            bns_destroy(orig);
         } else if (hint_missing_meth_flag(user_prefix)) {
             return 1;
         }

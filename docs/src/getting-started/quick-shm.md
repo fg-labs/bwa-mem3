@@ -112,7 +112,7 @@ It provides little benefit when:
 >
 > ```bash
 > bwa-mem3 shm -d &&
->   bwa-mem3 index ref.fa &&
+>   bwa-mem3 index --force ref.fa &&
 >   bwa-mem3 shm ref.fa
 > ```
 >

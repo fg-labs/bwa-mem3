@@ -542,7 +542,7 @@ STANDALONE_TESTS = kswv_nrow_zero_test kswv_freed_cell_test \
                    shm_section_find_test \
                    shm_pack_round_trip_test shm_lock_destroy_test \
                    shm_stage_test shm_thp_advise_test \
-                   kt_for_pool_test bns_zero_calloc_test \
+                   kt_for_pool_test bns_zero_calloc_test meth_restore_order_test \
                    err_fgets_eof_test \
                    kernel_padded_lane_uninit_test bam_rec_scratch_test \
                    detect_sa_compx_test nst_nt4_decode_test \
@@ -1252,6 +1252,13 @@ pwrite_all_status_test: $(BWA_LIB) $(HTS_LIB) test/pwrite_all_status_test.o
 bns_zero_calloc_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/bns_zero_calloc_test.o
 	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/bns_zero_calloc_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
 
+# Interpose calloc to catch allocation attempts before meth metadata validation.
+meth_restore_order_test: $(BWA_LIB) $(HTS_LIB) $(LIBSAIS_OBJS) test/meth_restore_order_test.o
+	$(CXX) $(CXXFLAGS) $(CPPFLAGS) $(LDFLAGS) test/meth_restore_order_test.o $(BWA_LIB) $(LIBSAIS_OBJS) $(LIBS) -o $@
+
+test/meth_restore_order_test.o: test/meth_restore_order_test.cpp
+	$(CXX) -c $(CXXFLAGS) $(CALLOC_INTERPOSE_CXXFLAGS) $(CPPFLAGS) $(INCLUDES) $(DEPFLAGS) $< -o $@
+
 # Compile+link smoke test for the fmi_seed_api.h facade: proves the header's
 # extern "C" section and every declared symbol actually resolve against
 # libbwa.a, standing in for the external (e.g. minibwa) consumer build. Not
@@ -1485,6 +1492,8 @@ test: test-binaries $(STANDALONE_TESTS_IN_TEST_TARGET) kvec_alloc_fail_test klib
 	BWA_MEM3=./bwa-mem3 ./test/regression/version_banner.sh
 	BWA_MEM3="$(CURDIR)/bwa-mem3" ./test/regression/meth_index_output.sh
 	BWA_MEM3="$(CURDIR)/bwa-mem3" ./test/regression/index_budget_preflight.sh
+	BWA_MEM3="$(CURDIR)/bwa-mem3" ./test/regression/index_overwrite.sh
+	BWA_MEM3="$(CURDIR)/bwa-mem3" ./test/regression/index_set_consistency.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/meth_rescue_batched_identical.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/repeat_chain_extension_window.sh
 	BWA_MEM3=./bwa-mem3 ./test/regression/thp_check_smoke.sh

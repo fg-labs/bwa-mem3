@@ -30,8 +30,15 @@ extern "C" {
 int emit_0123(const PackedText& pac, const char* prefix, int num_threads)
 {
     std::string out = std::string(prefix) + ".0123";
+    // Remove any existing entry, then create exclusively: a symlink or hard link
+    // planted at this path after the output preflight cannot redirect the write
+    // (O_TRUNC would truncate the linked file, possibly the input FASTA).
+    // unlink() drops only the directory entry, never the file a link names.
+    if (unlink(out.c_str()) != 0 && errno != ENOENT) {
+        err_fatal(__func__, "failed to remove '%s': %s", out.c_str(), strerror(errno));
+    }
     // Write-only: fd is never read on the success path.
-    int fd = open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    int fd = open(out.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) {
         err_fatal(__func__, "failed to open '%s': %s", out.c_str(), strerror(errno));
     }

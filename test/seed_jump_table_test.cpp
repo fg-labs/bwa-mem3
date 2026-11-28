@@ -1241,6 +1241,52 @@ static int fixture_workload(const char *prefix, bool portable_checks)
             report(at->shm_base != NULL && at->seed_jump == NULL && at->seed_jump_depth == 0,
                    "load_index(build_seed_jump=false) (shm attach): no table");
             delete at;
+            /* Corrupt only the staged metadata, keeping PAC's rounded size valid,
+             * so a real attach reaches the new cross-section length check. */
+            const int segment_fd = owned.descriptor(std::string(private_index) + first_name);
+            struct stat segment_stat;
+            const bool sized = segment_fd >= 0 && fstat(segment_fd, &segment_stat) == 0;
+            report(sized, "inconsistent attach: owned staged descriptor is readable");
+            if (sized) {
+                void *view = mmap(NULL, (size_t)segment_stat.st_size, PROT_READ | PROT_WRITE,
+                                  MAP_SHARED, segment_fd, 0);
+                report(view != MAP_FAILED, "inconsistent attach: staged metadata mapped");
+                if (view != MAP_FAILED) {
+                    uint64_t off = 0, size = 0;
+                    const bool found = bwa_shm_section_find((uint8_t *)view, BWA_SHM_SEC_BNS_STRUCT,
+                                                           &off, &size) == 0 && size == sizeof(bntseq_t);
+                    report(found, "inconsistent attach: staged BNS section found");
+                    if (found) {
+                        bntseq_t *bns = (bntseq_t *)((uint8_t *)view + off);
+                        const int64_t saved_length = bns->l_pac;
+                        bns->l_pac += (saved_length & 3) == 3 ? -1 : 1;
+                        fflush(NULL);
+                        bwa_tests::StderrCapture capture;
+                        const pid_t child = fork();
+                        if (child == 0) {
+#if defined(PRIVATE_STAGE_ASAN)
+                            on_exit(stage_child_exit, NULL);
+#endif
+                            FMI_search bad(staged_prefix);
+                            bad.load_index(false, 1, false);
+                            _exit(0);
+                        }
+                        int status = 0;
+                        pid_t ended = -1;
+                        if (child > 0) do { ended = waitpid(child, &status, 0); }
+                        while (ended < 0 && errno == EINTR);
+                        const std::string diagnostic = capture.text();
+                        bns->l_pac = saved_length;
+                        report(ended == child && child > 0 && WIFEXITED(status) &&
+                                   WEXITSTATUS(status) == EXIT_FAILURE &&
+                                   diagnostic.find("index staged in shared memory") != std::string::npos &&
+                                   diagnostic.find("shm -d") != std::string::npos,
+                               "inconsistent attached metadata exits with restage advice");
+                    }
+                    report(munmap(view, (size_t)segment_stat.st_size) == 0,
+                           "inconsistent attach: writable view unmapped");
+                }
+            }
             /* A caller bound to the compact layout does not attach a default
              * segment: it loads its own copy from disk. */
             at = new FMI_search(staged_prefix);
@@ -1334,7 +1380,8 @@ static void check_invalid_full_workload()
     for (bool corrupt : {false, true}) {
         bwa_tests::TempDir input("invalid_full");
         // A valid first scalar followed by a truncated file reaches a different
-        // fatal read than the missing-file exit, without constructing an index.
+        // fatal exit than the missing file, without constructing an index: the
+        // loader's size check refuses a file shorter than its header fixes.
         if (corrupt) {
             const int64_t length = 101;
             input.write("broken.bwt.2bit.64", std::string(reinterpret_cast<const char *>(&length), sizeof length));
@@ -1359,7 +1406,7 @@ static void check_invalid_full_workload()
         }
         const int rc = child > 0 ? wait_status(child) : -1;
         const std::string diagnostic = capture.text();
-        report(rc > 0 && diagnostic.find(corrupt ? "Unexpected end of file" : "Unable to open the file") != std::string::npos
+        report(rc > 0 && diagnostic.find(corrupt ? "has an invalid size, header or SA-rate tag" : "Unable to open the file") != std::string::npos
                    && diagnostic.find("[INFO] private namespace reserved") == std::string::npos
                    && shm_name_exists(ctl.c_str()) && lock_exists(lock) && shm_name_exists(segment.c_str()),
                corrupt ? "corrupt full input exits with its diagnostic before reserving the main namespace" :

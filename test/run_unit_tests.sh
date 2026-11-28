@@ -58,7 +58,7 @@ if [[ ! -s "$FIXTURES/phix.fa.bwt.2bit.64" ||
     ! -s "$FIXTURES/phix.fa.amb" ||
     ! -s "$FIXTURES/phix.fa.ann" ||
     ! -s "$FIXTURES/phix.fa.pac" ]]; then
-    "$BWAMEM3" index "$FIXTURES/phix.fa" > /dev/null 2>&1 || fail "bwa-mem3 index on phix.fa failed"
+    "$BWAMEM3" index --force "$FIXTURES/phix.fa" > /dev/null 2>&1 || fail "bwa-mem3 index on phix.fa failed"
 fi
 
 # --- fmi_test --------------------------------------------------------------
@@ -520,7 +520,7 @@ done
 SYN="$FIXTURES/synthetic_1mb.fa"
 if [[ ! -s "$SYN.bwt.2bit.64" || ! -s "$SYN.amb" ||
     ! -s "$SYN.ann" || ! -s "$SYN.pac" ]]; then
-    "$BWAMEM3" index "$SYN" > /dev/null 2>&1 || fail "bwa-mem3 index on synthetic_1mb.fa failed"
+    "$BWAMEM3" index --force "$SYN" > /dev/null 2>&1 || fail "bwa-mem3 index on synthetic_1mb.fa failed"
 fi
 # Slice a 40 kb read (> 32767) from the middle of the reference so it maps
 # back cleanly. Derived at run time rather than committed as a fixture.
@@ -636,6 +636,10 @@ ok "libsais_memory_budget_test"
 # here too so the Linux ARM64 row covers it, not only canonical-regressions.
 BWA_MEM3="$BWAMEM3" "$HERE/regression/index_budget_preflight.sh" || fail "index_budget_preflight failed"
 ok "index_budget_preflight"
+
+# Ordinary indexing requires explicit consent before replacing existing outputs.
+BWA_MEM3="$BWAMEM3" "$HERE/regression/index_overwrite.sh" || fail "index_overwrite failed"
+ok "index_overwrite"
 
 # --- shm_section_find_test (unit: section-find helper) -----------------------
 echo "==> shm_section_find_test"

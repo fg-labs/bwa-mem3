@@ -121,6 +121,10 @@ extern "C" {
 
 	void bns_dump(const bntseq_t *bns, const char *prefix);
 	bntseq_t *bns_restore(const char *prefix);
+    /* Same metadata, ALT handling and open .pac as bns_restore, but no
+     * reference-length-scaled position table. Validate file/header consistency
+     * before calling bns_build_pos2rid if the consumer needs that table. */
+    bntseq_t *bns_restore_metadata(const char *prefix);
 	/* Build the .pac path bns_restore opens for `prefix` ("<prefix>.pac") into
 	 * `out` (sized `outsz`, e.g. PATH_MAX); aborts if it would not fit. */
 	void bns_pac_path(char *out, size_t outsz, const char *prefix);
@@ -128,6 +132,18 @@ extern "C" {
 	 * ("<prefix>.alt"); `mem --alt-project` reads the alignments from it too. */
 	void bns_alt_path(char *out, size_t outsz, const char *prefix);
 	bntseq_t *bns_restore_core(const char *ann_filename, const char* amb_filename, const char* pac_filename);
+    /* Read only the .ann header, without allocating contig records or opening
+     * .pac. Returns 1 on success, 0 with a diagnostic for malformed/unreadable headers. */
+    int bns_read_ann_header(const char *path, int64_t *l_pac, int32_t *n_seqs, uint32_t *seed);
+    /* Check the open .pac's exact size and trailing l_pac%4 byte against .ann.
+     * Does not move its file offset. Returns 1, or 0 with a repair diagnostic. */
+    int bns_pac_fp_size_ok(const char *func, const char *pac_path, FILE *fp_pac, int64_t l_pac);
+	/* --meth: NULL when `seed` metadata is compatible with the layout `index --meth`
+	 * writes for `orig` (the <prefix> index): contigs r<name>, f<name> for each original contig, in
+	 * order, each the original's length, which is the layout meth_seed_to_orig maps seeds through.
+	 * Otherwise a short static description of the first difference. Names and lengths are metadata checks, not content provenance: a same-length
+	 * sequence substitution may pass. */
+	const char *bns_meth_seed_mismatch(const bntseq_t *seed, const bntseq_t *orig);
 	void bns_destroy(bntseq_t *bns);
 	int64_t bns_fasta2bntseq(gzFile fp_fa, const char *prefix, int for_only);
 	int bns_pos2rid(const bntseq_t *bns, int64_t pos_f);

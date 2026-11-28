@@ -64,7 +64,7 @@ minimal='output dir/minimal'
 reject --meth-only "$src"
 grep -q -- '--meth' reject.log || fail 'missing --meth guidance'
 reject --keep-meth-fasta "$src"
-reject --force "$src"
+index --force -p force-plain "$src"
 # Fixed writer temporary names are unrelated inputs, never output artifacts.
 for stem in temp-original temp-seed; do
     suffix=bwt.2bit.64.tmp

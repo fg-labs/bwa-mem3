@@ -610,3 +610,7 @@ above).
 [CLI Reference — mem](mem.md) ·
 [Best Practices — Multi-sample workflows](../best-practices/multi-sample.md) ·
 [Best Practices — Anti-patterns](../best-practices/anti-patterns.md)
+
+## Structural validation before staging
+
+Staging checks FM-index lengths and sizes against the reference metadata, validates any trailing SA-rate tag, and checks the packed reference's size and length remainder when it is included. `shm --meth` additionally checks seed/original contig metadata. This is not a sequence-content check and cannot detect all same-length mixed sets. A rejected set stages nothing: recopy the complete files or rebuild from the original FASTA with `index --force` (add `--meth` for methylation), dropping any old staged copy with `shm -d` first. Existing bwa-mem2 indexes remain usable without conversion.

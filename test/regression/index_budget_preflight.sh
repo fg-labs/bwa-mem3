@@ -90,7 +90,7 @@ before_listing="$(cd "$tmp/idx" && ls -A)"
 
 # --- 1: rejected rebuild leaves the existing index untouched ---------------
 rc=0
-"$bin" index --max-memory 1M -p "$prefix" "$tmp/b.fa" > /dev/null 2> "$tmp/reject.err" || rc=$?
+"$bin" index --max-memory 1M -p "$prefix" --force "$tmp/b.fa" > /dev/null 2> "$tmp/reject.err" || rc=$?
 [[ $rc -eq 3 ]] || fail "$tmp/reject.err" "over-budget rebuild exited $rc, expected 3"
 grep -q 'ERROR: libsais needs ~.* to index a .* reference; --max-memory is 1.0 MiB' "$tmp/reject.err" \
     || fail "$tmp/reject.err" "over-budget rebuild did not print the budget shortfall"
@@ -123,7 +123,7 @@ echo "PASS: over-budget fresh build rejected (exit 3), nothing written"
 # --- 3: empty reference leaves the existing index untouched -----------------
 : > "$tmp/none.fa"
 rc=0
-"$bin" index --max-memory 64M -p "$prefix" "$tmp/none.fa" > /dev/null 2> "$tmp/none.err" || rc=$?
+"$bin" index --max-memory 64M -p "$prefix" --force "$tmp/none.fa" > /dev/null 2> "$tmp/none.err" || rc=$?
 [[ $rc -eq 1 ]] || fail "$tmp/none.err" "empty-reference rebuild exited $rc, expected 1"
 grep -q "malformed reference" "$tmp/none.err" \
     || fail "$tmp/none.err" "empty-reference rebuild did not report the empty reference"
@@ -136,7 +136,7 @@ done
 echo "PASS: empty-reference rebuild rejected (exit 1), existing index byte-identical"
 
 # --- 4: within-budget rebuild still replaces the index ----------------------
-"$bin" index --max-memory 64M -p "$prefix" "$tmp/b.fa" > /dev/null 2> "$tmp/rebuild.err" \
+"$bin" index --max-memory 64M -p "$prefix" --force "$tmp/b.fa" > /dev/null 2> "$tmp/rebuild.err" \
     || fail "$tmp/rebuild.err" "within-budget rebuild of reference B failed"
 "$bin" index --max-memory 64M -p "$tmp/fresh" "$tmp/b.fa" > /dev/null 2> "$tmp/fresh.err" \
     || fail "$tmp/fresh.err" "fresh build of reference B failed"

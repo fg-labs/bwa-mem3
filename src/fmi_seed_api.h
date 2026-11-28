@@ -124,7 +124,9 @@ extern "C" {
 /* new FMI_search + load_index(load_pac=false, no seed jump table), in the
  * default checkpoint layout whatever the environment says: BWA3_COMPACT_OCC,
  * which selects `mem`'s layout, is ignored here, so fmi_seed_cp_occ() is never
- * NULL on a handle from this call. */
+ * NULL on a handle from this call. Missing, malformed or structurally inconsistent
+ * index files terminate the process with a diagnostic, as the underlying loader does;
+ * these failures are not reported as NULL. */
 FmiSeed       *fmi_seed_open(const char *prefix);
 /* fmi_seed_open in the layout the caller names (FMI_SEED_LAYOUT_*); NULL for
  * any other value. The environment is ignored here too.

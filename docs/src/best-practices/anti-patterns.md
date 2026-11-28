@@ -15,9 +15,9 @@ unnecessary failures when using bwa-mem3.
 > Always run `bwa-mem3 shm -d` before re-indexing:
 >
 > ```bash
-> bwa-mem3 shm -d           # drop all staged segments
-> bwa-mem3 index ref.fa     # rebuild the on-disk index
-> bwa-mem3 shm ref.fa       # re-stage the new index
+> bwa-mem3 shm -d &&
+>   bwa-mem3 index --force ref.fa &&
+>   bwa-mem3 shm ref.fa
 > ```
 >
 > There is no automatic staleness check in the implementation. The segment name
