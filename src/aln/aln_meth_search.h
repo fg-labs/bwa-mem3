@@ -121,10 +121,18 @@ struct aln_meth_locus_key_t {
     }
     uint64_t hash() const { return aln_flat_mix((uint64_t)rb ^ ((uint64_t)(hyp * 2 + strand) << 60) ^ (uint64_t)rid << 40); }
 };
+// --meth-mapq conversion-blind: a mirror table entry's key, a locus and (under the stock cuts) the
+// row's mirror-free differences, else 0
+struct aln_meth_mirror_key_t {
+    aln_meth_locus_key_t locus; int diffs;
+    bool operator==(const aln_meth_mirror_key_t &o) const { return locus == o.locus && diffs == o.diffs; }
+    uint64_t hash() const { return aln_flat_mix(locus.hash() ^ (uint64_t)(uint32_t)diffs); }
+};
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
-// aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not)
-enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2 };
+// aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not); TOP2 is
+// stock's -R stop under the cut (aln_meth_boundary)
+enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2, ALN_METH_STOP_TOP2 = 3 };
 struct aln_meth_slot_t {
     aln_meth_group_t *grp = nullptr;
     gap_job_t *job = nullptr;
@@ -135,6 +143,20 @@ struct aln_meth_slot_t {
     // max_diff: the read's -n limit (bwa_cal_maxdiff on its length for a fractional -n), set by
     // aln_meth_slot_start; a refined window with more differences is dropped (resolve_one).
     int len = 0, keep = 0, final_flush = 0, stop = 0, flushed_score = -1, max_diff = INT_MAX;
+    // cut: the search takes stock aln's cuts from the verified best (aln_meth_boundary): set unless
+    // -N, a negative penalty or --known-snvs. best: the lowest cost of a stored row. flushed: a
+    // flush has run. blind: --meth-mapq conversion-blind, which only observes the search: the
+    // search, its cuts and its limits are those of --meth-mapq scoring (aln_meth_boundary).
+    // need_next: the score at which the cuts first applied (the best stratum complete), -1 before;
+    // top2_next: the same for a mirror-free run (its best stratum complete), whose -R stop
+    // blind_note_top2 checks there; blind_need: the mirror-free strata could miss a row the cuts
+    // prune (blind_note_need), so they are not known. mf_best: the lowest mirror-free cost of a row
+    // in the mirror table (store_mirror_row); the mirror-free best so far is the lower of it and
+    // best. mf_stop: a mirror-free run stopped on -R where this search goes on, and mf_occ and
+    // mf_mirror hold the rows it had resolved there (res->occ and res->mirror_rows then), from
+    // which meth_blind_strata takes the strata; the mirror table is not kept past that point.
+    int cut = 0, flushed = 0, blind = 0, need_next = -1, top2_next = -1, blind_need = 0, mf_stop = 0;
+    int64_t best = INT64_MAX, mf_best = INT64_MAX;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     // Gap lists of the search's paths with more than one gap, ALN_METH_MAX_GAPS words each (see
@@ -151,9 +173,9 @@ struct aln_meth_slot_t {
     // Exact windows dedup before DP; every distinct span is evaluated before locus collapse.
     aln_flat_index_t<aln_meth_win_key_t> windows;
     aln_flat_index_t<aln_meth_locus_key_t> loci; // value: the locus's index in res->occ
-    // --meth-mapq conversion-blind: the mirror table's loci (value: the index in res->mirror_rows)
+    // --meth-mapq conversion-blind: the mirror table's keys (value: the index in res->mirror_rows)
     // and its CIGAR bytes, under a budget of its own (store_mirror_row). Cleared per read.
-    aln_flat_index_t<aln_meth_locus_key_t> mirror_loci;
+    aln_flat_index_t<aln_meth_mirror_key_t> mirror_loci;
     uint64_t mirror_bytes = 0;
     // The read's two query orientations as bit planes (rd_fwd, then p->rseq), built on first use.
     aln_meth_read_bits_t bits[2];
@@ -165,6 +187,9 @@ struct aln_meth_slot_t {
     // the ambiguity bits of a row's window (score_path).
     std::vector<uint8_t> win;
     std::vector<uint64_t> amb;
+    // --meth-mapq conversion-blind: the rows a mirror-free run had resolved where it stopped on -R
+    // and this search went on (mf_stop). Cleared per read.
+    std::vector<aln_meth_occ_t> mf_occ, mf_mirror;
 };
 struct aln_meth_group_t {
     const bwt_t *bwt = nullptr;
@@ -187,9 +212,20 @@ static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
          (x->alt_bound.valid && x->len > 0 && x->len <= KS_WINDOW_HALF));
 }
 bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
-// Keep batches bounded, but only refine score boundaries when stopping is possible.
+// Applies stock aln's cuts at a score boundary, for a search whose next entry has score next:
+// see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop).
+int aln_meth_boundary(aln_meth_slot_t *, int next);
+// Keep batches bounded. Under the cut, flush at the first hit and at every boundary; otherwise
+// refine score boundaries only when stopping is possible.
 static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
     if (x->pend.size() >= 32) return 1;
+    if (x->cut) { // flush at the first hit and at every score boundary; cut at boundaries
+        if (!x->pend.empty()) return !x->flushed || score > x->flushed_score;
+        if (score <= x->flushed_score) return 0;
+        x->flushed_score = score;
+        return (x->best != INT64_MAX || x->mf_best != INT64_MAX) && aln_meth_boundary(x, score)
+            && (x->stop = ALN_METH_STOP_TOP2);
+    }
     if (score <= x->flushed_score) return 0;
     if (aln_meth_stop_eligible(x)) return 1;
     // A skipped boundary replaces a flush/resume: do not re-examine this stratum.
@@ -218,6 +254,7 @@ static inline int aln_meth_resume(aln_meth_slot_t *x, gap_job_t *j, gap_entry_t 
     *e = j->e;
     const int score=(int)(e->info>>21);
     x->flushed_score=score;
+    if (x->cut) return (x->best != INT64_MAX || x->mf_best != INT64_MAX) && aln_meth_boundary(x, score);
     if (aln_meth_can_stop(x,score)) return 1;
     return 0;
 }

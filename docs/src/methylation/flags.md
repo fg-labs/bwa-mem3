@@ -193,7 +193,17 @@ comes out too high.
   ([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). A row that `-n` (or the
   seed's `-k`) dropped only for its mirror mismatches counts too, since with the mirror
   cell free it is within the limit, as under `collapsed`. If the rows kept for this
-  outgrow 64 MiB of CIGARs, the strata are unknown and the cap is 0. Placement, CIGAR, `NM`,
+  outgrow 64 MiB of CIGARs, the strata are unknown and the cap is 0. So are they when `aln`'s
+  stock search cuts may leave them different from a mirror-free run's while a row that could
+  still enter them (at most the mirror-free best plus `-M`) is unresolved: the search applies a
+  difference ceiling below the strata's own top-2 ceiling (the fewest mirror-free differences at
+  the mirror-free best, plus one, at most `-n`), or a `-R` stop ends the search but not a
+  mirror-free run ([#785](https://github.com/fg-labs/bwa-mem3/pull/785)). Once the next score the search would
+  expand is past the mirror-free best plus `-M`, no such row is left. Where a mirror-free run's
+  `-R` stop ends it but the search goes on, the strata are taken from the rows the search had
+  scored at that stop, which are the mirror-free run's; if the search is then left incomplete
+  (lookup budget, `-m`), they are unknown. In a pair, an end with
+  unknown strata gives both ends a cap of 0. Placement, CIGAR, `NM`,
   `MD`, `XA`, the Bismark tags, pairing and mate rescue are unchanged, so the record
   is `genomic`'s in every field but MAPQ. A record whose MAPQ the cap lowered
   carries the uncapped MAPQ in `YQ:i`, whatever `--meth-tags` selects. The other
@@ -214,7 +224,8 @@ read's seed), at `collapsed`'s single-end MAPQ. The insert size is the one `coll
 infers from those single-end selections, batch by batch. An end placed where that
 pairing places it is capped at the MAPQ that pairing gives it, any other end at 0. An
 end with more than `--max-occ` mirror-free loci is not paired, as under `collapsed`:
-both ends stay at their `collapsed` single-end selections. An end the `genomic` search
+both ends stay at their `collapsed` single-end selections. That pairing runs even where an
+end's `genomic` loci exceed `--max-occ` and `genomic` pairing does not run. An end the `genomic` search
 leaves unmapped, but whose rows `-n` (or `-k`) dropped only for their mirror mismatches, is
 placed as `collapsed` places it, so its mate is still capped by that pairing. Where
 `collapsed` then leaves the pair improper, its mate rescue is rerun too, with `collapsed`'s
