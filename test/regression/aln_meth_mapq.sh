@@ -24,11 +24,13 @@
 # read) are not; only MAPQ and YQ:i differ between the modes; under -n 1 (or a seed's -k 0) a copy
 # over the limit only by its mirror mismatches still caps, as collapsed keeps it;
 # a locus with several rows enters the cap, single and paired end, at its cheapest row with the
-# mirror cell free; the default for collapsed, neutral, TAPS and 5-base is scoring, and collapsed accepts conversion-blind as a no-op; paired end: a pair
-# whose MAPQ read 1's retained Cs raised is capped at the mirror-free pairing's MAPQ, a read 1 the
-# mirror-free pairing places at the other copy gets 0, a rescued mate takes its anchor's cap, a mate
+# mirror cell free; the default for collapsed, neutral, TAPS and 5-base is scoring, and collapsed accepts conversion-blind as a no-op; paired end: each
+# record's conversion-blind MAPQ is collapsed's, capped at the genomic one, where collapsed places
+# it, else 0 (including where collapsed starts an end at a tied mirror-free locus, and where the
+# genomic pairing places read 1 at a genomic tie past collapsed's mirror-free cut), a read 1 that
+# collapsed's pairing places at the other copy gets 0, a rescued mate takes its anchor's cap, a mate
 # that moves read 1 to the other copy anchors it (no cap) unless read 1's mirror-free loci exceed
-# --max-occ (then its cap is 0), and no MAPQ is ever raised; under --known-snvs and -n 2, a copy
+# --max-occ (then collapsed does not pair it, and its cap is 0), and no MAPQ is ever raised; under --known-snvs and -n 2, a copy
 # that only the ALT-window search reaches, over the limit only by its mirror mismatch, still caps,
 # single-end and through the mirror-free pairing; and the option's refusals.
 #
@@ -147,6 +149,24 @@ expect() {
         printf '%s\n' "$want" >&2
         echo "got" >&2
         cat "$file" >&2
+        exit 1
+    }
+}
+
+# The conversion-blind MAPQ observes collapsed's: each record (paired runs in the same order) has
+# the lower of the scoring and collapsed MAPQs where collapsed places it at the same position and
+# strand, else 0. Collapsed's own mate rescue is not rerun (a rescued mate takes its anchor's cap),
+# so a fixture where collapsed rescues a mate holds only if that rescue leaves these MAPQs. Reads
+# $tmp/<name>.{blind,scoring,collapsed}.sum.
+observer() {
+    local label=$1 name=$2
+    paste -d ' ' "$tmp/$name.blind.sum" "$tmp/$name.scoring.sum" "$tmp/$name.collapsed.sum" \
+        | awk '{
+            same = $3 == $15 && $4 == $16 && int($2 / 16) % 2 == int($14 / 16) % 2
+            want = !same ? 0 : $11 < $17 ? $11 : $17
+            if (int($2 / 4) % 2 == 0 && $5 != want) { bad = 1; print "  " $0 > "/dev/stderr" }
+        } END { exit bad }' || {
+        echo "FAIL: $label: a conversion-blind MAPQ is not collapsed's, capped at the genomic one" >&2
         exit 1
     }
 }
@@ -277,11 +297,12 @@ echo 'PASS: single-end-lowest-mirror-free-row'
 # Paired end, on a reference of its own (rowpe.fa): read 1 is 'tie' again, at contigs ta (one
 # deletion row of genomic 17 and mirror-free 14) and tb (a two-base deletion, 15), and read 2 comes
 # from after tb, so the genomic pairing (scoring and conversion-blind alike) places the pair at tb.
-# The shadow pairing must see ta at 14: then read 1 is not the only cheapest locus mirror-free, and
-# the pair's MAPQs drop from 60 to the shadow pairing's 36 and 37. At ta's genomic row (17) the
-# shadow is the real pairing and nothing is capped, as before this check. The shadow pairs the
-# genomic ends, so its MAPQs are not collapsed's here: collapsed starts read 1 at ta and pairs only
-# 11 of the 24 at tb (MAPQ 29).
+# The shadow pairing must see ta at 14, where collapsed starts read 1 (its only cheapest locus
+# mirror-free). Collapsed's insert size comes from those starts, all on another contig than read 2,
+# so it has none and pairs by -a 500: the 11 pairs within it move read 1 to tb (MAPQ 29 and 37), the
+# other 13 leave it at ta (MAPQ 23; read 2 37). So the conversion-blind MAPQs are 29 and 37, and 0
+# for read 1 of the 13. At ta's genomic row (17) the shadow is the real pairing and nothing is
+# capped.
 cat > "$tmp/rowpe.awk" << 'EOF'
 function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
 function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
@@ -310,21 +331,97 @@ awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/rowpe.awk" < /dev/null
 }
 run rowpe.scoring --meth --meth-mapq scoring -n 5 -l 1024 "$tmp/rowpe.fa" "$tmp/rowpe1.fq" "$tmp/rowpe2.fq"
 run rowpe.blind --meth -n 5 -l 1024 "$tmp/rowpe.fa" "$tmp/rowpe1.fq" "$tmp/rowpe2.fq"
+run rowpe.collapsed --meth --meth-scoring collapsed -n 5 -l 1024 "$tmp/rowpe.fa" "$tmp/rowpe1.fq" "$tmp/rowpe2.fq"
 # FLAG RNAME MAPQ YQ and how many of the 48 records have them
 tally() { awk '{ n[$2 " " $3 " " $5 " " $6]++ } END { for (k in n) print n[k], k }' "$1" | LC_ALL=C sort; }
 expect rowpe-scoring <(tally "$tmp/rowpe.scoring.sum") "24 147 tb 60 -
 24 99 tb 60 -"
-expect rowpe-conversion-blind <(tally "$tmp/rowpe.blind.sum") "24 147 tb 37 60
-24 99 tb 36 60"
+expect rowpe-collapsed <(tally "$tmp/rowpe.collapsed.sum") "11 147 tb 37 -
+11 99 tb 29 -
+13 145 tb 37 -
+13 97 ta 23 -"
+expect rowpe-conversion-blind <(tally "$tmp/rowpe.blind.sum") "11 99 tb 29 60
+13 99 tb 0 60
+24 147 tb 37 60"
+observer rowpe rowpe
 cmp <(strip "$tmp/rowpe.blind.rec") <(strip "$tmp/rowpe.scoring.rec") || {
     echo "FAIL: rowpe: modes differ outside MAPQ and YQ:i" >&2
     exit 1
 }
 echo 'PASS: paired-lowest-mirror-free-row'
 
-# A genomic hit past the mirror-free cut must not pair in the shadow. The two read-1 loci
-# tie genomically: cx has two mirror mismatches, ch two real mismatches. Only cx survives the
-# mirror-free cut, but the genomic mate places read 1 at ch, whose cap must therefore be 0.
+# Paired end, collapsed's starts (on a reference of its own, start.fa): pairing's MAPQ depends on
+# where the ends start, and collapsed starts each end at its own draw among the loci tied with the
+# mirror cell free. Each pair has a home contig (read 1's 40-base segment, read 2's 300 bases on)
+# and copies of a segment on contigs of their own: exact, or with a T under the C the read keeps
+# (one mismatch genomically, none mirror-free). Sixteen copies of each pair draw with sixteen seeds;
+# -A leaves out the insert-size estimate (and mate rescue).
+#   tie   read 2 has an exact and a mirror copy: where collapsed starts read 2 off home, pairing
+#         moves it there (29) and the genomic pair has 36
+#   low   read 2 has a mirror copy: likewise 29 where the genomic pair has 60
+#   both  each read has a mirror copy: where collapsed starts both off home both move (9), and the
+#         genomic pair has 46
+cat > "$tmp/start.awk" << 'EOF'
+function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
+function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
+function fq(file, name, s,   q) { q = s; gsub(/./, "I", q); printf "@%s\n%s\n+\n%s\n", name, s, q > file }
+function ga(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "G" ? "A" : c) } return out }
+function ct(s,   i, c, out) { out = ""; for (i = 1; i <= length(s); i++) { c = substr(s, i, 1); out = out (c == "C" ? "T" : c) } return out }
+# a contig of its own holding seg between two random flanks
+function copy(name, seg) { printf ">%s\n%s\n", name, dna(100) seg dna(100) > (dir "/start.fa") }
+# pair name: its home contig, and an exact copy of read 2's segment (dup2), a mirror copy of read
+# 1's (mir1) and one of read 2's (mir2); read 1 keeps the C at offset 12, read 2 the one at 20
+function pair(name, dup2, mir1, mir2,   s1, s2, a, b, k) {
+    s1 = put(dna(40), 12, "C")
+    s2 = put(dna(40), 20, "C")
+    printf ">%s\n%s\n", name, dna(100) s1 dna(260) s2 dna(100) > (dir "/start.fa")
+    if (dup2) copy(name "_dup2", s2)
+    if (mir1) copy(name "_mir1", put(s1, 12, "T"))
+    if (mir2) copy(name "_mir2", put(s2, 20, "T"))
+    a = put(ct(s1), 12, "C")
+    b = put(ga(rc(s2)), 19, "G")
+    for (k = 0; k < 16; ++k) {
+        fq(dir "/start1.fq", name k, a)
+        fq(dir "/start2.fq", name k, b)
+    }
+}
+BEGIN {
+    seed_rng(20261124)
+    pair("tie", 1, 0, 1)
+    pair("low", 0, 0, 1)
+    pair("both", 0, 1, 1)
+}
+EOF
+awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/start.awk" < /dev/null
+"$bin" index --meth "$tmp/start.fa" > "$tmp/start-index.out" 2> "$tmp/start-index.err" || {
+    echo "FAIL: index --meth (start.fa) exited nonzero" >&2
+    cat "$tmp/start-index.err" >&2
+    exit 1
+}
+run start.scoring --meth --meth-mapq scoring -A "$tmp/start.fa" "$tmp/start1.fq" "$tmp/start2.fq"
+run start.blind --meth -A "$tmp/start.fa" "$tmp/start1.fq" "$tmp/start2.fq"
+run start.collapsed --meth --meth-scoring collapsed -A "$tmp/start.fa" "$tmp/start1.fq" "$tmp/start2.fq"
+cmp <(strip "$tmp/start.blind.rec") <(strip "$tmp/start.scoring.rec") || {
+    echo "FAIL: start: modes differ outside MAPQ and YQ:i" >&2
+    exit 1
+}
+observer start start
+# each pair (its name less the copy number) with the genomic and conversion-blind MAPQs of a record
+shapes() { paste -d ' ' "$tmp/start.scoring.sum" "$tmp/start.blind.sum" | awk '{ sub(/[0-9]+$/, "", $1); print $1, $5, $11 }' | LC_ALL=C sort -u; }
+for want in 'tie 36 29' 'low 60 29' 'both 46 9'; do
+    shapes | grep -qx "$want" || {
+        echo "FAIL: start: no record with (pair, genomic, conversion-blind) MAPQs $want" >&2
+        shapes >&2
+        exit 1
+    }
+done
+echo 'PASS: paired-collapsed-starts'
+
+# Paired end, a genomic hit past the mirror-free cut (cut.fa): read 1 keeps two Cs; contig cx has a
+# T under both (two mismatches genomically, none mirror-free) and contig ch two real mismatches, so
+# the two tie genomically, but with the mirror cell free ch is past cx + 3 and is not one of
+# collapsed's loci. Read 2 comes from after ch: the genomic pairing places read 1 there (MAPQ 29),
+# collapsed cannot (it leaves read 1 at cx), so read 1's cap is 0.
 cat > "$tmp/cut.awk" << 'EOF'
 function dna(n,   s, i) { s = ""; for (i = 0; i < n; i++) s = s substr("ACGT", ri(4) + 1, 1); return s }
 function put(s, i, c) { return substr(s, 1, i) c substr(s, i + 2) }
@@ -355,16 +452,20 @@ awk -v dir="$tmp" -f "$here/aln_rng.awk" -f "$tmp/cut.awk" < /dev/null
 }
 run cut.scoring --meth --meth-mapq scoring "$tmp/cut.fa" "$tmp/cut1.fq" "$tmp/cut2.fq"
 run cut.blind --meth "$tmp/cut.fa" "$tmp/cut1.fq" "$tmp/cut2.fq"
+run cut.collapsed --meth --meth-scoring collapsed "$tmp/cut.fa" "$tmp/cut1.fq" "$tmp/cut2.fq"
 cmp <(strip "$tmp/cut.blind.rec") <(strip "$tmp/cut.scoring.rec") || {
     echo "FAIL: cut: modes differ outside MAPQ and YQ:i" >&2
     exit 1
 }
-awk '$2 % 256 >= 64 && $2 % 256 < 128 && $3 == "ch" && $5 > 0 { n++ } END { exit n == 0 }' "$tmp/cut.scoring.sum" || {
-    echo "FAIL: fixture: no genomic read 1 at ch with nonzero MAPQ" >&2
+observer cut cut
+# read 1 records the genomic pairing places at ch with a nonzero MAPQ, and their conversion-blind MAPQs
+past=$(awk '$2 % 256 >= 64 && $2 % 256 < 128 && $3 == "ch" && $5 > 0 { print $1 }' "$tmp/cut.scoring.sum")
+[ -n "$past" ] || {
+    echo "FAIL: fixture: the genomic pairing places no read 1 at ch with a nonzero MAPQ" >&2
     exit 1
 }
 awk '$2 % 256 >= 64 && $2 % 256 < 128 && $3 == "ch" && $5 != 0 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' "$tmp/cut.blind.sum" || {
-    echo "FAIL: cut: read 1 past the mirror-free cut is not capped at 0" >&2
+    echo "FAIL: cut: a read 1 at ch, past collapsed's cut, is not capped at 0" >&2
     exit 1
 }
 echo 'PASS: paired-past-mirror-free-cut'
@@ -404,11 +505,16 @@ paste -d ' ' "$tmp/pe.blind.sum" "$tmp/pe.scoring.sum" | awk '$5 > $11 { bad = 1
 }
 echo 'PASS: paired-only-lowers'
 
-# m600: both copies pair with read 2; the mirror-free pairing still keeps read 1 at copy A but
-# with the pair's one-end-unique MAPQ, and read 2 keeps its own.
-expect paired-near <(pick "$tmp/pe.blind.sum" m600) "m600 99 ab 401 10 60
-m600 147 ab 601 37 60"
-# m880: the mirror-free pairing places read 1 at copy B (as collapsed does), so its cap is 0.
+observer paired pe
+# m660: both copies pair with read 2; collapsed draws read 1 at copy A and pairs it there, with the
+# MAPQ of a pair with a close suboptimal pair, and read 2 keeps its own.
+expect paired-near <(pick "$tmp/pe.blind.sum" m660) "m660 99 ab 401 7 60
+m660 147 ab 661 37 60"
+[ "$(pick "$tmp/pe.collapsed.sum" m660 | awk '$2 == 99 { print $4 }')" = 401 ] || {
+    echo "FAIL: fixture: collapsed does not place m660's read 1 at copy A" >&2
+    exit 1
+}
+# m880: collapsed's pairing places read 1 at copy B, so its cap is 0.
 expect paired-elsewhere <(pick "$tmp/pe.blind.sum" m880) "m880 99 ab 401 0 60
 m880 147 ab 881 37 60"
 [ "$(pick "$tmp/pe.collapsed.sum" m880 | awk '$2 == 99 { print $4 }')" = 541 ] || {
@@ -438,8 +544,8 @@ anchor 147 ef 1181 37 -"
 echo 'PASS: paired-mate-anchors'
 
 # The same move with read 1's three mirror-free loci over --max-occ 2 (its two stock loci are not):
-# the pairing still moves read 1 to copy Z, but a mirror-free run would not pair it and would leave
-# it at copy A, so its cap is 0. Under the default --max-occ the shadow pairing anchors it too.
+# the pairing still moves read 1 to copy Z, but collapsed would not pair it and would leave it at its
+# single-end draw, so its cap is 0. Under the default --max-occ collapsed's pairing anchors it too.
 run o.blind --meth "$tmp/ref.fa" "$tmp/o1.fq" "$tmp/o2.fq"
 expect maxocc-default "$tmp/o.blind.sum" "maxocc 99 ayz 1281 29 -
 maxocc 147 ayz 1581 37 -"

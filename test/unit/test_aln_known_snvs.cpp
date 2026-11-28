@@ -2438,6 +2438,7 @@ TEST_CASE("aln_known_snvs: ALT windows forward their lowest mirror-free path eve
                     std::vector<uint32_t>{18u << 4, 1u << 4 | 2, 32u << 4};
             });
             REQUIRE(d2 != extra.end());
+            std::vector<ba::aln_meth_candidate_t> only_d2{*d2};
             // Exercise the main-search candidate boundary without a genomic FM search that could
             // independently rediscover the missing path and hide a forwarding regression.
             const int64_t bp = mr.bns->anns[1].offset + 100;
@@ -2463,6 +2464,23 @@ TEST_CASE("aln_known_snvs: ALT windows forward their lowest mirror-free path eve
             } else {
                 CHECK(result.hits.size() == 1); // a blind-only row never becomes a genomic locus
                 REQUIRE(result.blind_rows.size() == 1); CHECK(result.blind_rows[0].cost == 14);
+                // Without B, the main search has no genomic hit, but D2 must still select an
+                // end for its mate's collapsed shadow pairing. Windows must retain D2's path
+                // until this boundary; only here may the mirror table be consumed.
+                ba::aln_meth_read_t unmapped;
+                ba::aln_meth_slot_start(&slot, reads, &unmapped, 0, limit, 0);
+                slot.extra = &only_d2;
+                ba::aln_meth_slot_finish(&slot);
+                CHECK(unmapped.main == -1); CHECK(unmapped.hits.empty());
+                CHECK(unmapped.c1 == 0); CHECK(unmapped.c2 == 0);
+                CHECK(unmapped.flags == 0); CHECK(unmapped.blind_partial == 0);
+                CHECK(unmapped.mirror_rows.empty());
+                CHECK(unmapped.blind_best == 14);
+                CHECK(unmapped.blind_c1 == 1); CHECK(unmapped.blind_c2 == 0);
+                CHECK(unmapped.blind_main == 0);
+                REQUIRE(unmapped.blind_rows.size() == 1);
+                CHECK(unmapped.blind_rows[0].pos == 100);
+                CHECK(unmapped.blind_rows[0].cost == 14);
             }
         }
     }

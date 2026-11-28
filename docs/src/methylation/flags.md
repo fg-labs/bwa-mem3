@@ -211,21 +211,27 @@ comes out too high.
   what places a short read. Under `collapsed`, which already frees the mirror cell,
   the two values are the same.
 
-In `aln` paired-end output, complete mapped ends have a shadow pairing over only the
-mirror-free strata: loci within the mirror-free best cost plus `-M`, or all retained
-loci under `-N`, including loci only those strata keep. Its `--max-occ` gate uses the
-mirror-free counts independently of the genomic pairing's counts
-([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). Each end starts at its `genomic`
-single-end selection with its MAPQ clamped to its single-end cap, and the shadow uses
-the batch's `genomic` insert-size estimate, not a separate collapsed estimate or draw.
-An end placed where the shadow places it is capped at the MAPQ the shadow gives it,
-any other end at 0. If either end's mirror-free strata are unknown (a partial mirror
-table), both caps are 0. Otherwise, if its mirror-free counts do not fit `--max-occ`, each
-end keeps its single-end cap at its original placement, or gets 0 if genomic pairing moves
-it; and if the counts fit but a row the shadow admits has a mirror-free cost too large for
-the pairing's score field (20 bits), both caps are 0.
-A rescued mate takes its anchor's cap; rescue is not replayed by the shadow.
-`--known-snvs` twin MAPQs (`XV:Z`) are computed the same way as the record's.
+In `aln` paired-end output, the cap reruns the pairing `collapsed` makes. Each end's
+candidates are its mirror-free strata (each locus at its cheapest row with the mirror
+cell free, within best cost plus `-M` or without that cut under `-N`, including loci only
+those strata keep). Its `--max-occ` gate uses mirror-free counts independently of the
+genomic pairing's counts ([#821](https://github.com/fg-labs/bwa-mem3/pull/821)). Each end starts at
+the main hit `collapsed` draws among its mirror-free best loci (the same draw, with the
+read's seed), at `collapsed`'s single-end MAPQ. The insert size is the one `collapsed`
+infers from those single-end selections, batch by batch. An end placed where that
+pairing places it is capped at the MAPQ that pairing gives it, any other end at 0. If either
+end's mirror-free strata are unknown (a partial mirror table), both caps are 0. An
+end with more than `--max-occ` mirror-free loci is not paired, as under `collapsed`:
+both ends stay at their `collapsed` single-end selections. If the counts fit but a row the
+shadow admits has a mirror-free cost too large for the pairing's score field (20 bits), both
+caps are 0. An end the `genomic` search
+leaves unmapped, but whose rows `-n` (or `-k`) dropped only for their mirror mismatches, is
+placed as `collapsed` places it, so its mate is still capped by that pairing. A rescued mate
+takes its anchor's cap and, where `collapsed` pairs the ends properly, at most that pairing's
+MAPQ for the mate at the rescued position (0 elsewhere). `collapsed`'s own mate rescue and
+cap rescue are not rerun: where `collapsed` leaves a pair improper and rescues a mate, the
+cap can differ from `collapsed`'s MAPQ. `--known-snvs` twin MAPQs (`XV:Z`) are computed the
+same way as the record's.
 
 **Measured** on public NA12878 EM-seq (SRR10532145, 2×99 bp, 2 M pairs), read 1
 cut to 20–50 bp and aligned single-end with `aln` on an Apple M2 Max (12 cores; macOS, arm64, NEON

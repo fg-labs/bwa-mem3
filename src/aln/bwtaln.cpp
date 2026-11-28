@@ -807,8 +807,12 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 						x.cig == y.cig && x.blind == y.blind;
 				});
 		});
-	for (int i = 0; i < n_seqs; ++i)
-		if (has_copy[i] && (!keep_strata || res[i].flags)) aln_meth_trim(&res[i], max_xa_hits);
+	for (int i = 0; i < n_seqs; ++i) {
+		if (!has_copy[i]) continue;
+		if (!keep_strata || res[i].flags) aln_meth_trim(&res[i], max_xa_hits);
+		// --meth-mapq conversion-blind: the copies have drawn; the read keeps only its own pick
+		std::vector<aln_meth_blind_row_t>().swap(res[i].blind_ties);
+	}
 	aln_meth_report(read_no, n_seqs, res);
 	return n_dups;
 }
