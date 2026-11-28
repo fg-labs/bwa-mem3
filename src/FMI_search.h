@@ -227,6 +227,27 @@ class FMI_search: public indexEle
     static int64_t cp_occ_bytes_for(int64_t ref_seq_len);
     static int64_t sa_count_for(int64_t ref_seq_len, int64_t sa_compx);
 
+    /* The in-memory layout of the occurrence checkpoints, chosen before
+     * load_index() by the caller (main_mem: --compact-occ or BWA3_COMPACT_OCC;
+     * the constructor always starts in the default layout):
+     *   - default: the file's own 64-byte CP_OCC records, read as they are;
+     *   - compact: 32-byte CP_OCC_PLANES records converted at load (half the
+     *     memory: about 3 GB less on hg38), see fmi_seed_api.h.
+     * Alignment records are byte-identical in both for the same SA sampling
+     * (only @PG CL: differs, recording --compact-occ). Under --compat=bwa-mem2 a
+     * default run attached to a denser staged SA table can report other
+     * coordinates than a compact run reading the disk table: see
+     * docs/src/cli/mem.md, --compact-occ. The compact layout is never
+     * attached from shared memory (a staged segment holds the default layout):
+     * load_index() then loads a private copy from disk and says so.
+     * set_compact_occ() after an index is loaded is refused (exit). */
+    void set_compact_occ(bool on);
+    bool compact_occ() const { return cp_compact; }
+    /* main_mem's (and the tests') reading of BWA3_COMPACT_OCC: on for a value
+     * starting with '1'; a non-empty value starting with neither '0' nor '1' is
+     * reported once and ignored. The library never reads it on its own. */
+    static bool compact_occ_env();
+
     /* log2 of the bits per packed SA-sample high part for a BWT of ref_seq_len rows
      * (positions run up to ref_seq_len - 1): 1, 2, 4 or 8 bits -> 0..3. */
     static int sa_hi_log2_for(int64_t ref_seq_len) {
@@ -275,8 +296,12 @@ class FMI_search: public indexEle
                                char *why, size_t why_len);
 
     /* Read-only data accessors. Used by the round-trip test to byte-compare
-     * the packed segment payload against the in-memory loader's buffers. */
-    const void     *cp_occ_data()     const { return cp_occ; }
+     * the packed segment payload against the in-memory loader's buffers.
+     * cp_occ_data(): CP_OCC[] by default, CP_OCC_PLANES[] when compact. */
+    const void     *cp_occ_data()     const { return cp_compact ? (const void *)cp_planes : (const void *)cp_occ; }
+    /* Compact layout only: int64_t[4] per 2^cp_span_shift rows when the counts
+     * are span-relative (cp_wide), else NULL. */
+    const int64_t  *cp_count_base_data() const { return cp_compact && cp_wide ? &cp_base[0][0] : NULL; }
     const uint64_t *sa_hi_data()      const { return sa_hi; }
 
     const uint32_t *sa_ls_word_data() const { return sa_ls_word; }
@@ -341,7 +366,9 @@ class FMI_search: public indexEle
      * corrupt index), so a caller holding a segment can clean up.
      * n_threads: the per-destination-sample LF-walks are independent and write
      * disjoint slots, so the fill loop parallelizes with no locking; <=1 runs
-     * serially. get_sa_entry_compressed only reads shared index state. */
+     * serially. get_sa_entry_compressed only reads shared index state.
+     * cp_occ_src is the file's own checkpoint layout: this object is set to the
+     * default layout for the walk, whatever BWA3_COMPACT_OCC says. */
     bool densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
                          int64_t ref_seq_len, int64_t sentinel_idx,
                          const int8_t *src_ms, const uint32_t *src_ls,
@@ -555,7 +582,64 @@ private:
         inline const char *sa_hi_addr(int64_t i) const {
             return (const char *)&sa_hi[((uint64_t)i << sa_hi_log2) >> 6];
         }
+        /* The occurrence checkpoints, in one of two layouts (set_compact_occ):
+         * cp_occ holds the file's CP_OCC records (default; NULL when compact),
+         * cp_planes the CP_OCC_PLANES form (compact; NULL otherwise). */
+        bool cp_compact;
         CP_OCC *cp_occ;
+        CP_OCC_PLANES *cp_planes;
+        /* Compact layout only. cp_wide: some base occurs 2^32 times or more, so
+         * a 32-bit count cannot hold it. Then each record's counts are relative
+         * to the full counts at the first block of its 2^cp_span_shift-row span,
+         * cp_base[span] (cp_n_spans entries; cp_span_shift is 32 outside the
+         * tests). cp_base is read (and allocated) only when cp_wide; NULL
+         * otherwise. */
+        bool cp_wide;
+        int cp_span_shift;
+        int64_t cp_n_spans;
+        int64_t (*cp_base)[4];
+        /* Compact load only: the one row below reference_seq_len whose record
+         * sets no plane bit, checked against sentinel_index once it is read. */
+        int64_t cp_empty_row;
+        /* Compact layout: the rows of the sentinel's block after the sentinel,
+         * the only rows whose A count the planes over-count (the sentinel row
+         * reads as A), tested as (uint64_t)(row - cp_sent_after) < cp_sent_len.
+         * Set by set_cp_sentinel() wherever sentinel_index is. */
+        int64_t cp_sent_after;
+        uint64_t cp_sent_len;
+        void set_cp_sentinel() {
+            cp_sent_after = sentinel_index + 1;
+            cp_sent_len = (uint64_t)(((sentinel_index >> CP_SHIFT) + 1) * CP_BLOCK_SIZE - 1 - sentinel_index);
+        }
+
+        /* The compact layout's file-to-memory checkpoint transform (see
+         * CP_OCC_PLANES), used by load_index only. cp_is_wide: from the RAW
+         * (unadjusted) cumulative counts, whether some base occurs 2^32 times or
+         * more. */
+        static bool cp_is_wide(const int64_t raw_count[5]);
+        /* n file records at file offset rec0_off of `path` (open as shared_fd) ->
+         * dst, read and converted by up to nthreads workers, each on its own range
+         * and descriptor. base[span] holds the full counts of the span's first
+         * record (span = block >> (span_shift - CP_SHIFT)) and is read only when
+         * wide. False if a record is not one-hot: a row with two bases, or a row
+         * below ref_seq_len with none other than exactly one (the sentinel, whose
+         * row is stored in *empty_row), or a count that does not fit; or if the
+         * counts are not the running totals: the first record's are not zero,
+         * another's are not the previous record's plus its one-hot popcounts, or
+         * the last record's plus its popcounts are not the base totals that
+         * raw_count (the file's C[] array, before load_index's +1) gives. */
+        static bool cp_load_from_file(int shared_fd, const char *path, off_t rec0_off, int64_t n,
+                                      int64_t ref_seq_len, const int64_t raw_count[5], CP_OCC_PLANES *dst,
+                                      const int64_t (*base)[4], int span_shift, bool wide,
+                                      int nthreads, int64_t *empty_row);
+        /* Read the span bases (the file records at blocks span << (span_shift - CP_SHIFT))
+         * from the .bwt.2bit.64 at `fd` into a new int64_t[n_spans][4]. */
+        static int64_t (*cp_read_span_bases(int fd, const char *path, int64_t ref_seq_len,
+                                            int span_shift, int64_t *n_spans))[4];
+        /* Tests only: the span size (CP_SHIFT..32; 0 = the default, 32) and whether
+         * to rebase the counts even on a narrow reference, applied by the next
+         * compact load. */
+        static void set_cp_layout_for_test(int span_shift, bool force_wide);
 
         /* If non-NULL, cp_occ / sa_hi / sa_ls_word point into a shared
          * memory mapping owned by the shm segment rather than being
@@ -598,6 +682,7 @@ private:
         static inline void seed_jump_prefetch(const SeedJumpEntry *e);
         void build_seed_jump_table(int n_threads);
         void seed_jump_children(int L, int64_t first, int64_t n);
+        template <bool PL> void seed_jump_children_t(int L, int64_t first, int64_t n);
         static void *seed_jump_worker(void *arg);
 
         /* Defined inline so all hot callers (getSMEMs* and ls_advance_*)
@@ -609,9 +694,11 @@ private:
          * function's CPU samples on c7a (Zen 4) with gcc-14, with the
          * matching argument load close behind. always_inline removes the
          * call boundary and recovers the full gcc-11 baseline (and beats
-         * it by ~4% wall-clock on c7a with a 5M-read WGS slice, shm-warmed). */
+         * it by ~4% wall-clock on c7a with a 5M-read WGS slice, shm-warmed).
+         * The default (file) layout's step; backwardExt_planes is the compact
+         * layout's, and backwardExt_t<PL> / backwardExt pick one. */
         __attribute__((always_inline)) inline
-        SMEM backwardExt(SMEM smem, uint8_t a) const
+        SMEM backwardExt_file(SMEM smem, uint8_t a) const
         {
             /* sp/ep and their checkpoint block + one-hot mask do not depend on
              * the base b, so hoist them out of the per-base occ computation.
@@ -718,7 +805,7 @@ private:
          * s'==0 result is always discarded and its k is never read. Under that
          * precondition the remaining popcount is skipped too. */
         __attribute__((always_inline)) inline
-        SMEM backwardExt_konly(SMEM smem, uint8_t a) const
+        SMEM backwardExt_konly_file(SMEM smem, uint8_t a) const
         {
             return backwardExt_konly_cp(cp_occ, count[a], smem, a);
         }
@@ -756,6 +843,475 @@ private:
             return smem;
         }
 
+
+        /* ---- The compact layout's primitives (CP_OCC_PLANES, cp_planes) ---- */
+        /* The base code (0..3) at `row` from its block's planes. The sentinel
+         * row reads as A (0): callers test row == sentinel_index first. */
+        static inline int cp_base_at(const CP_OCC_PLANES &b, int64_t row)
+        {
+            const int y = CP_MASK - (int)(row & CP_MASK);
+            return (int)(((b.hi >> y) & 1) << 1 | ((b.lo >> y) & 1));
+        }
+
+        /* Everything an occurrence count reads besides the block, copied into
+         * locals by the hot loops (cp_view()): read through `this`, clang reloads
+         * each field after every store the loop makes, since it cannot tell the
+         * stores do not alias the object. sent_after/sent_len: the rows of the
+         * sentinel's block after the sentinel, the only rows whose A count the
+         * planes over-count (the sentinel reads as A), as one unsigned range
+         * test: (uint64_t)(pp - sent_after) < sent_len. */
+        struct CpView {
+            const CP_OCC_PLANES *cp;
+            const int64_t (*base)[4];
+            int64_t sent_after;
+            uint64_t sent_len;
+            int span_shift;
+            bool wide;
+        };
+        inline CpView cp_view() const
+        {
+            CpView v;
+            v.cp = cp_planes;
+            v.base = cp_base;
+            v.sent_after = cp_sent_after;
+            v.sent_len = cp_sent_len;
+            v.span_shift = cp_span_shift;
+            v.wide = cp_wide;
+            return v;
+        }
+
+        /* The plane masks of base c: all ones where c has that bit clear, so
+         * (hi ^ hx) & (lo ^ lx) marks the rows holding c. */
+        static inline uint64_t cp_hx(int c) { return (uint64_t)((c >> 1) & 1) - 1; }
+        static inline uint64_t cp_lx(int c) { return (uint64_t)(c & 1) - 1; }
+
+        /* Rows of `b`'s block before `pp` holding the base whose plane masks are
+         * hx/lx. On arm64 the planes and the row mask are loaded straight into d
+         * registers and only the count crosses back: arm64 has no scalar
+         * popcount, so a word built in general registers would cross twice. */
+        static inline int64_t cp_rows(const CP_OCC_PLANES &b, int64_t pp, uint64_t hx, uint64_t lx)
+        {
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            const uint64x1_t x = vand_u64(
+                vand_u64(veor_u64(vld1_u64(&b.hi), vcreate_u64(hx)),
+                         veor_u64(vld1_u64(&b.lo), vcreate_u64(lx))),
+                vld1_u64(&one_hot_mask_array[pp & CP_MASK]));
+            return (int64_t) vaddv_u8(vcnt_u8(vreinterpret_u8_u64(x)));
+#else
+            return (int64_t) __builtin_popcountll((b.hi ^ hx) & (b.lo ^ lx) & one_hot_mask_array[pp & CP_MASK]);
+#endif
+        }
+
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+        /* All four occurrence counts of bwt[0, row), `b` being row's block, in one vector, for
+         * the narrow compact layout (!cp_wide: 32 bits hold every count) and before the sentinel
+         * correction (cp_occ4_neon_sent): lanes [A, C] are ~hi & [~lo, lo] and [G, T] are
+         * hi & [~lo, lo] under the row mask; cnt counts their bytes and three pairwise adds fold
+         * each lane's eight bytes onto the checkpoint's 32-bit counts. A scalar popcount would
+         * cross to the vector unit and back per base. */
+        __attribute__((always_inline)) static inline uint32x4_t cp_occ4_neon(const CP_OCC_PLANES &b, int64_t row)
+        {
+            const uint64x2_t flip = vcombine_u64(vcreate_u64(~0ULL), vcreate_u64(0));
+            const uint64x2_t pl = vld1q_u64(&b.hi);   /* [hi, lo] */
+            const uint64x2_t m  = vld1q_dup_u64(&one_hot_mask_array[row & CP_MASK]);
+            const uint64x2_t hi = vdupq_laneq_u64(pl, 0);
+            const uint64x2_t lo = veorq_u64(vdupq_laneq_u64(pl, 1), flip);
+            const uint64x2_t ac = vandq_u64(vbicq_u64(m, hi), lo);
+            const uint64x2_t gt = vandq_u64(vandq_u64(m, hi), lo);
+            const uint8x16_t bytes = vpaddq_u8(vcntq_u8(vreinterpretq_u8_u64(ac)),
+                                               vcntq_u8(vreinterpretq_u8_u64(gt)));
+            return vpadalq_u16(vld1q_u32(b.cp_count), vpaddlq_u8(bytes));
+        }
+        /* cp_occ4_neon's sentinel correction: the sentinel reads as A, so lane A is one less
+         * for a row after it in its block ((uint64_t)(row - sent_after) < sent_len). */
+        __attribute__((always_inline)) static inline uint32x4_t cp_occ4_neon_sent(uint32x4_t o, int64_t row,
+                                                                                int64_t sent_after,
+                                                                                uint64_t sent_len)
+        {
+            const uint32x4_t lane_a = vsetq_lane_u32(1, vdupq_n_u32(0), 0);
+            if (__builtin_expect((uint64_t)(row - sent_after) < sent_len, 0)) o = vsubq_u32(o, lane_a);
+            return o;
+        }
+#endif
+
+        /* The occurrences of c in bwt[0, pp), `b` being pp's block. */
+        static inline int64_t cp_occ_v(const CpView &v, const CP_OCC_PLANES &b, int64_t pp, int c,
+                                       uint64_t hx, uint64_t lx)
+        {
+            int64_t occ = (int64_t)b.cp_count[c] + cp_rows(b, pp, hx, lx);
+            if (__builtin_expect(v.wide, 0)) occ += v.base[pp >> v.span_shift][c];
+            /* The range test comes before anything about c: c is the genome's own
+             * base, so a branch on it would mispredict. */
+            if (__builtin_expect((uint64_t)(pp - v.sent_after) < v.sent_len, 0)) occ -= (int64_t)(c == 0);
+            return occ;
+        }
+
+        /* cp_occ_v for a base A and a count layout fixed at compile time, for
+         * loops that extend many intervals by one base (the backward SMEM
+         * phase): A's rows are two and/bic ops on the planes with no plane
+         * masks to apply, there is no wide test, and only an A count tests the
+         * sentinel range (the sentinel reads as A, so no other base's count
+         * sees it). */
+        template <int A, bool WIDE>
+        static inline int64_t cp_occ_t(const CpView &v, const CP_OCC_PLANES &b, int64_t pp)
+        {
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            const uint64x1_t h = vld1_u64(&b.hi), l = vld1_u64(&b.lo);
+            const uint64x1_t m = vld1_u64(&one_hot_mask_array[pp & CP_MASK]);
+            const uint64x1_t mh = (A >> 1) ? vand_u64(m, h) : vbic_u64(m, h);
+            const uint64x1_t x  = (A & 1) ? vand_u64(mh, l) : vbic_u64(mh, l);
+            int64_t occ = (int64_t)b.cp_count[A] + (int64_t)vaddv_u8(vcnt_u8(vreinterpret_u8_u64(x)));
+#else
+            const uint64_t m = one_hot_mask_array[pp & CP_MASK];
+            const uint64_t mh = (A >> 1) ? (m & b.hi) : (m & ~b.hi);
+            const uint64_t x  = (A & 1) ? (mh & b.lo) : (mh & ~b.lo);
+            int64_t occ = (int64_t)b.cp_count[A] + (int64_t)__builtin_popcountll(x);
+#endif
+            if (WIDE) occ += v.base[pp >> v.span_shift][A];
+            if (A == 0 && __builtin_expect((uint64_t)(pp - v.sent_after) < v.sent_len, 0)) occ -= 1;
+            return occ;
+        }
+
+        /* Return f.run<A, WIDE>() for base a (0..3) and count layout wide: the one
+         * (wide, a) -> <A, WIDE> table the compact layout's per-base steps are picked
+         * through (backwardExt_konly_planes, ls_advance_backward_step). F is a functor with
+         * a member template `template <int A, bool WIDE> R run()`. */
+        template <class R, class F>
+        __attribute__((always_inline)) static inline R cp_step_dispatch(bool wide, int a, const F &f)
+        {
+            switch ((wide ? 4 : 0) | a) {
+            case 0: return f.template run<0, false>();
+            case 1: return f.template run<1, false>();
+            case 2: return f.template run<2, false>();
+            case 3: return f.template run<3, false>();
+            case 4: return f.template run<0, true>();
+            case 5: return f.template run<1, true>();
+            case 6: return f.template run<2, true>();
+            default: return f.template run<3, true>();
+            }
+        }
+
+        /* backwardExt_konly on the compact layout for a base and count layout fixed at
+         * compile time: the step the seeding drivers run (ls_backward_one,
+         * ls_backward_general) and backwardExt_konly_planes. k is left stale on the s'->0
+         * exit, so the caller must discard any s' < min_intv. The one-row case tests the
+         * row's base on its planes; the sentinel row reads as A there but has no base, so
+         * it extends nothing. */
+        template <int A, bool WIDE>
+        __attribute__((always_inline)) static inline
+        SMEM backwardExt_konly_ab(const CpView &v, int64_t count_a, SMEM smem)
+        {
+            const int64_t sp = (int64_t)smem.k;
+            if (smem.s == 1) {
+                const CP_OCC_PLANES &blk = v.cp[sp >> CP_SHIFT];
+                /* the sentinel row reads as A: only an A extension tests it */
+                if (cp_base_at(blk, sp) == A && (A != 0 || sp != v.sent_after - 1)) {
+                    smem.k = count_a + cp_occ_t<A, WIDE>(v, blk, sp);
+                    smem.s = 1;
+                } else {
+                    smem.s = 0;
+                }
+                return smem;
+            }
+            const int64_t ep = sp + (int64_t)smem.s;
+            const int64_t occ_s = cp_occ_t<A, WIDE>(v, v.cp[sp >> CP_SHIFT], sp);
+            const int64_t occ_e = cp_occ_t<A, WIDE>(v, v.cp[ep >> CP_SHIFT], ep);
+            smem.k = count_a + occ_s;
+            smem.s = occ_e - occ_s;
+            return smem;
+        }
+
+        /* backwardExt_konly_ab with the base known only at run time: the plane masks
+         * (cp_hx/cp_lx) select a's rows and the count layout is tested per count (it never
+         * changes, so the branch predicts), instead of a dispatch on the query base, which
+         * is unpredictable. For ls_backward_one, which extends a single interval, so a
+         * dispatch there is not amortised over a loop. Same results as
+         * backwardExt_konly_ab<a, wide>, stale k included. */
+        __attribute__((always_inline)) static inline
+        SMEM backwardExt_konly_rt(const CpView &v, int64_t count_a, SMEM smem, int a)
+        {
+            const int64_t sp = (int64_t)smem.k;
+            const uint64_t hx = cp_hx(a), lx = cp_lx(a);
+            if (smem.s == 1) {
+                const CP_OCC_PLANES &blk = v.cp[sp >> CP_SHIFT];
+                /* the sentinel row reads as A: only an A extension tests it */
+                if ((cp_base_at(blk, sp) == a) & ((a != 0) | (sp != v.sent_after - 1))) {
+                    smem.k = count_a + cp_occ_v(v, blk, sp, a, hx, lx);
+                    smem.s = 1;
+                } else {
+                    smem.s = 0;
+                }
+                return smem;
+            }
+            const int64_t ep = sp + (int64_t)smem.s;
+            const int64_t occ_s = cp_occ_v(v, v.cp[sp >> CP_SHIFT], sp, a, hx, lx);
+            const int64_t occ_e = cp_occ_v(v, v.cp[ep >> CP_SHIFT], ep, a, hx, lx);
+            smem.k = count_a + occ_s;
+            smem.s = occ_e - occ_s;
+            return smem;
+        }
+
+        inline int64_t occ_at(const CP_OCC_PLANES &b, int64_t pp, int c) const
+        {
+            const CpView v = cp_view();
+            return cp_occ_v(v, b, pp, c, cp_hx(c), cp_lx(c));
+        }
+
+        /* The four occurrence counts of bwt[0, row), `b` being row's block, from
+         * three popcounts: T is where both planes are set, G and C the rest of
+         * each plane, A what remains of the rows. */
+        inline void occ4_at(const CP_OCC_PLANES &b, int64_t row, int64_t occ[4]) const
+        {
+            const int64_t y = row & CP_MASK;
+            const uint64_t m = one_hot_mask_array[y];
+            const int64_t t = popcount64(b.hi & b.lo & m);
+            const int64_t g = popcount64(b.hi & m) - t;
+            const int64_t c = popcount64(b.lo & m) - t;
+            int64_t a = y - t - g - c;
+            if (__builtin_expect((uint64_t)(row - cp_sent_after) < cp_sent_len, 0)) a -= 1;
+            occ[0] = (int64_t)b.cp_count[0] + a;
+            occ[1] = (int64_t)b.cp_count[1] + c;
+            occ[2] = (int64_t)b.cp_count[2] + g;
+            occ[3] = (int64_t)b.cp_count[3] + t;
+            if (__builtin_expect(cp_wide, 0)) {
+                const int64_t *base = cp_base[row >> cp_span_shift];
+                for (int k = 0; k < 4; k++) occ[k] += base[k];
+            }
+        }
+
+        static inline int64_t popcount64(uint64_t x)
+        {
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            return (int64_t) vaddv_u8(vcnt_u8(vcreate_u8(x)));
+#else
+            return (int64_t) __builtin_popcountll(x);
+#endif
+        }
+
+        /* The compact layout's full backward step (backwardExt_file's contract). */
+        __attribute__((always_inline)) inline
+        SMEM backwardExt_planes(SMEM smem, uint8_t a) const
+        {
+            /* sp/ep and their checkpoint blocks do not depend on the base b, so
+             * they are loaded once. Only k[a] and s[a] are consumed for the
+             * result, but all four s[b] feed the l cumulation below. */
+            const int64_t sp = (int64_t)smem.k;
+            const int64_t ep = (int64_t)smem.k + (int64_t)smem.s;
+            const CP_OCC_PLANES &blk_sp = cp_planes[sp >> CP_SHIFT];
+            const CP_OCC_PLANES &blk_ep = cp_planes[ep >> CP_SHIFT];
+
+            int64_t occ_sp[4], s[4], l[4];
+
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            if (__builtin_expect(!cp_wide, 1)) {
+                /* All four bases of each block in one vector (cp_occ4_neon). */
+                const uint32x4_t o_sp = cp_occ4_neon_sent(cp_occ4_neon(blk_sp, sp), sp, cp_sent_after, cp_sent_len);
+                const uint32x4_t o_ep = cp_occ4_neon_sent(cp_occ4_neon(blk_ep, ep), ep, cp_sent_after, cp_sent_len);
+                /* 32-bit lanes hold every count here (!cp_wide); widen on store. */
+                const uint32x4_t s32 = vsubq_u32(o_ep, o_sp);
+                vst1q_s64(&occ_sp[0], vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(o_sp))));
+                vst1q_s64(&occ_sp[2], vreinterpretq_s64_u64(vmovl_high_u32(o_sp)));
+                vst1q_s64(&s[0], vreinterpretq_s64_u64(vmovl_u32(vget_low_u32(s32))));
+                vst1q_s64(&s[2], vreinterpretq_s64_u64(vmovl_high_u32(s32)));
+            } else
+#endif
+            {
+                int64_t occ_ep[4];
+                occ4_at(blk_sp, sp, occ_sp);
+                occ4_at(blk_ep, ep, occ_ep);
+                for (int b = 0; b < 4; b++) s[b] = occ_ep[b] - occ_sp[b];
+            }
+
+            int64_t sentinel_offset = 0;
+            if ((smem.k <= sentinel_index) && ((smem.k + smem.s) > sentinel_index))
+                sentinel_offset = 1;
+            l[3] = smem.l + sentinel_offset;
+            l[2] = l[3] + s[3];
+            l[1] = l[2] + s[2];
+            l[0] = l[1] + s[1];
+
+            smem.k = count[a] + occ_sp[a];
+            smem.l = l[a];
+            smem.s = s[a];
+            return smem;
+        }
+
+        /* Forward extension of `smem` by query base `a`: the interval of the
+         * pattern with `a` appended on the right (n unchanged). The same result
+         * as swapping k and l, calling backwardExt with the complement 3 - a and
+         * swapping back, but only what the swapped-back result reads is
+         * computed: base c = 3 - a's count at sp = smem.l and its size, and the
+         * summed sizes of the bases above c (the l recurrence, which becomes k).
+         * backwardExt builds all four k, s and l and picks one lane through the
+         * stack. A one-row interval needs one block and one count: the row's own
+         * base decides s, and whether it is above c (or the sentinel) moves k. */
+        __attribute__((always_inline)) inline
+        SMEM forwardExt_planes(SMEM smem, uint8_t a) const
+        {
+            const int c = 3 - (int)a;
+            if (__builtin_expect(cp_wide, 0)) {
+                SMEM r = smem;
+                r.k = smem.l; r.l = smem.k;
+                SMEM e = backwardExt_planes(r, (uint8_t)c);
+                SMEM out = e;
+                out.k = e.l; out.l = e.k;
+                return out;
+            }
+            const int64_t sp = smem.l;
+            const CpView v = cp_view();
+            if (smem.s == 1) {
+                const CP_OCC_PLANES &b = cp_planes[sp >> CP_SHIFT];
+                const int sym = cp_base_at(b, sp);
+                const bool sent = sp == sentinel_index;
+                const int64_t kc = cp_occ_v(v, b, sp, c, cp_hx(c), cp_lx(c));
+                smem.k = smem.k + (int64_t)(sent || sym > c);
+                smem.l = count[c] + kc;
+                smem.s = (int64_t)(!sent && sym == c);
+                return smem;
+            }
+            const int64_t ep = sp + smem.s;
+            const CP_OCC_PLANES &bsp = cp_planes[sp >> CP_SHIFT];
+            const CP_OCC_PLANES &bep = cp_planes[ep >> CP_SHIFT];
+            const int64_t so = (int64_t)((sp <= sentinel_index) & (ep > sentinel_index));
+            int64_t kc, sc, sgt;
+#if defined(__ARM_NEON) || defined(__aarch64__) || defined(APPLE_SILICON)
+            {
+                /* the sentinel reads as A: only lane A is corrected, and only
+                 * kc/sc read it (A is never above c) */
+                const uint32x4_t o_sp = cp_occ4_neon_sent(cp_occ4_neon(bsp, sp), sp, v.sent_after, v.sent_len);
+                const uint32x4_t o_ep = cp_occ4_neon_sent(cp_occ4_neon(bep, ep), ep, v.sent_after, v.sent_len);
+                static const uint32_t lanes[4] = {0, 1, 2, 3};
+                const uint32x4_t lane = vld1q_u32(lanes);
+                const uint32x4_t cv = vdupq_n_u32((uint32_t)c);
+                const uint32x4_t eq = vceqq_u32(lane, cv), gt = vcgtq_u32(lane, cv);
+                const uint32x4_t d = vsubq_u32(o_ep, o_sp);
+                kc  = (int64_t)vaddvq_u32(vandq_u32(o_sp, eq));
+                sc  = (int64_t)vaddvq_u32(vandq_u32(d, eq));
+                sgt = (int64_t)vaddlvq_u32(vandq_u32(d, gt));
+            }
+#else
+            {
+                /* Base c's rows are (hi ^ hx) & (lo ^ lx); the rows above c are
+                 * (hi & mh) | (lo & ml) | (hi & lo & mhl). Masks from a table: c
+                 * is a random base, so a branch on it would mispredict. */
+                static const uint64_t SEL[4][5] = {
+                    {~0ULL, ~0ULL, ~0ULL, ~0ULL, 0},    /* A: above = C, G, T = hi | lo */
+                    {~0ULL, 0, ~0ULL, 0, 0},            /* C: above = G, T = hi */
+                    {0, ~0ULL, 0, 0, ~0ULL},            /* G: above = T = hi & lo */
+                    {0, 0, 0, 0, 0},                    /* T: none */
+                };
+                const uint64_t *sel = SEL[c & 3];
+                const uint64_t msp = one_hot_mask_array[sp & CP_MASK], mep = one_hot_mask_array[ep & CP_MASK];
+                kc = cp_occ_v(v, bsp, sp, c, sel[0], sel[1]);
+                sc = cp_occ_v(v, bep, ep, c, sel[0], sel[1]) - kc;
+                /* the checkpoint counts of the bases above c, as a suffix sum picked
+                 * by c rather than a loop whose trip count depends on c */
+                const uint32_t d1 = bep.cp_count[1] - bsp.cp_count[1];
+                const uint32_t d2 = bep.cp_count[2] - bsp.cp_count[2];
+                const uint32_t d3 = bep.cp_count[3] - bsp.cp_count[3];
+                const uint32_t above[4] = { d1 + d2 + d3, d2 + d3, d3, 0 };
+                const uint32_t above_cnt = above[c & 3];
+                const uint64_t ae = ((bep.hi & sel[2]) | (bep.lo & sel[3]) | (bep.hi & bep.lo & sel[4])) & mep;
+                const uint64_t as = ((bsp.hi & sel[2]) | (bsp.lo & sel[3]) | (bsp.hi & bsp.lo & sel[4])) & msp;
+                /* wrapping u32 is exact: the rows above c in [sp, ep) are at most s */
+                sgt = (int64_t)(uint32_t)(above_cnt + (uint32_t)__builtin_popcountll(ae) - (uint32_t)__builtin_popcountll(as));
+            }
+#endif
+            smem.k = smem.k + so + sgt;
+            smem.l = count[c] + kc;
+            smem.s = sc;
+            return smem;
+        }
+        /* backwardExt_konly_file's contract, on the compact layout: the drivers' own step
+         * (backwardExt_konly_ab), so the tests that call backwardExt_konly check the code the
+         * aligner runs. */
+        struct KonlyStep {
+            const CpView &v;
+            int64_t count_a;
+            SMEM smem;
+            template <int A, bool WIDE> SMEM run() const { return backwardExt_konly_ab<A, WIDE>(v, count_a, smem); }
+        };
+        SMEM backwardExt_konly_planes(SMEM smem, uint8_t a) const
+        {
+            const CpView v = cp_view();
+            return cp_step_dispatch<SMEM>(cp_wide, a, KonlyStep{v, count[a], smem});
+        }
+
+
+        /* ---- One layout fixed at compile time (PL: the compact layout) ----
+         * The hot drivers are templates on PL, instantiated once per layout and
+         * picked once per call of a public entry point, so no lookup tests the
+         * layout. For PL = false each of these is exactly the default layout's
+         * own code. */
+        template <bool PL> inline const char *cp_line(int64_t row) const
+        {
+            return PL ? (const char *)&cp_planes[row >> CP_SHIFT] : (const char *)&cp_occ[row >> CP_SHIFT];
+        }
+        template <bool PL> __attribute__((always_inline)) inline
+        SMEM backwardExt_t(SMEM smem, uint8_t a) const
+        {
+            return PL ? backwardExt_planes(smem, a) : backwardExt_file(smem, a);
+        }
+        /* Forward extension of `smem` by query base `a`: backward extension with
+         * the BWT of the reverse complement (swap k <-> l, backwardExt by 3 - a,
+         * swap back). `l` is LIVE here: after the swap it is the k that drives
+         * the next forward step, so the full backwardExt's l-cumulation is
+         * required and backwardExt_konly does not apply. The compact layout
+         * computes only what the swapped-back result reads (forwardExt_planes). */
+        template <bool PL> __attribute__((always_inline)) inline
+        SMEM forwardExt_t(SMEM smem, uint8_t a) const
+        {
+            if (PL) return forwardExt_planes(smem, a);
+            SMEM smem_ = smem;
+            smem_.k = smem.l;
+            smem_.l = smem.k;
+            SMEM newSmem_ = backwardExt_file(smem_, 3 - a);
+            SMEM newSmem = newSmem_;
+            newSmem.k = newSmem_.l;
+            newSmem.l = newSmem_.k;
+            return newSmem;
+        }
+
+        /* The same three steps on this object's layout, tested per call: for the
+         * tests (the seed jump table build dispatches once, seed_jump_children_t),
+         * never a hot loop. */
+        SMEM backwardExt(SMEM smem, uint8_t a) const
+        {
+            return cp_compact ? backwardExt_t<true>(smem, a) : backwardExt_t<false>(smem, a);
+        }
+        SMEM forwardExt(SMEM smem, uint8_t a) const
+        {
+            return cp_compact ? forwardExt_t<true>(smem, a) : forwardExt_t<false>(smem, a);
+        }
+        SMEM backwardExt_konly(SMEM smem, uint8_t a) const
+        {
+            return cp_compact ? backwardExt_konly_planes(smem, a) : backwardExt_konly_file(smem, a);
+        }
+
+        /* The SA resolver's LF walks (FMI_search.cpp): one template body per walk, its LF
+         * step the only layout-specific part, and one out-of-line entry per layout. */
+        inline int64_t sa_sample_value(int64_t sp) const;
+        inline bool sa_lf_step_planes(int64_t &sp) const;
+        template <bool PL> inline bool sa_lf_step_walk(int64_t &sp) const;
+        template <bool PL> inline bool sa_lf_step_one(int64_t &sp) const;
+        template <bool PL> inline int64_t get_sa_entry_walk(int64_t pos);
+        template <bool PL> inline int64_t call_one_step_walk(int64_t pos, int64_t &sa_entry, int64_t &offset,
+                                                             int drop_sentinel_offset);
+        int64_t get_sa_entry_compressed_file(int64_t pos, int tid);
+        int64_t get_sa_entry_compressed_planes(int64_t pos, int tid);
+        template <bool PL> inline int64_t get_sa_entry_compressed_t(int64_t pos, int tid)
+        {
+            return PL ? get_sa_entry_compressed_planes(pos, tid) : get_sa_entry_compressed_file(pos, tid);
+        }
+        int64_t call_one_step_file(int64_t pos, int64_t &sa_entry, int64_t &offset, int drop_sentinel_offset);
+        int64_t call_one_step_planes(int64_t pos, int64_t &sa_entry, int64_t &offset, int drop_sentinel_offset);
+        template <bool PL> inline int64_t call_one_step_t(int64_t pos, int64_t &sa_entry, int64_t &offset,
+                                                          int drop_sentinel_offset)
+        {
+            return PL ? call_one_step_planes(pos, sa_entry, offset, drop_sentinel_offset)
+                      : call_one_step_file(pos, sa_entry, offset, drop_sentinel_offset);
+        }
+
     // ----- Lockstep SMEM batching internals -----
     // Defined in FMI_search.cpp. Phases and per-slot state are scoped to
     // the lockstep driver; not used anywhere else.
@@ -769,19 +1325,31 @@ private:
                       const int32_t *query_cum_len_ar,
                       const uint8_t *enc_qdb,
                       BsdFirstWalkHint *bsd_hint);
-    void ls_prefetch_cp_occ(const BatchSlot *s);
+    template <bool PL> void ls_prefetch_cp_occ(const BatchSlot *s);
     inline void ls_bsd_note(BatchSlot *s, int64_t k, int64_t l, int64_t sz);
     void ls_bsd_resolve(BatchSlot *s, const uint8_t *enc_qdb, int32_t p);
-    void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
+    template <bool PL> void ls_advance_forward_step(BatchSlot *s, const uint8_t *enc_qdb,
                                  bool s1_text);
-    inline void ls_prefetch_sa_row(int64_t p) const;
-    void ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac);
+    template <bool PL> inline void ls_prefetch_sa_row(int64_t p) const;
+    template <bool PL> void ls_s1_lf_step(BatchSlot *s, const uint8_t *pac, int64_t l_pac);
     void ls_s1_compare(BatchSlot *s, const uint8_t *enc_qdb,
                        const uint8_t *pac, int64_t l_pac);
-    void ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
+    template <bool PL> void ls_advance_forward_table(BatchSlot *s, const uint8_t *enc_qdb,
                                   bool s1_text);
-    void ls_prepare_backward(BatchSlot *s);
-    void ls_advance_backward_step(BatchSlot *s,
+    template <bool PL> void ls_prepare_backward(BatchSlot *s);
+    template <int A, bool WIDE>
+    int32_t ls_backward_general(BatchSlot *s, SMEM *prev, int32_t numPrev, int32_t min_intv,
+                                int32_t j, int32_t minSeedLen, int64_t count_a);
+    inline int32_t ls_backward_one(BatchSlot *s, int a, int32_t minSeedLen);
+    /* ls_backward_general as a cp_step_dispatch functor. */
+    struct LsBackwardGeneral {
+        FMI_search *f; BatchSlot *s; SMEM *prev; int32_t numPrev, min_intv, j, minSeedLen; int64_t count_a;
+        template <int A, bool WIDE> int32_t run() const
+        {
+            return f->ls_backward_general<A, WIDE>(s, prev, numPrev, min_intv, j, minSeedLen, count_a);
+        }
+    };
+    template <bool PL> void ls_advance_backward_step(BatchSlot *s,
                                   const uint8_t *enc_qdb,
                                   int32_t minSeedLen);
 
@@ -796,13 +1364,45 @@ private:
                        const SeedJumpEntry *jlev, int32_t jd,
                        int32_t minSeedLen,
                        const BsdFirstWalkHint *bsd_hint);
-    void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
+    template <bool PL> void bsd_prefetch_cp_occ(const BwtSeedSlot *s);
     void bsd_plan_jump(BwtSeedSlot *s, const uint8_t *enc_qdb,
                        const SeedJumpEntry *jlev, int32_t jd);
-    void bsd_advance_step(BwtSeedSlot *s,
+    template <bool PL> void bsd_advance_step(BwtSeedSlot *s,
                           const uint8_t *enc_qdb,
                           int32_t minSeedLen,
                           const SeedJumpEntry *jlev, int32_t jd);
+    // ----- The public drivers, one instantiation per checkpoint layout -----
+    // (PL: the compact layout). The public entry points of the same names pick
+    // one by cp_compact, once per call.
+    template <bool PL>
+    void getSMEMsOnePosOneThread_t(uint8_t *enc_qdb, int32_t *query_pos_array, int32_t *min_intv_array,
+                                   int32_t *rid_array, int32_t numReads, int32_t batch_size,
+                                   const bseq1_t *seq_, int32_t *query_cum_len_ar, int32_t max_readlength,
+                                   int32_t minSeedLen, SMEM *matchArray, int64_t *__numTotalSmem);
+    template <bool PL>
+    void getSMEMsOnePosOneThread_lockstep_t(uint8_t *enc_qdb, int32_t *query_pos_array,
+                                            int32_t *min_intv_array, int32_t *rid_array, int32_t numReads,
+                                            int32_t batch_size, const bseq1_t *seq_,
+                                            int32_t *query_cum_len_ar, int32_t max_readlength,
+                                            int32_t minSeedLen, SMEM *matchArray, int64_t *__numTotalSmem,
+                                            BsdFirstWalkHint *bsd_hint);
+    template <bool PL>
+    int64_t bwtSeedStrategyAllPosOneThread_t(uint8_t *enc_qdb, int32_t *max_intv_array, int32_t numReads,
+                                             const bseq1_t *seq_, int32_t *query_cum_len_ar,
+                                             int32_t minSeedLen, SMEM *matchArray);
+    template <bool PL>
+    int64_t bwtSeedStrategyAllPosOneThread_lockstep_t(uint8_t *enc_qdb, int32_t *max_intv_array,
+                                                      int32_t numReads, const bseq1_t *seq_,
+                                                      int32_t *query_cum_len_ar, int32_t minSeedLen,
+                                                      SMEM *matchArray, int32_t max_readlength,
+                                                      const BsdFirstWalkHint *bsd_hint);
+    template <bool PL>
+    void get_sa_entries_t(SMEM *smemArray, int64_t *coordArray, int32_t *coordCountArray,
+                          uint32_t count, int32_t max_occ, int tid);
+    template <bool PL>
+    void get_sa_entries_prefetch_t(SMEM *smemArray, int64_t *coordArray, int64_t *coordCountArray,
+                                   int64_t count, const int32_t max_occ, int tid, int64_t &id_,
+                                   int drop_sentinel_offset, bool trust_s1_tag);
 };
 
 #endif

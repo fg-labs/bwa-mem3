@@ -18,6 +18,12 @@
  * is pure occ arithmetic over cp_occ/count, well-defined for any in-bounds
  * (sp, sp+s), and both implementations must compute it identically.
  *
+ * Under BWA3_COMPACT_OCC=1 (the compact-layout leg) both sides read the same
+ * in-memory planes, so this is a self-consistency check of the two compact steps
+ * only: a plane-decoding bug common to both would pass here. The independent
+ * check of the compact layout is backwardext_parity_test, whose oracle reads the
+ * file's own records (cp_file_oracle.h).
+ *
  * Usage: backwardext_konly_parity_test <bwa-mem3 index prefix>
  *   e.g. backwardext_konly_parity_test fixtures/phix.fa
  */
@@ -41,7 +47,10 @@ int main(int argc, char *argv[]) {
     }
 
     FMI_search *fmi = new FMI_search(argv[1]);
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
 
     const int64_t ref_len = fmi->reference_seq_len;
     fprintf(stderr, "backwardext_konly_parity_test: reference_seq_len=%lld CP_MASK=%d\n",

@@ -35,6 +35,13 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <vector>
+#include "cp_file_oracle.h"
+
+/* The reference reads the file's own checkpoints and SA samples (cp_file_oracle.h), not the
+ * in-memory forms the resolver reads (the converted checkpoints, the packed SA high parts). */
+static std::vector<CP_OCC> g_cp;
+static std::vector<int8_t> g_sa_ms;
+static std::vector<uint32_t> g_sa_ls;
 
 /* Scalar LF walk with the pipeline's contract. Returns the resolved text
  * position; at the sentinel row that is the accumulated LF `offset` (sa value 0
@@ -44,20 +51,16 @@ static int64_t ref_resolve(const FMI_search *fmi, int64_t pos, int *hit_sentinel
     int64_t sp = pos, offset = 0;
     *hit_sentinel = 0;
     while ((sp & fmi->sa_compx_mask) != 0) {
-        const CP_OCC &blk = fmi->cp_occ[sp >> CP_SHIFT];
-        const int y = (int)(CP_MASK - (sp & CP_MASK));
-        int b = 4;
-        for (int c = 0; c < 4; c++)
-            if ((blk.one_hot_bwt_str[c] >> y) & 1ULL) { b = c; break; }
+        const int b = cp_file_base(g_cp, sp);
         if (b == 4) { *hit_sentinel = 1; return offset; }
         sym_steps[b]++;
-        const int64_t occ = blk.cp_count[b] +
-            (int64_t) __builtin_popcountll(blk.one_hot_bwt_str[b] & one_hot_mask_array[sp & CP_MASK]);
+        const int64_t occ = cp_file_occ(g_cp, b, sp);
         sp = fmi->count[b] + occ;
         offset++;
     }
-    int64_t sa = fmi->sa_hi_at(sp >> fmi->sa_compx);
-    sa = (sa << 32) + fmi->sa_ls_word[sp >> fmi->sa_compx];
+    const size_t k = (size_t) (sp >> fmi->sa_compx);
+    int64_t sa = g_sa_ms[k];
+    sa = (sa << 32) + g_sa_ls[k];
     return sa + offset;
 }
 
@@ -119,7 +122,12 @@ int main(int argc, char *argv[]) {
     setenv("BWA3_KS_DEDUP_STATS", "1", 1);
 
     FMI_search *fmi = new FMI_search(argv[1]);
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
+    g_cp = cp_file_records(argv[1], fmi->reference_seq_len);
+    sa_file_samples(argv[1], fmi->reference_seq_len, fmi->sa_compx, g_sa_ms, g_sa_ls);
 
     const int64_t ref_len = fmi->reference_seq_len;
     fprintf(stderr, "sa_resolve_parity_test: reference_seq_len=%lld sentinel_index=%lld SA_COMPX=%d\n",

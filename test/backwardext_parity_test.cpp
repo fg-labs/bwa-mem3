@@ -22,14 +22,18 @@
 #undef private
 #include "bwa.h"
 
+#include "cp_file_oracle.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 
+/* The reference reads the file's own checkpoints (cp_file_oracle.h), not the
+ * in-memory form backwardExt reads. */
+static std::vector<CP_OCC> g_cp;
 static int64_t ref_occ(const FMI_search *fmi, int b, int64_t p) {
-    const CP_OCC &blk = fmi->cp_occ[p >> CP_SHIFT];
-    const uint64_t m = one_hot_mask_array[p & CP_MASK];
-    return blk.cp_count[b] + (int64_t) __builtin_popcountll(blk.one_hot_bwt_str[b] & m);
+    (void) fmi;
+    return cp_file_occ(g_cp, b, p);
 }
 
 int main(int argc, char *argv[]) {
@@ -38,7 +42,11 @@ int main(int argc, char *argv[]) {
         return 2;
     }
     FMI_search *fmi = new FMI_search(argv[1]);
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
+    g_cp = cp_file_records(argv[1], fmi->reference_seq_len);
 
     const int64_t ref_len = fmi->reference_seq_len;
     const int64_t sentinel = fmi->sentinel_index;

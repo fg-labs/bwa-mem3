@@ -1086,7 +1086,10 @@ static int fixture_workload(const char *prefix, bool portable_checks)
     /* Default load: depth 10, built by load_index. */
     set_jump_env(NULL);
     FMI_search *fmi = new FMI_search(prefix);
+    fmi->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
     fmi->load_index();
+    /* The layout this run loaded, which test/run_unit_tests.sh checks against BWA3_COMPACT_OCC. */
+    fprintf(stderr, "occurrence checkpoint layout: %s\n", fmi->compact_occ() ? "compact" : "default");
     report(check_table(fmi, 10), "load_index builds the default depth-10 table");
 
     /* Rebuilds at the depths around the serial prefix (3) and the default,
@@ -1165,7 +1168,10 @@ static int fixture_workload(const char *prefix, bool portable_checks)
      * passes it (fmi_seed_open). */
     {
         FMI_search *np = new FMI_search(prefix);
+        np->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
         np->load_index(/*load_pac=*/false, /*n_threads=*/1, /*build_seed_jump=*/false);
+        report(np->compact_occ() == FMI_search::compact_occ_env(),
+               "load_index(build_seed_jump=false): requested checkpoint layout");
         report(np->seed_jump == NULL && np->seed_jump_depth == 0,
                "load_index(build_seed_jump=false): no table");
         delete np;
@@ -1233,6 +1239,14 @@ static int fixture_workload(const char *prefix, bool portable_checks)
             at->load_index(false, 1, false);
             report(at->shm_base != NULL && at->seed_jump == NULL && at->seed_jump_depth == 0,
                    "load_index(build_seed_jump=false) (shm attach): no table");
+            delete at;
+            /* The compact layout never attaches a staged segment (it holds the
+             * default layout): it loads its own copy from disk. */
+            at = new FMI_search(staged_prefix);
+            at->set_compact_occ(true);
+            at->load_index(false, 1, false);
+            report(at->shm_base == NULL && at->compact_occ() && at->cp_occ_data() != NULL,
+                   "load_index (compact layout, segment staged): loads from disk, no attach");
             delete at;
             FmiSeed *h = fmi_seed_open(staged_prefix);
             report(h != NULL && h->fmi->shm_base != NULL && h->fmi->seed_jump == NULL

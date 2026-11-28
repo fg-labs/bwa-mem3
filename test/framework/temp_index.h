@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -32,6 +33,13 @@ struct Contig {
     std::string name;
     std::string seq;
 };
+
+// n random bases from ACGT, two bits of each draw: the reference contigs the index tests build.
+inline std::string random_acgt(std::mt19937 &rng, size_t n) {
+    std::string s(n, 'A');
+    for (char &c : s) c = "ACGT"[rng() & 3];
+    return s;
+}
 
 // Reverse complement over A C G T in either case (case is kept); anything else
 // becomes N.
@@ -153,9 +161,10 @@ private:
 
 // `contigs` written as a FASTA in a TempDir, indexed with bwa_idx_build and
 // loaded with FMI_search::load_index. sa_compx is the SA sampling shift
-// (`index -u`, default 3). fmi() is the FM index; bns() and pac() are its
-// reference handles (pac is the 2-bit forward strand, N as a random base, as
-// `mem` sees it).
+// (`index -u`, default 3). build_seed_jump=false skips the seed jump table
+// for checks that do not use it; existing callers build it by default.
+// fmi() is the FM index; bns() and pac() are its reference handles (pac is the
+// 2-bit forward strand, N as a random base, as `mem` sees it).
 //
 // The FASTA's basename is the TempDir's own unique leaf: load_index first
 // tries to attach an index staged in shared memory (`bwa-mem3 shm`), matched
@@ -166,7 +175,8 @@ private:
 // stderr.
 class TempIndex {
 public:
-    explicit TempIndex(const std::vector<Contig> &contigs, int sa_compx = 3) {
+    explicit TempIndex(const std::vector<Contig> &contigs, int sa_compx = 3,
+                       bool build_seed_jump = true) {
         const std::string &dir = dir_.path();
         const std::string fasta = dir.substr(dir.rfind('/') + 1) + ".fa";
         dir_.write(fasta, fasta_text(contigs));
@@ -178,7 +188,8 @@ public:
             throw std::runtime_error("bwa_idx_build failed for " + prefix_ + "; log:\n" + read_file(log));
         }
         fmi_.reset(new FMI_search(prefix_.c_str()));
-        fmi_->load_index(/*load_pac=*/true, /*n_threads=*/1);
+        fmi_->set_compact_occ(FMI_search::compact_occ_env());   // the compact-layout test legs
+        fmi_->load_index(/*load_pac=*/true, /*n_threads=*/1, build_seed_jump);
     }
 
     FMI_search *fmi() const { return fmi_.get(); }

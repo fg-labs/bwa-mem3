@@ -10,6 +10,13 @@
 struct FmiSeed { FMI_search *fmi; };
 
 FmiSeed *fmi_seed_open(const char *prefix) {
+    return fmi_seed_open_layout(prefix, FMI_SEED_LAYOUT_DEFAULT);
+}
+
+FmiSeed *fmi_seed_open_layout(const char *prefix, int layout) {
+    // An unknown layout (a typo, or a constant from a newer header) fails
+    // closed rather than silently opening the default layout.
+    if (layout != FMI_SEED_LAYOUT_DEFAULT && layout != FMI_SEED_LAYOUT_COMPACT) return NULL;
     // Allocate the handle first (value-initialized, so h->fmi == nullptr), then
     // build the FMI_search inside a try/catch. A throw out of `new FMI_search`,
     // `load_index()`, or the handle allocation itself leaves nothing to leak: on
@@ -18,6 +25,10 @@ FmiSeed *fmi_seed_open(const char *prefix) {
     FmiSeed *h = new FmiSeed();
     try {
         h->fmi = new FMI_search(prefix);
+        // The caller's layout: the library never reads BWA3_COMPACT_OCC
+        // (main_mem does), so the environment cannot change what this stable
+        // surface returns.
+        h->fmi->set_compact_occ(layout == FMI_SEED_LAYOUT_COMPACT);
         // load_pac=false: this facade exposes only FM-index seeding data
         // (cp_occ/count/sentinel/SA resolution); the 2-bit packed reference
         // is never read through it, so skip the ~1.6 GB load (see
@@ -37,8 +48,17 @@ FmiSeed *fmi_seed_open(const char *prefix) {
 void fmi_seed_close(FmiSeed *h) { if (!h) return; delete h->fmi; delete h; }
 
 const CP_OCC *fmi_seed_cp_occ(const FmiSeed *h) {
-    if (!h) return NULL;                  // precondition: h from a live fmi_seed_open()
+    if (!h || !h->fmi) return NULL;       // precondition: h from a live fmi_seed_open()
+    if (h->fmi->compact_occ()) return NULL;   // compact layout: see fmi_seed_cp_occ_planes
     return (const CP_OCC *)h->fmi->cp_occ_data();
+}
+const CP_OCC_PLANES *fmi_seed_cp_occ_planes(const FmiSeed *h) {
+    if (!h || !h->fmi || !h->fmi->compact_occ()) return NULL;
+    return (const CP_OCC_PLANES *)h->fmi->cp_occ_data();
+}
+const int64_t *fmi_seed_cp_count_base(const FmiSeed *h) {
+    if (!h || !h->fmi) return NULL;
+    return h->fmi->cp_count_base_data();
 }
 
 const int64_t *fmi_seed_count(const FmiSeed *h) {
