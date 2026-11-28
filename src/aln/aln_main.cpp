@@ -222,6 +222,7 @@ struct se_ctx_t {
 	bwt_aln1_t **ks_aln = nullptr;         // --known-snvs: each read's window hits (null without)
 	const int *ks_n = nullptr;
 	const uint8_t *ks_stopped = nullptr;   // per read: its genomic or window search stopped at -m
+	const uint8_t *ks_wtop2b = nullptr;    // per read: its window search ended on its -R stop
 	std::vector<int64_t> *ks_count = nullptr; // per thread, KS_N_OUTCOMES counters each
 	struct ks_rec_t *ks_rec = nullptr;     // per read: its sites, twin and XV (with ks_aln)
 	int ks_phase = 0;                      // 0: place and print; 1: place only; 2: print only
@@ -262,7 +263,7 @@ void se_post_worker(void *data, int st, int n, int tid)
 			int64_t *cnt = c->ks_count->data() + (size_t)tid * KS_N_OUTCOMES;
 			for (int i = 0; i < n; ++i)
 				++cnt[ks_override(c->o->ks_windows, c->bns, c->bwt, &c->o->gap, c->o->max_xa_hits, seqs + i,
-								  c->ks_aln[st + i], c->ks_n[st + i], &alt_site[i], nullptr,
+								  c->ks_aln[st + i], c->ks_n[st + i], c->ks_wtop2b[st + i], &alt_site[i], nullptr,
 								  c->ks_stopped[st + i])];
 		}
 		ks_refine(c->bns, n, seqs, c->pac, alt_site.empty() ? nullptr : alt_site.data());
@@ -304,6 +305,7 @@ struct pe_ctx_t {
 	bwt_aln1_t **ks_aln[2] = {nullptr, nullptr}; // the window hits
 	const int *ks_n[2] = {nullptr, nullptr};
 	const uint8_t *ks_stopped[2] = {nullptr, nullptr};      // as se_ctx_t
+	const uint8_t *ks_wtop2b[2] = {nullptr, nullptr};       // as se_ctx_t
 	std::vector<pe_hit_t> *ks_hits[2] = {nullptr, nullptr}; // a credited end's hits, for the pairing
 	int64_t *ks_alt[2] = {nullptr, nullptr};                // the final placement's ALT (aln_site_key), or -1
 	ks_rec_t *ks_rec[2] = {nullptr, nullptr};
@@ -336,8 +338,8 @@ void pe_post_worker(void *data, int st, int n, int tid)
 				for (int i = 0; i < n; ++i) {
 					int64_t a;
 					++cnt[ks_override(c->o->ks_windows, c->bns, c->bwt, &c->o->gap, 0, s[j] + i,
-									  c->ks_aln[j][st + i], c->ks_n[j][st + i], &a, &c->ks_hits[j][st + i],
-									  c->ks_stopped[j][st + i])];
+									  c->ks_aln[j][st + i], c->ks_n[j][st + i], c->ks_wtop2b[j][st + i], &a,
+									  &c->ks_hits[j][st + i], c->ks_stopped[j][st + i])];
 				}
 		}
 		const std::vector<pe_hit_t> *h[2] = {ks ? c->ks_hits[0] + st : nullptr, ks ? c->ks_hits[1] + st : nullptr};
@@ -438,21 +440,22 @@ void ks_place_twins(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, s
 	bwa_seq_t *tw = (bwa_seq_t*)aln_calloc(nt, sizeof(bwa_seq_t));
 	for (int j = 0; j < nt; ++j) ks_make_read(tw + j, rec[idx[j]].tseq.data(), (int)rec[idx[j]].tseq.size(), is_comp);
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
-	const gap_opt_t discovery = ks_discovery_opt(o->gap);
+	const gap_opt_t window = ks_window_opt(o->gap);
 	aln_dup_state_t win_dup, main_dup;
-	aln_search_batch(o->ks_windows->bwt, nt, tw, &discovery, n_threads, o->share_dup_search ? &win_dup : nullptr);
+	aln_search_batch(o->ks_windows->bwt, nt, tw, &window, n_threads, o->share_dup_search ? &win_dup : nullptr);
 	std::vector<bwt_aln1_t*> win_aln(nt);
 	std::vector<int> win_n(nt), incomplete(nt);
+	std::vector<uint8_t> win_top2b(nt); // the main search below sets top2b anew
 	for (int j = 0; j < nt; ++j) {
 		incomplete[j] = tw[j].search_incomplete;
-		win_aln[j] = tw[j].aln; win_n[j] = tw[j].n_aln;
+		win_aln[j] = tw[j].aln; win_n[j] = tw[j].n_aln; win_top2b[j] = tw[j].top2b;
 		tw[j].aln = 0; tw[j].n_aln = 0;
 	}
 	aln_search_batch(bwt, nt, tw, &o->gap, n_threads, o->share_dup_search ? &main_dup : nullptr);
 	for (int j = 0; j < nt; ++j) {
 		ks_rec_t &r = rec[idx[j]];
 		r.twin_same = incomplete[j] || tw[j].search_incomplete ? -1
-			: ks_twin_place(o->ks_windows, bns, bwt, &o->gap, tw + j, win_aln[j], win_n[j],
+			: ks_twin_place(o->ks_windows, bns, bwt, &o->gap, tw + j, win_aln[j], win_n[j], win_top2b[j],
 							r.pos, r.strand, &r.twin_mapq);
 		free(win_aln[j]);
 	}
@@ -475,6 +478,7 @@ struct ks_twin_pe_ctx_t {
 	bwa_seq_t *tw[2];
 	bwt_aln1_t **win_aln[2];
 	const int *win_n[2];
+	const uint8_t *win_top2b[2]; // the window search ended on its -R stop
 	int *incomplete;          // per twin pair: crediting the twin was incomplete
 	int32_t *moved_span[2];   // per twin pair and end: bwa_pe_pair's moved_span
 	const pe_alt_sites_t *rescue;
@@ -499,7 +503,8 @@ void ks_twin_pe_worker(void *data, int st, int n, int tid)
 		for (int i = 0; i < n; ++i) {
 			int64_t a;
 			const ks_outcome_t r = ks_override(c->o->ks_windows, c->bns, c->bwt, &c->o->gap, 0, s[j] + i,
-											   c->win_aln[j][st + i], c->win_n[j][st + i], &a, &hits[j][i]);
+											   c->win_aln[j][st + i], c->win_n[j][st + i], c->win_top2b[j][st + i], &a,
+											   &hits[j][i]);
 			if (r == KS_INCOMPLETE) c->incomplete[st + i] = 1;
 		}
 	}
@@ -540,15 +545,17 @@ void ks_place_twins_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns
 	const int n_threads = o->gap.n_threads < 1 ? 1 : o->gap.n_threads;
 	std::vector<bwt_aln1_t*> win_aln[2];
 	std::vector<int> win_n[2];
+	std::vector<uint8_t> win_top2b[2]; // the main search below sets top2b anew
 	for (int j = 0; j < 2; ++j) {
-		const gap_opt_t discovery = ks_discovery_opt(o->gap);
+		const gap_opt_t window = ks_window_opt(o->gap);
 		aln_dup_state_t win_dup, main_dup;
-		aln_search_batch(o->ks_windows->bwt, nt, tw[j], &discovery, n_threads, o->share_dup_search ? &win_dup : nullptr);
+		aln_search_batch(o->ks_windows->bwt, nt, tw[j], &window, n_threads, o->share_dup_search ? &win_dup : nullptr);
 		win_aln[j].resize(nt);
 		win_n[j].resize(nt);
+		win_top2b[j].resize(nt);
 		for (int t = 0; t < nt; ++t) {
 			incomplete[t] |= tw[j][t].search_incomplete;
-			win_aln[j][t] = tw[j][t].aln; win_n[j][t] = tw[j][t].n_aln;
+			win_aln[j][t] = tw[j][t].aln; win_n[j][t] = tw[j][t].n_aln; win_top2b[j][t] = tw[j][t].top2b;
 			tw[j][t].aln = 0; tw[j][t].n_aln = 0;
 		}
 		aln_search_batch(bwt, nt, tw[j], &o->gap, n_threads, o->share_dup_search ? &main_dup : nullptr);
@@ -556,7 +563,9 @@ void ks_place_twins_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns
 	}
 	ks_twin_pe_ctx_t c;
 	c.o = o, c.bwt = bwt, c.bns = bns, c.pac = pac, c.ii = ii;
-	for (int j = 0; j < 2; ++j) c.tw[j] = tw[j], c.win_aln[j] = win_aln[j].data(), c.win_n[j] = win_n[j].data();
+	for (int j = 0; j < 2; ++j)
+		c.tw[j] = tw[j], c.win_aln[j] = win_aln[j].data(), c.win_n[j] = win_n[j].data(),
+		c.win_top2b[j] = win_top2b[j].data();
 	c.incomplete = incomplete.data();
 	std::vector<int32_t> moved_span[2];
 	for (int j = 0; j < 2; ++j) moved_span[j].assign(nt, -1), c.moved_span[j] = moved_span[j].data();
@@ -618,23 +627,26 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		// --known-snvs: the same search on the ALT windows, kept beside the main search's hits
 		std::vector<bwt_aln1_t*> ks_aln;
 		std::vector<int> ks_n;
-		std::vector<uint8_t> ks_stopped;
+		std::vector<uint8_t> ks_stopped, ks_wtop2b;
 		if (o->ks_windows) {
 			ks_aln.resize(n_seqs);
 			ks_n.resize(n_seqs);
-			std::vector<uint8_t> main_top2b(n_seqs); // the main search's -R stop (ks_merge reads it)
+			ks_wtop2b.resize(n_seqs);
+			// the main search's -R stop, then the window search's (ks_merge reads both)
+			std::vector<uint8_t> main_top2b(n_seqs);
 			for (int i = 0; i < n_seqs; ++i) {
 				ks_aln[i] = seqs[i].aln; ks_n[i] = seqs[i].n_aln; main_top2b[i] = seqs[i].top2b;
 				seqs[i].aln = 0; seqs[i].n_aln = 0;
 			}
 			ks_save_stopped(n_seqs, seqs, &ks_stopped);
-			const gap_opt_t discovery = ks_discovery_opt(o->gap);
-			aln_search_batch(o->ks_windows->bwt, n_seqs, seqs, &discovery, o->gap.n_threads,
+			const gap_opt_t window = ks_window_opt(o->gap);
+			aln_search_batch(o->ks_windows->bwt, n_seqs, seqs, &window, o->gap.n_threads,
 			                 o->share_dup_search ? &win_dup_state : nullptr);
 			ks_merge_stopped(n_seqs, seqs, &ks_stopped);
 			for (int i = 0; i < n_seqs; ++i) {
 				std::swap(ks_aln[i], seqs[i].aln);
 				std::swap(ks_n[i], seqs[i].n_aln);
+				ks_wtop2b[i] = seqs[i].top2b;
 				seqs[i].top2b = main_top2b[i];
 			}
 		}
@@ -647,6 +659,7 @@ int aln_run_se(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			c.ks_aln = ks_aln.data();
 			c.ks_n = ks_n.data();
 			c.ks_stopped = ks_stopped.data();
+			c.ks_wtop2b = ks_wtop2b.data();
 			c.ks_count = &ks_count;
 			ks_rec.resize(n_seqs);
 			c.ks_rec = ks_rec.data();
@@ -813,7 +826,7 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 		// each file is its own batch: the gap-open cap follows that file's longest read
 		std::vector<bwt_aln1_t*> ks_aln[2];
 		std::vector<int> ks_n[2];
-		std::vector<uint8_t> ks_stopped[2];
+		std::vector<uint8_t> ks_stopped[2], ks_wtop2b[2];
 		for (int m = 0; m < 2; ++m) {
 			const int n_shared = aln_search_batch(bwt, n_in[m], seqs[m], &o->gap, o->gap.n_threads, dup[m]);
 			if (bwa_verbose >= 4)
@@ -822,19 +835,22 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 			// --known-snvs: the same search on the ALT windows, kept beside the main search's hits
 			ks_aln[m].resize(n_in[m]);
 			ks_n[m].resize(n_in[m]);
-			std::vector<uint8_t> main_top2b(n_in[m]); // the main search's -R stop (ks_merge reads it)
+			ks_wtop2b[m].resize(n_in[m]);
+			// the main search's -R stop, then the window search's (ks_merge reads both)
+			std::vector<uint8_t> main_top2b(n_in[m]);
 			for (int i = 0; i < n_in[m]; ++i) {
 				ks_aln[m][i] = seqs[m][i].aln; ks_n[m][i] = seqs[m][i].n_aln; main_top2b[i] = seqs[m][i].top2b;
 				seqs[m][i].aln = 0; seqs[m][i].n_aln = 0;
 			}
 			ks_save_stopped(n_in[m], seqs[m], &ks_stopped[m]);
-			const gap_opt_t discovery = ks_discovery_opt(o->gap);
-			aln_search_batch(o->ks_windows->bwt, n_in[m], seqs[m], &discovery, o->gap.n_threads,
+			const gap_opt_t window = ks_window_opt(o->gap);
+			aln_search_batch(o->ks_windows->bwt, n_in[m], seqs[m], &window, o->gap.n_threads,
 			                 o->share_dup_search ? &win_dup_state[m] : nullptr);
 			ks_merge_stopped(n_in[m], seqs[m], &ks_stopped[m]);
 			for (int i = 0; i < n_in[m]; ++i) {
 				std::swap(ks_aln[m][i], seqs[m][i].aln);
 				std::swap(ks_n[m][i], seqs[m][i].n_aln);
+				ks_wtop2b[m][i] = seqs[m][i].top2b;
 				seqs[m][i].top2b = main_top2b[i];
 			}
 		}
@@ -863,6 +879,7 @@ int aln_run_pe(const aln_opt_t *o, const bwt_t *bwt, const bntseq_t *bns, ubyte_
 				c.ks_aln[j] = ks_aln[j].data();
 				c.ks_n[j] = ks_n[j].data();
 				c.ks_stopped[j] = ks_stopped[j].data();
+				c.ks_wtop2b[j] = ks_wtop2b[j].data();
 				c.ks_hits[j] = ks_hits[j].data();
 				c.ks_alt[j] = ks_alt[j].data();
 				c.ks_rec[j] = ks_rec[j].data();

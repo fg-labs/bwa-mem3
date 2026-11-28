@@ -130,6 +130,19 @@ at default `-m` (2,000,000) and `-m 200000` were identical to #799 apart from `@
 historical observations on the tested configurations, not a guarantee for other inputs or fresh
 validation of this documentation change.
 
+Since [#815](https://github.com/fg-labs/bwa-mem3/pull/815), plain `aln --known-snvs` without
+`--meth` applies the user's cuts to ALT-window discovery and searches again when those cuts
+could omit retained hits. Compared with #801, repeat-read `X0`/`X1`, primary alignment (including
+`CIGAR`, strand and alignment tags), `XT`, `MAPQ` and `XV` twin fields can change. Newly enabled
+mate rescue can also change mate fields and flags. In the reported post-rebase 20,000-pair chr22
+EM-seq checks at 40 and 150 bases with a real approximately 48,000-site list (host, tier and
+compiler not specified for these checks), default runs changed 7-10 records in counts/twin fields
+without changing placement or MAPQ. With `-n 8`, 122 records changed and three pairs moved,
+including two newly rescued proper pairs. The reported checks without `--known-snvs`, and with
+`--meth --known-snvs`, were identical to #801. These are historical observations, not new
+runtime validation of this documentation change; the larger pre-rebase output table is scoped
+separately in the PR.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:

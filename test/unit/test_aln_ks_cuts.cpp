@@ -255,7 +255,9 @@ void repro_case(int copies_of_a, bool meth)
  * H: R with three mismatches, no site: 9, the read's best (ceiling 4, retained cost 12).
  * I: R with five mismatches, one at a site whose ALT is R's base: 12 with the ALT (four
  *    differences), 15 without. Only the ALT-window search can propose it, and only if it does not
- *    cut at its own best's ceiling (2). */
+ *    cut at its own best's ceiling (2). Under --meth the window search takes no such ceiling; in
+ *    plain aln it takes it, and its ceiling below the merged one (4) runs it again: the one
+ *    end-to-end case of a window search run again for its ceiling. */
 void window_ceiling_case(bool meth)
 {
     uint32_t st = 77;
@@ -420,8 +422,9 @@ std::string locus(int pos0, const std::string &cigar) { return "c1,+" + std::to_
 // Every read's summary under --known-snvs equals the oracle's (no --known-snvs, ALT substituted).
 // The oracle's own primary among equal-best loci is a draw, so a tie compares the locus sets
 // (primary and XA together) instead of which one is primary. Each run must hold one record per
-// read, in order. want_loci, when given, is each read's planted loci, which the oracle must report
-// (so that two runs that both miss them cannot agree).
+// read (two, read 1 and read 2, for a paired case), in order. want_loci, when given (single end
+// only), is each read's planted loci, which the oracle must report (so that two runs that both miss
+// them cannot agree).
 void same_as_oracle(const KsCase &k, std::vector<std::string> opts, const std::string &label,
                     const std::vector<std::vector<std::string>> &want_loci = {})
 {
@@ -429,13 +432,14 @@ void same_as_oracle(const KsCase &k, std::vector<std::string> opts, const std::s
     ks_opts.insert(ks_opts.end(), {"--known-snvs", k.vcf});
     const auto got = k.run(ks_opts, k.ref, label + ".ks");
     const auto oracle = k.run(opts, k.oracle, label + ".oracle");
-    REQUIRE(got.size() == k.n_reads);
-    REQUIRE(oracle.size() == k.n_reads);
-    REQUIRE((want_loci.empty() || want_loci.size() == k.n_reads));
+    const size_t per = k.fq2.empty() ? 1 : 2; // records per read
+    REQUIRE(got.size() == k.n_reads * per);
+    REQUIRE(oracle.size() == k.n_reads * per);
+    REQUIRE((want_loci.empty() || (per == 1 && want_loci.size() == k.n_reads)));
     for (size_t i = 0; i < got.size(); ++i) {
         CAPTURE(label); CAPTURE(i); CAPTURE(summary(got[i])); CAPTURE(summary(oracle[i]));
-        CHECK(got[i][0] == "r" + std::to_string(i));
-        CHECK(oracle[i][0] == "r" + std::to_string(i));
+        CHECK(got[i][0] == "r" + std::to_string(i / per));
+        CHECK(oracle[i][0] == "r" + std::to_string(i / per));
         if (!want_loci.empty()) {
             std::vector<std::string> want = want_loci[i];
             std::sort(want.begin(), want.end());
@@ -448,6 +452,58 @@ void same_as_oracle(const KsCase &k, std::vector<std::string> opts, const std::s
         if (tag(oracle[i], "X0:i") == "1") CHECK(summary(got[i]) == summary(oracle[i]));
         else CHECK(loci(got[i]) == loci(oracle[i]));
     }
+}
+
+/* -R counts loci, not window rows, at a small -R: each of `copies` exact copies P of R has two sites
+ * just before it, so two ALT windows hold it with the reference bases: two window rows at cost 0
+ * per locus. Q: R with two mismatches, one at a site whose ALT is R's base: 3 with the ALT (one
+ * difference). Under -R 1 the window search stops at cost 0 after the first locus's two rows and
+ * never proposes Q, which only it holds at 3 (Q costs 6 on the reference, past the main search's
+ * score cut). With one copy the merged best stratum is one locus, within -R 1, so Q is retained;
+ * with two it is two loci, over -R 1, and only the best stratum is kept. The first window search's
+ * rows miss their sites, so without the second search the read would be untouched. `paired` runs
+ * the case paired end, with a mate 300 bases past the read's locus. */
+void window_overlap_r1_case(int copies, bool paired = false)
+{
+    uint32_t st = 1357;
+    const std::string read = no_c(st, 100);
+    std::string c1 = aln_test::lcg_dna(st, 4000 * (copies + 1));
+    std::vector<site_t> sites;
+    std::vector<int> ps;
+    for (int k = 0; k < copies; ++k) {
+        const int p = 1000 + 4000 * k;
+        ps.push_back(p);
+        c1.replace(p, 100, read);
+        for (int s : {p - 30, p - 20})
+            sites.push_back({s, c1[s], std::string(1, mm_base(c1[s] == 'C' ? 'A' : c1[s])), c1[s]});
+    }
+    const int q = 1000 + 4000 * copies;
+    const std::string seg_q = with_mm(read, {50, 70});
+    c1.replace(q, 100, seg_q);
+    sites.push_back({q + 50, seg_q[50], std::string(1, read[50]), read[50]});
+    KsCase k(c1, sites, {read});
+    if (paired) {
+        k.pair_with({aln_test::revcomp(c1.substr(ps[0] + 300, 100))});
+        same_as_oracle(k, {"-n", "5", "-R", "1"}, "r1pe");
+        const auto got = k.run({"-n", "5", "-R", "1", "--known-snvs", k.vcf}, k.ref, "r1pe.check");
+        REQUIRE(got.size() == 2);
+        const auto &r1 = (std::stoi(got[0][1]) & 0x40) ? got[0] : got[1];
+        CHECK(r1[3] == pos1(ps[0]));
+        CHECK(tag(r1, "X1:i") == "1");
+        CHECK(tag(r1, "XA:Z").find("c1,+" + pos1(q) + ",100M") != std::string::npos);
+        return;
+    }
+    if (copies == 1) {
+        const std::string want = "0 c1:" + pos1(ps[0]) + " 100M MAPQ 23 X0 1 X1 1 XA c1,+" + pos1(q) + ",100M";
+        check_against_oracle(k, false, {"-n", "5", "-R", "1"}, {want});
+        return;
+    }
+    same_as_oracle(k, {"-n", "5", "-R", "1"}, "r1x" + std::to_string(copies));
+    const auto got = k.run({"-n", "5", "-R", "1", "--known-snvs", k.vcf}, k.ref, "r1x.check");
+    REQUIRE(got.size() == 1);
+    CHECK(tag(got[0], "X0:i") == std::to_string(copies));
+    CHECK(tag(got[0], "X1:i") == "-"); // stock prints no X1 when X0 is over -R
+    CHECK(tag(got[0], "XA:Z").find("," + pos1(q) + ",") == std::string::npos);
 }
 } // namespace
 
@@ -651,7 +707,7 @@ TEST_CASE("aln_ks_cuts: plain aln: -R counts the final best, not the main search
     repro_case(31, false);
 }
 
-TEST_CASE("aln_ks_cuts: plain aln: the ALT-window search does not take a ceiling from its own gapped best")
+TEST_CASE("aln_ks_cuts: plain aln: an ALT-window search whose own gapped best set a tight ceiling runs again")
 {
     window_ceiling_case(false);
 }
@@ -689,6 +745,55 @@ TEST_CASE("aln_ks_cuts: plain aln: with -e, gap extensions are not differences i
 TEST_CASE("aln_ks_cuts: plain aln: overlapping ALT windows count one locus once toward -R")
 {
     window_overlap_case(false);
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: an ALT-window row across two windows does not cut the window search")
+{
+    // The window index holds the windows back to back, so a read can match across the end of one
+    // window and the start of the next: a row that is in no window alone, so the merge drops it.
+    // J: the last 50 bases of site A's window are R's first half with one mismatch, and the first
+    //    50 of site B's window R's second half with one: a 6-cost row across the two windows, the
+    //    window search's first hit (ceiling 3, score cut 9).
+    // L: R with a deleted base and, at site C, a mismatch whose ALT is R's base: 11 with the ALT
+    //    (one difference), 14 on the reference (two), the main search's best.
+    // The merged best is 11 (cap 2), above the window search's own 6, so its score cut dropped L.
+    uint32_t st = 8080;
+    const std::string read = no_c(st, 100);
+    std::string c1 = aln_test::lcg_dna(st, 10000);
+    const int a = 2000, b = 4000, l = 7000;
+    const std::string r_mm = with_mm(read, {10, 90});
+    c1.replace(a + 111, 50, r_mm.substr(0, 50)); // site A's window ends at a + 160
+    c1.replace(b - 160, 50, r_mm.substr(50));    // site B's window starts at b - 160
+    std::string seg_l = with_mm(read, {70});
+    char extra = 'A';
+    while (extra == read[49] || extra == read[50]) extra = extra == 'A' ? 'G' : 'T';
+    seg_l = seg_l.substr(0, 50) + extra + seg_l.substr(50);
+    c1.replace(l, 101, seg_l);
+    const int c_site = l + 71; // seg_l's base 71 is read base 70
+    auto alt_of = [&](int p) { return std::string(1, mm_base(c1[p] == 'C' ? 'A' : c1[p])); };
+    const KsCase k(c1, {{a, c1[a], alt_of(a), c1[a]}, {b, c1[b], alt_of(b), c1[b]},
+                        {c_site, seg_l[71], std::string(1, read[70]), read[70]}}, {read});
+    const std::string want = "0 c1:" + pos1(l) + " 50M1D50M MAPQ 37 X0 1 X1 0 XA";
+    check_against_oracle(k, false, {"-n", "5"}, {want});
+    // credited: the mismatch at C is the ALT, so no mismatch is left (XM counts with the ALT credited)
+    const auto got = k.run({"-n", "5", "--known-snvs", k.vcf}, k.ref, "junction");
+    REQUIRE(got.size() == 1);
+    CHECK(tag(got[0], "XM:i") == "0");
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: an ALT-window search stopped on -R by one locus's window rows runs again")
+{
+    window_overlap_r1_case(1);
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: an ALT-window search run again keeps -R on the merged loci")
+{
+    window_overlap_r1_case(2);
+}
+
+TEST_CASE("aln_ks_cuts: plain aln: a paired-end ALT-window search stopped on -R runs again")
+{
+    window_overlap_r1_case(1, true);
 }
 
 TEST_CASE("aln_ks_cuts: neutral conversion ties retain the better one-ALT haplotype")
