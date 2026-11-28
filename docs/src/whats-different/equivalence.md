@@ -159,6 +159,15 @@ single-end output was byte-identical (md5 of non-`@PG` lines), including the rea
 pair changed this way. Output
 without `--meth` is byte-identical: the proof runs only in the `--meth` search.
 
+Since [#788](https://github.com/fg-labs/bwa-mem3/pull/788), a `--meth` read whose search makes
+200,000 index expansions without a hit is checked once more with the same proof and larger caps
+(16,384 candidate rows instead of 4,096; see [`aln`](../cli/aln.md)). The same proof gives the
+same result as the full search, so only a read whose search would stop at the `-m` work bound can
+change, as for #787. On ultrashort EM-seq and 5-base slices (hg19, an x86_64 AVX-512 host, clang
+19.1.7; 1 million single-end reads and 1 million pairs, 1 million pairs and 200,000 single-end
+reads with `--known-snvs`), output was byte-identical to #787 on the AVX-512 tier. Output
+without `--meth` is byte-identical.
+
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
 On the drop-in profile (plain <code>bwa-mem3 mem</code>, no flags), release 0.7.1 gives the <strong>same primary alignment as bwa-mem2</strong> for <strong>every</strong> read of the slice re-measured after the parity work landed (1,066,668 records, HG00096 WGS, hg38, x86): identical <code>FLAG</code>, <code>RNAME</code>, <code>POS</code>, <code>MAPQ</code>, <code>CIGAR</code>, <code>AS</code>, and <code>XS</code>. Those record bytes differ by <strong>two additive tags</strong> and nothing else:
