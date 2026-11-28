@@ -184,13 +184,14 @@ template <> struct gap_group<AlnMeth> {
 		const int64_t *ord;      // per read of the (possibly compacted) batch: its ordinal in the stream
 		const uint8_t *keep;     // per read: keep both strata (others share its search), or null
 		aln_meth_read_t *res;    // per read of the (possibly compacted) batch
-		// extra, alt_bounds and incoming_flags are per read of the caller's batch: read r of a
+		// extra, alt_bounds and incoming state are per read of the caller's batch: read r of a
 		// compacted batch reads entry src[r] of each (src null: entry r).
 		const int *src;
 		const std::vector<aln_meth_candidate_t> *extra; // per read: --known-snvs candidates, or null
 		const aln_meth_alt_bound_t *alt_bounds;
 		bool capture_full_width;
 		const int *incoming_flags;
+		const int *incoming_blind_partial;
 	};
 
 	static thread_local const ctx_t *ctx;
@@ -222,6 +223,7 @@ template <> struct gap_group<AlnMeth> {
 		const int s = ctx->src ? ctx->src[r] : r;
 		slot(c)->extra = ctx->extra ? ctx->extra + s : nullptr;
 		if (ctx->incoming_flags) slot(c)->res->flags |= ctx->incoming_flags[s];
+		if (ctx->incoming_blind_partial) slot(c)->res->blind_partial = ctx->incoming_blind_partial[s];
 		if (ctx->alt_bounds) slot(c)->alt_bound = ctx->alt_bounds[s];
 	}
 	static const ubyte_t *seq(const gap_slot_core_t *c, const bwa_seq_t *) { return slot(c)->vseq.data(); }
@@ -753,14 +755,15 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 						  bwa_seq_t *seqs, const gap_opt_t *opt, int n_threads, int read_no, int64_t ord0,
 						  int keep_strata, int max_xa_hits, aln_dup_state_t *dup, aln_meth_read_t *res,
 						  const std::vector<aln_meth_candidate_t> *extra,
-						  const aln_meth_alt_bound_t *alt_bounds, bool capture_full_width, const int *incoming_flags)
+						  const aln_meth_alt_bound_t *alt_bounds, bool capture_full_width, const int *incoming_flags,
+                          const int *incoming_blind_partial)
 {
 	gap_opt_t bopt = batch_opt(n_seqs, seqs, opt);
 	gap_group<AlnMeth>::ctx_t mc;
 	mc.ref = ref; mc.mo = mo; mc.read_no = read_no; mc.keep_strata = keep_strata; mc.max_xa_hits = max_xa_hits;
 	mc.keep = nullptr; mc.src = nullptr;
 	mc.extra = extra; mc.alt_bounds = alt_bounds; mc.capture_full_width = capture_full_width;
-	mc.incoming_flags = incoming_flags;
+	mc.incoming_flags = incoming_flags; mc.incoming_blind_partial = incoming_blind_partial;
 	std::vector<int64_t> ord(n_seqs);
 	std::vector<uint8_t> has_copy(n_seqs, 0);
 	for (int i = 0; i < n_seqs; ++i) ord[i] = ord0 + i;
@@ -793,6 +796,7 @@ int aln_meth_search_batch(const bwt_t *bwt, const aln_meth_ref_t *ref, const aln
 		// window reached along two paths scores differently)
 		[&](int i, int first) {
 			if (incoming_flags && incoming_flags[i] != incoming_flags[first]) return false;
+			if (incoming_blind_partial && incoming_blind_partial[i] != incoming_blind_partial[first]) return false;
 			if (alt_bounds && (alt_bounds[i].valid != alt_bounds[first].valid ||
 					(alt_bounds[i].valid && alt_bounds[i].value != alt_bounds[first].value))) return false;
 			if (!extra) return true;

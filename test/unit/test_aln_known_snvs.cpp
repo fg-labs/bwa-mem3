@@ -2385,6 +2385,185 @@ TEST_CASE("aln_known_snvs: --meth-mapq conversion-blind counts an ALT-window row
         }
 }
 
+TEST_CASE("aln_known_snvs: ALT windows forward their lowest mirror-free path even when another row is their hit"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    // Dropping the window mirror table at finish, or forwarding only its genomic-selected path,
+    // loses D2 below. D1=17M1D33M has two genuine mismatches; D2=18M1D32M has one genuine and
+    // one mirror mismatch. Both cost 17 genomically, but D2 costs 14 mirror-free. B costs 15.
+    // With -n 3 D1 is the window's hit (CIGAR tie-break); with -n 2 neither row is a hit.
+    namespace ba = bwa_aln;
+    bwa_tests::TempDir tmp{"ks_lowest_mirror"};
+    bwa_tests::StderrCapture quiet;
+    uint32_t state = 20261123;
+    auto flank = [&]() { return aln_test::lcg_dna(state, 100); };
+    auto other_base = [](char c) { return c == 'G' ? 'A' : 'G'; };
+    std::string r = aln_test::lcg_dna(state, 50); r.replace(16, 3, "ACA");
+    std::string a = r.substr(0, 16) + "ATAA" + r.substr(19);
+    a[41] = other_base(r[40]);
+    a[31] = other_base(r[30]); // the site's REF; the ALT restores the D1/D2 fixture
+    std::string b = r; b.insert(30, std::string(1, other_base(r[30])) + other_base(other_base(r[30])));
+    const std::string fa = tmp.unique_file();
+    REQUIRE(aln_test::write_test_fasta(fa, {{"A", flank() + a + flank()}, {"B", flank() + b + flank()}}));
+    build_meth_index(fa);
+    FMI_search fmi((fa + ".meth").c_str());
+    fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, fa.c_str(), fmi.idx->bns, 1) == 0);
+    ba::ks_sites_t sites; ba::ks_windows_t windows;
+    const auto vcf = write_vcf(tmp.file("s.vcf"), {row("A", 132, a[31], std::string(1, r[30]))});
+    REQUIRE(ba::ks_load(vcf.c_str(), mr.bns, mr.pac, &sites) == 0);
+    REQUIRE(ba::ks_windows_build(&sites, mr.bns, mr.pac, 1, 1, &windows) == 0);
+    mr.known_snvs = &sites;
+    auto *gap = ba::gap_init_opt(); gap->fnr = -1; gap->seed_len = 1024;
+    ba::aln_meth_opt_t mo; mo.m.meth_mode = 1;
+    mo.m.meth_mapq = MEM_METH_MAPQ_CONVERSION_BLIND; ba::aln_meth_opt_finish(&mo);
+    const auto fq = write_fq(tmp.file("r.fq"), {{"r", r}, {"dup", r}});
+    auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+    auto *reads = ba::bwa_read_seq(input, 2, &n, BWA_MODE_COMPREAD, 0);
+    ba::bwa_seq_close(input); REQUIRE(n == 2);
+    for (int limit : {3, 2}) {
+        CAPTURE(limit);
+        gap->max_diff = limit;
+        const auto discovery = ba::ks_discovery_opt(*gap);
+        ba::aln_meth_read_t wres[2]; ba::aln_dup_state_t dup;
+        CHECK(ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 2, reads, &discovery, 1, 1, 0,
+                                      1, 1000, &dup, wres, nullptr, nullptr, true) == 1);
+        CHECK(wres[0].hits.size() == (limit == 3 ? 1 : 0));
+        CHECK(wres[1].n_lookups == 0); // even a no-hit representative must retain paths for copies
+        for (const auto &window : wres) {
+            std::vector<ba::aln_meth_candidate_t> extra;
+            ba::ks_meth_candidates(&windows, mr.bns, window, &extra);
+            const auto d2 = std::find_if(extra.begin(), extra.end(), [](const ba::aln_meth_candidate_t &c) {
+                return c.blind && c.rid == 0 && c.rb == 100 && c.cig ==
+                    std::vector<uint32_t>{18u << 4, 1u << 4 | 2, 32u << 4};
+            });
+            REQUIRE(d2 != extra.end());
+            // Exercise the main-search candidate boundary without a genomic FM search that could
+            // independently rediscover the missing path and hide a forwarding regression.
+            const int64_t bp = mr.bns->anns[1].offset + 100;
+            extra.push_back({1, 0, 1, bp, bp + 52, {30u << 4, 2u << 4 | 2, 20u << 4}});
+            ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = gap;
+            group.keep_strata = 1;
+            ba::aln_meth_slot_t slot; slot.grp = &group;
+            ba::aln_meth_read_t result;
+            ba::aln_meth_slot_start(&slot, reads, &result, 0, limit, 0); slot.extra = &extra;
+            ba::aln_meth_slot_finish(&slot);
+            CHECK(result.flags == 0); CHECK(result.blind_partial == 0);
+            CHECK(result.mirror_rows.empty()); // main search consumes the table; windows retain it
+            CHECK(result.blind_best == 14); CHECK(result.blind_c1 == 1); CHECK(result.blind_c2 == 1);
+            REQUIRE(result.main >= 0); CHECK(result.hits[result.main].rid == 1);
+            if (limit == 3) {
+                REQUIRE(result.hits.size() == 2);
+                const auto &h = result.hits[0];
+                CHECK(h.cost == 17);
+                CHECK(ba::aln_meth_blind_view(result, h, gap->s_mm).cost == 14);
+                const auto *c = ba::aln_meth_hit_cigar(result, h);
+                CHECK(std::vector<uint32_t>(c, c + h.n_cig) ==
+                      std::vector<uint32_t>{17u << 4, 1u << 4 | 2, 33u << 4});
+            } else {
+                CHECK(result.hits.size() == 1); // a blind-only row never becomes a genomic locus
+                REQUIRE(result.blind_rows.size() == 1); CHECK(result.blind_rows[0].cost == 14);
+            }
+        }
+    }
+    // A window's mirror-only candidate can lose every mirror mismatch when rescored in the
+    // genomic reference/site context. It still contributes to blind strata, never to hits.
+    gap->max_diff = 3;
+    const int64_t bp = mr.bns->anns[1].offset + 100;
+    std::vector<ba::aln_meth_candidate_t> extra = {
+        {0, 0, 1, 100, 151, {17u << 4, 1u << 4 | 2, 33u << 4}},
+        {1, 0, 1, bp, bp + 52, {30u << 4, 2u << 4 | 2, 20u << 4}, true}};
+    ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = gap;
+    group.keep_strata = 1;
+    ba::aln_meth_slot_t slot; slot.grp = &group;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_start(&slot, reads, &result, 0, 3, 0); slot.extra = &extra;
+    ba::aln_meth_slot_finish(&slot);
+    REQUIRE(result.hits.size() == 1);
+    CHECK(result.hits[0].rid == 0); CHECK(result.hits[0].cost == 17);
+    CHECK(result.c1 == 1); CHECK(result.c2 == 0);
+    CHECK(result.n_over_diff == 1); CHECK(result.n_over_seed == 0); // A's uncredited reference row
+    CHECK(result.blind_best == 15); CHECK(result.blind_c1 == 1); CHECK(result.blind_c2 == 1);
+    REQUIRE(result.blind_rows.size() == 1);
+    CHECK(result.blind_rows[0].pos == (bwtint_t)bp); CHECK(result.blind_rows[0].cost == 15);
+    CHECK(result.blind_rows[0].n_mm == 0);
+    ba::bwa_free_read_seq(2, reads); free(gap);
+    ba::ks_windows_free(&windows); ba::aln_meth_ref_free(&mr);
+}
+
+TEST_CASE("aln_known_snvs: an ALT window's mirror table keeps only rows that cover its site"
+          * doctest::test_suite("unit/aln_known_snvs")) {
+    // U=50M and G (one deletion in the A run) both start at 100. U ends at 150, before the site; G
+    // ends at 151 and covers it, so only G can be forwarded (ks_meth_candidates drops a row that
+    // misses its site). U is the cheaper row of the locus, so the genomic hit misses the site: the
+    // window forwards a path for that locus only if G holds the mirror table's entry. That holds
+    // whether both rows carry a mirror mismatch (read C over reference T at 10) or neither does.
+    namespace ba = bwa_aln;
+    for (const bool mirror : {true, false}) {
+        CAPTURE(mirror);
+        bwa_tests::TempDir tmp{"ks_mirror_site"};
+        bwa_tests::StderrCapture quiet;
+        uint32_t state = 20261127;
+        auto flank = [&]() { return aln_test::lcg_dna(state, 100); };
+        std::string r = aln_test::lcg_dna(state, 50);
+        r[10] = 'C'; r[39] = 'G';
+        r.replace(40, 10, std::string(10, 'A'));
+        std::string a = r + "G"; // the site's REF at 150; its ALT A extends the A run
+        if (mirror) a[10] = 'T';
+        const std::string fa = tmp.unique_file();
+        REQUIRE(aln_test::write_test_fasta(fa, {{"A", flank() + a + "C" + flank()}}));
+        build_meth_index(fa);
+        FMI_search fmi((fa + ".meth").c_str());
+        fmi.load_index(false, 1, false, BWAMEM_HUGETLB_OFF, false);
+        ba::aln_meth_ref_t mr;
+        REQUIRE(ba::aln_meth_ref_load(&mr, fa.c_str(), fmi.idx->bns, 1) == 0);
+        ba::ks_sites_t sites; ba::ks_windows_t windows;
+        const auto vcf = write_vcf(tmp.file("s.vcf"), {row("A", 151, 'G', "A")});
+        REQUIRE(ba::ks_load(vcf.c_str(), mr.bns, mr.pac, &sites) == 0);
+        REQUIRE(ba::ks_windows_build(&sites, mr.bns, mr.pac, 1, 1, &windows) == 0);
+        mr.known_snvs = &sites;
+        auto *gap = ba::gap_init_opt(); gap->fnr = -1; gap->seed_len = 1024; gap->max_diff = 2;
+        ba::aln_meth_opt_t mo; mo.m.meth_mode = 1;
+        mo.m.meth_mapq = MEM_METH_MAPQ_CONVERSION_BLIND; ba::aln_meth_opt_finish(&mo);
+        const auto fq = write_fq(tmp.file("r.fq"), {{"r", r}});
+        auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+        auto *reads = ba::bwa_read_seq(input, 1, &n, BWA_MODE_COMPREAD, 0);
+        ba::bwa_seq_close(input); REQUIRE(n == 1);
+        const auto discovery = ba::ks_discovery_opt(*gap);
+        ba::aln_meth_read_t wres; ba::aln_dup_state_t dup;
+        CHECK(ba::aln_meth_search_batch(windows.bwt, windows.mref, &mo, 1, reads, &discovery, 1, 1, 0,
+                                        1, 1000, &dup, &wres, nullptr, nullptr, true) == 0); // no duplicates
+        CHECK(wres.blind_partial == 0);
+        std::vector<ba::aln_meth_candidate_t> extra;
+        ba::ks_meth_candidates(&windows, mr.bns, wres, &extra);
+        // every retained window row is forwardable
+        CHECK(std::count_if(extra.begin(), extra.end(), [](const ba::aln_meth_candidate_t &c) { return c.blind; })
+              == (std::ptrdiff_t)wres.mirror_rows.size());
+        // U is the window's genomic hit, on the forward strand; G is the same locus (strand, copy)
+        const auto u = std::find_if(wres.hits.begin(), wres.hits.end(), [](const ba::aln_meth_hit_t &h) { return h.strand == 0; });
+        REQUIRE(u != wres.hits.end());
+        const auto g = std::find_if(extra.begin(), extra.end(), [&](const ba::aln_meth_candidate_t &c) {
+            return c.blind && c.rid == 0 && c.strand == 0 && c.hyp == (int)u->hyp && c.rb == 100 && c.re == 151;
+        });
+        REQUIRE(g != extra.end());
+        // G's path is 50 read bases over 51 reference bases with its one deletion inside the A run
+        // (read offsets 40-49), not merely a row with G's bounds.
+        int read_bases = 0, deletions = 0, del_at = -1;
+        for (const uint32_t op : g->cig) {
+            const int o = op & 15, l = (int)(op >> 4);
+            if (o == 0) read_bases += l;
+            else if (o == 2) { deletions += l; del_at = read_bases; }
+            else FAIL("unexpected CIGAR operation in G's path");
+        }
+        CHECK(read_bases == 50);
+        CHECK(deletions == 1);
+        CHECK(del_at >= 40);
+        CHECK(del_at <= 50);
+        ba::bwa_free_read_seq(1, reads); free(gap);
+        ba::ks_windows_free(&windows); ba::aln_meth_ref_free(&mr);
+    }
+}
+
 TEST_CASE("aln_known_snvs: --meth an ALT-window hit's soft-clipped insertion is scored as its search path"
           * doctest::test_suite("unit/aln_known_snvs")) {
     bwa_tests::TempDir tmp{"ks_meth_retry"}; const std::string dir = tmp.path();

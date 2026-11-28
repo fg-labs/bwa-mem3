@@ -35,8 +35,9 @@ enum mem_meth_scoring { MEM_METH_SCORING_COLLAPSED = 0, MEM_METH_SCORING_GENOMIC
  *   CONVERSION_BLIND: MAPQ is capped at what the same scoring gives with the mirror cell
  *                     (read C x reference T on the C->T strand, read G x reference A on the G->A
  *                     strand) freed as a conversion, at the same penalties: each locus at its
- *                     scoring alignment's cost less one mismatch penalty per mirror mismatch
- *                     (exact for an ungapped locus; a gapped one is not realigned). Under genomic
+ *                     cheapest row with the mirror cell free among the rows the search scored
+ *                     there (the row collapsed keeps; at a --known-snvs ALT window the rows come
+ *                     from the window search's own selection, so one can be missing). Under genomic
  *                     scoring a retained (methylated) C otherwise makes a short read look unique,
  *                     so a MAPQ filter selects methylated molecules and inflates CpG methylation.
  *                     Placement, CIGAR and the other tags stay the scoring model's. Resolved by

@@ -24,6 +24,19 @@ Under `--known-snvs` the cap also counts an ALT-window placement that `-n` (or `
 its mirror mismatches, as `collapsed` does, so it can lower MAPQ and the `XV:Z` twin MAPQ
 further. A newly capped record gains `YQ:i`; an existing `YQ:i` still holds the uncapped MAPQ.
 No other field changes ([PR #820](https://github.com/fg-labs/bwa-mem3/pull/820)).
+The cap takes each locus at its cheapest row with the mirror cell free among the rows available
+to it (`collapsed`'s order over those rows), not at the row the `genomic` search keeps there,
+including retained mirror-free rows from ALT-window searches. A separate `collapsed` run need not
+keep the same row: at an ALT window without a search path, `genomic` realignment can omit the row
+that run would keep. Where a locus has several rows, the cap can differ from that of
+earlier versions ([PR #821](https://github.com/fg-labs/bwa-mem3/pull/821)).
+For complete mapped pairs, the shadow also excludes genomic hits outside the mirror-free score
+cut and evaluates pairing when mirror-free counts fit `--max-occ`, even when genomic counts do
+not. Fitting `--max-occ` is not enough on its own: both ends' mirror-free strata must be known
+(no partial mirror table) and every row the shadow admits must have a cost that fits the
+pairing's score field; otherwise both caps are 0, even for a complete genomic pair. These corrections can change MAPQ, the presence of `YQ:i`, and the `XV:Z` twin MAPQ; other
+fields are unchanged. The shadow still starts from the `genomic` single-end selections, uses
+its insert-size estimate, and does not replay mate rescue, so it is not a full collapsed run.
 
 Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read whose pending
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,
