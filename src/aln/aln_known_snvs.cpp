@@ -1257,11 +1257,28 @@ int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs,
 {
 	std::vector<aln_meth_extra_t> extra;
 	if (o->ks_windows) {
+		// The cap: a probe of the main search (aln_meth_probe_batch, its exact stratum and a few
+		// verified rows) gives a read with such a row an upper bound U on its final best, and its
+		// window search starts from the seed U + M (ks_meth_window_seed), so it stops at U + 2M: a
+		// read whose own search stops on -R retains reference rows within B + M that only a window
+		// holds, at up to U + 2M there, for pairing and for single-end XA alike. A read with no probe
+		// row, a read that does not fit an ALT window, and every read under --meth-context cpg run
+		// their window search uncapped. Under -N or a negative penalty the window search takes no
+		// score cut, so there is no probe.
+		const gap_opt_t &g = o->gap;
+		const bool cpg = o->meth->m.meth_context == METH_CTX_CPG;
+		std::vector<int64_t> caps;
+		if (aln_meth_takes_cuts(&g) && !cpg) {
+			caps.assign((size_t)n, INT64_MAX);
+			aln_meth_probe_batch(bwt, o->meth_ref, o->meth, n, seqs, &g, g.n_threads, read_no, ord, caps.data());
+			for (int i = 0; i < n; ++i) caps[i] = ks_meth_window_seed(caps[i], seqs[i].len, &g, cpg);
+		}
 		// The ALT-window search runs with the read's own options: as a candidate generator
 		// (aln_meth_boundary_gen) it takes only the cuts that hold for any final best.
 		std::vector<aln_meth_read_t> windows(n);
-		aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n, seqs, &o->gap,
-							  o->gap.n_threads, read_no, ord, 1, o->max_xa_hits, window_dup, windows.data());
+		aln_meth_search_batch(o->ks_windows->bwt, o->ks_windows->mref, o->meth, n, seqs, &g, g.n_threads, read_no,
+							  ord, 1, o->max_xa_hits, window_dup, windows.data(), nullptr,
+							  caps.empty() ? nullptr : caps.data());
 		extra.resize(n);
 		for (int i = 0; i < n; ++i) ks_meth_candidates(o->ks_windows, o->meth_ref->bns, windows[i], &extra[i]);
 	}

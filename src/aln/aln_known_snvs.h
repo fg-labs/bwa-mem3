@@ -60,6 +60,41 @@ static inline bool ks_fits_window(int64_t len, const gap_opt_t *opt)
 	return len + (opt->max_gapo > 1 ? opt->max_gapo - 1 : 0) + (opt->max_gape > 0 ? opt->max_gape : 0) <= KS_WINDOW_HALF;
 }
 
+/* --known-snvs under --meth: the seed (starting best) of a read's ALT-window search, from upper, an
+ * upper bound U on the read's final best B_f (its probe's cheapest verified row, INT64_MAX: none).
+ * Every capped read, single-end or paired, takes U + M, so its window search stops at U + 2M. The
+ * read then finishes as with a window search that ran uncapped to its own stop:
+ * - B_f <= U. The probe's rows are the first rows of the main search's first hit (its exact
+ *   stratum), and the main search looks up at least as many of them (aln_meth_flush_parked).
+ * - The read retains only rows within B_f + M <= U + M (the finish's score cut), each scored on the
+ *   reference or with one site's ALT in place. A window is the reference with one site's ALT in
+ *   place, so a row costs the same there as with that ALT credited, and within M of its cost on the
+ *   reference: one column differs.
+ * - So a retained row credited an ALT costs at most U + M in that ALT's window, and a retained
+ *   reference row over a site at most U + 2M in that site's window: the window search reaches both.
+ * - A window row above U + 2M gives no retained row. It costs more than U + M on the reference. With
+ *   another site's ALT credited it could cost U + M or less, but that site's window then holds it at
+ *   that cost (the read fits its windows), so the window search's own best is at most U + M and its
+ *   cut at most U + 2M: it never kept the row. Without such rows the retained rows are the same, and
+ *   so are X0, X1, XA and the rows pairing uses.
+ * - The capped search is complete below min(U + M, its own best) + M + 1, above every cost the
+ *   finish audit asks for (B_f + M), so the cap adds no audit failure. It does less work than an
+ *   uncapped search, so it can finish within -m where that one runs out and leaves the read
+ *   incomplete.
+ * A seed of U (a stop at U + M) holds only for a read whose own search completes, since that search
+ * proposes its reference rows itself. A search that stops on -R keeps only the rows it found and the
+ * window search's, and both paired-end pairing and single-end XA output use a reference row within
+ * B_f + M that only a window holds, at up to U + 2M.
+ * A read that does not fit an ALT window (ks_fits_window) can cover a site outside that site's
+ * window, so it can need a row that only another site's window holds, at up to 2M more; under
+ * --meth-context cpg an ALT can relabel its neighbour's CpG, changing two columns. Both run
+ * uncapped (INT64_MAX), as does a read with no bound. */
+static inline int64_t ks_meth_window_seed(int64_t upper, int len, const gap_opt_t *opt, bool cpg)
+{
+	if (upper == INT64_MAX || cpg || !ks_fits_window(len, opt)) return INT64_MAX;
+	return upper + opt->s_mm;
+}
+
 /* One ALT window: the reference [beg, beg + len) of contig rid with the ALT of one site in place. */
 struct ks_window_t {
 	int rid;
@@ -123,8 +158,9 @@ struct aln_meth_read_t;
  * [0, n) searched on the ALT-window index, a candidate generator, then on the converted index
  * `bwt` with each read's window candidates (aln_meth_extra_t: rows, horizon and flags), scored
  * before its first step. A read whose window search stopped below the costs it retains is
- * reported incomplete with the window search's flags (the finish-time audit). Arguments and the
- * return value are aln_meth_search_batch's; window_dup is the window search's duplicate state. */
+ * reported incomplete with the window search's flags (the finish-time audit). The window search is
+ * capped from a probe of the main search (ks_meth_window_seed). Arguments and the return value are
+ * aln_meth_search_batch's; window_dup is the window search's duplicate state. */
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res);
 
