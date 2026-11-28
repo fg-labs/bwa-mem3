@@ -39,7 +39,8 @@
 # for both ends of a pair (each with scoring's MAPQ in YQ:i); past a mirror-free run's own -R stop
 # the strata are that run's (a hit it never reaches stays out of the shadow pairing, and the mate is
 # not capped to 0); with the cuts conversion-blind leaves every field but MAPQ and YQ:i as scoring
-# has it, across penalties and -m limits (blind-genomic-identity); and the option's refusals.
+# has it, across penalties and -m limits (blind-genomic-identity), and for single-end reads that
+# end on a saturation certificate (blind-certificate); and the option's refusals.
 #
 # Env:
 #   BWA_MEM3  the binary (default: the repository's ./bwa-mem3)
@@ -589,7 +590,7 @@ run need.scoring --meth --meth-mapq scoring -n 5 "$tmp/need.fa" "$tmp/need.fq"
 run need.blind --meth -n 5 -v 4 "$tmp/need.fa" "$tmp/need.fq"
 expect need-scoring "$tmp/need.scoring.sum" "need 0 g 401 37 -"
 expect need-conversion-blind "$tmp/need.blind.sum" "need 0 g 401 0 37"
-grep -qF '; 1 with mirror-free strata the cuts may have pruned;' "$tmp/need.blind.err" || {
+grep -qF '; 1 with mirror-free strata the cuts may have pruned or a certificate left incomplete;' "$tmp/need.blind.err" || {
     echo "FAIL: need: the read's mirror-free strata are not marked as possibly pruned" >&2
     exit 1
 }
@@ -750,6 +751,60 @@ for pen in '-M 5 -O 3 -E 1' '-e 3 -E 1'; do
     done
 done
 echo 'PASS: blind-genomic-identity'
+
+# A single-end read can end on a saturation certificate, and does so in both modes: the cap only
+# observes the search. On the same reference, read 1 alone at -R 5 has reads with more than five
+# best copies (repeat certificates: XT:A:R, X0 over -R, MAPQ 0). Every field but MAPQ and YQ:i
+# is still scoring's, no MAPQ rises, and a certified repeat keeps MAPQ 0 with no YQ:i (the cap
+# has nothing to lower, whether or not the mirror-free strata are known where the read ends).
+for pen in '' '-M 5 -O 3 -E 1'; do
+    # shellcheck disable=SC2086 # pen is a list of options
+    run cert.scoring --meth --meth-mapq scoring -v 4 -R 5 $pen "$tmp/rep.fa" "$tmp/rep1.fq"
+    # shellcheck disable=SC2086
+    run cert.blind --meth -v 4 -R 5 $pen "$tmp/rep.fa" "$tmp/rep1.fq"
+    for mode in scoring blind; do
+        grep -qE '; [1-9][0-9]* repeat certificates;' "$tmp/cert.$mode.err" || {
+            echo "FAIL: blind-certificate ($pen): $mode does not reach a repeat certificate" >&2
+            exit 1
+        }
+        [ "$(wc -l < "$tmp/cert.$mode.rec")" -eq 60 ] || {
+            echo "FAIL: blind-certificate ($pen): $mode does not give 60 records" >&2
+            exit 1
+        }
+    done
+    same_outside_mapq "blind-certificate ($pen)" "$tmp/cert.blind.rec" "$tmp/cert.scoring.rec"
+    paste -d ' ' "$tmp/cert.blind.sum" "$tmp/cert.scoring.sum" | awk '$5 > $11 { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' || {
+        echo "FAIL: blind-certificate ($pen): a conversion-blind MAPQ is above scoring's" >&2
+        exit 1
+    }
+    # name, MAPQ and YQ (or -) of the repeats past -R
+    repeats() {
+        awk '{
+            x0 = 0; rep = 0; yq = "-"
+            for (i = 12; i <= NF; ++i) {
+                if (index($i, "X0:i:") == 1) x0 = substr($i, 6) + 0
+                if ($i == "XT:A:R") rep = 1
+                if (index($i, "YQ:i:") == 1) yq = substr($i, 6)
+            }
+            if (rep && x0 > 5) print $1, $5, yq
+        }' "$1"
+    }
+    repeats "$tmp/cert.scoring.rec" > "$tmp/cert.scoring.rep"
+    repeats "$tmp/cert.blind.rec" > "$tmp/cert.blind.rep"
+    [ -s "$tmp/cert.scoring.rep" ] || {
+        echo "FAIL: blind-certificate ($pen): no read is a repeat past -R" >&2
+        exit 1
+    }
+    awk '$2 != 0 || $3 != "-" { bad = 1; print "  " $0 > "/dev/stderr" } END { exit bad }' "$tmp/cert.scoring.rep" "$tmp/cert.blind.rep" || {
+        echo "FAIL: blind-certificate ($pen): a certified repeat has a MAPQ above 0 or a YQ:i" >&2
+        exit 1
+    }
+    cmp "$tmp/cert.scoring.rep" "$tmp/cert.blind.rep" || {
+        echo "FAIL: blind-certificate ($pen): the certified repeats differ between the modes" >&2
+        exit 1
+    }
+done
+echo 'PASS: blind-certificate'
 
 # The default is scoring outside em-seq genomic; collapsed accepts conversion-blind (a no-op).
 for args in '--meth --meth-scoring collapsed' '--meth=taps' '--meth=5base' '--meth --meth-scoring neutral'; do

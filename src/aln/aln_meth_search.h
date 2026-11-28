@@ -131,8 +131,29 @@ struct aln_meth_mirror_key_t {
 struct aln_meth_group_t;
 enum { ALN_METH_KEEP_STRATA = 1, ALN_METH_KEEP_COPIES = 2 }; // aln_meth_slot_t::keep
 // aln_meth_slot_t::stop: why a read stopped resolving windows (0 while it has not); TOP2 is
-// stock's -R stop under the cut (aln_meth_boundary)
-enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2, ALN_METH_STOP_TOP2 = 3 };
+// stock's -R stop under the cut (aln_meth_boundary), CERT a saturation certificate (a read with
+// aln_meth_slot_t::cert; one that gives up incomplete instead stops with LOOKUP)
+enum { ALN_METH_STOP_CIGAR = 1, ALN_METH_STOP_LOOKUP = 2, ALN_METH_STOP_TOP2 = 3, ALN_METH_STOP_CERT = 4 };
+// Once the best stratum closes, only retained worse loci can change the certificate counts.
+// Store mutations update their old/new contribution; a best-row mutation invalidates the snapshot.
+struct aln_meth_cert_counts_t {
+    int64_t best = INT64_MAX, ceiling = INT64_MAX, cut = INT64_MAX;
+    long c1 = 0, worse = 0;
+    int fewest = INT_MAX, only_mm = 0;
+    size_t n_occ = 0;
+    bool ready = false, gape = false;
+    int nb = 0; // Bounded by the CIGAR budget; placed in the snapshot's existing padding.
+
+    void update(const aln_meth_occ_t *before, const aln_meth_occ_t &after, size_t size) {
+        if (!ready) return;
+        if (after.cost <= best || (before && before->cost <= best)) { ready = false; return; }
+        auto retained = [&](const aln_meth_occ_t &o) {
+            return !o.drawn && o.cost <= cut && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
+        };
+        worse += (int)retained(after) - (int)(before && retained(*before));
+        n_occ = size;
+    }
+};
 struct aln_meth_slot_t {
     aln_meth_group_t *grp = nullptr;
     gap_job_t *job = nullptr;
@@ -150,13 +171,20 @@ struct aln_meth_slot_t {
     // need_next: the score at which the cuts first applied (the best stratum complete), -1 before;
     // top2_next: the same for a mirror-free run (its best stratum complete), whose -R stop
     // blind_note_top2 checks there; blind_need: the mirror-free strata could miss a row the cuts
-    // prune (blind_note_need), so they are not known. mf_best: the lowest mirror-free cost of a row
+    // prune (blind_note_need) or a certificate leaves unresolved (blind_note_cert), so they are not
+    // known. mf_best: the lowest mirror-free cost of a row
     // in the mirror table (store_mirror_row); the mirror-free best so far is the lower of it and
     // best. mf_stop: a mirror-free run stopped on -R where this search goes on, and mf_occ and
     // mf_mirror hold the rows it had resolved there (res->occ and res->mirror_rows then), from
     // which meth_blind_strata takes the strata; the mirror table is not kept past that point.
     int cut = 0, flushed = 0, blind = 0, need_next = -1, top2_next = -1, blind_need = 0, mf_stop = 0;
     int64_t best = INT64_MAX, mf_best = INT64_MAX;
+    // cert: rows are verified stratum by stratum and certificates end the read once its best
+    // stratum is complete (single-end, under cut). ivs: every hit flushed, for the draw.
+    int cert = 0;
+    aln_meth_cert_counts_t cert_counts;
+    std::vector<aln_meth_pend_t> ivs;
+    uint64_t perm_rng = 0;
     uint64_t rng = 0, alignment_bytes = 0;
     int64_t unrep_cost = INT64_MAX; // the lowest cost of a refined window dropped as unrepresentable
     // Gap lists of the search's paths with more than one gap, ALN_METH_MAX_GAPS words each (see
@@ -183,6 +211,8 @@ struct aln_meth_slot_t {
     // --known-snvs: candidate windows from the ALT-window search, resolved before the read finishes
     const std::vector<aln_meth_candidate_t> *extra = nullptr;
     aln_meth_alt_bound_t alt_bound; // ALT-index lower bound (aln_meth_alt_certificate), not the genomic width
+    // the ordinals of the read's duplicate copies (their draws are made here, aln_meth_slot_finish)
+    const std::vector<int64_t> *copy_ords = nullptr;
     // Scratch: the reference window of the candidate being resolved (refined, then accounted), and
     // the ambiguity bits of a row's window (score_path).
     std::vector<uint8_t> win;
@@ -213,7 +243,8 @@ static inline bool aln_meth_stop_eligible(const aln_meth_slot_t *x) {
 }
 bool aln_meth_can_stop(const aln_meth_slot_t *, int next_score);
 // Applies stock aln's cuts at a score boundary, for a search whose next entry has score next:
-// see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop).
+// see aln_meth.cpp. Returns 1 when the read is done (stock's -R stop, or for a certificate read a
+// certificate, aln_meth_certify).
 int aln_meth_boundary(aln_meth_slot_t *, int next);
 // Keep batches bounded. Under the cut, flush at the first hit and at every boundary; otherwise
 // refine score boundaries only when stopping is possible.
@@ -223,8 +254,9 @@ static inline int aln_meth_needs_flush(aln_meth_slot_t *x, int score) {
         if (!x->pend.empty()) return !x->flushed || score > x->flushed_score;
         if (score <= x->flushed_score) return 0;
         x->flushed_score = score;
+        // a certificate read's boundary sets its own stop (aln_meth_certify)
         return (x->best != INT64_MAX || x->mf_best != INT64_MAX) && aln_meth_boundary(x, score)
-            && (x->stop = ALN_METH_STOP_TOP2);
+            && (x->stop || (x->stop = ALN_METH_STOP_TOP2));
     }
     if (score <= x->flushed_score) return 0;
     if (aln_meth_stop_eligible(x)) return 1;
@@ -281,8 +313,10 @@ void aln_meth_redraw_hits(aln_meth_read_t *, uint64_t);
  * loci stored as hits): every field but the work counters is copied and the main hit is redrawn
  * with rng among src's best hits. Unless keep_all, a result aln_meth_trim(max_xa_hits) would cut
  * to its main hit gets only that hit (any max_xa_hits < 0 prints no XA, so it always does). src is
- * unchanged on return. */
-void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng, int keep_all, int max_xa_hits);
+ * unchanged on return. ord: the copy's ordinal; a copy src's search drew for (a repeat
+ * certificate's copy_draw) takes that draw instead. */
+void aln_meth_copy_dup(aln_meth_read_t *dst, aln_meth_read_t *src, uint64_t rng, int keep_all, int max_xa_hits,
+                       int64_t ord = -1);
 uint64_t aln_meth_draw_seed(const aln_meth_ref_t *, int, int64_t);
 void aln_meth_flush_parked(aln_meth_group_t *);
 }

@@ -40,6 +40,8 @@ struct aln_meth_opt_t {
 	int p_second = 500;             // second component of the single total budget
 	int8_t mat_ot[25], mat_ob[25], mat7_ot[49], mat7_ob[49];
 	aln_meth_fast_t fast; // set by aln_meth_opt_finish
+	// The row budget of a read verified with saturation certificates: the ordinary total, p_best + p_second.
+	int cert_budget = 4096 + 500;
 };
 
 /* Builds the matrices (meth_fill_mats on aln's base matrix); call once the options are final. */
@@ -98,6 +100,7 @@ struct aln_meth_occ_t {
     int n_mirror = 0;      // mismatches in the mirror cell (OT read C x ref T, OB read G x ref A); in n_mm
     int alt = 0;           // --known-snvs: the credited site allele as ks_site_rel gives it (0: none)
     int64_t ks_site = -1;  // --known-snvs: the credited site allele (aln_site_key), or -1
+    int drawn = 0; // a repeat's drawn primary (or a copy's), not a verified row: kept, not counted
     int64_t cost = 0;
     aln_meth_alignment_t alignment;
 };
@@ -139,6 +142,15 @@ struct aln_meth_alt_bound_t {
     int value = 0;
     bool valid = false;
 };
+/* A complete read whose row work ended on a saturation certificate (aln_meth_read_t::cert), taken
+ * once its best stratum is complete: REPEAT, more than -R loci at the best cost (fewest conversions
+ * under the tie-break): X0 their full count, X1 omitted, MAPQ 0 with multiple best loci (a single
+ * best can certify at -R 0 with positive stock MAPQ). CROWDED, a unique best and at least
+ * ALN_METH_CROWDED retained worse loci: X1 is a lower bound, XA omitted, MAPQ 0. SATURATED, at least
+ * ALN_METH_SAT_ROWS best-cost loci under the conversion tie-break: exact X0, omitted X1/XA,
+ * stock MAPQ 0, and the usual primary draw among the fewest-conversion winners. */
+enum { ALN_METH_CERT_REPEAT = 1, ALN_METH_CERT_CROWDED = 2, ALN_METH_CERT_SATURATED = 3 };
+enum { ALN_METH_CROWDED = 255, ALN_METH_SAT_ROWS = 179 };
 struct aln_meth_read_t {
     // The search's candidate loci; finishing the read moves the retained ones to hits and frees it.
     std::vector<aln_meth_occ_t> occ;
@@ -207,7 +219,8 @@ struct aln_meth_read_t {
     // end's conversion-blind cap is 0.
     int blind_partial = 0;
     // Under the stock cuts the search may have pruned a row of the mirror-free strata
-    // (blind_note_need), or it went on past a mirror-free -R stop and was then left incomplete
+    // (blind_note_need), a saturation certificate ended the read before one was resolved
+    // (blind_note_cert), or it went on past a mirror-free -R stop and was then left incomplete
     // (meth_blind_strata), so they are not known: the conversion-blind cap is 0, for both ends of
     // a pair.
     int blind_incomplete = 0;
@@ -218,6 +231,11 @@ struct aln_meth_read_t {
     // The MAPQ cap the record's end carries to emission (255: none), and the MAPQ it replaced
     // when the cap lowered it (YQ:i), else -1.
     int blind_cap = 255, yq = -1;
+    int cert = 0; // ALN_METH_CERT_*: the certificate that ended a complete read's row work, or 0
+    // A repeat certificate's draws for the read's duplicate copies (each its own search's draw):
+    // the copy's ordinal and its main locus, which is among hits; in ascending ordinal.
+    struct copy_draw_t { int64_t ord; int rid, hyp, strand; bwtint_t pos; };
+    std::vector<copy_draw_t> copy_draw;
 };
 /* The stop certificate a read's ALT-window search gives its genomic search: a lower bound on the
  * mismatches of every ungapped placement that covers a site with that site's ALT in place. A

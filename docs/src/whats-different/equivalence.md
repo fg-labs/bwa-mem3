@@ -106,16 +106,25 @@ decides whether they can have pruned a row that selection needs (the mirror-free
 more differences than the genomic best when the genomic best is gapped, or a `-R` stop can come
 before the mirror-free strata are complete); if so, the cap is 0, for both ends of a pair. Where a
 mirror-free run's own `-R` stop comes before the search's, the selection is taken from the rows
-resolved at that stop, which are the mirror-free run's. The
+resolved at that stop, which are the mirror-free run's. A single-end read that ends on a
+saturation certificate ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)) ends there in both
+modes; the cap is 0 unless that selection is complete there, and such a read's MAPQ is 0 already
+unless it is a repeat with one best locus (`-R` below 1). The
 paired-end mirror-free pairing uses only the loci of that selection, and runs even where an end's
-stock loci exceed `--max-occ` (so stock pairing does not) but its loci in that selection do not. Measured on a chr22 EM-seq
-simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
+stock loci exceed `--max-occ` (so stock pairing does not) but its loci in that selection do not.
+
+**Historical measurements:** the following chr22 results predate both the best-stratum-complete
+certificate rule and the revised 179-locus count-reporting contract in #786. Their zero-cap counts, MAPQ and
+record-agreement results describe those earlier builds, not validation of the revised behavior.
+Measured on a chr22 EM-seq simulation (40,000 reads or pairs per run, 40 and 150 bp, single and paired end; Apple M2 Max,
 macOS arm64, NEON, clang 21): every field outside `MAPQ` and `YQ:i` matched `--meth-mapq scoring`
 at the default penalties and with `-M 5 -O 3 -E 1`, `-M 1 -O 3 -E 1`, `-M 2 -O 5 -E 2`, `-e 3`,
 `-e 3 -E 1`, `-R 1`, `-R 2`, `-n 8`, `-l 32 -k 0`, `-m 300`, `-N` and `-M 0`, and no conversion-blind MAPQ
-was above `scoring`'s. At the default penalties 2 of 40,000 reads at 40 bp single end and 6 of 40,000
+was above `scoring`'s. At the default penalties 17 of 40,000 reads at 40 bp single end and 6 of 40,000
 pairs at 40 bp had their cap set to 0 for strata the search may have left incomplete (none at 150 bp);
-at `-M 5 -O 3 -E 1`, 7 and 16, and 2 of 40,000 pairs at 150 bp. Reads whose mirror-free best has more
+at `-M 5 -O 3 -E 1`, 34 and 16, and 2 of 40,000 pairs at 150 bp. The single-end counts were 2 and 7
+before saturation certificates ([#786](https://github.com/fg-labs/bwa-mem3/pull/786)); the added
+reads had MAPQ 0 already, and the cap lowered the same records as before (728 and 1,108). Reads whose mirror-free best has more
 than `-R` loci, where a mirror-free run stops but the search goes on, are no longer among them: their
 caps come from the rows resolved at that stop. Against `--meth-scoring collapsed` itself, no
 conversion-blind MAPQ was above `collapsed`'s at the same placement in any of those runs, single
@@ -136,6 +145,37 @@ still contributes when the pair is otherwise eligible; a pair `--known-snvs` exc
 collapsed estimate (an ALT-credited pair) contributes neither end. Correcting this floor can change the collapsed estimate or its previous-batch
 fallback, and thus other pairs' conversion-blind MAPQs and known-SNV twin MAPQs. The genomic
 estimate and the ordinary read-length floor are unchanged.
+
+Since [#786](https://github.com/fg-labs/bwa-mem3/pull/786), a single-end `aln --meth` read that
+takes those cuts verifies its rows stratum by stratum and can end on a saturation certificate
+only once its best stratum is complete (so the best loci and stock's top-2 difference ceiling
+are final): a *repeat* (more than `-R` best loci, using the fewest conversions under the TAPS/5base
+tie-break) or a *crowded* read (a unique best with at least 255 retained worse loci, excluding
+stock's full-`-n` MAPQ-25 case). See [`aln`](../cli/aln.md) for the conditions. A repeat reports the
+full best count in `X0` with no `X1`. Its MAPQ is 0 with multiple best loci; at `-R 0`, one best
+locus can certify with positive stock MAPQ. Its primary (`POS`, `CIGAR`, strand) is selected by
+rejection sampling over eligible best rows, with a reservoir draw among retained best loci after
+256 unsuccessful attempts. A crowded read has MAPQ 0 and reports the verified count in `X1`
+(a lower bound); its `XA` is omitted regardless of the XA cap, since unverified worse loci could
+leave it partial. A separate *saturated* certificate can end a TAPS/5base neutral search with at
+least 179 retained best-cost loci, after the ordinary repeat/crowded predicates. It retains exact
+`X0` and the fewest-conversion primary set, but omits `X1` and `XA` regardless of the XA cap:
+MAPQ saturation alone does not finalize a worse-locus count. The internal counts still give
+MAPQ 0 through the stock formula, without an incomplete flag or a forced-MAPQ path. Its primary
+is a reservoir draw among the fully verified conversion winners, not the earlier 179-as-repeat
+rejection draw, so the same seed need not reproduce that revision's primary position or derived
+tags. It is counted separately from repeat, crowded and incomplete reads. Conversion-blind is
+not accepted for the TAPS/neutral scoring this kind requires. An unfinished best stratum can
+also change the conversion winner and either count, so incomplete reads do not claim `X0` or
+`X1` even as lower bounds.
+Certificate-enabled reads keep the 4,596-row lookup budget; it marks a read incomplete when
+required work remains, not merely when the final interval fills it exactly. A read that no
+certificate can end within the budget's remainder binds early, as reads without certificates do:
+at most 64 more rows, taken in the order its hits were found, then incomplete at MAPQ 0. Earlier
+CPU, incomplete-read and simulated-truth measurements predate this revision and are not current
+performance claims.
+Paired-end `--meth` input keeps the previous search and is unchanged. Output without `--meth`
+is byte-identical.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
