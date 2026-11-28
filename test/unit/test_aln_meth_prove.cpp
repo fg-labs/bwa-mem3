@@ -111,6 +111,95 @@ TEST_CASE("aln_meth_prove: the banded edit distance equals full dynamic programm
     }
 }
 
+// Independent full matrix oracle: no rolling diagonals or early termination.
+static int masked_band_oracle(const std::vector<uint8_t> &q, const std::vector<uint8_t> &text,
+                              int lo, int hi, bool free_start, int limit)
+{
+    const int n = (int)q.size(), m = (int)text.size(), inf = 1000000;
+    static std::vector<int> cells; // one flat (n + 1) x (m + 1) matrix, reused across calls
+    cells.assign((size_t)(n + 1) * (m + 1), inf);
+    auto d = [&](int a, int b) -> int & { return cells[(size_t)a * (m + 1) + b]; };
+    for (int b = 0; b <= m; ++b)
+        if (lo <= b && b <= hi) d(0, b) = free_start ? 0 : b;
+    for (int a = 1; a <= n; ++a) {
+        for (int b = 0; b <= m; ++b) {
+            if (b - a < lo || b - a > hi) continue;
+            d(a, b) = d(a - 1, b) + 1;
+            if (b) d(a, b) = std::min({d(a, b), d(a, b - 1) + 1,
+                d(a - 1, b - 1) + (q[a - 1] < 4 && (text[b - 1] >> q[a - 1] & 1) ? 0 : 1)});
+        }
+    }
+    return std::min(*std::min_element(cells.end() - (m + 1), cells.end()), limit + 1);
+}
+
+TEST_CASE("aln_meth_prove: the bit-parallel banded edit distance equals the cell-by-cell one")
+{
+    Rng rng(13);
+    std::vector<int16_t> dp;
+    ba::aln_meth_verify_scratch_t s;
+    long below = 0, above = 0;
+    for (int t = 0; t < 4000; ++t) { // a bounded sample: the unit budget is ~100 ms per case
+        const int n = rng.below(90), m = rng.below(160), kmax = rng.below(t % 7 == 0 ? 32 : 10);
+        std::vector<uint8_t> q(n), tm(m);
+        for (auto &c : q) c = (uint8_t)(rng.below(25) == 0 ? 4 : rng.below(4));
+        for (auto &b : tm) { // mostly one base; some converted-copy pairs and some ambiguous runs
+            const int r = rng.below(20);
+            b = r == 0 ? (uint8_t)0xf : r <= 2 ? (uint8_t)(1 << 1 | 1 << 3) : r == 3 ? (uint8_t)(1 << 0 | 1 << 2) : (uint8_t)(1 << rng.below(4));
+        }
+        if (rng.below(3) && n > 0) { // a near copy of the query somewhere in the text
+            const int at = rng.below(m + 1);
+            for (int a = 0; a < n && at + a < m; ++a)
+                if (q[a] < 4 && rng.below(8)) tm[at + a] = (uint8_t)(1 << q[a]);
+        }
+        // bands like the refutations' (around a start offset), and arbitrary ones up to 72 wide
+        int lo, hi;
+        if (rng.below(2)) {
+            const int c = rng.below(40), span = rng.below(6 * std::max(kmax, 1) + 1);
+            lo = -kmax - c; hi = span + kmax - c;
+        } else {
+            lo = -rng.below(n + 30); hi = lo + rng.below(72);
+        }
+        for (bool free_start : {false, true}) {
+            const int want = ba::aln_meth_band_ed(q.data(), n, tm.data(), m, lo, hi, free_start, kmax, &dp);
+            const int got = ba::aln_meth_band_ed_bits(q.data(), n, tm.data(), m, lo, hi, free_start, kmax, &s);
+            INFO("t=" << t << " n=" << n << " m=" << m << " kmax=" << kmax << " band=[" << lo << "," << hi << "] free=" << free_start);
+            REQUIRE(got == want);
+            REQUIRE(got == masked_band_oracle(q, tm, lo, hi, free_start, kmax));
+            (want <= kmax ? below : above) += 1;
+        }
+    }
+    MESSAGE("within kmax " << below << ", above kmax " << above << " of 8000");
+    CHECK(below > 400); // not vacuous: both outcomes are common
+    CHECK(above > 400);
+}
+
+TEST_CASE("aln_meth_prove: lazy mask planes preserve the scalar result across text boundaries")
+{
+    auto &x = prove_index();
+    const int64_t n = (int64_t)x.bwt->seq_len;
+    Rng rng(41);
+    ba::aln_meth_verify_scratch_t s;
+    std::vector<int16_t> dp;
+    for (int t = 0; t < 3000; ++t) {
+        const int len = 1 + rng.below(150), k = rng.below(12), span = rng.below(6 * k + 1);
+        const int64_t lo = rng.below((int)n + 40) - 20, hi = lo + span;
+        std::vector<uint8_t> seq(len);
+        for (auto &c : seq) c = (uint8_t)rng.below(5);
+        if (t % 2 && lo >= 0 && lo + len < n)
+            std::copy(x.text.begin() + lo, x.text.begin() + lo + len, seq.begin());
+        const int64_t w0 = std::max<int64_t>(0, lo), w1 = std::min<int64_t>(n, hi + len + k);
+        int want = 1;
+        if (w1 > w0 && hi >= w0) {
+            std::vector<uint8_t> masks(w1 - w0);
+            ba::aln_meth_text_masks(x.ref, w0, w1, masks.data());
+            const int c = (int)(w0 - lo), dlo = -k - c, dhi = span + k - c;
+            want = ba::aln_meth_band_ed(seq.data(), len, masks.data(), (int)masks.size(), dlo, dhi, true, k, &dp) > k;
+            REQUIRE(want == (masked_band_oracle(seq, masks, dlo, dhi, true, k) > k));
+        }
+        REQUIRE(ba::aln_meth_refute_starts(x.ref, n, seq.data(), len, lo, hi, k, &s) == want);
+    }
+}
+
 TEST_CASE("aln_meth_prove: a window refutation never refutes an alignment that starts in its band")
 {
     auto &x = prove_index();
@@ -311,6 +400,30 @@ TEST_CASE("aln_meth_prove: the proof uses the search's widths for its first piec
         CHECK(a == b);
         CHECK(r1 == r2);
         CHECK(s1 <= s2);
+    }
+}
+
+TEST_CASE("aln_meth_prove: exact-count precheck abandons capped attempts without proving planted hits")
+{
+    auto &x = prove_index();
+    ba::aln_meth_ph_scratch_t scratch;
+    for (int k : {3, 4, 5, 6, 7}) {
+        const int len = 120;
+        std::vector<uint8_t> seq(x.text.begin() + 100, x.text.begin() + 100 + len), complement(len);
+        for (int a = 0; a < len; ++a) complement[a] = (uint8_t)(3 - seq[a]);
+        std::vector<ba::bwt_width_t> width(len + 1);
+        ba::bwt_cal_width(x.bwt, len, complement.data(), width.data());
+        long walked = 0, counted = 0;
+        REQUIRE(ba::aln_meth_pigeonhole(x.bwt, x.ref, seq.data(), len, k, width.data(), &scratch,
+                                      &walked, &counted, 0) == 0);
+        CHECK(scratch.why == ba::ALN_METH_PH_ROWS_CAP);
+        CHECK(counted > 0);
+        CHECK(walked == len - len / ((k + 2) / 2)); // only width walks, no approximate frontier
+        long other_steps = 0, other_rows = 0;
+        CHECK(ba::aln_meth_pigeonhole(x.bwt, x.ref, seq.data(), len, k, nullptr, &scratch,
+                                    &other_steps, &other_rows, 0) == 0);
+        CHECK(other_rows == counted);
+        CHECK(other_steps == walked + len / ((k + 2) / 2));
     }
 }
 

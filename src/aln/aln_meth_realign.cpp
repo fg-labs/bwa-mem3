@@ -258,6 +258,15 @@ inline uint64_t plane_at(const uint64_t *p, size_t nw, int64_t b)
 void aln_meth_amb_bits(const aln_meth_ref_t &ref, int64_t rb, int len, std::vector<uint64_t> *bits)
 {
     bits->assign(((size_t)len + 31) / 32, 0);
+    // The bins the window covers (aln_meth_ref_t::hole_bins): when none holds a run, no run
+    // overlaps the window and the bits stay clear; a bin past the table is searched.
+    if (!ref.hole_bins.empty() && len > 0 && rb >= 0) {
+        const uint64_t first = (uint64_t)rb >> ALN_METH_HOLE_SHIFT, last = (uint64_t)(rb + len - 1) >> ALN_METH_HOLE_SHIFT;
+        bool any = false;
+        for (uint64_t b = first; b <= last && !any; ++b)
+            any = (b >> 6) >= ref.hole_bins.size() || (ref.hole_bins[b >> 6] >> (b & 63) & 1);
+        if (!any) return;
+    }
     amb_bits_t ctx{bits->data(), rb};
     bns_iter_ambi(ref.bns, rb, len, amb_visit, &ctx);
 }

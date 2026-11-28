@@ -4,6 +4,7 @@
 #include "aln_meth_prove.h"
 
 #include <algorithm>
+#include <cstring>
 
 #include "../bntseq.h"
 
@@ -112,6 +113,107 @@ int aln_meth_band_ed(const ubyte_t *q, int n, const uint8_t *t, int m, int dlo, 
     return band_ed_t(q, n, m, dlo, dhi, free_start, kmax, scratch, [t](int) { return t; });
 }
 
+/* Text masks as four bit planes: bit (p + PAD) of plane c is set when base c may be at text
+ * position p. Positions below 0, and those not filled yet, read as 0. */
+namespace {
+struct mask_planes_t {
+    enum { PAD = 64 };
+    uint64_t *w = nullptr; // plane c is w[c * nw, (c + 1) * nw)
+    int nw = 0;
+    // Planes for positions below n, all clear, in *store.
+    void init(std::vector<uint64_t> *store, int n)
+    {
+        nw = (n + PAD) / 64 + 2;
+        store->assign(4 * (size_t)nw, 0);
+        w = store->data();
+    }
+    // Masks t[from, to) into the planes; from is a multiple of 8, and t holds zeros from to up to
+    // the next multiple of 8.
+    void fill(const uint8_t *t, int from, int to)
+    {
+        for (int p = from; p < to; p += 8) {
+            uint64_t x;
+            memcpy(&x, t + p, 8);
+            const int bi = p + PAD;
+            for (int c = 0; c < 4; ++c) {
+                // bit c of each byte, gathered into one byte (byte i's bit lands at bit i)
+                const uint64_t y = (x >> c) & 0x0101010101010101ULL;
+                w[c * nw + (bi >> 6)] |= ((y * 0x0102040810204080ULL) >> 56) << (bi & 63);
+            }
+        }
+    }
+    // Bit d: base c may be at position pos + d, for d in [0, 64).
+    uint64_t bits(int c, int pos) const
+    {
+        const int bi = pos + PAD;
+        if (bi < 0) return 0; // every position below 0
+        const uint64_t *pl = w + c * nw + (bi >> 6);
+        const int sh = bi & 63;
+        return sh ? pl[0] >> sh | pl[1] << (64 - sh) : pl[0];
+    }
+};
+static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "mask_planes_t::fill reads 8 masks as one little-endian word");
+} // namespace
+
+// Bits lo..hi of a W-bit word (empty when lo > hi after clamping to [0, W)).
+static inline uint64_t bit_range(int lo, int hi, int W)
+{
+    lo = std::max(lo, 0);
+    hi = std::min(hi, W - 1);
+    if (lo > hi) return 0;
+    const uint64_t up = hi >= 63 ? ~0ULL : (1ULL << (hi + 1)) - 1;
+    return up & ~0ULL << lo;
+}
+
+/* band_ed_t on bit vectors: the same cells, the same result and the same early exit, for bands of
+ * at most 64 diagonals and kmax <= ALN_METH_BITS_KMAX. Bit d of V[t] is set when the cell on
+ * diagonal d of the current row, D[a][a + d + dlo], is at most t (Wu and Manber's recurrence, one
+ * word per distance up to kmax): a cell is at most t when its diagonal predecessor is at most t and
+ * the bases match, or when its diagonal or upper predecessor (row a - 1) or its left neighbour (row
+ * a) is at most t - 1. Distances above kmax are never needed: such a cell only feeds cells above
+ * kmax. more(b): as for band_ed_t, makes text positions [0, b) of the planes readable. */
+template <class More>
+static int band_ed_bits(const ubyte_t *q, int n, int m, int dlo, int dhi, bool free_start, int kmax, More more)
+{
+    const int W = dhi - dlo + 1, K = kmax;
+    if (W <= 0) return kmax + 1;
+    uint64_t va[ALN_METH_BITS_KMAX + 1], vb[ALN_METH_BITS_KMAX + 1];
+    uint64_t *V = va, *N = vb;
+    uint64_t valid = bit_range(-dlo, m - dlo, W); // row 0: b = d + dlo in [0, m]
+    for (int t = 0; t <= K; ++t) V[t] = free_start ? valid : valid & bit_range(-dlo, t - dlo, W); // D[0][b] = b
+    if (!V[K]) return K + 1;
+    for (int a = 1; a <= n; ++a) {
+        const mask_planes_t &P = more(std::min(m, std::max(0, a + dhi)));
+        const int qc = q[a - 1];
+        valid = bit_range(-a - dlo, m - a - dlo, W);                  // b = a + d + dlo in [0, m]
+        const uint64_t diag = valid & bit_range(1 - a - dlo, W - 1, W); // b >= 1: a diagonal predecessor
+        const uint64_t match = qc < 4 ? P.bits(qc, a + dlo - 1) & diag : 0; // t[b - 1] holds base qc
+        uint64_t left = 0; // N[t - 1]
+        for (int t = 0; t <= K; ++t) {
+            uint64_t x = V[t] & match;
+            if (t) x |= (V[t - 1] & diag) | V[t - 1] >> 1 | left << 1;
+            N[t] = left = x & valid;
+        }
+        if (!N[K]) return K + 1; // every cell of the row is above kmax
+        std::swap(V, N);
+    }
+    for (int t = 0; t <= K; ++t)
+        if (V[t]) return t;
+    return K + 1;
+}
+
+int aln_meth_band_ed_bits(const ubyte_t *q, int n, const uint8_t *t, int m, int dlo, int dhi, bool free_start, int kmax,
+                          aln_meth_verify_scratch_t *s)
+{
+    if (dhi - dlo + 1 > 64 || kmax < 0 || kmax > ALN_METH_BITS_KMAX) return aln_meth_band_ed(q, n, t, m, dlo, dhi, free_start, kmax, &s->dp);
+    s->text.assign((size_t)m + 8, 0);
+    std::copy(t, t + m, s->text.begin());
+    mask_planes_t P;
+    P.init(&s->planes, std::max(m + 8, n + dhi + 64));
+    P.fill(s->text.data(), 0, m);
+    return band_ed_bits(q, n, m, dlo, dhi, free_start, kmax, [&P](int) -> const mask_planes_t & { return P; });
+}
+
 int aln_meth_refute_starts(const aln_meth_ref_t &ref, int64_t seq_len, const ubyte_t *seq, int len, int64_t y_lo,
                            int64_t y_hi, int kmax, aln_meth_verify_scratch_t *s)
 {
@@ -121,17 +223,47 @@ int aln_meth_refute_starts(const aln_meth_ref_t &ref, int64_t seq_len, const uby
     if (w1 <= w0 || y_hi < w0) return 1;
     const int c = (int)(w0 - y_lo), span = (int)(y_hi - y_lo);
     const int m = (int)(w1 - w0);
-    s->text.resize(m);
+    const int dlo = -kmax - c, dhi = span + kmax - c;
+    const bool bits = dhi - dlo + 1 <= 64 && kmax >= 0 && kmax <= ALN_METH_BITS_KMAX;
+    s->text.assign((size_t)m + 8, 0);
+    mask_planes_t planes;
+    if (bits) planes.init(&s->planes, std::max(m + 8, len + dhi + 64));
     int have = 0;
     auto more = [&](int b) {
         if (b > have) { // in chunks, a few rows ahead
-            const int to = std::min(m, std::max(b, have + 32));
+            const int to = std::min(m, std::max((b + 31) & ~31, have + 32));
             aln_meth_text_masks(ref, w0 + have, w0 + to, s->text.data() + have);
+            if (bits) planes.fill(s->text.data(), have, to);
             have = to;
         }
         return (const uint8_t *)s->text.data();
     };
-    return band_ed_t(seq, len, m, -kmax - c, span + kmax - c, true, kmax, &s->dp, more) > kmax;
+    if (bits) {
+        auto more_planes = [&](int b) -> const mask_planes_t & { more(b); return planes; };
+        return band_ed_bits(seq, len, m, dlo, dhi, true, kmax, more_planes) > kmax;
+    }
+    return band_ed_t(seq, len, m, dlo, dhi, true, kmax, &s->dp, more) > kmax;
+}
+
+// Prefetch the original-reference bytes a converted-text window can read, including boundaries.
+static void prefetch_window(const aln_meth_ref_t &ref, int64_t lo, int64_t hi)
+{
+    const int64_t lc = ref.conv_bns->l_pac;
+    lo = std::max<int64_t>(0, lo);
+    hi = std::min<int64_t>(2 * lc, hi);
+    while (lo < hi) {
+        const bool reverse = lo >= lc;
+        const int64_t f = reverse ? 2 * lc - 1 - lo : lo;
+        const int crid = bns_pos2rid(ref.conv_bns, f), rid = crid >> 1;
+        const bntann1_t &c = ref.conv_bns->anns[crid];
+        const int64_t n = std::min(hi - lo, reverse ? f - c.offset + 1 : c.offset + c.len - f);
+        const int64_t p = ref.bns->anns[rid].offset + f - c.offset;
+        const int64_t first = reverse ? p - n + 1 : p;
+        const int64_t last = reverse ? p : p + n - 1;
+        for (int64_t b = first >> 2; b <= last >> 2; b += 64) __builtin_prefetch(ref.pac + b);
+        __builtin_prefetch(ref.pac + (last >> 2));
+        lo += n;
+    }
 }
 
 int aln_meth_refute_window(const aln_meth_ref_t &ref, int64_t seq_len, const ubyte_t *seq, int len, int64_t y0, int kmax,
@@ -193,6 +325,14 @@ int aln_meth_pigeonhole(const bwt_t *bwt, const aln_meth_ref_t &ref, const ubyte
             s->bid[off[j] + x.t] = x.bid;
             if (++x.t == pa[j + 1] - pa[j]) --n_walk;
         }
+    }
+    // Exact occurrences are a subset of the enumerated rows, even for a one-edit piece. A
+    // hopeless attempt can stop before constructing its approximate-search frontier.
+    int64_t exact_rows = 0;
+    for (int j = 0; j < p; ++j) {
+        if (s->bid[off[j + 1] - 1] != 0) continue;
+        exact_rows += j == 0 && width ? (int64_t)width[pa[1] - 1].w : (int64_t)(w[j].l - w[j].k + 1);
+        if (exact_rows > max_rows) { s->why = ALN_METH_PH_ROWS_CAP; *rows = exact_rows; return 0; }
     }
     // The pieces' occurrences within their allowances: backward search from each piece's last base
     // (S[j] is the next base a node consumes), all nodes of all pieces advanced one lookup per round.
@@ -275,7 +415,12 @@ int aln_meth_pigeonhole(const bwt_t *bwt, const aln_meth_ref_t &ref, const ubyte
     // Rows of one locus (several pieces, or one piece's edit placements) give nearby starts: their
     // start ranges, [y0, y0 + 2 kmax] each, are checked together while they overlap, up to a span
     // of 6 kmax (one banded pass over their union).
+    size_t prefetched = 0;
     for (size_t i = 0; i < st.size();) {
+        while (prefetched < std::min(st.size(), i + 8)) {
+            const int64_t start = st[prefetched++];
+            prefetch_window(ref, start, start + len + 3 * (int64_t)kmax);
+        }
         const int64_t lo = st[i];
         int64_t hi = st[i] + 2 * (int64_t)kmax;
         size_t j = i + 1;

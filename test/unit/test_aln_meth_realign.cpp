@@ -420,4 +420,51 @@ TEST_CASE("aln_realign: the equal-span bit-parallel scorer equals the base-by-ba
     CHECK(!f.ok);
 }
 
+TEST_CASE("aln_realign: the hole bins give the ambiguity bits the run search gives") {
+    // A reference over several bins, with runs inside one bin, ending just before a bin edge, over whole bins
+    // and at the reference end; bins and windows are checked against the reference without bins.
+    const int64_t B = 1LL << ba::ALN_METH_HOLE_SHIFT;
+    const int64_t L = 5 * B + 777;
+    std::vector<uint8_t> bases((size_t)L, 0);
+    Ref with(bases), without(bases);
+    std::vector<bntamb1_t> ambs = {{B / 2, 7, 'N'}, {2 * B - 12, 9, 'N'}, {3 * B + 10, (int32_t)(B + 20), 'N'},
+                                   {L - 4, 4, 'N'}};
+    for (Ref *r : {&with, &without}) { r->bns.n_holes = (int)ambs.size(); r->bns.ambs = ambs.data(); }
+    ba::aln_meth_ref_index_holes(&with.ref);
+    REQUIRE(!with.ref.hole_bins.empty());
+    CHECK(without.ref.hole_bins.empty());
+    // bins 0, 1, 3, 4 and 5 hold a run, bin 2 does not
+    for (int64_t b = 0; b <= 5; ++b) CHECK((with.ref.hole_bins[0] >> b & 1) == (b == 2 ? 0u : 1u));
+    uint64_t rng = 99;
+    auto next = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+    std::vector<int64_t> starts;
+    for (const auto &a : ambs) for (int64_t d = -160; d <= 160; d += 7) starts.push_back(a.offset + d);
+    for (int64_t b = 1; b <= 5; ++b) for (int64_t d = -160; d <= 40; d += 9) starts.push_back(b * B + d);
+    for (int k = 0; k < 2000; ++k) starts.push_back((int64_t)(next() % (uint64_t)L));
+    for (int64_t rb : starts) {
+        if (rb < 0 || rb >= L) continue;
+        const int len = (int)std::min<int64_t>(1 + (int64_t)(next() % 300), L - rb);
+        std::vector<uint64_t> a, b;
+        ba::aln_meth_amb_bits(with.ref, rb, len, &a);
+        ba::aln_meth_amb_bits(without.ref, rb, len, &b);
+        CHECK(a == b);
+    }
+    // a run before the reference start (malformed): no bins, so every window searches the runs
+    std::vector<bntamb1_t> bad = {{-5, 20, 'N'}, {3 * B + 10, 9, 'N'}};
+    Ref neg(bases), neg_without(bases);
+    for (Ref *r : {&neg, &neg_without}) { r->bns.n_holes = (int)bad.size(); r->bns.ambs = bad.data(); }
+    ba::aln_meth_ref_index_holes(&neg.ref);
+    CHECK(neg.ref.hole_bins.empty());
+    for (int64_t rb : {(int64_t)0, (int64_t)10, 3 * B}) {
+        std::vector<uint64_t> a, b;
+        ba::aln_meth_amb_bits(neg.ref, rb, 64, &a);
+        ba::aln_meth_amb_bits(neg_without.ref, rb, 64, &b);
+        CHECK(a == b);
+    }
+    // no runs: no bins, and nothing to find
+    Ref clear(bases);
+    ba::aln_meth_ref_index_holes(&clear.ref);
+    CHECK(clear.ref.hole_bins.empty());
+}
+
 TEST_SUITE_END;
