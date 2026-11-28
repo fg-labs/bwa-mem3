@@ -3,6 +3,7 @@
 #ifndef BWA_MEM3_ALN_KNOWN_SNVS_H
 #define BWA_MEM3_ALN_KNOWN_SNVS_H
 
+#include <atomic>
 #include "../bntseq.h"
 #include "bwtaln.h"
 #include "bwape.h"
@@ -41,10 +42,23 @@ struct ks_sites_t {
  * ambiguous N run), is an error naming it. Returns 0, or -1 with an error on stderr. */
 int ks_load(const char *path, const bntseq_t *bns, const uint8_t *pac, ks_sites_t *out);
 
-/* Half-width of an ALT window: a read up to KS_WINDOW_HALF - (max gap extensions) bases long that
- * covers a site lies inside its window. Longer reads are searched too, but ordinary placement
- * override falls back to stock; methylation genomic refinement and paired rescue have separate bounds. */
+/* Half-width of an ALT window: a read that fits one (ks_fits_window) and covers a site lies inside
+ * its window. Longer reads are searched too, but ordinary placement override falls back to stock
+ * and the --meth main search takes no cuts; methylation genomic refinement and paired rescue have
+ * separate bounds. */
 #define KS_WINDOW_HALF 160
+
+/* Whether a read of len bases fits an ALT window under the search options opt. A window is the
+ * 2 * KS_WINDOW_HALF + 1 bases around its site, so it holds every placement over the site that
+ * spans at most KS_WINDOW_HALF + 1 bases. A placement spans len plus its deleted bases, at most one
+ * per gap open and gap extension opt allows, so a read fits when len + max(0, -o - 1) + max(0, -e)
+ * <= KS_WINDOW_HALF (exact for -o >= 1; under -o 0, which allows no gap, a base short). Then each
+ * placement of the read that covers a site lies inside that site's window and the window index
+ * holds it. */
+static inline bool ks_fits_window(int64_t len, const gap_opt_t *opt)
+{
+	return len + (opt->max_gapo > 1 ? opt->max_gapo - 1 : 0) + (opt->max_gape > 0 ? opt->max_gape : 0) <= KS_WINDOW_HALF;
+}
 
 /* One ALT window: the reference [beg, beg + len) of contig rid with the ALT of one site in place. */
 struct ks_window_t {
@@ -78,23 +92,26 @@ struct ks_windows_t {
 int ks_windows_build(const ks_sites_t *sites, const bntseq_t *bns, const uint8_t *pac, int n_threads,
 					 int meth, ks_windows_t *out, const char *cache_path = nullptr);
 
-/* The windows as a forward-only reference: bns (one contig `w<i>` per window, no ambiguity
- * holes, fields as bns_restore gives for today's windows.fa) and pac (l_pac/4+1 bytes, as
- * bwa_idx_load_ele loads). Caller owns both (bns_destroy / free). */
+/* The windows as a forward-only reference: bns (one contig `w<i>` per window, with the
+ * reference's ambiguity holes that fall in it, translated to window coordinates; other fields as
+ * bns_restore gives) and pac (l_pac/4+1 bytes, as bwa_idx_load_ele loads; a hole's bases are the
+ * main index's fill). Caller owns both (bns_destroy / free). */
 void ks_windows_ref(const std::vector<ks_window_t> &win, const bntseq_t *bns, const uint8_t *pac,
 					bntseq_t **out_bns, uint8_t **out_pac);
 /* --meth: per window `r<name>` (G->A) then `f<name>` (C->T), the layout aln_meth_ref_load checks.
- * Windows only: valid because window text has no ambiguity holes (the 2-bit codes are exact). */
+ * Converts the packed codes as stored, a hole's fill included (as `index --meth` converts the
+ * main index's fill); the holes themselves are kept on the original windows, for scoring. */
 void ks_windows_meth_convert(const bntseq_t *orig_bns, const uint8_t *orig_pac, bntseq_t **conv_bns,
 							 uint8_t **conv_pac);
 
 /* --meth: the candidate windows (original reference, rid = contig) of the hits a read's search on
- * the converted window index found that cover their window's site. */
+ * the converted window index found that cover their window's site, with that search's horizon and
+ * flags (aln_meth_extra_t). */
 void ks_meth_candidates(const ks_windows_t *w, const bntseq_t *bns, const struct aln_meth_read_t &wres,
-						std::vector<struct aln_meth_candidate_t> *out);
+						struct aln_meth_extra_t *out);
 void ks_windows_free(ks_windows_t *w);
 
-/* The options a read's ALT-window search runs with: NONSTOP and no -R cut, so synthetic copies
+/* The options a read's plain (not --meth) ALT-window search runs with: NONSTOP and no -R cut, so synthetic copies
  * and cross-window hits cannot tighten the genomic discovery bound. The main search and the
  * genomic merge still apply the user's retention policy. */
 gap_opt_t ks_discovery_opt(const gap_opt_t &opt);
@@ -103,14 +120,22 @@ struct aln_opt_t;
 struct aln_dup_state_t;
 struct aln_meth_read_t;
 /* --meth with --known-snvs (o->ks_windows set; without it, the genomic search alone): reads
- * [0, n) searched on the ALT-window index, then on the converted index `bwt` with the windows'
- * candidates, each read's stop certificate (aln_meth_alt_certificate) and its window-search
- * flags as incoming_flags. Incomplete window discovery taints the genomic result: retained
- * windows may place a read, but cannot certify uniqueness or support pair promotion. Arguments
- * and the return value are aln_meth_search_batch's; window_dup is the window search's
- * duplicate state. */
+ * [0, n) searched on the ALT-window index, a candidate generator, then on the converted index
+ * `bwt` with each read's window candidates (aln_meth_extra_t: rows, horizon and flags), scored
+ * before its first step. A read whose window search stopped below the costs it retains is
+ * reported incomplete with the window search's flags (the finish-time audit). Arguments and the
+ * return value are aln_meth_search_batch's; window_dup is the window search's duplicate state. */
 int ks_meth_search(const aln_opt_t *o, const bwt_t *bwt, int n, bwa_seq_t *seqs, int read_no, int64_t ord,
 				   int keep, aln_dup_state_t *dup, aln_dup_state_t *window_dup, aln_meth_read_t *res);
+
+/* Without --meth: whether a read's main search (hits a/n, top2b: it ended on its -R stop) took
+ * cuts from its own first hit (the top-2 ceiling; the -R stop on its best stratum) that may have
+ * left out hits the merged set keeps, whose best is best and whose cap on differences is cap. Its
+ * score cut (its best + M) never does: no merged best is above a search's own. Under -N there is
+ * no ceiling or score cut and the merge keeps every hit within -n, so only an -R stop below the
+ * merged best counts. ks_merge then runs the search again (the ALT-window search takes no cuts:
+ * ks_discovery_opt). */
+bool ks_cuts_too_tight(const gap_opt_t *opt, int max_diff, const bwt_aln1_t *a, int n, bool top2b, int best, int cap);
 
 /* What ks_override did to a read. */
 enum ks_outcome_t {
@@ -138,8 +163,10 @@ ks_outcome_t ks_override(const ks_windows_t *w, const bntseq_t *bns, const bwt_t
 						 int max_xa_hits, bwa_seq_t *s, const bwt_aln1_t *win_aln, int win_n, int64_t *alt_site,
 						 std::vector<pe_hit_t> *hits = nullptr, bool stopped = false);
 /* Mate rescue's site lister (pe_alt_sites_t::list) over a ks_rescue_ctx_t: the site alleles in the
- * packed range [beg, end), on every contig it reaches, at most KS_RESCUE_MAX_SITES. */
+ * packed range [beg, end), on every contig it reaches, at most KS_RESCUE_MAX_SITES. The first range
+ * holding more prints a warning (once per run; ks_site_cap_warned, which tests reset). */
 #define KS_RESCUE_MAX_SITES 32
+std::atomic<bool> &ks_site_cap_warned();
 struct ks_rescue_ctx_t {
 	const ks_sites_t *sites;
 	const bntseq_t *bns;

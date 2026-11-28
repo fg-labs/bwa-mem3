@@ -58,8 +58,13 @@ The twin fields are `NA,NA` for:
 - `O` and `H` entries;
 - the selected entry when its plain twin search is incomplete.
 
-Without `--meth`, a read with more than 256 candidate loci, longer than about 160 bases, or whose
-genomic or ALT-window search stopped at the `-m` limit keeps its stock search result, but its first `R` or `A` site still gets a twin. For paired input, pairing and ALT-aware mate rescue still use that end with its mate, so its final record can still differ from stock's, for example when its mate is credited. The twin fields are numeric
+Without `--meth`, a read with more than 256 candidate loci, too long for an ALT window (its
+length plus `max(0, -o - 1)` plus `E` over 160, where `E` is `-e` when it is positive and 6 (the gap extensions `-e -1` allows) otherwise: longer than 154 bases at
+the defaults), or whose
+genomic or ALT-window search stopped at the `-m` limit keeps its stock search result, but its
+first `R` or `A` site still gets a twin. For paired input, pairing and ALT-aware mate rescue still
+use that end with its mate, so its final record can still differ from stock's, for example when
+its mate is credited. The twin fields are numeric
 when that search completes. Twins use the original quality-trimmed bases, including the mate's
 trimmed bases for paired input.
 
@@ -175,26 +180,27 @@ The twin of a paired read is a pair, so `twin_mapq` is the twin pair's paired MA
   two sites is credited for one of them only, and may still be misplaced. This holds under
   `--meth` too. A mate-rescue window, or under `--meth` a candidate window, with more than 32
   site alleles tries only its first 32 (in position order); the rest stay at REF.
-- **Long reads.** Without `--meth`, reads longer than about 160 bases keep their stock search
-  result; for paired input, pairing and ALT-aware mate rescue can still change the final record,
-  for example when the mate is credited.
-  Full-read ALT-window discovery, including under `--meth`, requires a read to fit within a window
-  of at most 321 bases. It cannot independently discover an over-budget read that does not fit.
-  Methylation genomic refinement can still credit longer reads at discovered loci; paired-end
-  rescue separately tries ALT-substituted rescue windows and is not limited by that discovery width.
+- **Long reads.** A read fits an ALT window when its length plus `max(0, -o - 1)` plus `E` is at
+  most 160, where `E` is `-e` when it is positive and 6 (the gap extensions `-e -1` allows) otherwise: 154 bases at the defaults. Its longest
+  placement (its length plus a deleted base per gap open and extension allowed) then spans at most
+  161 bases, the most a window of 321 bases holds over its site. Every placement of it over a site then lies inside that site's window. Without
+  `--meth`, a read that does not fit keeps its stock search result; for paired input, pairing and
+  ALT-aware mate rescue can still change the final record, for example when the mate is credited.
+  Full-read ALT-window discovery, including under `--meth`, cannot independently discover an
+  over-budget read that does not fit. Methylation genomic refinement can still credit longer reads
+  at discovered loci; paired-end rescue separately tries ALT-substituted rescue windows and is not
+  limited by that discovery width.
+- **Long reads under `--meth`.** With known sites loaded, a read that does not fit an ALT window
+  takes none of stock's cuts in its main search, so it runs to its `-n` and a highly repetitive
+  one can use up the lookup budget (MAPQ 0, no `X0`/`X1`).
 - **Work limits under `--meth`.** If a read's ALT-window search hits a work limit (the lookup
-  budget or the `-m` stack cap), the read is reported as incomplete even when none of its
-  placements covers a site: it gets MAPQ 0 with no `X0`/`X1`. If its genomic search hits the
-  lookup budget instead, the ALT-window placements already found are still evaluated (unless the
-  read has also reached its 64 MiB candidate CIGAR cap), and the read is likewise incomplete. For paired input, neither end of that pair can then be promoted
-  by pairing or mate rescue, so the mate's record can change too.
-- **Long unseeded reads under `--meth`.** With known sites loaded, an unseeded read longer than
-  160 bases (possible only when `-l` exceeds 160) cannot stop early, so a highly repetitive one
-  can use up the lookup budget.
-- **Early stopping near sites under `--meth`.** An ALT-window placement that covers a site with at
-  most one mismatch more than the best placement found blocks early stopping, even when the same
-  locus is also found at lower cost without the ALT. In a repetitive family this includes reads
-  that carry the REF base, so a read that matches one locus exactly can end at MAPQ 0.
+  budget or the `-m` stack cap) below the costs the read keeps (its best cost plus one mismatch;
+  any cost under `-N`, or when the read keeps no placement), the read is reported as incomplete
+  even when none of its placements covers a site: it gets MAPQ 0 with no `X0`/`X1`. If its genomic search hits the lookup budget instead, the ALT-window
+  placements already found are still evaluated (unless the read has also reached its 64 MiB
+  candidate CIGAR cap), and the read is likewise incomplete. For paired input, neither end of that
+  pair can then be promoted by pairing or mate rescue, so the mate's record can change too. A
+  window-search limit hit above those costs leaves the read as it would be without it.
 - **Paralogous sites.** If a site's ALT allele matches a paralog somewhere else in the genome, reads
   from the paralog carry the ALT. Crediting the ALT does not break an exact tie: a paralog read that
   matches the site and the paralog equally well gets MAPQ 0 and fails the MAPQ rule. A paralog read

@@ -612,7 +612,7 @@ static GAP_HOT int gap_job_start_t(gap_job_t *j, const bwt_t *bwt)
 	j->c.max_entries = opt->max_entries; j->c.max_gapo = opt->max_gapo; j->c.max_gape = opt->max_gape;
 	j->c.max_seed_diff = opt->max_seed_diff; j->c.indel_end_skip = opt->indel_end_skip;
 	j->c.max_del_occ = opt->max_del_occ; j->c.seed_off = j->len - opt->seed_len;
-	j->best_cnt = 0;
+	j->best_cnt = 0; j->top2b = 0;
 	j->max_entries = 0;
 	j->m_aln = P::meth ? 0 : 4; j->n_aln = 0;
 	// Stock transfers this array to the read. Meth queues hits in its slot's owned vectors,
@@ -653,7 +653,7 @@ static GAP_COLD int gap_job_hit(gap_job_t *J, const bwt_t *bwt, const gap_entry_
 			J->max_diff = (J->best_diff + 1 > opt->max_diff)? opt->max_diff : J->best_diff + 1; // top2 behaviour
 	}
 	if (score == J->best_score) J->best_cnt += l - k + 1;
-	else if (J->best_cnt > opt->max_top2) return 1; // top2b behaviour
+	else if (J->best_cnt > opt->max_top2) { J->top2b = 1; return 1; } // top2b behaviour
 	if (e->n_gapo) { // check whether the hit has been found. this may happen when a gap occurs in a tandem repeat
 		for (j = 0; j != J->n_aln; ++j)
 			if (J->aln[j].k == k && J->aln[j].l == l) break;

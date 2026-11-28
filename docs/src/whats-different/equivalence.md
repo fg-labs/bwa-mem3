@@ -23,9 +23,10 @@ Since [#777](https://github.com/fg-labs/bwa-mem3/pull/777), an `aln --meth` read
 candidate rows exceed its remaining SA lookup budget resolves at most 64 more rows at that batch,
 without exceeding the budget, to choose its best-known placement. Such incomplete reads have
 MAPQ 0 and omit `X0`/`X1`/`XA`; their `POS` and `CIGAR` can differ from the previous
-implementation. Incomplete ALT-window discovery under `--known-snvs` also marks the genomic result
-incomplete before confidence calculation and pairing, including the twin searches. A retained
-placement from truncated discovery therefore cannot certify a unique high-MAPQ hit.
+implementation. Under `--known-snvs`, ALT-window discovery that stopped below the costs a read
+retains also marks the genomic result incomplete before confidence calculation and pairing,
+including the twin searches. A retained placement from truncated discovery therefore cannot
+certify a unique high-MAPQ hit.
 
 Historical comparisons on ultrashort 5-base and EM-seq slices, each containing 1 million read
 pairs, found changed MAPQ-0 placements and some ends that lost their MAPQ-0 placement and became
@@ -109,6 +110,14 @@ change, as for #787. On ultrashort EM-seq and 5-base slices (hg19, an x86_64 AVX
 19.1.7; 1 million single-end reads and 1 million pairs, 1 million pairs and 200,000 single-end
 reads with `--known-snvs`), output was byte-identical to #787 on the AVX-512 tier. Output
 without `--meth` is byte-identical.
+
+Since [#799](https://github.com/fg-labs/bwa-mem3/pull/799), `aln --meth` ranks equal-cost rows
+at a locus by fewest differences before applying the applicable TAPS/5base conversion tie-break
+and reference-before-ALT ordering. This can change the retained alignment, `MAPQ` and
+`X0`/`X1`/`XA`, including without `--known-snvs`. In the reported 1-million-pair hg19 EM-seq
+and 5-base comparisons on Sapphire Rapids (x86_64, AVX-512, clang 19.1.7), plain `--meth` output
+at `82b6ab82b` was byte-identical to #789 at `b8673682b`. Those historical observations do not
+exclude differences at other tied loci and are not a fresh validation of the current revision.
 
 <div class="warning" style="border:3px solid #2e7d32;border-radius:8px;padding:1rem 1.25rem;margin:1.25rem 0;background:#e8f5e9;color:#1b1b1b;">
 <strong style="font-size:1.35em;display:block;margin-bottom:0.4rem;">✅ No alignment record bwa-mem2 emits is changed or removed — and on the cell re-measured for 0.7.1 its primary alignments are reproduced exactly.</strong>
