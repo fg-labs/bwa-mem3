@@ -15,8 +15,9 @@
  * and --short-insert pairing skip such a candidate instead.
  * The bwa_paired_sw wrapper itself is not kept (nothing calls it). bwa_pe_pairing and
  * bwa_pe_pair_grouped expose pairing and the grouping to the unit tests. Pairing sorts its rows
- * with pdqsort_128 in place of ks_introsort_128; the sorted array is the same. Known-SNV
- * pairing consumes allele-bearing hit lists and rescue tries single-allele windows. See README.md. */
+ * with aln_pair_sort (pdqsort_128, or a radix sort for large arrays) in place of ks_introsort_128;
+ * the sorted array is the same. Known-SNV pairing consumes allele-bearing hit lists and rescue
+ * tries single-allele windows. See README.md. */
 #include "bwape.h"
 #include "aln_alloc.h"
 
@@ -186,6 +187,76 @@ static inline int pair_insert_penalty(double p)
 	return isfinite(p) ? (int)p : INT_MIN;
 }
 
+/* pdqsort_128's order by (x, y), with an LSD radix sort for large arrays. When the rows' x range and
+ * y fit one 63-bit key, ((x - x_min) << by) | y orders the rows exactly as (x, y) does (x - x_min is
+ * monotone and does not wrap; y < 2^by), so a stable sort by that key gives the same array as any
+ * correct sort (rows equal under the order are identical bytes). Otherwise, and below
+ * PAIR_RADIX_MIN rows, pdqsort_128. The sort takes no memory beyond the array: its 2n words hold the
+ * n keys and the second buffer. */
+enum { PAIR_RADIX_MIN = 256 };
+void aln_pair_sort(size_t n, pair64_t *a)
+{
+	if (n < PAIR_RADIX_MIN) { pdqsort_128(n, a); return; }
+	uint64_t x_min = a[0].x, x_max = a[0].x, y_or = 0;
+	for (size_t i = 0; i < n; ++i) {
+		x_min = a[i].x < x_min ? a[i].x : x_min;
+		x_max = a[i].x > x_max ? a[i].x : x_max;
+		y_or |= a[i].y;
+	}
+	const int by = y_or ? 64 - __builtin_clzll(y_or) : 0;
+	const uint64_t xr = x_max - x_min;
+	const int bx = xr ? 64 - __builtin_clzll(xr) : 0;
+	if (bx + by > 63) { pdqsort_128(n, a); return; }
+	static_assert(sizeof(pair64_t) == 2 * sizeof(uint64_t), "pair64_t is two words");
+	// The array as 2n words, through its bytes (memcpy): a uint64_t pointer into a row may not step
+	// past that row's member it points at.
+	unsigned char *const w = reinterpret_cast<unsigned char*>(a);
+	auto ld = [w](size_t i) { uint64_t v; memcpy(&v, w + 8 * i, 8); return v; };
+	auto st = [w](size_t i, uint64_t v) { memcpy(w + 8 * i, &v, 8); };
+	// Key i goes to word i once row i (words 2i, 2i + 1) is read: word i <= 2i is part of a row
+	// already read. Words [n, 2n) are then free for the second buffer.
+	for (size_t i = 0; i < n; ++i) {
+		const uint64_t k = (a[i].x - x_min) << by | a[i].y;
+		st(i, k);
+	}
+	size_t k0 = 0, k1 = n; // the first word of the keys and of the second buffer
+	const int passes = (bx + by + 7) / 8;
+	uint32_t cnt[8][256];
+	memset(cnt, 0, sizeof(uint32_t) * 256 * (size_t)passes);
+	for (size_t i = 0; i < n; ++i) {
+		const uint64_t k = ld(i);
+		for (int p = 0; p < passes; ++p) ++cnt[p][k >> (8 * p) & 0xff];
+	}
+	for (int p = 0; p < passes; ++p) {
+		uint32_t *c = cnt[p];
+		if (c[ld(k0) >> (8 * p) & 0xff] == n) continue; // every key has this digit
+		uint32_t sum = 0;
+		for (int b = 0; b < 256; ++b) { const uint32_t t = c[b]; c[b] = sum; sum += t; }
+		for (size_t i = 0; i < n; ++i) {
+			const uint64_t k = ld(k0 + i);
+			st(k1 + c[k >> (8 * p) & 0xff]++, k);
+		}
+		std::swap(k0, k1);
+	}
+	// Back to rows: row i is words 2i, 2i + 1. Keys in [0, n) are decoded from the last (rows i' > i
+	// at words 2i and 2i + 1 are already done); keys in [n, 2n) from the first (the words written for
+	// row i hold keys i' <= i, already read).
+	const uint64_t ym = (1ULL << by) - 1;
+	if (k0 == 0) {
+		for (size_t i = n; i-- > 0;) {
+			const uint64_t k = ld(i);
+			a[i].x = (k >> by) + x_min;
+			a[i].y = k & ym;
+		}
+	} else {
+		for (size_t i = 0; i < n; ++i) {
+			const uint64_t k = ld(n + i);
+			a[i].x = (k >> by) + x_min;
+			a[i].y = k & ym;
+		}
+	}
+}
+
 template <bool SameContig = false>
 static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
                    const isize_info_t *ii, const bntseq_t *bns = nullptr)
@@ -272,10 +343,10 @@ static int pairing(bwa_seq_t *p[2], pe_data_t *d, const pe_opt_t *opt, int s_mm,
 	o_score = subo_score = (uint64_t)-1;
 	o_n = subo_n = 0;
 	d->moved_span[0] = d->moved_span[1] = -1;
-	/* pdqsort_128 in place of upstream's ks_introsort_128: both order rows by the whole
+	/* aln_pair_sort in place of upstream's ks_introsort_128: both order rows by the whole
 	 * (x, y), so rows equal under it are identical bytes and the sorted array is the same
-	 * (utils.h). The guard keeps pdqsort_128 from forming a + n on an empty, null array. */
-	if (d->arr.n > 1) pdqsort_128(d->arr.n, d->arr.a);
+	 * (utils.h). The guard keeps the sort from forming a + n on an empty, null array. */
+	if (d->arr.n > 1) aln_pair_sort(d->arr.n, d->arr.a);
 	/* --short-insert pairs mates that start at the same base (both reads cover the whole
 	 * fragment). The loop pairs a reverse hit only with forward hits already seen, so within a
 	 * run of equal positions put the forward hits first; the sort alone orders them by hit index. */

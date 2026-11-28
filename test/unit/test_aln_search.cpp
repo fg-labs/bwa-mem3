@@ -2020,3 +2020,24 @@ TEST_CASE("aln_search: a 65535-base read that matches nothing gives no hit"
     REQUIRE(b.n == 1);
     CHECK(b.seqs[0].n_aln == 0);
 }
+
+TEST_CASE("aln_search: gap_scores_fit holds only when no score within the limits can reach the stack bound"
+          * doctest::test_suite("unit/aln_search")) {
+    namespace ba = bwa_aln;
+    ba::gap_opt_t *o = ba::gap_init_opt();
+    REQUIRE((o->mode & BWA_MODE_GAPE) != 0);
+    o->max_diff = 4;
+    CHECK(ba::gap_scores_fit(o, ba::GAP_SCORE_LIMIT)); // the defaults
+    o->max_diff = 3; o->s_gapo = o->s_gape = 1;
+    o->s_mm = 682; CHECK(ba::gap_scores_fit(o, ba::GAP_SCORE_LIMIT));  // 3 x 682 = 2046
+    o->s_mm = 683; CHECK(!ba::gap_scores_fit(o, ba::GAP_SCORE_LIMIT)); // 3 x 683 = 2049
+    o->s_mm = 2048; CHECK(!ba::gap_scores_fit(o, ba::GAP_SCORE_LIMIT)); // one mismatch is too much
+    o->s_mm = 3; o->s_gapo = 700; CHECK(!ba::gap_scores_fit(o, ba::GAP_SCORE_LIMIT)); // gap opens too
+    o->s_gapo = 11; o->s_gape = 700; CHECK(!ba::gap_scores_fit(o, ba::GAP_SCORE_LIMIT)); // extensions too
+    // without GAPE, extensions are not differences: up to max_gape of them come on top
+    o->mode &= ~BWA_MODE_GAPE; o->s_gape = 4; o->max_gape = 6;
+    CHECK(ba::gap_scores_fit(o, 3 * 11 + 6 * 4 + 1));
+    CHECK(!ba::gap_scores_fit(o, 3 * 11 + 6 * 4));
+    o->max_diff = INT_MAX; CHECK(!ba::gap_scores_fit(o, ba::GAP_SCORE_LIMIT));
+    free(o);
+}

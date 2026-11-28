@@ -100,6 +100,9 @@ int bwa_pe_pair(const bntseq_t *bns, const bwt_t *bwt, int n_seqs, bwa_seq_t *se
 				const isize_info_t *ii, const pe_opt_t *opt, const gap_opt_t *gopt,
 				const std::vector<pe_hit_t> *const hits[2] = nullptr,
 				int32_t *const moved_span[2] = nullptr);
+/* Sorts a pairing array by (x, y), as pdqsort_128 does (the same array), with a radix sort for large
+ * arrays (bwape.cpp). */
+void aln_pair_sort(size_t n, pair64_t *a);
 /* sampe's pairing of one pair, for the unit tests' reference: `arr` holds upstream's
  * (position, k<<2 | strand<<1 | end) array for the pair (sorted in place); the alignments are
  * p[0]->aln and p[1]->aln. Returns the number of alignments whose position changed. */
