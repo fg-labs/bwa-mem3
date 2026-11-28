@@ -72,7 +72,8 @@ on a measurement. `test/regression/bwtseed_lockstep_driver_identity.sh`
 pins the scalar driver in CI and checks it against the default.
 
 Its depth is a distinct knob from the phase-2 SMEM width above. The default is
-**24** (32 on AMD Zen 5; see "Zen 5 lockstep widths" below), resolved at startup
+**24** (32 on AMD Zen 5, see "Zen 5 lockstep widths" below; 48 on Apple silicon,
+see "Apple silicon bwtSeed depth" below), resolved at startup
 into a runtime value. Measured whole-aligner wall on a
 5M-read WGS slice (150 bp paired NovaSeq reads, hg38), each host at threads ≤
 physical cores (held fixed so the sweep compares depths, not thread regimes),
@@ -99,18 +100,44 @@ md5 gate matching the prior depth-8 output on x86 (clang-19, avx512bw tier) and 
 
 | Variable | Effect |
 |---|---|
-| `BWA3_BWTSEED_LOCKSTEP_N=<n>` | Pin the third-pass lockstep depth to `<n>` (1–64). A value above 64 is clamped; a non-positive or malformed value is reported to stderr and ignored (the host default is used). An unset or empty value (`BWA3_BWTSEED_LOCKSTEP_N=`) silently keeps the host default (24; 32 on AMD Zen 5, see "Zen 5 lockstep widths" below), with no message. |
+| `BWA3_BWTSEED_LOCKSTEP_N=<n>` | Pin the third-pass lockstep depth to `<n>` (1–64). A value above 64 is clamped; a non-positive or malformed value is reported to stderr and ignored (the host default is used). An unset or empty value (`BWA3_BWTSEED_LOCKSTEP_N=`) silently keeps the host default (24; 32 on AMD Zen 5, see "Zen 5 lockstep widths" below; 48 on Apple silicon), with no message. |
 | `BWA3_BWTSEED_LOCKSTEP=0`\|`1` | Force the third-pass lockstep driver off / on (default: on). |
+
+### Apple silicon bwtSeed depth
+
+Builds for Apple silicon (Arm macOS, NEON tier) default the third-pass depth to
+**48**; every other build keeps 24. The depth is a compile-time default there, so
+`BWA3_BWTSEED_LOCKSTEP_N` still overrides it. Measured 48 against 24 on hg38 with
+the 5M-read WGS slice (150 bp reads), interleaved reps with the arm order rotated,
+clang 19.1.7, user+sys CPU (negative = less time with 48):
+
+| Host | Threads | Mode | Reps | CPU at 24 → 48 | Paired CPU (reps faster) | Paired wall |
+|---|---|---|---|---|---|---|
+| Apple M5 Ultra | 16 | single-end | 6 | 86.34 → 86.09 s | −0.29% (4/6) | −0.18% |
+| Apple M5 Ultra | 16 | paired-end | 6 | 235.10 → 234.68 s | −0.13% (5/6) | −0.17% |
+| Apple M3 Ultra | 14 | single-end | 8 | 91.41 → 91.15 s | −0.21% (8/8) | −0.30% |
+| Apple M3 Ultra | 14 | paired-end | 2 | 252.33 → 251.59 s | −0.29% (2/2) | −0.28% |
+| Apple M2 Max | 6 | single-end | 8 | 96.31 → 95.63 s | −0.63% (7/8) | −0.57% |
+| Apple M2 Max | 6 | paired-end | 8 | 274.25 → 274.06 s | −0.05% (4/8) | +0.16% |
+
+The alignment records were identical in every run. These are small effects. The
+M2 Max ran on a busy laptop, where the paired-end run cannot resolve anything
+below about 2%. An earlier, more contended M3 Ultra run read +0.9% paired-end,
+and that did not reproduce. Peak RSS was unchanged on these short-read runs
+(within 0.02 GB). Each worker's third-pass match buffer grows with the depth times
+the batch's longest read, so on long reads (tens of kb and up) depth 48 holds
+about twice the scratch memory of 24: set `BWA3_BWTSEED_LOCKSTEP_N` lower there
+if memory is tight.
 
 ## Zen 5 lockstep widths ([PR #588](https://github.com/fg-labs/bwa-mem3/pull/588))
 
 On AMD Zen 5 CPUs, both lockstep seeding widths now default to **32**: the
 phase-2 SMEM width (16 elsewhere) and the third-pass bwtSeed width (24
-elsewhere). The CPU is identified once at startup with CPUID: an `AuthenticAMD`
+elsewhere, 48 on Apple silicon). The CPU is identified once at startup with CPUID: an `AuthenticAMD`
 vendor, family 1Ah, and a Zen 5 model (00h–2Fh, 40h–4Fh, 60h–7Fh or D0h–D7h,
 the ranges the Linux kernel assigns to Zen 5). Family 1Ah also holds Zen 6
 (models 50h–5Fh, 80h–AFh, C0h–CFh, D8h–EFh); Zen 6, any other family-1Ah model,
-and every other host keep 16 / 24. Precedence, highest first: an explicit
+and every other host keep 16 / 24 (16 / 48 on Apple silicon). Precedence, highest first: an explicit
 `BWA3_SMEM_LOCKSTEP_N` / `BWA3_BWTSEED_LOCKSTEP_N` pin, then (SMEM only) the
 opt-in `BWA3_SMEM_LOCKSTEP_PROBE` startup probe, then this host default, then the
 compile-time default. If the opted-in probe cannot measure, the SMEM width falls

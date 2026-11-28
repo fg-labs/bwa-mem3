@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <algorithm>
 #include <map>
 #include <string>
 #include <vector>
@@ -454,7 +455,7 @@ int main(int argc, char *argv[]) {
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
-    /* Case 3: small batch (numReads < N at the default width 24) — every read
+    /* Case 3: small batch (numReads < N at the default width, 24 or 48) — every read
      * seeds its own slot, no recycle. Varied read contents. */
     {
         const char *reads[] = {
@@ -473,7 +474,7 @@ int main(int argc, char *argv[]) {
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
-    /* Case 4: a larger small batch (still < N at the default width 24) — distinct
+    /* Case 4: a larger small batch (still < N at the default width, 24 or 48) — distinct
      * read contents, no recycle here. The recycle path is exercised by Case 11r
      * (width 8) and the default-width recycle case (Case 11s) below. */
     {
@@ -633,7 +634,7 @@ int main(int argc, char *argv[]) {
 
     /* Case 11p: phiX subsequence, many reads, exercises the
      * stepping-pass/flush interleave when emitted matches are non-empty.
-     * Same parameters as 10p, more reads (still < N at the default width 24, so
+     * Same parameters as 10p, more reads (still < N at the default width, 24 or 48, so
      * no recycle) with non-trivial match_buf contents. */
     {
         /* 8 overlapping windows over the phiX start; each will emit
@@ -658,7 +659,7 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 11r: numReads > N forces slot recycle on non-empty match_buf
-     * contents. The width is runtime (g_bwtseed_lockstep_n) and its default (24)
+     * contents. The width is runtime (g_bwtseed_lockstep_n) and its default (24; 48 on Apple silicon)
      * exceeds 20, so pin it to 8 here: 20 reads then guarantees
      * the first 8 slots retire while 12 inputs are still pending. The recycle path
      * must reset match_count, ready, and phase for each recycled slot without
@@ -691,28 +692,27 @@ int main(int argc, char *argv[]) {
     }
 
     /* Case 11s: same slot-recycle path as 11r, but at the compile-time default
-     * width (no pin), so numReads must exceed the default. 30 reads > 24 forces
-     * the recycle branch at the width non-Zen 5 hosts run. This is the coverage
-     * 11r's width-8 pin does not give (the recycle path at N = default); Case 11z
-     * covers the AMD Zen 5 host default. */
+     * width (no pin), so numReads must exceed the default: default + 6 reads
+     * (30 at the portable 24, 54 at Apple silicon's 48) force the recycle branch
+     * at the width the host runs. This is the coverage 11r's width-8 pin does
+     * not give (the recycle path at N = default); Case 11z covers the AMD Zen 5
+     * host default. */
     {
-        /* 30 sliding 44-bp windows over the phiX start (src is 122 bp, so a
-         * window at offset i needs i + 44 <= 122, i.e. up to i = 78 > 29). */
-        const char *reads[30];
+        /* Sliding 44-bp windows over the phiX start (src is 122 bp, so a window
+         * at offset i needs i + 44 <= 122: up to 79 windows). */
         const char *src =
             "GAGTTTTATCGCTTCCATGACGCAGAAGTTAACACTTTCGGATATTTCTGATGAGTCGAAAA"
             "ATTATCTTGATAAAGCAGGAATTACTACTGCTTGTTTACGAATTAAATCGAAGTGGACTGCT";
-        char buf[30][45];
-        for (int i = 0; i < 30; i++) {
-            memcpy(buf[i], src + i, 44);
-            buf[i][44] = '\0';
-            reads[i] = buf[i];
-        }
-        int32_t numReads = 30;
+        const int32_t max_windows = 122 - 44 + 1;
+        const int32_t numReads = std::min<int32_t>(g_bwtseed_lockstep_n + 6, max_windows);
+        std::vector<std::string> bufs;
+        std::vector<const char *> reads;
+        for (int32_t i = 0; i < numReads; i++) bufs.emplace_back(src + i, (size_t)44);
+        for (const std::string &b : bufs) reads.push_back(b.c_str());
         int32_t max_readlength = 44;
         uint8_t *enc_qdb; bseq1_t *seq_; int32_t *cum_len;
-        encode_reads(reads, numReads, &enc_qdb, &seq_, &cum_len);
-        if (g_bwtseed_lockstep_n >= numReads)   /* only a -D build raising the default */
+        encode_reads(reads.data(), numReads, &enc_qdb, &seq_, &cum_len);
+        if (g_bwtseed_lockstep_n >= numReads)   /* only a -D build raising the default to 79+ */
             fprintf(stderr, "[NOTE] Case 11s: default width %d >= %d reads, so no slot "
                     "recycles here (Case 11w covers it)\n", (int)g_bwtseed_lockstep_n,
                     (int)numReads);
@@ -723,14 +723,17 @@ int main(int argc, char *argv[]) {
         free(enc_qdb); free(seq_); free(cum_len);
     }
 
-    /* Case 11z: slot recycle at the AMD Zen 5 host-default width (32 unless a -D
-     * override clamps it), the width Zen 5 hosts run by default. 70 sliding
+    /* Case 11z: slot recycle at the AMD Zen 5 width, BWA3_ZEN5_BWTSEED_LOCKSTEP_N
+     * (32), the width Zen 5 hosts run by default. It is pinned from the constant,
+     * capped at BWTSEED_LOCKSTEP_N_MAX, rather than taken from the host default,
+     * which a build with a higher compile-time default (Apple silicon's 48) floors
+     * at that default, so 32 runs on every build whose cap allows it. 70 sliding
      * 44-bp windows (offsets 0..69 of the 122-bp src) exceed that width twice
      * over, so every slot recycles at least once with non-empty match_buf
      * contents. The width is pinned through the runtime global and restored,
      * as in Case 11r. */
     {
-        const int32_t zen5_n = bwa3_bwtseed_host_default_width(1, 0x1a, 0x02);
+        const int32_t zen5_n = std::min<int32_t>(BWA3_ZEN5_BWTSEED_LOCKSTEP_N, BWTSEED_LOCKSTEP_N_MAX);
         enum { NZ = 70 };
         const char *reads[NZ];
         const char *src =
@@ -745,7 +748,7 @@ int main(int argc, char *argv[]) {
         if (zen5_n >= NZ) {
             /* Only a -D build raising the widths gets here; Case 11w covers
              * slot recycle at every width up to BWTSEED_LOCKSTEP_N_MAX. */
-            fprintf(stderr, "[SKIP] Case 11z: host-default width %d leaves no recycle "
+            fprintf(stderr, "[SKIP] Case 11z: Zen 5 width %d leaves no recycle "
                     "with %d reads (Case 11w covers it)\n", zen5_n, (int)NZ);
         } else {
             int32_t numReads = NZ;
@@ -756,7 +759,7 @@ int main(int argc, char *argv[]) {
             g_bwtseed_lockstep_n = zen5_n;
             char name[128];
             snprintf(name, sizeof(name),
-                     "Case 11z: numReads(%d) > N(%d), slot recycle at the Zen 5 host-default width",
+                     "Case 11z: numReads(%d) > N(%d), slot recycle at the Zen 5 width",
                      (int)NZ, (int)zen5_n);
             run_case(fmi, name,
                      numReads, max_readlength, /*minSeed=*/10, /*max_intv=*/5,

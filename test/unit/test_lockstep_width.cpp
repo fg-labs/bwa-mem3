@@ -385,12 +385,20 @@ TEST_CASE("host width: AMD Zen 5 gets the Zen 5 widths, every other host the def
         CHECK(bwa3_smem_host_default_width(0, 0, 0)    == SMEM_LOCKSTEP_N);
         CHECK(bwa3_bwtseed_host_default_width(0, 0, 0) == BWTSEED_LOCKSTEP_N);
     }
-#if SMEM_LOCKSTEP_N <= 32 && SMEM_LOCKSTEP_N_MAX >= 32 && \
-    BWTSEED_LOCKSTEP_N <= 32 && BWTSEED_LOCKSTEP_N_MAX >= 32 && \
-    BWA3_ZEN5_SMEM_LOCKSTEP_N == 32 && BWA3_ZEN5_BWTSEED_LOCKSTEP_N == 32
-    SUBCASE("shipped configuration: Zen 5 is 32/32") {
-        CHECK(bwa3_smem_host_default_width(1, 0x1a, kZen5Model)    == 32);
+#if SMEM_LOCKSTEP_N <= 32 && SMEM_LOCKSTEP_N_MAX >= 32 && BWA3_ZEN5_SMEM_LOCKSTEP_N == 32
+    SUBCASE("shipped configuration: Zen 5's SMEM width is 32") {
+        CHECK(bwa3_smem_host_default_width(1, 0x1a, kZen5Model) == 32);
+    }
+#endif
+#if BWTSEED_LOCKSTEP_N <= 32 && BWTSEED_LOCKSTEP_N_MAX >= 32 && BWA3_ZEN5_BWTSEED_LOCKSTEP_N == 32
+    SUBCASE("shipped configuration: Zen 5's bwtSeed width is 32") {
         CHECK(bwa3_bwtseed_host_default_width(1, 0x1a, kZen5Model) == 32);
+    }
+#elif BWTSEED_LOCKSTEP_N > 32 && BWA3_ZEN5_BWTSEED_LOCKSTEP_N == 32
+    // A build whose compile-time default is above 32 (Apple silicon's 48) never
+    // lowers it: the Zen 5 width is floored at the default.
+    SUBCASE("Zen 5's bwtSeed width is floored at a compile-time default above 32") {
+        CHECK(bwa3_bwtseed_host_default_width(1, 0x1a, kZen5Model) == BWTSEED_LOCKSTEP_N);
     }
 #endif
     SUBCASE("the host default stays inside [compile-time default, cap]") {
@@ -401,6 +409,23 @@ TEST_CASE("host width: AMD Zen 5 gets the Zen 5 widths, every other host the def
         CHECK(b >= BWTSEED_LOCKSTEP_N);
         CHECK(b <= BWTSEED_LOCKSTEP_N_MAX);
     }
+}
+
+// The shipped compile-time bwtSeed default: 48 on Apple silicon builds (Arm
+// macOS), 24 on every other build. Pinned only when the build takes the default
+// (no -DBWTSEED_LOCKSTEP_N override).
+TEST_CASE("bwtseed width: the compile-time default is 48 on Apple silicon, 24 elsewhere"
+          * doctest::test_suite("unit/smem")) {
+#if defined(BWTSEED_LOCKSTEP_N_IS_BUILD_DEFAULT)
+#if defined(__APPLE__) && defined(__aarch64__)
+    CHECK(BWTSEED_LOCKSTEP_N == 48);
+#else
+    CHECK(BWTSEED_LOCKSTEP_N == 24);
+#endif
+    CHECK(bwa3_bwtseed_host_default_width(0, 0, 0) == BWTSEED_LOCKSTEP_N);
+#else
+    MESSAGE("BWTSEED_LOCKSTEP_N set by -D (" << BWTSEED_LOCKSTEP_N << "): shipped default not pinned");
+#endif
 }
 
 // The resolvers return {width, source}; check both at once.
