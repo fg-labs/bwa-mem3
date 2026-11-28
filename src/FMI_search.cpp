@@ -477,6 +477,8 @@ FMI_search::FMI_search(const char *fname)
     cp_occ_huge = bwamem_hugetlb_buf_t{NULL, 0};
     seed_jump = NULL;
     seed_jump_depth = 0;
+    cp_prefer_staged = false;
+    cp_layout_requested = false;
 
     /* one_hot_mask_array is now a file-scope compile-time constant table (see
      * FMI_search.h); nothing to allocate or initialize here. */
@@ -499,7 +501,7 @@ FMI_search::~FMI_search()
         else if (cp_occ)              _mm_free(cp_occ);
         else if (cp_planes)           _mm_free(cp_planes);
     }
-    free(cp_base);   /* compact layout only; never part of the shm segment */
+    free(cp_base);   /* compact layout only; process-private on both paths (copied out of an attached segment) */
     /* Process-private on both paths (never part of the shm segment). */
     if (seed_jump) _mm_free(seed_jump);
 }
@@ -517,12 +519,13 @@ int64_t FMI_search::cp_occ_size_bytes() const {
                       : cp_occ_bytes_for(reference_seq_len);
 }
 
-bool FMI_search::compact_occ_env()
+bool FMI_search::compact_occ_env(bool *set)
 {
     /* An opt-in switch: on only for a value starting with '1'. A value that
      * starts with neither '0' nor '1' ("yes", "false") is reported, once, and
      * ignored, so a typo cannot silently pick a layout. */
     const char *e = getenv("BWA3_COMPACT_OCC");
+    if (set != NULL) *set = e != NULL && (e[0] == '0' || e[0] == '1');
     if (e != NULL && e[0] != '\0' && e[0] != '0' && e[0] != '1') {
         static std::atomic<bool> warned{false};
         if (!warned.exchange(true))
@@ -541,6 +544,12 @@ void FMI_search::set_compact_occ(bool on)
     cp_compact = on;
 }
 
+void FMI_search::prefer_staged_layout(bool requested)
+{
+    cp_prefer_staged = true;
+    cp_layout_requested = requested;
+}
+
 /* ---- the compact layout's file-to-memory checkpoint transform -------------- */
 static int  g_cp_span_shift_test = 0;      /* 0: the default (32) */
 static bool g_cp_force_wide_test = false;
@@ -549,7 +558,7 @@ void FMI_search::set_cp_layout_for_test(int span_shift, bool force_wide)
 {
     /* below CP_SHIFT the span-to-block shift goes negative; above 32 a span's
      * counts no longer fit 32 bits */
-    xassert(span_shift == 0 || (span_shift >= CP_SHIFT && span_shift <= 32),
+    xassert(span_shift == 0 || cp_span_shift_ok(span_shift),
             "set_cp_layout_for_test: span_shift out of range");
     g_cp_span_shift_test = span_shift;
     g_cp_force_wide_test = force_wide;
@@ -563,6 +572,11 @@ bool FMI_search::cp_is_wide(const int64_t raw_count[5])
     for (int b = 0; b < 4; b++)
         if (raw_count[b + 1] - raw_count[b] >= ((int64_t)1 << 32)) return true;
     return false;
+}
+
+FMI_search::CpCompactForm FMI_search::cp_compact_form(const int64_t raw_count[5])
+{
+    return CpCompactForm{ cp_span_shift_default(), cp_is_wide(raw_count) };
 }
 
 /* The conversion of the n file records of src (block first + i at src[i]) into dst, serially;
@@ -709,6 +723,43 @@ int64_t (*FMI_search::cp_read_span_bases(int fd, const char *path, int64_t ref_s
     }
     *n_spans = ns;
     return base;
+}
+
+bool FMI_search::cp_convert_records(int fd, const char *path, off_t rec0_off, int64_t n,
+                                    int64_t ref_seq_len, const int64_t raw_count[5],
+                                    CpCompactForm form, CP_OCC_PLANES *dst,
+                                    int64_t (**base)[4], int64_t *n_spans, int nthreads,
+                                    int64_t *empty_row)
+{
+    /* span bases are read only when the counts are span-relative */
+    *base = form.wide ? cp_read_span_bases(fd, path, ref_seq_len, form.span_shift, n_spans) : NULL;
+    if (!form.wide) *n_spans = 0;
+    if (cp_load_from_file(fd, path, rec0_off, n, ref_seq_len, raw_count, dst, *base, form.span_shift,
+                          form.wide, nthreads, empty_row))
+        return true;
+    free(*base);
+    *base = NULL;
+    return false;
+}
+
+bool FMI_search::cp_compact_convert(int fd, const char *path, int64_t ref_seq_len,
+                                    const int64_t raw_count[5], int64_t sentinel_index,
+                                    CpCompactForm form,
+                                    CP_OCC_PLANES *dst, int64_t (**base)[4], int64_t *n_spans,
+                                    int nthreads)
+{
+    *base = NULL;
+    *n_spans = 0;
+    if (!cp_span_shift_ok(form.span_shift)) return false;
+    int64_t empty_row = -1;
+    if (!cp_convert_records(fd, path, (off_t)FMI_BWT2BIT_HDR_BYTES, (ref_seq_len >> CP_SHIFT) + 1,
+                            ref_seq_len, raw_count, form, dst, base, n_spans, nthreads, &empty_row))
+        return false;
+    if (cp_sentinel_row_ok(empty_row, sentinel_index)) return true;
+    free(*base);
+    *base = NULL;
+    *n_spans = 0;
+    return false;
 }
 
 int64_t FMI_search::sa_sample_count() const {
@@ -936,9 +987,14 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
         fprintf(stderr, "ERROR! load_index_from_shm called with NULL base\n");
         exit(EXIT_FAILURE);
     }
-    /* A staged segment holds the file's checkpoint layout only (load_index
-     * never attaches one for the compact layout). */
-    cp_compact = false;
+    /* The layout is chosen before the attach (set_compact_occ; load_index
+     * sets the segment's when it prefers the staged one), never switched here. */
+    if ((bwa_shm_segment_compact(base) != 0) != cp_compact) {
+        fprintf(stderr, "ERROR! load_index_from_shm: the segment holds the %s checkpoint layout "
+                "and this index was set to the %s one (set_compact_occ)\n",
+                cp_compact ? "default" : "compact", cp_compact ? "compact" : "default");
+        exit(EXIT_FAILURE);
+    }
     uint64_t off = 0, sz = 0;
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SCALARS, &off, &sz) != 0
@@ -972,12 +1028,50 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
     sa_compx_mask = (1LL << sa_compx) - 1;
     set_sa_hi_geometry();
 
-    if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
-        || (int64_t)sz != sizes[0] || off % alignof(CP_OCC) != 0) {
-        fprintf(stderr, "ERROR! shm segment missing, misaligned or mis-sized FMI_CP_OCC\n");
-        exit(EXIT_FAILURE);
+    if (!cp_compact) {
+        if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_OCC, &off, &sz) != 0
+            || (int64_t)sz != sizes[0] || off % alignof(CP_OCC) != 0) {
+            fprintf(stderr, "ERROR! shm segment missing, misaligned or mis-sized FMI_CP_OCC\n");
+            exit(EXIT_FAILURE);
+        }
+        cp_occ = (CP_OCC *)(base + off);
+    } else {
+        /* The compact layout: the converted records, their count form and,
+         * when the counts are wide, the span bases (copied: process-private,
+         * freed by the destructor; NULL otherwise, as after a disk load). */
+        if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_LAYOUT, &off, &sz) != 0
+            || sz != BWA_SHM_FMI_CP_LAYOUT_BYTES) {
+            fprintf(stderr, "ERROR! shm segment missing or malformed FMI_CP_LAYOUT\n");
+            exit(EXIT_FAILURE);
+        }
+        int64_t lay[2];
+        memcpy(lay, base + off, sizeof lay);
+        if (!cp_span_shift_ok(lay[0]) || (lay[1] != 0 && lay[1] != 1)) {
+            fprintf(stderr, "ERROR! shm FMI_CP_LAYOUT: span_shift=%lld wide=%lld out of bounds\n",
+                    (long long)lay[0], (long long)lay[1]);
+            exit(EXIT_FAILURE);
+        }
+        cp_span_shift = (int)lay[0];
+        cp_wide       = lay[1] != 0;
+        cp_n_spans    = cp_wide ? (reference_seq_len >> cp_span_shift) + 1 : 0;
+        if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_BASE, &off, &sz) != 0
+            || sz != (uint64_t)cp_n_spans * sizeof cp_base[0]) {
+            fprintf(stderr, "ERROR! shm segment missing or mis-sized FMI_CP_BASE\n");
+            exit(EXIT_FAILURE);
+        }
+        if (cp_wide) {
+            cp_base = (int64_t (*)[4])malloc((size_t)sz);
+            xassert(cp_base != NULL, "out of memory: checkpoint span bases");
+            memcpy(cp_base, base + off, (size_t)sz);
+        }
+        /* 32-byte aligned: two records per cache line, as the disk load's. */
+        if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_CP_PLANES, &off, &sz) != 0
+            || (int64_t)sz != cp_occ_size_bytes() || off % sizeof(CP_OCC_PLANES) != 0) {
+            fprintf(stderr, "ERROR! shm segment missing, misaligned or mis-sized FMI_CP_PLANES\n");
+            exit(EXIT_FAILURE);
+        }
+        cp_planes = (CP_OCC_PLANES *)(base + off);
     }
-    cp_occ = (CP_OCC *)(base + off);
 
     if (bwa_shm_section_find(base, BWA_SHM_SEC_FMI_SA_MS, &off, &sz) != 0
         || (int64_t)sz != sizes[1] || off % alignof(uint64_t) != 0) {
@@ -996,9 +1090,11 @@ void FMI_search::load_index_from_shm(uint8_t *base, size_t len, size_t map_len)
 
     shm_base = base;
     shm_len  = map_len;   /* what the destructor unmaps */
+    set_cp_sentinel();
 
-    fprintf(stderr, "* FMI attached from shm: ref_seq_len=%ld sentinel_index=%ld\n",
-            (long)reference_seq_len, (long)sentinel_index);
+    fprintf(stderr, "* FMI attached from shm: ref_seq_len=%ld sentinel_index=%ld%s\n",
+            (long)reference_seq_len, (long)sentinel_index,
+            cp_compact ? " (compact checkpoint layout)" : "");
 }
 
 bool FMI_search::densify_sa_into(const CP_OCC *cp_occ_src, const int64_t count_src[5],
@@ -1196,19 +1292,40 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     /* Try the staged shm segment first. On hit, both the FMI internals
      * (cp_occ / sa_*) and the BNS+PAC are attached as views into the
      * mapping; the segment lifetime belongs to the shm-loading process.
-     * A segment holds the default checkpoint layout only, so the compact
-     * layout never attaches one: it loads from disk, and says so when a
-     * complete segment is staged (a registry entry alone, from a stage in
-     * progress or interrupted, holds no index to duplicate). */
-    if (cp_compact) {
-        if (bwa_shm_test_complete(file_name) == 1)
-            fprintf(stderr, "[W::load_index] compact checkpoint layout: not attaching the index staged in "
-                    "shared memory (it holds the default layout); loading a private copy from disk, "
-                    "which adds to the memory the staged segment already holds\n");
-    } else {
+     * A segment holds one checkpoint layout (bwa_shm_segment_compact). A
+     * caller that prefers the staged one (main_mem: prefer_staged_layout)
+     * attaches either and takes its layout, through set_compact_occ; any other
+     * attaches only its own layout (bwa_shm_attach declines the other, and
+     * this loads from disk). */
+    {
         size_t   shm_attach_len = 0, shm_map_len = 0;
         uint8_t *shm_base_local = bwa_shm_attach(file_name, &shm_attach_len, &shm_map_len,
-                                                 /*need_pac=*/load_pac);
+                                                 /*need_pac=*/load_pac,
+                                                 cp_prefer_staged ? -1
+                                                 : cp_compact ? (int)BWA_SHM_CP_LAYOUT_COMPACT
+                                                              : (int)BWA_SHM_CP_LAYOUT_DEFAULT);
+        if (shm_base_local != NULL) {
+            const bool seg_compact = bwa_shm_segment_compact(shm_base_local) != 0;
+            if (seg_compact != cp_compact) {
+                if (cp_layout_requested)
+                    fprintf(stderr, "[W::load_index] the %s checkpoint layout was requested (%s), but the "
+                            "index staged in shared memory holds the %s one, which this run uses "
+                            "instead (alignment records are the same in both); to use the %s layout, "
+                            "restage it: `bwa-mem3 shm -d` (drops every staged index), then the "
+                            "`bwa-mem3 shm` command that staged it (keeping --meth) %s\n",
+                            cp_compact ? "compact" : "default",
+                            cp_compact ? "--compact-occ or BWA3_COMPACT_OCC=1" : "BWA3_COMPACT_OCC=0",
+                            seg_compact ? "compact" : "default", cp_compact ? "compact" : "default",
+                            cp_compact ? "with --compact-occ added (and without --huge-pages, whose "
+                                         "1 GB stage holds the default layout only)"
+                                       : "without --compact-occ");
+                else
+                    fprintf(stderr, "[M::load_index] the index staged in shared memory holds the "
+                            "%s checkpoint layout%s; using it\n", seg_compact ? "compact" : "default",
+                            seg_compact ? " (staged with `bwa-mem3 shm --compact-occ`)" : "");
+                set_compact_occ(seg_compact);   /* nothing is loaded yet */
+            }
+        }
         if (shm_base_local != NULL) {
             /* shm_map_len: the whole mapping, which can be longer than the
              * packed index it holds, is what the destructor unmaps. */
@@ -1338,13 +1455,10 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     // The compact layout holds 32-byte CP_OCC_PLANES records (half the file's),
     // converted from the file's records as they are read (below).
     int64_t cp_occ_bytes = cp_occ_size * (cp_compact ? (int64_t)sizeof(CP_OCC_PLANES) : (int64_t)sizeof(CP_OCC));
+    const CpCompactForm cp_form = cp_compact_form(count);   /* read only when cp_compact */
     if (cp_compact) {
-        cp_span_shift = cp_span_shift_default();
-        cp_wide = cp_is_wide(count);
-        /* span bases are read only when the counts are span-relative */
-        if (cp_wide)
-            cp_base = cp_read_span_bases(fileno(cpstream), cp_file_name, reference_seq_len, cp_span_shift,
-                                         &cp_n_spans);
+        cp_span_shift = cp_form.span_shift;
+        cp_wide = cp_form.wide;
     }
     // A buffer on pre-faulted 1 GB pages needs no page faults while it is
     // filled, so the read is a plain copy out of the page cache and keeps
@@ -1374,8 +1488,8 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
         const int cp_nt = cp_occ_huge.base != NULL ? huge_load_nt : load_nt;
         const off_t rec0 = ftello(cpstream);
         xassert(rec0 >= 0, "ftello failed during index load");
-        xassert(cp_load_from_file(fileno(cpstream), cp_file_name, rec0, cp_occ_size, reference_seq_len,
-                                  count, cp_planes, cp_base, cp_span_shift, cp_wide, cp_nt, &cp_empty_row),
+        xassert(cp_convert_records(fileno(cpstream), cp_file_name, rec0, cp_occ_size, reference_seq_len,
+                                   count, cp_form, cp_planes, &cp_base, &cp_n_spans, cp_nt, &cp_empty_row),
                 kCpCorruptMsg);
         xassert(fseeko(cpstream, rec0 + (off_t)cp_occ_size * (off_t)sizeof(CP_OCC), SEEK_SET) == 0,
                 "fseeko failed during index load");
@@ -1467,7 +1581,7 @@ void FMI_search::load_index(bool load_pac, int n_threads, bool build_seed_jump,
     // The compact layout's one base-less row must be the sentinel's: the planes
     // read any other such row as A, where the default layout sees no base.
     if (cp_compact)
-        xassert(cp_empty_row == sentinel_index, kCpCorruptMsg);
+        xassert(cp_sentinel_row_ok(cp_empty_row, sentinel_index), kCpCorruptMsg);
 
     // cp_occ, count[] and sentinel_index are in: build the seed jump table.
     if (build_seed_jump) build_seed_jump_table(load_nt);

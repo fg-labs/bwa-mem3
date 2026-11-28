@@ -635,7 +635,7 @@ static bool staging_prerequisite()
 static void stage_child_exit(int status, void *) { fflush(NULL); _exit(status); }
 #endif
 
-static bool stage_required(const char *prefix, const char *name)
+static bool stage_required(const char *prefix, const char *name, bool compact = false)
 {
     bwa_tests::StderrCapture capture;
     fflush(NULL);
@@ -644,7 +644,8 @@ static bool stage_required(const char *prefix, const char *name)
 #if defined(PRIVATE_STAGE_ASAN)
         on_exit(stage_child_exit, NULL);
 #endif
-        const int rc = bwa_shm_stage(prefix);
+        const int rc = bwa_shm_stage(prefix, /*bns_only=*/false, /*target_sa_compx=*/-1,
+                                     /*n_threads=*/1, /*huge=*/false, compact);
         fflush(NULL);
         _exit(rc == 0 ? 0 : 1);
     }
@@ -1240,8 +1241,8 @@ static int fixture_workload(const char *prefix, bool portable_checks)
             report(at->shm_base != NULL && at->seed_jump == NULL && at->seed_jump_depth == 0,
                    "load_index(build_seed_jump=false) (shm attach): no table");
             delete at;
-            /* The compact layout never attaches a staged segment (it holds the
-             * default layout): it loads its own copy from disk. */
+            /* A caller bound to the compact layout does not attach a default
+             * segment: it loads its own copy from disk. */
             at = new FMI_search(staged_prefix);
             at->set_compact_occ(true);
             at->load_index(false, 1, false);
@@ -1253,7 +1254,31 @@ static int fixture_workload(const char *prefix, bool portable_checks)
                        && h->fmi->seed_jump_depth == 0,
                    "fmi_seed_open (already-staged shm attach): no table");
             fmi_seed_close(h);
-            if (stage_required(second_prefix, "second private fixture staging")) {
+            if (stage_required(second_prefix, "second private fixture staging (compact layout)",
+                               /*compact=*/true)) {
+                /* A caller bound to the default layout (the seed facade) does not attach a
+                 * compact segment: it loads from disk and says so. */
+                std::string warned;
+                FmiSeed *d = NULL;
+                {
+                    bwa_tests::StderrCapture capture;
+                    d = fmi_seed_open(second_prefix);
+                    warned = capture.text();
+                }
+                report(d != NULL && d->fmi->shm_base == NULL && !d->fmi->compact_occ()
+                           && fmi_seed_cp_occ(d) != NULL
+                           && warned.find("[W::bwa_shm_attach]") != std::string::npos
+                           && warned.find("compact checkpoint layout and this load uses the default")
+                                  != std::string::npos,
+                       "fmi_seed_open (default layout, compact segment staged): loads from disk, says so");
+                fmi_seed_close(d);
+                /* mem's path (prefer_staged_layout) attaches it in its layout. */
+                FMI_search *pf = new FMI_search(second_prefix);
+                pf->prefer_staged_layout(/*requested=*/false);
+                pf->load_index(false, 1, false);
+                report(pf->shm_base != NULL && pf->compact_occ() && pf->cp_occ_data() != NULL,
+                       "load_index (prefer_staged_layout, compact segment staged): attaches it, compact");
+                delete pf;
                 drop_fixture_shm(staged_prefix);
                 std::vector<std::string> names;
                 report(read_shm_registry(&names) == REGISTRY_READABLE

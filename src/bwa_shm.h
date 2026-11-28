@@ -45,9 +45,20 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
  * fallback; rejecting it at attach lets load_index() fall back to disk.
  * Bumped 2 -> 3 when FMI_SA_MS changed from one byte per SA sample to the packed
  * high parts (FMI_search::sa_hi_size_bytes()).
- * Increment whenever any packed section layout (e.g. BWA_SHM_FMI_SCALARS_BYTES)
- * changes. */
-#define BWA_SHM_VERSION        3u
+ * Bumped 3 -> 4 when the header gained cp_layout (the compact checkpoint
+ * layout, `shm --compact-occ`): a version-3 reader would take a compact
+ * segment's header for a default one, and a version-4 reader cannot tell a
+ * version-3 segment's layout, so each rejects the other at attach and loads
+ * from disk.
+ * Bump it whenever the header or any packed section layout (e.g.
+ * BWA_SHM_FMI_SCALARS_BYTES) changes. */
+#define BWA_SHM_VERSION        4u
+/* The occurrence-checkpoint layout a segment holds (bwa_shm_header_t.cp_layout).
+ * DEFAULT: the file's 64-byte records in FMI_CP_OCC. COMPACT (`shm
+ * --compact-occ`): the 32-byte records in FMI_CP_PLANES instead, plus
+ * FMI_CP_BASE and FMI_CP_LAYOUT. Any other value is refused at attach. */
+#define BWA_SHM_CP_LAYOUT_DEFAULT 0u
+#define BWA_SHM_CP_LAYOUT_COMPACT 1u
 #define BWA_SHM_CTL_NAME       "/bwactl"
 /* Named POSIX semaphore guarding read-modify-write sequences against
  * /bwactl. A stager holds it only for the few milliseconds of registry and
@@ -77,6 +88,15 @@ Authors: Vasimuddin Md <vasimuddin.md@intel.com>; Sanchit Misra <sanchit.misra@i
 #define BWA_SHM_SEC_BNS_NAMES    8u
 #define BWA_SHM_SEC_PAC          9u
 #define BWA_SHM_SEC_REF_STRING   10u
+/* The compact layout's sections (BWA_SHM_CP_LAYOUT_COMPACT). FMI_CP_PLANES:
+ * CP_OCC_PLANES[] (32 bytes per 64 rows). FMI_CP_BASE: int64_t[4] per
+ * 2^span_shift rows, the full counts the span-relative ones are taken from;
+ * empty unless the counts are wide. FMI_CP_LAYOUT: BWA_SHM_FMI_CP_LAYOUT_BYTES,
+ * int64_t span_shift and wide. */
+#define BWA_SHM_SEC_FMI_CP_PLANES 11u
+#define BWA_SHM_SEC_FMI_CP_BASE   12u
+#define BWA_SHM_SEC_FMI_CP_LAYOUT 13u
+#define BWA_SHM_FMI_CP_LAYOUT_BYTES (sizeof(int64_t) * 2)
 
 /* 1 GB staging (`bwa-mem3 shm --huge-pages`). /dev/shm backs a segment with
  * 2 MB pages at most, so the index goes into a System V segment created with
@@ -115,7 +135,8 @@ typedef struct {
 	uint64_t magic;          /* BWA_SHM_MAGIC (a 1 GB stub: BWA_SHM_HUGE_MAGIC),
 	                          * or 0 while staging */
 	uint32_t version;        /* BWA_SHM_VERSION */
-	uint32_t n_sections;
+	uint16_t n_sections;
+	uint16_t cp_layout;      /* BWA_SHM_CP_LAYOUT_*; 0 in a 1 GB stub */
 	uint64_t total_size;     /* bytes including this header */
 	uint64_t reserved[5];    /* [0] stager PID, [1] stage token; 1 GB stub only:
 	                          * [2] System V segment bytes, [3] its id + 1,
@@ -124,6 +145,9 @@ typedef struct {
 	                          *     32 (0: unknown);
 	                          * rest zero */
 } bwa_shm_header_t;           /* 64 bytes; first object in every segment */
+#ifdef __cplusplus
+static_assert(sizeof(bwa_shm_header_t) == 64, "bwa_shm_header_t is 64 bytes");
+#endif
 
 typedef struct {
 	uint32_t kind;           /* one of BWA_SHM_SEC_* */
@@ -140,13 +164,6 @@ extern "C" {
 	/* 1 if `prefix`'s basename is registered (which includes a stage still in
 	 * progress or one that was interrupted), 0 if not, -1 on error. */
 	int       bwa_shm_test(const char *prefix);
-	/* 1 if `prefix`'s basename is registered and its segment is complete (the
-	 * check bwa_shm_stage makes to find an index already staged), 0 if not, -1
-	 * on error. A registered stage still in progress or interrupted, or one
-	 * with no segment or an unusable one, gives 0. Complete does not mean a
-	 * given load can attach it: bwa_shm_attach also refuses, e.g., a seed-only
-	 * stage when the load needs the packed reference. */
-	int       bwa_shm_test_complete(const char *prefix);
 	/* bns_only=true stages a SEED-only segment (D3 --meth): the FM-index + BNS
 	 * are packed, but PAC and REF_STRING (.0123) are omitted (zero-length
 	 * sections) because `mem --meth` never reads the seed pac/.0123. The seed
@@ -157,8 +174,11 @@ extern "C" {
 	 * staging cost + extra shm for faster per-query SA resolution, without
 	 * rebuilding the on-disk index.
 	 * n_threads: worker count for the densify pass (the per-sample LF-walks are
-	 * independent); <=0 or 1 runs it serially. Ignored when not densifying. */
-	/* huge: stage on 1 GB huge pages (`shm --huge-pages`, Linux only; see
+	 * independent) and the compact conversion; <=0 or 1 runs them serially.
+	 * compact: stage the 32-byte occurrence-checkpoint layout
+	 * (BWA_SHM_CP_LAYOUT_COMPACT). Not combinable with a target_sa_compx (any
+	 * value >= 0), nor with huge.
+	 * huge: stage on 1 GB huge pages (`shm --huge-pages`, Linux only; see
 	 * BWA_SHM_HUGE_MAGIC). Fails, staging nothing, when they cannot be had; on
 	 * an AMD x86 host, where 1 GB staging measured no gain (unless
 	 * BWAMEM3_SHM_HUGE_PAGES_AMD=1 is set); where kernel.shm_rmid_forced
@@ -168,7 +188,8 @@ extern "C" {
 	int       bwa_shm_stage(const char *prefix, bool bns_only = false,
 	                        int target_sa_compx = -1,
 	                        int n_threads = 1,
-	                        bool huge = false); /* loads from disk, packs, stages */
+	                        bool huge = false,
+	                        bool compact = false); /* loads from disk, packs, stages */
 	/* Test-only hook (see bwa_shm.cpp): bwa_shm_stage calls it with its
 	 * writable index mapping after it has registered the segment and released
 	 * the stager lock, before the pack fills it, so a unit test can inspect
@@ -191,13 +212,45 @@ extern "C" {
 	 * munmap: a 1 GB index is a System V attachment. */
 	/* need_pac: the caller loads the packed reference (PAC), so a stage
 	 * without a usable one (a seed-only `shm --meth` stage) is declined (NULL)
-	 * rather than attached for a load that would exit on it. */
+	 * rather than attached for a load that would exit on it.
+	 * cp_layout: a BWA_SHM_CP_LAYOUT_* the caller can use, so a segment of the
+	 * other layout is declined (NULL, with a note); -1 takes either, and the
+	 * caller reads which with bwa_shm_segment_compact. */
 	uint8_t  *bwa_shm_attach(const char *prefix, size_t *len_out,
 	                         size_t *map_len_out = NULL,
-	                         bool need_pac = false);                 /* NULL if not staged */
+	                         bool need_pac = false,
+	                         int cp_layout = -1);                    /* NULL if not staged */
 	void      bwa_shm_detach(uint8_t *base, size_t map_len);
 	int       bwa_shm_section_find(const uint8_t *base, uint32_t kind,
 	                               uint64_t *offset_out, uint64_t *size_out);
+	/* 1 if the attached segment at `base` holds the compact checkpoint layout
+	 * (header cp_layout BWA_SHM_CP_LAYOUT_COMPACT), 0 if the default one. */
+	int       bwa_shm_segment_compact(const uint8_t *base);
+
+	/* The huge-page warning that `shm` (after the pack) and bwa_shm_attach (for a
+	 * segment it returns) print, at most once per process, when the segment is not
+	 * on huge pages. Exposed for its unit tests (test/unit/test_shm_hugepage_warn.cpp);
+	 * nothing else calls them.
+	 * bwa_shm_hugepage_warn_wanted: whether to warn for a segment of seg_len bytes.
+	 * on_huge is bwa_smaps_vma_finish's verdict for its mapping (bwa_thp.h);
+	 * pmd_bytes the PMD (transparent huge page) size; shmem_enabled the text of
+	 * /sys/kernel/mm/transparent_hugepage/shmem_enabled, or NULL when it cannot be
+	 * read. 1 only when the segment could be on huge pages and is not: the
+	 * mapping is resident and none of it is huge (on_huge == 0), the segment
+	 * holds at least one PMD page (a smaller one is never PMD-mapped, whatever
+	 * the mount), and the kernel has shmem THP not set to [deny] (which turns it
+	 * off for every tmpfs mount, whatever the mount option).
+	 * bwa_shm_format_hugepage_warning: the one-line "[W::<func>]" message for a
+	 * segment on page_bytes pages, newline-terminated, into buf (n bytes; NULL
+	 * and 0 to size it). forced: shmem_enabled is [force], which gives every
+	 * tmpfs mount huge pages whatever its huge= option, so the message advises
+	 * freeing or compacting memory instead of a remount. Returns the snprintf
+	 * length. */
+	int       bwa_shm_hugepage_warn_wanted(int on_huge, uint64_t seg_len, uint64_t pmd_bytes,
+	                                       const char *shmem_enabled);
+	int       bwa_shm_format_hugepage_warning(char *buf, size_t n, const char *func,
+	                                          const char *name, uint64_t page_bytes,
+	                                          uint64_t pmd_bytes, int forced);
 
 	/* Layout of a packed bwa-mem3 index segment. Computed by bwa_shm_compute
 	 * from a prefix on disk; consumed by bwa_shm_pack_into and bwa_shm_stage.
@@ -213,12 +266,15 @@ extern "C" {
 		                                   * disk_sa_compx unless `shm -u` densified it. */
 		int64_t  disk_sa_compx;           /* SA shift on disk (tail-detected). Source stride
 		                                   * for a densify pass; == sa_compx when not densifying. */
-		int       densify_threads;        /* worker count for the SA densify pass (>=1);
-		                                   * 1 == serial. Ignored when not densifying. */
+		int       densify_threads;        /* worker count for the SA densify pass and the
+		                                   * compact conversion (>=1); 1 == serial. */
+		bool      compact;                /* stage the compact checkpoint layout */
+		int64_t   cp_span_shift;          /* compact only: rows per count span, log2 */
+		int64_t   cp_wide;                /* compact only: counts are span-relative */
 		int64_t  ref_string_len;         /* file size of <prefix>.0123 */
 		uint64_t total_size;
 		uint32_t n_sections;
-		bwa_shm_section_t sections[16];  /* 10 used today; spare for forward-compat */
+		bwa_shm_section_t sections[16];  /* 10 (default layout) or 12 (compact) used */
 		uint64_t stager_pid;             /* header reserved[0]; 0 outside bwa_shm_stage */
 		uint64_t stage_token;            /* header reserved[1]; 0 outside bwa_shm_stage */
 	} bwa_shm_layout_t;
@@ -228,11 +284,14 @@ extern "C" {
 	 * `.0123` is not stat'd (the seed `.0123` need not exist) — see bwa_shm_stage. */
 	int  bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout,
 	                     bool bns_only = false, int target_sa_compx = -1,
-	                     int n_threads = 1);
+	                     int n_threads = 1, bool compact = false);
 
 	/* Pack the index described by `layout` into `dest`, which must be at least
-	 * layout->total_size bytes. Streams cp_occ / sa_* / pac / ref_string from
-	 * disk straight into dest (no intermediate heap copy). Returns 0/-1. */
+	 * layout->total_size bytes. Compact layouts require 32-byte alignment of
+	 * dest; a misaligned compact destination is rejected before any writes.
+	 * Default layouts retain their natural alignment requirements (8 bytes).
+	 * Streams cp_occ / sa_* / pac / ref_string from disk straight into dest
+	 * (no intermediate heap copy). Returns 0/-1. */
 	int  bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest);
 
 	/* Release the layout's loaded BNS. Safe to call after compute fails. */

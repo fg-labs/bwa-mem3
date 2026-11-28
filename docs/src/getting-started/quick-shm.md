@@ -11,6 +11,13 @@ in sequence on the same machine, this per-invocation overhead accumulates.
 attach to the in-memory segment instead of reading from disk, reducing per-sample startup time
 to near zero.
 
+> **Important — on Linux, mount `/dev/shm` with `huge=advise` first.** On the stock mount the
+> segment sits on 4 KB pages and alignment uses more CPU than a disk load (measured below and in
+> the page linked at the end of this note); `shm` and `mem` print a `[W::]` warning when this happens. Run
+> `sudo mount -o remount,huge=advise /dev/shm` (and add `huge=advise` to the `/dev/shm` options in
+> `/etc/fstab` to keep it), then stage, or drop (`bwa-mem3 shm -d`) and restage an index staged
+> before the remount. See [`shm` → Huge pages](../cli/shm.md#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size).
+
 ## Stage the index
 
 ```bash

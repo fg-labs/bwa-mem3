@@ -32,6 +32,7 @@
 #include "utils.h"         /* err_fread_noeof, err_fclose, xopen */
 #include "bwa_madvise.h"   /* bwamem_madv_hugepage */
 #include "simd_dispatch.h" /* bwa3_host_cpu_identity */
+#include "bwa_thp.h"       /* bwa_smaps_vma_*, bwa_proc_read_stream: the shared smaps reader */
 
 #include <stdio.h>
 #include <cstdlib>
@@ -49,6 +50,7 @@
 #include <limits.h>        /* PATH_MAX */
 #include <signal.h>        /* kill(pid, 0) liveness probe */
 #include <time.h>
+#include <atomic>
 #include <string>
 #include <vector>
 
@@ -301,6 +303,118 @@ static void *idx_segment_map(int fd, size_t len, int prot)
     return m;
 }
 
+int bwa_shm_hugepage_warn_wanted(int on_huge, uint64_t seg_len, uint64_t pmd_bytes,
+                                 const char *shmem_enabled)
+{
+    if (on_huge != 0) return 0;                 /* on huge pages, or cannot tell */
+    if (seg_len < pmd_bytes) return 0;          /* never PMD-mapped: no huge page fits */
+    if (shmem_enabled == NULL) return 0;        /* no shmem THP in the kernel */
+    if (std::strstr(shmem_enabled, "[deny]") != NULL) return 0;   /* off for every mount */
+    return 1;
+}
+
+/* "4 KB", "64 KB", "2 MB", "512 MB", "1 GB": a page size in the message. */
+static std::string shm_page_size_text(uint64_t bytes)
+{
+    static const char *const unit[] = { "B", "KB", "MB", "GB" };
+    int u = 0;
+    while (u < 3 && bytes >= 1024 && bytes % 1024 == 0) { bytes /= 1024; ++u; }
+    return std::to_string((unsigned long long)bytes) + " " + unit[u];
+}
+
+int bwa_shm_format_hugepage_warning(char *buf, size_t n, const char *func, const char *name,
+                                    uint64_t page_bytes, uint64_t pmd_bytes, int forced)
+{
+    const std::string page = shm_page_size_text(page_bytes), pmd = shm_page_size_text(pmd_bytes);
+    /* Under shmem_enabled [force] every tmpfs mount already gets huge pages,
+     * whatever its huge= option, so small pages mean the kernel could not
+     * allocate a free PMD-sized block when the segment was written: memory too
+     * low or too fragmented, or THP defrag set to never (no compaction). */
+    if (forced)
+        return std::snprintf(buf, n,
+            "[W::%s] the shm segment for '%s' is on %s pages, not %s huge pages, although "
+            "shmem_enabled is [force], so remounting /dev/shm cannot help: the kernel found no "
+            "free %s block when the segment was written (memory too low or too fragmented). "
+            "Fix: free memory, or compact it with `echo 1 | sudo tee /proc/sys/vm/compact_memory`, "
+            "and check that /sys/kernel/mm/transparent_hugepage/defrag is not [never]; then "
+            "restage, since page size is fixed at staging: `bwa-mem3 shm -d`, then your "
+            "`bwa-mem3 shm` command again.\n",
+            func, name, page.c_str(), pmd.c_str(), pmd.c_str());
+    return std::snprintf(buf, n,
+        "[W::%s] the shm segment for '%s' is on %s pages, not %s huge pages. "
+        "Fix: `sudo mount -o remount,huge=advise /dev/shm` (add huge=advise "
+        "to the /dev/shm options in /etc/fstab to keep it across reboots), then restage, since "
+        "page size is fixed at staging: `bwa-mem3 shm -d`, then your `bwa-mem3 shm` command "
+        "again.\n",
+        func, name, page.c_str(), pmd.c_str());
+}
+
+/* Warn, once per process, when the segment mapped at `base` is not on huge
+ * pages. It checks what the kernel did, not the mount options: the smaps entry
+ * for the mapping, whose pages the caller has touched (the stager's pack, the
+ * attach's magic load). smaps is streamed (bwa_proc_read_stream) and the read
+ * stops after that one VMA. Silent at -v < 2, when it cannot tell (smaps
+ * unreadable), and when the segment could not be on huge pages
+ * (bwa_shm_hugepage_warn_wanted: a segment smaller than one PMD page, no shmem
+ * THP in the kernel, or shmem_enabled set to deny). Under shmem_enabled
+ * [force] the advice is to free or compact memory, not to remount. The caller
+ * never passes a 1 GB (hugetlb) segment, which smaps would report as huge
+ * anyway. Linux only; a no-op elsewhere. Never changes the exit status or
+ * output. Called with no stager lock held: it reads procfs and sysfs and
+ * writes stderr. */
+#if defined(__linux__)
+static int shm_smaps_vma_feed(void *p, const char *data, size_t n)
+{
+    bwa_smaps_vma_feed((bwa_smaps_vma_parser_t *)p, data, n);
+    return bwa_smaps_vma_done((const bwa_smaps_vma_parser_t *)p);
+}
+
+/* The PMD (transparent huge page) size: 2 MB on x86-64 and on arm64 with 4 KB
+ * base pages, 512 MB on arm64 with 64 KB ones. */
+static uint64_t shm_pmd_bytes(void)
+{
+    char *text = NULL;
+    size_t cap = 0;
+    unsigned long long v = 0;
+    if (bwa_proc_read_text("/sys/kernel/mm/transparent_hugepage/hpage_pmd_size", &text, &cap, 64) > 0)
+        v = std::strtoull(text, NULL, 10);
+    std::free(text);
+    return v > 0 ? (uint64_t)v : 2ULL << 20;
+}
+#endif
+
+static std::atomic<bool> g_small_pages_warned{false};
+
+static void shm_warn_if_small_pages(const char *func, const void *base, uint64_t seg_len,
+                                    const char *name)
+{
+#if defined(__linux__)
+    if (bwa_verbose < 2 || g_small_pages_warned.load(std::memory_order_relaxed)) return;
+    const uint64_t pmd = shm_pmd_bytes();
+    if (seg_len < pmd) return;   /* no huge page fits: skip the smaps walk */
+    char *thp = NULL;
+    size_t cap = 0;
+    const bool have_thp =
+        bwa_proc_read_text("/sys/kernel/mm/transparent_hugepage/shmem_enabled", &thp, &cap, 4096) >= 0;
+    bwa_smaps_vma_parser_t vma;
+    bwa_smaps_vma_init(&vma, (unsigned long long)(uintptr_t)base);
+    const bool want = bwa_proc_read_stream("/proc/self/smaps", shm_smaps_vma_feed, &vma) == 0 &&
+                      bwa_shm_hugepage_warn_wanted(bwa_smaps_vma_finish(&vma), seg_len, pmd,
+                                                   have_thp ? thp : NULL);
+    const int forced = have_thp && std::strstr(thp, "[force]") != NULL;
+    std::free(thp);
+    if (!want || g_small_pages_warned.exchange(true)) return;
+    const uint64_t page = (uint64_t)sysconf(_SC_PAGESIZE);
+    const int n = bwa_shm_format_hugepage_warning(NULL, 0, func, name, page, pmd, forced);
+    if (n <= 0) return;
+    std::string msg((size_t)n + 1, '\0');
+    bwa_shm_format_hugepage_warning(&msg[0], msg.size(), func, name, page, pmd, forced);
+    std::fputs(msg.c_str(), stderr);
+#else
+    (void)func; (void)base; (void)seg_len; (void)name;
+#endif
+}
+
 /* Test-only hook, called after the lock is released and before the pack
  * (shm_thp_advise_test, shm_stage_test). NULL in production. */
 void (*bwa_shm_stage_map_hook)(const void *base, size_t len) = NULL;
@@ -388,6 +502,13 @@ static void ctl_remove(void *m, const char *name)
     h.n_entries  = (uint16_t)(h.n_entries - 1);
     h.next_write = (uint16_t)(tail - len - base);
     ctl_header_store(base, h);
+}
+
+/* A complete index header this release reads: its version, and a checkpoint
+ * layout it knows. The one test every reader of a segment header makes. */
+static bool shm_header_known(const bwa_shm_header_t *h)
+{
+    return h->version == BWA_SHM_VERSION && h->cp_layout <= BWA_SHM_CP_LAYOUT_COMPACT;
 }
 
 /* Segment states, from the header (see bwa_shm_header_t). */
@@ -598,10 +719,10 @@ static void *huge_attach(const bwa_shm_header_t *stub, int *id_out, const char *
         std::memcpy(&hdr, m, sizeof(hdr));
         if (magic != BWA_SHM_MAGIC || hdr.reserved[1] != stub->reserved[1])
             *why = "it is not the index that was staged";
-        else if (hdr.version != BWA_SHM_VERSION || hdr.total_size > stub->reserved[2] ||
-                 hdr.total_size < sizeof(bwa_shm_header_t))
-            *why = "its index header has another version, or a size past the segment or "
-                   "shorter than the header";
+        else if (!shm_header_known(&hdr) || hdr.cp_layout != BWA_SHM_CP_LAYOUT_DEFAULT ||
+                 hdr.total_size > stub->reserved[2] || hdr.total_size < sizeof(bwa_shm_header_t))
+            *why = "its index header has another version or checkpoint layout, or a size past "
+                   "the segment or shorter than the header";
         else if (!index_sections_ok((const uint8_t *)m))
             *why = "its index lacks a section that every load reads, or has one past its "
                    "end, misaligned for its type or of a size the load cannot use, or "
@@ -660,7 +781,7 @@ static seg_state segment_state(const char *idx_path, bwa_shm_header_t *hdr,
         return seg != (void *)-1 ? SEG_COMPLETE : id == HUGE_ABSENT ? SEG_DEAD : SEG_BAD;
     }
     /* Shorter than its header declares: bwa_shm_attach refuses it, so it is bad. */
-    if (magic == BWA_SHM_MAGIC && hdr->version == BWA_SHM_VERSION)
+    if (magic == BWA_SHM_MAGIC && shm_header_known(hdr))
         return hdr->total_size <= (uint64_t)st.st_size ? SEG_COMPLETE : SEG_BAD;
     if (magic != 0) return SEG_BAD;
     /* A 1 GB stager in another PID namespace cannot be checked for life from
@@ -836,12 +957,13 @@ static uint64_t stage_token(void)
 extern "C" {
 
 int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
-                    int target_sa_compx, int n_threads)
+                    int target_sa_compx, int n_threads, bool compact)
 {
     if (prefix == NULL || layout == NULL) return -1;
 
     memset(layout, 0, sizeof(*layout));
     layout->densify_threads = (n_threads > 1) ? n_threads : 1;
+    layout->compact = compact;
     size_t plen = strlen(prefix);
     if (plen + 1 > sizeof(layout->prefix)) {
         fprintf(stderr, "[E::%s] prefix too long\n", __func__);
@@ -908,29 +1030,38 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
             bwa_shm_layout_free(layout);
             return -1;
         }
-        if (i > 0 && layout->count[i] < layout->count[i - 1] - 1) {
-            /* count[i - 1] is already +1-adjusted. */
+        if (i > 0 && layout->count[i] < layout->count[i - 1]) {
+            /* Both raw: the +1 adjustment is applied after this loop (the compact
+             * layout's count form reads the raw counts). */
             fprintf(stderr,
                 "[E::%s] %s: count[%d]=%lld < count[%d]=%lld (the counts must not "
                 "decrease)\n",
                 __func__, cp_path, i, (long long)layout->count[i], i - 1,
-                (long long)layout->count[i - 1] - 1);
+                (long long)layout->count[i - 1]);
             err_fclose(cp);
             bwa_shm_layout_free(layout);
             return -1;
         }
-        layout->count[i] += 1;
     }
-    /* Every row but the sentinel's holds a base, so the last count is the
-     * reference length (raw ref_seq_len - 1, +1): FMI_search::shm_scalars_ok
-     * refuses any other, so a stage of one would succeed and be unusable. */
-    if (layout->count[4] != layout->reference_seq_len) {
+    /* Every row but the sentinel's holds a base, so the last raw count is
+     * reference_seq_len - 1 (reference_seq_len once +1-adjusted):
+     * FMI_search::shm_scalars_ok refuses any other, so a stage of one would
+     * succeed and be unusable. */
+    if (layout->count[4] != layout->reference_seq_len - 1) {
         fprintf(stderr, "[E::%s] %s: count[4]=%lld != reference_seq_len - 1 (%lld)\n", __func__, cp_path,
-                (long long)layout->count[4] - 1, (long long)layout->reference_seq_len - 1);
+                (long long)layout->count[4], (long long)layout->reference_seq_len - 1);
         err_fclose(cp);
         bwa_shm_layout_free(layout);
         return -1;
     }
+    /* The compact layout's span size and count form, from the RAW counts as a
+     * compact disk load decides them. */
+    if (compact) {
+        const FMI_search::CpCompactForm form = FMI_search::cp_compact_form(layout->count);
+        layout->cp_span_shift = form.span_shift;
+        layout->cp_wide       = form.wide ? 1 : 0;
+    }
+    for (int i = 0; i < 5; ++i) layout->count[i] += 1;
 
     /* The disk SA rate, by the same detect_sa_compx() the disk loader uses, so
      * the segment is sized for what that loader would read. */
@@ -952,6 +1083,17 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
      * target warns and stages the disk rate. */
     layout->sa_compx = layout->disk_sa_compx;
     if (target_sa_compx >= 0) {
+        if (compact) {
+            /* The densify walk resolves rows against the file's 64-byte records,
+             * which a compact segment does not hold; refused for any -u value,
+             * a no-op one included, so the rule does not depend on the index. */
+            fprintf(stderr,
+                "[E::%s] -u (SA densify) cannot be combined with the compact checkpoint layout "
+                "(--compact-occ); stage one or the other\n", __func__);
+            err_fclose(cp);
+            bwa_shm_layout_free(layout);
+            return -1;
+        }
         if (target_sa_compx < layout->disk_sa_compx && target_sa_compx <= 6) {
             layout->sa_compx = target_sa_compx;
         } else {
@@ -963,7 +1105,13 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
     }
 
     int64_t cp_occ_count = (layout->reference_seq_len >> CP_SHIFT) + 1;
-    int64_t cp_occ_bytes = cp_occ_count * (int64_t)sizeof(CP_OCC);
+    int64_t cp_occ_bytes = cp_occ_count * (int64_t)sizeof(CP_OCC);   /* on disk */
+    /* What the segment holds: the file's records, or the compact ones. */
+    int64_t cp_sec_bytes = compact ? cp_occ_count * (int64_t)sizeof(CP_OCC_PLANES) : cp_occ_bytes;
+    /* The span bases, held only when the counts are span-relative (as a disk load). */
+    int64_t cp_base_bytes = compact && layout->cp_wide
+        ? ((layout->reference_seq_len >> layout->cp_span_shift) + 1) * (int64_t)(4 * sizeof(int64_t))
+        : 0;
 
     /* SA section sizing uses the STAGED stride (layout->sa_compx), which may be
      * denser than disk when -u densifies. */
@@ -1021,7 +1169,7 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
     int64_t pac_bytes         = bns_only ? 0 : (bns->l_pac / 4 + 1);
 
     /* 6. Lay out sections at 64-byte aligned offsets. */
-    static const uint32_t N_SECTIONS = 10;
+    const uint32_t N_SECTIONS = compact ? 12 : 10;
     uint64_t cursor = sizeof(bwa_shm_header_t)
                     + (uint64_t)N_SECTIONS * sizeof(bwa_shm_section_t);
     cursor = (cursor + 63ull) & ~63ull;
@@ -1035,7 +1183,7 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
     };
 
     place(BWA_SHM_SEC_FMI_SCALARS, fmi_scalars_bytes, 0);
-    place(BWA_SHM_SEC_FMI_CP_OCC,  cp_occ_bytes,      1);
+    place(compact ? BWA_SHM_SEC_FMI_CP_PLANES : BWA_SHM_SEC_FMI_CP_OCC, cp_sec_bytes, 1);
     place(BWA_SHM_SEC_FMI_SA_MS,   sa_ms_bytes,       2);
     place(BWA_SHM_SEC_FMI_SA_LS,   sa_ls_bytes,       3);
     place(BWA_SHM_SEC_BNS_STRUCT,  bns_struct_bytes,  4);
@@ -1044,6 +1192,10 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
     place(BWA_SHM_SEC_BNS_NAMES,   bns_names_bytes,   7);
     place(BWA_SHM_SEC_PAC,         pac_bytes,         8);
     place(BWA_SHM_SEC_REF_STRING,  layout->ref_string_len, 9);
+    if (compact) {
+        place(BWA_SHM_SEC_FMI_CP_BASE,   cp_base_bytes,                          10);
+        place(BWA_SHM_SEC_FMI_CP_LAYOUT, (int64_t)BWA_SHM_FMI_CP_LAYOUT_BYTES,   11);
+    }
 
     if (cursor > BWA_SHM_MAX_TOTAL_SIZE) {
         fprintf(stderr,
@@ -1062,6 +1214,11 @@ int bwa_shm_compute(const char *prefix, bwa_shm_layout_t *layout, bool bns_only,
 int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
 {
     if (layout == NULL || dest == NULL || layout->bns == NULL) return -1;
+    if (layout->compact && (uintptr_t)dest % alignof(CP_OCC_PLANES) != 0) {
+        fprintf(stderr, "[E::%s] compact destination must be %zu-byte aligned\n",
+                __func__, alignof(CP_OCC_PLANES));
+        return -1;
+    }
     const bntseq_t *bns = (const bntseq_t *)layout->bns;
     const bwa_shm_section_t *sec = layout->sections;
 
@@ -1102,8 +1259,48 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
         err_fclose(cp);
         return -1;
     }
-    /* CP_OCC first (identical in both modes). */
-    err_fread_noeof(dest + sec[1].offset, 1, (size_t)sec[1].size, cp);
+    if (!layout->compact) {
+        /* CP_OCC first (identical in both modes). */
+        err_fread_noeof(dest + sec[1].offset, 1, (size_t)sec[1].size, cp);
+    } else {
+        /* The compact layout, converted and checked as a compact disk load
+         * converts and checks it (FMI_search::cp_compact_convert): the records,
+         * then the span bases when the counts are wide; then skip the file's
+         * records. */
+        const int64_t n_cp = (layout->reference_seq_len >> CP_SHIFT) + 1;
+        const FMI_search::CpCompactForm form = { (int)layout->cp_span_shift, layout->cp_wide != 0 };
+        int64_t (*base)[4] = NULL;
+        int64_t n_spans = 0;
+        /* layout->count is +1-adjusted; the conversion checks the raw C[] array */
+        int64_t raw_count[5];
+        for (int i = 0; i < 5; ++i) raw_count[i] = layout->count[i] - 1;
+        const bool sized = (uint64_t)n_cp * sizeof(CP_OCC_PLANES) == sec[1].size;
+        const bool ok = sized &&
+            FMI_search::cp_compact_convert(fileno(cp), cp_path, layout->reference_seq_len,
+                                           raw_count, layout->sentinel_index, form,
+                                           (CP_OCC_PLANES *)(dest + sec[1].offset), &base, &n_spans,
+                                           layout->densify_threads);
+        const bool base_sized = ok && (uint64_t)n_spans * sizeof base[0] == sec[10].size;
+        if (base_sized) {
+            if (sec[10].size != 0) memcpy(dest + sec[10].offset, base, (size_t)sec[10].size);
+            const int64_t lay[2] = { layout->cp_span_shift, layout->cp_wide };
+            memcpy(dest + sec[11].offset, lay, sizeof lay);
+        }
+        free(base);
+        if (!base_sized) {
+            fprintf(stderr, "[E::%s] %s: %s\n", __func__, cp_path,
+                    sized && !ok ? "a checkpoint is not one-hot or out of range, or its counts "
+                                   "are not the running totals (corrupt index?)"
+                                 : "compact section sizes disagree with the layout");
+            err_fclose(cp);
+            return -1;
+        }
+        if (fseeko(cp, (off_t)BWA_BWT_2BIT_HEADER_BYTES + (off_t)n_cp * (off_t)sizeof(CP_OCC), SEEK_SET) != 0) {
+            fprintf(stderr, "[E::%s] fseeko on %s failed\n", __func__, cp_path);
+            err_fclose(cp);
+            return -1;
+        }
+    }
 
     const int hi_log2 = FMI_search::sa_hi_log2_for(layout->reference_seq_len);
     /* SA_MS: the packed high parts. Both branches assign every word of the section. */
@@ -1236,7 +1433,8 @@ int bwa_shm_pack_into(const bwa_shm_layout_t *layout, uint8_t *dest)
     bwa_shm_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.version     = BWA_SHM_VERSION;
-    hdr.n_sections  = layout->n_sections;
+    hdr.n_sections  = (uint16_t)layout->n_sections;
+    hdr.cp_layout   = layout->compact ? BWA_SHM_CP_LAYOUT_COMPACT : BWA_SHM_CP_LAYOUT_DEFAULT;
     hdr.total_size  = layout->total_size;
     hdr.reserved[0] = layout->stager_pid;
     hdr.reserved[1] = layout->stage_token;
@@ -1291,19 +1489,15 @@ int bwa_shm_test(const char *prefix)
     }, (void *)prefix_basename(prefix));
 }
 
-int bwa_shm_test_complete(const char *prefix)
-{
-    const int registered = bwa_shm_test(prefix);
-    if (registered != 1) return registered;
-    return name_state(prefix_basename(prefix)) == SEG_COMPLETE ? 1 : 0;
-}
-
 static int list_cb(int64_t l_mem, const char *name, void * /*ctx*/)
 {
-    const seg_state st = name_state(name);
+    bwa_shm_header_t hdr;
+    const seg_state st = name_state(name, &hdr);
+    const bool compact = st == SEG_COMPLETE && hdr.cp_layout == BWA_SHM_CP_LAYOUT_COMPACT;
     std::printf("%s\t%lld%s\n", name, (long long)l_mem,
                 st == SEG_STAGING || st == SEG_DEAD ? "\tincomplete" :
-                st == SEG_ABSENT ? "\tmissing" : st == SEG_BAD ? "\tunusable" : "");
+                st == SEG_ABSENT ? "\tmissing" : st == SEG_BAD ? "\tunusable" :
+                compact ? "\tcompact" : "");
     return 0;
 }
 
@@ -1665,9 +1859,24 @@ static bool huge_removed(int id)
 #endif
     return false;
 }
+/* A complete segment already staged for `name`: 0 if it holds the requested
+ * checkpoint layout, -1 with an error if it holds the other one (one segment
+ * per index; `shm -d` first to restage it). */
+static int staged_layout_check(const char *func, const char *prefix,
+                               const bwa_shm_header_t *hdr, bool compact)
+{
+    const bool staged_compact = hdr->cp_layout == BWA_SHM_CP_LAYOUT_COMPACT;
+    if (staged_compact == compact) return 0;
+    std::fprintf(stderr, "[E::%s] index '%s' is already in shm with the %s checkpoint layout; "
+                 "run bwa-mem3 shm -d first (it drops every staged index) to stage it with the "
+                 "%s one\n", func, prefix,
+                 staged_compact ? "compact (--compact-occ)" : "default",
+                 compact ? "compact (--compact-occ)" : "default");
+    return -1;
+}
 
 int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
-                  int n_threads, bool huge)
+                  int n_threads, bool huge, bool compact)
 {
     if (prefix == NULL || prefix[0] == '\0') {
         std::fprintf(stderr, "[E::%s] empty prefix\n", __func__);
@@ -1681,17 +1890,30 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
     char idx_path[PATH_MAX];
     path_concat2(idx_path, BWA_SHM_IDX_PREFIX, name);
 
+    /* A 1 GB stage holds the default checkpoint layout only: its stub and
+     * attach checks know that segment version alone. */
+    if (huge && compact) {
+        std::fprintf(stderr, "[E::%s] --huge-pages cannot be combined with the compact checkpoint "
+                     "layout (--compact-occ); nothing was staged\n", __func__);
+        return -1;
+    }
+    if (compact && target_sa_compx >= 0) {
+        std::fprintf(stderr, "[E::%s] -u (SA densify) cannot be combined with the compact checkpoint "
+                     "layout (--compact-occ); stage one or the other\n", __func__);
+        return -1;
+    }
     /* A host that cannot take a 1 GB stage refuses one whatever is staged. */
     if (huge && huge_refused()) return -1;
 
     /* 0. Already staged: skip the disk reads and the lock. Step 2 decides. */
     bwa_shm_header_t hdr;
     if (bwa_shm_test(prefix) == 1 && segment_state(idx_path, &hdr) == SEG_COMPLETE)
-        return report_already_staged(prefix, &hdr, huge);
+        return staged_layout_check(__func__, prefix, &hdr, compact) != 0
+               ? -1 : report_already_staged(prefix, &hdr, huge);
 
     /* 1. Compute the layout (loads BNS; peeks scalars from the FMI file). */
     bwa_shm_layout_t layout;
-    if (bwa_shm_compute(prefix, &layout, bns_only, target_sa_compx, n_threads) != 0) {
+    if (bwa_shm_compute(prefix, &layout, bns_only, target_sa_compx, n_threads, compact) != 0) {
         std::fprintf(stderr, "[E::%s] failed to compute layout for '%s'\n",
                      __func__, prefix);
         return -1;
@@ -1744,8 +1966,11 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
         sleep(1);
     }
     const int probe_errno = errno;
-    if (state == SEG_COMPLETE && ctl_find(g.ctl, name) != NULL)
-        return report_already_staged(prefix, &hdr, huge);
+    if (state == SEG_COMPLETE && ctl_find(g.ctl, name) != NULL) {
+        g.unlock();   /* the header is copied: report without holding the stager lock */
+        return staged_layout_check(__func__, prefix, &hdr, compact) != 0
+               ? -1 : report_already_staged(prefix, &hdr, huge);
+    }
     if (state == SEG_COMPLETE || state == SEG_BAD) {   /* never adopt or replace it */
         int complete_id = -1;
         /* `shm -d` walks the registry, so it reaches only a registered stub. */
@@ -1828,6 +2053,19 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
                          "Retry; do not delete the stub while its segment may exist, or its "
                          "pages stay pinned with nothing that names them\n", __func__,
                          idx_path);
+        else if (state == SEG_BAD && hdr.magic == BWA_SHM_MAGIC && !shm_header_known(&hdr) &&
+                 registered)
+            /* Ours, registered, but a segment version or checkpoint layout this release
+             * does not read: staged by a different release, which `shm -d` removes like any
+             * registered segment. A segment this release reads that is bad (shorter than
+             * its header declares) gets the generic message below. Printed under the
+             * stager lock like the other refusals in this block; the guard releases it on
+             * the return just after. */
+            std::fprintf(stderr, "[E::%s] '%s' is already in shm as segment version %u "
+                         "(checkpoint layout %u), staged by a different bwa-mem3 release (this "
+                         "one stages version %u); run bwa-mem3 shm -d first, then stage it "
+                         "again\n", __func__, name, hdr.version, (unsigned)hdr.cp_layout,
+                         BWA_SHM_VERSION);
         else
             std::fprintf(stderr, "[E::%s] segment %s exists %s; not replacing it. Remove "
                          "it with shm_unlink(\"%s\") after checking that no stager is "
@@ -2043,13 +2281,17 @@ int bwa_shm_stage(const char *prefix, bool bns_only, int target_sa_compx,
                      (unsigned)huge_key(layout.stage_token));
         return 0;
     }
+    /* The stage is complete. Warn with no lock held (the pack has written every
+     * page); a 1 GB stage is on huge pages by construction and returned above. */
+    g.unlock();
+    shm_warn_if_small_pages(__func__, g.idx, layout.total_size, name);
     std::fprintf(stderr, "[M::%s] staged '%s' (%llu bytes) as %s\n",
                  __func__, name, (unsigned long long)layout.total_size, idx_path);
     return 0;
 }
 
 uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out,
-                        bool need_pac)
+                        bool need_pac, int cp_layout)
 {
     if (len_out != NULL) *len_out = 0;
     if (map_len_out != NULL) *map_len_out = 0;
@@ -2103,11 +2345,14 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out
      * created, attached by huge_attach after the checks that segment_state
      * makes too (the size the stub records, the length mapped here, and a
      * complete header that carries the stub's token). */
-    if (magic == BWA_SHM_HUGE_MAGIC && is_huge_stub(&hdr)) {
+    const bool from_huge = magic == BWA_SHM_HUGE_MAGIC && is_huge_stub(&hdr);
+    if (from_huge) {
         munmap(m, len);
         if (hdr.version != BWA_SHM_VERSION) {
             std::fprintf(stderr, "[E::%s] unsupported 1 GB stub version %u in %s (expected "
-                         "%u)\n", __func__, hdr.version, idx_path, BWA_SHM_VERSION);
+                         "%u): it was staged by a different bwa-mem3 release and is not attached; "
+                         "run bwa-mem3 shm -d (which removes all staged indices), then stage it "
+                         "again with this release\n", __func__, hdr.version, idx_path, BWA_SHM_VERSION);
             return NULL;
         }
         const bwa_shm_header_t stub = hdr;
@@ -2136,9 +2381,12 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out
     }
     /* For a 1 GB index huge_attach has already checked the version and size
      * below; they guard the POSIX path. */
-    if (hdr.version != BWA_SHM_VERSION) {
-        std::fprintf(stderr, "[E::%s] unsupported segment version %u in %s (expected %u)\n",
-                     __func__, hdr.version, idx_path, BWA_SHM_VERSION);
+    if (!shm_header_known(&hdr)) {
+        std::fprintf(stderr, "[E::%s] unsupported segment version %u (checkpoint layout %u) in %s "
+                     "(expected version %u): it was staged by a different bwa-mem3 release and "
+                     "is not attached; run bwa-mem3 shm -d, then stage it again with this "
+                     "release\n", __func__, hdr.version, (unsigned)hdr.cp_layout, idx_path,
+                     BWA_SHM_VERSION);
         bwa_shm_detach((uint8_t *)m, len);
         return NULL;
     }
@@ -2151,6 +2399,17 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out
         bwa_shm_detach((uint8_t *)m, len);
         return NULL;
     }
+    /* A caller bound to one checkpoint layout (the seed facade, the tests)
+     * cannot use the other: decline it, so the load reads the disk. */
+    if (cp_layout >= 0 && (unsigned)cp_layout != hdr.cp_layout) {
+        std::fprintf(stderr, "[W::%s] '%s' is staged in shared memory with the %s checkpoint "
+                     "layout and this load uses the %s one; not attaching it, so a private copy "
+                     "loads from disk\n", __func__, name,
+                     hdr.cp_layout == BWA_SHM_CP_LAYOUT_COMPACT ? "compact" : "default",
+                     cp_layout == (int)BWA_SHM_CP_LAYOUT_COMPACT ? "compact" : "default");
+        bwa_shm_detach((uint8_t *)m, len);
+        return NULL;
+    }
     /* A load that reads the packed reference cannot use a seed-only stage,
      * and would exit on it: decline it here, so the load reads the disk. */
     if (need_pac && !index_pac_ok((const uint8_t *)m)) {
@@ -2160,6 +2419,10 @@ uint8_t *bwa_shm_attach(const char *prefix, size_t *len_out, size_t *map_len_out
         bwa_shm_detach((uint8_t *)m, len);
         return NULL;
     }
+
+    /* The magic load above touched the first page. A 1 GB segment is on huge
+     * pages by construction. */
+    if (!from_huge) shm_warn_if_small_pages(__func__, m, hdr.total_size, name);
 
     if (len_out != NULL) *len_out = (size_t)hdr.total_size;
     if (map_len_out != NULL) *map_len_out = len;
@@ -2179,7 +2442,7 @@ int bwa_shm_section_find(const uint8_t *base, uint32_t kind,
     if (base == NULL) return -1;
     const bwa_shm_header_t *hdr = (const bwa_shm_header_t *)base;
     if (hdr->magic   != BWA_SHM_MAGIC)   return -1;
-    if (hdr->version != BWA_SHM_VERSION) return -1;
+    if (!shm_header_known(hdr))          return -1;
 
     /* Bound-check the section table itself before walking it. A corrupt
      * n_sections could otherwise drive us past the mapped region. */
@@ -2203,6 +2466,11 @@ int bwa_shm_section_find(const uint8_t *base, uint32_t kind,
         }
     }
     return -1;
+}
+
+int bwa_shm_segment_compact(const uint8_t *base)
+{
+    return base != NULL && ((const bwa_shm_header_t *)base)->cp_layout == BWA_SHM_CP_LAYOUT_COMPACT;
 }
 
 /* Resolve the on-disk prefix for `bwa-mem3 shm --meth <idxbase>` so that
@@ -2262,13 +2530,21 @@ static int hint_missing_meth_flag(const char *prefix)
 static void print_shm_usage(void)
 {
     std::fprintf(stderr,
-        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [--huge-pages] [-u INT] [-t INT] [idxbase]\n\n"
+        "\nUsage: bwa-mem3 shm [-d|-l|--help] [--meth] [--compact-occ] [--huge-pages] [-u INT] [-t INT] [idxbase]\n\n"
         "Options:\n"
         "  -d        destroy all indices in shared memory (matches bwa v1 behavior)\n"
         "  -l        list indices in shared memory; a third column flags\n"
-        "            incomplete, missing or unusable entries\n"
+        "            incomplete, missing or unusable entries, and `compact` marks\n"
+        "            one staged with --compact-occ\n"
         "  --meth    stage a `bwa-mem3 index --meth` index — auto-appends\n"
         "            `.meth` to <idxbase>, mirroring `mem --meth`\n"
+        "  --compact-occ\n"
+        "            stage the FM-index occurrence checkpoints in the 32-byte\n"
+        "            compact layout (about 3 GB less shared memory on hg38); `mem`\n"
+        "            attaches it with or without --compact-occ. One layout per\n"
+        "            index: run `shm -d` to restage in the other. BWA3_COMPACT_OCC\n"
+        "            does not apply to `shm`. Not with -u, -l, -d or\n"
+        "            --huge-pages (a 1 GB stage holds the default layout)\n"
         "  -u INT    densify the staged SA sample table to sample-rate shift INT\n"
         "            (in [0,6]) when it is denser than the on-disk rate. Trades a\n"
         "            one-time staging cost + extra shared memory for faster SA\n"
@@ -2277,10 +2553,11 @@ static void print_shm_usage(void)
         "            stride-8 (default) index. A value >= the disk rate is a\n"
         "            no-op (warns). Output is byte-identical either way.\n"
         "  -t, --threads INT\n"
-        "            worker threads for the -u densify pass (default 1). The\n"
-        "            per-sample walks are independent, so this scales near-\n"
-        "            linearly; has no effect unless -u actually densifies (a\n"
-        "            target denser than the on-disk rate).\n"
+        "            worker threads for the -u densify pass and the --compact-occ\n"
+        "            conversion (default 1). The per-sample walks are independent,\n"
+        "            so this scales near-linearly; has no effect without -u\n"
+        "            actually densifying (a target denser than the on-disk rate)\n"
+        "            or --compact-occ.\n"
         "  --huge-pages\n"
         "            stage the index on 1 GB huge pages: a System V shared memory\n"
         "            segment from the host's reserved 1 GB pool (10 pages for a\n"
@@ -2315,7 +2592,8 @@ int main_shm(int argc, char *argv[])
 {
     int c, to_list = 0, to_drop = 0, meth = 0, ret = 0;
     int target_sa_compx = -1;   /* -1 = stage the on-disk SA rate unchanged */
-    int n_threads = 1;          /* worker count for the -u densify pass */
+    int n_threads = 1;          /* worker count for the -u densify pass / compact conversion */
+    bool compact = false;       /* --compact-occ (only `mem` reads BWA3_COMPACT_OCC) */
     int huge = 0;               /* --huge-pages */
 
     /* Pre-scan for --help / -h. getopt_long would treat -h as unknown
@@ -2348,6 +2626,7 @@ int main_shm(int argc, char *argv[])
 #endif
     static struct option long_opts[] = {
         {"meth",    no_argument,       0, 1000},
+        {"compact-occ", no_argument,   0, 1002},
         {"threads", required_argument, 0, 't' },
         {"huge-pages", no_argument,    0, 1001},
         {0,         0,                 0, 0   }
@@ -2356,6 +2635,7 @@ int main_shm(int argc, char *argv[])
         if      (c == 'l')   to_list = 1;
         else if (c == 'd')   to_drop = 1;
         else if (c == 1000)  meth    = 1;
+        else if (c == 1002)  compact = true;
         else if (c == 1001)  huge    = 1;
         else if (c == 't') {
             /* Worker count for the -u densify pass. Bare positive integer;
@@ -2410,10 +2690,21 @@ int main_shm(int argc, char *argv[])
             "[E::%s] --threads cannot be combined with -l or -d\n", __func__);
         return 1;
     }
-    if (n_threads > 1 && target_sa_compx < 0) {
+    if (compact && (to_list || to_drop)) {
         std::fprintf(stderr,
-            "[W::%s] --threads only affects the -u densify pass; ignoring "
-            "without -u\n", __func__);
+            "[E::%s] --compact-occ cannot be combined with -l or -d\n", __func__);
+        return 1;
+    }
+    if (compact && target_sa_compx >= 0) {
+        std::fprintf(stderr,
+            "[E::%s] --compact-occ cannot be combined with -u: the densify walk reads the "
+            "index file's checkpoint layout, which a compact segment does not hold\n", __func__);
+        return 1;
+    }
+    if (n_threads > 1 && target_sa_compx < 0 && !compact) {
+        std::fprintf(stderr,
+            "[W::%s] --threads only affects the -u densify pass and the "
+            "--compact-occ conversion; ignoring without either\n", __func__);
     }
     if (huge && (to_list || to_drop)) {
         std::fprintf(stderr,
@@ -2445,7 +2736,7 @@ int main_shm(int argc, char *argv[])
         /* --meth stages a SEED-only segment: omit PAC + REF_STRING (.0123),
          * which `mem --meth` never reads. Saves ~14.5 GB of shm on hg38. */
         if (bwa_shm_stage(user_prefix, /*bns_only=*/meth != 0, target_sa_compx,
-                          n_threads, huge != 0) < 0) {
+                          n_threads, huge != 0, compact) < 0) {
             std::fprintf(stderr,
                 "[E::%s] failed to stage '%s' in shared memory\n",
                 __func__, user_prefix);

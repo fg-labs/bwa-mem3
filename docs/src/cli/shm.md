@@ -8,6 +8,39 @@ small samples back-to-back against the same reference — such as clinical
 panels or amplicon sequencing — this removes the dominant I/O bottleneck.
 `shm` also lists and destroys staged segments.
 
+> **Important — on Linux, mount `/dev/shm` with `huge=advise` before staging**
+>
+> On a stock `/dev/shm` mount (`huge=never`) a staged index sits on 4 KB pages, and
+> alignment against it uses more CPU than an index loaded from disk, by a quarter to a
+> third on a human genome
+> ([measurements below](#huge-pages-mount-devshm-with-hugeadvise-or-hugewithin_size)).
+> When that happens, `shm` (after staging) and `mem` (when it attaches) print a one-line
+> `[W::bwa_shm_stage]` or `[W::bwa_shm_attach]` warning; exit status and output do not
+> change. The warning is skipped where the segment cannot be on huge pages: a segment smaller than one
+> huge page (2 MB; 512 MB on an arm64 kernel with 64 KB pages), a kernel whose
+> `/sys/kernel/mm/transparent_hugepage/shmem_enabled` is `[deny]`, which keeps every tmpfs
+> mount on 4 KB pages, and an index staged with `--huge-pages`; and it is not printed
+> with `-v 1` or lower, or when `/proc/self/smaps` cannot be read. To fix it, remount
+> and restage (but see `[force]` below). The page size is fixed when the segment is written, so an index staged
+> before the remount stays on 4 KB pages until restaged:
+>
+> ```bash
+> sudo mount -o remount,huge=advise /dev/shm
+> bwa-mem3 shm -d
+> bwa-mem3 shm ref.fa
+> ```
+>
+> To keep it across reboots, add `huge=advise` to the `/dev/shm` options in
+> `/etc/fstab`, e.g. `tmpfs /dev/shm tmpfs defaults,huge=advise 0 0`.
+>
+> Where `shmem_enabled` is `[force]`, every tmpfs mount already gets huge pages whatever
+> its `huge=` option, so a segment left on 4 KB pages means the kernel found no free huge
+> page when it was written (memory too low or too fragmented). The warning then says so
+> and advises freeing memory or compacting it
+> (`echo 1 | sudo tee /proc/sys/vm/compact_memory`, with
+> `/sys/kernel/mm/transparent_hugepage/defrag` not `[never]`) before restaging, not a
+> remount.
+
 ## Synopsis
 
 ```text
@@ -90,7 +123,9 @@ with `ipcrm -m <id>`, and only then the stub (see
 
 Prints the name and size in bytes of each registered segment, tab-separated,
 one per line. The size is that of the packed index; for a `--huge-pages` stage
-the pages it pins are that size rounded up to whole 1 GB pages. A third column flags an entry `mem` will not attach to:
+the pages it pins are that size rounded up to whole 1 GB pages. A third column gives an entry's
+state when it is not a plain complete index: `compact` for one `mem` attaches (below), and
+otherwise why `mem` will not attach to it:
 
 - `incomplete`: its stage is still running or was interrupted, or it was staged
   with `--huge-pages` and its 1 GB segment has since been removed;
@@ -103,6 +138,10 @@ the pages it pins are that size rounded up to whole 1 GB pages. A third column f
   IPC namespace, is not the size its stub records, or does not hold the complete
   index its stage packed (its header, and every section a load reads, of the
   size that load requires).
+
+- `compact`: a complete segment staged with
+  [`--compact-occ`](#--compact-occ--stage-the-compact-checkpoint-layout); informational, `mem`
+  attaches it.
 
 Useful to confirm that staging succeeded before launching alignment jobs.
 
@@ -133,7 +172,9 @@ bases from `.pac` on demand; that saves the seed's ~13 GB and the original's
 Stages the index on **1 GB huge pages** from the host's hugetlb pool, to cut the
 data-TLB page walks of seeding below what the 2 MB pages of `/dev/shm` allow
 (see [Performance](#1-gb-pages-shm---huge-pages)). `mem`, `shm -l` and `shm -d`
-are used exactly as for any other staged index; `mem` needs no flag.
+are used exactly as for any other staged index; `mem` needs no flag. A 1 GB stage
+holds the default checkpoint layout: it is refused with
+[`--compact-occ`](#--compact-occ--stage-the-compact-checkpoint-layout).
 
 `/dev/shm` cannot hold 1 GB pages, so the index goes into a System V shared
 memory segment created with `SHM_HUGETLB | SHM_HUGE_1GB`, and `/dev/shm` holds
@@ -307,6 +348,35 @@ Sapphire Rapids at the AVX-512BW tier, Graviton4 at the NEON tier and AMD Zen 4
 at the AVX-512BW tier), where they were byte-identical to the same index
 staged in `/dev/shm` in every arm.
 
+### `--compact-occ` — stage the compact checkpoint layout
+
+Stages the FM-index occurrence checkpoints in the 32-byte compact layout that
+[`mem --compact-occ`](mem.md#--compact-occ--hold-the-occurrence-checkpoints-in-half-the-memory-opt-in)
+uses, converted while staging: about 3 GB less shared memory on hg38. The staged
+index wins: `mem` attaches a staged segment in the layout it holds, with or without
+`--compact-occ`. The design contract is byte-identical alignment records for the same
+reads and run settings: the compact layout is a lossless representation, not a change
+in alignment policy. The [`mem --compact-occ` validation scope](mem.md#--compact-occ--hold-the-occurrence-checkpoints-in-half-the-memory-opt-in)
+describes the fixture-based correctness evidence, not a guarantee across all inputs,
+hosts or SIMD tiers. `shm_compact_occ_test.sh` checks staged alignment parity on
+phiX and a generated seed-only fixture; `shm_pack_round_trip_test` validates compact
+segment sections and row resolution. These tests do not establish exhaustive
+staged-layout validation. A run that requested the other
+layout (`--compact-occ` against a default segment, or the reverse
+with `BWA3_COMPACT_OCC=0`) prints a `[W::load_index]` line saying the staged layout is
+used and how to restage.
+
+An index has one staged segment, in one layout: to switch, `bwa-mem3 shm -d` (which
+drops every staged index) and stage again; staging the other layout over a staged
+index is an error. Only this flag selects the layout: `shm` does not read
+`BWA3_COMPACT_OCC`, which applies to `mem`. The conversion uses
+[`-t`](#-t---threads-int--worker-threads) workers. Not combinable with `-u` (any value),
+`-l` or `-d`, nor with
+[`--huge-pages`](#--huge-pages--stage-the-index-on-1-gb-huge-pages-linux-opt-in): a 1 GB
+stage holds the default checkpoint layout only, so `shm --huge-pages --compact-occ` is
+refused, staging nothing, before any host check. `BWA3_COMPACT_OCC` does not change
+`shm --huge-pages`.
+
 ### `-u INT` — densify the staged SA sample table
 
 Stages a **denser** suffix-array (SA) sample table than the one on disk, without
@@ -333,13 +403,14 @@ To make the denser table permanent on disk (so every `mem` and every future
 `shm` stage picks it up with no flag, at the cost of a larger index file), use
 [`re-sa`](re-sa.md) instead — it is the on-disk counterpart of this flag.
 
-### `-t, --threads INT` — densify worker threads
+### `-t, --threads INT` — worker threads
 
-Number of worker threads for the `-u` densify pass, default `1`. The per-sample
+Number of worker threads for the `-u` densify pass and the `--compact-occ`
+conversion, default `1`. The per-sample
 LF-walks are independent and write disjoint slots, so densification scales
 near-linearly with thread count (on hg38, Graviton4, arm64/NEON tier, the
 densify pass runs ~11 min at `-t 1` and ~40 s at `-t 16`). Meaningful only with
-`-u`; a value `> 1` without `-u` warns and is ignored.
+`-u` or `--compact-occ`; a value `> 1` without either warns and is ignored.
 
 ## Performance
 
@@ -409,7 +480,8 @@ because of another tmpfs. To check this index's segment, look at its entry in
 `/proc/<pid>/smaps` of a running `mem`: `ShmemPmdMapped` is non-zero when the
 segment is mapped on 2 MB pages.
 
-On a `huge=never` mount the request is ignored. Staging still saves the index
+On a `huge=never` mount the request is ignored, and `shm` and `mem` say so
+with a `[W::]` line on stderr. Staging still saves the index
 load, but each run then pays the CPU cost above, which on a large sample can
 exceed the load time saved.
 

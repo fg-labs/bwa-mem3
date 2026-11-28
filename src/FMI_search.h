@@ -235,18 +235,58 @@ class FMI_search: public indexEle
      *     memory: about 3 GB less on hg38), see fmi_seed_api.h.
      * Alignment records are byte-identical in both for the same SA sampling
      * (only @PG CL: differs, recording --compact-occ). Under --compat=bwa-mem2 a
-     * default run attached to a denser staged SA table can report other
-     * coordinates than a compact run reading the disk table: see
-     * docs/src/cli/mem.md, --compact-occ. The compact layout is never
-     * attached from shared memory (a staged segment holds the default layout):
-     * load_index() then loads a private copy from disk and says so.
+     * run attached to a denser staged SA table can report other coordinates
+     * than one reading the disk table: see docs/src/cli/mem.md, --compact-occ.
+     * A staged shm segment holds one layout (`shm --compact-occ` stages the
+     * compact one). By default
+     * load_index() attaches only a segment of this layout and loads from disk
+     * otherwise, so a caller that never calls prefer_staged_layout() (the seed
+     * facade, the tests) always gets the layout it set.
      * set_compact_occ() after an index is loaded is refused (exit). */
     void set_compact_occ(bool on);
     bool compact_occ() const { return cp_compact; }
+    /* main_mem only: load_index() attaches an index staged in shared memory
+     * whatever its checkpoint layout, which then replaces set_compact_occ()'s
+     * choice (that choice applies to a disk load). `requested`: the user chose
+     * the layout explicitly (--compact-occ or BWA3_COMPACT_OCC), so a staged
+     * index of the other layout is reported with a [W::load_index] line; with
+     * no request, attaching a compact one is noted with an [M::load_index] line.
+     * Before load_index(). */
+    void prefer_staged_layout(bool requested);
     /* main_mem's (and the tests') reading of BWA3_COMPACT_OCC: on for a value
      * starting with '1'; a non-empty value starting with neither '0' nor '1' is
-     * reported once and ignored. The library never reads it on its own. */
-    static bool compact_occ_env();
+     * reported once and ignored. *set (if given): the value starts with '0' or
+     * '1', so it chose a layout. The library never reads it on its own. */
+    static bool compact_occ_env(bool *set = NULL);
+
+    /* The compact layout's checkpoint conversion, for `shm --compact-occ`
+     * (bwa_shm.cpp), which stages what a compact load_index() holds.
+     * cp_compact_form: the span size and count form a compact load picks for
+     * the index whose RAW (on-disk, unadjusted) cumulative counts are
+     * raw_count. cp_compact_convert: converts the checkpoint records of the
+     * .bwt.2bit.64 open at fd (`path`, for messages) into dst ((ref_seq_len >>
+     * CP_SHIFT) + 1 records) with up to nthreads workers, and when form.wide
+     * reads the span bases into a new int64_t[*n_spans][4] at *base (free()
+     * it; NULL otherwise). raw_count: the file's C[] array, before
+     * load_index's +1, as cp_load_from_file takes it. The conversion and checks
+     * are load_index()'s own: false (nothing allocated) where load_index()
+     * would refuse the file, a record that is not one-hot or out of range, or
+     * whose counts are not the running totals, or a base-less row other than
+     * sentinel_index's. */
+    struct CpCompactForm { int span_shift; bool wide; };
+    static CpCompactForm cp_compact_form(const int64_t raw_count[5]);
+    static bool cp_compact_convert(int fd, const char *path, int64_t ref_seq_len,
+                                   const int64_t raw_count[5], int64_t sentinel_index,
+                                   CpCompactForm form,
+                                   CP_OCC_PLANES *dst, int64_t (**base)[4], int64_t *n_spans,
+                                   int nthreads);
+    /* The span sizes (log2 rows) the compact layout takes: at least one block,
+     * and at most 2^32 rows, so a span-relative count fits 32 bits. */
+    static bool cp_span_shift_ok(int64_t span_shift) { return span_shift >= CP_SHIFT && span_shift <= 32; }
+    /* Tests only: the span size (cp_span_shift_ok; 0 = the default, 32) and
+     * whether to rebase the counts even on a narrow reference, applied by the
+     * next compact load or cp_compact_form. Process-wide. */
+    static void set_cp_layout_for_test(int span_shift, bool force_wide);
 
     /* log2 of the bits per packed SA-sample high part for a BWT of ref_seq_len rows
      * (positions run up to ref_seq_len - 1): 1, 2, 4 or 8 bits -> 0..3. */
@@ -613,9 +653,9 @@ private:
         }
 
         /* The compact layout's file-to-memory checkpoint transform (see
-         * CP_OCC_PLANES), used by load_index only. cp_is_wide: from the RAW
-         * (unadjusted) cumulative counts, whether some base occurs 2^32 times or
-         * more. */
+         * CP_OCC_PLANES), used by load_index and cp_compact_convert. cp_is_wide:
+         * from the RAW (unadjusted) cumulative counts, whether some base occurs
+         * 2^32 times or more. */
         static bool cp_is_wide(const int64_t raw_count[5]);
         /* n file records at file offset rec0_off of `path` (open as shared_fd) ->
          * dst, read and converted by up to nthreads workers, each on its own range
@@ -636,10 +676,20 @@ private:
          * from the .bwt.2bit.64 at `fd` into a new int64_t[n_spans][4]. */
         static int64_t (*cp_read_span_bases(int fd, const char *path, int64_t ref_seq_len,
                                             int span_shift, int64_t *n_spans))[4];
-        /* Tests only: the span size (CP_SHIFT..32; 0 = the default, 32) and whether
-         * to rebase the counts even on a narrow reference, applied by the next
-         * compact load. */
-        static void set_cp_layout_for_test(int span_shift, bool force_wide);
+        /* The conversion load_index() and cp_compact_convert share: the span
+         * bases when form.wide (*base, else NULL) and the n records at rec0_off,
+         * converted into dst (raw_count and *empty_row as cp_load_from_file
+         * takes and sets them). On false
+         * *base is freed and NULL. cp_sentinel_row_ok is the check that follows
+         * once sentinel_index is known. */
+        static bool cp_convert_records(int fd, const char *path, off_t rec0_off, int64_t n,
+                                       int64_t ref_seq_len, const int64_t raw_count[5],
+                                       CpCompactForm form, CP_OCC_PLANES *dst,
+                                       int64_t (**base)[4], int64_t *n_spans, int nthreads,
+                                       int64_t *empty_row);
+        static bool cp_sentinel_row_ok(int64_t empty_row, int64_t sentinel_index) {
+            return empty_row == sentinel_index;
+        }
 
         /* If non-NULL, cp_occ / sa_hi / sa_ls_word point into a shared
          * memory mapping owned by the shm segment rather than being
@@ -678,6 +728,10 @@ private:
         struct SeedJumpEntry { int64_t k, l, s; };
         SeedJumpEntry *seed_jump;
         int32_t        seed_jump_depth;
+        /* prefer_staged_layout(): attach a staged index of either layout, and
+         * whether the layout set_compact_occ() chose was the user's request. */
+        bool           cp_prefer_staged;
+        bool           cp_layout_requested;
         static int64_t seed_jump_level_off(int L) { return (((int64_t)1 << (2 * L)) - 4) / 3; }
         static inline void seed_jump_prefetch(const SeedJumpEntry *e);
         void build_seed_jump_table(int n_threads);

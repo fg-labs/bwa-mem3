@@ -19,9 +19,11 @@
 #include "bntseq.h"
 #include "utils.h"
 #include "framework/shm_registry_guard.h"
+#include "framework/stderr_capture.h"
 #include "framework/temp_dir.h"
 
 #include <cerrno>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -99,12 +101,138 @@ static void copy_file(const std::string &from, const std::string &to) {
     CHECK_EQ(std::fclose(out), 0);
 }
 
+/* Registry lookup uses only the basename, so a different directory containing
+ * phix.fa is not an independent disk oracle. Give each copy a run-unique name. */
+static std::string copy_disk_index(const char *prefix, const bwa_tests::TempDir &dir) {
+    const std::string &path = dir.path();
+    const std::string copy = dir.file(path.substr(path.rfind('/') + 1) + ".fa");
+    for (const char *ext : {".amb", ".ann", ".bwt.2bit.64", ".pac"})
+        copy_file(std::string(prefix) + ext, copy + ext);
+    const std::string alt = std::string(prefix) + ".alt";
+    struct stat st;
+    if (stat(alt.c_str(), &st) == 0) copy_file(alt, copy + ".alt");
+    else CHECK_EQ(errno, ENOENT);
+    return copy;
+}
+
+// Generate an ALT-bearing index from the supplied fixture without changing it.
+// Copying the oracle must preserve ALT metadata, not just the four core files.
+static bool check_alt_oracle(const char *prefix) {
+    const bwa_tests::TempDir source_dir("alt_source"), oracle_dir("alt_oracle");
+    const std::string source = copy_disk_index(prefix, source_dir);
+    bntseq_t *bns = bns_restore(source.c_str());
+    CHECK(bns != NULL && bns->n_seqs > 0);
+    const std::string name = bns->anns[0].name;
+    bns_destroy(bns);
+    FILE *alt = std::fopen((source + ".alt").c_str(), "w");
+    CHECK(alt != NULL);
+    CHECK(std::fprintf(alt, "%s\n", name.c_str()) > 0);
+    CHECK_EQ(std::fclose(alt), 0);
+    const std::string oracle = copy_disk_index(source.c_str(), oracle_dir);
+    CHECK(source.substr(source.rfind('/') + 1) != oracle.substr(oracle.rfind('/') + 1));
+    uint8_t *packed = NULL;
+    uint64_t len = 0, off = 0, size = 0;
+    CHECK_EQ(bwa_shm_pack_from_disk(source.c_str(), &packed, &len), 0);
+    CHECK_EQ(bwa_shm_section_find(packed, BWA_SHM_SEC_BNS_ANNS, &off, &size), 0);
+    const auto *anns = (const bntann1_t *)(packed + off);
+    bns = bns_restore(oracle.c_str());
+    CHECK(bns != NULL);
+    const bool parity = anns[0].is_alt == 1 && bns->anns[0].is_alt == 1;
+    bns_destroy(bns);
+    std::free(packed);
+    if (!parity) {
+        std::fprintf(stderr, "disk oracle did not preserve the generated ALT annotation\n");
+        return false;
+    }
+    // Negative control: without the optional sidecar the same contig is primary.
+    CHECK_EQ(unlink((oracle + ".alt").c_str()), 0);
+    bns = bns_restore(oracle.c_str());
+    CHECK(bns != NULL && bns->anns[0].is_alt == 0);
+    bns_destroy(bns);
+    std::printf("shm_pack_round_trip_test: ALT oracle parity and negative control OK\n");
+    return true;
+}
+
+// Compact packing must reject an under-aligned buffer before writing anything;
+// default packing must continue to accept natural alignment.
+static bool check_pack_alignment(const char *prefix) {
+    for (const bool compact : {false, true}) {
+        bwa_shm_layout_t layout;
+        CHECK_EQ(bwa_shm_compute(prefix, &layout, false, -1, 2, compact), 0);
+        uint8_t *storage = NULL;
+        CHECK_EQ(posix_memalign((void **)&storage, 64, layout.total_size + 32), 0);
+        CHECK(storage != NULL);
+        std::memset(storage, 0xa5, (size_t)layout.total_size + 32);
+        if (compact) {
+            bwa_tests::StderrCapture cap;
+            if (bwa_shm_pack_into(&layout, storage + 16) != -1) {
+                std::fprintf(stdout, "compact pack accepted a destination 16 modulo 32\n");
+                std::free(storage);
+                bwa_shm_layout_free(&layout);
+                return false;
+            }
+            CHECK(cap.text().find("aligned") != std::string::npos);
+            for (uint64_t i = 0; i < layout.total_size + 32; ++i) CHECK_EQ(storage[i], 0xa5);
+        } else {
+            CHECK_EQ(bwa_shm_pack_into(&layout, storage + 8), 0);
+            CHECK_EQ(bwa_shm_segment_compact(storage + 8), 0);
+        }
+        CHECK_EQ(bwa_shm_pack_into(&layout, storage), 0);
+        CHECK_EQ(bwa_shm_segment_compact(storage), (int)compact);
+        std::free(storage);
+        bwa_shm_layout_free(&layout);
+    }
+    std::printf("shm_pack_round_trip_test: compact alignment guard and default natural alignment OK\n");
+    return true;
+}
+
+// Swap the sentinel and one ordinary row in a scratch index: compact packing
+// must reject corrupt records even though exactly one row is still base-less.
+static void check_compact_corrupt_pack(const std::string &tprefix, int64_t sent,
+                                       int64_t reference_seq_len) {
+    const int64_t row = sent >= CP_BLOCK_SIZE ? 0 : CP_BLOCK_SIZE;
+    CHECK(row < reference_seq_len);
+    auto edit_planes = [&](int64_t r, bool set_a) {
+        const std::string path = tprefix + ".bwt.2bit.64";
+        FILE *f = std::fopen(path.c_str(), "r+b");
+        CHECK(f != NULL);
+        const off_t at = (off_t)BWT_2BIT_HEADER_BYTES + (off_t)(r >> CP_SHIFT) * (off_t)sizeof(CP_OCC)
+                       + (off_t)offsetof(CP_OCC, one_hot_bwt_str);
+        uint64_t oh[4];
+        CHECK_EQ(fseeko(f, at, SEEK_SET), 0);
+        CHECK_EQ(std::fread(oh, sizeof oh, 1, f), (size_t)1);
+        const uint64_t bit = 1ULL << (CP_BLOCK_SIZE - 1 - (r & (CP_BLOCK_SIZE - 1)));
+        for (int c = 0; c < 4; ++c) oh[c] &= ~bit;
+        if (set_a) oh[0] |= bit;
+        CHECK_EQ(fseeko(f, at, SEEK_SET), 0);
+        CHECK_EQ(std::fwrite(oh, sizeof oh, 1, f), (size_t)1);
+        CHECK_EQ(std::fclose(f), 0);
+    };
+    edit_planes(row, /*set_a=*/false);
+    edit_planes(sent, /*set_a=*/true);
+
+    bwa_shm_layout_t bl;
+    CHECK_EQ(bwa_shm_compute(tprefix.c_str(), &bl, false, -1, 2, /*compact=*/true), 0);
+    uint8_t *bbuf = NULL;
+    CHECK_EQ(posix_memalign((void **)&bbuf, 64, bl.total_size), 0);
+    CHECK(bbuf != NULL);
+    std::memset(bbuf, 0, (size_t)bl.total_size);
+    {
+        bwa_tests::StderrCapture cap;
+        CHECK(bwa_shm_pack_into(&bl, bbuf) != 0);
+        CHECK(cap.text().find("a checkpoint is not one-hot or out of range") != std::string::npos);
+    }
+    std::free(bbuf);
+    bwa_shm_layout_free(&bl);
+}
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         std::fprintf(stderr, "Usage: %s <prefix>\n", argv[0]);
         return 2;
     }
     const char *prefix = argv[1];
+    if (!check_alt_oracle(prefix) || !check_pack_alignment(prefix)) return 1;
 
     /* 1. Pack from disk. */
     uint8_t *buf = NULL;
@@ -122,7 +250,9 @@ int main(int argc, char *argv[]) {
     CHECK_EQ(hdr.total_size, buf_len);
 
     /* 3. Independently load the same index from disk for comparison. */
-    FMI_search ref(prefix);
+    const bwa_tests::TempDir disk_dir("shm_oracle");
+    const std::string disk_prefix = copy_disk_index(prefix, disk_dir);
+    FMI_search ref(disk_prefix.c_str());
     ref.load_index();
 
     /* 4. Walk sections and compare. */
@@ -243,6 +373,221 @@ int main(int argc, char *argv[]) {
     section(BWA_SHM_SEC_REF_STRING, &off, &sz);
     CHECK_EQ(sz, 0ull);
 
+    /* The compact layout (`shm --compact-occ`): a segment whose header records
+     * the compact checkpoint layout and whose FMI_CP_PLANES section is what a
+     * compact disk load holds, with the count form (and, when wide, the span
+     * bases) beside it, and every other section as the default segment's. Run
+     * twice: the default count form, and span-relative counts forced on 512-row
+     * spans (FMI_search::set_cp_layout_for_test), so the span bases and the
+     * wide flag carry real values. Each segment is then attached as `mem` would
+     * attach it (load_index_from_shm) and every row resolved through it. */
+    CHECK_EQ(hdr.cp_layout, (uint16_t)BWA_SHM_CP_LAYOUT_DEFAULT);
+    CHECK_EQ(bwa_shm_segment_compact(buf), 0);
+    for (int forced = 0; forced < 2; ++forced) {
+        if (forced) FMI_search::set_cp_layout_for_test(9, true);
+        const int shift = forced ? 9 : 32;
+        FMI_search cref(disk_prefix.c_str());
+        cref.set_compact_occ(true);
+        cref.load_index();
+        CHECK(cref.compact_occ());
+
+        bwa_shm_layout_t cl;
+        CHECK_EQ(bwa_shm_compute(prefix, &cl, /*bns_only=*/false, /*target_sa_compx=*/-1,
+                                 /*n_threads=*/2, /*compact=*/true), 0);
+        const uint64_t clen = cl.total_size;
+        uint8_t *cbuf = NULL;
+        CHECK_EQ(posix_memalign((void **)&cbuf, 64, clen), 0);
+        CHECK(cbuf != NULL);
+        CHECK_EQ(bwa_shm_pack_into(&cl, cbuf), 0);
+        bwa_shm_layout_free(&cl);
+
+        bwa_shm_header_t chdr;
+        std::memcpy(&chdr, cbuf, sizeof(chdr));
+        CHECK_EQ(chdr.magic,      BWA_SHM_MAGIC);
+        CHECK_EQ(chdr.version,    BWA_SHM_VERSION);
+        CHECK_EQ(chdr.cp_layout,  (uint16_t)BWA_SHM_CP_LAYOUT_COMPACT);
+        CHECK_EQ(chdr.n_sections, 12u);
+        CHECK_EQ(bwa_shm_segment_compact(cbuf), 1);
+        uint64_t coff = 0, csz = 0;
+        CHECK(bwa_shm_section_find(cbuf, BWA_SHM_SEC_FMI_CP_OCC, &coff, &csz) != 0);
+
+        CHECK_EQ(bwa_shm_section_find(cbuf, BWA_SHM_SEC_FMI_CP_PLANES, &coff, &csz), 0);
+        CHECK_EQ((int64_t)csz, cref.cp_occ_size_bytes());
+        CHECK_EQ(std::memcmp(cbuf + coff, cref.cp_occ_data(), (size_t)csz), 0);
+        const uint64_t planes_off = coff;
+
+        CHECK_EQ(bwa_shm_section_find(cbuf, BWA_SHM_SEC_FMI_CP_LAYOUT, &coff, &csz), 0);
+        CHECK_EQ(csz, (uint64_t)BWA_SHM_FMI_CP_LAYOUT_BYTES);
+        int64_t lay[2];
+        std::memcpy(lay, cbuf + coff, sizeof lay);
+        CHECK_EQ(lay[0], (int64_t)shift);
+        CHECK_EQ(lay[1], (int64_t)forced);
+
+        /* Span bases, held only when wide (phiX's counts are narrow): the file's
+         * full counts at each span's first block. */
+        CHECK_EQ(bwa_shm_section_find(cbuf, BWA_SHM_SEC_FMI_CP_BASE, &coff, &csz), 0);
+        const int64_t n_spans = forced ? (ref.reference_seq_len >> shift) + 1 : 0;
+        CHECK_EQ(csz, (uint64_t)n_spans * 4 * sizeof(int64_t));
+        const CP_OCC *file_cp = (const CP_OCC *)ref.cp_occ_data();
+        for (int64_t sp = 0; sp < n_spans; ++sp)
+            CHECK_EQ(std::memcmp(cbuf + coff + sp * 4 * sizeof(int64_t),
+                                 file_cp[sp << (shift - CP_SHIFT)].cp_count, 4 * sizeof(int64_t)), 0);
+        if (forced) {
+            CHECK(n_spans > 1);
+            CHECK(cref.cp_count_base_data() != NULL);
+            CHECK_EQ(std::memcmp(cbuf + coff, cref.cp_count_base_data(), (size_t)csz), 0);
+        } else {
+            CHECK(cref.cp_count_base_data() == NULL);
+        }
+
+        /* Everything else is the default segment's. */
+        const uint32_t same[] = { BWA_SHM_SEC_FMI_SCALARS, BWA_SHM_SEC_FMI_SA_MS, BWA_SHM_SEC_FMI_SA_LS,
+                                  BWA_SHM_SEC_BNS_AMBS, BWA_SHM_SEC_BNS_NAMES, BWA_SHM_SEC_PAC };
+        for (uint32_t kind : same) {
+            uint64_t doff = 0, dsz = 0;
+            section(kind, &doff, &dsz);
+            CHECK_EQ(bwa_shm_section_find(cbuf, kind, &coff, &csz), 0);
+            CHECK_EQ(csz, dsz);
+            CHECK_EQ(std::memcmp(cbuf + coff, buf + doff, (size_t)csz), 0);
+        }
+        {
+            uint64_t doff = 0, dsz = 0;
+            section(BWA_SHM_SEC_BNS_STRUCT, &doff, &dsz);
+            CHECK_EQ(bwa_shm_section_find(cbuf, BWA_SHM_SEC_BNS_STRUCT, &coff, &csz), 0);
+            CHECK_EQ(csz, dsz);
+            CHECK_EQ(bwa_shm_section_find(cbuf, BWA_SHM_SEC_BNS_ANNS, &coff, &csz), 0);
+            section(BWA_SHM_SEC_BNS_ANNS, &doff, &dsz);
+            CHECK_EQ(csz, dsz);
+            CHECK_EQ(bwa_shm_section_find(cbuf, BWA_SHM_SEC_REF_STRING, &coff, &csz), 0);
+            CHECK_EQ(csz, 0ull);
+        }
+
+        /* Attach it as `mem` would (the object unmaps the mapping): the compact
+         * state is the compact disk load's, and every row resolves to the
+         * default disk load's coordinate (the LF-walk reads the planes, and the
+         * span bases when wide). */
+        {
+            void *m = mmap(NULL, (size_t)clen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            CHECK(m != MAP_FAILED);
+            std::memcpy(m, cbuf, (size_t)clen);
+            FMI_search a(prefix);
+            a.set_compact_occ(true);
+            a.load_index_from_shm((uint8_t *)m, (size_t)clen, (size_t)clen);
+            CHECK(a.compact_occ());
+            CHECK_EQ((const uint8_t *)a.cp_occ_data(), (const uint8_t *)m + planes_off);
+            if (forced) {
+                CHECK(a.cp_count_base_data() != NULL);
+                CHECK_EQ(std::memcmp(a.cp_count_base_data(), cref.cp_count_base_data(),
+                                     (size_t)n_spans * 4 * sizeof(int64_t)), 0);
+            } else {
+                CHECK(a.cp_count_base_data() == NULL);
+            }
+            for (int64_t row = 0; row < ref.reference_seq_len; ++row)
+                CHECK_EQ(a.get_sa_entry_compressed(row, 0), ref.get_sa_entry_compressed(row, 0));
+        }
+        /* A compact segment the attach must refuse (it exits, as for any malformed
+         * segment): a layout of another span size or count form than it can use, a
+         * span-base section of the wrong size, no FMI_CP_PLANES, or a compact
+         * segment attached by an index set to the default layout. */
+        if (forced) {
+            enum Bad { SHIFT_LOW, SHIFT_HIGH, WIDE_2, BASE_SIZE, NO_PLANES, DEFAULT_SET };
+            const struct { Bad bad; const char *msg; } bads[] = {
+                {SHIFT_LOW, "FMI_CP_LAYOUT"}, {SHIFT_HIGH, "FMI_CP_LAYOUT"}, {WIDE_2, "FMI_CP_LAYOUT"},
+                {BASE_SIZE, "FMI_CP_BASE"}, {NO_PLANES, "FMI_CP_PLANES"},
+                {DEFAULT_SET, "load_index_from_shm: the segment holds the compact"} };
+            const bwa_tests::TempDir errdir("cp_attach_bad");
+            const std::string err_path = errdir.file("load.err");
+            for (const auto &b : bads) {
+                std::fflush(NULL);
+                const pid_t pid = fork();
+                CHECK(pid >= 0);
+                if (pid == 0) {
+                    const int efd = open(err_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+                    if (efd < 0 || dup2(efd, STDERR_FILENO) < 0) _exit(3);
+                    void *m = mmap(NULL, (size_t)clen, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                    if (m == MAP_FAILED) _exit(3);
+                    uint8_t *seg = (uint8_t *)m;
+                    std::memcpy(seg, cbuf, (size_t)clen);
+                    bwa_shm_section_t *table = (bwa_shm_section_t *)(seg + sizeof(bwa_shm_header_t));
+                    uint64_t o = 0, z = 0;
+                    if (bwa_shm_section_find(seg, BWA_SHM_SEC_FMI_CP_LAYOUT, &o, &z) != 0) _exit(3);
+                    int64_t bl[2];
+                    std::memcpy(bl, seg + o, sizeof bl);
+                    if (b.bad == SHIFT_LOW) bl[0] = CP_SHIFT - 1;
+                    if (b.bad == SHIFT_HIGH) bl[0] = 33;
+                    if (b.bad == WIDE_2) bl[1] = 2;
+                    std::memcpy(seg + o, bl, sizeof bl);
+                    for (uint32_t i = 0; i < chdr.n_sections; ++i) {
+                        if (b.bad == BASE_SIZE && table[i].kind == BWA_SHM_SEC_FMI_CP_BASE) table[i].size -= 32;
+                        if (b.bad == NO_PLANES && table[i].kind == BWA_SHM_SEC_FMI_CP_PLANES) table[i].kind = 99;
+                    }
+                    FMI_search x(prefix);
+                    x.set_compact_occ(b.bad != DEFAULT_SET);
+                    x.load_index_from_shm(seg, (size_t)clen, (size_t)clen);
+                    _exit(0);   /* attached a bad segment: the parent fails the test */
+                }
+                int status = 0;
+                CHECK_EQ(waitpid(pid, &status, 0), pid);
+                CHECK(WIFEXITED(status) && WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 3);
+                FILE *ef = std::fopen(err_path.c_str(), "r");
+                CHECK(ef != NULL);
+                std::string err;
+                char eb[4096];
+                size_t r;
+                while ((r = std::fread(eb, 1, sizeof(eb), ef)) > 0) err.append(eb, r);
+                std::fclose(ef);
+                CHECK(err.find(b.msg) != std::string::npos);
+            }
+        }
+        std::free(cbuf);
+        if (forced) FMI_search::set_cp_layout_for_test(0, false);
+    }
+    /* `shm -u` densifies against the file's records, which a compact segment
+     * does not hold: the combination is refused, whatever the -u value (a
+     * densifying one, and one at the disk rate, which would be a no-op). */
+    {
+        bwa_shm_layout_t ul;
+        if (ref.sa_compx > 0)
+            CHECK(bwa_shm_compute(prefix, &ul, false, (int)ref.sa_compx - 1, 1, /*compact=*/true) != 0);
+        CHECK(bwa_shm_compute(prefix, &ul, false, (int)ref.sa_compx, 1, /*compact=*/true) != 0);
+    }
+    /* A corrupt index that a compact disk load refuses is refused by the compact
+     * stage too: one row's base cleared and the sentinel row given one, so the
+     * records still hold exactly one base-less row, but not the sentinel's. Only
+     * the check against sentinel_index (made after the conversion on both
+     * paths) catches it; the planes would read the cleared row as A. */
+    {
+        const bwa_tests::TempDir tdir("cp_sentinel");
+        const std::string dir = tdir.path();
+        const std::string tprefix = copy_disk_index(prefix, tdir);
+        check_compact_corrupt_pack(tprefix, ref.sentinel_index, ref.reference_seq_len);
+
+        const std::string err_path = dir + "/load.err";
+        std::fflush(NULL);
+        const pid_t pid = fork();
+        CHECK(pid >= 0);
+        if (pid == 0) {
+            const int efd = open(err_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+            if (efd < 0 || dup2(efd, STDERR_FILENO) < 0) _exit(3);
+            FMI_search c(tprefix.c_str());
+            c.set_compact_occ(true);
+            c.load_index();
+            _exit(0);   /* loaded a corrupt index: the parent fails the test */
+        }
+        int status = 0;
+        CHECK_EQ(waitpid(pid, &status, 0), pid);
+        CHECK(!(WIFEXITED(status) && WEXITSTATUS(status) == 0));
+        FILE *ef = std::fopen(err_path.c_str(), "r");
+        CHECK(ef != NULL);
+        std::string err;
+        char eb[4096];
+        size_t r;
+        while ((r = std::fread(eb, 1, sizeof(eb), ef)) > 0) err.append(eb, r);
+        std::fclose(ef);
+        CHECK(err.find("a checkpoint is not one-hot or out of range") != std::string::npos);
+    }
+    std::printf("shm_pack_round_trip_test: compact layout OK\n");
+
     /* Cleanup. */
     std::free(buf);
 
@@ -357,8 +702,9 @@ int main(int argc, char *argv[]) {
      * coverage of the shm densify path (bwa_shm_compute sizing +
      * bwa_shm_pack_into's densify branch feeding densify_sa_into). */
     if (argc >= 3) {
-        const char *oracle_prefix = argv[2];
-        FMI_search oracle(oracle_prefix);
+        const bwa_tests::TempDir oracle_dir("sa_oracle");
+        const std::string oracle_prefix = copy_disk_index(argv[2], oracle_dir);
+        FMI_search oracle(oracle_prefix.c_str());
         oracle.load_index();
         CHECK(oracle.sa_compx < ref.sa_compx);   /* oracle must be strictly denser */
 
