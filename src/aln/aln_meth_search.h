@@ -142,12 +142,13 @@ struct aln_meth_cert_counts_t {
     int fewest = INT_MAX, only_mm = 0;
     size_t n_occ = 0;
     bool ready = false, gape = false;
+    int nb = 0; // Bounded by the CIGAR budget; placed in the snapshot's existing padding.
 
     void update(const aln_meth_occ_t *before, const aln_meth_occ_t &after, size_t size) {
         if (!ready) return;
         if (after.cost <= best || (before && before->cost <= best)) { ready = false; return; }
         auto retained = [&](const aln_meth_occ_t &o) {
-            return o.cost <= cut && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
+            return !o.drawn && o.cost <= cut && (int64_t)o.n_mm + o.n_gapo + (gape ? o.n_gape : 0) <= ceiling;
         };
         worse += (int)retained(after) - (int)(before && retained(*before));
         n_occ = size;

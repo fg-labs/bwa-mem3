@@ -305,6 +305,48 @@ std::string expected_xm(const std::string &genome, int start, const std::string 
     return xm;
 }
 
+// Separate from ref(): these adversarial repeats must not change the older fixtures' SA order.
+struct SaturatedRef {
+    bwa_tests::TempDir tmp{"aln_meth_saturated"};
+    std::string fa, read[3], genome[3];
+    SaturatedRef()
+    {
+        fa = tmp.unique_file();
+        uint32_t st = 411731;
+        for (int kind = 0; kind < 3; ++kind) {
+            read[kind] = aln_test::lcg_dna(st, 60);
+            for (int i = 0; i < 14; ++i) read[kind][i] = 'T';
+            read[kind][30] = 'A';
+            genome[kind] = aln_test::lcg_dna(st, 100);
+            for (int k = 0; k < (kind == 2 ? 256 : 179); ++k) {
+                std::string target = read[kind];
+                target[30] = 'G'; // one strict mismatch, cost 3, at every planted locus
+                const bool winner = k == 0 || (kind == 1 && (k == 89 || k == 178));
+                const int conversions = winner ? 1 : 2 + k % 12;
+                for (int i = 0; i < conversions; ++i) target[i] = 'C';
+                genome[kind] += target + aln_test::lcg_dna(st, 40);
+            }
+        }
+        REQUIRE(aln_test::write_test_fasta(fa, {{"sat-one", genome[0]}, {"sat-three", genome[1]},
+                                               {"sat-crowded", genome[2]}}));
+        std::vector<std::string> args = {"index", "--meth", fa};
+        std::vector<char *> argv;
+        for (auto &arg : args) argv.push_back(&arg[0]);
+        argv.push_back(nullptr);
+        optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+        optreset = 1;
+#endif
+        REQUIRE(bwa_index((int)args.size(), argv.data()) == 0);
+    }
+};
+
+SaturatedRef &saturated_ref()
+{
+    static SaturatedRef r;
+    return r;
+}
+
 } // namespace
 
 TEST_SUITE_BEGIN("unit/aln_meth");
@@ -564,6 +606,7 @@ TEST_CASE("aln_meth: a repeat certificate reports the full X0 and draws its prim
         CHECK(tag_value(r, "XT:A") == "R");
         CHECK(tag_value(r, "X0:i") == "31");
         CHECK(r.tag.count("X1:i") == 0);
+        CHECK(r.cigar == "40M"); // an exact locus, not merely a uniformly drawn key
         ++drawn[r.rname + ":" + std::to_string(r.pos) + (r.flag & 16 ? "-" : "+")];
     }
     std::set<std::string> expected;
@@ -679,8 +722,19 @@ TEST_CASE("aln_meth: a certificate counts only the best rows within the top-2 ce
     optreset = 1;
 #endif
     REQUIRE(bwa_index((int)index_args.size(), argv.data()) == 0);
-    const auto v = run_aln({"--meth", "-n", "6", "-l", "1024", "-R", "5"},
-                           {write_fq_in(dir, "cert-ceiling.fq", {read})}, fa, dir);
+    // -v 4 reports the certificates: three best loci within -R 5 must not end the search as a repeat
+    // (counting the six dropped loci would, and the finish would then hide it behind the same SAM).
+    const int verbose = bwa_verbose;
+    std::string log;
+    std::vector<Rec> v;
+    {
+        bwa_tests::StderrCapture capture;
+        v = run_aln({"--meth", "-n", "6", "-l", "1024", "-R", "5", "-v", "4"},
+                    {write_fq_in(dir, "cert-ceiling.fq", {read})}, fa, dir);
+        log = capture.text();
+    }
+    bwa_verbose = verbose;
+    CHECK(log.find("; 0 repeat certificates;") != std::string::npos);
     REQUIRE(v.size() == 1);
     CHECK(v[0].rname.rfind("gap", 0) == 0);
     CHECK(tag_value(v[0], "XT:A") == "R");
@@ -2843,24 +2897,252 @@ TEST_CASE("aln_meth: identical reads with different --known-snvs candidates do n
     free(opt); ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt);
 }
 
+TEST_CASE("aln_meth: certificate counts retain the compact cache footprint")
+{
+    CHECK(sizeof(bwa_aln::aln_meth_cert_counts_t) <= 64);
+}
+
+TEST_CASE("aln_meth: saturated certificates keep exact counts and use stock MAPQ")
+{
+    namespace ba = bwa_aln;
+    // The new kind preserves both internal counts; stock's formula, not a new forcing path, gives MAPQ.
+    struct Case { int n, winners, mm, limit, repeat_limit, cert, mapq; };
+    for (const Case &c : {Case{178, 1, 1, 2, 5, 0, 1},
+                          Case{179, 1, 1, 2, 5, ba::ALN_METH_CERT_SATURATED, 0},
+                          Case{179, 3, 1, 2, 5, ba::ALN_METH_CERT_SATURATED, 0},
+                          Case{179, 179, 1, 2, 179, ba::ALN_METH_CERT_SATURATED, 0},
+                          Case{179, 1, 2, 2, 5, 0, 25},
+                          Case{179, 6, 1, 2, 5, ba::ALN_METH_CERT_REPEAT, 0},
+                          Case{256, 1, 1, 2, 5, ba::ALN_METH_CERT_CROWDED, 0}}) {
+        CAPTURE(c.n); CAPTURE(c.winners); CAPTURE(c.mm); CAPTURE(c.repeat_limit);
+        auto *opt = ba::gap_init_opt(); opt->max_diff = c.limit; opt->max_top2 = c.repeat_limit;
+        ba::aln_meth_opt_t mo;
+        mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+        ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo;
+        ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = c.limit; job.score_cut = INT_MAX;
+        ba::aln_meth_read_t result;
+        ba::aln_meth_slot_t slot;
+        slot.grp = &group; slot.job = &job; slot.res = &result;
+        slot.best = 3 * c.mm; slot.max_diff = c.limit; slot.cert = slot.cut = slot.keep = 1;
+        for (int i = 0; i < c.n; ++i) {
+            ba::aln_meth_occ_t o{};
+            o.cost = slot.best; o.n_mm = c.mm; o.n_conv = i < c.winners ? 0 : 1;
+            o.pos = o.alignment.rb = 100 * i;
+            result.occ.push_back(o);
+        }
+        CHECK(ba::aln_meth_boundary(&slot, (int)slot.best) == 0); // no certificate in an open best stratum
+        CHECK(ba::aln_meth_boundary(&slot, (int)slot.best + 1) == (c.cert ? 1 : 0));
+        CHECK(result.cert == c.cert);
+        CHECK(result.flags == 0);
+        ba::aln_meth_slot_finish(&slot);
+        CHECK(result.c1 == c.winners);
+        CHECK(result.c2 == c.n - c.winners);
+        CHECK(result.n_conv_moved == c.n - c.winners);
+        ba::bwa_seq_t seq{}; seq.c1 = result.c1; seq.c2 = result.c2; seq.n_mm = c.mm;
+        ba::bwase_initialize();
+        CHECK(ba::bwa_approx_mapQ(&seq, c.limit) == c.mapq);
+        free(opt);
+    }
+}
+
+TEST_CASE("aln_meth: saturated certificates exclude drawn and over-ceiling rows")
+{
+    namespace ba = bwa_aln;
+    auto *opt = ba::gap_init_opt(); opt->max_diff = 3; opt->max_top2 = 5;
+    ba::aln_meth_opt_t mo;
+    mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    ba::aln_meth_opt_finish(&mo);
+    ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo;
+    ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 3; job.score_cut = INT_MAX;
+    ba::aln_meth_read_t result;
+    ba::aln_meth_slot_t slot;
+    slot.grp = &group; slot.job = &job; slot.res = &result;
+    slot.best = 3; slot.max_diff = 3; slot.cert = 1;
+    for (int i = 0; i < 178; ++i) {
+        ba::aln_meth_occ_t o{}; o.cost = 3; o.n_mm = 1; o.n_conv = i ? 2 : 1;
+        result.occ.push_back(o);
+    }
+    auto outside = result.occ[0]; outside.n_mm = 3; outside.n_conv = 0;
+    result.occ.push_back(outside);
+    auto drawn = result.occ[0]; drawn.drawn = 1; drawn.n_conv = 0;
+    result.occ.push_back(drawn);
+    CHECK(ba::aln_meth_boundary(&slot, 4) == 0);
+    CHECK(result.cert == 0);
+    free(opt);
+}
+
+TEST_CASE("aln_meth: a saturated certificate is not a mirror-free R stop")
+{
+    // The CLI rejects conversion-blind with TAPS/neutral, the only mode taking the new kind.
+    // Exercise its low-level observer anyway: real mirror-free stops and a past-window boundary
+    // are known, but a high-R stop inside the mirror-free window leaves its worse stratum unknown.
+    namespace ba = bwa_aln;
+    struct Case { int r, next, mirror, need, mf_stop; };
+    for (const Case &c : {Case{5, 4, 0, 0, 1}, Case{179, 4, 0, 1, 0},
+                          Case{179, 7, 0, 0, 0}, Case{179, 4, 1, 0, 0}}) {
+        CAPTURE(c.r); CAPTURE(c.next); CAPTURE(c.mirror);
+        auto *opt = ba::gap_init_opt(); opt->max_diff = 2; opt->max_top2 = c.r;
+        ba::aln_meth_opt_t mo;
+        mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+        ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_group_t group; group.opt = opt; group.mo = &mo;
+        ba::gap_job_t job = {}; job.opt = *opt; job.max_diff = 2; job.score_cut = INT_MAX;
+        ba::aln_meth_read_t result;
+        ba::aln_meth_slot_t slot;
+        slot.grp = &group; slot.job = &job; slot.res = &result;
+        slot.best = slot.mf_best = 3; slot.max_diff = 2; slot.cert = slot.blind = 1;
+        for (int i = 0; i < 179; ++i) {
+            ba::aln_meth_occ_t o{}; o.cost = 3; o.n_mm = 1; o.n_conv = i ? 1 : 0;
+            o.pos = o.alignment.rb = 100 * i;
+            result.occ.push_back(o);
+        }
+        if (c.mirror) {
+            auto row = result.occ[0]; row.n_mirror = 1; row.pos = row.alignment.rb = 50000;
+            result.mirror_rows.push_back(row); // mirror-free best 0, its window ends at 3
+        }
+        CHECK(ba::aln_meth_boundary(&slot, c.next) == 1);
+        CHECK(result.cert == ba::ALN_METH_CERT_SATURATED);
+        CHECK(result.flags == 0);
+        CHECK(slot.blind_need == c.need);
+        CHECK(slot.mf_stop == c.mf_stop);
+        CHECK(slot.stop == ba::ALN_METH_STOP_CERT);
+        free(opt);
+    }
+}
+
+TEST_CASE("aln_meth: saturated copies keep exact X0 and draw only verified conversion winners")
+{
+    namespace ba = bwa_aln;
+    auto &fixture = saturated_ref();
+    FMI_search fmi((fixture.fa + ".meth").c_str()); fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, fixture.fa.c_str(), fmi.idx->bns, 1) == 0);
+    auto *opt = ba::gap_init_opt();
+    opt->fnr = -1; opt->max_diff = 2; opt->max_top2 = 5; opt->seed_len = 1024;
+    ba::aln_meth_opt_t mo;
+    mo.m.meth_mode = 1; mo.m.meth_chem = METH_CHEM_TAPS; mo.m.meth_scoring = MEM_METH_SCORING_NEUTRAL;
+    mo.m.meth_tags = MEM_METH_TAG_XR | MEM_METH_TAG_XG | MEM_METH_TAG_XM;
+    ba::aln_meth_opt_finish(&mo);
+    ba::bwase_initialize();
+    auto run = [&](int kind, int share, int threads, int n, int repeat_limit) {
+        CAPTURE(kind); CAPTURE(share); CAPTURE(threads); CAPTURE(repeat_limit);
+        opt->max_top2 = repeat_limit;
+        const int winners = kind == 1 ? 3 : 1;
+        const int loci = kind == 2 ? 256 : 179;
+        const int cert = winners > repeat_limit ? ba::ALN_METH_CERT_REPEAT :
+                         kind == 2 ? ba::ALN_METH_CERT_CROWDED : ba::ALN_METH_CERT_SATURATED;
+        const bool saturated = cert == ba::ALN_METH_CERT_SATURATED;
+        const std::string fq = write_fq_in(fixture.tmp.path(), "copies.fq", std::vector<std::string>(n, fixture.read[kind]));
+        auto *input = ba::bwa_seq_open(fq.c_str()); REQUIRE(input != nullptr);
+        int got = 0;
+        auto *reads = ba::bwa_read_seq(input, n, &got, BWA_MODE_COMPREAD, 0);
+        REQUIRE(got == n); REQUIRE(reads != nullptr);
+        std::vector<ba::aln_meth_read_t> results(n);
+        ba::aln_dup_state_t dup;
+        const int verbose = bwa_verbose; bwa_verbose = 4;
+        std::string log;
+        {
+            bwa_tests::StderrCapture capture;
+            const int copies = ba::aln_meth_search_batch(bwt, &mr, &mo, n, reads, opt, threads, 1, 0, 0,
+                                                        10000, share ? &dup : nullptr, results.data());
+            CHECK(copies == (share ? n - 1 : 0));
+            log = capture.text();
+        }
+        bwa_verbose = verbose;
+        CHECK(log.find("; 0 incomplete;") != std::string::npos);
+        CHECK(log.find("; " + std::to_string(cert == ba::ALN_METH_CERT_REPEAT ? n : 0) +
+                       " repeat certificates; " + std::to_string(cert == ba::ALN_METH_CERT_CROWDED ? n : 0) +
+                       " crowded certificates; " + std::to_string(saturated ? n : 0) +
+                       " saturated certificates;") != std::string::npos);
+        for (const auto &r : results) {
+            CHECK(r.flags == 0);
+            CHECK(r.cert == cert);
+            CHECK(r.c1 == winners);
+            CHECK(r.c2 >= loci - winners); // kept internally for stock MAPQ, never replaced by zero
+            if (cert != ba::ALN_METH_CERT_REPEAT) CHECK(r.copy_draw.empty());
+            // a crowded or saturated read can leave worse loci unverified: it keeps only its main hit
+            CHECK(r.hits.size() == (cert == ba::ALN_METH_CERT_REPEAT ? (size_t)loci : 1u));
+        }
+        ba::aln_meth_finish_se(&mr, &mo, opt, 10000, n, reads, results.data());
+        kstring_t sam = {0, 0, nullptr};
+        for (int i = 0; i < n; ++i) {
+            CHECK((int)reads[i].mapQ == 0);
+            CHECK((int)reads[i].c1 == winners);
+            CHECK((int)reads[i].c2 == results[i].c2);
+            ba::aln_meth_print_sam1(&sam, &mr, &mo, reads + i, &results[i], 1, nullptr, BWA_MODE_COMPREAD, repeat_limit);
+        }
+        const std::string text(sam.s, sam.l); free(sam.s);
+        std::istringstream in(text);
+        const auto records = parse_records(in);
+        REQUIRE((int)records.size() == n);
+        for (const auto &r : records) {
+            CHECK(r.flag == 0);
+            CHECK(r.rname == (kind == 0 ? "sat-one" : kind == 1 ? "sat-three" : "sat-crowded"));
+            CHECK((r.pos == 101 || (kind == 1 && (r.pos == 9001 || r.pos == 17901))));
+            CHECK(r.mapq == 0);
+            CHECK(r.cigar == "60M");
+            CHECK(r.seq == fixture.read[kind]);
+            CHECK(r.qual == std::string(60, 'I'));
+            CHECK(tag_value(r, "X0:i") == std::to_string(winners));
+            if (cert == ba::ALN_METH_CERT_CROWDED) CHECK(tag_value(r, "X1:i") == "255");
+            else CHECK(r.tag.count("X1:i") == 0);
+            CHECK(r.tag.count("XA:Z") == (cert == ba::ALN_METH_CERT_REPEAT ? 1u : 0u)); // no partial XA
+            CHECK(tag_value(r, "NM:i") == "1");
+            CHECK(tag_value(r, "MD:Z") == expected_md(fixture.genome[kind], r.pos - 1, r.seq));
+            CHECK(tag_value(r, "XR:Z") == "CT");
+            CHECK(tag_value(r, "XG:Z") == "CT");
+            CHECK(tag_value(r, "XM:Z") == expected_xm(fixture.genome[kind], r.pos - 1, r.seq, true, true));
+        }
+        // A later read in a reused slot must not inherit the certificate, counts or copy metadata.
+        ba::aln_meth_group_t group; group.ref = &mr; group.mo = &mo; group.opt = opt;
+        ba::aln_meth_slot_t slot; slot.grp = &group;
+        ba::aln_meth_slot_start(&slot, reads, &results[0], n, 2, 0);
+        CHECK(results[0].cert == 0); CHECK(results[0].flags == 0);
+        CHECK(results[0].c1 == 0); CHECK(results[0].c2 == 0);
+        CHECK(results[0].hits.empty()); CHECK(results[0].copy_draw.empty());
+        ba::bwa_free_read_seq(n, reads); CHECK(ba::bwa_seq_close(input) == 0);
+        return text;
+    };
+    run(0, 1, 1, 8, 5); // a single conversion winner: 178 displaced ties give stock MAPQ 0
+    const std::string alone = run(1, 0, 1, 96, 5);
+    CHECK(run(1, 0, 4, 96, 5) == alone);
+    CHECK(run(1, 1, 4, 96, 5) == alone);
+    // Ordinary certificates retain their existing large-cap XA contracts and separate counters.
+    run(1, 1, 4, 8, 1);
+    run(2, 1, 4, 8, 5);
+    std::istringstream in(alone);
+    std::map<int, int> draws;
+    for (const auto &r : parse_records(in)) ++draws[r.pos];
+    REQUIRE(draws.size() == 3);
+    double chi2 = 0;
+    for (int pos : {101, 9001, 17901}) chi2 += (draws[pos] - 32.0) * (draws[pos] - 32.0) / 32.0;
+    CAPTURE(chi2);
+    CHECK(chi2 < 13.82); // two degrees of freedom, p = 0.001
+    ba::aln_meth_ref_free(&mr); ba::bwt_destroy(bwt); free(opt);
+}
+
 TEST_CASE("aln_meth: the work report distinguishes certificates from ordinary repeats")
 {
     namespace ba = bwa_aln;
-    ba::aln_meth_read_t result[4];
+    ba::aln_meth_read_t result[5];
     result[0].c1 = 31; // ordinary repeat, not a certificate
     result[1].cert = ba::ALN_METH_CERT_REPEAT;
     result[2].cert = ba::ALN_METH_CERT_CROWDED;
     result[3].flags = ba::ALN_METH_BIND_BEST;
+    result[4].cert = ba::ALN_METH_CERT_SATURATED;
     const int verbose = bwa_verbose;
     bwa_verbose = 4;
     std::string text;
     {
         bwa_tests::StderrCapture capture;
-        ba::aln_meth_report(1, 4, result);
+        ba::aln_meth_report(1, 5, result);
         text = capture.text();
     }
     bwa_verbose = verbose;
-    CHECK(text.find("; 1 repeat certificates; 1 crowded certificates;") != std::string::npos);
+    CHECK(text.find("; 1 incomplete;") != std::string::npos);
+    CHECK(text.find("; 1 repeat certificates; 1 crowded certificates; 1 saturated certificates;") != std::string::npos);
 }
 
 TEST_CASE("aln_meth: certificate score and ordinary-budget boundaries preserve give-up decisions")
@@ -2891,7 +3173,8 @@ TEST_CASE("aln_meth: certificate score and ordinary-budget boundaries preserve g
                         result.occ.push_back(row);
                     }
                     const bool repeat = next > 3;
-                    const bool give_up = next == 3 && conversions && lookups >= budget;
+                    // Exactly filling the ordinary budget is not past it: such a read can still complete.
+                    const bool give_up = next == 3 && conversions && lookups > budget;
                     CHECK(ba::aln_meth_boundary(&slot, next) == (repeat || give_up));
                     CHECK(result.cert == (repeat ? ba::ALN_METH_CERT_REPEAT : 0));
                     CHECK(result.flags == (give_up ? ba::ALN_METH_BIND_BEST : 0));
@@ -3127,10 +3410,230 @@ TEST_CASE("aln_meth: a reused slot cannot reuse a previous read's certificate co
     free(opt);
 }
 
-TEST_CASE("aln_meth: 179 conversion ties do not finish an observable worse count")
+TEST_CASE("aln_meth: a read whose best stratum cannot close within the cap binds after ALN_METH_BIND_ROWS rows")
 {
-    // One conversion winner among 179 cost-3 loci leaves X1 at 178. A pending cost-6 locus
-    // is within best + M and the two-difference ceiling: it must still be counted, not certified away.
+    namespace ba = bwa_aln;
+    // Two converted copies, each indexed in both orientations: 64 bases give 257 SA rows.
+    bwa_tests::TempDir tmp{"aln_meth_doomed"};
+    const std::string fa = tmp.path() + "/ref.fa", query = "G" + std::string(31, 'A');
+    REQUIRE(aln_test::write_test_fasta(fa, {{"locus", query + std::string(32, 'G')}}));
+    std::vector<std::string> args = {"index", "--meth", fa};
+    std::vector<char *> argv;
+    for (auto &s : args) argv.push_back(&s[0]);
+    argv.push_back(nullptr);
+    optind = 1;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    optreset = 1;
+#endif
+    REQUIRE(bwa_index((int)args.size(), argv.data()) == 0);
+    FMI_search fmi((fa + ".meth").c_str()); fmi.load_index(false, 1);
+    auto *bwt = ba::bwt_from_fmi(&fmi);
+    ba::aln_meth_ref_t mr;
+    REQUIRE(ba::aln_meth_ref_load(&mr, fa.c_str(), fmi.idx->bns, 1) == 0);
+    REQUIRE(bwt->seq_len == 256);
+    bwtint_t known = (bwtint_t)-1;
+    for (bwtint_t k = 0; k <= bwt->seq_len; ++k) {
+        int strand = 0;
+        const auto pos = ba::bwa_pos_from_sa(mr.conv_bns, ba::bwt_sa(bwt, k), 32, &strand);
+        if (pos == (bwtint_t)mr.conv_bns->anns[1].offset && !strand) known = k;
+    }
+    REQUIRE(known != (bwtint_t)-1);
+    auto mismatch = query; mismatch[16] = 'T';
+    const auto fq = write_fq_in(tmp.path(), "reads.fq", {query, mismatch, std::string(32, 'N')});
+    auto *input = ba::bwa_seq_open(fq.c_str()); int n = 0;
+    auto *reads = ba::bwa_read_seq(input, 3, &n, BWA_MODE_COMPREAD, 0);
+    REQUIRE(n == 3);
+    struct Scenario {
+        const char *name;
+        int ordinary, full, read, score;
+        long lookups;
+        bool incomplete, cached, repeat;
+        int max_diff;
+    };
+    // Rows cost at least their interval's converted score, so no certificate fires until every
+    // uncached row scoring at most max(best, lowest pending score) is verified. When those rows
+    // exceed the cap's remainder the read binds as the ordinary path does: ALN_METH_BIND_ROWS more
+    // rows, incomplete. The interval holds 257 rows; a known placement costs one lookup first.
+    const Scenario cases[] = {
+        {"open zero-cost best binds", 40, 100, 0, 0, 1 + ba::ALN_METH_BIND_ROWS, true, false, false, 5},
+        {"positive best above the current score binds", 40, 100, 1, 0, 1 + ba::ALN_METH_BIND_ROWS, true, false, false, 5},
+        {"positive best in the current stratum binds", 40, 100, 1, 1, 1 + ba::ALN_METH_BIND_ROWS, true, false, false, 5},
+        {"the ordinary budget does not move the bind", 0, 100, 0, 0, 1 + ba::ALN_METH_BIND_ROWS, true, false, false, 5},
+        {"a cap remainder below the bind rows stops at the cap", 40, 30, 0, 0, 30, true, false, false, 5},
+        {"one row over the full remainder binds", 40, 257, 0, 0, 1 + ba::ALN_METH_BIND_ROWS, true, false, false, 5},
+        {"width equals the full remainder", 40, 258, 0, 0, 258, false, false, false, 5},
+        {"cached interval costs no further lookups", 40, 258, 0, 0, 258, false, true, false, 5},
+        {"closed best can still certify", 40, 100, 0, 1, 65, false, false, true, 5},
+        {"no best binds as the ordinary search does", 40, 100, 2, 0, ba::ALN_METH_BIND_ROWS, true, false, false, 5},
+        {"no best that fits the cap keeps searching", 40, 258, 2, 0, 257, false, false, false, 5},
+        // Once the best stratum is closed its counts are final: only a crowded certificate can still
+        // become true. Without one (the unique best already has the read's full -n), the read
+        // completes only by verifying every pending row, so it binds when they cannot fit.
+        {"closed best that cannot certify binds", 40, 100, 1, 2, 1 + ba::ALN_METH_BIND_ROWS, true, false, false, 1},
+        {"closed best that may still be crowded keeps searching", 40, 100, 1, 2, 100, true, false, false, 5},
+        // Worse loci count only up to best + s_mm: rows scoring above that window can never make the
+        // unique best crowded, so the closed read still cannot certify.
+        {"closed best past the crowded window binds", 40, 100, 1, 3, 1 + ba::ALN_METH_BIND_ROWS, true, false, false, 5},
+    };
+    for (const auto &test : cases) {
+        CAPTURE(test.name);
+        auto *opt = ba::gap_init_opt();
+        opt->s_mm = 1; opt->s_gapo = 3; opt->s_gape = 1;
+        opt->max_diff = 5; opt->max_top2 = test.repeat ? 0 : 30;
+        ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+        mo.p_best = test.ordinary; mo.p_second = 0; mo.cert_budget = test.full;
+        ba::aln_meth_group_t group;
+        group.opt = opt; group.mo = &mo; group.ref = &mr; group.bwt = bwt;
+        group.n_slots = 1; group.slot.resize(1);
+        ba::gap_slot_core_t core = {}; group.cores = &core;
+        core.job.opt = *opt; core.job.max_diff = 5; core.job.score_cut = INT_MAX;
+        auto &slot = group.slot[0]; slot.grp = &group; slot.job = &core.job;
+        ba::aln_meth_read_t result;
+        ba::aln_meth_slot_start(&slot, reads + test.read, &result, 0, test.max_diff, 0);
+        REQUIRE(slot.cert);
+        auto flush = [&] {
+            core.state = ba::GAP_SLOT_PARKED;
+            ba::aln_meth_flush_parked(&group);
+        };
+        ba::gap_entry_t entry = {};
+        if (test.read != 2) {
+            ba::aln_meth_hit(&slot, &entry, known, known);
+            flush();
+            REQUIRE(result.n_lookups == 1);
+            REQUIRE(slot.best == (test.read == 1 ? 1 : 0));
+        }
+        entry.n_mm = test.score;
+        ba::aln_meth_hit(&slot, &entry, 0, bwt->seq_len);
+        flush();
+        CHECK(result.n_lookups == test.lookups);
+        CHECK(result.flags == (test.incomplete ? ba::ALN_METH_BIND_BEST : 0));
+        CHECK(result.cert == (test.repeat ? ba::ALN_METH_CERT_REPEAT : 0));
+        if (test.cached) {
+            // A different gap path reaches the fully resolved interval, not a duplicate hit.
+            entry.n_mm = 0; entry.n_del = entry.n_gapo = 1;
+            entry.last_diff_pos = (int)ALN_METH_GAP(30, 1, 1);
+            ba::aln_meth_hit(&slot, &entry, 0, bwt->seq_len);
+            REQUIRE(slot.pend.size() == 1);
+            flush();
+            CHECK(result.n_lookups == 258);
+            CHECK(result.flags == 0);
+        }
+        slot.keep = ba::ALN_METH_KEEP_STRATA;
+        ba::aln_meth_slot_finish(&slot);
+        CHECK(result.n_lookups == test.lookups);
+        CHECK(result.flags == (test.incomplete ? ba::ALN_METH_BIND_BEST : 0));
+        if (test.read == 2) {
+            CHECK(result.main == -1);
+            CHECK(result.hits.empty());
+        } else {
+            REQUIRE(result.main >= 0);
+            CHECK(result.hits[result.main].cost == (test.read == 1 ? 1 : 0));
+            CHECK(cigar_of(result, result.hits[result.main]) == std::vector<uint32_t>{32u << 4});
+        }
+        free(opt);
+    }
+    // One flush over several pending intervals: (k, l, converted score, gap position or -1).
+    struct Pend { bwtint_t k, l; int score, gap; };
+    auto run_pend = [&](int read, bool known_first, int full, const std::vector<Pend> &hits,
+                        const std::function<void(const ba::aln_meth_slot_t &)> &inspect = nullptr) {
+        auto *opt = ba::gap_init_opt();
+        opt->s_mm = 1; opt->s_gapo = 3; opt->s_gape = 1; opt->max_diff = 5; opt->max_top2 = 30;
+        ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+        mo.p_best = 40; mo.p_second = 0; mo.cert_budget = full;
+        ba::aln_meth_group_t group;
+        group.opt = opt; group.mo = &mo; group.ref = &mr; group.bwt = bwt;
+        group.n_slots = 1; group.slot.resize(1);
+        ba::gap_slot_core_t core = {}; group.cores = &core;
+        core.job.opt = *opt; core.job.max_diff = 5; core.job.score_cut = INT_MAX;
+        auto &slot = group.slot[0]; slot.grp = &group; slot.job = &core.job;
+        ba::aln_meth_read_t result;
+        ba::aln_meth_slot_start(&slot, reads + read, &result, 0, 5, 0);
+        REQUIRE(slot.cert);
+        auto flush = [&] { core.state = ba::GAP_SLOT_PARKED; ba::aln_meth_flush_parked(&group); };
+        if (known_first) {
+            ba::gap_entry_t entry = {};
+            ba::aln_meth_hit(&slot, &entry, known, known);
+            flush();
+            REQUIRE(result.n_lookups == 1);
+        }
+        for (const auto &h : hits) {
+            ba::gap_entry_t entry = {};
+            if (h.gap >= 0) {
+                entry.n_del = entry.n_gapo = 1;
+                entry.last_diff_pos = (int)ALN_METH_GAP(h.gap, 1, 1);
+            } else entry.n_mm = h.score;
+            ba::aln_meth_hit(&slot, &entry, h.k, h.l);
+        }
+        REQUIRE(slot.pend.size() == hits.size());
+        flush();
+        if (inspect) inspect(slot);
+        const auto out = std::make_pair(result.n_lookups, result.flags);
+        slot.keep = ba::ALN_METH_KEEP_STRATA;
+        ba::aln_meth_slot_finish(&slot);
+        free(opt);
+        return out;
+    };
+    SUBCASE("one interval reached along two gap paths is counted once") {
+        // 2 x 257 rows exceed the 258-row cap but 257 fit: the read must not bind.
+        const auto r = run_pend(2, false, 258, {{0, bwt->seq_len, 3, 30}, {0, bwt->seq_len, 3, 29}});
+        CHECK(r.first == 257);
+        CHECK(r.second == 0);
+    }
+    SUBCASE("distinct required intervals are summed") {
+        // 128 + 129 rows each fit the 200-row cap but not together: bind after 64 rows.
+        const auto r = run_pend(2, false, 200, {{0, 127, 0, -1}, {128, bwt->seq_len, 0, -1}});
+        CHECK(r.first == ba::ALN_METH_BIND_ROWS);
+        CHECK(r.second == ba::ALN_METH_BIND_BEST);
+    }
+    SUBCASE("a doomed read binds on rows in the order its hits were found") {
+        // As the ordinary bind does: the wide interval found first takes all ALN_METH_BIND_ROWS rows,
+        // so the narrow one found second (which a narrow-first order would resolve whole) is not.
+        const auto r = run_pend(2, false, 200, {{64, bwt->seq_len, 0, -1}, {0, 63, 0, -1}}, [&](const ba::aln_meth_slot_t &s) {
+            size_t pos;
+            CHECK(s.sa_ix.find(ba::aln_meth_kl_key_t{0, 63}, &pos) < 0);
+            REQUIRE(s.sa_rows.size() == (size_t)ba::ALN_METH_BIND_ROWS);
+            for (int t = 0; t < ba::ALN_METH_BIND_ROWS; ++t) CHECK(s.sa_rows[t] == ba::bwt_sa(bwt, 64 + t));
+        });
+        CHECK(r.first == ba::ALN_METH_BIND_ROWS);
+        CHECK(r.second == ba::ALN_METH_BIND_BEST);
+    }
+    SUBCASE("the verification order is seeded from the read's bases, not its ordinal") {
+        // Identical reads verify the same rows whether duplicate sharing searches them once or not;
+        // the ordinal still seeds the primary's draw.
+        auto *opt = ba::gap_init_opt();
+        ba::aln_meth_opt_t mo; ba::aln_meth_opt_finish(&mo);
+        ba::aln_meth_group_t group;
+        group.opt = opt; group.mo = &mo; group.ref = &mr; group.bwt = bwt;
+        group.n_slots = 1; group.slot.resize(1);
+        ba::gap_slot_core_t core = {}; group.cores = &core;
+        core.job.opt = *opt; core.job.max_diff = 5; core.job.score_cut = INT_MAX;
+        auto &slot = group.slot[0]; slot.grp = &group; slot.job = &core.job;
+        ba::aln_meth_read_t result;
+        auto seeds = [&](int read, int64_t ord) {
+            ba::aln_meth_slot_start(&slot, reads + read, &result, ord, 5, 0);
+            return std::make_pair(slot.perm_rng, slot.rng);
+        };
+        const auto a = seeds(0, 0), b = seeds(0, 12345), c = seeds(1, 0);
+        CHECK(a.first == b.first);
+        CHECK(a.second != b.second);
+        CHECK(a.first != c.first);
+        free(opt);
+    }
+    SUBCASE("only rows at the lowest pending score are required while the stratum is open") {
+        // Best 1 above the lowest pending score 0: a score-0 row could still lower the best below the
+        // score-1 interval, so that interval is not required yet and the read keeps searching.
+        const auto r = run_pend(1, true, 100, {{0, 0, 0, -1}, {0, bwt->seq_len, 1, -1}});
+        CHECK(r.first == 100);
+        CHECK(r.second == ba::ALN_METH_BIND_BEST);
+    }
+    ba::bwt_destroy(bwt); ba::aln_meth_ref_free(&mr);
+    ba::bwa_free_read_seq(n, reads); ba::bwa_seq_close(input);
+}
+
+TEST_CASE("aln_meth: 179 conversion ties certify exact X0 without claiming an unfinished X1")
+{
+    // One conversion winner among 179 cost-3 loci leaves internal c2 at 178. A pending cost-6
+    // locus would fit the retained window, so the new certificate must not expose that c2 as X1.
     namespace ba = bwa_aln;
     auto *opt = ba::gap_init_opt();
     opt->max_diff = 2; opt->max_top2 = 5;
@@ -3150,17 +3653,16 @@ TEST_CASE("aln_meth: 179 conversion ties do not finish an observable worse count
         o.pos = o.alignment.rb = 100 * i;
         result.occ.push_back(o);
     }
-    CHECK(ba::aln_meth_boundary(&slot, 6) == 0);
-    CHECK(result.cert == 0);
-    CHECK(slot.stop == 0);
-    ba::aln_meth_occ_t pending{};
-    pending.cost = 6; pending.n_mm = 2; pending.pos = pending.alignment.rb = 20000;
-    result.occ.push_back(pending);
+    CHECK(ba::aln_meth_boundary(&slot, 6) == 1);
+    CHECK(result.cert != 0);
+    CHECK(result.cert != ba::ALN_METH_CERT_REPEAT);
+    CHECK(result.cert != ba::ALN_METH_CERT_CROWDED);
+    CHECK(slot.stop == ba::ALN_METH_STOP_CERT);
     ba::aln_meth_slot_finish(&slot);
     CHECK(result.flags == 0);
     CHECK(result.c1 == 1);
-    CHECK(result.c2 == 179);
-    CHECK(result.hits.size() == 180);
+    CHECK(result.c2 == 178);
+    CHECK(result.hits.size() == 179);
     free(opt);
 }
 
@@ -3193,8 +3695,13 @@ TEST_CASE("aln_meth: an open conversion stratum can change either best count dir
         CHECK(result.cert == 0);
         for (int i = 0; i < c.pending_n; ++i) add(c.pending_conv);
         // Finish the whole stratum before its best count can certify.
-        CHECK(ba::aln_meth_boundary(&slot, 4) == (c.want_c1 > 5 ? 1 : 0));
-        CHECK(result.cert == (c.want_c1 > 5 ? ba::ALN_METH_CERT_REPEAT : 0));
+        CHECK(ba::aln_meth_boundary(&slot, 4) == 1);
+        if (c.want_c1 > 5) CHECK(result.cert == ba::ALN_METH_CERT_REPEAT);
+        else {
+            CHECK(result.cert != 0);
+            CHECK(result.cert != ba::ALN_METH_CERT_REPEAT);
+            CHECK(result.cert != ba::ALN_METH_CERT_CROWDED);
+        }
         // No draw intervals are needed here: the fallback uses the fully verified set.
         ba::aln_meth_slot_finish(&slot);
         CHECK(result.c1 == c.want_c1);

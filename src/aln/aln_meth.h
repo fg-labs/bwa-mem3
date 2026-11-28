@@ -40,7 +40,8 @@ struct aln_meth_opt_t {
 	int p_second = 500;             // second component of the single total budget
 	int8_t mat_ot[25], mat_ob[25], mat7_ot[49], mat7_ob[49];
 	aln_meth_fast_t fast; // set by aln_meth_opt_finish
-	int cert_budget = 16384; // the row budget of a read verified with saturation certificates
+	// The row budget of a read verified with saturation certificates: the ordinary total, p_best + p_second.
+	int cert_budget = 4096 + 500;
 };
 
 /* Builds the matrices (meth_fill_mats on aln's base matrix); call once the options are final. */
@@ -145,9 +146,11 @@ struct aln_meth_alt_bound_t {
  * once its best stratum is complete: REPEAT, more than -R loci at the best cost (fewest conversions
  * under the tie-break): X0 their full count, X1 omitted, MAPQ 0 with multiple best loci (a single
  * best can certify at -R 0 with positive stock MAPQ). CROWDED, a unique best and at least
- * ALN_METH_CROWDED retained worse loci: X1 is a lower bound, MAPQ 0. */
-enum { ALN_METH_CERT_REPEAT = 1, ALN_METH_CERT_CROWDED = 2 };
-enum { ALN_METH_CROWDED = 255 };
+ * ALN_METH_CROWDED retained worse loci: X1 is a lower bound, XA omitted, MAPQ 0. SATURATED, at least
+ * ALN_METH_SAT_ROWS best-cost loci under the conversion tie-break: exact X0, omitted X1/XA,
+ * stock MAPQ 0, and the usual primary draw among the fewest-conversion winners. */
+enum { ALN_METH_CERT_REPEAT = 1, ALN_METH_CERT_CROWDED = 2, ALN_METH_CERT_SATURATED = 3 };
+enum { ALN_METH_CROWDED = 255, ALN_METH_SAT_ROWS = 179 };
 struct aln_meth_read_t {
     // The search's candidate loci; finishing the read moves the retained ones to hits and frees it.
     std::vector<aln_meth_occ_t> occ;
